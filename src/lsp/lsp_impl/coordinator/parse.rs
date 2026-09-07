@@ -419,10 +419,9 @@ impl ParseCoordinator {
                 ),
             );
         };
-        let build_bridge_regions = self
-            .settings_manager
-            .load_settings()
-            .any_bridge_server_runnable();
+        let settings = self.settings_manager.load_settings();
+        let build_bridge_regions = settings.any_bridge_server_runnable();
+        let bridge = std::sync::Arc::clone(&self.bridge);
         let pool_uri = uri.clone();
         // The first install's verdict lives outside the work-unit too, so a
         // panic after the hand-off cannot lose a publish that already landed.
@@ -447,7 +446,21 @@ impl ParseCoordinator {
                     entry_mint_epoch,
                     inputs.incarnation,
                     build_bridge_regions,
-                    &|_| true,
+                    // The routing rule the bridge itself applies to a region
+                    // (host filter, spawnable command, `languages` list with
+                    // its wildcard), asked with the canonical language it
+                    // routes on and memoized per (host, language) pair, so
+                    // populate resolves exactly the documents the bridge
+                    // would route.
+                    &|canonical: &str| {
+                        !bridge
+                            .cached_configs_for_injection_language(
+                                &settings,
+                                &inputs.language_name,
+                                canonical,
+                            )
+                            .is_empty()
+                    },
                     &mut |discovered| {
                         log::trace!(
                             target: "kakehashi::parse",
