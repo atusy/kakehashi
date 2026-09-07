@@ -288,28 +288,53 @@ mod tests {
         snapshot
     }
 
+    /// Clone of a held tree: a parse's two installs carry the same tree, and
+    /// clones share their child nodes even though each clone's root node
+    /// has its own identity.
+    fn upgrade_of(held: &ParseSnapshot, bridge: bool, resolved: bool) -> ParseSnapshot {
+        let mut snapshot = snap_with_tree(held.incarnation, held.parsed_version);
+        snapshot.tree = held.tree.clone();
+        with_regions(snapshot, bridge, resolved)
+    }
+
     /// A parse publishes its tree as soon as the injection discovery is
     /// derived, and the bridge/resolved regions — the resolution the token
     /// readers never consume — land on the same version afterwards. The
-    /// cell admits that as an upgrade: same lifetime, same version, a tree
-    /// on both sides, and at least one region view going from absent to
+    /// cell admits that as an upgrade: same lifetime, same version, the
+    /// SAME tree on both sides (a tree under an already-issued result id is
+    /// never swapped, not even by a sibling parse of the same text carrying
+    /// regions), and at least one region view going from absent to
     /// present. Nothing else re-publishes an equal version: the same shape
-    /// again, a tree-less upgrade (no reader may lose the tree), or a
-    /// region view going from present to absent.
+    /// again, a tree-less upgrade, a different tree, or any region view
+    /// going from present to absent.
     #[test]
     fn equal_version_regions_upgrade_is_admitted_over_a_tree_bearing_snapshot() {
         let mut slot = SnapshotSlot::bootstrap(7);
-        slot.snapshot = Some(Arc::new(snap_with_tree(7, 3)));
+        let held = snap_with_tree(7, 3);
+        let held_tree = held.tree.clone();
+        slot.snapshot = Some(Arc::new(held));
+        let held = || ParseSnapshot {
+            tree: held_tree.clone(),
+            ..snap_with_tree(7, 3)
+        };
         assert!(
-            slot.admits(&with_regions(snap_with_tree(7, 3), true, false)),
+            slot.admits(&upgrade_of(&held(), true, false)),
             "bridge regions arriving on the published version upgrade it"
         );
         assert!(
-            slot.admits(&with_regions(snap_with_tree(7, 3), true, true)),
+            slot.admits(&upgrade_of(&held(), true, true)),
             "both region views arriving upgrade it"
         );
         assert!(
-            !slot.admits(&with_regions(snap_with_tree(6, 3), true, true)),
+            !slot.admits(&with_regions(snap_with_tree(7, 3), true, true)),
+            "a sibling parse's tree of the same text is a swap, never admitted"
+        );
+        assert!(
+            !slot.admits(&{
+                let mut other = upgrade_of(&held(), true, true);
+                other.incarnation = 6;
+                other
+            }),
             "the incarnation clause is never bypassed by the upgrade"
         );
         assert!(
@@ -317,18 +342,34 @@ mod tests {
             "an upgrade must carry the tree the readers already derive from"
         );
 
-        slot.snapshot = Some(Arc::new(with_regions(snap_with_tree(7, 3), true, false)));
+        // With one region view present, only the other's arrival upgrades.
+        slot.snapshot = Some(Arc::new(upgrade_of(&held(), true, false)));
         assert!(
-            slot.admits(&with_regions(snap_with_tree(7, 3), true, true)),
+            slot.admits(&upgrade_of(&held(), true, true)),
             "the remaining region view arriving still upgrades"
         );
         assert!(
-            !slot.admits(&with_regions(snap_with_tree(7, 3), true, false)),
+            !slot.admits(&upgrade_of(&held(), true, false)),
             "the same shape again is not an upgrade"
         );
         assert!(
-            !slot.admits(&snap_with_tree(7, 3)),
+            !slot.admits(&upgrade_of(&held(), false, true)),
+            "a view going absent is a downgrade even when another arrives"
+        );
+        assert!(
+            !slot.admits(&held()),
             "a region view going absent is a downgrade, never admitted"
+        );
+        let mut with_discovery = upgrade_of(&held(), true, false);
+        with_discovery.injection_regions = Some(Arc::new(DiscoveredInjections {
+            generation: 1,
+            complete: true,
+            regions: Vec::new(),
+        }));
+        slot.snapshot = Some(Arc::new(with_discovery));
+        assert!(
+            !slot.admits(&upgrade_of(&held(), true, true)),
+            "the discovery going absent is a downgrade even as the resolution arrives"
         );
     }
 
