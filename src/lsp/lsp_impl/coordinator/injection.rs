@@ -1155,6 +1155,76 @@ mod tests {
         assert!(landed, "test publish must land");
     }
 
+    /// A document none of the runnable servers route publishes a roster:
+    /// its regions' languages and identities, no content, nothing to open.
+    /// The injection pass still owes those regions their injected grammar
+    /// — highlighting needs it whether or not a server does — so the pass
+    /// must schedule the grammar load from the roster instead of returning
+    /// at "nothing to route".
+    #[tokio::test]
+    async fn an_unrouted_document_still_loads_its_injected_grammars() {
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("markdown".to_string(), language.clone());
+        let text = "```lua\nprint(1)\n```\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&language)
+            .expect("load markdown grammar");
+        let tree = parser.parse(text, None).expect("parse markdown");
+        let uri = Url::parse("file:///unrouted_roster.md").unwrap();
+        let incarnation =
+            server
+                .documents
+                .insert(uri.clone(), text.to_string(), Some("markdown".into()), None);
+        let content_version = server.documents.get(&uri).unwrap().content_version();
+        let generation = server.cache.semantic_token_generation();
+        let roster = vec![crate::document::DiscoveredBridgeRegion {
+            language: "lua".to_string(),
+            region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+            content: None,
+        }];
+        assert!(
+            server
+                .documents
+                .install_parse(
+                    &uri,
+                    crate::document::LanguageCheck::Expect(Some("markdown")),
+                    std::sync::Arc::new(crate::document::snapshot::ParseSnapshot {
+                        text: std::sync::Arc::from(text),
+                        tree: Some(tree),
+                        language: Some("markdown".to_string()),
+                        parsed_version: content_version,
+                        incarnation,
+                        injection_regions: None,
+                        bridge_regions: Some((generation, std::sync::Arc::new(roster))),
+                        resolved_regions: None,
+                        layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
+                    }),
+                )
+                .current
+        );
+        assert!(!server.language.has_parser_available("lua"));
+
+        server
+            .injection_coordinator()
+            .process_injections(&uri, false)
+            .await;
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline && !server.language.has_parser_available("lua")
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            server.language.has_parser_available("lua"),
+            "the roster's languages drive the injected-grammar load"
+        );
+    }
     /// The snapshot fast path of `resolve_injection_data` must produce
     /// exactly what the inline (live-tree) resolution produces — the fast
     /// path's output is forwarded verbatim to downstream servers, so a
