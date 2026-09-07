@@ -602,14 +602,25 @@ mod tests {
                     uri: lsp_uri,
                     language_id: "markdown".to_string(),
                     version: 1,
-                    text: "# Example\n\n```lua\nprint(1)\n```\n".to_string(),
+                    // Enough regions for the discovery to be worth storing,
+                    // so the first publish is seen to carry it.
+                    text: format!("# Example\n\n{}", "```lua\nprint(1)\n```\n".repeat(9)),
                 },
             })
             .await;
 
-        // First publish: the current tree with no regions yet — and a token
-        // wait already returns it while the resolution is still held.
+        // First publish: the current tree with its discovery and no regions
+        // yet — and a token wait already returns it while the resolution is
+        // still held.
         wait_until(|| regions_of(&uri) == Some((None, None))).await;
+        assert!(
+            server
+                .documents
+                .latest_snapshot(&uri)
+                .and_then(|view| view.slot.snapshot)
+                .is_some_and(|snapshot| snapshot.injection_regions.is_some()),
+            "the first publish carries the discovery the token readers consume"
+        );
         let woke = tokio::time::timeout(
             Duration::from_secs(1),
             server.wait_for_current_snapshot(&uri, Duration::from_secs(1)),
@@ -626,7 +637,7 @@ mod tests {
 
         // Second publish: the same version, upgraded with the regions.
         drop(hold);
-        wait_until(|| regions_of(&uri) == Some((Some(1), Some(1)))).await;
+        wait_until(|| regions_of(&uri) == Some((Some(9), Some(9)))).await;
     }
 
     #[tokio::test]

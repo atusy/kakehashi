@@ -1112,13 +1112,20 @@ mod tests {
         coordinator
             .language_registry_for_parallel()
             .register("markdown".to_string(), language.clone());
-        let text = "```lua\nprint(1)\n```\n";
+        // Enough regions for the discovery to be worth storing (the token
+        // path's reuse gate), so the hand-off is seen to carry it.
+        let text = "```lua\nprint(1)\n```\n".repeat(9);
+        let text = text.as_str();
         let mut parser = Parser::new();
         parser.set_language(&language).unwrap();
         let tree = parser.parse(text, None).unwrap();
 
         let handed_out = std::cell::Cell::new(None);
         let mut on_discovered = |discovered: InjectionDiscovery| {
+            assert!(
+                discovered.discovery.is_some(),
+                "the hand-off carries the discovery the token readers consume"
+            );
             handed_out.set(Some(discovered.generation));
             coordinator.set_base_mapping("lua", "python");
         };
@@ -1143,12 +1150,11 @@ mod tests {
             "the hand-off carries the pass's generation"
         );
         assert_eq!(
-            populated
-                .bridge_regions
-                .as_ref()
-                .and_then(|regions| regions.first())
-                .map(|region| region.language.as_str()),
-            Some("python"),
+            populated.bridge_regions.as_ref().map(|regions| regions
+                .iter()
+                .map(|region| region.language.as_str())
+                .collect::<Vec<_>>()),
+            Some(vec!["python"; 9]),
             "resolution ran after the hand-off: it saw the mapping the hand-off installed"
         );
     }
