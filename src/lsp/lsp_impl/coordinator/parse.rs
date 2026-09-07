@@ -1115,7 +1115,7 @@ impl ParseCoordinator {
                     &self.cache,
                     uri,
                     content_version,
-                    tree_less_upgrade,
+                    tree_less_upgrade || installed.tree_upgrade,
                 )
             {
                 events.push(crate::language::LanguageEvent::semantic_tokens_refresh(
