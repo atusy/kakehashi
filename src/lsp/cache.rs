@@ -62,20 +62,22 @@ pub(crate) struct CacheCoordinator {
 
 /// Everything one `populate_injections` pass derives from its single
 /// injection-query run (parse-snapshot ADR §3, never discover twice): the
-/// semantic-path discovery (gated) and the bridge-downstream region list
-/// (ungated). Both ride the `ParseSnapshot` the parse publishes.
+/// semantic-path discovery (below its own reuse gate) and, behind one gate
+/// (a runnable bridge server), two views of one resolution — the
+/// bridge-downstream region list and the whole-document resolved regions.
+/// All ride the `ParseSnapshot` the parse publishes.
 pub(crate) struct PopulatedInjections {
     pub(crate) discovery: Option<crate::document::DiscoveredInjections>,
-    /// `None` when the build was skipped (no bridge server configured) —
+    /// `None` when the resolution was skipped (no runnable bridge server) —
     /// bridge readers then fall back to inline resolution — vs `Some(empty)`
     /// for "ran, nothing matched" (readers skip their work).
     pub(crate) bridge_regions: Option<Vec<crate::document::DiscoveredBridgeRegion>>,
-    /// `None` when fully resolved regions were intentionally skipped on the
-    /// parse critical path; readers then fall back to inline resolution.
+    /// The same gate as `bridge_regions`: `None` exactly when it is, and the
+    /// whole-document readers then resolve inline.
     pub(crate) resolved_regions: Option<Vec<crate::language::injection::ResolvedInjection>>,
     /// The settings generation this populate pass ran under — stamped onto
-    /// the snapshot's `resolved_regions` so reload-stale resolution is never
-    /// served (see `ParseSnapshot::resolved_regions`).
+    /// the snapshot's `bridge_regions` and `resolved_regions` so reload-stale
+    /// resolution is never served (see `ParseSnapshot::resolved_regions`).
     pub(crate) generation: u64,
 }
 
@@ -226,7 +228,6 @@ impl CacheCoordinator {
         entry_mint_epoch: (u64, u64),
         incarnation: u64,
         build_bridge_regions: bool,
-        build_resolved_regions: bool,
     ) -> Option<PopulatedInjections> {
         self.populate_injections_cancellable(
             uri,
@@ -238,7 +239,6 @@ impl CacheCoordinator {
             entry_mint_epoch,
             incarnation,
             build_bridge_regions,
-            build_resolved_regions,
             None,
         )
     }
@@ -255,7 +255,6 @@ impl CacheCoordinator {
         entry_mint_epoch: (u64, u64),
         incarnation: u64,
         build_bridge_regions: bool,
-        build_resolved_regions: bool,
         cancel: Option<&crate::cancel::CancelToken>,
     ) -> Option<PopulatedInjections> {
         if crate::cancel::is_cancelled(cancel) {
@@ -391,11 +390,10 @@ impl CacheCoordinator {
                 ));
             }
 
-            // Resolve once for every consumer that needs resolved language /
-            // virtual content. In production the bridge and whole-document
-            // gates rise together, so resolving independently would duplicate
-            // the language-detection chain on the parse critical path.
-            let resolved = if build_bridge_regions || build_resolved_regions {
+            // One resolution for every consumer that needs resolved languages /
+            // virtual content: the bridge regions and the whole-document
+            // resolved regions below are two views of this single pass.
+            let resolved = if build_bridge_regions {
                 let resolved = crate::language::injection::InjectionResolver::resolve_from_prebuilt_cancellable(
                     language,
                     &regions,
@@ -418,10 +416,8 @@ impl CacheCoordinator {
             // waste for the (common) bridge-less deployment — `None` makes
             // any late-configured bridge fall back to inline resolution.
             let bridge_regions: Option<Vec<crate::document::DiscoveredBridgeRegion>> =
-                build_bridge_regions.then(|| {
+                resolved.as_ref().map(|resolved| {
                     resolved
-                        .as_ref()
-                        .expect("bridge regions requested resolution")
                         .iter()
                         .map(|region| crate::document::DiscoveredBridgeRegion {
                             language: region.injection_language.clone(),
@@ -435,8 +431,7 @@ impl CacheCoordinator {
             // same single query run — and from the SAME per-region ids and
             // content hashes already in `cacheable_regions` (no duplicate
             // mint/hash on this critical path).
-            let resolved_regions = build_resolved_regions
-                .then(|| resolved.expect("whole-document regions requested resolution"));
+            let resolved_regions = resolved;
 
             if crate::cancel::is_cancelled(cancel) {
                 return None;
@@ -982,7 +977,6 @@ mod tests {
                 tracker.mint_epoch(&uri),
                 1,
                 true,
-                true,
             )
             .expect("the pass ran");
 
@@ -1009,7 +1003,6 @@ mod tests {
                 &tracker,
                 tracker.mint_epoch(&uri),
                 1,
-                true,
                 true,
             )
             .expect("the pass ran");
@@ -1057,7 +1050,6 @@ mod tests {
             &tracker,
             tracker.mint_epoch(&uri),
             1,
-            true,
             true,
             Some(&cancel),
         );
@@ -1107,7 +1099,6 @@ mod tests {
             &tracker,
             tracker.mint_epoch(&uri),
             1,
-            true,
             true,
             Some(&cancel),
         );
@@ -1171,7 +1162,6 @@ print("hello")
             tracker.mint_epoch(&uri),
             0,
             true,
-            true,
         );
 
         // Verify we have one injection region
@@ -1233,7 +1223,6 @@ print("hello")
             &tracker,
             tracker.mint_epoch(&uri),
             0,
-            true,
             true,
         );
 
@@ -1314,7 +1303,6 @@ print("hello")
             tracker.mint_epoch(&uri),
             0,
             true,
-            true,
         );
 
         let regions = cache.get_injections(&uri).expect("should have injections");
@@ -1360,7 +1348,6 @@ print("goodbye")
             &tracker,
             tracker.mint_epoch(&uri),
             0,
-            true,
             true,
         );
 
