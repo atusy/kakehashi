@@ -1393,6 +1393,72 @@ mod tests {
         );
     }
 
+    /// Layer trees are derived lazily on the published snapshot by the
+    /// whole-document readers. The regions upgrade replaces that snapshot
+    /// with one carrying the same tree, so it inherits what a reader
+    /// already derived instead of making the next reader derive it again.
+    #[test]
+    fn install_parse_upgrade_inherits_the_layer_trees_already_derived() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///layer-trees.md").unwrap();
+        let text = "# doc\n";
+        let incarnation = store.insert(
+            uri.clone(),
+            text.to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let (expected_text, content_version) = {
+            let doc = store.get(&uri).unwrap();
+            (doc.text_arc(), doc.content_version())
+        };
+        let tree = markdown_tree(text);
+        store.install_parse(
+            &uri,
+            LanguageCheck::Expect(Some("markdown")),
+            parse_snapshot(
+                &expected_text,
+                Some(tree.clone()),
+                content_version,
+                incarnation,
+            ),
+        );
+        let derived = store
+            .latest_snapshot(&uri)
+            .and_then(|view| view.slot.snapshot)
+            .expect("the tree is published");
+        assert!(derived.layer_trees.set((1, Arc::new(Vec::new()))).is_ok());
+
+        let mut snapshot = super::super::snapshot::ParseSnapshot {
+            text: Arc::clone(&expected_text),
+            tree: Some(tree.clone()),
+            language: Some("markdown".to_string()),
+            parsed_version: content_version,
+            incarnation,
+            injection_regions: None,
+            bridge_regions: None,
+            resolved_regions: None,
+            layer_trees: std::sync::OnceLock::new(),
+        };
+        snapshot.bridge_regions = Some((1, Arc::new(Vec::new())));
+        assert!(
+            store
+                .install_parse(
+                    &uri,
+                    LanguageCheck::Expect(Some("markdown")),
+                    Arc::new(snapshot),
+                )
+                .published
+        );
+        assert!(
+            store
+                .latest_snapshot(&uri)
+                .and_then(|view| view.slot.snapshot)
+                .is_some_and(|snapshot| snapshot.layer_trees.get().is_some()),
+            "the upgrade carries the layer trees the readers already derived"
+        );
+    }
+
     /// One publish per version and lifetime, and currency reported from the
     /// snapshot's stamps: the first install at a version lands and is current;
     /// an equal-version duplicate lands nothing and is not current; a parse of
