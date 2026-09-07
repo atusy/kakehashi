@@ -3620,6 +3620,51 @@ mod tests {
                 .is_none(),
             "a roster nothing routes must not be resolved inline"
         );
+
+        // The partner case: a roster whose regions carry content is a
+        // routed document, and the publisher still anchors its regions —
+        // the short-circuit reads the content, not the roster's presence.
+        let routed = Url::parse("file:///test/routed.md").unwrap();
+        let incarnation = server.documents.insert(
+            routed.clone(),
+            text.to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let content_version = server.documents.get(&routed).unwrap().content_version();
+        let landed = server
+            .documents
+            .get(&routed)
+            .map(|doc| {
+                doc.publish_snapshot(&std::sync::Arc::new(
+                    crate::document::snapshot::ParseSnapshot {
+                        text: std::sync::Arc::from(text),
+                        tree: Some(tree.clone()),
+                        language: Some("markdown".to_string()),
+                        parsed_version: content_version,
+                        incarnation,
+                        injection_regions: None,
+                        bridge_regions: Some((
+                            generation,
+                            std::sync::Arc::new(vec![crate::document::DiscoveredBridgeRegion {
+                                language: "lua".to_string(),
+                                region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+                                content: Some("print(1)\n".to_string()),
+                            }]),
+                        )),
+                        resolved_regions: None,
+                        layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
+                    },
+                ))
+            })
+            .unwrap_or(false);
+        assert!(landed, "test publish must land");
+        assert!(
+            publisher
+                .current_region_offsets(&routed)
+                .is_some_and(|offsets| !offsets.is_empty()),
+            "a routed document's regions are anchored as before"
+        );
     }
 
     #[tokio::test]

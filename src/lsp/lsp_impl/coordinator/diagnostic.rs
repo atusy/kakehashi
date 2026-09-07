@@ -817,6 +817,64 @@ mod tests {
                 .is_none(),
             "a roster nothing routes must not be resolved inline"
         );
+
+        // The partner case: a roster whose regions carry content is a
+        // routed document, and its regions are resolved for contexts as
+        // before — the short-circuit reads the content, not the roster's
+        // presence. (No server handles lua here, so the resolution leaves
+        // its mark in the tracker rather than in a context.)
+        let routed = Url::parse("file:///test/routed-diagnostic.md").unwrap();
+        let incarnation = server.documents.insert(
+            routed.clone(),
+            text.to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let content_version = server.documents.get(&routed).unwrap().content_version();
+        assert!(
+            server
+                .documents
+                .install_parse(
+                    &routed,
+                    crate::document::LanguageCheck::Expect(Some("markdown")),
+                    std::sync::Arc::new(crate::document::snapshot::ParseSnapshot {
+                        text: std::sync::Arc::from(text),
+                        tree: Some(tree.clone()),
+                        language: Some("markdown".to_string()),
+                        parsed_version: content_version,
+                        incarnation,
+                        injection_regions: None,
+                        bridge_regions: Some((
+                            generation,
+                            std::sync::Arc::new(vec![crate::document::DiscoveredBridgeRegion {
+                                language: "lua".to_string(),
+                                region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+                                content: Some("print(1)\n".to_string()),
+                            }]),
+                        )),
+                        resolved_regions: None,
+                        layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
+                    }),
+                )
+                .current
+        );
+        preparer
+            .prepare_diagnostic_snapshot_when_current(&routed, incarnation, content_version)
+            .expect("a current parse yields a diagnostic snapshot");
+        assert!(
+            server
+                .bridge
+                .node_tracker()
+                .lookup_in_layer(
+                    &routed,
+                    content.start_byte(),
+                    content.end_byte(),
+                    content.kind(),
+                    crate::language::injection::REGION_IDENTITY_LAYER_BASE,
+                )
+                .is_some(),
+            "a routed document's regions are resolved as before"
+        );
     }
 
     #[tokio::test]
