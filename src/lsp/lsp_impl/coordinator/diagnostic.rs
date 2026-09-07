@@ -691,7 +691,7 @@ mod tests {
                 injection_regions: None,
                 bridge_regions: None,
                 resolved_regions: None,
-                layer_trees: std::sync::OnceLock::new(),
+                layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
             }),
         );
         assert!(installed.current && installed.published);
@@ -739,7 +739,7 @@ mod tests {
                         injection_regions: None,
                         bridge_regions: None,
                         resolved_regions: None,
-                        layer_trees: std::sync::OnceLock::new(),
+                        layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
                     }),
                 )
                 .current

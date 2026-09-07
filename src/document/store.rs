@@ -630,7 +630,7 @@ impl DocumentStore {
             injection_regions: None,
             bridge_regions: None,
             resolved_regions: None,
-            layer_trees: std::sync::OnceLock::new(),
+            layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
         };
         doc.publish_snapshot(&Arc::new(snapshot));
     }
@@ -829,7 +829,7 @@ mod tests {
             injection_regions: None,
             bridge_regions: None,
             resolved_regions: None,
-            layer_trees: std::sync::OnceLock::new(),
+            layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -954,7 +954,7 @@ mod tests {
                 injection_regions: None,
                 bridge_regions: None,
                 resolved_regions: None,
-                layer_trees: std::sync::OnceLock::new(),
+                layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
             }),
         );
         assert!(reparse.current && reparse.published);
@@ -1278,7 +1278,7 @@ mod tests {
                 injection_regions: None,
                 bridge_regions: None,
                 resolved_regions: None,
-                layer_trees: std::sync::OnceLock::new(),
+                layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
             };
             snapshot.bridge_regions = Some((1, Arc::new(Vec::new())));
             Arc::new(snapshot)
@@ -1391,7 +1391,7 @@ mod tests {
                 injection_regions: None,
                 bridge_regions: None,
                 resolved_regions: None,
-                layer_trees: std::sync::OnceLock::new(),
+                layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
             };
             snapshot.bridge_regions = Some((1, Arc::new(Vec::new())));
             store.install_parse(
@@ -1451,7 +1451,7 @@ mod tests {
             injection_regions: None,
             bridge_regions: None,
             resolved_regions: None,
-            layer_trees: std::sync::OnceLock::new(),
+            layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
         };
         snapshot.bridge_regions = Some((1, Arc::new(Vec::new())));
         assert!(
@@ -1640,7 +1640,7 @@ mod tests {
                 injection_regions: None,
                 bridge_regions: None,
                 resolved_regions: None,
-                layer_trees: std::sync::OnceLock::new(),
+                layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
             }),
         );
         assert!(
@@ -1672,7 +1672,7 @@ mod tests {
                 injection_regions: None,
                 bridge_regions: None,
                 resolved_regions: None,
-                layer_trees: std::sync::OnceLock::new(),
+                layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
             }
         }
 

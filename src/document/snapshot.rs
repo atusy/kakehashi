@@ -101,7 +101,7 @@ pub(crate) struct ParseSnapshot {
     /// empty embedded layer for the rest of this snapshot's life. A walker
     /// seeing a generation mismatch bypasses the cell and walks fresh (the
     /// pre-cache per-request cost) until the next snapshot rebuilds it.
-    pub(crate) layer_trees: std::sync::OnceLock<(u64, Arc<Vec<SnapshotLayerTree>>)>,
+    pub(crate) layer_trees: Arc<std::sync::OnceLock<(u64, Arc<Vec<SnapshotLayerTree>>)>>,
 }
 
 /// The per-URI `watch` value: the current lifetime plus the latest snapshot.
@@ -231,7 +231,7 @@ mod tests {
             injection_regions: None,
             bridge_regions: None,
             resolved_regions: None,
-            layer_trees: std::sync::OnceLock::new(),
+            layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -278,7 +278,7 @@ mod tests {
             injection_regions: None,
             bridge_regions: None,
             resolved_regions: None,
-            layer_trees: std::sync::OnceLock::new(),
+            layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
         }
     }
 

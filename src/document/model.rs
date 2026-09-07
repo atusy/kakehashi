@@ -231,7 +231,7 @@ impl Document {
             injection_regions: None,
             bridge_regions: None,
             resolved_regions: None,
-            layer_trees: std::sync::OnceLock::new(),
+            layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -518,7 +518,7 @@ mod tests {
             injection_regions: None,
             bridge_regions: None,
             resolved_regions: None,
-            layer_trees: std::sync::OnceLock::new(),
+            layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -721,7 +721,7 @@ mod tests {
             injection_regions: None,
             bridge_regions: None,
             resolved_regions: None,
-            layer_trees: std::sync::OnceLock::new(),
+            layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
         })));
         // `Tree` clones share their subtrees but not the root handle, so a
         // child node's id is the identity that survives the clone.
