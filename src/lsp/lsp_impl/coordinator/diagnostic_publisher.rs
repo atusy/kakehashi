@@ -1749,6 +1749,20 @@ impl DiagnosticPublisher {
             // here removes queries, and "no query" would read as no regions.
             return settled().then_some(offsets);
         };
+        // A roster nothing routes (the parse looked; no runnable server
+        // handles any region language, so no entry carries content) means
+        // no virtual document exists whose diagnostics could need
+        // anchoring: nothing to resolve, and resolving inline here would
+        // pay on every edit what the parse path declined. Generation-
+        // stamped, so a reload that configures a server falls through to
+        // the inline resolution below.
+        if self
+            .documents
+            .current_bridge_regions(host, generation_before)
+            .is_some_and(|roster| roster.iter().all(|region| region.content.is_none()))
+        {
+            return settled().then_some(offsets);
+        }
 
         let resolved_regions = match self
             .documents

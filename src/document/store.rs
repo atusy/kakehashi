@@ -655,6 +655,28 @@ impl DocumentStore {
         (*stamped_generation == current_generation).then(|| std::sync::Arc::clone(regions))
     }
 
+    /// The current snapshot's bridge roster, stamped with `current_generation`
+    /// (see [`current_resolved_regions`](Self::current_resolved_regions)). A
+    /// roster with no content-bearing entry is definitive: the parse looked,
+    /// and no runnable server handles any of the document's region
+    /// languages, so nothing was routed and no virtual document exists —
+    /// bridge-side readers skip their work instead of resolving inline.
+    /// `None` means the parse could not look (or the roster is stale or
+    /// reload-stale): resolve inline.
+    pub(crate) fn current_bridge_regions(
+        &self,
+        uri: &Url,
+        current_generation: u64,
+    ) -> Option<std::sync::Arc<Vec<crate::document::DiscoveredBridgeRegion>>> {
+        let view = self.latest_snapshot(uri)?;
+        let snapshot = view.slot.snapshot?;
+        if snapshot.parsed_version != view.content_version {
+            return None;
+        }
+        let (stamped_generation, regions) = snapshot.bridge_regions.as_ref()?;
+        (*stamped_generation == current_generation).then(|| std::sync::Arc::clone(regions))
+    }
+
     /// Subscribe to `uri`'s snapshot-slot changes for a **bounded** wait (the
     /// first-parse and explicit-action waits, the only two the parse-snapshot
     /// model permits). `None` for an unregistered/closed URI. The `Ref` is
