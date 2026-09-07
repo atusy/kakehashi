@@ -399,7 +399,7 @@ impl ParseCoordinator {
                 return PopulatedSnapshotRegions::default();
             };
             PopulatedSnapshotRegions {
-                discovery: populated.discovery.map(std::sync::Arc::new),
+                discovery: populated.discovery,
                 bridge_regions: populated
                     .bridge_regions
                     .map(|regions| (populated.generation, std::sync::Arc::new(regions))),
