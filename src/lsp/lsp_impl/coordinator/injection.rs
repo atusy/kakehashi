@@ -266,6 +266,26 @@ impl InjectionCoordinator {
     ///
     /// Resolves injection data once and reuses it across all three steps. Must be
     /// called AFTER parse_document so the AST is available.
+    /// The languages of every region on the current snapshot's roster —
+    /// routed or not — when a populate pass published one under the current
+    /// settings generation; `None` when the pass could not look or the
+    /// regions are stale, so the caller derives the languages from what it
+    /// resolved inline.
+    fn roster_languages(&self, uri: &Url) -> Option<HashSet<String>> {
+        let view = self.documents.latest_snapshot(uri)?;
+        let snapshot = view.slot.snapshot?;
+        if snapshot.parsed_version != view.content_version {
+            return None;
+        }
+        let (stamped_generation, roster) = snapshot.bridge_regions.as_ref()?;
+        (*stamped_generation == self.cache.semantic_token_generation()).then(|| {
+            roster
+                .iter()
+                .map(|region| region.language.clone())
+                .collect()
+        })
+    }
+
     pub(crate) async fn process_injections(&self, uri: &Url, forward_did_change: bool) {
         let _ = self
             .process_injections_after_lifecycle_lock(
@@ -356,7 +376,14 @@ impl InjectionCoordinator {
             self.documents.remove_edit_lock_if_unshared(uri, &edit_lock);
             return true;
         };
-        if injections.is_empty() {
+        // The languages owed an injected grammar: every region's, routed
+        // or not — the roster a document nothing routes publishes carries
+        // them without content — falling back to the routed regions when
+        // the pass resolved inline.
+        let languages: HashSet<String> = self
+            .roster_languages(uri)
+            .unwrap_or_else(|| injections.iter().map(|inj| inj.language.clone()).collect());
+        if injections.is_empty() && languages.is_empty() {
             self.bridge.cancel_eager_open(uri);
             return true;
         }
@@ -364,6 +391,9 @@ impl InjectionCoordinator {
         // Stop the previous pass before closing a replaced language-bearing URI;
         // otherwise an old eager task can enqueue didOpen after the close and
         // resurrect the stale URI. The new batch is created below after cleanup.
+        // With nothing routed, a virtual document a region used to have is one
+        // to close: the replaced set is judged against the routed regions, so
+        // an unrouted document closes them all.
         self.bridge.cancel_eager_open(uri);
         let replaced_regions = self.bridge.close_replaced_docs(uri, &injections).await;
         for region_id in replaced_regions {
@@ -376,9 +406,6 @@ impl InjectionCoordinator {
                 .forward_didchange_to_opened_docs(uri, incarnation, &injections)
                 .await;
         }
-
-        let languages: HashSet<String> =
-            injections.iter().map(|inj| inj.language.clone()).collect();
 
         // Re-home the injected-language parser install OFF this task (#480 liveness;
         // the parse-actor ADR's "PR-3"). When a region's injected language has no
@@ -408,6 +435,10 @@ impl InjectionCoordinator {
             }
         };
         tokio::spawn(install_task);
+        if injections.is_empty() {
+            // Nothing to route: the grammar load above is all the pass owes.
+            return true;
+        }
 
         // Routing may need to wait for a downstream provider to become ready.
         // Keep that wait out of the lifecycle pass: the pass must release its
@@ -1163,7 +1194,22 @@ mod tests {
     /// at "nothing to route".
     #[tokio::test]
     async fn an_unrouted_document_still_loads_its_injected_grammars() {
-        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let (service, mut socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        // What the server tells the client: a grammar it could not load is
+        // reported there, so the load is observable whether it succeeds
+        // (the parser becomes available) or is refused (the report names it).
+        let told = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        {
+            let told = std::sync::Arc::clone(&told);
+            tokio::spawn(async move {
+                use futures::StreamExt;
+                while let Some(request) = socket.next().await {
+                    told.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(format!("{request:?}"));
+                }
+            });
+        }
         let server = service.inner();
         let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
         server
@@ -1215,13 +1261,20 @@ mod tests {
             .process_injections(&uri, false)
             .await;
 
+        let attempted = || {
+            server.language.has_parser_available("lua")
+                || told
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .any(|message| message.contains("lua"))
+        };
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        while tokio::time::Instant::now() < deadline && !server.language.has_parser_available("lua")
-        {
+        while tokio::time::Instant::now() < deadline && !attempted() {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         assert!(
-            server.language.has_parser_available("lua"),
+            attempted(),
             "the roster's languages drive the injected-grammar load"
         );
     }
