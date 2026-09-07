@@ -392,13 +392,20 @@ impl ParseCoordinator {
                 if latest.is_none() {
                     self.documents.remove_edit_lock_if_unshared(uri, &edit_lock);
                 }
-                return self.documents.install_parse(
-                    uri,
-                    check.as_check(),
-                    inputs.snapshot(PopulatedSnapshotRegions::default()),
-                );
+                None
+            } else {
+                Some(latch)
             }
-            latch
+        };
+        // Refused at the latch (the inputs moved on): one install, without
+        // regions — after the edit lock is released, so a queued edit never
+        // waits behind a stale publish and the evicted tree's teardown.
+        let Some(entry_mint_epoch) = entry_mint_epoch else {
+            return self.documents.install_parse(
+                uri,
+                check.as_check(),
+                inputs.snapshot(PopulatedSnapshotRegions::default()),
+            );
         };
         let build_bridge_regions = self
             .settings_manager
