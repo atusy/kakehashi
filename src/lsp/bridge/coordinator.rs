@@ -1076,12 +1076,17 @@ impl BridgeCoordinator {
         self.pool.close_invalidated_docs(uri, ulids).await;
     }
 
+    /// Close the virtual documents of regions whose language moved on:
+    /// `expected` is every live region's `(region_id, language)` — the
+    /// snapshot's roster when it is current, else the regions the pass
+    /// resolved — so a region that stopped being routed closes the document
+    /// it used to have.
     pub(crate) async fn close_replaced_docs(
         &self,
         uri: &Url,
-        injections: &[BridgeInjection],
+        expected: &[(String, String)],
     ) -> std::collections::HashSet<String> {
-        self.pool.close_replaced_docs(uri, injections).await
+        self.pool.close_replaced_docs(uri, expected).await
     }
 
     /// Take the upstream notification receiver for forwarding to the editor.

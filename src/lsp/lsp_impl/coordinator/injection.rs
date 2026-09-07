@@ -169,7 +169,7 @@ impl InjectionCoordinator {
             // carries content for every region and is routed; a document
             // none routes carries none, and its roster informs the
             // injected-grammar load and the closing of virtual documents
-            // (see `roster_languages`).
+            // (see `roster_regions`).
             let regions = bridge_regions
                 .iter()
                 .filter_map(|region| {
@@ -262,12 +262,12 @@ impl InjectionCoordinator {
         settled().then_some(resolved)
     }
 
-    /// The languages of every region on the current snapshot's roster —
-    /// routed or not — when a populate pass published one under the current
-    /// settings generation; `None` when the pass could not look or the
-    /// regions are stale, so the caller derives the languages from what it
-    /// resolved inline.
-    fn roster_languages(&self, uri: &Url) -> Option<HashSet<String>> {
+    /// Every region on the current snapshot's roster as `(region_id,
+    /// language)` — routed or not — when a populate pass published one under
+    /// the current settings generation; `None` when the pass could not look
+    /// or the regions are stale, so the caller derives both the languages
+    /// owed a grammar and the replacement set from what it resolved inline.
+    fn roster_regions(&self, uri: &Url) -> Option<Vec<(String, String)>> {
         let view = self.documents.latest_snapshot(uri)?;
         let snapshot = view.slot.snapshot?;
         if snapshot.parsed_version != view.content_version {
@@ -277,7 +277,7 @@ impl InjectionCoordinator {
         (*stamped_generation == self.cache.semantic_token_generation()).then(|| {
             roster
                 .iter()
-                .map(|region| region.language.clone())
+                .map(|region| (region.region_id.clone(), region.language.clone()))
                 .collect()
         })
     }
@@ -381,9 +381,16 @@ impl InjectionCoordinator {
         // or not — the roster a document nothing routes publishes carries
         // them without content — falling back to the routed regions when
         // the pass resolved inline.
-        let languages: HashSet<String> = self
-            .roster_languages(uri)
-            .unwrap_or_else(|| injections.iter().map(|inj| inj.language.clone()).collect());
+        let roster = self.roster_regions(uri).unwrap_or_else(|| {
+            injections
+                .iter()
+                .map(|inj| (inj.region_id.clone(), inj.language.clone()))
+                .collect()
+        });
+        let languages: HashSet<String> = roster
+            .iter()
+            .map(|(_, language)| language.clone())
+            .collect();
         if injections.is_empty() && languages.is_empty() {
             self.bridge.cancel_eager_open(uri);
             return true;
@@ -392,11 +399,11 @@ impl InjectionCoordinator {
         // Stop the previous pass before closing a replaced language-bearing URI;
         // otherwise an old eager task can enqueue didOpen after the close and
         // resurrect the stale URI. The new batch is created below after cleanup.
-        // With nothing routed, a virtual document a region used to have is one
-        // to close: the replaced set is judged against the routed regions, so
-        // an unrouted document closes them all.
+        // Judged against every live region's language — the roster's when
+        // current — so a region that stopped being routed closes the
+        // virtual document it used to have.
         self.bridge.cancel_eager_open(uri);
-        let replaced_regions = self.bridge.close_replaced_docs(uri, &injections).await;
+        let replaced_regions = self.bridge.close_replaced_docs(uri, &roster).await;
         for region_id in replaced_regions {
             self.diagnostics
                 .evict_source(uri, &DiagnosticSource::Region(region_id));
