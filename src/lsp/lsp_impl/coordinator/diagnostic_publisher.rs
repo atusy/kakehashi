@@ -3503,6 +3503,111 @@ mod tests {
         );
     }
 
+    /// Populate publishes a roster — every region's language and identity,
+    /// no content — when no runnable server handles any of the document's
+    /// region languages: nothing was routed, so no virtual document exists
+    /// whose diagnostics would need anchoring. The publisher takes that at
+    /// its word — no regions to anchor — instead of resolving inline, which
+    /// would mint region identity and pay, on every edit, the resolution
+    /// the parse path just declined.
+    #[tokio::test]
+    async fn current_region_offsets_takes_an_unrouted_roster_without_resolving() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let publisher = DiagnosticPublisher::new(server);
+
+        let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let query = tree_sitter::Query::new(
+            &language,
+            "(fenced_code_block (info_string (language) @injection.language) \
+             (code_fence_content) @injection.content)",
+        )
+        .expect("valid markdown injection query");
+        server
+            .language
+            .query_store()
+            .insert_injection_query("markdown".to_string(), std::sync::Arc::new(query));
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("markdown".to_string(), language.clone());
+
+        let uri = Url::parse("file:///test/unrouted.md").unwrap();
+        let text = "```lua\nprint(1)\n```\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(text, None).unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            text.to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let content_version = server.documents.get(&uri).unwrap().content_version();
+        let generation = server.cache.semantic_token_generation();
+        let landed = server
+            .documents
+            .get(&uri)
+            .map(|doc| {
+                doc.publish_snapshot(&std::sync::Arc::new(
+                    crate::document::snapshot::ParseSnapshot {
+                        text: std::sync::Arc::from(text),
+                        tree: Some(tree.clone()),
+                        language: Some("markdown".to_string()),
+                        parsed_version: content_version,
+                        incarnation,
+                        injection_regions: None,
+                        bridge_regions: Some((
+                            generation,
+                            std::sync::Arc::new(vec![crate::document::DiscoveredBridgeRegion {
+                                language: "lua".to_string(),
+                                region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+                                content: None,
+                            }]),
+                        )),
+                        resolved_regions: None,
+                        layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
+                    },
+                ))
+            })
+            .unwrap_or(false);
+        assert!(landed, "test publish must land");
+
+        assert!(
+            publisher
+                .current_region_offsets(&uri)
+                .is_some_and(|offsets| offsets.is_empty()),
+            "nothing routed: no region to anchor, and the answer is definitive"
+        );
+        // The fence content is the one region the query names; inline
+        // resolution would have minted its identity in the region layer.
+        let content = tree
+            .root_node()
+            .descendant_for_byte_range(8, 9)
+            .and_then(|node| {
+                let mut node = node;
+                while node.kind() != "code_fence_content" {
+                    node = node.parent()?;
+                }
+                Some(node)
+            })
+            .expect("the fence content node");
+        assert!(
+            server
+                .bridge
+                .node_tracker()
+                .lookup_in_layer(
+                    &uri,
+                    content.start_byte(),
+                    content.end_byte(),
+                    content.kind(),
+                    crate::language::injection::REGION_IDENTITY_LAYER_BASE,
+                )
+                .is_none(),
+            "a roster nothing routes must not be resolved inline"
+        );
+    }
+
     #[tokio::test]
     async fn current_region_offsets_distinguishes_unknown_from_absent_geometry() {
         let (service, _socket) = LspService::new(Kakehashi::new);
