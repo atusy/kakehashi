@@ -23,9 +23,14 @@ struct SnapshotInputs {
 }
 
 impl SnapshotInputs {
+    /// `layer_trees` is the lazy cell the snapshot derives its layer trees
+    /// into: fresh for a first install, the first install's own for the
+    /// regions upgrade of the same version, so a reader deriving them
+    /// across the upgrade lands where every later reader looks.
     fn snapshot(
         &self,
         regions: PopulatedSnapshotRegions,
+        layer_trees: LayerTreeCell,
     ) -> std::sync::Arc<crate::document::snapshot::ParseSnapshot> {
         std::sync::Arc::new(crate::document::snapshot::ParseSnapshot {
             text: std::sync::Arc::clone(&self.text),
@@ -36,10 +41,14 @@ impl SnapshotInputs {
             injection_regions: regions.discovery,
             bridge_regions: regions.bridge_regions,
             resolved_regions: regions.resolved_regions,
-            layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
+            layer_trees,
         })
     }
 }
+
+type LayerTreeCell = std::sync::Arc<
+    std::sync::OnceLock<(u64, std::sync::Arc<Vec<crate::document::SnapshotLayerTree>>)>,
+>;
 
 /// An owned [`LanguageCheck`](crate::document::LanguageCheck): the first
 /// install runs on the compute pool, so the expectation must travel.
@@ -404,7 +413,10 @@ impl ParseCoordinator {
             return self.documents.install_parse(
                 uri,
                 check.as_check(),
-                inputs.snapshot(PopulatedSnapshotRegions::default()),
+                inputs.snapshot(
+                    PopulatedSnapshotRegions::default(),
+                    std::sync::Arc::new(std::sync::OnceLock::new()),
+                ),
             );
         };
         let build_bridge_regions = self
@@ -414,7 +426,11 @@ impl ParseCoordinator {
         let pool_uri = uri.clone();
         // The first install's verdict lives outside the work-unit too, so a
         // panic after the hand-off cannot lose a publish that already landed.
-        let first: std::sync::Arc<std::sync::Mutex<Option<crate::document::ParseInstall>>> =
+        type First = Option<(
+            crate::document::ParseInstall,
+            std::sync::Arc<crate::document::snapshot::ParseSnapshot>,
+        )>;
+        let first: std::sync::Arc<std::sync::Mutex<First>> =
             std::sync::Arc::new(std::sync::Mutex::new(None));
         let regions = run_awaited_populate(&self.compute_pool, version_cancel, {
             let inputs = std::sync::Arc::clone(&inputs);
@@ -438,15 +454,20 @@ impl ParseCoordinator {
                             inputs.parsed_version,
                             discovered.generation
                         );
+                        let snapshot = inputs.snapshot(
+                            PopulatedSnapshotRegions {
+                                discovery: discovered.discovery,
+                                ..PopulatedSnapshotRegions::default()
+                            },
+                            std::sync::Arc::new(std::sync::OnceLock::new()),
+                        );
                         let installed = documents.install_parse(
                             &pool_uri,
                             check.as_check(),
-                            inputs.snapshot(PopulatedSnapshotRegions {
-                                discovery: discovered.discovery,
-                                ..PopulatedSnapshotRegions::default()
-                            }),
+                            std::sync::Arc::clone(&snapshot),
                         );
-                        *first.lock().unwrap_or_else(|e| e.into_inner()) = Some(installed);
+                        *first.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some((installed, snapshot));
                     },
                     Some(&cancel_for_work),
                 );
@@ -483,7 +504,7 @@ impl ParseCoordinator {
             // the cell refused (a sibling parse of this version landed its
             // tree first) has nothing to upgrade: the regions would ride the
             // sibling's tree with a tree the readers never derived from.
-            Some(first) => {
+            Some((first, first_snapshot)) => {
                 // The verdict the callers act on is taken now, after the
                 // resolution, not at the first install: an edit landing in
                 // between has moved the document on, and the downstream
@@ -493,8 +514,12 @@ impl ParseCoordinator {
                 let upgraded = (first.published
                     && (regions.bridge_regions.is_some() || regions.resolved_regions.is_some()))
                 .then(|| {
-                    self.documents
-                        .install_parse(uri, check.as_check(), inputs.snapshot(regions))
+                    self.documents.install_parse(
+                        uri,
+                        check.as_check(),
+                        inputs
+                            .snapshot(regions, std::sync::Arc::clone(&first_snapshot.layer_trees)),
+                    )
                 });
                 let current = match upgraded {
                     Some(upgrade) => upgrade.current,
@@ -509,9 +534,11 @@ impl ParseCoordinator {
                 crate::document::ParseInstall { current, ..first }
             }
             // The pass never reached the hand-off: one install, as before.
-            None => self
-                .documents
-                .install_parse(uri, check.as_check(), inputs.snapshot(regions)),
+            None => self.documents.install_parse(
+                uri,
+                check.as_check(),
+                inputs.snapshot(regions, std::sync::Arc::new(std::sync::OnceLock::new())),
+            ),
         }
     }
 
