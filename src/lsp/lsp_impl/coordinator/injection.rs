@@ -165,10 +165,11 @@ impl InjectionCoordinator {
             // query would not discover. Mismatch falls back inline below.
             && *stamped_generation == self.cache.semantic_token_generation()
         {
-            // Only the regions a server handles carry content and are
-            // routed; the rest of the roster informs the injected-grammar
-            // install and the closing of virtual documents (see
-            // `injection_languages`).
+            // A document one of whose region languages a server handles
+            // carries content for every region and is routed; a document
+            // none routes carries none, and its roster informs the
+            // injected-grammar load and the closing of virtual documents
+            // (see `roster_languages`).
             let regions = bridge_regions
                 .iter()
                 .filter_map(|region| {
@@ -261,11 +262,6 @@ impl InjectionCoordinator {
         settled().then_some(resolved)
     }
 
-    /// Process injected languages: resolve injection data, optionally forward didChange,
-    /// auto-install missing parsers, and eagerly open virtual documents.
-    ///
-    /// Resolves injection data once and reuses it across all three steps. Must be
-    /// called AFTER parse_document so the AST is available.
     /// The languages of every region on the current snapshot's roster —
     /// routed or not — when a populate pass published one under the current
     /// settings generation; `None` when the pass could not look or the
@@ -286,6 +282,11 @@ impl InjectionCoordinator {
         })
     }
 
+    /// Process injected languages: resolve injection data, optionally forward didChange,
+    /// auto-install missing parsers, and eagerly open virtual documents.
+    ///
+    /// Resolves injection data once and reuses it across all three steps. Must be
+    /// called AFTER parse_document so the AST is available.
     pub(crate) async fn process_injections(&self, uri: &Url, forward_did_change: bool) {
         let _ = self
             .process_injections_after_lifecycle_lock(
@@ -1211,6 +1212,14 @@ mod tests {
             });
         }
         let server = service.inner();
+        // No auto-install: the load either succeeds from the test data
+        // directory or is reported as a missing parser, never a download.
+        server
+            .settings_manager
+            .apply_settings(crate::config::WorkspaceSettings {
+                auto_install: false,
+                ..Default::default()
+            });
         let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
         server
             .language
@@ -1267,7 +1276,7 @@ mod tests {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .iter()
-                    .any(|message| message.contains("lua"))
+                    .any(|message| message.contains("'lua'"))
         };
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while tokio::time::Instant::now() < deadline && !attempted() {
