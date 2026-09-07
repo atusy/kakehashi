@@ -36,7 +36,7 @@ impl SnapshotInputs {
             injection_regions: regions.discovery,
             bridge_regions: regions.bridge_regions,
             resolved_regions: regions.resolved_regions,
-            layer_trees: std::sync::OnceLock::new(),
+            layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
         })
     }
 }
@@ -693,7 +693,7 @@ impl ParseCoordinator {
                     injection_regions: None,
                     bridge_regions: None,
                     resolved_regions: None,
-                    layer_trees: std::sync::OnceLock::new(),
+                    layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
                 }),
             );
             if installed.current {
@@ -718,7 +718,7 @@ impl ParseCoordinator {
                 injection_regions: None,
                 bridge_regions: None,
                 resolved_regions: None,
-                layer_trees: std::sync::OnceLock::new(),
+                layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
             }),
         );
         if installed.current {
