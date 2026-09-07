@@ -524,6 +524,134 @@ mod tests {
     /// bridge consumes has run. With the resolution held, the first publish
     /// is observable on its own: current, tree-bearing, regions absent, and
     /// a token wait already returns it.
+    /// The open parse resolves a document's regions only when the bridge's
+    /// own routing rule (host filter, spawnable command, `languages` list)
+    /// gives one of its region languages a server — judged on the canonical
+    /// language the bridge routes on, so a ```` ```py ```` fence is a
+    /// `python` region. A document nothing routes publishes its roster
+    /// (language and identity, no content) and no resolved regions. Pinned
+    /// at the parse coordinator so the gate cannot drift from the routing
+    /// the bridge applies when it opens virtual documents.
+    #[tokio::test]
+    async fn did_open_resolves_regions_only_for_a_language_a_server_handles() {
+        let (service, mut socket) = LspService::new(Kakehashi::new);
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            while socket.next().await.is_some() {}
+        });
+        let server = service.inner();
+
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("markdown".to_string(), tree_sitter_md::LANGUAGE.into());
+        let markdown_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let injection_query = Query::new(
+            &markdown_language,
+            r#"
+            (fenced_code_block
+              (info_string
+                (language) @injection.language)
+              (code_fence_content) @injection.content)
+            "#,
+        )
+        .expect("valid markdown injection query");
+        server
+            .language
+            .query_store()
+            .insert_injection_query("markdown".to_string(), std::sync::Arc::new(injection_query));
+
+        let mut language_servers = HashMap::new();
+        language_servers.insert(
+            "python-bridge".to_string(),
+            BridgeServerConfig {
+                cmd: Some(vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "cat > /dev/null".to_string(),
+                ]),
+                languages: Some(vec!["python".to_string()]),
+                initialization_options: None,
+                workspace_markers: None,
+                on_type_formatting_triggers: None,
+                prefer_shared_instance: None,
+                force_start: None,
+                enabled: None,
+                settings: None,
+            },
+        );
+        server.settings_manager.apply_settings(WorkspaceSettings {
+            auto_install: false,
+            language_servers,
+            ..Default::default()
+        });
+        server
+            .bridge
+            .insert_ready_test_connection("python-bridge")
+            .await;
+
+        let open = |path: &str, fence: &str| {
+            let uri = Url::parse(path).expect("valid test URI");
+            let lsp_uri = crate::lsp::lsp_impl::url_to_uri(&uri).expect("URI should convert");
+            let text = format!("# Example\n\n```{fence}\nprint(1)\n```\n");
+            (uri, lsp_uri, text)
+        };
+        let regions_of = |uri: &Url| {
+            server
+                .documents
+                .latest_snapshot(uri)
+                .and_then(|view| view.slot.snapshot)
+                .filter(|snapshot| snapshot.tree.is_some())
+                .and_then(|snapshot| {
+                    let (_, roster) = snapshot.bridge_regions.as_ref()?;
+                    Some((
+                        roster
+                            .iter()
+                            .map(|region| (region.language.clone(), region.content.is_some()))
+                            .collect::<Vec<_>>(),
+                        snapshot.resolved_regions.is_some(),
+                    ))
+                })
+        };
+
+        let (unrouted, unrouted_lsp, unrouted_text) =
+            open("file:///test/resolve_gate_unrouted.md", "lua");
+        server
+            .did_open_impl(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: unrouted_lsp,
+                    language_id: "markdown".to_string(),
+                    version: 1,
+                    text: unrouted_text,
+                },
+            })
+            .await;
+        wait_until(|| regions_of(&unrouted).is_some()).await;
+        assert_eq!(
+            regions_of(&unrouted),
+            Some((vec![("lua".to_string(), false)], false)),
+            "no server handles lua: on the roster, nothing resolved"
+        );
+
+        let (routed, routed_lsp, routed_text) = open("file:///test/resolve_gate_routed.md", "py");
+        server
+            .did_open_impl(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: routed_lsp,
+                    language_id: "markdown".to_string(),
+                    version: 1,
+                    text: routed_text,
+                },
+            })
+            .await;
+        wait_until(|| regions_of(&routed).is_some_and(|(_, resolved)| resolved)).await;
+        assert_eq!(
+            regions_of(&routed),
+            Some((vec![("python".to_string(), true)], true)),
+            "python-bridge handles python, which `py` canonicalizes to: resolved"
+        );
+    }
+
     #[tokio::test]
     async fn did_open_publishes_the_tree_before_the_regions_are_resolved() {
         let (service, mut socket) = LspService::new(Kakehashi::new);
