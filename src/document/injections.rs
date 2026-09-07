@@ -97,12 +97,76 @@ pub(crate) struct DiscoveredInjections {
     pub regions: Vec<DiscoveredRegion>,
 }
 
+/// What one populate pass publishes for the **bridge** downstream
+/// (`process_injections` → eager spawn / didChange forwarding / auto-install),
+/// per document: either every region resolved with the content the bridge
+/// opens downstream — a runnable bridge server handles one of the document's
+/// region languages — or the roster of a document nothing routes. The two are
+/// distinct shapes on purpose: a roster region has no content to open, and
+/// "resolved" is a property of the document, not of a region, so a reader
+/// cannot mistake one region's content for its being routed.
+#[derive(Clone)]
+pub(crate) enum BridgeRegions {
+    /// Every region, with its virtual-document content; the pass resolved the
+    /// document because a runnable bridge server handles one of its region
+    /// languages. A region here is still only routed if the bridge's routing
+    /// rule names a server for its language.
+    Resolved(std::sync::Arc<Vec<DiscoveredBridgeRegion>>),
+    /// Every region's language and identity and nothing else: no runnable
+    /// server handles any of the document's region languages (or the
+    /// document has no regions), so nothing opens them — the roster still
+    /// drives the injected-grammar load and the closing of a virtual document
+    /// a region used to have.
+    Roster(std::sync::Arc<Vec<BridgeRosterRegion>>),
+}
+
+impl BridgeRegions {
+    /// The resolved regions, `None` for a roster.
+    pub(crate) fn resolved(&self) -> Option<&[DiscoveredBridgeRegion]> {
+        match self {
+            Self::Resolved(regions) => Some(regions),
+            Self::Roster(_) => None,
+        }
+    }
+
+    /// Whether nothing in the document is routed: a roster.
+    pub(crate) fn is_roster(&self) -> bool {
+        matches!(self, Self::Roster(_))
+    }
+
+    /// Every region's `(language, region_id)`, resolved or on the roster.
+    pub(crate) fn identities(&self) -> Vec<(&str, &str)> {
+        match self {
+            Self::Resolved(regions) => regions
+                .iter()
+                .map(|region| (region.language.as_str(), region.region_id.as_str()))
+                .collect(),
+            Self::Roster(regions) => regions
+                .iter()
+                .map(|region| (region.language.as_str(), region.region_id.as_str()))
+                .collect(),
+        }
+    }
+}
+
+/// One region of the roster a document nothing routes publishes: its language
+/// and identity, enough for the injected-grammar load and the closing of a
+/// virtual document it used to have; no content, because nothing opens it.
+#[derive(Clone)]
+pub(crate) struct BridgeRosterRegion {
+    /// The region's canonical language (see [`DiscoveredBridgeRegion::language`]).
+    pub language: String,
+    /// The region's tracker ULID (see [`DiscoveredBridgeRegion::region_id`]).
+    pub region_id: String,
+}
+
 /// One discovered injection region in the owned form the **bridge** downstream
 /// (`process_injections` → eager spawn / didChange forwarding / auto-install)
 /// consumes — the parse-pass twin of `BridgeInjection`, kept here so `document`
 /// need not depend on `lsp::bridge`. Built by `populate_injections` from the
 /// same single injection-query pass as everything else (never re-discovered on
-/// the downstream path), and carried on the `ParseSnapshot`.
+/// the downstream path), and carried on the `ParseSnapshot` as
+/// [`BridgeRegions::Resolved`].
 #[derive(Clone)]
 pub(crate) struct DiscoveredBridgeRegion {
     /// Resolved injection language, shared by eager lifecycle messages and
@@ -116,14 +180,8 @@ pub(crate) struct DiscoveredBridgeRegion {
     pub region_id: String,
     /// The exact virtual-document text the bridge opens downstream (excluded
     /// prefixes removed; an `injection.combined` group preserves host line
-    /// numbers with empty lines and uses spaces for later gaps on a line):
-    /// `Some` for every region of a document one of whose region languages
-    /// a runnable bridge server handles, `None` for every region of a
-    /// document none routes — those regions are on the roster, their
-    /// language and identity still drive the injected-grammar load and the
-    /// closing of a virtual document they used to have, but nothing opens
-    /// them.
-    pub content: Option<String>,
+    /// numbers with empty lines and uses spaces for later gaps on a line).
+    pub content: String,
 }
 
 /// One pre-parsed injection layer of a document, in document-order DFS —

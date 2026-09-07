@@ -95,12 +95,12 @@ pub(crate) struct InjectionDiscovery {
 pub(crate) struct PopulatedInjections {
     pub(crate) discovery: Option<std::sync::Arc<crate::document::DiscoveredInjections>>,
     /// `None` when no bridge server is runnable — bridge readers then fall
-    /// back to inline resolution — vs `Some(empty)` for "ran, no regions"
-    /// (readers skip their work) vs the roster: every region's language and
-    /// identity, with content for every region iff a runnable server handles
-    /// one of the document's region languages (the resolution ran iff the
-    /// regions carry content).
-    pub(crate) bridge_regions: Option<Vec<crate::document::DiscoveredBridgeRegion>>,
+    /// back to inline resolution — vs the document's regions resolved with
+    /// content (a runnable server handles one of its region languages; the
+    /// resolution ran) vs the roster of a document nothing routes (every
+    /// region's language and identity; readers open nothing), an empty
+    /// roster for "ran, no regions".
+    pub(crate) bridge_regions: Option<crate::document::BridgeRegions>,
     /// `Some` iff the resolution ran (a runnable server handles one of the
     /// document's region languages); the whole-document readers resolve
     /// inline otherwise.
@@ -117,7 +117,9 @@ impl PopulatedInjections {
     pub(crate) fn empty(generation: u64) -> Self {
         Self {
             discovery: None,
-            bridge_regions: Some(Vec::new()),
+            bridge_regions: Some(crate::document::BridgeRegions::Roster(std::sync::Arc::new(
+                Vec::new(),
+            ))),
             resolved_regions: Some(Vec::new()),
             generation,
         }
@@ -508,40 +510,38 @@ impl CacheCoordinator {
             // a runnable server, `None`: populate runs on the pre-publish
             // critical path, and a bridge configured by a later reload
             // falls back to inline resolution.
-            let bridge_regions: Option<Vec<crate::document::DiscoveredBridgeRegion>> =
-                match &resolved {
-                    Some(resolved) => Some(
+            let bridge_regions: Option<crate::document::BridgeRegions> = match &resolved {
+                Some(resolved) => Some(crate::document::BridgeRegions::Resolved(
+                    std::sync::Arc::new(
                         resolved
                             .iter()
                             .map(|region| crate::document::DiscoveredBridgeRegion {
                                 language: region.injection_language.clone(),
                                 region_id: region.region.region_id.clone(),
-                                content: Some(region.virtual_content.clone()),
+                                content: region.virtual_content.clone(),
                             })
                             .collect(),
                     ),
-                    // Every identifier canonicalizes without content here:
-                    // one that could not would have made the document
-                    // routable above. (Memo hits: the names were just asked.)
-                    None if build_bridge_regions => Some(
+                )),
+                // Every identifier canonicalizes without content here:
+                // one that could not would have made the document
+                // routable above. (Memo hits: the names were just asked.)
+                None if build_bridge_regions => {
+                    Some(crate::document::BridgeRegions::Roster(std::sync::Arc::new(
                         regions
                             .iter()
                             .zip(&cacheable_regions)
-                            .map(
-                                |(info, cacheable)| crate::document::DiscoveredBridgeRegion {
-                                    language: language
-                                        .canonical_injection_language_from_identifier(
-                                            &info.language,
-                                        )
-                                        .unwrap_or_else(|| info.language.clone()),
-                                    region_id: cacheable.region_id.clone(),
-                                    content: None,
-                                },
-                            )
+                            .map(|(info, cacheable)| crate::document::BridgeRosterRegion {
+                                language: language
+                                    .canonical_injection_language_from_identifier(&info.language)
+                                    .unwrap_or_else(|| info.language.clone()),
+                                region_id: cacheable.region_id.clone(),
+                            })
                             .collect(),
-                    ),
-                    None => None,
-                };
+                    )))
+                }
+                None => None,
+            };
 
             // The whole-document readers' fully resolved regions, from the
             // same single query run — and from the SAME per-region ids and
@@ -1134,7 +1134,7 @@ mod tests {
             populated
                 .bridge_regions
                 .as_ref()
-                .is_some_and(|regions| regions.is_empty()),
+                .is_some_and(|regions| regions.identities().is_empty()),
             "a settled language without an injection query publishes a definitive empty set"
         );
     }
@@ -1206,8 +1206,9 @@ mod tests {
         );
         assert_eq!(
             populated.bridge_regions.as_ref().map(|regions| regions
-                .iter()
-                .map(|region| region.language.as_str())
+                .identities()
+                .into_iter()
+                .map(|(language, _)| language)
                 .collect::<Vec<_>>()),
             Some(vec!["python"; 9]),
             "resolution ran after the hand-off: it saw the mapping the hand-off installed"
@@ -1267,23 +1268,29 @@ mod tests {
 
         let unrouted = populate("unrouted.md", "```lua\nprint(1)\n```\n");
         let roster = unrouted.bridge_regions.expect("the roster is published");
+        assert!(roster.is_roster(), "no server handles lua: on the roster");
         assert_eq!(
             roster
-                .iter()
-                .map(|region| (region.language.as_str(), region.content.is_some()))
+                .identities()
+                .into_iter()
+                .map(|(language, _)| language)
                 .collect::<Vec<_>>(),
-            vec![("lua", false)],
-            "no server handles lua: on the roster, not resolved"
+            vec!["lua"],
+            "the roster names the region's language"
         );
         assert!(unrouted.resolved_regions.is_none());
 
         let routed = populate("routed.md", "```py\nprint(1)\n```\n");
         assert_eq!(
-            routed.bridge_regions.as_ref().map(|regions| regions
-                .iter()
-                .map(|region| (region.language.as_str(), region.content.is_some()))
-                .collect::<Vec<_>>()),
-            Some(vec![("python", true)]),
+            routed
+                .bridge_regions
+                .as_ref()
+                .and_then(|regions| regions.resolved())
+                .map(|regions| regions
+                    .iter()
+                    .map(|region| region.language.as_str())
+                    .collect::<Vec<_>>()),
+            Some(vec!["python"]),
             "a server handles python, which is what `py` canonicalizes to: resolved"
         );
         assert!(routed.resolved_regions.is_some());
@@ -1293,7 +1300,7 @@ mod tests {
             unknown
                 .bridge_regions
                 .as_ref()
-                .is_some_and(|regions| regions.iter().all(|region| region.content.is_some())),
+                .is_some_and(|regions| regions.resolved().is_some()),
             "an identifier only the content could canonicalize is resolved, not guessed"
         );
     }

@@ -165,21 +165,21 @@ impl InjectionCoordinator {
             // query would not discover. Mismatch falls back inline below.
             && *stamped_generation == self.cache.semantic_token_generation()
         {
-            // A document one of whose region languages a server handles
-            // carries content for every region and is routed; a document
-            // none routes carries none, and its roster informs the
-            // injected-grammar load and the closing of virtual documents
-            // (see `roster_regions`).
-            let regions = bridge_regions
-                .iter()
-                .filter_map(|region| {
-                    region.content.as_ref().map(|content| BridgeInjection {
+            // A document one of whose region languages a server handles is
+            // resolved with content for every region; a document none
+            // routes publishes a roster, which routes nothing — it informs
+            // the injected-grammar load and the closing of virtual
+            // documents instead (see `roster_regions`).
+            let regions = bridge_regions.resolved().map_or_else(Vec::new, |regions| {
+                regions
+                    .iter()
+                    .map(|region| BridgeInjection {
                         language: region.language.clone(),
                         region_id: region.region_id.clone(),
-                        content: content.clone(),
+                        content: region.content.clone(),
                     })
-                })
-                .collect();
+                    .collect()
+            });
             return settled().then_some(regions);
         }
 
@@ -262,8 +262,8 @@ impl InjectionCoordinator {
         settled().then_some(resolved)
     }
 
-    /// Every region on the current snapshot's roster as `(region_id,
-    /// language, resolved)` — resolved iff the pass gave it content —
+    /// Every region on the current snapshot's bridge regions as `(region_id,
+    /// language, resolved)` — resolved iff the pass resolved the document —
     /// when a populate pass published one under the current settings
     /// generation; `None` when the pass could not look or the regions are
     /// stale, so the caller derives both the languages owed a grammar and
@@ -274,16 +274,14 @@ impl InjectionCoordinator {
         if snapshot.parsed_version != view.content_version {
             return None;
         }
-        let (stamped_generation, roster) = snapshot.bridge_regions.as_ref()?;
+        let (stamped_generation, regions) = snapshot.bridge_regions.as_ref()?;
         (*stamped_generation == self.cache.semantic_token_generation()).then(|| {
-            roster
-                .iter()
-                .map(|region| {
-                    (
-                        region.region_id.clone(),
-                        region.language.clone(),
-                        region.content.is_some(),
-                    )
+            let resolved = !regions.is_roster();
+            regions
+                .identities()
+                .into_iter()
+                .map(|(language, region_id)| {
+                    (region_id.to_string(), language.to_string(), resolved)
                 })
                 .collect()
         })
@@ -1274,11 +1272,12 @@ mod tests {
                 .insert(uri.clone(), text.to_string(), Some("markdown".into()), None);
         let content_version = server.documents.get(&uri).unwrap().content_version();
         let generation = server.cache.semantic_token_generation();
-        let roster = vec![crate::document::DiscoveredBridgeRegion {
-            language: "lua".to_string(),
-            region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
-            content: None,
-        }];
+        let roster = crate::document::BridgeRegions::Roster(std::sync::Arc::new(vec![
+            crate::document::BridgeRosterRegion {
+                language: "lua".to_string(),
+                region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+            },
+        ]));
         assert!(
             server
                 .documents
@@ -1292,7 +1291,7 @@ mod tests {
                         parsed_version: content_version,
                         incarnation,
                         injection_regions: None,
-                        bridge_regions: Some((generation, std::sync::Arc::new(roster))),
+                        bridge_regions: Some((generation, roster)),
                         resolved_regions: None,
                         layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
                     }),
@@ -1408,8 +1407,12 @@ mod tests {
                 .documents
                 .latest_snapshot(&uri)
                 .and_then(|view| view.slot.snapshot)
-                .and_then(|snapshot| snapshot.bridge_regions.as_ref().map(|(_, r)| Arc::clone(r)))
-                .filter(|roster| roster.iter().all(|region| region.content.is_some()))
+                .and_then(|snapshot| {
+                    snapshot
+                        .bridge_regions
+                        .as_ref()
+                        .and_then(|(_, regions)| regions.resolved().map(<[_]>::to_vec))
+                })
         };
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while tokio::time::Instant::now() < deadline && roster().is_none() {
@@ -1552,7 +1555,7 @@ mod tests {
             .update_document(uri.clone(), text.to_string(), None);
         let content_version = server.documents.get(&uri).unwrap().content_version();
         publish(
-            Some((populated.generation, std::sync::Arc::new(bridge_regions))),
+            Some((populated.generation, bridge_regions)),
             content_version,
         );
         let fast = injection
@@ -1758,10 +1761,7 @@ mod tests {
                         parsed_version: content_version,
                         incarnation,
                         injection_regions: None,
-                        bridge_regions: Some((
-                            populated.generation,
-                            std::sync::Arc::new(bridge_regions),
-                        )),
+                        bridge_regions: Some((populated.generation, bridge_regions)),
                         resolved_regions: None,
                         layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
                     },

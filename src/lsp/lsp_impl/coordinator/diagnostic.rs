@@ -423,8 +423,8 @@ impl DiagnosticSnapshotPreparer {
                 .injection_query(&language_name)
                 .map(|injection_query| {
                     // A roster nothing routes (the parse looked; no runnable
-                    // server handles any region language, so no entry
-                    // carries content) means no region has a server to ask:
+                    // server handles any region language) means no region
+                    // has a server to ask:
                     // no contexts, and no inline resolution paying on every
                     // edit what the parse path declined. Generation-stamped,
                     // so a reload that configures a server resolves inline
@@ -432,7 +432,7 @@ impl DiagnosticSnapshotPreparer {
                     if self
                         .documents
                         .current_bridge_regions(uri, self.cache.semantic_token_generation())
-                        .is_some_and(|roster| roster.iter().all(|region| region.content.is_none()))
+                        .is_some_and(|regions| regions.is_roster())
                     {
                         return Vec::new();
                     }
@@ -773,11 +773,12 @@ mod tests {
                         injection_regions: None,
                         bridge_regions: Some((
                             generation,
-                            std::sync::Arc::new(vec![crate::document::DiscoveredBridgeRegion {
-                                language: "lua".to_string(),
-                                region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
-                                content: None,
-                            }]),
+                            crate::document::BridgeRegions::Roster(std::sync::Arc::new(vec![
+                                crate::document::BridgeRosterRegion {
+                                    language: "lua".to_string(),
+                                    region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+                                },
+                            ])),
                         )),
                         resolved_regions: None,
                         layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -846,11 +847,13 @@ mod tests {
                         injection_regions: None,
                         bridge_regions: Some((
                             generation,
-                            std::sync::Arc::new(vec![crate::document::DiscoveredBridgeRegion {
-                                language: "lua".to_string(),
-                                region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
-                                content: Some("print(1)\n".to_string()),
-                            }]),
+                            crate::document::BridgeRegions::Resolved(std::sync::Arc::new(vec![
+                                crate::document::DiscoveredBridgeRegion {
+                                    language: "lua".to_string(),
+                                    region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+                                    content: "print(1)\n".to_string(),
+                                },
+                            ])),
                         )),
                         resolved_regions: None,
                         layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),

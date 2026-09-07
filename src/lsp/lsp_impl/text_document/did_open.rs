@@ -596,11 +596,12 @@ mod tests {
                 .and_then(|view| view.slot.snapshot)
                 .filter(|snapshot| snapshot.tree.is_some())
                 .and_then(|snapshot| {
-                    let (_, roster) = snapshot.bridge_regions.as_ref()?;
+                    let (_, regions) = snapshot.bridge_regions.as_ref()?;
                     Some((
-                        roster
-                            .iter()
-                            .map(|region| (region.language.clone(), region.content.is_some()))
+                        regions
+                            .identities()
+                            .into_iter()
+                            .map(|(language, _)| (language.to_string(), !regions.is_roster()))
                             .collect::<Vec<_>>(),
                         snapshot.resolved_regions.is_some(),
                     ))
@@ -717,7 +718,10 @@ mod tests {
                 let snapshot = view.slot.snapshot?;
                 (snapshot.parsed_version == view.content_version && snapshot.tree.is_some())
                     .then_some((
-                        snapshot.bridge_regions.as_ref().map(|(_, r)| r.len()),
+                        snapshot
+                            .bridge_regions
+                            .as_ref()
+                            .map(|(_, r)| r.identities().len()),
                         snapshot.resolved_regions.as_ref().map(|(_, r)| r.len()),
                     ))
             })

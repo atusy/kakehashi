@@ -73,10 +73,7 @@ impl InstallCheck {
 #[derive(Default)]
 struct PopulatedSnapshotRegions {
     discovery: Option<std::sync::Arc<crate::document::DiscoveredInjections>>,
-    bridge_regions: Option<(
-        u64,
-        std::sync::Arc<Vec<crate::document::DiscoveredBridgeRegion>>,
-    )>,
+    bridge_regions: Option<(u64, crate::document::BridgeRegions)>,
     resolved_regions: Option<(
         u64,
         std::sync::Arc<Vec<crate::language::injection::ResolvedInjection>>,
@@ -502,7 +499,7 @@ impl ParseCoordinator {
                         discovery: populated.discovery,
                         bridge_regions: populated
                             .bridge_regions
-                            .map(|regions| (populated.generation, std::sync::Arc::new(regions))),
+                            .map(|regions| (populated.generation, regions)),
                         resolved_regions: populated
                             .resolved_regions
                             .map(|regions| (populated.generation, std::sync::Arc::new(regions))),

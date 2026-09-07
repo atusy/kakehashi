@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use tree_sitter::Tree;
 
-use super::injections::{DiscoveredBridgeRegion, DiscoveredInjections, SnapshotLayerTree};
+use super::injections::{BridgeRegions, DiscoveredInjections, SnapshotLayerTree};
 use crate::language::injection::ResolvedInjection;
 
 /// The reserved terminal incarnation `didClose` installs in a slot
@@ -65,20 +65,22 @@ pub(crate) struct ParseSnapshot {
     /// binding: text, tree, and regions are one value, so the regions can
     /// never be consumed against a different tree.
     pub(crate) injection_regions: Option<Arc<DiscoveredInjections>>,
-    /// The bridge downstream's region list, derived by the same populate pass
+    /// The bridge downstream's regions, derived by the same populate pass
     /// (`None` when populate didn't run for this snapshot or no bridge server
-    /// was configured — the downstream then resolves inline; `Some(empty)`
-    /// means genuinely no regions). Stamped with the settings generation the
+    /// was configured — the downstream then resolves inline; otherwise the
+    /// document's regions resolved with content, or the roster of a document
+    /// nothing routes, see [`BridgeRegions`]). Stamped with the settings generation the
     /// discovery ran under, like `resolved_regions`: a reload can change the
     /// injection query without publishing a new snapshot, and the consumer
     /// must fall back inline rather than open virtual documents for regions
     /// the new query would not discover.
-    pub(crate) bridge_regions: Option<(u64, Arc<Vec<DiscoveredBridgeRegion>>)>,
+    pub(crate) bridge_regions: Option<(u64, BridgeRegions)>,
     /// Fully resolved injection regions (`InjectionResolver::resolve_all`'s
     /// shape) from the same populate pass, for the whole-document readers —
     /// pull/push diagnostics, documentSymbol/Color, formatting's virt layer —
     /// which previously each re-ran the injection query per request. Same
-    /// `None`/`Some(empty)` semantics as `bridge_regions`.
+    /// `None` semantics as `bridge_regions`; `Some(empty)` means genuinely no
+    /// regions.
     /// Stamped with the settings generation the populate pass ran under: a
     /// reload (which can change injection resolution) bumps the generation
     /// WITHOUT publishing a new snapshot, so consumers gate on the stamp and
@@ -299,7 +301,7 @@ mod tests {
 
     fn with_regions(mut snapshot: ParseSnapshot, bridge: bool, resolved: bool) -> ParseSnapshot {
         if bridge {
-            snapshot.bridge_regions = Some((1, Arc::new(Vec::new())));
+            snapshot.bridge_regions = Some((1, BridgeRegions::Roster(Arc::new(Vec::new()))));
         }
         if resolved {
             snapshot.resolved_regions = Some((1, Arc::new(Vec::new())));
