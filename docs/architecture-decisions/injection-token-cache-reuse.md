@@ -238,28 +238,29 @@ preference order:
   from one atomic snapshot — physically one unit, so there is **no reader-side gate
   to get wrong**: a snapshot carries discovery (reuse) or does not (the
   on-demand-parse fallback tree → discover inline). The only gate is on the
-  *writer* side — the second CAS below that attaches discovery only to the tree it
-  was built for. Realizability, given `populate_injections` runs *after* the
-  tree CAS (`set_parse_result_if_text_and_incarnation_unchanged`, defined in
-  `src/document/store.rs` and invoked from `src/lsp/lsp_impl/coordinator/parse.rs`):
-  - **No *new* `NodeTracker` mutation.** `populate_injections` *already* calls
-    `tracker.get_or_create` today, to mint the `region_id` on each
-    `CacheableInjectionRegion` it inserts into the `InjectionMap` (which
-    `invalidate_for_edits` needs for token-cache eviction). The discovery build
-    must **reuse that same id** — it is produced by the same shared stage, from the
-    same `Q`, so the lever adds *no* off-ingress `get_or_create` beyond today's.
-    (The pre-existing off-ingress minting, and its interaction with a concurrent
-    subsequent edit, is governed by
-    [lazy-node-identity-tracking](lazy-node-identity-tracking.md) and is neither
-    worsened nor in scope to fix here.) Because reuse is bound to the tree
+  *writer* side — the install below attaches discovery only to the tree it
+  was built for. Realizability, given `populate_injections` runs *before* the
+  install (`DocumentStore::install_parse`, invoked from
+  `src/lsp/lsp_impl/coordinator/parse.rs`) on the tree value, guarding its own
+  cache commits by the tracker's epoch and the lifetime:
+  - **No *new* `NodeTracker` mutation.** `populate_injections` *already* mints
+    the `region_id` on each `CacheableInjectionRegion` it inserts into the
+    `InjectionMap` (which `invalidate_for_edits` needs for token-cache eviction),
+    through the tracker's epoch/incarnation-guarded batch mint
+    (`mint_batch_if_unshifted`) and commit (`commit_if_unshifted`): a pass whose
+    document was edited, closed, or reopened since it latched its epoch mints
+    nothing and commits nothing. The discovery build must **reuse that same id** —
+    it is produced by the same shared stage, from the same `Q`, so the lever adds
+    *no* off-ingress minting beyond today's, and inherits the same guard
+    ([lazy-node-identity-tracking](lazy-node-identity-tracking.md)). Because reuse
+    is bound to the tree
     identity, a stored `region_id` is only ever served for the exact tree it was
     minted on — consistent with the `InjectionMap` / tracker state for that tree;
     a changed tree misses and the miss-path mints fresh, as today.
-  - **Publication scheme:** publish the tree first; build discovery; then attach it
-    to the parse result via a *second* CAS that no-ops unless the tree / parse
-    epoch is still the one just published. Discovery is therefore briefly *absent*
-    between the two CASes (a request in that window re-discovers inline), but never
-    attached to the wrong tree.
+  - **Publication scheme:** build discovery on the tree value first, then install
+    tree and discovery-carrying snapshot in one `install_parse`; there is no window
+    in which the snapshot exists without its discovery, and discovery is never
+    attached to the wrong tree (the install rejects a tree whose inputs moved on).
 - **Alternative — a parse epoch.** If coupling into the parse result is too
   invasive, key a separate `DiscoveredInjectionCache` on a **fresh monotonic
   per-parse epoch** — *not* `incarnation` (preserved across edits, so it cannot
@@ -276,14 +277,14 @@ obligation), and parse ordering (below) affects only hit-rate.
 
 **Currency — hit-rate, not correctness.** Correctness rests on the tree-identity
 binding above; ordering only governs how often a reusable discovery is *available*
-when the request runs. In the reparse loop, when a tree lands the order is
-set-tree → `populate_injections` → `advance_watermark` / `mark_parse_finished`
+when the request runs. In the reparse loop the order is
+`populate_injections` → `install_parse` → `mark_parse_finished` / `advance_watermark`
 (`src/lsp/lsp_impl/coordinator/parse.rs`), and the semantic handler's settle waits on the parse
 watermark + parse-completion before snapshotting the tree
 (`src/lsp/lsp_impl/text_document/semantic_tokens.rs`), so in the common debounced case the
 snapshot already carries (or its epoch already matches) the populated discovery.
-On the branches where `populate_injections` is skipped (the CAS-fail `if stored`
-guard, the no-tree / error paths — `advance_watermark` still runs there), when the
+On the branches where `populate_injections` does not run (the no-tree / error
+paths — `advance_watermark` still runs there), when the
 200 ms settle budget expires, or on the on-demand-parse fallback, there is simply
 no discovery to reuse and the request re-discovers inline. No ordering guarantee
 is load-bearing.

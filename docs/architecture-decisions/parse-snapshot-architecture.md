@@ -117,12 +117,12 @@ mapping is not one-to-one and must be stated precisely:
   (which already owns the parse lifecycle), not onto the read-side slot. Deleting
   `parse_states` is contingent on those two moves.
 
-The store's tree/watermark CAS methods (four tree writes —
-`update_tree_if_text_unchanged`, `update_tree_if_text_and_language_unchanged`,
-`attach_tree_if_absent`, `set_parse_result_if_text_and_incarnation_unchanged` —
-plus the two watermark advances `advance_watermark` /
-`advance_watermark_for_incarnation`) collapse to **one publish primitive**,
-executed inside `send_if_modified` so the guard and the write are atomic under the
+The store's tree writes are already collapsed into `DocumentStore::install_parse`
+(the snapshot publish below inside `send_if_modified`, then — only if it was
+admitted — the legacy tree attach, both under the document's entry guard); the
+two watermark advances `advance_watermark` / `advance_watermark_for_incarnation`
+still remain to be folded into the **one publish primitive**, which is executed
+inside `send_if_modified` so the guard and the write are atomic under the
 channel's own lock (the co-location is what makes this a single atomic
 check-then-act rather than a cross-map TOCTOU against `Document.incarnation`):
 
@@ -201,22 +201,28 @@ enforced by co-location today, become explicit scheduler invariants:
   scratch. "Leaves no accumulated edits" is an explicit reset, not an emergent
   property.
 
-A parse pass therefore has a **single version/incarnation-guarded commit sequence**, so no downstream effect ever escapes for a snapshot that lost the CAS:
-compute the tree, region map, and tokens **privately** (nothing shared mutated);
-revalidate `incarnation == current_incarnation`; run the one publish primitive; and
-emit the downstream — `semanticTokens/refresh`, injected-language forwarding,
-diagnostic republish, and any shared injection-token-cache write — **only if that exact publish succeeded** (the shared `NodeTracker` is not mutated on this path at
-all; see §3), in the order the
-per-document-parse-scheduler loop already uses (`populate → mark finished →
-downstream`). A rejected publish (a racing edit or reopen advanced the slot) emits
-nothing and mutates no shared state. The two Stage-2 stores are **not** written in
-one cross-store transaction — that is unnecessary, because they are not co-equal:
-the **snapshot publish is the sole commit point and runs first**, and every
-downstream effect gates on *its* result. The legacy tree CAS that follows is a
-Stage-2-only compatibility shim feeding the incremental seed (which still reads
-`Document::tree` until Stage 3 removes it); it is made strict-version so it never
-regresses, but if it *loses* a race the only consequence is that the next pass
-reseeds from the current snapshot instead of the legacy tree — a self-correcting
+A parse pass therefore has a **single version/incarnation-guarded commit sequence**, so no reader-visible publication or downstream emission ever escapes for a snapshot that lost the admission:
+compute the tree, region map, and tokens on the tree value (the populate pass
+commits its injection caches under its own tracker-epoch/lifetime guard, so a
+pass whose text moved on commits nothing there); run the one install
+(`install_parse`: the snapshot publish, then — only if admitted — the legacy tree
+attach, under one entry guard); and emit the downstream — `semanticTokens/refresh`,
+injected-language forwarding, diagnostic republish — gated on the install's
+result, in the order the per-document-parse-scheduler loop already uses
+(`populate → install → mark finished → downstream`). A rejected publish (a racing
+edit or reopen advanced the slot) emits nothing and attaches nothing. (Two
+parses of the *same* version — an install reparse racing the edit reparse — may
+both commit their populate bookkeeping before one of them loses the equal-version
+admission; those commits are equivalent, keyed by the same tree coordinates under
+the same epoch, so the loser's cache entries are the winner's.) The two
+Stage-2 stores are written by one primitive but are not co-equal: the **snapshot
+publish is the sole commit point**; the legacy tree attach that accompanies it is
+a Stage-2-only compatibility shim feeding the incremental seed (which still reads
+`Document::tree` until Stage 3 removes it). `semanticTokens/refresh` gates on the
+publish; the legacy-tree-dependent downstream (`mark_parse_finished`, the open
+parse's tree-dependent follow-ups) gates on the attach until Stage 3, and an
+attach is refused only when the inputs moved on or an equal-version sibling
+already landed the same tree — in either case the next pass reseeds from the current snapshot instead of the legacy tree, a self-correcting
 perf blip, never a served inconsistency, since readers already read the snapshot,
 not the legacy tree. So no reader-visible divergence can arise from the ordering.
 
@@ -509,15 +515,23 @@ inside the existing safety contracts at each step:
   preserving the `populate → finish` ordering the injection-map invalidation
   depends on.
 - **Stage 2 — versioned snapshot reads.** Introduce `SnapshotSlot` + the `watch`
-  channel + `latest_snapshot`. **The parse loop dual-writes under one guard**: the
-  legacy tree CAS (the incremental seed still reads `Document::tree`/`pending_seed`,
-  which Stage 3 removes) is made strict-version like the publish, both writes run
-  under the same `(incarnation, parsed_version)` guard, and the **snapshot publish is the sole commit point** — all downstream (refresh, forwarding, diagnostics,
-  shared cache writes) gate on the *publish* result, never the legacy CAS (§2). So
+  channel + `latest_snapshot`. **The parse loop installs the legacy tree and the
+  snapshot through one store primitive** (`install_parse`): the legacy tree (the
+  incremental seed still reads `Document::tree`/`pending_seed`, which Stage 3
+  removes) is attached iff the parse's inputs still describe the document AND
+  the snapshot was admitted, the snapshot is published iff the language still
+  matches and the cell admits it, and both happen under the same entry guard —
+  there is no attach-only path, while publish-without-attach (a stale but
+  consistent parse) is allowed. The **snapshot publish is the sole commit point** —
+  `semanticTokens/refresh` gates on the publish result, and the legacy-tree-
+  dependent downstream (`mark_parse_finished`, the open parse's tree-dependent
+  follow-ups) gates on the attach until Stage 3 removes the legacy tree (§2). So
   `latest_snapshot` retains a servable tree across an edit's `tree.take()`; the two
-  stores may transiently sit at different versions (a lost legacy CAS just reseeds
+  stores may transiently sit at different versions (a rejected attach just reseeds
   next pass), but no **reader** sees the difference because every reader reads the
-  snapshot, not the legacy tree. `populate`'s split into geometry derivation and
+  snapshot, not the legacy tree. The populate pass runs *before* the install, on
+  the tree value; it guards its own cache commits by the tracker's epoch and the
+  lifetime, so a pass whose text moved on commits nothing. `populate`'s split into geometry derivation and
   the latch-gated tracker reconciliation (§3) is **already in**. Take the
   grammar auto-install off the read handlers (`compute_captures` no longer triggers
   `ensure_injection_languages_loaded_for_document` inline): the parse loop
@@ -540,11 +554,12 @@ inside the existing safety contracts at each step:
   `wait_for_epoch` / `ensure_document_parsed` **and** the inline-parse fallbacks
   (`try_parse_and_update_document`, `selection_range_impl`) — closing the
   resurrection vector. Delivers *instant reads* and *lifecycle independent of
-  parsing*. Without the dual-write this stage would reproduce the empty-after-edit
-  regression, so it is mandatory here, not deferred.
+  parsing*. Without the single install this stage would reproduce the
+  empty-after-edit regression, so it is mandatory here, not deferred.
 - **Stage 3 — consolidation.** Remove `Document::tree` / `pending_seed` (the seed
-  now lives on the scheduler), collapse the CAS methods into the one publish
-  primitive, delete the watermark waits, and prune the now-superseded passages
+  now lives on the scheduler) and the legacy readers, delete the watermark waits,
+  and prune the now-superseded passages (the CAS methods are already collapsed
+  into `install_parse`)
   from per-document-parse-scheduler (its tree-clear-on-edit and watermark/epoch
   sections) per delete-on-supersede — done **here**, when the behavior actually
   changes, not before. Per the repo's structural-vs-behavioral separation
@@ -617,7 +632,8 @@ inside the existing safety contracts at each step:
   see the refined language without depending on `Document::language_id` being
   rewritten or requiring a re-`didOpen`.
 - State and coupling shrink: two `watch` maps collapse to one, six store CAS /
-  watermark methods to one publish primitive, and the `pending_seed` invariant
+  watermark methods to one publish primitive (tree writes done — `install_parse`;
+  watermark advances pending), and the `pending_seed` invariant
   surface on `Document` is deleted (favorable on the State > Coupling > Complexity
   > Code ordering the repo optimizes for).
 
@@ -690,8 +706,9 @@ dequeue hook (§4).
 `ParseSnapshot` published into the `SnapshotSlot` `watch` cell on the
 `Document` entry through the §2 publish primitive (bootstrap/strict-version/
 incarnation guard, `u64::MAX` close sentinel, reserved in `next_incarnation`
-and refused by the guard itself); the parse loop dual-writes on every
-resolution path and emits `semanticTokens/refresh` at its publish point;
+and refused by the guard itself); the parse loop installs tree and snapshot
+through `install_parse` on every resolution path and emits
+`semanticTokens/refresh` at its publish point;
 `semanticTokens` full/delta serve-current via the parked wait (initially
 shipped serve-stale; revised on live-editor evidence — see §3) and
 `captures/full` likewise serve-current (initially serve-stale; revised after

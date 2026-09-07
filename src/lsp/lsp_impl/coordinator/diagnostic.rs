@@ -679,31 +679,27 @@ mod tests {
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&language).unwrap();
         let tree = parser.parse(text, None).unwrap();
-        assert!(documents.set_parse_result_if_inputs_unchanged(
+        let installed = documents.install_parse(
             &uri,
-            &expected_text,
-            incarnation,
-            content_version,
-            Some("markdown"),
-            Some(tree.clone()),
-        ));
-        let snapshot = crate::document::snapshot::ParseSnapshot {
-            text: expected_text,
-            tree: Some(tree),
-            language: Some("markdown".to_string()),
-            parsed_version: content_version,
-            incarnation,
-            injection_regions: None,
-            bridge_regions: None,
-            resolved_regions: None,
-            layer_trees: std::sync::OnceLock::new(),
-        };
-        assert!(
-            documents
-                .get(&uri)
-                .unwrap()
-                .publish_snapshot(std::sync::Arc::new(snapshot))
+            crate::document::ParseInputs {
+                text: &expected_text,
+                language_id: Some(Some("markdown")),
+                incarnation,
+                content_version,
+            },
+            std::sync::Arc::new(crate::document::snapshot::ParseSnapshot {
+                text: std::sync::Arc::clone(&expected_text),
+                tree: Some(tree),
+                language: Some("markdown".to_string()),
+                parsed_version: content_version,
+                incarnation,
+                injection_regions: None,
+                bridge_regions: None,
+                resolved_regions: None,
+                layer_trees: std::sync::OnceLock::new(),
+            }),
         );
+        assert!(installed.attached && installed.published);
 
         assert!(
             tokio::time::timeout(std::time::Duration::from_secs(1), &mut wait)
@@ -733,14 +729,31 @@ mod tests {
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&language).unwrap();
         let tree = parser.parse(text, None).unwrap();
-        assert!(server.documents.set_parse_result_if_inputs_unchanged(
-            &uri,
-            &expected_text,
-            incarnation,
-            content_version,
-            Some("markdown"),
-            Some(tree),
-        ));
+        assert!(
+            server
+                .documents
+                .install_parse(
+                    &uri,
+                    crate::document::ParseInputs {
+                        text: &expected_text,
+                        language_id: Some(Some("markdown")),
+                        incarnation,
+                        content_version,
+                    },
+                    std::sync::Arc::new(crate::document::snapshot::ParseSnapshot {
+                        text: std::sync::Arc::clone(&expected_text),
+                        tree: Some(tree),
+                        language: Some("markdown".to_string()),
+                        parsed_version: content_version,
+                        incarnation,
+                        injection_regions: None,
+                        bridge_regions: None,
+                        resolved_regions: None,
+                        layer_trees: std::sync::OnceLock::new(),
+                    }),
+                )
+                .attached
+        );
 
         assert!(document_matches_lineage(
             &server.documents.get(&uri).unwrap(),

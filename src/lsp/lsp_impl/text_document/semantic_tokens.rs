@@ -1323,7 +1323,7 @@ mod tests {
             .documents
             .get(uri)
             .map(|doc| {
-                doc.publish_snapshot(std::sync::Arc::new(
+                doc.publish_snapshot(&std::sync::Arc::new(
                     crate::document::snapshot::ParseSnapshot {
                         text: std::sync::Arc::from(text),
                         tree: None,
@@ -1763,7 +1763,7 @@ mod tests {
             .documents
             .get(&uri)
             .map(|doc| {
-                doc.publish_snapshot(std::sync::Arc::new(
+                doc.publish_snapshot(&std::sync::Arc::new(
                     crate::document::snapshot::ParseSnapshot {
                         text: std::sync::Arc::from(text),
                         tree: None,

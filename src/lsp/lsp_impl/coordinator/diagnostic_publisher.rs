@@ -3541,7 +3541,7 @@ mod tests {
             .documents
             .get(&publishing)
             .map(|doc| {
-                doc.publish_snapshot(std::sync::Arc::new(
+                doc.publish_snapshot(&std::sync::Arc::new(
                     crate::document::snapshot::ParseSnapshot {
                         text: std::sync::Arc::from(text),
                         tree: Some(tree),

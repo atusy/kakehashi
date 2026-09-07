@@ -150,8 +150,8 @@ impl DocumentStore {
     /// Unlike [`update_tree_availability`] this does **not** create the entry
     /// (`get`, not `parse_sender`'s get-or-insert). For a live document the entry
     /// always exists (created on insert), so this is equivalent; but for the
-    /// non-inserting reader CAS it avoids resurrecting a parse-state for a URI that
-    /// a concurrent `didClose` removed — `remove` drops `parse_states` first, so a
+    /// non-inserting `install_parse` (which may run after a `didClose`) it avoids
+    /// resurrecting a parse-state for a URI that a concurrent `didClose` removed — `remove` drops `parse_states` first, so a
     /// get-or-insert here would recreate a ghost `has_tree = true` for a closed
     /// document. Holding the `Ref` serializes against that `remove`.
     fn mark_tree_available_if_tracked(&self, uri: &Url) {
@@ -352,285 +352,6 @@ impl DocumentStore {
         self.update_tree_availability(uri, false);
         // Keep the "live document ⟺ watermark entry" invariant (see `update_document`).
         self.ensure_watermark_entry(uri, incarnation);
-    }
-
-    /// Store `new_tree` for an **existing** document, but only if its current text
-    /// still equals `expected_text`. Returns `true` iff the tree was stored.
-    ///
-    /// This is the safe persistence path for an **on-demand reader parse** (e.g.
-    /// `kakehashi/node`'s parse fallback). Unlike [`update_document`] it is
-    /// **non-inserting**: a `Vacant` entry — the document was closed while the
-    /// parse ran — is left untouched, so a parse completing after a `didClose`
-    /// cannot **resurrect** the document. Folding the text-equality check into the
-    /// same atomic `get_mut` lock also closes the check-then-write window against a
-    /// concurrent `didChange`: a tree parsed from now-stale text is dropped rather
-    /// than associated with the newer text. The availability update is likewise
-    /// non-inserting (see `mark_tree_available_if_tracked`), so the parse-state
-    /// isn't resurrected either.
-    /// Test-only since the snapshot conversion removed the last production
-    /// caller (the node handlers' on-demand parse); store tests still exercise
-    /// the CAS semantics its non-test siblings share.
-    #[cfg(test)]
-    pub(crate) fn update_tree_if_text_unchanged(
-        &self,
-        uri: &Url,
-        expected_text: &str,
-        new_tree: Tree,
-    ) -> bool {
-        // `get_mut` (non-inserting, borrowed key) rather than `entry(uri.clone())`:
-        // a missing document — a concurrent didClose removed it — yields `None` and
-        // is left untouched, so the parse can't resurrect it, and we avoid cloning
-        // the `Url`. The `RefMut` holds the shard write lock for the whole arm, so
-        // the text check and the tree write are atomic against didChange/didClose.
-        // Text already equals `expected_text`, so only the tree is attached — no
-        // text re-clone.
-        let stored = if let Some(mut doc) = self.documents.get_mut(uri) {
-            if doc.text() == expected_text {
-                doc.set_tree(new_tree);
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        if stored {
-            // Non-inserting too: don't recreate a parse-state for a URI a
-            // concurrent didClose may have just dropped.
-            self.mark_tree_available_if_tracked(uri);
-        }
-        stored
-    }
-
-    /// Like [`update_tree_if_text_unchanged`], but additionally requires the
-    /// document's `language_id` to still equal `expected_language_id` **and** its
-    /// open incarnation to still equal `expected_incarnation`.
-    ///
-    /// For the off-ingress edit reparse (`reparse_latest`), whose tree was parsed
-    /// from the text, grammar, and lifetime observed at read time. Three axes,
-    /// checked atomically under the same `get_mut` shard lock as the tree write:
-    /// - **text** rejects a within-lifetime stale parse — a `didChange` landed
-    ///   while parsing, so the tree is of now-superseded text (the scheduler's
-    ///   `dirty` loop reparses the newer text);
-    /// - **language** rejects a close + reopen with identical text but a different
-    ///   `language_id` — a tree parsed by the *old* grammar must not attach to the
-    ///   relabelled document;
-    /// - **incarnation** rejects a close + reopen even with identical text *and*
-    ///   language — the tree belongs to the prior lifetime, and attaching it to
-    ///   the reopened document (then advancing its watermark on the old ticket)
-    ///   would let a new-lifetime reader observe a parse it never requested. This
-    ///   is the [`(incarnation, ticket)`](Document::incarnation) epoch's
-    ///   incarnation half; the text and language checks remain because they guard
-    ///   the orthogonal within-lifetime races above.
-    #[cfg(test)]
-    pub(crate) fn update_tree_if_text_and_language_unchanged(
-        &self,
-        uri: &Url,
-        expected_text: &str,
-        expected_language_id: Option<&str>,
-        expected_incarnation: u64,
-        new_tree: Tree,
-    ) -> bool {
-        let stored = if let Some(mut doc) = self.documents.get_mut(uri) {
-            if doc.incarnation() == expected_incarnation
-                && doc.text() == expected_text
-                && doc.language_id() == expected_language_id
-            {
-                doc.set_tree(new_tree);
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        if stored {
-            self.mark_tree_available_if_tracked(uri);
-        }
-        stored
-    }
-
-    pub(crate) fn update_tree_if_parse_inputs_unchanged(
-        &self,
-        uri: &Url,
-        expected_text: &str,
-        expected_language_id: Option<&str>,
-        expected_incarnation: u64,
-        expected_content_version: u64,
-        new_tree: Tree,
-    ) -> bool {
-        let stored = self.documents.get_mut(uri).is_some_and(|mut doc| {
-            if doc.incarnation() == expected_incarnation
-                && doc.content_version() == expected_content_version
-                && doc.text() == expected_text
-                && doc.language_id() == expected_language_id
-            {
-                doc.set_tree(new_tree);
-                true
-            } else {
-                false
-            }
-        });
-        if stored {
-            self.mark_tree_available_if_tracked(uri);
-        }
-        stored
-    }
-
-    /// Like [`update_tree_if_text_and_language_unchanged`], but additionally stores
-    /// the tree only if the document currently has **no** tree. For the off-ingress
-    /// install reparse (`reparse_installed_document`), whose "don't clobber a
-    /// concurrent parse" guard is a `tree.is_some()` pre-check: a parse attaching a
-    /// tree for the same text *between* that pre-check and this write would otherwise
-    /// be overwritten. Folding the `tree.is_none()` check into the same `get_mut`
-    /// shard lock as the text comparison makes the guard atomic.
-    ///
-    /// Carries the same `language` and `incarnation` axes as
-    /// [`update_tree_if_text_and_language_unchanged`], for the same reason: the
-    /// install reparse is off-ingress, so a `didClose` + reopen (possibly relabelling
-    /// the language) can race it. Without these checks the freshly-installed grammar's
-    /// tree could attach to a reopened — even relabelled — document.
-    #[cfg(test)]
-    pub(crate) fn attach_tree_if_absent(
-        &self,
-        uri: &Url,
-        expected_text: &str,
-        expected_language_id: Option<&str>,
-        expected_incarnation: u64,
-        new_tree: Tree,
-    ) -> bool {
-        let stored = if let Some(mut doc) = self.documents.get_mut(uri) {
-            if doc.tree().is_none()
-                && doc.incarnation() == expected_incarnation
-                && doc.text() == expected_text
-                && doc.language_id() == expected_language_id
-            {
-                doc.set_tree(new_tree);
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        if stored {
-            self.mark_tree_available_if_tracked(uri);
-        }
-        stored
-    }
-
-    pub(crate) fn attach_tree_if_parse_inputs_unchanged(
-        &self,
-        uri: &Url,
-        expected_text: &str,
-        expected_language_id: Option<&str>,
-        expected_incarnation: u64,
-        expected_content_version: u64,
-        new_tree: Tree,
-    ) -> bool {
-        let stored = self.documents.get_mut(uri).is_some_and(|mut doc| {
-            if doc.tree().is_none()
-                && doc.incarnation() == expected_incarnation
-                && doc.content_version() == expected_content_version
-                && doc.text() == expected_text
-                && doc.language_id() == expected_language_id
-            {
-                doc.set_tree(new_tree);
-                true
-            } else {
-                false
-            }
-        });
-        if stored {
-            self.mark_tree_available_if_tracked(uri);
-        }
-        stored
-    }
-
-    /// Record the didOpen parse's detected `language` + optional `tree` on the
-    /// **existing** document, preserving its already-stored text, but only if the
-    /// text and incarnation observed when the parse read them are unchanged.
-    /// Returns `true` iff it was stored.
-    ///
-    /// For the **off-ingress** didOpen parse ([`parse_document`]). Unlike
-    /// [`update_tree_if_text_and_language_unchanged`] it **sets** the language rather
-    /// than checking it: the open parse refines the language guess stored during
-    /// `didOpen` with content detection (`detect_language`), so it is the writer of the
-    /// authoritative language — there is no language to match against. The two axes
-    /// it does check, atomically under the same `get_mut` shard lock as the write:
-    /// - **text** rejects a within-lifetime stale parse — a `didChange` landed while
-    ///   parsing, so this tree (and its language, possibly shebang-derived) is of
-    ///   now-superseded text; the scheduler's reparse covers the newer text. The
-    ///   check is `Arc::ptr_eq` on the `Arc<str>` the parse captured, **O(1)** — any
-    ///   text mutation (`didChange`) or reopen swaps in a *fresh* allocation, so
-    ///   pointer identity is exactly "same text this parse read" without an O(n)
-    ///   byte compare under the shard write lock (this is the large-document open
-    ///   path). A spurious mismatch could only drop a still-valid tree to a harmless
-    ///   reparse, never attach a stale one;
-    /// - **incarnation** rejects a close + reopen — the result belongs to the prior
-    ///   lifetime and must neither attach its tree nor clobber the reopened
-    ///   document's freshly-inserted language.
-    ///
-    /// **Non-inserting** (`get_mut`): a document a concurrent `didClose` removed is
-    /// left gone, not resurrected — the resurrection-safety the open parse needs once
-    /// it runs off the ingress ticket. Availability is marked only when a tree
-    /// landed (the no-tree paths rely on the caller's `mark_parse_finished(false)`).
-    #[cfg(test)]
-    pub(crate) fn set_parse_result_if_text_and_incarnation_unchanged(
-        &self,
-        uri: &Url,
-        expected_text: &Arc<str>,
-        expected_incarnation: u64,
-        language: Option<&str>,
-        tree: Option<Tree>,
-    ) -> bool {
-        let has_tree = tree.is_some();
-        // `language` is borrowed: the `String` allocation is deferred to inside the
-        // successful CAS branch (`language.map(String::from)`), so a CAS that rejects
-        // (a `didChange`/reopen raced this off-ingress parse) allocates nothing.
-        let stored = if let Some(mut doc) = self.documents.get_mut(uri) {
-            if doc.incarnation() == expected_incarnation
-                && Arc::ptr_eq(&doc.text_arc(), expected_text)
-            {
-                doc.set_parse_result(language.map(String::from), tree);
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        if stored && has_tree {
-            self.mark_tree_available_if_tracked(uri);
-        }
-        stored
-    }
-
-    pub(crate) fn set_parse_result_if_inputs_unchanged(
-        &self,
-        uri: &Url,
-        expected_text: &Arc<str>,
-        expected_incarnation: u64,
-        expected_content_version: u64,
-        language: Option<&str>,
-        tree: Option<Tree>,
-    ) -> bool {
-        let has_tree = tree.is_some();
-        let stored = self.documents.get_mut(uri).is_some_and(|mut doc| {
-            if doc.incarnation() == expected_incarnation
-                && doc.content_version() == expected_content_version
-                && Arc::ptr_eq(&doc.text_arc(), expected_text)
-            {
-                doc.set_parse_result(language.map(String::from), tree);
-                true
-            } else {
-                false
-            }
-        });
-        if stored && has_tree {
-            self.mark_tree_available_if_tracked(uri);
-        }
-        stored
     }
 
     /// Return the per-document `didChange` serialization lock, creating it on
@@ -913,7 +634,7 @@ impl DocumentStore {
             resolved_regions: None,
             layer_trees: std::sync::OnceLock::new(),
         };
-        doc.publish_snapshot(Arc::new(snapshot));
+        doc.publish_snapshot(&Arc::new(snapshot));
     }
 
     /// The CURRENT snapshot's fully resolved injection regions, or `None` when
@@ -959,9 +680,705 @@ pub(crate) struct SnapshotView {
     pub(crate) content_version: u64,
 }
 
+/// What a parse pass expects the document to still be when its result is
+/// installed: the exact inputs it parsed. A relabelled language rejects the
+/// whole install; otherwise the cell's admission rule decides the publish,
+/// and the legacy tree is attached only when the snapshot was admitted AND
+/// the text, incarnation and content version are unchanged — so a document
+/// that moved on (an edit, a close and reopen) can still publish an older
+/// snapshot without attaching its tree, and an equal-version sibling parse
+/// attaches nothing even with unchanged inputs.
+pub(crate) struct ParseInputs<'a> {
+    /// The exact text allocation the parse read (`Document::text_arc`);
+    /// compared by identity, not content — this is the large-document open
+    /// path and the compare runs under the shard's write guard.
+    pub(crate) text: &'a Arc<str>,
+    /// `Some(expected)` requires the document's stored language to still be
+    /// `expected` (`Some(None)`: still unlabelled) — an off-ingress reparse
+    /// must not attach to a relabelled reopen — and leaves the stored
+    /// language as it is; the tree alone is attached. `None` lets the
+    /// snapshot's language (first-parse detection) become the stored one.
+    pub(crate) language_id: Option<Option<&'a str>>,
+    pub(crate) incarnation: u64,
+    pub(crate) content_version: u64,
+}
+
+/// The outcome of [`DocumentStore::install_parse`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ParseInstall {
+    /// The legacy tree (and language) were attached: the inputs were
+    /// unchanged and the snapshot was admitted (implies `published`).
+    pub(crate) attached: bool,
+    /// The snapshot landed in the document's cell: the language matched and
+    /// the slot admitted it.
+    pub(crate) published: bool,
+}
+
+impl DocumentStore {
+    /// Install a parse result: attach its tree (and language) to the legacy
+    /// document iff `expected` still describes the document, and publish
+    /// `snapshot` iff the cell admits it — both under the document's entry
+    /// lock, as the one way a parse reaches readers. The `parse_states`
+    /// `has_tree` flip runs after that guard is released (a different map);
+    /// it is non-inserting, so a `didClose` between the two leaves no ghost
+    /// entry.
+    ///
+    /// The two writes share one `get_mut` guard, and the tree is attached
+    /// only when the snapshot was admitted, so no reader can observe a tree
+    /// whose snapshot is not in the cell and no path can attach a tree
+    /// without publishing: this is the only attach entry point. The reverse
+    /// is allowed — the snapshot may land while the tree does not, when the
+    /// inputs moved on: a parse of text an edit has moved on from is stale
+    /// but consistent, which serve-stale readers consume (parse-snapshot
+    /// ADR), and the cell's admission rule rejects an out-of-order version on
+    /// its own. A language check that fails rejects both: the tree belongs
+    /// to a language the document no longer has, and so does the snapshot.
+    pub(crate) fn install_parse(
+        &self,
+        uri: &Url,
+        expected: ParseInputs<'_>,
+        snapshot: Arc<super::snapshot::ParseSnapshot>,
+    ) -> ParseInstall {
+        let has_tree = snapshot.tree.is_some();
+        let (version, incarnation) = (snapshot.parsed_version, snapshot.incarnation);
+        // The snapshot this install evicts — and `snapshot` itself when the
+        // cell rejects it — is dropped only after the guard is released:
+        // dropping a tree (and its layer trees, its region vectors) is not
+        // free, and the shard's readers would wait on it otherwise.
+        let mut evicted = None;
+        let outcome = self
+            .documents
+            .get_mut(uri)
+            .map_or_else(ParseInstall::default, |mut doc| {
+                evicted = doc.latest_snapshot_slot().snapshot;
+                if expected
+                    .language_id
+                    .is_some_and(|language_id| doc.language_id() != language_id)
+                {
+                    return ParseInstall::default();
+                }
+                let inputs_unchanged = doc.incarnation() == expected.incarnation
+                    && doc.content_version() == expected.content_version
+                    && Arc::ptr_eq(&doc.text_arc(), expected.text);
+                // A checked language is kept as stored: the reparses attach
+                // a tree, they do not relabel (the snapshot carries the
+                // detected name for its own readers). Only the open parse
+                // (`language_id: None`) records what it detected.
+                let language = match expected.language_id {
+                    None => snapshot.language.clone(),
+                    Some(_) => doc.language_id().map(String::from),
+                };
+                let tree = snapshot.tree.clone();
+                let published = doc.publish_snapshot(&snapshot);
+                let attached = inputs_unchanged && published;
+                if attached {
+                    doc.set_parse_result(language, tree);
+                }
+                ParseInstall {
+                    attached,
+                    published,
+                }
+            });
+        // Likewise a rejected `snapshot` (still owned here: the publish
+        // borrows) — destroyed only after the guard is released.
+        drop(evicted);
+        drop(snapshot);
+        if !outcome.published {
+            log::debug!(
+                target: "kakehashi::snapshot",
+                "publish rejected for {uri}: v{version} inc{incarnation}"
+            );
+        }
+        // A different map (`parse_states`): touched only after the document
+        // guard above is released.
+        if outcome.attached && has_tree {
+            self.mark_tree_available_if_tracked(uri);
+        }
+        outcome
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn markdown_tree(text: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_md::LANGUAGE.into())
+            .unwrap();
+        parser.parse(text, None).unwrap()
+    }
+
+    fn parse_snapshot(
+        text: &Arc<str>,
+        tree: Option<tree_sitter::Tree>,
+        parsed_version: u64,
+        incarnation: u64,
+    ) -> Arc<super::super::snapshot::ParseSnapshot> {
+        Arc::new(super::super::snapshot::ParseSnapshot {
+            text: Arc::clone(text),
+            tree,
+            language: Some("markdown".to_string()),
+            parsed_version,
+            incarnation,
+            injection_regions: None,
+            bridge_regions: None,
+            resolved_regions: None,
+            layer_trees: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// A parse of text an edit has moved on from — before that edit's own
+    /// reparse published — lands its snapshot as stale but consistent (the
+    /// cell admits a newer version than it holds) while the tree, which
+    /// would be a reader-visible tree of the wrong text, does not attach.
+    #[test]
+    fn install_parse_publishes_a_stale_but_consistent_snapshot_without_attaching() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///stale.md").unwrap();
+        let text = "# doc\n";
+        let incarnation = store.insert(
+            uri.clone(),
+            text.to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let (expected_text, content_version) = {
+            let doc = store.get(&uri).unwrap();
+            (doc.text_arc(), doc.content_version())
+        };
+        // The edit lands first; its reparse has not published yet.
+        store.update_document(uri.clone(), "# doc edited\n".to_string(), None);
+        let outcome = store.install_parse(
+            &uri,
+            ParseInputs {
+                text: &expected_text,
+                language_id: Some(Some("markdown")),
+                incarnation,
+                content_version,
+            },
+            parse_snapshot(
+                &expected_text,
+                Some(markdown_tree(text)),
+                content_version,
+                incarnation,
+            ),
+        );
+        assert_eq!(
+            outcome,
+            ParseInstall {
+                attached: false,
+                published: true
+            }
+        );
+        assert!(store.get(&uri).unwrap().tree().is_none());
+        assert!(
+            store.latest_snapshot(&uri).is_some_and(|view| view
+                .slot
+                .snapshot
+                .as_ref()
+                .is_some_and(|s| s.parsed_version == content_version
+                    && s.parsed_version != view.content_version)),
+            "the stale snapshot is in the cell, trailing the edited revision"
+        );
+    }
+
+    /// A reparse checks the stored language and attaches the tree without
+    /// relabelling the document: detection may resolve a stored `sh` to its
+    /// `bash` base, and the stored id stays `sh` (the snapshot carries the
+    /// detected name). The open parse, which checks nothing, records what it
+    /// detected — the label a client-supplied `text` becomes `markdown`.
+    #[test]
+    fn install_parse_relabels_only_on_the_open_parse() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///label.md").unwrap();
+        let text = "# doc\n";
+        let incarnation = store.insert(uri.clone(), text.to_string(), Some("sh".into()), None);
+        let (expected_text, content_version) = {
+            let doc = store.get(&uri).unwrap();
+            (doc.text_arc(), doc.content_version())
+        };
+        let reparse = store.install_parse(
+            &uri,
+            ParseInputs {
+                text: &expected_text,
+                language_id: Some(Some("sh")),
+                incarnation,
+                content_version,
+            },
+            Arc::new(super::super::snapshot::ParseSnapshot {
+                text: Arc::clone(&expected_text),
+                tree: Some(markdown_tree(text)),
+                language: Some("bash".to_string()),
+                parsed_version: content_version,
+                incarnation,
+                injection_regions: None,
+                bridge_regions: None,
+                resolved_regions: None,
+                layer_trees: std::sync::OnceLock::new(),
+            }),
+        );
+        assert!(reparse.attached && reparse.published);
+        assert_eq!(
+            store.get(&uri).unwrap().language_id(),
+            Some("sh"),
+            "a checked reparse keeps the stored language"
+        );
+
+        let uri2 = Url::parse("file:///label2.md").unwrap();
+        let incarnation2 = store.insert(uri2.clone(), text.to_string(), Some("text".into()), None);
+        let (expected_text2, content_version2) = {
+            let doc = store.get(&uri2).unwrap();
+            (doc.text_arc(), doc.content_version())
+        };
+        let open = store.install_parse(
+            &uri2,
+            ParseInputs {
+                text: &expected_text2,
+                language_id: None,
+                incarnation: incarnation2,
+                content_version: content_version2,
+            },
+            parse_snapshot(
+                &expected_text2,
+                Some(markdown_tree(text)),
+                content_version2,
+                incarnation2,
+            ),
+        );
+        assert!(open.attached && open.published);
+        assert_eq!(
+            store.get(&uri2).unwrap().language_id(),
+            Some("markdown"),
+            "the open parse records the detected language"
+        );
+        assert!(store.get(&uri2).unwrap().tree().is_some());
+    }
+
+    /// A same-language, identical-text reopen draws a new lifetime with the
+    /// revision counter back at zero: the incarnation is the only input that
+    /// tells the prior lifetime's parse apart, in both check modes.
+    #[test]
+    fn install_parse_rejects_the_prior_lifetime_after_an_identical_reopen() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///reopen.md").unwrap();
+        let text = "# doc\n";
+        let incarnation = store.insert(
+            uri.clone(),
+            text.to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let (expected_text, content_version) = {
+            let doc = store.get(&uri).unwrap();
+            (doc.text_arc(), doc.content_version())
+        };
+        store.remove(&uri);
+        let reopened = store.insert(
+            uri.clone(),
+            text.to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        assert_ne!(reopened, incarnation);
+        assert_eq!(
+            store.get(&uri).unwrap().content_version(),
+            content_version,
+            "the reopened lifetime restarts its revision counter"
+        );
+        // The reopened document's allocation differs, but a prior-lifetime
+        // parse holding the reopened text (a re-read that raced the close)
+        // must still be told apart by the lifetime alone.
+        let reopened_text = store.get(&uri).unwrap().text_arc();
+        for language_id in [Some(Some("markdown")), None] {
+            let stale = store.install_parse(
+                &uri,
+                ParseInputs {
+                    text: &reopened_text,
+                    language_id,
+                    incarnation,
+                    content_version,
+                },
+                parse_snapshot(
+                    &reopened_text,
+                    Some(markdown_tree(text)),
+                    content_version,
+                    incarnation,
+                ),
+            );
+            assert_eq!(
+                stale,
+                ParseInstall::default(),
+                "the prior lifetime's parse must land nothing (mode {language_id:?})"
+            );
+            assert!(store.get(&uri).unwrap().tree().is_none());
+        }
+        drop(expected_text);
+    }
+
+    /// `didClose` drops the parse state before the document; an install that
+    /// lands in that window must not recreate the parse state for a
+    /// document that is going away.
+    #[test]
+    fn install_parse_does_not_recreate_parse_state_dropped_by_a_close() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///closing.md").unwrap();
+        let text = "# doc\n";
+        let incarnation = store.insert(
+            uri.clone(),
+            text.to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let (expected_text, content_version) = {
+            let doc = store.get(&uri).unwrap();
+            (doc.text_arc(), doc.content_version())
+        };
+        store.parse_states.remove(&uri);
+        let installed = store.install_parse(
+            &uri,
+            ParseInputs {
+                text: &expected_text,
+                language_id: None,
+                incarnation,
+                content_version,
+            },
+            parse_snapshot(
+                &expected_text,
+                Some(markdown_tree(text)),
+                content_version,
+                incarnation,
+            ),
+        );
+        assert!(installed.attached, "the document itself is still there");
+        assert!(
+            !store.parse_states.contains_key(&uri),
+            "a parse state the close already dropped must not be recreated"
+        );
+    }
+
+    /// An off-ingress reparse names the language it parsed under; a reopen
+    /// that relabelled the URI (same text, new lifetime and language) must
+    /// not receive the tree, and neither must a same-language reopen with
+    /// identical text — the tree belongs to the prior lifetime.
+    #[test]
+    fn install_parse_rejects_a_relabelled_or_reopened_document() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///relabel.md").unwrap();
+        let text = "# doc\n";
+        let incarnation = store.insert(
+            uri.clone(),
+            text.to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let (expected_text, content_version) = {
+            let doc = store.get(&uri).unwrap();
+            (doc.text_arc(), doc.content_version())
+        };
+        // Relabelled reopen: same text, different language and lifetime.
+        store.remove(&uri);
+        let reopened = store.insert(
+            uri.clone(),
+            text.to_string(),
+            Some("text".to_string()),
+            None,
+        );
+        assert_ne!(reopened, incarnation);
+        let stale = store.install_parse(
+            &uri,
+            ParseInputs {
+                text: &expected_text,
+                language_id: Some(Some("markdown")),
+                incarnation,
+                content_version,
+            },
+            parse_snapshot(
+                &expected_text,
+                Some(markdown_tree(text)),
+                content_version,
+                incarnation,
+            ),
+        );
+        assert_eq!(stale, ParseInstall::default());
+        assert!(store.get(&uri).unwrap().tree().is_none());
+        assert_eq!(store.get(&uri).unwrap().language_id(), Some("text"));
+        // A language mismatch alone (the document was relabelled in place)
+        // also rejects the tree — and leaves the cell exactly as it was.
+        let (reopened_text, reopened_version) = {
+            let doc = store.get(&uri).unwrap();
+            (doc.text_arc(), doc.content_version())
+        };
+        let cell_before = store.latest_snapshot(&uri).and_then(|v| v.slot.snapshot);
+        let mismatched = store.install_parse(
+            &uri,
+            ParseInputs {
+                text: &reopened_text,
+                language_id: Some(Some("markdown")),
+                incarnation: reopened,
+                content_version: reopened_version,
+            },
+            parse_snapshot(
+                &reopened_text,
+                Some(markdown_tree(text)),
+                reopened_version,
+                reopened,
+            ),
+        );
+        assert_eq!(
+            mismatched,
+            ParseInstall::default(),
+            "a language the document no longer has must neither attach nor publish"
+        );
+        assert!(store.get(&uri).unwrap().tree().is_none());
+        let cell_after = store.latest_snapshot(&uri).and_then(|v| v.slot.snapshot);
+        assert!(
+            match (&cell_before, &cell_after) {
+                (None, None) => true,
+                (Some(then), Some(now)) => Arc::ptr_eq(then, now),
+                _ => false,
+            },
+            "a rejected language must not touch the published snapshot"
+        );
+    }
+
+    /// The text is compared by allocation identity, not content: a parse that
+    /// read a different `Arc<str>` with the same bytes did not read the
+    /// document's own text, so its tree is not attached — while the snapshot,
+    /// judged only by the cell's admission rule, still publishes.
+    #[test]
+    fn install_parse_compares_the_text_by_identity_not_content() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///identity.md").unwrap();
+        let text = "# doc\n";
+        let incarnation =
+            store.insert(uri.clone(), text.to_string(), Some("markdown".into()), None);
+        let content_version = store.get(&uri).unwrap().content_version();
+        let other_allocation: Arc<str> = Arc::from(text);
+        assert_ne!(
+            Arc::as_ptr(&other_allocation),
+            Arc::as_ptr(&store.get(&uri).unwrap().text_arc())
+        );
+        let outcome = store.install_parse(
+            &uri,
+            ParseInputs {
+                text: &other_allocation,
+                language_id: Some(Some("markdown")),
+                incarnation,
+                content_version,
+            },
+            parse_snapshot(
+                &other_allocation,
+                Some(markdown_tree(text)),
+                content_version,
+                incarnation,
+            ),
+        );
+        assert_eq!(
+            outcome,
+            ParseInstall {
+                attached: false,
+                published: true
+            },
+            "equal bytes from another allocation are not the document's text"
+        );
+        assert!(store.get(&uri).unwrap().tree().is_none());
+    }
+
+    /// A parse that found a language but produced no tree still records the
+    /// language (host bridging needs only text + language) and publishes a
+    /// tree-less snapshot; a closed document keeps no parse state.
+    #[test]
+    fn install_parse_records_a_language_without_a_tree_and_nothing_after_close() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///no-tree.md").unwrap();
+        let text = "# doc\n";
+        let incarnation = store.insert(uri.clone(), text.to_string(), None, None);
+        let (expected_text, content_version) = {
+            let doc = store.get(&uri).unwrap();
+            (doc.text_arc(), doc.content_version())
+        };
+        let installed = store.install_parse(
+            &uri,
+            ParseInputs {
+                text: &expected_text,
+                language_id: None,
+                incarnation,
+                content_version,
+            },
+            parse_snapshot(&expected_text, None, content_version, incarnation),
+        );
+        assert_eq!(
+            installed,
+            ParseInstall {
+                attached: true,
+                published: true
+            }
+        );
+        let doc = store.get(&uri).unwrap();
+        assert_eq!(doc.language_id(), Some("markdown"));
+        assert!(doc.tree().is_none());
+        drop(doc);
+
+        store.remove(&uri);
+        store.install_parse(
+            &uri,
+            ParseInputs {
+                text: &expected_text,
+                language_id: None,
+                incarnation,
+                content_version,
+            },
+            parse_snapshot(
+                &expected_text,
+                Some(markdown_tree(text)),
+                content_version,
+                incarnation,
+            ),
+        );
+        assert!(
+            store.get(&uri).is_none() && !store.parse_states.contains_key(&uri),
+            "an install into a closed document must not resurrect it or its parse state"
+        );
+    }
+
+    /// The one way a parse reaches readers: the legacy tree and the snapshot
+    /// land together, or — when the document moved on — neither the tree
+    /// (inputs changed) nor a snapshot the cell does not admit.
+    #[test]
+    fn install_parse_lands_tree_and_snapshot_together_or_not_at_all() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///install.md").unwrap();
+        let text = "# doc\n";
+        let incarnation = store.insert(
+            uri.clone(),
+            text.to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let (expected_text, content_version) = {
+            let doc = store.get(&uri).unwrap();
+            (doc.text_arc(), doc.content_version())
+        };
+
+        let outcome = store.install_parse(
+            &uri,
+            ParseInputs {
+                text: &expected_text,
+                language_id: Some(Some("markdown")),
+                incarnation,
+                content_version,
+            },
+            parse_snapshot(
+                &expected_text,
+                Some(markdown_tree(text)),
+                content_version,
+                incarnation,
+            ),
+        );
+        assert_eq!(
+            outcome,
+            ParseInstall {
+                attached: true,
+                published: true
+            }
+        );
+        assert!(store.get(&uri).unwrap().tree().is_some(), "tree attached");
+        assert!(
+            store.latest_snapshot(&uri).is_some_and(|view| view
+                .slot
+                .snapshot
+                .as_ref()
+                .is_some_and(|s| s.parsed_version == view.content_version && s.tree.is_some())),
+            "snapshot published and current"
+        );
+
+        // The same parse installed again (a sibling reparse of the same
+        // revision): the cell refuses an equal-version tree swap, and the
+        // tree must not be re-attached either — nothing lands without its
+        // snapshot. Identity, not just the reported outcome: the stored tree
+        // and the cell's snapshot must be the very ones the first install
+        // landed.
+        let landed_tree = store.get(&uri).unwrap().tree().map(|t| t.root_node().id());
+        let landed_snapshot = store.latest_snapshot(&uri).and_then(|v| v.slot.snapshot);
+        let again = store.install_parse(
+            &uri,
+            ParseInputs {
+                text: &expected_text,
+                language_id: Some(Some("markdown")),
+                incarnation,
+                content_version,
+            },
+            parse_snapshot(
+                &expected_text,
+                Some(markdown_tree(text)),
+                content_version,
+                incarnation,
+            ),
+        );
+        assert_eq!(
+            again,
+            ParseInstall::default(),
+            "an equal-version duplicate lands neither tree nor snapshot"
+        );
+        assert_eq!(
+            store.get(&uri).unwrap().tree().map(|t| t.root_node().id()),
+            landed_tree,
+            "the duplicate must not swap the attached tree"
+        );
+        assert!(
+            store
+                .latest_snapshot(&uri)
+                .and_then(|v| v.slot.snapshot)
+                .zip(landed_snapshot)
+                .is_some_and(|(now, then)| Arc::ptr_eq(&now, &then)),
+            "the duplicate must not swap the published snapshot"
+        );
+
+        // An edit moved the document on: the parse of the old text attaches
+        // nothing, and its snapshot (an older version) is not admitted.
+        store.update_document(uri.clone(), "# doc edited\n".to_string(), None);
+        let stale = store.install_parse(
+            &uri,
+            ParseInputs {
+                text: &expected_text,
+                language_id: Some(Some("markdown")),
+                incarnation,
+                content_version,
+            },
+            parse_snapshot(
+                &expected_text,
+                Some(markdown_tree(text)),
+                content_version,
+                incarnation,
+            ),
+        );
+        assert_eq!(stale, ParseInstall::default());
+        assert!(
+            store.get(&uri).unwrap().tree().is_none(),
+            "a stale parse must not attach to the edited document"
+        );
+
+        // A closed document: nothing to install into.
+        store.remove(&uri);
+        let gone = store.install_parse(
+            &uri,
+            ParseInputs {
+                text: &expected_text,
+                language_id: None,
+                incarnation,
+                content_version,
+            },
+            parse_snapshot(
+                &expected_text,
+                Some(markdown_tree(text)),
+                content_version,
+                incarnation,
+            ),
+        );
+        assert_eq!(gone, ParseInstall::default());
+    }
 
     #[test]
     fn reload_invalidation_clears_open_document_trees() {
@@ -987,16 +1404,29 @@ mod tests {
         assert_eq!(store.invalidate_all_parses(), vec![uri.clone()]);
 
         let stale_tree = parser.parse("fn main() {}", None).unwrap();
-        assert!(
-            !store.set_parse_result_if_inputs_unchanged(
-                &uri,
-                &pre_reload_text,
+        let stale = store.install_parse(
+            &uri,
+            ParseInputs {
+                text: &pre_reload_text,
+                language_id: Some(Some("rust")),
                 incarnation,
-                0,
-                Some("rust"),
-                Some(stale_tree),
-            ),
-            "a pre-reload parse must not restore the legacy tree"
+                content_version: 0,
+            },
+            Arc::new(super::super::snapshot::ParseSnapshot {
+                text: Arc::clone(&pre_reload_text),
+                tree: Some(stale_tree),
+                language: Some("rust".to_string()),
+                parsed_version: 0,
+                incarnation,
+                injection_regions: None,
+                bridge_regions: None,
+                resolved_regions: None,
+                layer_trees: std::sync::OnceLock::new(),
+            }),
+        );
+        assert!(
+            !stale.attached && !stale.published,
+            "a pre-reload parse must neither restore the legacy tree nor land its snapshot"
         );
 
         let document = store.get(&uri).unwrap();
@@ -1030,7 +1460,7 @@ mod tests {
         fn publish(store: &DocumentStore, uri: &Url, snapshot: ParseSnapshot) -> bool {
             store
                 .get(uri)
-                .map(|doc| doc.publish_snapshot(Arc::new(snapshot)))
+                .map(|doc| doc.publish_snapshot(&Arc::new(snapshot)))
                 .unwrap_or(false)
         }
 
@@ -1209,439 +1639,6 @@ mod tests {
         );
     }
 
-    fn parse_rust(text: &str) -> Tree {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .unwrap();
-        parser.parse(text, None).unwrap()
-    }
-
-    #[test]
-    fn update_tree_if_text_unchanged_does_not_resurrect_closed_document() {
-        let store = DocumentStore::new();
-        let uri = Url::parse("file:///closed.rs").unwrap();
-        // No document inserted: models a didClose that removed the entry while an
-        // on-demand reader parse was still running.
-        let stored =
-            store.update_tree_if_text_unchanged(&uri, "fn main() {}", parse_rust("fn main() {}"));
-        assert!(
-            !stored,
-            "must not store a tree for a vacant (closed) document"
-        );
-        assert!(
-            store.get(&uri).is_none(),
-            "the closed document must not be resurrected by the reader parse"
-        );
-    }
-
-    #[test]
-    fn update_tree_if_text_unchanged_stores_when_text_matches() {
-        let store = DocumentStore::new();
-        let uri = Url::parse("file:///live.rs").unwrap();
-        store.insert(
-            uri.clone(),
-            "fn main() {}".to_string(),
-            Some("rust".to_string()),
-            None,
-        );
-
-        let stored =
-            store.update_tree_if_text_unchanged(&uri, "fn main() {}", parse_rust("fn main() {}"));
-        assert!(stored, "a live document with unchanged text gets the tree");
-        assert!(
-            store.get(&uri).unwrap().tree().is_some(),
-            "the parsed tree must be visible after the CAS write"
-        );
-    }
-
-    #[test]
-    fn update_tree_if_text_unchanged_drops_stale_text_parse() {
-        let store = DocumentStore::new();
-        let uri = Url::parse("file:///edited.rs").unwrap();
-        // The document moved on (a didChange landed) while the parse for the old
-        // text was in flight.
-        store.insert(
-            uri.clone(),
-            "fn newer() {}".to_string(),
-            Some("rust".to_string()),
-            None,
-        );
-
-        let stored =
-            store.update_tree_if_text_unchanged(&uri, "fn main() {}", parse_rust("fn main() {}"));
-        assert!(!stored, "a tree parsed from now-stale text must be dropped");
-        assert!(
-            store.get(&uri).unwrap().tree().is_none(),
-            "the stale tree must not overwrite the current text's (still-absent) tree"
-        );
-    }
-
-    #[test]
-    fn attach_tree_if_absent_stores_only_when_no_tree_present() {
-        let store = DocumentStore::new();
-        let uri = Url::parse("file:///absent.rs").unwrap();
-        store.insert(
-            uri.clone(),
-            "fn main() {}".to_string(),
-            Some("rust".to_string()),
-            None,
-        );
-        let incarnation = store.get(&uri).unwrap().incarnation();
-
-        // No tree yet → stores.
-        assert!(store.attach_tree_if_absent(
-            &uri,
-            "fn main() {}",
-            Some("rust"),
-            incarnation,
-            parse_rust("fn main() {}")
-        ));
-        let first = store.get(&uri).unwrap().tree().unwrap().root_node().id();
-
-        // A tree is now present → a second attach must NOT clobber it (the guard
-        // is atomic with the write, unlike a separate tree.is_some() pre-check).
-        assert!(!store.attach_tree_if_absent(
-            &uri,
-            "fn main() {}",
-            Some("rust"),
-            incarnation,
-            parse_rust("fn main() {}")
-        ));
-        assert_eq!(
-            store.get(&uri).unwrap().tree().unwrap().root_node().id(),
-            first,
-            "an existing tree must be preserved, not overwritten"
-        );
-    }
-
-    #[test]
-    fn attach_tree_if_absent_rejects_a_reopen_with_a_fresh_incarnation() {
-        let store = DocumentStore::new();
-        let uri = Url::parse("file:///reinstalled.rs").unwrap();
-        store.insert(
-            uri.clone(),
-            "fn main() {}".to_string(),
-            Some("rust".to_string()),
-            None,
-        );
-        // An install reparse read this lifetime's incarnation, then the document was
-        // closed and reopened (same text + language, no tree yet) while the install
-        // finished.
-        let stale_incarnation = store.get(&uri).unwrap().incarnation();
-        store.remove(&uri);
-        store.insert(
-            uri.clone(),
-            "fn main() {}".to_string(),
-            Some("rust".to_string()),
-            None,
-        );
-
-        assert!(
-            !store.attach_tree_if_absent(
-                &uri,
-                "fn main() {}",
-                Some("rust"),
-                stale_incarnation,
-                parse_rust("fn main() {}")
-            ),
-            "a freshly-installed grammar's tree from the prior lifetime must not \
-             attach to the reopened document"
-        );
-        assert!(
-            store.get(&uri).unwrap().tree().is_none(),
-            "the reopened document keeps no tree from the closed lifetime"
-        );
-    }
-
-    #[test]
-    fn update_tree_if_text_and_language_unchanged_rejects_a_changed_language() {
-        let store = DocumentStore::new();
-        let uri = Url::parse("file:///relabelled.rs").unwrap();
-        // Document was reopened with the same text but a different language_id
-        // while an old-grammar parse was in flight.
-        store.insert(
-            uri.clone(),
-            "fn main() {}".to_string(),
-            Some("ruby".to_string()),
-            None,
-        );
-        let incarnation = store.get(&uri).unwrap().incarnation();
-
-        let stored = store.update_tree_if_text_and_language_unchanged(
-            &uri,
-            "fn main() {}",
-            Some("rust"),
-            incarnation,
-            parse_rust("fn main() {}"),
-        );
-        assert!(
-            !stored,
-            "a tree parsed for a different language must be rejected"
-        );
-        assert!(
-            store.get(&uri).unwrap().tree().is_none(),
-            "the relabelled document keeps no wrong-grammar tree"
-        );
-
-        // Same language and incarnation → stores.
-        assert!(store.update_tree_if_text_and_language_unchanged(
-            &uri,
-            "fn main() {}",
-            Some("ruby"),
-            incarnation,
-            parse_rust("fn main() {}"),
-        ));
-        assert!(store.get(&uri).unwrap().tree().is_some());
-    }
-
-    #[test]
-    fn update_tree_if_text_and_language_unchanged_rejects_a_reopen_with_a_fresh_incarnation() {
-        let store = DocumentStore::new();
-        let uri = Url::parse("file:///reopened.rs").unwrap();
-        store.insert(
-            uri.clone(),
-            "fn main() {}".to_string(),
-            Some("rust".to_string()),
-            None,
-        );
-        // An off-ingress parse read this lifetime's incarnation, then the document
-        // was closed and reopened with identical text and language while the parse
-        // was in flight.
-        let stale_incarnation = store.get(&uri).unwrap().incarnation();
-        store.remove(&uri);
-        store.insert(
-            uri.clone(),
-            "fn main() {}".to_string(),
-            Some("rust".to_string()),
-            None,
-        );
-
-        let stored = store.update_tree_if_text_and_language_unchanged(
-            &uri,
-            "fn main() {}",
-            Some("rust"),
-            stale_incarnation,
-            parse_rust("fn main() {}"),
-        );
-        assert!(
-            !stored,
-            "a tree from the prior lifetime must not attach to the reopened \
-             document even when text and language are identical"
-        );
-        assert!(
-            store.get(&uri).unwrap().tree().is_none(),
-            "the reopened document keeps no tree from the closed lifetime"
-        );
-    }
-
-    #[test]
-    fn attach_tree_if_absent_does_not_resurrect_closed_document() {
-        let store = DocumentStore::new();
-        let uri = Url::parse("file:///closed.rs").unwrap();
-        // No document exists, so the CAS rejects regardless of the expected
-        // language/incarnation (they are never compared on the Vacant path).
-        assert!(!store.attach_tree_if_absent(
-            &uri,
-            "fn main() {}",
-            Some("rust"),
-            1,
-            parse_rust("fn main() {}")
-        ));
-        assert!(
-            store.get(&uri).is_none(),
-            "must not resurrect a closed document"
-        );
-    }
-
-    #[test]
-    fn set_parse_result_if_text_and_incarnation_unchanged_sets_language_and_tree() {
-        let store = DocumentStore::new();
-        let uri = Url::parse("file:///open_refine.rs").unwrap();
-        // didOpen inserted the document with the client language ID ("text"); the
-        // open parse refines it to the content-detected "rust" and attaches a tree.
-        store.insert(
-            uri.clone(),
-            "fn main() {}".to_string(),
-            Some("text".to_string()),
-            None,
-        );
-        let (incarnation, text) = {
-            let doc = store.get(&uri).unwrap();
-            (doc.incarnation(), doc.text_arc())
-        };
-
-        assert!(store.set_parse_result_if_text_and_incarnation_unchanged(
-            &uri,
-            &text,
-            incarnation,
-            Some("rust"),
-            Some(parse_rust("fn main() {}")),
-        ));
-        let doc = store.get(&uri).unwrap();
-        assert_eq!(
-            doc.language_id(),
-            Some("rust"),
-            "the open parse must SET (refine) the language, not just check it"
-        );
-        assert!(doc.tree().is_some(), "the tree must be attached");
-    }
-
-    #[test]
-    fn set_parse_result_if_text_and_incarnation_unchanged_records_language_without_a_tree() {
-        // The parse-failed-but-language-detected path (parse timeout / parser
-        // unavailable / join error): the open parse records the detected language
-        // with NO tree, so a host-bridged document keeps its language after a parse
-        // failure rather than being nulled out.
-        let store = DocumentStore::new();
-        let uri = Url::parse("file:///open_lang_no_tree.rs").unwrap();
-        store.insert(
-            uri.clone(),
-            "fn main() {}".to_string(),
-            Some("text".to_string()),
-            None,
-        );
-        let (incarnation, text) = {
-            let doc = store.get(&uri).unwrap();
-            (doc.incarnation(), doc.text_arc())
-        };
-
-        assert!(store.set_parse_result_if_text_and_incarnation_unchanged(
-            &uri,
-            &text,
-            incarnation,
-            Some("rust"),
-            None,
-        ));
-        let doc = store.get(&uri).unwrap();
-        assert_eq!(
-            doc.language_id(),
-            Some("rust"),
-            "the detected language is recorded even though the parse produced no tree"
-        );
-        assert!(
-            doc.tree().is_none(),
-            "no tree lands on the parse-failure path"
-        );
-    }
-
-    #[test]
-    fn set_parse_result_if_text_and_incarnation_unchanged_rejects_stale_text() {
-        let store = DocumentStore::new();
-        let uri = Url::parse("file:///open_stale_text.rs").unwrap();
-        store.insert(
-            uri.clone(),
-            "fn main() {}".to_string(),
-            Some("rust".to_string()),
-            None,
-        );
-        // Capture the text the parse "read" (its Arc identity) before the edit.
-        let (incarnation, text) = {
-            let doc = store.get(&uri).unwrap();
-            (doc.incarnation(), doc.text_arc())
-        };
-        // A didChange landed mid-parse, moving the text on (same lifetime).
-        store.apply_edit_clearing_tree(&uri, "fn newer() {}".to_string(), &[]);
-
-        let stored = store.set_parse_result_if_text_and_incarnation_unchanged(
-            &uri,
-            &text,
-            incarnation,
-            Some("rust"),
-            Some(parse_rust("fn main() {}")),
-        );
-        assert!(!stored, "a tree parsed from now-stale text must be dropped");
-        assert!(
-            store.get(&uri).unwrap().tree().is_none(),
-            "the stale tree must not overwrite the newer text's (still-absent) tree"
-        );
-    }
-
-    #[test]
-    fn set_parse_result_if_text_and_incarnation_unchanged_rejects_a_reopen() {
-        let store = DocumentStore::new();
-        let uri = Url::parse("file:///open_reopen.rs").unwrap();
-        store.insert(
-            uri.clone(),
-            "fn main() {}".to_string(),
-            Some("rust".to_string()),
-            None,
-        );
-        // The open parse read this lifetime's incarnation + text, then a didClose +
-        // reopen (identical text + language) raced it while parsing.
-        let (stale_incarnation, stale_text) = {
-            let doc = store.get(&uri).unwrap();
-            (doc.incarnation(), doc.text_arc())
-        };
-        store.remove(&uri);
-        store.insert(
-            uri.clone(),
-            "fn main() {}".to_string(),
-            Some("rust".to_string()),
-            None,
-        );
-
-        let stored = store.set_parse_result_if_text_and_incarnation_unchanged(
-            &uri,
-            &stale_text,
-            stale_incarnation,
-            Some("rust"),
-            Some(parse_rust("fn main() {}")),
-        );
-        assert!(
-            !stored,
-            "a tree from the prior lifetime must not attach to the reopened document"
-        );
-        assert!(
-            store.get(&uri).unwrap().tree().is_none(),
-            "the reopened document keeps no tree from the closed lifetime"
-        );
-    }
-
-    #[test]
-    fn set_parse_result_if_text_and_incarnation_unchanged_does_not_resurrect_closed_document() {
-        let store = DocumentStore::new();
-        let uri = Url::parse("file:///open_closed.rs").unwrap();
-        // No document exists (a didClose removed it before the off-ingress parse ran).
-        assert!(!store.set_parse_result_if_text_and_incarnation_unchanged(
-            &uri,
-            &Arc::<str>::from("fn main() {}"),
-            1,
-            Some("rust"),
-            Some(parse_rust("fn main() {}")),
-        ));
-        assert!(
-            store.get(&uri).is_none(),
-            "the off-ingress open parse must not resurrect a closed document"
-        );
-    }
-
-    #[test]
-    fn update_tree_if_text_unchanged_does_not_recreate_parse_state_after_close() {
-        let store = DocumentStore::new();
-        let uri = Url::parse("file:///race.rs").unwrap();
-        store.insert(
-            uri.clone(),
-            "fn main() {}".to_string(),
-            Some("rust".to_string()),
-            None,
-        );
-        // `remove` (didClose) drops `parse_states` before `documents`; model the
-        // window where the parse-state is already gone but our in-flight CAS still
-        // sees the document.
-        store.parse_states.remove(&uri);
-
-        let stored =
-            store.update_tree_if_text_unchanged(&uri, "fn main() {}", parse_rust("fn main() {}"));
-        assert!(stored, "the still-present document gets the tree");
-        assert!(
-            store.parse_states.get(&uri).is_none(),
-            "the availability update must not recreate a parse-state for a URI whose \
-             parse-state a concurrent close already removed"
-        );
-    }
-
-    /// Read the published watermark ticket for a URI (test-only; the field is private).
     fn watermark_of(store: &DocumentStore, uri: &Url) -> Option<u64> {
         store.watermarks.get(uri).map(|s| s.borrow().ticket)
     }

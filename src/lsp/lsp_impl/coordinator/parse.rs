@@ -10,9 +10,9 @@ use crate::lsp::lsp_impl::{Kakehashi, build_notifier};
 use crate::lsp::settings_manager::SettingsManager;
 
 /// Everything one populate pass derives for the snapshot it rides on
-/// (parse-snapshot ADR §3): all `None` when populate was skipped (raced CAS)
-/// or the pool work-unit panicked — readers then fall back to inline
-/// resolution for that snapshot.
+/// (parse-snapshot ADR §3): all `None` when the pool work-unit panicked or
+/// populate's own epoch/lifetime guard committed nothing — readers then fall
+/// back to inline resolution for that snapshot.
 #[derive(Default)]
 struct PopulatedSnapshotRegions {
     discovery: Option<std::sync::Arc<crate::document::DiscoveredInjections>>,
@@ -291,46 +291,6 @@ impl ParseCoordinator {
         }
     }
 
-    /// Publish a parse pass's [`ParseSnapshot`](crate::document::snapshot::ParseSnapshot)
-    /// into the document's snapshot cell (parse-snapshot ADR §2, Stage-2
-    /// dual-write). The cell's own guard (incarnation + strict version) decides
-    /// admission; a document a `didClose` already removed simply has no cell to
-    /// publish into (its detached cell holds the closed sentinel). Returns
-    /// whether the publish landed.
-    ///
-    /// During the dual-write stage this runs alongside the legacy tree CAS and
-    /// may admit a snapshot the legacy CAS rejects — deliberately: a parse of
-    /// text an edit has since moved on from is *stale but consistent*, exactly
-    /// what serve-stale readers consume, while the legacy tree must stay
-    /// current-text-only. No single reader mixes the two sources (cell readers
-    /// consume the snapshot's own (text, tree); legacy readers snapshot the
-    /// store under one shard Ref), and every parse pass runs the legacy CAS
-    /// BEFORE this publish: a legacy-tree reader woken by the publish (the
-    /// explicit-action waiters read `doc.snapshot()` after
-    /// `wait_for_current_snapshot`) therefore finds the store already
-    /// settled — either the tree attached, or a racing edit rejected the CAS,
-    /// in which case the cell is not Current for that reader either. The
-    /// legacy store and its remaining readers go away in Stage 3.
-    fn publish_parse_snapshot(
-        &self,
-        uri: &Url,
-        snapshot: crate::document::snapshot::ParseSnapshot,
-    ) -> bool {
-        let (version, incarnation) = (snapshot.parsed_version, snapshot.incarnation);
-        let landed = self
-            .documents
-            .get(uri)
-            .map(|doc| doc.publish_snapshot(std::sync::Arc::new(snapshot)))
-            .unwrap_or(false);
-        if !landed {
-            log::debug!(
-                target: "kakehashi::snapshot",
-                "publish rejected for {uri}: v{version} inc{incarnation}"
-            );
-        }
-        landed
-    }
-
     /// Run `CacheCoordinator::populate_injections` as a compute-pool work-unit
     /// and await it.
     ///
@@ -373,8 +333,9 @@ impl ParseCoordinator {
         //   the tracker at `(0, epoch+1)` — indistinguishable from a
         //   reopen's first mint, so the latch alone cannot refuse it; the
         //   reopen case fails the incarnation check);
-        // - currency (`content_version` unchanged since the parse's CAS —
-        //   an edit that already landed makes this pass's tree stale).
+        // - currency (`content_version` unchanged since the parse captured
+        //   its inputs — an edit that already landed makes this pass's tree
+        //   stale).
         // Anything landing AFTER the lock drops is caught by the latch
         // re-check inside the batch mint / commit (`cleanup` bumps the
         // epoch before it removes; an edit-shift bumps the generation).
@@ -457,9 +418,10 @@ impl ParseCoordinator {
     /// calling this, so the parse re-reads that stored text (a cheap `Arc<str>`
     /// refcount bump, [`text_arc`](crate::document::Document::text_arc)) rather than
     /// carrying a second owned `String`, and records the detected language + tree
-    /// **in place** via the non-inserting, text + incarnation CAS
-    /// [`set_parse_result_if_text_and_incarnation_unchanged`] instead of re-inserting a
-    /// fresh copy of the text. Net: zero full-document text copies in the open parse.
+    /// **in place** through the non-inserting, text + incarnation guarded
+    /// [`install_parse`](crate::document::DocumentStore::install_parse) instead of
+    /// re-inserting a fresh copy of the text. Net: zero full-document text copies
+    /// in the open parse.
     /// That store write is **non-inserting** and lifetime-guarded, so it is
     /// resurrection-safe and stale-safe once the open parse moves off the ingress
     /// ticket: a `didClose` racing it stays closed, and a `didChange` / reopen landing
@@ -573,38 +535,16 @@ impl ParseCoordinator {
             };
 
             if let Some(tree) = parsed_tree {
-                // Legacy tree CAS BEFORE the snapshot publish: a legacy-store
-                // reader woken by the publish (the explicit-action waiters
-                // read `doc.snapshot()` after `wait_for_current_snapshot`)
-                // must find the tree already attached — publish-first opened
-                // a window where the cell said Current while the legacy store
-                // was still tree-less, silently no-opping a user-triggered
-                // formatting. The CAS is non-inserting (text + incarnation
-                // checked), so a tree parsed from open-time text/lifetime is
-                // dropped when a `didChange` moved the text on or a
-                // `didClose`/reopen changed the incarnation — the publish
-                // below still lands in that case (stale-but-consistent is
-                // exactly what serve-stale readers consume; the cell guard
-                // independently rejects out-of-order versions). Only populate
-                // the injection caches when the tree actually landed, so a
-                // `didClose` racing this off-ingress parse can't leave stale
-                // injection entries for a gone document. (`Tree` clone is a
-                // cheap refcount bump.)
-                let stored = self.documents.set_parse_result_if_inputs_unchanged(
-                    &uri,
-                    &text,
-                    incarnation,
-                    content_version,
-                    Some(&language_name),
-                    Some(tree.clone()),
-                );
-                // Populate BEFORE the publish so the derived discovery rides the
-                // snapshot (ADR §3 don't-discover-twice); readers keep serving
-                // the previous snapshot meanwhile. A rejected CAS (raced) skips
-                // populate — the snapshot then publishes without discovery and
-                // readers discover inline for that (already-superseded) snapshot.
-                let regions = if stored {
-                    self.populate_injections_on_pool(
+                // Populate BEFORE the install so the derived discovery rides
+                // the snapshot (ADR §3 don't-discover-twice); populate guards
+                // itself against a pass whose text or lifetime moved on (the
+                // tracker's epoch and incarnation), so it needs no confirmation
+                // from the store first, and the install below then publishes
+                // the snapshot iff the cell admits it and attaches the tree
+                // only with an admitted snapshot and unchanged inputs (a
+                // language mismatch rejects both outright).
+                let regions = self
+                    .populate_injections_on_pool(
                         uri.clone(),
                         text.clone(),
                         tree.clone(),
@@ -613,13 +553,16 @@ impl ParseCoordinator {
                         content_version,
                         version_cancel.clone(),
                     )
-                    .await
-                } else {
-                    PopulatedSnapshotRegions::default()
-                };
-                self.publish_parse_snapshot(
+                    .await;
+                let installed = self.documents.install_parse(
                     &uri,
-                    crate::document::snapshot::ParseSnapshot {
+                    crate::document::ParseInputs {
+                        text: &text,
+                        language_id: None,
+                        incarnation,
+                        content_version,
+                    },
+                    std::sync::Arc::new(crate::document::snapshot::ParseSnapshot {
                         text: text.clone(),
                         tree: Some(tree.clone()),
                         language: Some(language_name.clone()),
@@ -629,24 +572,22 @@ impl ParseCoordinator {
                         bridge_regions: regions.bridge_regions,
                         resolved_regions: regions.resolved_regions,
                         layer_trees: std::sync::OnceLock::new(),
-                    },
+                    }),
                 );
-                if stored {
-                    // AFTER the publish: a downstream task woken by this mark
+                if installed.attached {
+                    // AFTER the install: a downstream task woken by this mark
                     // on another runtime thread must find the snapshot (and
-                    // its fast-path regions) already in the cell — marking
-                    // first let it read the previous snapshot and fall back
-                    // to inline resolution for one cycle.
+                    // its fast-path regions) already in the cell.
                     self.documents
                         .mark_parse_finished(&uri, parse_generation, true);
                 }
                 advance_watermark();
                 self.notifier().log_language_events(&events).await;
-                // `stored` is exactly "this call's CAS landed the tree": false when a
+                // `attached` is exactly "this call landed the tree": false when a
                 // racing `didChange`/reopen moved the text or incarnation on and the
                 // edit reparse won, in which case the open downstream must NOT re-run
                 // over the edit's tree.
-                return stored;
+                return installed.attached;
             }
 
             // Parse produced no tree (timeout / parser unavailable / join error) but
@@ -654,20 +595,15 @@ impl ParseCoordinator {
             // through to the no-language path below which would null it out. Host
             // bridging needs only text + language (never a tree), so preserving the
             // language keeps a host-bridged document working after a parse failure.
-            if self.documents.set_parse_result_if_inputs_unchanged(
+            let installed = self.documents.install_parse(
                 &uri,
-                &text,
-                incarnation,
-                content_version,
-                Some(&language_name),
-                None,
-            ) {
-                self.documents
-                    .mark_parse_finished(&uri, parse_generation, false);
-            }
-            self.publish_parse_snapshot(
-                &uri,
-                crate::document::snapshot::ParseSnapshot {
+                crate::document::ParseInputs {
+                    text: &text,
+                    language_id: None,
+                    incarnation,
+                    content_version,
+                },
+                std::sync::Arc::new(crate::document::snapshot::ParseSnapshot {
                     text: text.clone(),
                     tree: None,
                     language: Some(language_name.clone()),
@@ -677,28 +613,27 @@ impl ParseCoordinator {
                     bridge_regions: None,
                     resolved_regions: None,
                     layer_trees: std::sync::OnceLock::new(),
-                },
+                }),
             );
+            if installed.attached {
+                self.documents
+                    .mark_parse_finished(&uri, parse_generation, false);
+            }
             advance_watermark();
             self.notifier().log_language_events(&events).await;
             return false;
         }
 
         // No language detected at all → store no language, no tree.
-        if self.documents.set_parse_result_if_inputs_unchanged(
+        let installed = self.documents.install_parse(
             &uri,
-            &text,
-            incarnation,
-            content_version,
-            None,
-            None,
-        ) {
-            self.documents
-                .mark_parse_finished(&uri, parse_generation, false);
-        }
-        self.publish_parse_snapshot(
-            &uri,
-            crate::document::snapshot::ParseSnapshot {
+            crate::document::ParseInputs {
+                text: &text,
+                language_id: None,
+                incarnation,
+                content_version,
+            },
+            std::sync::Arc::new(crate::document::snapshot::ParseSnapshot {
                 text: text.clone(),
                 tree: None,
                 language: None,
@@ -708,8 +643,12 @@ impl ParseCoordinator {
                 bridge_regions: None,
                 resolved_regions: None,
                 layer_trees: std::sync::OnceLock::new(),
-            },
+            }),
         );
+        if installed.attached {
+            self.documents
+                .mark_parse_finished(&uri, parse_generation, false);
+        }
         advance_watermark();
         self.notifier().log_language_events(&events).await;
         false
@@ -724,11 +663,10 @@ impl ParseCoordinator {
     ///
     /// - re-reads the **latest** store text rather than the open-time text (a
     ///   `didChange` may have landed while the install ran), and
-    /// - persists through the **non-inserting**, tree-absent `attach_tree_if_absent`
-    ///   CAS, so a `didClose` during the install leaves the document gone instead
-    ///   of resurrecting it (the install/parse resurrection vector the actor ADR
-    ///   calls out), and a `didChange` between the read and the write drops the
-    ///   now-stale tree.
+    /// - persists through the **non-inserting** `install_parse`, so a `didClose`
+    ///   during the install leaves the document gone instead of resurrecting it
+    ///   (the install/parse resurrection vector the actor ADR calls out), and a
+    ///   `didChange` between the read and the write drops the now-stale tree.
     ///
     /// No watermark advance: the originating `didOpen`'s skip-parse branch already
     /// resolved that ticket's watermark, and this reparse carries no ticket.
@@ -859,31 +797,18 @@ impl ParseCoordinator {
 
             let Some(tree) = parsed else { break };
 
-            // Persist FIRST through the non-inserting, tree-absent CAS —
-            // before the snapshot publish, so a legacy-store reader the
-            // publish wakes finds the tree already attached (see the
-            // parse_document ordering note). A closed (Vacant) document, one
-            // whose text moved (a concurrent `didChange`), or one a
-            // concurrent parse already gave a tree all drop this tree — the
-            // tree-absent check makes the "don't clobber a concurrent parse"
-            // guard atomic with the write. Only populate the injection caches
-            // when the tree actually landed, so a `didClose` racing this
-            // reparse can't leave stale injection entries for a gone
-            // document. (`Tree` clone is a cheap refcount bump.)
-            let stored = self.documents.attach_tree_if_parse_inputs_unchanged(
-                &uri,
-                &text,
-                expected_language_id.as_deref(),
-                expected_incarnation,
-                content_version,
-                tree.clone(),
-            );
-            // Populate BEFORE the publish so the discovery rides the snapshot
-            // (ADR §3); the cell guard still rejects a stale lifetime or an
-            // out-of-order version at publish. A rejected CAS skips populate —
-            // the snapshot still publishes as stale-but-consistent.
-            let regions = if stored {
-                self.populate_injections_on_pool(
+            // Populate BEFORE the install so the discovery rides the snapshot
+            // (ADR §3); populate guards itself against a pass whose text or
+            // lifetime moved on, and the install then attaches the tree only
+            // with an admitted snapshot and unchanged inputs: a closed
+            // (Vacant) document, one whose text moved (a concurrent
+            // `didChange` — its snapshot may still publish as an older
+            // version, the tree does not attach), and one a concurrent parse
+            // already gave a tree at this version (the cell refuses the
+            // equal-version swap, so the tree is not re-attached either) all
+            // drop this tree. (`Tree` clone is a cheap refcount bump.)
+            let regions = self
+                .populate_injections_on_pool(
                     uri.clone(),
                     text.clone(),
                     tree.clone(),
@@ -892,13 +817,16 @@ impl ParseCoordinator {
                     content_version,
                     version_cancel.clone(),
                 )
-                .await
-            } else {
-                PopulatedSnapshotRegions::default()
-            };
-            let published = self.publish_parse_snapshot(
+                .await;
+            let installed = self.documents.install_parse(
                 &uri,
-                crate::document::snapshot::ParseSnapshot {
+                crate::document::ParseInputs {
+                    text: &text,
+                    language_id: Some(expected_language_id.as_deref()),
+                    incarnation: expected_incarnation,
+                    content_version,
+                },
+                std::sync::Arc::new(crate::document::snapshot::ParseSnapshot {
                     text: text.clone(),
                     tree: Some(tree.clone()),
                     language: Some(language_name.clone()),
@@ -908,23 +836,24 @@ impl ParseCoordinator {
                     bridge_regions: regions.bridge_regions,
                     resolved_regions: regions.resolved_regions,
                     layer_trees: std::sync::OnceLock::new(),
-                },
+                }),
             );
             // Serve-stale's heal signal, mirroring reparse_latest: a token
             // request answered empty (or 15s-capped) while the install was
             // still compiling has no lineage to re-drive it — without the
             // refresh, a slow install leaves the document unhighlighted
             // until an incidental edit.
-            if published {
+            if installed.published {
                 events.push(crate::language::LanguageEvent::semantic_tokens_refresh(
                     language_name.clone(),
                 ));
             }
-            if stored {
+            if installed.attached {
                 break;
             }
-            // CAS rejected: the text moved under us (a concurrent `didChange`).
-            // Loop to re-read the latest text and try again.
+            // Install rejected: the text moved under us (a concurrent
+            // `didChange`), or a sibling parse already installed this
+            // version. Loop to re-read the latest text and try again.
         }
 
         // Covers the give-up exits of the retry loop (parser still
@@ -943,9 +872,9 @@ impl ParseCoordinator {
     /// it runs in a spawned loop, *not* on the writer ticket. When the edit stashed a
     /// `pending_seed` (the pre-edit tree with this edit's `InputEdit`s applied) the
     /// parse is **incremental**, seeded from it; a full-text sync stashes no seed and
-    /// parses from scratch (which keeps #348 closed). The tree write
-    /// is the non-inserting text **and language** CAS
-    /// [`update_tree_if_text_and_language_unchanged`]: a closed (Vacant) document is
+    /// parses from scratch (which keeps #348 closed). The tree write is the
+    /// non-inserting, text **and language** guarded
+    /// [`install_parse`](crate::document::DocumentStore::install_parse): a closed (Vacant) document is
     /// left gone (resurrection-safe), a text that moved on (a `didChange` landed
     /// while parsing) is dropped — the scheduler's `dirty` loop then reparses the
     /// newer text — and a reopen that changed the language is rejected (no
@@ -1065,32 +994,24 @@ impl ParseCoordinator {
 
         let mut events = load_result.events;
         if let Some(tree) = parsed {
-            // Legacy tree CAS BEFORE the snapshot publish (see the
-            // parse_document ordering note): a legacy-store reader woken by
-            // the publish must find the tree already attached. Text +
-            // language + incarnation checked atomically under the tree-write
-            // shard lock: text rejects a within-lifetime stale parse (a
+            // Attach and publish happen in one `install_parse` under the
+            // entry guard, so a legacy-store reader woken by the publish
+            // always finds the tree already attached. Text + language +
+            // incarnation are checked atomically under that guard: text
+            // rejects a within-lifetime stale parse (a
             // `didChange` landed mid-parse); language rejects a reopen that
             // relabelled the URI; incarnation rejects a same-language,
             // identical-text reopen — the tree belongs to the prior lifetime
             // and must not attach to the reopened document (nor let the
             // watermark advance below run on the old lifetime's ticket).
-            let stored = self.documents.update_tree_if_parse_inputs_unchanged(
-                uri,
-                &text,
-                language_id.as_deref(),
-                incarnation,
-                content_version,
-                tree.clone(),
-            );
-            // Populate BEFORE the publish so the derived discovery rides the
+            // Populate BEFORE the install so the derived discovery rides the
             // snapshot (ADR §3, don't-discover-twice); readers keep serving the
-            // previous snapshot for populate's duration. A rejected legacy CAS
-            // (the text moved on mid-parse) skips populate — the snapshot still
-            // publishes as stale-but-consistent (its readers discover inline;
-            // the scheduler's dirty loop is already reparsing the newer text).
-            let regions = if stored {
-                self.populate_injections_on_pool(
+            // previous snapshot for populate's duration. Populate guards itself
+            // against a pass whose text moved on mid-parse (the scheduler's
+            // dirty loop is already reparsing the newer text), and the install
+            // then attaches the tree only with an admitted snapshot.
+            let regions = self
+                .populate_injections_on_pool(
                     uri.clone(),
                     text.clone(),
                     tree.clone(),
@@ -1099,18 +1020,21 @@ impl ParseCoordinator {
                     content_version,
                     version_cancel.clone(),
                 )
-                .await
-            } else {
-                PopulatedSnapshotRegions::default()
-            };
+                .await;
             let tree_less_upgrade = self.documents.latest_snapshot(uri).is_some_and(|view| {
                 view.slot.snapshot.is_some_and(|snapshot| {
                     snapshot.parsed_version == content_version && snapshot.tree.is_none()
                 })
             });
-            let published = self.publish_parse_snapshot(
+            let installed = self.documents.install_parse(
                 uri,
-                crate::document::snapshot::ParseSnapshot {
+                crate::document::ParseInputs {
+                    text: &text,
+                    language_id: Some(language_id.as_deref()),
+                    incarnation,
+                    content_version,
+                },
+                std::sync::Arc::new(crate::document::snapshot::ParseSnapshot {
                     text: text.clone(),
                     tree: Some(tree.clone()),
                     language: Some(language_name.clone()),
@@ -1120,8 +1044,9 @@ impl ParseCoordinator {
                     bridge_regions: regions.bridge_regions,
                     resolved_regions: regions.resolved_regions,
                     layer_trees: std::sync::OnceLock::new(),
-                },
+                }),
             );
+            let published = installed.published;
             // Serve-stale's heal signal (ADR §3), narrowed to the cases the
             // workspace-scoped request is actually FOR. `refresh` is expensive
             // for the client (Neovim's handler cancels its in-flight token

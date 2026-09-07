@@ -974,7 +974,7 @@ mod tests {
             .documents
             .get(&current)
             .map(|doc| {
-                doc.publish_snapshot(Arc::new(crate::document::snapshot::ParseSnapshot {
+                doc.publish_snapshot(&Arc::new(crate::document::snapshot::ParseSnapshot {
                     text: Arc::from(text),
                     tree: Some(tree),
                     language: Some("markdown".to_string()),
@@ -1131,7 +1131,7 @@ mod tests {
             .documents
             .get(uri)
             .map(|doc| {
-                doc.publish_snapshot(std::sync::Arc::new(
+                doc.publish_snapshot(&std::sync::Arc::new(
                     crate::document::snapshot::ParseSnapshot {
                         text: std::sync::Arc::from(text),
                         tree: Some(tree),
@@ -1207,7 +1207,7 @@ mod tests {
                 .documents
                 .get(&uri)
                 .map(|doc| {
-                    doc.publish_snapshot(std::sync::Arc::new(
+                    doc.publish_snapshot(&std::sync::Arc::new(
                         crate::document::snapshot::ParseSnapshot {
                             text: std::sync::Arc::from(text),
                             tree: Some(tree.clone()),
@@ -1450,7 +1450,7 @@ mod tests {
             .documents
             .get(&uri)
             .map(|doc| {
-                doc.publish_snapshot(std::sync::Arc::new(
+                doc.publish_snapshot(&std::sync::Arc::new(
                     crate::document::snapshot::ParseSnapshot {
                         text: std::sync::Arc::from(text),
                         // With a tree: a tree-less snapshot would not be
@@ -1619,7 +1619,7 @@ mod tests {
             .documents
             .get(&uri)
             .map(|doc| {
-                doc.publish_snapshot(std::sync::Arc::new(
+                doc.publish_snapshot(&std::sync::Arc::new(
                     crate::document::snapshot::ParseSnapshot {
                         text: std::sync::Arc::from(text),
                         tree: Some(tree),
