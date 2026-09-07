@@ -92,6 +92,7 @@ pub(crate) struct InjectionDiscovery {
 /// (a runnable bridge server), two views of one resolution — the
 /// bridge-downstream region list and the whole-document resolved regions.
 /// All ride the `ParseSnapshot` the parse publishes.
+#[derive(Default)]
 pub(crate) struct PopulatedInjections {
     pub(crate) discovery: Option<std::sync::Arc<crate::document::DiscoveredInjections>>,
     /// Both resolution views, or unavailable when resolution was skipped.

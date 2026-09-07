@@ -172,6 +172,12 @@ no populate pass produces. `None` means unavailable (also after skipped or
 cancelled resolution), not a promise that a later publish will complete it.
 A present pair of empty vectors means the query established no regions.
 
+Store readers share the same lifetime/version/generation gate for both region
+views. Readers already bound to a snapshot validate its regions' generation on
+that snapshot instead of looking up the store again: a new publish must never
+pair the old text/tree with new regions. Generation mismatch preserves inline
+fallback rather than turning an unavailable result into a definitive empty one.
+
 - **Incarnation-scoped, strict monotonicity.** The `>` is strict — equal-version
   double-publishes (e.g. a racing open-parse and reparse both at version 0) must
   not swap the `Tree` under an already-issued `result_id` and fire a spurious

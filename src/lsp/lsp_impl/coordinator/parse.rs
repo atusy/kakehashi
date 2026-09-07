@@ -2,7 +2,7 @@ use crate::document::DocumentStore;
 use crate::document::model::IncrementalSeed;
 use crate::language::{DocumentParserPool, LanguageCoordinator};
 use crate::lsp::bridge::BridgeCoordinator;
-use crate::lsp::cache::CacheCoordinator;
+use crate::lsp::cache::{CacheCoordinator, PopulatedInjections};
 use crate::lsp::client::ClientNotifier;
 use tower_lsp_server::Client;
 use url::Url;
@@ -23,7 +23,7 @@ struct SnapshotInputs {
 impl SnapshotInputs {
     fn snapshot(
         &self,
-        regions: PopulatedSnapshotRegions,
+        regions: PopulatedInjections,
     ) -> std::sync::Arc<crate::document::snapshot::ParseSnapshot> {
         std::sync::Arc::new(crate::document::snapshot::ParseSnapshot {
             text: std::sync::Arc::clone(&self.text),
@@ -52,16 +52,6 @@ impl InstallCheck {
             Self::Expect(language) => crate::document::LanguageCheck::Expect(language.as_deref()),
         }
     }
-}
-
-/// Everything one populate pass derives for the snapshot it rides on
-/// (parse-snapshot ADR §3): all `None` when the pool work-unit panicked or
-/// populate's own epoch/lifetime guard committed nothing — readers then fall
-/// back to inline resolution for that snapshot.
-#[derive(Default)]
-struct PopulatedSnapshotRegions {
-    discovery: Option<std::sync::Arc<crate::document::DiscoveredInjections>>,
-    regions: Option<crate::document::snapshot::ResolvedRegions>,
 }
 
 /// Keep the historical publish outcome separate from the verdict after the
@@ -402,7 +392,7 @@ impl ParseCoordinator {
                 .install_parse(
                     uri,
                     check.as_check(),
-                    inputs.snapshot(PopulatedSnapshotRegions::default()),
+                    inputs.snapshot(PopulatedInjections::default()),
                 )
                 .into();
         };
@@ -440,9 +430,9 @@ impl ParseCoordinator {
                             inputs.parsed_version,
                             discovered.generation
                         );
-                        let snapshot = inputs.snapshot(PopulatedSnapshotRegions {
+                        let snapshot = inputs.snapshot(PopulatedInjections {
                             discovery: discovered.discovery,
-                            ..PopulatedSnapshotRegions::default()
+                            ..PopulatedInjections::default()
                         });
                         let installed = documents.install_parse(
                             &pool_uri,
@@ -460,12 +450,7 @@ impl ParseCoordinator {
                 // ran-and-empty shape instead would publish "no injections"
                 // for a pass that never derived anything, blanking the
                 // document's injections until the next parse.
-                populated.map_or_else(PopulatedSnapshotRegions::default, |populated| {
-                    PopulatedSnapshotRegions {
-                        discovery: populated.discovery,
-                        regions: populated.regions,
-                    }
-                })
+                populated.unwrap_or_default()
             }
         })
         .await

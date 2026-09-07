@@ -155,18 +155,11 @@ impl InjectionCoordinator {
         // downstream runs right after the publish, so it virtually always is;
         // a raced edit falls back to the inline resolution below (which reads
         // the live tree, exactly as before).
-        if let Some(view) = self.documents.latest_snapshot(uri)
-            && let Some(snapshot) = &view.slot.snapshot
-            && snapshot.parsed_version == view.content_version
-            && let Some(regions) = &snapshot.regions
-            // Generation gate (like resolved_regions): a reload can change
-            // the injection query without a new snapshot — consuming the old
-            // query's regions would open/update virtual documents the new
-            // query would not discover. Mismatch falls back inline below.
-            && regions.generation == self.cache.semantic_token_generation()
+        if let Some(regions) = self
+            .documents
+            .current_bridge_regions(uri, self.cache.semantic_token_generation())
         {
             let regions = regions
-                .bridge
                 .iter()
                 .map(|region| BridgeInjection {
                     language: region.language.clone(),

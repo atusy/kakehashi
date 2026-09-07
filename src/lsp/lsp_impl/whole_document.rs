@@ -117,22 +117,19 @@ impl Kakehashi {
             // regions. Snapshot immutability makes tree, text, and regions
             // one value; absent/reload-stale falls back inline over the same
             // tree.
-            let all_regions = match snapshot
-                .regions
-                .as_ref()
-                .filter(|regions| regions.generation == self.cache.semantic_token_generation())
-            {
-                Some(regions) => std::sync::Arc::clone(&regions.whole_document),
-                None => std::sync::Arc::new(InjectionResolver::resolve_all(
-                    &self.language,
-                    self.bridge.node_tracker(),
-                    &uri,
-                    snapshot_tree,
-                    &snapshot.text,
-                    injection_query.as_ref(),
-                    snapshot.incarnation,
-                )),
-            };
+            let all_regions =
+                match snapshot.regions_for_generation(self.cache.semantic_token_generation()) {
+                    Some(regions) => std::sync::Arc::clone(&regions.whole_document),
+                    None => std::sync::Arc::new(InjectionResolver::resolve_all(
+                        &self.language,
+                        self.bridge.node_tracker(),
+                        &uri,
+                        snapshot_tree,
+                        &snapshot.text,
+                        injection_query.as_ref(),
+                        snapshot.incarnation,
+                    )),
+                };
 
             if all_regions.is_empty() {
                 return Ok(None);

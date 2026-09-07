@@ -645,14 +645,33 @@ impl DocumentStore {
         uri: &Url,
         current_generation: u64,
     ) -> Option<std::sync::Arc<Vec<crate::language::injection::ResolvedInjection>>> {
+        self.current_region_views(uri, current_generation)
+            .map(|regions| regions.whole_document)
+    }
+
+    /// The same currency/generation gate for bridge lifecycle readers.
+    pub(crate) fn current_bridge_regions(
+        &self,
+        uri: &Url,
+        current_generation: u64,
+    ) -> Option<Arc<Vec<super::DiscoveredBridgeRegion>>> {
+        self.current_region_views(uri, current_generation)
+            .map(|regions| regions.bridge)
+    }
+
+    fn current_region_views(
+        &self,
+        uri: &Url,
+        current_generation: u64,
+    ) -> Option<super::snapshot::ResolvedRegions> {
         let view = self.latest_snapshot(uri)?;
         let snapshot = view.slot.snapshot?;
-        if snapshot.parsed_version != view.content_version {
+        if snapshot.incarnation != view.slot.current_incarnation
+            || snapshot.parsed_version != view.content_version
+        {
             return None;
         }
-        let regions = snapshot.regions.as_ref()?;
-        (regions.generation == current_generation)
-            .then(|| std::sync::Arc::clone(&regions.whole_document))
+        snapshot.regions_for_generation(current_generation).cloned()
     }
 
     /// Subscribe to `uri`'s snapshot-slot changes for a **bounded** wait (the
@@ -1270,6 +1289,81 @@ mod tests {
             store.get(&uri).is_none() && !store.parse_states.contains_key(&uri),
             "an install into a closed document must not resurrect it or its parse state"
         );
+    }
+
+    #[test]
+    fn both_region_readers_distinguish_unavailable_empty_and_stale() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///region-readers.md").unwrap();
+        let text: Arc<str> = Arc::from("# doc\n");
+        let incarnation =
+            store.insert(uri.clone(), text.to_string(), Some("markdown".into()), None);
+        let version = store.get(&uri).unwrap().content_version();
+        let first = parse_snapshot(&text, Some(markdown_tree(&text)), version, incarnation);
+        assert!(
+            store
+                .install_parse(&uri, LanguageCheck::Record, Arc::clone(&first))
+                .current
+        );
+        assert!(store.current_bridge_regions(&uri, 1).is_none());
+        assert!(store.current_resolved_regions(&uri, 1).is_none());
+        assert!(store.complete_parse(
+            &uri,
+            LanguageCheck::Record,
+            &first,
+            Some(super::super::snapshot::ResolvedRegions::empty(1))
+        ));
+        assert!(store.current_bridge_regions(&uri, 1).unwrap().is_empty());
+        assert!(store.current_resolved_regions(&uri, 1).unwrap().is_empty());
+        assert!(store.current_bridge_regions(&uri, 2).is_none());
+        assert!(store.current_resolved_regions(&uri, 2).is_none());
+        let bound = store.latest_snapshot(&uri).unwrap().slot.snapshot.unwrap();
+        store.update_document(uri.clone(), "# edited\n".into(), None);
+        assert!(store.current_bridge_regions(&uri, 1).is_none());
+        assert!(store.current_resolved_regions(&uri, 1).is_none());
+        assert!(
+            bound.regions_for_generation(1).is_some(),
+            "snapshot-bound reads keep their own regions"
+        );
+        assert!(
+            bound.regions_for_generation(2).is_none(),
+            "even a bound read rejects reload-stale regions"
+        );
+    }
+
+    #[test]
+    fn completion_cannot_overwrite_a_newer_published_tree() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///newer-tree.md").unwrap();
+        let text: Arc<str> = Arc::from("# doc\n");
+        let incarnation =
+            store.insert(uri.clone(), text.to_string(), Some("markdown".into()), None);
+        let version = store.get(&uri).unwrap().content_version();
+        let first = parse_snapshot(&text, Some(markdown_tree(&text)), version, incarnation);
+        assert!(
+            store
+                .install_parse(&uri, LanguageCheck::Record, Arc::clone(&first))
+                .current
+        );
+        let edited: Arc<str> = Arc::from("# edited\n");
+        store.update_document(uri.clone(), edited.to_string(), None);
+        let version = store.get(&uri).unwrap().content_version();
+        let newer = parse_snapshot(&edited, Some(markdown_tree(&edited)), version, incarnation);
+        assert!(
+            store
+                .install_parse(&uri, LanguageCheck::Record, Arc::clone(&newer))
+                .current
+        );
+        for regions in [
+            None,
+            Some(super::super::snapshot::ResolvedRegions::empty(1)),
+        ] {
+            assert!(!store.complete_parse(&uri, LanguageCheck::Record, &first, regions));
+            assert!(Arc::ptr_eq(
+                &newer,
+                &store.latest_snapshot(&uri).unwrap().slot.snapshot.unwrap()
+            ));
+        }
     }
 
     #[test]

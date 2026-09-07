@@ -89,6 +89,17 @@ pub(crate) struct ParseSnapshot {
     pub(crate) layer_trees: Arc<std::sync::OnceLock<(u64, Arc<Vec<SnapshotLayerTree>>)>>,
 }
 
+impl ParseSnapshot {
+    /// Read regions belonging to this snapshot only when their settings are
+    /// still current. A reader already bound to a snapshot must not re-read
+    /// the store and pair its tree with a newer snapshot's regions.
+    pub(crate) fn regions_for_generation(&self, generation: u64) -> Option<&ResolvedRegions> {
+        self.regions
+            .as_ref()
+            .filter(|regions| regions.generation == generation)
+    }
+}
+
 /// The bridge and whole-document views of one resolution. They are published
 /// together, so neither presence nor the settings generation can disagree.
 #[derive(Clone)]
