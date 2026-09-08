@@ -58,6 +58,7 @@ impl SnapshotInputs {
 enum InstallCheck {
     Record,
     Expect(Option<String>),
+    RecordIfUnchanged(Option<String>),
 }
 
 impl InstallCheck {
@@ -65,6 +66,9 @@ impl InstallCheck {
         match self {
             Self::Record => crate::document::LanguageCheck::Record,
             Self::Expect(language) => crate::document::LanguageCheck::Expect(language.as_deref()),
+            Self::RecordIfUnchanged(language) => {
+                crate::document::LanguageCheck::RecordIfUnchanged(language.as_deref())
+            }
         }
     }
 }
@@ -484,7 +488,17 @@ impl ParseCoordinator {
                 let current_at_completion = initial_install.published
                     && self.documents.complete_parse(
                         uri,
-                        check.as_check(),
+                        if initial_install.current
+                            && matches!(&*check, InstallCheck::RecordIfUnchanged(_))
+                        {
+                            // The first publish refined the provisional label.
+                            // Regions must validate the label that publish stored.
+                            crate::document::LanguageCheck::Expect(
+                                first_snapshot.language.as_deref(),
+                            )
+                        } else {
+                            check.as_check()
+                        },
                         first_snapshot,
                         regions.regions,
                     );
@@ -1072,7 +1086,11 @@ impl ParseCoordinator {
             let installed = self
                 .populate_and_install(
                     uri,
-                    InstallCheck::Expect(language_id.clone()),
+                    if language_id.is_none() {
+                        InstallCheck::RecordIfUnchanged(None)
+                    } else {
+                        InstallCheck::Expect(language_id.clone())
+                    },
                     SnapshotInputs {
                         text: text.clone(),
                         tree,

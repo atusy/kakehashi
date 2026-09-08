@@ -72,7 +72,9 @@ gates:
 - **Language detection is split by layer.** The input `language_id` starts as the
   client-declared LSP `languageId` that `didOpen` records. In the current
   store-backed path, an open parse can still write the detected language back to
-  `Document::language_id`; the snapshot architecture separates that refinement by
+  `Document::language_id`. A current edit parse can also establish an unlabelled
+  document's language atomically with its tree publication; a stale parse cannot.
+  The snapshot architecture separates the parser result by
   recording the parse result as the snapshot's own **derived** `language`. The
   snapshot carries the more-accurate detected language, and readers use the
   snapshot's value instead of requiring a relabelled input document.
@@ -191,15 +193,15 @@ fallback rather than turning an unavailable result into a definitive empty one.
   still checks `incarnation == current_incarnation` (it is not an unconditional
   early-return), so a straggler publish from lifetime N is rejected against N+1 and
   the version compare is only ever within one lifetime.
-- **Language axis** is subsumed by incarnation for the *stored label*: every
-  reopen draws a fresh incarnation (so a relabel across lifetimes is already
-  rejected), and within one lifetime `Document::language_id` does not change —
-  the reparses' `LanguageCheck::Expect` guards exactly that. The *detected*
-  language a snapshot carries may still move within a lifetime (detection re-runs
-  on the edited text: a rewritten shebang), which is why the seed is bound to
-  the snapshot's grammar independently. The three-axis edit-path CAS
-  (`incarnation && text && language`) therefore reduces to `incarnation && version`
-  for admission, plus the language check on install.
+- **Language checks guard captured input labels as well as incarnation.** Every
+  reopen draws a fresh incarnation. Reparses preserve established labels with
+  `LanguageCheck::Expect`; an unlabelled edit uses `RecordIfUnchanged(None)` so
+  its current publish can establish the detected language without overwriting a
+  concurrent refinement. After such a publish, regions completion validates the
+  newly stored label, along with the exact first-published snapshot identity.
+  A stale publish records no label and completion keeps the original expectation.
+  The snapshot's detected language can still move with edited content (such as
+  a rewritten shebang), so incremental seeds remain bound to its grammar.
 - **Isolation is per-request re-resolution + incarnation validation, not cell identity.** A `latest_snapshot(uri)` call resolves the *current* cell from the
   store each time and never caches a `Receiver` across requests, and it validates
   `snapshot.incarnation == <live document incarnation>` before serving. To keep that
@@ -690,10 +692,10 @@ inside the existing safety contracts at each step:
   `didClose` removed. (It is *not* closed by Stage 1, which leaves the current
   inline-parse fallbacks — `try_parse_and_update_document`, `selection_range_impl` —
   in place; those are the vector, and they are removed in Stage 2.)
-- Latent language-detection staleness is closed as a side effect:
-  `ParseSnapshot.language` carries the *parse's* detected language, so readers
-  see the refined language without depending on `Document::language_id` being
-  rewritten or requiring a re-`didOpen`.
+- Snapshot readers see the parse's detected language directly through
+  `ParseSnapshot.language`. Store-label readers, including host bridge routing,
+  additionally need a current publish to refine an unlabelled document when the
+  open parse lost to an edit.
 - State and coupling shrink: two `watch` maps collapse to one, six store CAS /
   watermark methods to one publish primitive (tree writes done — `install_parse`;
   watermark advances pending), and the `pending_seed` invariant

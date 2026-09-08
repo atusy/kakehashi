@@ -708,6 +708,9 @@ pub(crate) enum LanguageCheck<'a> {
     /// is rejected — a tree from the old grammar must not reach a relabelled
     /// reopen — and the stored language is left as it is.
     Expect(Option<&'a str>),
+    /// Refine a provisional label only when it still matches the captured input
+    /// and the snapshot is current. Configured labels use `Expect` instead.
+    RecordIfUnchanged(Option<&'a str>),
 }
 
 /// The outcome of [`DocumentStore::install_parse`].
@@ -744,7 +747,8 @@ impl DocumentStore {
         regions: Option<super::snapshot::ResolvedRegions>,
     ) -> bool {
         let current_at_completion = self.documents.get_mut(uri).is_some_and(|doc| {
-            if let LanguageCheck::Expect(language) = language
+            if let LanguageCheck::Expect(language) | LanguageCheck::RecordIfUnchanged(language) =
+                language
                 && doc.language_id() != language
             {
                 return false;
@@ -796,40 +800,46 @@ impl DocumentStore {
         // dropping a tree (and its layer trees, its region vectors) is not
         // free, and the shard's readers would wait on it otherwise.
         let mut evicted = None;
-        let outcome = self
-            .documents
-            .get_mut(uri)
-            .map_or_else(ParseInstall::default, |mut doc| {
-                evicted = doc.latest_snapshot_slot().snapshot;
-                if let LanguageCheck::Expect(expected) = language
-                    && doc.language_id() != expected
-                {
-                    return ParseInstall::default();
-                }
-                let parsed_current_version = snapshot.parsed_version == doc.content_version();
-                let detected = snapshot.language.clone();
-                // Read before the publish, under the same guard: the held
-                // snapshot is what this publish upgrades, if anything.
-                let fills_placeholder = has_tree
-                    && evicted.as_ref().is_some_and(|held| {
-                        held.parsed_version == version
-                            && held.incarnation == incarnation
-                            && held.tree.is_none()
-                    });
-                let published = doc.publish_snapshot(&snapshot);
-                let current = published && parsed_current_version;
-                // The reparses do not relabel (the snapshot carries the
-                // detected name for its own readers); only the open parse
-                // records what it detected.
-                if current && matches!(language, LanguageCheck::Record) {
-                    doc.record_language(detected);
-                }
-                ParseInstall {
-                    current,
-                    published,
-                    tree_upgrade: published && fills_placeholder,
-                }
-            });
+        let outcome =
+            self.documents
+                .get_mut(uri)
+                .map_or_else(ParseInstall::default, |mut doc| {
+                    evicted = doc.latest_snapshot_slot().snapshot;
+                    if let LanguageCheck::Expect(expected)
+                    | LanguageCheck::RecordIfUnchanged(expected) = language
+                        && doc.language_id() != expected
+                    {
+                        return ParseInstall::default();
+                    }
+                    let parsed_current_version = snapshot.parsed_version == doc.content_version();
+                    let detected = snapshot.language.clone();
+                    // Read before the publish, under the same guard: the held
+                    // snapshot is what this publish upgrades, if anything.
+                    let fills_placeholder = has_tree
+                        && evicted.as_ref().is_some_and(|held| {
+                            held.parsed_version == version
+                                && held.incarnation == incarnation
+                                && held.tree.is_none()
+                        });
+                    let published = doc.publish_snapshot(&snapshot);
+                    let current = published && parsed_current_version;
+                    // A provisional label is refined atomically with the current
+                    // tree. A stale publish must not establish language for an edit
+                    // whose own detection may have selected a different grammar.
+                    if current
+                        && matches!(
+                            language,
+                            LanguageCheck::Record | LanguageCheck::RecordIfUnchanged(_)
+                        )
+                    {
+                        doc.record_language(detected);
+                    }
+                    ParseInstall {
+                        current,
+                        published,
+                        tree_upgrade: published && fills_placeholder,
+                    }
+                });
         // Likewise a rejected `snapshot` (still owned here: the publish
         // borrows) — destroyed only after the guard is released.
         drop(evicted);

@@ -1466,6 +1466,26 @@ print("hello")
     /// the snapshot is `None` with the tree cleared and valid again once the
     /// reparse restores it.
     #[tokio::test]
+    async fn current_edit_parse_establishes_an_unlabelled_documents_language() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+        let uri = Url::parse("file:///test/unlabelled.rs").unwrap();
+        server
+            .documents
+            .insert(uri.clone(), "fn edited() {}".to_string(), None, None);
+
+        server
+            .parse_coordinator()
+            .reparse_latest(&uri, Some(1))
+            .await;
+
+        let document = server.documents.get(&uri).unwrap();
+        assert!(document.has_current_tree());
+        assert_eq!(document.language_id(), Some("rust"));
+    }
+
+    #[tokio::test]
     async fn diagnostic_snapshot_needs_the_reparsed_tree_not_the_cleared_one() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
