@@ -746,7 +746,7 @@ mod tests {
             .language
             .language_registry_for_parallel()
             .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
-        server
+        let owner_parse = server
             .install_coordinator()
             .reload_language_after_install(
                 "rust",
@@ -761,7 +761,19 @@ mod tests {
             data_dir: std::path::PathBuf::from("/installed"),
         });
 
-        assert!(waiter.await.same_lifetime);
+        let completion = waiter.await;
+        assert!(completion.same_lifetime);
+        assert!(
+            owner_parse
+                .expect("owner produced a parse")
+                .matches(&server.documents.get(&first).unwrap())
+        );
+        assert!(
+            completion
+                .parsed
+                .expect("waiter produced its own parse")
+                .matches(&server.documents.get(&second).unwrap())
+        );
         assert!(server.documents.get(&first).unwrap().tree().is_some());
         assert!(server.documents.get(&second).unwrap().tree().is_some());
     }
@@ -798,7 +810,14 @@ mod tests {
             .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
         drop(claim);
 
-        assert!(waiter.await.same_lifetime);
+        let completion = waiter.await;
+        assert!(completion.same_lifetime);
+        assert!(
+            completion
+                .parsed
+                .expect("takeover produced a parse")
+                .matches(&server.documents.get(&uri).unwrap())
+        );
         assert!(server.documents.get(&uri).unwrap().tree().is_some());
     }
 
