@@ -85,12 +85,13 @@ The common root is that a document's parser readiness and parse scheduling have
 Give a document's parse lifecycle a **single per-document owner that drives the
 parse off the ingress ticket**, realized as a **per-document coalescing parse
 scheduler**: the text stays in the shared document store, and the owner holds only
-the parse-scheduling decision. Pair it with a **single per-document epoch** — the
-pair `(incarnation, ticket)` — that is the one source of truth for ordering,
-resurrection-safety, and parse-staleness: the retained process-wide open
-generation (the incarnation, monotonic across reopen) paired with the ingress
-writer ticket (intra-lifetime wire order), with publication checking those axes
-rather than relying on the `edit_lock` alone for resurrection safety.
+the parse-scheduling decision. Use `(incarnation, ticket)` for wire-order
+readiness: the retained process-wide open generation paired with the ingress
+writer ticket. Snapshot publication instead checks the incarnation and orders
+snapshots by parsed content version; `install_parse` does not receive an ingress
+ticket. A published snapshot is current only when its parsed version equals the
+document's content version. These checks protect publication independently of
+the `edit_lock`, which serializes document registration and teardown.
 
 The owner is deliberately a scheduler rather than a mailbox actor that owns the
 document's text (the actor is Option 4, not chosen; see below). Because
@@ -118,7 +119,7 @@ tree-sitter the accumulated edits since the last parse) and degrades cleanly to 
 full parse otherwise. Incrementality is a performance optimization, never a
 correctness requirement.
 
-### One epoch for ordering, resurrection, and staleness
+### Readiness tickets and snapshot versions share the lifetime guard
 
 The four ad-hoc sequences are really **two axes** of one idea: an *incarnation*
 (which open→close lifetime this is) and an *intra-lifetime ticket* (wire order
@@ -136,8 +137,9 @@ within one open document). The design makes the per-document **epoch** the pair
 - the **ticket** is the ingress writer sequence within the current lifetime,
   plumbed to the handler from the gate.
 
-Two derived quantities read off this one pair; the unification is of the
-*source*, not of a single scalar:
+Readiness and publication share the incarnation, but their intra-lifetime
+coordinates have different jobs. A ticket orders ingress work; a content version
+identifies the text consumed by a parse. They are not interchangeable:
 
 - **Wire order / readiness (reader watermark).** Each mutation stamps its write
   with `(incarnation, ticket)`. The owner publishes a **processed-through
@@ -160,14 +162,18 @@ Two derived quantities read off this one pair; the unification is of the
   required because, with the handler returning at *enqueue*, a bare `has_tree`
   check would be satisfied while the store still holds the **old** tree —
   reintroducing the #342/#374 stale-tree race.
-- **Resurrection-safety (epoch-checked CAS writes).** Every tree write becomes an
-  **atomic, non-inserting** store update checked against the full
-  `(incarnation, ticket)` pair: it no-ops if the document is gone (`Vacant`), the
-  incarnation differs (a reopen happened), or the ticket moved. The check
-  belongs to the tree publication itself, not to separate parse-progress
-  bookkeeping. The owner's parse is one
-  writer; the reader on-demand fallbacks are the others (see below) — the guarantee
-  holds only if **every** store-writing path uses this CAS.
+- **Resurrection-safety (guarded snapshot publication).** Tree publication is an
+  **atomic, non-inserting** store update: it no-ops if the document is gone,
+  the snapshot incarnation differs, the stored language fails the admission
+  check, or the snapshot cell rejects its version/tree transition. The cell
+  orders parsed versions against the held snapshot, not an ingress ticket.
+  An edit can make an otherwise admissible snapshot stale: it may still publish
+  for serve-stale readers, but `install_parse` reports it as current only when
+  `parsed_version == content_version`. The owner's parse and reader on-demand
+  fallbacks must use this publication path. Off-ingress watermark advancement
+  uses `advance_watermark_for_incarnation`, which checks the captured incarnation.
+  The on-ingress `advance_watermark` does not compare an expected incarnation;
+  it relies on the retained ingress gate and lifetime ordering.
 - **Close-then-reopen detection** is the incarnation half: a reopen draws a fresh
   incarnation, so a stale lineage insert or a late parse from the previous
   lifetime fails the incarnation check even though the reopened lifetime's
@@ -391,17 +397,16 @@ scheduler keeps the text in the store in the first place.
 - **Burst coalescing.** A run of edits collapses to one parse over the
   accumulated text, saving the per-edit reparse cost on injection-heavy documents
   (the cost force).
-- **Explicit ordering axes.** Wire-order readiness,
-  resurrection-safety, and parse-staleness key on a single composite epoch
-  `(incarnation, ticket)` — the retained process-wide open generation paired with
-  the ingress ticket — whose per-write check establishes resurrection safety
-  at publication. The incarnation half keeps the epoch monotonic across a reopen even though
-  tickets restart.
+- **Explicit ordering axes.** Wire-order readiness uses `(incarnation, ticket)`;
+  snapshot admission uses the incarnation and parsed-version ordering, while
+  currentness compares the parsed version with the document's content version.
+  The shared incarnation prevents old-lifetime work from affecting a reopen,
+  even though ingress tickets restart.
 - **The install/parse resurrection path is structurally closed** — a close removes
-  the store entry and advances the epoch, so a later parse or shared-install
-  completion finds a stale epoch and its non-inserting write no-ops — without
-  supersede machinery. This holds *provided* every store-writing path, including
-  the reader on-demand fallback, goes through the epoch-checked CAS (see Negative).
+  the store entry and a reopen has a fresh incarnation, so a late parse or
+  shared-install completion cannot publish into the new lifetime. This holds
+  *provided* every snapshot writer, including reader on-demand fallbacks, uses
+  the guarded non-inserting publication path (see Negative).
 - **One owner** for a document's parse-readiness and parse scheduling; the text
   stays in the shared store and the global install stays shared.
 
@@ -415,8 +420,8 @@ scheduler keeps the text in the store in the first place.
   inline.
 - **Resurrection-safety is a multi-site proof obligation.** Because the scheduler
   keeps the concurrent handlers and the reader fallbacks bypass the owner, the
-  epoch-checked write must be applied at *every* store-writing site rather than
-  being a single-consumer invariant — the accepted cost of decomposing instead of
+  incarnation-checked snapshot write must be applied at *every* store-writing
+  site rather than being a single-consumer invariant — the accepted cost of decomposing instead of
   funneling all writes through one actor.
 - **Carefully tuned races must be preserved**: the captures-lineage close ordering
   still rides the retained `edit_lock` (the scheduler keeps it, so no replacement
@@ -428,7 +433,8 @@ scheduler keeps the text in the store in the first place.
   race.
 - **Reader on-demand parse fallbacks must stop being unguarded store writers**
   (`ensure_parsed_for_node_lookup` and analogues): return a private tree or
-  persist through the epoch-checked CAS write, or the resurrection vector reopens.
+  persist through the guarded snapshot publication path, or the resurrection
+  vector reopens.
 - **Injection orchestration must be re-homed** carefully: injected-language
   auto-install through the shared deadline-bounded installer, bridge-server spawn
   fire-and-forget, and bridge `didChange` forwarding kept ordered after the parse.
@@ -451,17 +457,20 @@ collapses to one reparse; install is off-ingress, behind a killable-subprocess
 deadline — compilation re-execs a `__compile-parser` subprocess whose process group
 the installer kills when the deadline fires, with an in-subprocess watchdog that
 group-kills the compile even if the parent dies first. Readers wait on the
-`(incarnation, ticket)` epoch watermark rather than on tree presence. Every tree
-write is the one non-inserting `install_parse`: the cell admits a snapshot only
-for the captured incarnation and a newer version — or the same version when the
-incoming snapshot brings a tree the held one lacks, which is how a reparse fills
-in a reload placeholder or a give-up snapshot instead of leaving the document
-tree-less until the next edit, or when it brings bridge / resolved regions the
-held tree-bearing one lacks, which is how a parse's second install lands the
-resolution after its first already released the readers — the reparse's language check
-rejects a relabelled document, and the watermark advance is incarnation-guarded, so a
-close-then-reopen during an in-flight parse fails its epoch check at the write
-rather than resurrecting the closed document. Injection orchestration runs
+`(incarnation, ticket)` epoch watermark rather than on tree presence. New tree
+snapshots pass through the non-inserting `install_parse`: the cell requires the
+captured incarnation and accepts bootstrap, a newer parsed version without tree
+downgrade, or a same-version tree upgrade over a tree-less placeholder. The
+language admission check runs under the document entry lock. Publication may
+retain a stale-but-consistent snapshot; currentness additionally requires the
+current content version. Region completion uses the separate `enrich_regions`
+path, which requires pointer identity with the exact published snapshot instead
+of replacing its tree. Off-ingress `advance_watermark_for_incarnation` validates
+the incarnation and advances the ingress ticket monotonically. On-ingress
+`advance_watermark` advances the ticket without checking an expected incarnation;
+its caller relies on the ingress gate's lifetime ordering. Late off-ingress work
+from a closed or reopened lifetime is rejected by the publication and guarded
+watermark paths' incarnation checks. Injection orchestration runs
 downstream of the parse, off the ingress path. The text-owning actor of Option 4 is
 not pursued; see Considered Options.
 
