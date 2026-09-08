@@ -375,62 +375,159 @@ pub(crate) fn collect_all_injections_cancellable<'a>(
     injection_query: Option<&Query>,
     cancel: Option<&crate::cancel::CancelToken>,
 ) -> Option<Vec<InjectionRegionInfo<'a>>> {
+    let query = injection_query?;
+    if root.byte_range().len() >= 64 * 1024
+        && rayon::current_thread_index().is_some()
+        && rayon::current_num_threads() > 1
+        && let Some(regions) = try_collect_partitioned(root, text, query, cancel)
+    {
+        return Some(regions);
+    }
+    collect_query_roots(std::slice::from_ref(root), text, query, None, cancel)
+}
+
+// Partition only local, single-root patterns. Root-starting matches still run
+// against the whole tree so captures spanning siblings retain their context.
+fn try_collect_partitioned<'a>(
+    root: &Node<'a>,
+    text: &str,
+    query: &Query,
+    cancel: Option<&crate::cancel::CancelToken>,
+) -> Option<Vec<InjectionRegionInfo<'a>>> {
+    use rayon::prelude::*;
+
+    if crate::cancel::is_cancelled(cancel)
+        || (0..query.pattern_count())
+            .any(|i| !query.is_pattern_rooted(i) || query.is_pattern_non_local(i))
+    {
+        return None;
+    }
+    let mut walk = root.walk();
+    let mut children = Vec::new();
+    let mut work_items = 0;
+    for child in root.children(&mut walk) {
+        if crate::cancel::is_cancelled_periodically(cancel, &mut work_items) {
+            return None;
+        }
+        children.push(child);
+    }
+    if children.len() < 2 {
+        return None;
+    }
+    let chunk_size = children.len().div_ceil(2 * rayon::current_num_threads());
+    let (root_regions, child_regions) = rayon::join(
+        || collect_query_roots(std::slice::from_ref(root), text, query, Some(0), cancel),
+        || {
+            children
+                .par_chunks(chunk_size)
+                .map(|chunk| collect_query_roots(chunk, text, query, None, cancel))
+                .collect::<Option<Vec<_>>>()
+        },
+    );
+    let mut regions = root_regions?;
+    for chunk in child_regions? {
+        if crate::cancel::is_cancelled(cancel) {
+            return None;
+        }
+        regions.extend(chunk);
+    }
+    let key = |r: &InjectionRegionInfo<'_>| {
+        (
+            r.content_node.start_byte(),
+            r.content_node.end_byte(),
+            r.pattern_index,
+        )
+    };
+    regions.sort_by(|a, b| {
+        key(a)
+            .cmp(&key(b))
+            .then_with(|| a.language.cmp(&b.language))
+    });
+    // A root and its descendant can cover identical bytes. Preserve the serial
+    // cursor's first-match choice (including node identity and directives) by
+    // abandoning partitioning whenever independent cursors collide.
+    for pair in regions.windows(2) {
+        if crate::cancel::is_cancelled_periodically(cancel, &mut work_items)
+            || (key(&pair[0]) == key(&pair[1]) && pair[0].language == pair[1].language)
+        {
+            return None;
+        }
+    }
+    if crate::cancel::is_cancelled(cancel) {
+        None
+    } else {
+        Some(regions)
+    }
+}
+
+fn collect_query_roots<'a>(
+    roots: &[Node<'a>],
+    text: &str,
+    query: &Query,
+    max_start_depth: Option<u32>,
+    cancel: Option<&crate::cancel::CancelToken>,
+) -> Option<Vec<InjectionRegionInfo<'a>>> {
     if crate::cancel::is_cancelled(cancel) {
         return None;
     }
-    let query = injection_query?;
 
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(query, *root, text.as_bytes());
+    cursor.set_max_start_depth(max_start_depth);
 
     // Deduplicate repeated matches of the same language layer while preserving
     // distinct languages assigned to the same content range (#598).
     let mut injections_map = std::collections::HashMap::new();
     let mut work_items = 0;
 
-    while let Some(match_) = matches.next() {
-        if crate::cancel::is_cancelled_periodically(cancel, &mut work_items) {
-            return None;
-        }
-        if !check_match_predicates(query, match_, text) {
-            continue;
-        }
-        let Some(language) = extract_injection_language(query, match_, text) else {
-            continue;
-        };
-        for capture in iter_injection_content_captures(match_, query) {
+    for root in roots {
+        let mut matches = cursor.matches(query, *root, text.as_bytes());
+        while let Some(match_) = matches.next() {
             if crate::cancel::is_cancelled_periodically(cancel, &mut work_items) {
                 return None;
             }
-            if capture.node.start_byte() >= capture.node.end_byte() {
+            if !check_match_predicates(query, match_, text) {
                 continue;
             }
-            let key = (
-                capture.node.start_byte(),
-                capture.node.end_byte(),
-                language.clone(),
-                match_.pattern_index,
-            );
-            // `or_insert_with` so the per-pattern predicate scans
-            // (`has_include_children_for_pattern` / `effective_offset_for_pattern`)
-            // are skipped when this content-node range was already inserted by
-            // an earlier matching pattern for the same language. Same
-            // resulting language layers, fewer scans.
-            injections_map.entry(key).or_insert_with(|| {
-                let offset = runtime_offset_for_capture(query, match_, capture, text);
-                InjectionRegionInfo {
-                    language: language.clone(),
-                    content_node: capture.node,
-                    pattern_index: match_.pattern_index,
-                    include_children: has_include_children_for_pattern(query, match_.pattern_index),
-                    // Combined grouping is independent of runtime range
-                    // adjustment; consumers compose each member's effective
-                    // range into the shared injected document.
-                    combined: has_combined_for_pattern(query, match_.pattern_index),
-                    identity_slot: 0,
-                    offset,
+            let Some(language) = extract_injection_language(query, match_, text) else {
+                continue;
+            };
+            for capture in iter_injection_content_captures(match_, query) {
+                if crate::cancel::is_cancelled_periodically(cancel, &mut work_items) {
+                    return None;
                 }
-            });
+                if capture.node.start_byte() >= capture.node.end_byte() {
+                    continue;
+                }
+                let key = (
+                    capture.node.start_byte(),
+                    capture.node.end_byte(),
+                    language.clone(),
+                    match_.pattern_index,
+                );
+                // `or_insert_with` so the per-pattern predicate scans
+                // (`has_include_children_for_pattern` / `effective_offset_for_pattern`)
+                // are skipped when this content-node range was already inserted by
+                // an earlier matching pattern for the same language. Same
+                // resulting language layers, fewer scans.
+                injections_map.entry(key).or_insert_with(|| {
+                    let offset = runtime_offset_for_capture(query, match_, capture, text);
+                    InjectionRegionInfo {
+                        language: language.clone(),
+                        content_node: capture.node,
+                        pattern_index: match_.pattern_index,
+                        include_children: has_include_children_for_pattern(
+                            query,
+                            match_.pattern_index,
+                        ),
+                        // Combined grouping is independent of runtime range
+                        // adjustment; consumers compose each member's effective
+                        // range into the shared injected document.
+                        combined: has_combined_for_pattern(query, match_.pattern_index),
+                        identity_slot: 0,
+                        offset,
+                    }
+                });
+            }
         }
     }
 
@@ -1489,6 +1586,317 @@ mod tests {
     use rstest::rstest;
     use tree_sitter::{Node, Parser, Query, StreamingIterator};
     use url::Url;
+
+    #[test]
+    #[ignore = "manual discovery attribution probe"]
+    fn discovery_attribution_probe() {
+        use std::time::Instant;
+        let root = std::path::PathBuf::from(std::env::var("DISCOVERY_PROBE_INPUTS").unwrap());
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join("inputs.json")).unwrap())
+                .unwrap();
+        let runtime = std::path::Path::new(manifest["runtime"].as_str().unwrap());
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        for (name, ext) in [("rust", "rs"), ("markdown", "md")] {
+            let mut loader = crate::language::loader::ParserLoader::default();
+            let language = loader
+                .load_language(&runtime.join(format!("parser/{name}.so")), name)
+                .unwrap();
+            let query_text =
+                std::fs::read_to_string(runtime.join(format!("queries/{name}/injections.scm")))
+                    .unwrap();
+            let query = Query::new(&language, &query_text).unwrap();
+            let text = std::fs::read_to_string(root.join(format!("{name}-large.{ext}"))).unwrap();
+            let mut parser = Parser::new();
+            parser.set_language(&language).unwrap();
+            let tree = parser.parse(&text, None).unwrap();
+            assert_discovery_matches_reference(&tree, &text, &query);
+            for mode in [0, 1, 2, 2, 1, 0] {
+                let now = Instant::now();
+                let mut count = 0;
+                for _ in 0..20 {
+                    if mode == 1 {
+                        count += std::hint::black_box(pool.install(|| {
+                            collect_all_injections(&tree.root_node(), &text, Some(&query)).unwrap()
+                        }))
+                        .len();
+                    } else if mode == 2 {
+                        count += std::hint::black_box(
+                            reference_collect_all_injections(
+                                &tree.root_node(),
+                                &text,
+                                Some(&query),
+                                None,
+                            )
+                            .unwrap(),
+                        )
+                        .len();
+                    } else {
+                        let mut cursor = QueryCursor::new();
+                        let mut matches = cursor.matches(&query, tree.root_node(), text.as_bytes());
+                        while let Some(m) = matches.next() {
+                            count += std::hint::black_box(m.captures.len());
+                        }
+                    }
+                }
+                eprintln!(
+                    "{name} mode={mode} elapsed_ms={} count={count}",
+                    now.elapsed().as_secs_f64() * 1000. / 20.
+                );
+            }
+        }
+    }
+
+    fn reference_collect_all_injections<'a>(
+        root: &Node<'a>,
+        text: &str,
+        injection_query: Option<&Query>,
+        cancel: Option<&crate::cancel::CancelToken>,
+    ) -> Option<Vec<InjectionRegionInfo<'a>>> {
+        if crate::cancel::is_cancelled(cancel) {
+            return None;
+        }
+        let query = injection_query?;
+
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(query, *root, text.as_bytes());
+
+        // Deduplicate repeated matches of the same language layer while preserving
+        // distinct languages assigned to the same content range (#598).
+        let mut injections_map = std::collections::HashMap::new();
+        let mut work_items = 0;
+
+        while let Some(match_) = matches.next() {
+            if crate::cancel::is_cancelled_periodically(cancel, &mut work_items) {
+                return None;
+            }
+            if !check_match_predicates(query, match_, text) {
+                continue;
+            }
+            let Some(language) = extract_injection_language(query, match_, text) else {
+                continue;
+            };
+            for capture in iter_injection_content_captures(match_, query) {
+                if crate::cancel::is_cancelled_periodically(cancel, &mut work_items) {
+                    return None;
+                }
+                if capture.node.start_byte() >= capture.node.end_byte() {
+                    continue;
+                }
+                let key = (
+                    capture.node.start_byte(),
+                    capture.node.end_byte(),
+                    language.clone(),
+                    match_.pattern_index,
+                );
+                // `or_insert_with` so the per-pattern predicate scans
+                // (`has_include_children_for_pattern` / `effective_offset_for_pattern`)
+                // are skipped when this content-node range was already inserted by
+                // an earlier matching pattern for the same language. Same
+                // resulting language layers, fewer scans.
+                injections_map.entry(key).or_insert_with(|| {
+                    let offset = runtime_offset_for_capture(query, match_, capture, text);
+                    InjectionRegionInfo {
+                        language: language.clone(),
+                        content_node: capture.node,
+                        pattern_index: match_.pattern_index,
+                        include_children: has_include_children_for_pattern(
+                            query,
+                            match_.pattern_index,
+                        ),
+                        // Combined grouping is independent of runtime range
+                        // adjustment; consumers compose each member's effective
+                        // range into the shared injected document.
+                        combined: has_combined_for_pattern(query, match_.pattern_index),
+                        identity_slot: 0,
+                        offset,
+                    }
+                });
+            }
+        }
+
+        if crate::cancel::is_cancelled(cancel) {
+            return None;
+        }
+
+        // Sort by start_byte (primary) and end_byte (secondary) to ensure deterministic ordering
+        let mut injections: Vec<_> = injections_map.into_values().collect();
+        injections.sort_by(|a, b| {
+            (
+                a.content_node.start_byte(),
+                a.content_node.end_byte(),
+                a.pattern_index,
+                a.language.as_str(),
+            )
+                .cmp(&(
+                    b.content_node.start_byte(),
+                    b.content_node.end_byte(),
+                    b.pattern_index,
+                    b.language.as_str(),
+                ))
+        });
+        for region in &mut injections {
+            // Retain the stable query-position component for discovery tests. The
+            // collision-free language component is allocated later by
+            // `NodeTracker::named_layer_for_incarnation`, where URI lifecycle state
+            // can own and reclaim dynamic language names.
+            region.identity_slot = region.pattern_index;
+        }
+        Some(injections)
+    }
+
+    fn assert_discovery_matches_reference(tree: &Tree, text: &str, query: &Query) {
+        let describe = |regions: Vec<InjectionRegionInfo<'_>>| {
+            regions
+                .into_iter()
+                .map(|r| {
+                    (
+                        r.content_node.id(),
+                        r.content_node.range(),
+                        r.language,
+                        r.pattern_index,
+                        r.identity_slot,
+                        r.include_children,
+                        r.combined,
+                        r.offset,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        if let Some(partitioned) =
+            pool.install(|| try_collect_partitioned(&tree.root_node(), text, query, None))
+        {
+            assert_eq!(
+                describe(partitioned),
+                describe(
+                    reference_collect_all_injections(&tree.root_node(), text, Some(query), None)
+                        .unwrap()
+                )
+            );
+        }
+        assert_eq!(
+            describe(collect_all_injections(&tree.root_node(), text, Some(query)).unwrap()),
+            describe(
+                reference_collect_all_injections(&tree.root_node(), text, Some(query), None)
+                    .unwrap()
+            ),
+        );
+    }
+
+    #[test]
+    fn discovery_preserves_full_query_metadata_and_first_matches() {
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(
+            &language,
+            r#"
+            ((block_comment) @injection.content
+              (#set! injection.language "lua")
+              (#set! injection.include-children "false")
+              (#set! injection.combined))
+            ((block_comment) @injection.content
+              (#set! injection.language "comment")
+              (#offset! @injection.content 0 2 0 -2)
+              (#trim! @injection.content 0 1 0 1))
+            ((string_literal (string_content) @injection.language) @injection.content
+              (#gsub! @injection.language "^lang_" "")
+              (#offset! @injection.content 0 1 0 -1))
+            ((string_literal (string_content) @injection.language) @injection.content
+              (#set! injection.language "static")
+              (#set-lang-from-info-string! @injection.language))
+            ((identifier) @injection.content
+              (#contains? @injection.content "value")
+              (#set! injection.language "rust"))
+            ((block_comment) @injection.content
+              (#offset! @injection.content 0 -1 0 1)
+              (#set! injection.language "expanded"))
+            ((block_comment) @injection.content
+              (#offset! @injection.content "bad")
+              (#set! injection.language "malformed"))
+            ((call_expression arguments: (arguments
+              (identifier) @helper (identifier)* @injection.content))
+              (#set! injection.language "duplicate"))
+        "#,
+        )
+        .unwrap();
+        let text = "/*  comment  */\nfn main() { let value = \"lang_lua\"; call(a, b, c, d); }\n";
+        let tree = create_rust_parser().parse(text, None).unwrap();
+        assert_discovery_matches_reference(&tree, text, &query);
+        assert!(
+            collect_all_injections(&tree.root_node(), text, Some(&query))
+                .unwrap()
+                .len()
+                >= 10
+        );
+    }
+
+    #[test]
+    fn discovery_metadata_is_scoped_to_each_query_and_edited_tree() {
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let queries: Vec<_> = ["lua", "comment"].into_iter().map(|name| Query::new(&language,
+            &format!("((block_comment) @injection.content (#set! injection.language \"{name}\") (#offset! @injection.content 0 2 0 -2))")
+        ).unwrap()).collect();
+        let mut parser = create_rust_parser();
+        let mut text = "/* original */\nfn main() {}\n".to_string();
+        let mut tree = parser.parse(&text, None).unwrap();
+        for replacement in ["/* edited */", "\n/* shifted */", "", "/* reopened */"] {
+            // Replace the prefix before the function, including any newline.
+            let old_end = text.find("fn main").unwrap();
+            let old_end_position =
+                tree_sitter::Point::new(text[..old_end].bytes().filter(|b| *b == b'\n').count(), 0);
+            let inserted = format!("{replacement}\n");
+            let new_end_position =
+                tree_sitter::Point::new(inserted.bytes().filter(|b| *b == b'\n').count(), 0);
+            tree.edit(&tree_sitter::InputEdit {
+                start_byte: 0,
+                old_end_byte: old_end,
+                new_end_byte: inserted.len(),
+                start_position: tree_sitter::Point::new(0, 0),
+                old_end_position,
+                new_end_position,
+            });
+            text.replace_range(..old_end, &inserted);
+            tree = parser.parse(&text, Some(&tree)).unwrap();
+            for query in &queries {
+                assert_discovery_matches_reference(&tree, &text, query);
+            }
+            // A fresh lifetime/tree must not retain query metadata from the preceding pass.
+            let fresh = parser.parse(&text, None).unwrap();
+            for query in &queries {
+                assert_discovery_matches_reference(&fresh, &text, query);
+            }
+        }
+    }
+
+    #[test]
+    fn rooted_local_query_can_use_partitioned_discovery() {
+        let text = "/* first */\nfn main() {}\n/* second */";
+        let mut parser = create_rust_parser();
+        let tree = parser.parse(text, None).unwrap();
+        let query = Query::new(
+            &tree_sitter_rust::LANGUAGE.into(),
+            "((block_comment) @injection.content (#set! injection.language \"comment\"))",
+        )
+        .unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let regions =
+            pool.install(|| try_collect_partitioned(&tree.root_node(), text, &query, None));
+        assert_eq!(
+            regions
+                .expect("a rooted local query can be partitioned")
+                .len(),
+            2
+        );
+    }
 
     fn create_rust_parser() -> Parser {
         let mut parser = Parser::new();
