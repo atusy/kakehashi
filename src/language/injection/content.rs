@@ -93,6 +93,64 @@ pub(super) fn compute_line_column_offsets(
     }
 }
 
+/// Remove common leading ASCII indentation from a bridge virtual document.
+///
+/// Only spaces and tabs participate. Blank lines do not constrain the common
+/// indent, but up to that many leading whitespace characters are removed from
+/// them too. Newline spelling and line count are preserved. `line_column_offsets`
+/// is extended as needed and incremented by the UTF-16 width removed from each
+/// line so virtual positions continue to translate to the original host text.
+pub(super) fn dedent_virtual_content(
+    content: String,
+    mut line_column_offsets: Vec<u32>,
+) -> (String, Vec<u32>) {
+    if content.is_empty() {
+        if line_column_offsets.is_empty() {
+            line_column_offsets.push(0);
+        }
+        return (content, line_column_offsets);
+    }
+
+    fn body_without_eol(line: &str) -> &str {
+        let without_lf = line.strip_suffix('\n').unwrap_or(line);
+        without_lf.strip_suffix('\r').unwrap_or(without_lf)
+    }
+
+    let physical_lines: Vec<&str> = content.split_inclusive('\n').collect();
+    let logical_line_count = physical_lines.len() + usize::from(content.ends_with('\n'));
+
+    let common = physical_lines
+        .iter()
+        .filter_map(|line| {
+            let body = body_without_eol(line);
+            let indent = body
+                .bytes()
+                .take_while(|byte| matches!(byte, b' ' | b'\t'))
+                .count();
+            (indent < body.len()).then_some(indent)
+        })
+        .min()
+        .unwrap_or(0);
+
+    line_column_offsets.resize(logical_line_count.max(1), 0);
+    if common == 0 {
+        return (content, line_column_offsets);
+    }
+
+    let mut output = String::with_capacity(content.len());
+    for (index, line) in physical_lines.iter().enumerate() {
+        let removable = line
+            .bytes()
+            .take(common)
+            .take_while(|byte| matches!(byte, b' ' | b'\t'))
+            .count();
+        output.push_str(&line[removable..]);
+        line_column_offsets[index] = line_column_offsets[index].saturating_add(removable as u32);
+    }
+
+    (output, line_column_offsets)
+}
+
 /// Per-parse wall-clock budget for every native parse that runs on the
 /// bounded compute pool — the single source of truth: the parse
 /// coordinator's `PARSE_TIMEOUT` is defined as this constant, so host and
@@ -573,6 +631,42 @@ mod tests {
             .parse("fn main() {}", None)
             .expect("empty-range skip must leave the parser unrestricted");
         assert_eq!(reparsed.root_node().byte_range(), 0..12);
+    }
+
+    #[test]
+    fn dedent_removes_common_indent_and_extends_offsets() {
+        let (content, offsets) =
+            dedent_virtual_content("    one\n      two\n\n    three\n".to_string(), vec![2]);
+
+        assert_eq!(content, "one\n  two\n\nthree\n");
+        assert_eq!(offsets, vec![6, 4, 0, 4, 0]);
+    }
+
+    #[test]
+    fn dedent_preserves_crlf_and_tabs() {
+        let (content, offsets) =
+            dedent_virtual_content("\t\tone\r\n\t\t\ttwo\r\n".to_string(), Vec::new());
+
+        assert_eq!(content, "one\r\n\ttwo\r\n");
+        assert_eq!(offsets, vec![2, 2, 0]);
+    }
+
+    #[test]
+    fn dedent_ignores_blank_lines_when_finding_common_indent() {
+        let (content, offsets) =
+            dedent_virtual_content("    one\n      \n    two".to_string(), vec![1, 3, 0]);
+
+        assert_eq!(content, "one\n  \ntwo");
+        assert_eq!(offsets, vec![5, 7, 4]);
+    }
+
+    #[test]
+    fn dedent_no_common_indent_keeps_text_and_normalizes_offset_length() {
+        let input = "one\n    two\n".to_string();
+        let (content, offsets) = dedent_virtual_content(input.clone(), vec![3]);
+
+        assert_eq!(content, input);
+        assert_eq!(offsets, vec![3, 0, 0]);
     }
 
     // --- stale-tree hardening: byte offsets that no longer match `text` must
