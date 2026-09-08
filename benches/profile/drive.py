@@ -12,17 +12,53 @@ Usage:
 """
 import argparse
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+import hashlib
 import json
 import math
 import os
+import platform
 import subprocess
 import sys
 import threading
 import time
+from typing import Optional
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gen_session import gen_rust, gen_markdown_injections  # noqa: E402
+
+try:
+    import resource
+except ImportError:  # The LSP driver also runs on Windows.
+    resource = None
+
+
+def children_resources():
+    return resource.getrusage(resource.RUSAGE_CHILDREN) if resource else None
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+PROFILE_DOCUMENT_QUERY = "kakehashi-profile-document"
+
+
+def profile_document_tag(uri):
+    values = parse_qs(urlsplit(uri).query, keep_blank_values=True).get(PROFILE_DOCUMENT_QUERY, [])
+    return values[0] if len(values) == 1 and values[0] else None
+
+
+def tagged_document_uris(uris):
+    # VirtualDocumentUri preserves the host query while replacing its basename.
+    # Tags therefore survive injection routing without changing directory roots.
+    return [urlunsplit(urlsplit(uri)._replace(query=f"{PROFILE_DOCUMENT_QUERY}={index}"))
+            for index, uri in enumerate(uris)]
 
 
 @dataclass(frozen=True)
@@ -31,6 +67,8 @@ class RequestSample:
     wire_bytes: int
     status: str
     completed_at: float = 0.0
+    uri: str = ""
+    token_count: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -85,6 +123,12 @@ def response_status(message: dict) -> str:
     if not error:
         return "null" if "result" in message and message["result"] is None else "ok"
     return "canceled" if error.get("code") == -32800 else "error"
+
+
+def semantic_token_count(method: str, response: dict):
+    if method != "textDocument/semanticTokens/full" or response_status(response) != "ok":
+        return None
+    return len((response.get("result") or {}).get("data", [])) // 5
 
 
 def server_request_result(message: dict):
@@ -159,6 +203,15 @@ def main() -> None:
     ap.add_argument("--lang", choices=["rust", "markdown"], default="rust")
     ap.add_argument("--size", type=int, default=150)
     ap.add_argument("--requests", type=int, default=300)
+    ap.add_argument("--documents", type=int, default=1,
+                    help="edit this many copies before requesting tokens concurrently")
+    ap.add_argument("--tag-document-uris", action="store_true",
+                    help="tag host URIs so controlled peers can associate injection opens")
+    ap.add_argument("--warmup", type=int, default=0,
+                    help="unmeasured cycles before collecting request samples")
+    ap.add_argument("--edit-delay-ms", type=float, default=10,
+                    help="delay after each edit; use 0 for edit-to-response latency")
+    ap.add_argument("--json-output", help="write exact samples and run metadata as JSON")
     ap.add_argument(
         "--burst", type=int, default=1,
         help="send this many semantic-token requests back-to-back per cycle; "
@@ -200,6 +253,8 @@ def main() -> None:
     args = ap.parse_args()
     if args.requests <= 0:
         ap.error("--requests must be positive")  # avoids divide-by-zero in the summary
+    if args.warmup < 0 or args.edit_delay_ms < 0:
+        ap.error("--warmup and --edit-delay-ms must be non-negative")
     if args.burst <= 0:
         ap.error("--burst must be positive")
     if args.burst_edits and args.burst <= 1:
@@ -208,6 +263,10 @@ def main() -> None:
         ap.error("--burst-delay-ms must be non-negative")
     if args.burst > 1 and (args.captures or args.concurrent_captures):
         ap.error("--burst cannot be combined with captures modes")
+    if args.documents <= 0:
+        ap.error("--documents must be positive")
+    if args.documents > 1 and (args.burst > 1 or args.captures or args.concurrent_captures):
+        ap.error("--documents cannot be combined with bursts or captures")
     if args.concurrent_captures:
         args.captures = True
 
@@ -226,14 +285,23 @@ def main() -> None:
     else:
         uri, lang, text = "file:///profile/inj.md", "markdown", gen_markdown_injections(args.size)
 
+    uris = [uri] if args.documents == 1 else [
+        uri.rsplit(".", 1)[0] + f"-{index}." + uri.rsplit(".", 1)[1]
+        for index in range(args.documents)
+    ]
+    if args.tag_document_uris:
+        uris = tagged_document_uris(uris)
+        uri = uris[0]
     env = dict(os.environ, KAKEHASHI_DATA_DIR=args.data_dir)
     # Let the server's stderr through (it's silent unless RUST_LOG is set) so a
     # crash or panic is visible instead of being swallowed during profiling.
+    resources_before = children_resources()
     srv = subprocess.Popen([args.bin, *args.server_arg], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                            env=env)
     rid = 0
     request_samples = defaultdict(list)
     notification_counts = Counter()
+    diagnostic_messages = []
     notification_bytes = Counter()
     server_request_counts = Counter()
     server_request_bytes = Counter()
@@ -279,6 +347,10 @@ def main() -> None:
         method = message.get("method", "<unknown>")
         notification_counts[method] += 1
         notification_bytes[method] += wire_bytes
+        if method in ("window/logMessage", "window/showMessage"):
+            params = message.get("params") or {}
+            if params.get("type") in (1, 2):
+                diagnostic_messages.append(params)
 
     def handle_server_method(message, wire_bytes):
         method = message.get("method")
@@ -313,14 +385,18 @@ def main() -> None:
             wire_bytes=wire_bytes,
             status=response_status(response),
             completed_at=completed_at,
+            uri=(params.get("textDocument") or {}).get("uri", ""),
+            token_count=semantic_token_count(method, response),
         ))
         return response
 
     def measured_batch(requests):
         pending = {}
         for method, params in requests:
+            started = time.perf_counter()
             request_id = send_request(method, params)
-            pending[request_id] = (method, time.perf_counter())
+            pending[request_id] = (method, started, params)
+        request_ids = list(pending)
 
         responses = {}
         while pending:
@@ -330,16 +406,18 @@ def main() -> None:
             request_id = message.get("id")
             if request_id not in pending:
                 continue
-            method, started = pending.pop(request_id)
+            method, started, params = pending.pop(request_id)
             completed_at = time.perf_counter()
             request_samples[method].append(RequestSample(
                 seconds=completed_at - started,
                 wire_bytes=wire_bytes,
                 status=response_status(message),
                 completed_at=completed_at,
+                uri=(params.get("textDocument") or {}).get("uri", ""),
+                token_count=semantic_token_count(method, message),
             ))
-            responses[method] = message
-        return responses
+            responses[request_id] = message
+        return [responses[request_id] for request_id in request_ids]
 
     def measured_repeated(method, params, count, before_next=None, delay_seconds=0):
         nonlocal rid
@@ -367,6 +445,8 @@ def main() -> None:
                         wire_bytes=wire_bytes,
                         status=response_status(message),
                         completed_at=completed_at,
+                        uri=(params.get("textDocument") or {}).get("uri", ""),
+                        token_count=semantic_token_count(method, message),
                     ))
                     responses[request_id] = message
             except BaseException as error:
@@ -401,8 +481,9 @@ def main() -> None:
                                                 "tokenTypes": [], "tokenModifiers": [],
                                                 "formats": ["relative"]}}}})
         notify("initialized", {})
-        notify("textDocument/didOpen", {"textDocument": {
-            "uri": uri, "languageId": lang, "version": 1, "text": text}})
+        for document_uri in uris:
+            notify("textDocument/didOpen", {"textDocument": {
+                "uri": document_uri, "languageId": lang, "version": 1, "text": text}})
         if args.settle > 0:
             time.sleep(args.settle)  # let the initial parse settle
 
@@ -428,8 +509,9 @@ def main() -> None:
         # LSP `character` offsets are UTF-16 code units, not Unicode code
         # points — a non-ASCII first line would make the edit range invalid.
         first_line_len = len(text.split("\n", 1)[0].encode("utf-16-le")) // 2
-        t0 = time.time()
+        t0 = time.perf_counter()
         req_times = []
+        edit_response_times = []
         cycle_success_times = []
         line_has_extra = False
 
@@ -439,17 +521,30 @@ def main() -> None:
                 first_line_len, line_has_extra
             )
             version += 1
-            notify("textDocument/didChange", {
-                "textDocument": {"uri": uri, "version": version},
-                "contentChanges": [change],
-            })
+            for document_uri in uris:
+                notify("textDocument/didChange", {
+                    "textDocument": {"uri": document_uri, "version": version},
+                    "contentChanges": [change],
+                })
 
-        for i in range(args.requests):
+        for i in range(args.requests + args.warmup):
+            if i == args.warmup:
+                # Warmup drives the same edits and requests, but no warmup
+                # sample contributes to measured distributions or counters.
+                request_samples.clear()
+                req_times.clear()
+                edit_response_times.clear()
+                cycle_success_times.clear()
+                ok = canceled = superseded = 0
+                sys.stderr.write("[drive] measurement-start\n")
+                sys.stderr.flush()
+                t0 = time.perf_counter()
+            t_cycle = time.perf_counter()
             for j in range(args.edits):
                 # A no-op didChange would be deduped by hashes.
                 send_toggle_edit()
-                # a beat for the off-ingress reparse to run (the profiled work)
-                time.sleep(0.01)
+                if args.edit_delay_ms:
+                    time.sleep(args.edit_delay_ms / 1000)
             t_req = time.perf_counter()
             semantic_sample_start = len(
                 request_samples["textDocument/semanticTokens/full"]
@@ -468,11 +563,16 @@ def main() -> None:
                 # Queue captures first to model an editor whose highlighting work
                 # is already in flight when semantic tokens arrive.
                 responses = measured_batch([*captures_requests, semantic_request])
-                semantic_responses = [responses[semantic_request[0]]]
+                semantic_responses = [responses[-1]]
                 captures_responses = {
-                    method: responses[method]
-                    for method, _ in captures_requests
+                    method: response
+                    for (method, _), response in zip(captures_requests, responses)
                 }
+            elif args.documents > 1:
+                semantic_responses = measured_batch([
+                    (semantic_request[0], {"textDocument": {"uri": document_uri}})
+                    for document_uri in uris
+                ])
             elif args.burst > 1:
                 if args.burst_edits:
                     send_toggle_edit()
@@ -497,6 +597,7 @@ def main() -> None:
                     captures_result_id = next_result_id
                     break
             req_times.append(time.perf_counter() - t_req)
+            edit_response_times.append(time.perf_counter() - t_cycle)
             cycle_semantic_samples = request_samples[
                 "textDocument/semanticTokens/full"
             ][semantic_sample_start:]
@@ -513,7 +614,9 @@ def main() -> None:
             ok += cycle_ok
             canceled += cycle_canceled
             superseded += cycle_superseded
-        elapsed = time.time() - t0
+        elapsed = time.perf_counter() - t0
+        sys.stderr.write("[drive] measurement-end\n")
+        sys.stderr.flush()
 
         request("shutdown", None)
         notify("exit", {})
@@ -525,6 +628,37 @@ def main() -> None:
             srv.kill()
             srv.wait()
 
+    resources_after = children_resources()
+    if args.json_output:
+        binary_sha256 = file_sha256(args.bin)
+        artifact = {
+            "schema_version": 1,
+            "arguments": vars(args),
+            "platform": platform.platform(),
+            "binary_sha256": binary_sha256,
+            "fixture_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "fixture_bytes": len(text.encode("utf-8")),
+            "document_uris": uris,
+            "last_semantic_token_count": tokens,
+            "rust_log": env.get("RUST_LOG", ""),
+            "elapsed_seconds": elapsed,
+            "request_samples": {
+                method: [asdict(sample) for sample in samples]
+                for method, samples in request_samples.items()
+            },
+            "cycle_seconds": edit_response_times,
+            "notification_counts_including_warmup": dict(notification_counts),
+            "server_warnings_and_errors": diagnostic_messages,
+            # The driver launches one server. Child resource usage includes
+            # startup/shutdown and warmup, unlike the measured latency window.
+            "children_user_seconds": (resources_after.ru_utime - resources_before.ru_utime) if resources_after else None,
+            "children_system_seconds": (resources_after.ru_stime - resources_before.ru_stime) if resources_after else None,
+            "children_maxrss_bytes": resources_after.ru_maxrss * (1 if sys.platform == "darwin" else 1024) if resources_after else None,
+            "server_exit_code": srv.returncode,
+        }
+        with open(args.json_output, "w", encoding="utf-8") as output:
+            json.dump(artifact, output, indent=2)
+            output.write("\n")
     n_bytes = len(text.encode("utf-8"))
     n_lines = len(text.splitlines())
     source = (f"file={args.file} ({n_bytes}B/{n_lines}L)"
@@ -533,7 +667,7 @@ def main() -> None:
     measured_responses = sum(len(samples) for samples in request_samples.values())
     sys.stderr.write(f"[drive] first-cycle ms: {firsts}\n")
     sys.stderr.write(
-        f"[drive] lang={lang} {source} cycles={args.requests} burst={args.burst} "
+        f"[drive] lang={lang} {source} documents={args.documents} cycles={args.requests} burst={args.burst} "
         f"responses={measured_responses} "
         f"ok={ok} canceled={canceled} superseded={superseded} tokens/req={tokens} "
         f"wall={elapsed*1000:.0f}ms "

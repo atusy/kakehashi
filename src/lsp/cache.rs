@@ -339,12 +339,26 @@ impl CacheCoordinator {
         };
 
         // Collect all injection regions from the parsed tree
+        let profile_start = log::log_enabled!(target: "kakehashi::profile", log::Level::Debug)
+            .then(std::time::Instant::now);
         let regions = crate::language::injection::collect_all_injections_cancellable(
             &tree.root_node(),
             text,
             Some(injection_query.as_ref()),
             cancel,
-        )?;
+        );
+        if let Some(start) = profile_start {
+            log::debug!(
+                target: "kakehashi::profile",
+                "phase=discovery elapsed_us={} completed={} regions={} bytes={} uri={}",
+                start.elapsed().as_micros(),
+                regions.is_some(),
+                regions.as_ref().map_or(0, Vec::len),
+                text.len(),
+                uri,
+            );
+        }
+        let regions = regions?;
         if crate::cancel::is_cancelled(cancel) {
             return None;
         }
@@ -448,14 +462,28 @@ impl CacheCoordinator {
             // virtual content: the bridge regions and the whole-document
             // resolved regions below are two views of this single pass.
             let resolved = if build_bridge_regions {
+                let profile_start =
+                    log::log_enabled!(target: "kakehashi::profile", log::Level::Debug)
+                        .then(std::time::Instant::now);
                 let resolved = crate::language::injection::InjectionResolver::resolve_from_prebuilt_cancellable(
                     language,
                     &regions,
                     &cacheable_regions,
                     text,
                     cancel,
-                )?;
-                Some(resolved)
+                );
+                if let Some(start) = profile_start {
+                    log::debug!(
+                        target: "kakehashi::profile",
+                        "phase=resolution elapsed_us={} completed={} regions={} bytes={} uri={}",
+                        start.elapsed().as_micros(),
+                        resolved.is_some(),
+                        regions.len(),
+                        text.len(),
+                        uri,
+                    );
+                }
+                Some(resolved?)
             } else {
                 None
             };
