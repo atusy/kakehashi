@@ -447,6 +447,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_open_cannot_register_diagnostics_for_an_edited_document() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+        server.bridge.insert_ready_test_connection("rust_ls").await;
+        let uri = Url::parse("file:///test/stale-open-diagnostic.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn original() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let original = server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("rust"), None, None)
+            .await
+            .expect("open parse completes");
+        server
+            .documents
+            .update_document(uri.clone(), "fn edited() {}".to_string(), None);
+        let edited = server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("rust"), None, None)
+            .await
+            .expect("edited parse completes");
+        assert_eq!(original.incarnation, edited.incarnation);
+        assert_ne!(original.content_version, edited.content_version);
+        assert!(!server.synthetic_diagnostics.has_active_task(&uri));
+
+        spawn_synthetic_diagnostic_for_parse(
+            &server.documents,
+            &server.diagnostic_scheduler(),
+            uri.clone(),
+            original,
+            std::future::ready(()),
+        )
+        .await;
+        assert!(
+            !server.synthetic_diagnostics.has_active_task(&uri),
+            "stale open must not register a task using the edited tree"
+        );
+
+        spawn_synthetic_diagnostic_for_parse(
+            &server.documents,
+            &server.diagnostic_scheduler(),
+            uri.clone(),
+            edited,
+            std::future::ready(()),
+        )
+        .await;
+        assert!(
+            server.synthetic_diagnostics.has_active_task(&uri),
+            "the current parse must be eligible for diagnostic registration"
+        );
+        server.synthetic_diagnostics.remove_document(&uri);
+    }
+
+    #[tokio::test]
     async fn delayed_open_parse_cannot_relabel_a_reopened_document() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
