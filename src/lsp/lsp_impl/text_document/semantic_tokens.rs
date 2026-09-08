@@ -196,34 +196,54 @@ impl Kakehashi {
         supersede: &crate::cancel::CancelToken,
     ) -> TokenSnapshot {
         use crate::lsp::lsp_impl::snapshot_read::{SnapshotWait, TOKEN_SETTLE_BACKSTOP};
-        let wait = self.wait_for_current_snapshot(uri, TOKEN_SETTLE_BACKSTOP);
-        let outcome = match cancel_rx {
-            Some(rx) => {
-                tokio::select! {
-                    biased;
-                    // Fires on $/cancelRequest (and on forwarder teardown,
-                    // which the compute-race arms below treat as cancel too).
-                    _ = rx => return TokenSnapshot::Cancelled,
-                    // Fires when a newer request for this document flips this
-                    // request's tracker token — release the park (and its
-                    // admission slot) instead of computing a discarded result.
-                    _ = supersede.cancelled() => return TokenSnapshot::Superseded,
-                    outcome = wait => outcome,
+        let profile_start = log::log_enabled!(target: "kakehashi::profile", log::Level::Debug)
+            .then(std::time::Instant::now);
+        let result = async {
+            let wait = self.wait_for_current_snapshot(uri, TOKEN_SETTLE_BACKSTOP);
+            let outcome = match cancel_rx {
+                Some(rx) => {
+                    tokio::select! {
+                        biased;
+                        // Fires on $/cancelRequest (and on forwarder teardown,
+                        // which the compute-race arms below treat as cancel too).
+                        _ = rx => return TokenSnapshot::Cancelled,
+                        // Fires when a newer request for this document flips this
+                        // request's tracker token — release the park (and its
+                        // admission slot) instead of computing a discarded result.
+                        _ = supersede.cancelled() => return TokenSnapshot::Superseded,
+                        outcome = wait => outcome,
+                    }
                 }
-            }
-            None => {
-                tokio::select! {
-                    biased;
-                    _ = supersede.cancelled() => return TokenSnapshot::Superseded,
-                    outcome = wait => outcome,
+                None => {
+                    tokio::select! {
+                        biased;
+                        _ = supersede.cancelled() => return TokenSnapshot::Superseded,
+                        outcome = wait => outcome,
+                    }
                 }
+            };
+            match outcome {
+                SnapshotWait::Current(snapshot) => TokenSnapshot::Current(snapshot),
+                SnapshotWait::Stale => TokenSnapshot::Stale,
+                SnapshotWait::Unparsed | SnapshotWait::Gone => TokenSnapshot::Absent,
             }
-        };
-        match outcome {
-            SnapshotWait::Current(snapshot) => TokenSnapshot::Current(snapshot),
-            SnapshotWait::Stale => TokenSnapshot::Stale,
-            SnapshotWait::Unparsed | SnapshotWait::Gone => TokenSnapshot::Absent,
         }
+        .await;
+        if let Some(start) = profile_start {
+            let outcome = match &result {
+                TokenSnapshot::Current(_) => "current",
+                TokenSnapshot::Stale => "stale",
+                TokenSnapshot::Absent => "absent",
+                TokenSnapshot::Cancelled => "cancelled",
+                TokenSnapshot::Superseded => "superseded",
+            };
+            log::debug!(
+                target: "kakehashi::profile",
+                "phase=snapshot_wait elapsed_us={} outcome={} uri={}",
+                start.elapsed().as_micros(), outcome, uri,
+            );
+        }
+        result
     }
 
     pub(crate) async fn semantic_tokens_full_impl(

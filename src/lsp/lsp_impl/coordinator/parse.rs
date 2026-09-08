@@ -397,8 +397,12 @@ impl ParseCoordinator {
     {
         use crate::error::LockResultExt;
 
+        // This is queue + parse + resume time, not isolated parser CPU time.
+        let profile_start = log::log_enabled!(target: "kakehashi::profile", log::Level::Debug)
+            .then(std::time::Instant::now);
         let parser_pool = std::sync::Arc::clone(&self.parser_pool);
         let language_name_owned = language_name.to_string();
+        let profile_uri = profile_start.map(|_| uri.clone());
         let cancel_for_work = cancel.clone();
         let result = tokio::time::timeout(
             PARSE_AWAIT_BACKSTOP,
@@ -447,8 +451,21 @@ impl ParseCoordinator {
                     // tree-less until the next edit). The awaiter above covers
                     // queue + parse with slack, so the result is not dropped.
                     let deadline = std::time::Instant::now() + PARSE_TIMEOUT;
+                    let parse_start = profile_uri.as_ref().map(|_| std::time::Instant::now());
                     let (parser, value) =
                         parse_fn(parser, deadline, attempt != 0, cancel_for_work.as_ref());
+                    if let (Some(start), Some(uri)) = (parse_start, profile_uri.as_ref()) {
+                        log::debug!(
+                            target: "kakehashi::profile",
+                            "phase=parse elapsed_us={} completed={} attempt={} bytes={} language={} uri={}",
+                            start.elapsed().as_micros(),
+                            value.is_some(),
+                            attempt,
+                            text_len,
+                            language_name_owned,
+                            uri,
+                        );
+                    }
                     match parser_pool
                         .lock()
                         .recover_poison("ParseCoordinator::parse_with_pool(release)")
@@ -465,6 +482,17 @@ impl ParseCoordinator {
         )
         .await;
 
+        if let Some(start) = profile_start {
+            log::debug!(
+                target: "kakehashi::profile",
+                "phase=parse_await elapsed_us={} completed={} bytes={} language={} uri={}",
+                start.elapsed().as_micros(),
+                matches!(&result, Ok(Some(Some(_)))),
+                text_len,
+                language_name,
+                uri,
+            );
+        }
         match result {
             // Outer Option: None = the work-unit panicked (logged with its
             // payload by the pool). Inner Option: None = no parser available

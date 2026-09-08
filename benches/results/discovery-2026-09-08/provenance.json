@@ -1,0 +1,50 @@
+{
+  "builds": {
+    "baseline": {
+      "source": "73df422f9c2e16f93a411f5ae5b7c1213a19f2b7",
+      "binary": "/tmp/kakehashi-1068-final-baseline-73df422f9",
+      "sha256": "41dbac8e16b5eac9ae442f9f3ce507b1cc43b4d6f3c676ebe26f0689bae74d02",
+      "build": "cargo build --release --bin kakehashi"
+    },
+    "candidate": {
+      "source": "5fbaf20b79a272996c500fa9cf9264102c3f2f3e",
+      "binary": "/tmp/kakehashi-1068-final-candidate-5fbaf20b7",
+      "sha256": "b5249af6fdd383bbad06e7ea7719c0fd057a178f127c64ba12e15696227f5e23",
+      "build": "cargo build --release --bin kakehashi"
+    },
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14) (built from a source tarball)"
+  },
+  "hardware": {
+    "hw.model": "Mac16,12",
+    "hw.memsize": "34359738368",
+    "hw.ncpu": "10",
+    "machdep.cpu.brand_string": "Apple M4"
+  },
+  "platform": "macOS-26.5.1-arm64-arm-64bit",
+  "query_repository": "https://github.com/nvim-treesitter/nvim-treesitter",
+  "query_commit": "8b98b4470eb326f1c7b50dae79f8c963568e5720",
+  "measurement_harness_commit": "e80b668ff49a42dd07473d014b3be2d8bd8eca19",
+  "notes": [
+    "Exact optimized binaries copied before later source changes.",
+    "Parser and real query assets copied from existing Neovim runtime; only hashes are retained, no parser libraries or query source files committed.",
+    "No own Cargo builds or tests overlapped the authoritative matrix. Ordinary desktop processes remained running; alternating pairs describe workstation noise, not isolated-machine confidence intervals.",
+    "A/B logging disabled; candidate phase logs collected separately."
+  ],
+  "archive": {
+    "filename": "raw-results.tar.gz",
+    "storage": "External local retention; not distributed with this repository and no public download URL is recorded.",
+    "sha256": "5b23b353692ad358e9a71aabb3d4cdf30bea49e00d8fc4b39d97db99ba433e5e",
+    "bytes": 7706200,
+    "files": 556
+  },
+  "matrix_execution": {
+    "exit_code": 0,
+    "manifest_sha256": "5f92ec149aabc10d07a6e83b22e72ad30c728e1c366c91d3db67dc74beac6186",
+    "status": "complete"
+  },
+  "supersedes": {
+    "report_commit": "0f56eb7c977625a437f2bfddacd847eb8635fa7c",
+    "archive_sha256": "e7d84e2dd5a76d3dabde3ed62dc3de35dccf26ffbdda9d53ed2d7e7c1c4bf18d",
+    "reason": "Rerun with explicit token counts and per-host bridge URI evidence; initial results remain at the immutable report commit."
+  }
+}

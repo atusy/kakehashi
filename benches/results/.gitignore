@@ -1,0 +1,4 @@
+# Keep raw measurement archives outside the repository.
+*.tar.gz
+*.tar.xz
+*.zip

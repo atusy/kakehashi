@@ -8,14 +8,25 @@ from drive import (
     RequestSample,
     count_semantic_outcomes,
     next_toggle_change,
+    profile_document_tag,
     response_result_id,
     server_request_result,
     summarize_samples,
     summarize_samples_by_status,
+    tagged_document_uris,
 )
 
 
 class RequestSummaryTest(unittest.TestCase):
+    def test_tags_preserve_file_paths_and_identify_each_document(self):
+        uris = ["file:///profile/input-0.md", "file:///profile/input-1.md"]
+        tagged = tagged_document_uris(uris)
+        self.assertEqual(tagged, [uri + f"?kakehashi-profile-document={index}"
+                                  for index, uri in enumerate(uris)])
+        self.assertEqual([profile_document_tag(uri) for uri in tagged], ["0", "1"])
+        self.assertIsNone(profile_document_tag(uris[0]))
+        self.assertIsNone(profile_document_tag(tagged[0] + "&kakehashi-profile-document=1"))
+
     def test_summarizes_latency_status_and_wire_bytes(self):
         samples = [
             RequestSample(seconds=0.010, wire_bytes=100, status="ok"),
