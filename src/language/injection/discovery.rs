@@ -1788,7 +1788,10 @@ mod tests {
             );
         }
         assert_eq!(
-            describe(collect_all_injections(&tree.root_node(), text, Some(query)).unwrap()),
+            describe(
+                pool.install(|| collect_all_injections(&tree.root_node(), text, Some(query)))
+                    .unwrap()
+            ),
             describe(
                 reference_collect_all_injections(&tree.root_node(), text, Some(query), None)
                     .unwrap()
@@ -1849,7 +1852,7 @@ mod tests {
             &format!("((block_comment) @injection.content (#set! injection.language \"{name}\") (#offset! @injection.content 0 2 0 -2))")
         ).unwrap()).collect();
         let mut parser = create_rust_parser();
-        let mut text = "/* original */\nfn main() {}\n".to_string();
+        let mut text = "/* original */\nfn main() {}\n".repeat(3000);
         let mut tree = parser.parse(&text, None).unwrap();
         for replacement in ["/* edited */", "\n/* shifted */", "", "/* reopened */"] {
             // Replace the prefix before the function, including any newline.
@@ -1937,6 +1940,64 @@ mod tests {
             1
         );
         assert_discovery_matches_reference(&tree, text, &query);
+    }
+
+    #[test]
+    fn large_parallel_dispatch_and_collision_fallback_match_the_oracle() {
+        let text = "/* 日本語 */\nfn item() { let value = \"lua\"; }\n".repeat(2000);
+        assert!(text.len() >= 64 * 1024);
+        let tree = create_rust_parser().parse(&text, None).unwrap();
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let disjoint = Query::new(
+            &language,
+            r#"
+            ((block_comment) @injection.content
+              (#set! injection.language "comment") (#set! injection.combined)
+              (#set! injection.include-children) (#offset! @injection.content 0 2 0 -2))
+            ((string_literal (string_content) @injection.language) @injection.content)
+        "#,
+        )
+        .unwrap();
+        assert!(
+            pool.install(|| try_collect_partitioned(&tree.root_node(), &text, &disjoint, None))
+                .is_some()
+        );
+        assert_discovery_matches_reference(&tree, &text, &disjoint);
+        let overlapping = Query::new(
+            &language,
+            r#"
+            ((source_file) @injection.content (#set! injection.language "rust")
+              (#set! injection.include-children) (#set! injection.combined)
+              (#offset! @injection.content 0 1 0 -1))
+        "#,
+        )
+        .unwrap();
+        assert!(overlapping.is_pattern_rooted(0));
+        assert!(!overlapping.is_pattern_non_local(0));
+        // Both windows independently find the same root capture; this must
+        // take the collision fallback rather than picking an arbitrary copy.
+        let middle = tree
+            .root_node()
+            .child((tree.root_node().child_count() / 2).try_into().unwrap())
+            .unwrap()
+            .start_byte();
+        for range in [0..middle, middle..text.len()] {
+            assert_eq!(
+                collect_query_range(&tree.root_node(), &text, &overlapping, Some(range), None)
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        assert!(
+            pool.install(|| try_collect_partitioned(&tree.root_node(), &text, &overlapping, None))
+                .is_none()
+        );
+        assert_discovery_matches_reference(&tree, &text, &overlapping);
     }
 
     #[test]
