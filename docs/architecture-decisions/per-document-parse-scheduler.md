@@ -170,8 +170,10 @@ identifies the text consumed by a parse. They are not interchangeable:
   An edit can make an otherwise admissible snapshot stale: it may still publish
   for serve-stale readers, but `install_parse` reports it as current only when
   `parsed_version == content_version`. The owner's parse and reader on-demand
-  fallbacks must use this publication path. Watermark advancement is a separate,
-  incarnation-guarded operation on ingress tickets.
+  fallbacks must use this publication path. Off-ingress watermark advancement
+  uses `advance_watermark_for_incarnation`, which checks the captured incarnation.
+  The on-ingress `advance_watermark` does not compare an expected incarnation;
+  it relies on the retained ingress gate and lifetime ordering.
 - **Close-then-reopen detection** is the incarnation half: a reopen draws a fresh
   incarnation, so a stale lineage insert or a late parse from the previous
   lifetime fails the incarnation check even though the reopened lifetime's
@@ -463,10 +465,12 @@ language admission check runs under the document entry lock. Publication may
 retain a stale-but-consistent snapshot; currentness additionally requires the
 current content version. Region completion uses the separate `enrich_regions`
 path, which requires pointer identity with the exact published snapshot instead
-of replacing its tree. Watermark advancement separately validates the incarnation
-and advances the ingress ticket monotonically. A close or reopen therefore
-rejects old-lifetime publication and watermark work through their respective
-incarnation checks. Injection orchestration runs
+of replacing its tree. Off-ingress `advance_watermark_for_incarnation` validates
+the incarnation and advances the ingress ticket monotonically. On-ingress
+`advance_watermark` advances the ticket without checking an expected incarnation;
+its caller relies on the ingress gate's lifetime ordering. Late off-ingress work
+from a closed or reopened lifetime is rejected by the publication and guarded
+watermark paths' incarnation checks. Injection orchestration runs
 downstream of the parse, off the ingress path. The text-owning actor of Option 4 is
 not pursued; see Considered Options.
 
