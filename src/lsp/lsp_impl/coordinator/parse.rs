@@ -517,7 +517,8 @@ impl ParseCoordinator {
     /// rechecks currency after the awaited work; downstream never acts on the
     /// earlier install-time verdict. A skipped/cancelled/panicking resolution
     /// leaves the first snapshot usable and readers fall back inline.
-    /// Awaiting the work unit preserves populate → mark-finished ordering.
+    /// Awaiting the work unit keeps optional enrichment before the caller advances
+    /// its watermark.
     async fn populate_and_install(
         &self,
         uri: &Url,
@@ -732,10 +733,8 @@ impl ParseCoordinator {
         let mut events = Vec::new();
 
         // Read the text the registering didOpen already stored (a refcount bump, not
-        // a copy), together with the open lifetime's **incarnation** — BEFORE marking
-        // the parse started, so a document a `didClose` already removed leaves neither
-        // a resurrected document nor an orphan parse-state entry for the now-closed
-        // URI. A missing document stops **without** touching the watermark: the
+        // a copy), together with the open lifetime's **incarnation**. A missing
+        // document stops **without** touching the watermark: the
         // watermark is per-lifetime, so a plain advance with this prior-lifetime
         // ticket could inflate a reopen's freshly-seeded channel and prematurely
         // release a new-lifetime reader; a genuine close instead drops the channel and
@@ -766,8 +765,6 @@ impl ParseCoordinator {
                     .advance_watermark_for_incarnation(&uri, ticket, incarnation);
             }
         };
-
-        let parse_generation = self.documents.mark_parse_started(&uri);
 
         let language_name = self
             .language
@@ -834,13 +831,6 @@ impl ParseCoordinator {
                         version_cancel.clone(),
                     )
                     .await;
-                if installed.current_at_completion {
-                    // AFTER the install: a downstream task woken by this mark
-                    // on another runtime thread must find the snapshot (and
-                    // its fast-path regions) already in the cell.
-                    self.documents
-                        .mark_parse_finished(&uri, parse_generation, true);
-                }
                 advance_watermark();
                 self.notifier().log_language_events(&events).await;
                 // Carry the producing revision across this await. Admission
@@ -856,40 +846,13 @@ impl ParseCoordinator {
             // through to the no-language path below which would null it out. Host
             // bridging needs only text + language (never a tree), so preserving the
             // language keeps a host-bridged document working after a parse failure.
-            let installed = self
-                .install_and_reconcile(
-                    &uri,
-                    crate::document::LanguageCheck::Record,
-                    std::sync::Arc::new(crate::document::snapshot::ParseSnapshot {
-                        text: text.clone(),
-                        tree: None,
-                        language: Some(language_name.clone()),
-                        parsed_version: content_version,
-                        incarnation,
-                        injection_regions: None,
-                        regions: None,
-                        layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
-                    }),
-                )
-                .await;
-            if installed.current {
-                self.documents
-                    .mark_parse_finished(&uri, parse_generation, false);
-            }
-            advance_watermark();
-            self.notifier().log_language_events(&events).await;
-            return None;
-        }
-
-        // No language detected at all → store no language, no tree.
-        let installed = self
-            .install_and_reconcile(
+            self.install_and_reconcile(
                 &uri,
                 crate::document::LanguageCheck::Record,
                 std::sync::Arc::new(crate::document::snapshot::ParseSnapshot {
                     text: text.clone(),
                     tree: None,
-                    language: None,
+                    language: Some(language_name.clone()),
                     parsed_version: content_version,
                     incarnation,
                     injection_regions: None,
@@ -898,10 +861,27 @@ impl ParseCoordinator {
                 }),
             )
             .await;
-        if installed.current {
-            self.documents
-                .mark_parse_finished(&uri, parse_generation, false);
+            advance_watermark();
+            self.notifier().log_language_events(&events).await;
+            return None;
         }
+
+        // No language detected at all → store no language, no tree.
+        self.install_and_reconcile(
+            &uri,
+            crate::document::LanguageCheck::Record,
+            std::sync::Arc::new(crate::document::snapshot::ParseSnapshot {
+                text: text.clone(),
+                tree: None,
+                language: None,
+                parsed_version: content_version,
+                incarnation,
+                injection_regions: None,
+                regions: None,
+                layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
+            }),
+        )
+        .await;
         advance_watermark();
         self.notifier().log_language_events(&events).await;
         None

@@ -11,7 +11,6 @@ use url::Url;
 // The central store for all document-related information.
 pub struct DocumentStore {
     documents: DashMap<Url, Document>,
-    parse_states: DashMap<Url, watch::Sender<ParseState>>,
     /// Per-document serialization lock for `didChange` application.
     ///
     /// `didChange` handlers read the current text, apply incremental ranges, and
@@ -58,13 +57,6 @@ pub struct DocumentStore {
     watermarks: DashMap<Url, watch::Sender<Watermark>>,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct ParseState {
-    generation: u64,
-    in_progress: bool,
-    has_tree: bool,
-}
-
 /// The value carried by a document's parse-watermark channel: the open
 /// `incarnation` the channel belongs to, and the highest `ticket` whose parse
 /// has resolved for that lifetime. Storing the incarnation **in the channel**
@@ -101,7 +93,6 @@ impl Default for DocumentStore {
     fn default() -> Self {
         Self {
             documents: DashMap::new(),
-            parse_states: DashMap::new(),
             edit_locks: DashMap::new(),
             open_counter: std::sync::atomic::AtomicU64::new(1),
             watermarks: DashMap::new(),
@@ -130,77 +121,7 @@ impl DocumentStore {
             uris.push(entry.key().clone());
             entry.value_mut().invalidate_parse();
         }
-        for uri in &uris {
-            self.update_tree_availability(uri, false);
-        }
         uris
-    }
-
-    /// Update tree availability without affecting parse-in-progress tracking.
-    /// The `in_progress` state is owned exclusively by mark_parse_started/mark_parse_finished.
-    fn update_tree_availability(&self, uri: &Url, has_tree: bool) {
-        let sender = self.parse_sender(uri);
-        let mut state = *sender.borrow();
-        state.has_tree = has_tree;
-        sender.send_replace(state);
-    }
-
-    /// Set `has_tree = true` only if a parse-state entry already exists.
-    ///
-    /// Unlike [`update_tree_availability`] this does **not** create the entry
-    /// (`get`, not `parse_sender`'s get-or-insert). For a live document the entry
-    /// always exists (created on insert), so this is equivalent; but for the
-    /// non-inserting `install_parse` (which may run after a `didClose`) it avoids
-    /// resurrecting a parse-state for a URI that a concurrent `didClose` removed — `remove` drops `parse_states` first, so a
-    /// get-or-insert here would recreate a ghost `has_tree = true` for a closed
-    /// document. Holding the `Ref` serializes against that `remove`.
-    fn mark_tree_available_if_tracked(&self, uri: &Url) {
-        if let Some(sender) = self.parse_states.get(uri) {
-            let mut state = *sender.borrow();
-            state.has_tree = true;
-            sender.send_replace(state);
-        }
-    }
-
-    fn parse_sender(&self, uri: &Url) -> watch::Sender<ParseState> {
-        match self.parse_states.entry(uri.clone()) {
-            Entry::Occupied(entry) => entry.get().clone(),
-            Entry::Vacant(entry) => {
-                let (sender, _receiver) = watch::channel(ParseState::default());
-                entry.insert(sender.clone());
-                sender
-            }
-        }
-    }
-
-    pub fn mark_parse_started(&self, uri: &Url) -> u64 {
-        let sender = self.parse_sender(uri);
-        let mut state = *sender.borrow();
-        state.generation = state.generation.saturating_add(1);
-        state.in_progress = true;
-        state.has_tree = false;
-        sender.send_replace(state);
-        state.generation
-    }
-
-    pub fn mark_parse_finished(&self, uri: &Url, generation: u64, has_tree: bool) {
-        // Non-inserting (`get`, not `parse_sender`'s get-or-insert), mirroring
-        // [`mark_tree_available_if_tracked`]: once the open parse runs off the ingress
-        // ticket (#6) a `didClose` can land between `mark_parse_started` and here, and
-        // `remove` drops `parse_states` first — a get-or-insert would recreate an
-        // orphan default entry for the closed URI. The generation guard already
-        // prevents state corruption; this also stops the resurrection. Holding the
-        // `Ref` serializes against that `remove`.
-        let Some(sender) = self.parse_states.get(uri) else {
-            return;
-        };
-        let mut state = *sender.borrow();
-        if state.generation != generation {
-            return;
-        }
-        state.in_progress = false;
-        state.has_tree = has_tree;
-        sender.send_replace(state);
     }
 
     // Lock safety: Single insert() call - no read lock held before or during write
@@ -211,7 +132,6 @@ impl DocumentStore {
         language_id: Option<String>,
         tree: Option<Tree>,
     ) -> u64 {
-        let has_tree = tree.is_some();
         // didOpen registers a fresh lifetime → a fresh incarnation, so an
         // in-flight parse from a prior open of this URI can't publish against it.
         let incarnation = self.next_incarnation();
@@ -221,13 +141,9 @@ impl DocumentStore {
             _ => Document::new(text, incarnation),
         };
 
-        // The parse-state and watermark maps are independent of `documents`, so seed
-        // them with the borrowed `&uri` first and let `documents.insert` consume the
-        // owned `uri` last — avoiding a `Url` clone on every didOpen.
-        self.update_tree_availability(&uri, has_tree);
-        // Seed the watermark for this lifetime's incarnation so its lifetime tracks
-        // the document's; the advance paths are non-inserting and rely on this
-        // entry being present. A reopen replaces any leftover prior-lifetime channel.
+        // Seed this lifetime's watermark before documents.insert consumes the
+        // URI, avoiding a clone. Non-inserting advance paths rely on this entry;
+        // a reopen replaces any leftover prior-lifetime channel.
         self.ensure_watermark_entry(&uri, incarnation);
         self.documents.insert(uri, document);
         incarnation
@@ -252,30 +168,26 @@ impl DocumentStore {
         // `Url` clone. Only a miss falls back to `entry` (owned key), which re-checks
         // for a document a concurrent insert added between the `get_mut` and here —
         // matching `apply_edit`.
-        let (has_tree, incarnation) = if let Some(mut doc) = self.documents.get_mut(&uri) {
+        let incarnation = if let Some(mut doc) = self.documents.get_mut(&uri) {
             // Update in place, preserving the incarnation (an edit is the same lifetime).
-            let has_tree = if let Some(tree) = new_tree {
+            if let Some(tree) = new_tree {
                 doc.update_tree_and_text(tree, text);
-                true
             } else {
                 // No new tree provided - clear existing tree and update text only.
                 // This path is used when text changes without re-parsing (rare edge case).
                 doc.update_text(text);
-                false
-            };
-            (has_tree, doc.incarnation())
+            }
+            doc.incarnation()
         } else {
             match self.documents.entry(uri.clone()) {
                 Entry::Occupied(mut entry) => {
                     let doc = entry.get_mut();
-                    let has_tree = if let Some(tree) = new_tree {
+                    if let Some(tree) = new_tree {
                         doc.update_tree_and_text(tree, text);
-                        true
                     } else {
                         doc.update_text(text);
-                        false
-                    };
-                    (has_tree, doc.incarnation())
+                    }
+                    doc.incarnation()
                 }
                 Entry::Vacant(entry) => {
                     // Document doesn't exist - create new one (a fresh lifetime →
@@ -283,23 +195,20 @@ impl DocumentStore {
                     // counter, not `documents`, so drawing it while holding this
                     // entry's shard write lock cannot deadlock.
                     let incarnation = self.next_incarnation();
-                    let has_tree = if let Some(tree) = new_tree {
+                    if let Some(tree) = new_tree {
                         entry.insert(Document::with_tree(
                             text,
                             "unknown".to_string(),
                             tree,
                             incarnation,
                         ));
-                        true
                     } else {
                         entry.insert(Document::new(text, incarnation));
-                        false
-                    };
-                    (has_tree, incarnation)
+                    }
+                    incarnation
                 }
             }
         };
-        self.update_tree_availability(&uri, has_tree);
         // Keep the "live document ⟺ watermark entry" invariant: `update_document`
         // can insert on its `Vacant` branch, and a present document with no
         // watermark entry would break the live-document ⟺ watermark invariant.
@@ -310,10 +219,9 @@ impl DocumentStore {
     /// Apply a `didChange`'s new text and log its edits for the **incremental
     /// parse seed** — the per-document-parse-scheduler flip's edit path.
     ///
-    /// The version bump makes the published tree stale (so a reader never sees a
-    /// tree predating this edit); the side effects are tree-availability → false
-    /// and the watermark entry ensured; and the `edits` are logged for the
-    /// off-ingress `reparse_latest`'s incremental seed. With no `edits` (full-text
+    /// The version bump marks the published tree stale. The watermark entry is
+    /// ensured and the `edits` are logged for the off-ingress `reparse_latest`'s
+    /// incremental seed. With no `edits` (full-text
     /// sync) seeding is forbidden until a fresh tree is published (#348).
     /// Coalesced edits accumulate in the log (see [`Document::apply_edit`]).
     ///
@@ -326,7 +234,7 @@ impl DocumentStore {
         // which also re-checks for a document a concurrent open inserted between the
         // `get_mut` and here — mirroring `ParseScheduler::schedule` and the atomicity
         // of the prior `update_document`. The `RefMut` / entry is dropped before the
-        // parse-state and watermark updates below (separate maps), keeping the
+        // watermark update below (a separate map), keeping the
         // `documents` shard lock held no longer than `update_document` did.
         let incarnation = if let Some(mut doc) = self.documents.get_mut(uri) {
             doc.apply_edit(text, edits);
@@ -347,7 +255,6 @@ impl DocumentStore {
                 }
             }
         };
-        self.update_tree_availability(uri, false);
         // Keep the "live document ⟺ watermark entry" invariant (see `update_document`).
         self.ensure_watermark_entry(uri, incarnation);
     }
@@ -538,7 +445,6 @@ impl DocumentStore {
     /// gone. Keeping the map entry makes a fast reopen wait on the same mutex
     /// instead of creating a fresh lock and racing the old lifetime's cleanup.
     pub(crate) fn remove_preserving_edit_lock(&self, uri: &Url) -> Option<Document> {
-        self.parse_states.remove(uri);
         // Dropping the watermark sender wakes any reader still blocked on
         // the watermark for this document, so a reader racing the close
         // proceeds into the empty fallback instead of stalling to the timeout.
@@ -788,9 +694,7 @@ impl DocumentStore {
     /// A stale-but-consistent parse (an edit landed since) still publishes,
     /// which serve-stale readers consume (parse-snapshot ADR); the cell
     /// rejects an out-of-order version on its own; a failed language check
-    /// rejects the install outright. The `parse_states` `has_tree` flip runs
-    /// after the guard is released (a different map); it is non-inserting,
-    /// so a `didClose` between the two leaves no ghost entry.
+    /// rejects the install outright.
     pub(crate) fn install_parse(
         &self,
         uri: &Url,
@@ -862,11 +766,6 @@ impl DocumentStore {
                 target: "kakehashi::snapshot",
                 "publish rejected for {uri}: v{version} inc{incarnation}"
             );
-        }
-        // A different map (`parse_states`): touched only after the document
-        // guard above is released.
-        if outcome.current && has_tree {
-            self.mark_tree_available_if_tracked(uri);
         }
         outcome
     }
@@ -1143,42 +1042,6 @@ mod tests {
         drop(expected_text);
     }
 
-    /// `didClose` drops the parse state before the document; an install that
-    /// lands in that window must not recreate the parse state for a
-    /// document that is going away.
-    #[test]
-    fn install_parse_does_not_recreate_parse_state_dropped_by_a_close() {
-        let store = DocumentStore::new();
-        let uri = Url::parse("file:///closing.md").unwrap();
-        let text = "# doc\n";
-        let incarnation = store.insert(
-            uri.clone(),
-            text.to_string(),
-            Some("markdown".to_string()),
-            None,
-        );
-        let (expected_text, content_version) = {
-            let doc = store.get(&uri).unwrap();
-            (doc.text_arc(), doc.content_version())
-        };
-        store.parse_states.remove(&uri);
-        let installed = store.install_parse(
-            &uri,
-            LanguageCheck::Record,
-            parse_snapshot(
-                &expected_text,
-                Some(markdown_tree(text)),
-                content_version,
-                incarnation,
-            ),
-        );
-        assert!(installed.current, "the document itself is still there");
-        assert!(
-            !store.parse_states.contains_key(&uri),
-            "a parse state the close already dropped must not be recreated"
-        );
-    }
-
     /// An off-ingress reparse names the language it parsed under; a reopen
     /// that relabelled the URI (same text, new lifetime and language) must
     /// not receive the tree, and neither must a same-language reopen with
@@ -1338,8 +1201,8 @@ mod tests {
             ),
         );
         assert!(
-            store.get(&uri).is_none() && !store.parse_states.contains_key(&uri),
-            "an install into a closed document must not resurrect it or its parse state"
+            store.get(&uri).is_none(),
+            "an install into a closed document must not resurrect it"
         );
     }
 

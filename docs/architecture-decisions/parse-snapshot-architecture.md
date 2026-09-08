@@ -98,8 +98,9 @@ snapshot:
 SnapshotSlot { current_incarnation: u64, snapshot: Option<Arc<ParseSnapshot>> }
 ```
 
-This channel **subsumes** the current `parse_states` and `watermarks` maps, but the
-mapping is not one-to-one and must be stated precisely:
+The snapshot channel supplies parse readiness and tree availability. The unused
+`parse_states` map has been deleted; the separate ingress-ticket `watermarks`
+remain until their callers migrate. The contracts are distinct:
 
 - Two distinct predicates replace the old single `has_tree`: **`resolved`** =
   `slot.snapshot.is_some()` (a parse for this lifetime has completed at least once)
@@ -114,15 +115,16 @@ mapping is not one-to-one and must be stated precisely:
   `parsed_version` and releases first-parse waiters (who then fall through to their
   empty / `null` / `ContentModified` paths), which the old boolean `has_tree` could
   not express.
-- `parsed_version` is the watermark ticket; `current_incarnation` is the
-  per-lifetime guard.
-- `ParseState`'s three fields are each accounted for, none silently dropped:
-  `has_tree` is **replaced** by the two slot predicates above (not re-homed); the
-  **`generation`** (a monotonic parse-run counter that `mark_parse_started` bumps
-  and `mark_parse_finished` checks to reject an out-of-order finish) and the
-  **`in_progress`** flag **re-home** onto `ParseScheduler`'s per-document state
-  (which already owns the parse lifecycle), not onto the read-side slot. Deleting
-  `parse_states` is contingent on those two moves.
+- `parsed_version` is the document content version consumed by the parse;
+  `current_incarnation` is the per-lifetime guard. The separately retained
+  watermark tracks ingress writer tickets, which are not content versions.
+- The former `ParseState` fields (`has_tree`, `generation`, `in_progress`) had
+  no readers outside their own bookkeeping. They are deleted without moving
+  them to the scheduler or adding generation checks (#1063). Snapshot predicates
+  answer tree/readiness questions, and the existing scheduler owns its work.
+  Keeping or relocating the unused state would create a second lifecycle model
+  with no consumer; the existing incarnation, publication and watermark guards
+  remain responsible for their respective contracts.
 
 The store's tree writes are collapsed into `DocumentStore::install_parse` (the
 snapshot publish below inside `send_if_modified`, under the document's entry
@@ -267,7 +269,7 @@ reports currency at completion. A pass without a hand-off installs once.
 Downstream decisions use the appropriate outcome: current-tree follow-ups use
 completion-time currency; settle refresh uses the initial publication/placeholder
 upgrade and its existing live-version check. The scheduler order remains
-`populate → initial publish → optional enrichment → mark finished → downstream`.
+`populate → initial publish → optional enrichment → watermark advance → downstream`.
  A rejected publish (a racing
 edit or reopen advanced the slot) emits nothing and attaches nothing. (Two
 parses of the *same* version — an install reparse racing the edit reparse — may
@@ -625,8 +627,9 @@ inside the existing safety contracts at each step:
 - **Stage 3 — consolidation.** *Done for the tree and the seed:* `Document::tree`
   is derived from the published cell and the incremental seed from the cell plus
   the document's edit log (`Document::incremental_seed`), so the readers that
-  went through `Document::tree` / `snapshot()` read the cell. *Remaining:* delete
-  the watermark waits and `parse_states`, and prune the now-superseded passages
+  went through `Document::tree` / `snapshot()` read the cell. The unused
+  `parse_states` map is deleted without replacement. *Remaining:* delete
+  the watermark waits and prune the now-superseded passages
   (the CAS methods are already collapsed into `install_parse`)
   from per-document-parse-scheduler (its tree-clear-on-edit and watermark/epoch
   sections) per delete-on-supersede — done **here**, when the behavior actually
