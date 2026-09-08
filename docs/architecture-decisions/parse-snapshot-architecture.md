@@ -278,7 +278,13 @@ and successful install reparse return their producing
 `ParseLineage` (incarnation and content version). Their injection follow-ups must
 validate that lineage and a current tree under the lifecycle lock before
 cancelling or replacing eager work, and preserve that target through settle
-retries. Synthetic diagnostic preparation also checks the producing revision.
+retries. Before releasing that lock, a pass claims the eager batch and registers
+its detached routing task. Routing inherits that batch's generation and cancellation
+token; it cannot cancel or replace a newer batch after awaiting a provider. Its
+owned routing-token guard releases only that pass's virtual-URI tokens on completion
+or cancellation, including cancellation before the task first runs. Both routing
+and spawned child opens count toward batch completion.
+Synthetic diagnostic preparation also checks the producing revision.
 A same-version region enrichment preserves the lineage; an edit or reopen does
 not. A completion-time Boolean alone cannot authorize later side effects. Installation
 eligibility alone also grants no follow-up: a current tree supplied by another

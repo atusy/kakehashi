@@ -1,5 +1,4 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::HashSet;
 
 use url::Url;
 
@@ -9,7 +8,7 @@ use crate::language::injection::{InjectionResolver, collect_all_injections};
 use crate::language::{DocumentParserPool, LanguageCoordinator, LanguageEvent};
 use crate::lsp::auto_install::AutoInstallManager;
 use crate::lsp::bridge::BridgeCoordinator;
-use crate::lsp::bridge::coordinator::BridgeInjection;
+use crate::lsp::bridge::coordinator::{BridgeInjection, EagerOpenPass};
 use crate::lsp::cache::CacheCoordinator;
 use crate::lsp::client::ClientNotifier;
 use crate::lsp::diagnostic_cache::{DiagnosticAggregator, DiagnosticSource};
@@ -436,21 +435,20 @@ impl InjectionCoordinator {
         // per-document lock promptly, while the detached task still observes
         // the same incarnation and is cancelled by the next close/rebuild.
         let coordinator = self.clone();
-        let uri = uri.clone();
+        let routing_uri = uri.clone();
         let routing_tokens = self
             .bridge
-            .begin_virtual_routing_for_injections(&uri, &injections);
-        tokio::spawn(async move {
-            coordinator
-                .eager_spawn_bridge_servers(
-                    &uri,
-                    incarnation,
-                    &host_language,
-                    injections,
-                    routing_tokens,
-                )
-                .await;
-        });
+            .begin_virtual_routing_for_injections(uri, &injections);
+        self.bridge.spawn_eager_open_routing(
+            uri,
+            incarnation,
+            routing_tokens,
+            move |pass| async move {
+                coordinator
+                    .eager_spawn_bridge_servers(&routing_uri, pass, &host_language, injections)
+                    .await;
+            },
+        );
         true
     }
 
@@ -594,21 +592,13 @@ impl InjectionCoordinator {
     pub(crate) async fn eager_spawn_bridge_servers(
         &self,
         uri: &Url,
-        incarnation: u64,
+        pass: EagerOpenPass,
         host_language: &str,
         injections: Vec<BridgeInjection>,
-        routing_tokens: HashMap<Url, Arc<tokio::sync::watch::Sender<bool>>>,
     ) {
         let settings = self.settings_manager.load_settings();
         self.bridge
-            .eager_spawn_and_open_documents(
-                &settings,
-                host_language,
-                uri,
-                incarnation,
-                injections,
-                routing_tokens,
-            )
+            .eager_spawn_and_open_documents(&settings, host_language, uri, pass, injections)
             .await;
     }
 
