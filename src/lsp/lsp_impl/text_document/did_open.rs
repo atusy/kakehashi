@@ -1486,6 +1486,106 @@ print("hello")
     }
 
     #[tokio::test]
+    async fn current_edit_parse_refines_an_unconfigured_client_label() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+        let uri = Url::parse("file:///test/unresolved-label.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn edited() {}".to_string(),
+            Some("text".to_string()),
+            None,
+        );
+
+        server
+            .parse_coordinator()
+            .reparse_latest(&uri, Some(1))
+            .await;
+
+        let document = server.documents.get(&uri).unwrap();
+        assert!(document.has_current_tree());
+        assert_eq!(document.language_id(), Some("rust"));
+    }
+
+    #[tokio::test]
+    async fn current_edit_parse_preserves_configured_host_alias_routing() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+        let mut settings = (*server.settings_manager.load_settings()).clone();
+        let mut alias = settings.languages["rust"].clone();
+        alias.base = Some("rust".to_string());
+        settings.languages.insert("custom-rust".to_string(), alias);
+        settings
+            .language_servers
+            .get_mut("rust_ls")
+            .unwrap()
+            .languages = Some(vec!["custom-rust".to_string()]);
+        server.settings_manager.apply_settings(settings);
+        server.language.set_base_mapping("custom-rust", "rust");
+        server.bridge.insert_ready_test_connection("rust_ls").await;
+        let uri = Url::parse("file:///test/host-alias.rs").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "fn edited() {}".to_string(),
+            Some("custom-rust".to_string()),
+            None,
+        );
+        server.bridge.open_host_incarnation(&uri, incarnation).await;
+        server
+            .parse_coordinator()
+            .reparse_latest(&uri, Some(1))
+            .await;
+        let (label, text) = {
+            let document = server.documents.get(&uri).unwrap();
+            assert!(document.has_current_tree());
+            assert_eq!(document.language_id(), Some("custom-rust"));
+            assert_eq!(
+                document
+                    .latest_snapshot_slot()
+                    .snapshot
+                    .unwrap()
+                    .language
+                    .as_deref(),
+                Some("rust"),
+                "the alias routes the host while the snapshot records its actual grammar"
+            );
+            (
+                document.language_id().unwrap().to_string(),
+                document.text().to_string(),
+            )
+        };
+        let settings = server.settings_manager.load_settings();
+        server
+            .bridge
+            .eager_open_host_document_on_servers(&settings, &label, &uri, &text);
+        timeout(Duration::from_secs(1), async {
+            while !server
+                .bridge
+                .pool()
+                .is_host_document_opened(&uri, "rust_ls")
+                .await
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the alias-specific server receives the host open");
+        server
+            .documents
+            .update_document(uri.clone(), "fn next_edit() {}".to_string(), None);
+        server
+            .parse_coordinator()
+            .reparse_latest(&uri, Some(2))
+            .await;
+        assert_eq!(
+            server.documents.get(&uri).unwrap().language_id(),
+            Some("custom-rust")
+        );
+    }
+
+    #[tokio::test]
     async fn diagnostic_snapshot_needs_the_reparsed_tree_not_the_cleared_one() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();

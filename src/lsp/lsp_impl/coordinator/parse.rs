@@ -515,6 +515,20 @@ impl ParseCoordinator {
         }
     }
 
+    fn reparse_language_check(&self, language_id: Option<String>, detected: &str) -> InstallCheck {
+        let preserve = language_id.as_deref().is_some_and(|label| {
+            label == detected
+                || self
+                    .language
+                    .is_declared_host_language(label, &self.settings_manager.load_settings())
+        });
+        if preserve {
+            InstallCheck::Expect(language_id)
+        } else {
+            InstallCheck::RecordIfUnchanged(language_id)
+        }
+    }
+
     /// Parse the (already-registered) document at `uri` and publish the result.
     ///
     /// The registering `didOpen` inserts the document — **with its text** — before
@@ -1086,11 +1100,7 @@ impl ParseCoordinator {
             let installed = self
                 .populate_and_install(
                     uri,
-                    if language_id.is_none() {
-                        InstallCheck::RecordIfUnchanged(None)
-                    } else {
-                        InstallCheck::Expect(language_id.clone())
-                    },
+                    self.reparse_language_check(language_id.clone(), &language_name),
                     SnapshotInputs {
                         text: text.clone(),
                         tree,

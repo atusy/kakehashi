@@ -72,8 +72,8 @@ gates:
 - **Language detection is split by layer.** The input `language_id` starts as the
   client-declared LSP `languageId` that `didOpen` records. In the current
   store-backed path, an open parse can still write the detected language back to
-  `Document::language_id`. A current edit parse can also establish an unlabelled
-  document's language atomically with its tree publication; a stale parse cannot.
+  `Document::language_id`. A current edit parse can also refine a provisional
+  document label atomically with its tree publication; a stale parse cannot.
   The snapshot architecture separates the parser result by
   recording the parse result as the snapshot's own **derived** `language`. The
   snapshot carries the more-accurate detected language, and readers use the
@@ -195,9 +195,12 @@ fallback rather than turning an unavailable result into a definitive empty one.
   the version compare is only ever within one lifetime.
 - **Language checks guard captured input labels as well as incarnation.** Every
   reopen draws a fresh incarnation. Reparses preserve established labels with
-  `LanguageCheck::Expect`; an unlabelled edit uses `RecordIfUnchanged(None)` so
-  its current publish can establish the detected language without overwriting a
-  concurrent refinement. After such a publish, regions completion validates the
+  `LanguageCheck::Expect`. A label is provisional if absent, or if it differs
+  from the detected grammar and has no language configuration, eligible base,
+  available parser, or explicit bridge-server language declaration. Wildcard
+  bridge support alone does not establish a label. Provisional labels use
+  `RecordIfUnchanged(captured_label)` so a current publish can establish the
+  detected language without overwriting a concurrent refinement. After such a publish, regions completion validates the
   newly stored label, along with the exact first-published snapshot identity.
   A stale publish records no label and completion keeps the original expectation.
   The snapshot's detected language can still move with edited content (such as
