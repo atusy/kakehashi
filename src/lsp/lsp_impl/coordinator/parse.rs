@@ -895,7 +895,7 @@ impl ParseCoordinator {
             let installed = self
                 .populate_and_install(
                     &uri,
-                    InstallCheck::Expect(expected_language_id.clone()),
+                    self.reparse_language_check(expected_language_id.clone(), &language_name),
                     SnapshotInputs {
                         text: text.clone(),
                         tree,

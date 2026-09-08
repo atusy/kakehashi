@@ -937,8 +937,12 @@ mod tests {
         assert!(server.documents.get(&uri).unwrap().tree().is_none());
     }
 
+    #[rstest::rstest]
+    #[case(None)]
+    #[case(Some("text"))]
+    #[case(Some("rust"))]
     #[tokio::test]
-    async fn available_parser_reports_only_its_own_parse() {
+    async fn available_parser_reports_only_its_own_parse(#[case] initial_label: Option<&str>) {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
         server
@@ -949,7 +953,7 @@ mod tests {
         let incarnation = server.documents.insert(
             uri.clone(),
             "fn main() {}".into(),
-            Some("rust".into()),
+            initial_label.map(str::to_string),
             None,
         );
         let install = server.install_coordinator();
@@ -959,6 +963,10 @@ mod tests {
         assert!(first.same_lifetime);
         let parsed = first.parsed.expect("this install published the parse");
         assert!(parsed.matches(&server.documents.get(&uri).unwrap()));
+        assert_eq!(
+            server.documents.get(&uri).unwrap().language_id(),
+            Some("rust")
+        );
         let second = install
             .maybe_auto_install_language("rust", uri.clone(), false, Some(incarnation), true)
             .await;

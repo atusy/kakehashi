@@ -72,7 +72,7 @@ gates:
 - **Language detection is split by layer.** The input `language_id` starts as the
   client-declared LSP `languageId` that `didOpen` records. In the current
   store-backed path, an open parse can still write the detected language back to
-  `Document::language_id`. A current edit parse can also refine a provisional
+  `Document::language_id`. A current edit or installer reparse can also refine a provisional
   document label atomically with its tree publication; a stale parse cannot.
   The snapshot architecture separates the parser result by
   recording the parse result as the snapshot's own **derived** `language`. The
