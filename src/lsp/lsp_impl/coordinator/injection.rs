@@ -22,6 +22,21 @@ use crate::lsp::lsp_impl::{build_notifier, detect_document_language};
 use super::InstallCoordinator;
 use super::install::InstallCoordinatorDeps;
 
+#[derive(Clone, Copy)]
+enum InjectionTarget {
+    Incarnation(u64),
+    Parsed(super::parse::ParseLineage),
+}
+
+impl InjectionTarget {
+    fn matches(self, document: &crate::document::Document) -> bool {
+        match self {
+            Self::Incarnation(incarnation) => document.incarnation() == incarnation,
+            Self::Parsed(lineage) => lineage.matches(document) && document.has_current_tree(),
+        }
+    }
+}
+
 /// `Clone` is a cheap refcount bump of the shared coordinators (every field is a
 /// `Client` / `Arc<_>` / `AutoInstallManager`, all `Clone`); it lets
 /// `process_injections` hand an owned handle to a spawned off-ingress install task.
@@ -274,7 +289,21 @@ impl InjectionCoordinator {
         self.process_injections_after_lifecycle_lock(
             uri,
             forward_did_change,
-            Some(incarnation),
+            Some(InjectionTarget::Incarnation(incarnation)),
+            std::future::ready(()),
+        )
+        .await
+    }
+
+    pub(crate) async fn process_injections_for_parse(
+        &self,
+        uri: &Url,
+        lineage: super::parse::ParseLineage,
+    ) -> bool {
+        self.process_injections_after_lifecycle_lock(
+            uri,
+            false,
+            Some(InjectionTarget::Parsed(lineage)),
             std::future::ready(()),
         )
         .await
@@ -284,7 +313,7 @@ impl InjectionCoordinator {
         &self,
         uri: &Url,
         forward_did_change: bool,
-        required_incarnation: Option<u64>,
+        required: Option<InjectionTarget>,
         after_lifecycle_lock: F,
     ) -> bool
     where
@@ -298,14 +327,18 @@ impl InjectionCoordinator {
         let edit_lock = self.documents.edit_lock(uri);
         let _lifecycle_guard = edit_lock.lock().await;
         after_lifecycle_lock.await;
-        let Some(incarnation) = self.documents.get(uri).map(|doc| doc.incarnation()) else {
-            self.bridge.cancel_eager_open(uri);
+        let Some(document) = self.documents.get(uri) else {
+            if required.is_none() {
+                self.bridge.cancel_eager_open(uri);
+            }
             self.documents.remove_edit_lock_if_unshared(uri, &edit_lock);
             return false;
         };
-        if required_incarnation.is_some_and(|required| incarnation != required) {
+        if required.is_some_and(|target| !target.matches(&document)) {
             return false;
         }
+        let incarnation = document.incarnation();
+        drop(document);
 
         // Stored language first (see `document_language`): parser-aware
         // detection answers `None` while the language is still publishing,
@@ -339,6 +372,7 @@ impl InjectionCoordinator {
                     &host_language,
                     forward_did_change,
                     incarnation,
+                    required,
                 );
             }
             self.documents.remove_edit_lock_if_unshared(uri, &edit_lock);
@@ -606,6 +640,7 @@ impl InjectionCoordinator {
         host_language: &str,
         forward_did_change: bool,
         incarnation: u64,
+        required: Option<InjectionTarget>,
     ) {
         const INJECTION_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
         const INJECTION_RETRY_POLL: std::time::Duration = std::time::Duration::from_millis(50);
@@ -613,10 +648,17 @@ impl InjectionCoordinator {
         // same window re-runs the pass once, when the language settles; a
         // close and reopen in the meantime gets its own waiter, since this
         // one exits at its lifetime check.
-        let Some(claim) = self
-            .settle_retry_waiters
-            .claim("injection", uri, Some(incarnation))
-        else {
+        let Some(claim) = self.settle_retry_waiters.claim(
+            if matches!(required, Some(InjectionTarget::Parsed(_))) {
+                // An open retry is revision-bound and may become a no-op.
+                // It cannot satisfy the edit path's latest-revision retry.
+                "open-injection"
+            } else {
+                "injection"
+            },
+            uri,
+            Some(incarnation),
+        ) else {
             return;
         };
         let this = self.clone();
@@ -652,9 +694,13 @@ impl InjectionCoordinator {
                     // right now makes the rerun defer again, and its retry
                     // must be able to claim the slot this waiter held.
                     drop(claim);
-                    let _ = this
-                        .process_injections_for_incarnation(&uri, forward_did_change, incarnation)
-                        .await;
+                    let _ = Box::pin(this.process_injections_after_lifecycle_lock(
+                        &uri,
+                        forward_did_change,
+                        required.or(Some(InjectionTarget::Incarnation(incarnation))),
+                        std::future::ready(()),
+                    ))
+                    .await;
                     return;
                 }
                 if tokio::time::Instant::now() >= deadline {
@@ -898,7 +944,7 @@ fn parser_enabled_injection_language(language: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::parser_enabled_injection_language;
+    use super::{InjectionTarget, parser_enabled_injection_language};
 
     #[test]
     fn explicit_plaintext_does_not_request_a_parser() {
@@ -1089,16 +1135,21 @@ mod tests {
 
         let processed = server
             .injection_coordinator()
-            .process_injections_after_lifecycle_lock(&uri, false, Some(old_incarnation), async {
-                server.documents.remove_preserving_edit_lock(&uri);
-                let new_incarnation =
-                    server
-                        .documents
-                        .insert(uri.clone(), "new".to_string(), None, None);
-                assert_ne!(new_incarnation, old_incarnation);
-                let token = server.bridge.begin_test_eager_open_batch(&uri);
-                let _ = token_tx.send(token);
-            })
+            .process_injections_after_lifecycle_lock(
+                &uri,
+                false,
+                Some(InjectionTarget::Incarnation(old_incarnation)),
+                async {
+                    server.documents.remove_preserving_edit_lock(&uri);
+                    let new_incarnation =
+                        server
+                            .documents
+                            .insert(uri.clone(), "new".to_string(), None, None);
+                    assert_ne!(new_incarnation, old_incarnation);
+                    let token = server.bridge.begin_test_eager_open_batch(&uri);
+                    let _ = token_tx.send(token);
+                },
+            )
             .await;
         let token = token_rx.await.unwrap();
 
@@ -1106,6 +1157,80 @@ mod tests {
         assert!(
             !token.is_cancelled(),
             "a stale pass must not cancel the reopened lifetime's eager batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_open_pass_does_not_cancel_edited_eager_batch() {
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///delayed-open.rs").unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let original = "fn original() {}";
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            original.into(),
+            None,
+            parser.parse(original, None),
+        );
+        let (token_tx, token_rx) = tokio::sync::oneshot::channel();
+        let processed = server
+            .injection_coordinator()
+            .process_injections_after_lifecycle_lock(
+                &uri,
+                false,
+                Some(InjectionTarget::Parsed(super::super::parse::ParseLineage {
+                    incarnation,
+                    content_version: 0,
+                })),
+                async {
+                    let edited = "fn edited() {}";
+                    server.documents.update_document(
+                        uri.clone(),
+                        edited.into(),
+                        parser.parse(edited, None),
+                    );
+                    assert!(server.documents.get(&uri).unwrap().has_current_tree());
+                    let _ = token_tx.send(server.bridge.begin_test_eager_open_batch(&uri));
+                },
+            )
+            .await;
+        let token = token_rx.await.unwrap();
+        assert!(
+            !token.is_cancelled(),
+            "the old open must not cancel the edit's eager batch"
+        );
+        assert!(!processed);
+    }
+
+    #[tokio::test]
+    async fn deferred_open_does_not_consume_the_edits_retry_slot() {
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///deferred-open.rs").unwrap();
+        let incarnation = server
+            .documents
+            .insert(uri.clone(), String::new(), None, None);
+        let injection = server.injection_coordinator();
+        injection.retry_injection_pass_when_settled(
+            &uri,
+            "rust",
+            false,
+            incarnation,
+            Some(InjectionTarget::Parsed(super::super::parse::ParseLineage {
+                incarnation,
+                content_version: 0,
+            })),
+        );
+        let edit_retry = injection
+            .settle_retry_waiters
+            .claim("injection", &uri, Some(incarnation));
+        assert!(
+            edit_retry.is_some(),
+            "a stale open retry must not absorb the newer edit's retry"
         );
     }
 

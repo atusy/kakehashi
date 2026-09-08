@@ -291,24 +291,23 @@ impl Kakehashi {
                 let landed = parse
                     .parse_document(parse_uri.clone(), Some(parse_language_id.as_str()), ticket)
                     .await;
-                // Run the open downstream only when THIS parse's install published the
-                // current tree — not merely when "a tree exists". A `didChange` racing
-                // this open parse can move the text on and let the edit reparse publish
-                // the newer tree (and run `process_injections(forward=true)`) first;
-                // this parse is then reported not current (`landed == false`). Re-running the open downstream
-                // (`process_injections(forward=false)`) over the edit's tree would
-                // supersede the edit's eager-open batch. When `landed` is false the
-                // edit reparse owns the current tree and already ran the correct
-                // downstream, so there is nothing for the open path to do. (A parse
-                // that produced no tree at all also returns false.)
-                if landed {
-                    injection.process_injections(&parse_uri, false).await;
+                // Publication grants a revision, not a permanent permission.
+                // The downstream rechecks it under its lifecycle lock so a
+                // delayed open cannot supersede the newer edit's eager batch.
+                if let Some(lineage) = landed {
+                    if !injection
+                        .process_injections_for_parse(&parse_uri, lineage)
+                        .await
+                    {
+                        return;
+                    }
                     if !deferred.is_empty() {
                         build_notifier(&client, &settings_manager)
                             .log_language_events(&deferred)
                             .await;
                     }
-                    diagnostic_scheduler.spawn_synthetic_diagnostic_task(parse_uri);
+                    diagnostic_scheduler
+                        .spawn_synthetic_diagnostic_task_for_parse(parse_uri, lineage);
                 }
             });
         }

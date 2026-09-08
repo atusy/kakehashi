@@ -10,6 +10,21 @@ use url::Url;
 use crate::lsp::lsp_impl::{Kakehashi, build_notifier};
 use crate::lsp::settings_manager::SettingsManager;
 
+/// The document revision whose parse may drive downstream work. Enriching
+/// its region views keeps this identity; an edit or reopen does not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ParseLineage {
+    pub(crate) incarnation: u64,
+    pub(crate) content_version: u64,
+}
+
+impl ParseLineage {
+    pub(crate) fn matches(self, document: &crate::document::Document) -> bool {
+        document.incarnation() == self.incarnation
+            && document.content_version() == self.content_version
+    }
+}
+
 /// Inputs of the initial snapshot. Region completion reuses that published
 /// snapshot directly and cannot submit these inputs again.
 struct SnapshotInputs {
@@ -510,22 +525,15 @@ impl ParseCoordinator {
     /// advance is a document already gone (a `didClose` removed it): its watermark
     /// channel is gone too, so its readers have already fallen back.
     ///
-    /// Returns `true` iff **this** call's install published the current tree
-    /// (i.e. it is the parse whose tree is now current). The off-ingress open caller gates its
-    /// tree-dependent downstream (`process_injections(forward=false)`, the deferred
-    /// refresh, the synthetic diagnostic) on this — **not** on "the document has a
-    /// tree": a `didChange` racing this parse can move the text on and let the edit
-    /// reparse publish the newer tree (and run `process_injections(forward=true)`)
-    /// first; this parse's install then reports not current, and re-checking `tree().is_some()` would
-    /// wrongly see the edit's tree and re-run the *open* downstream over it,
-    /// superseding the edit's eager-open batch. Gating on the own-install result is the
-    /// same discipline `reparse_latest` follows for its `populate_injections`.
+    /// Return the revision published by this parse only when it is current at
+    /// completion. Callers must validate it again at downstream admission: an
+    /// edit or reopen may win while this task is suspended after publication.
     pub(crate) async fn parse_document(
         &self,
         uri: Url,
         language_id: Option<&str>,
         ticket: Option<u64>,
-    ) -> bool {
+    ) -> Option<ParseLineage> {
         let mut events = Vec::new();
 
         // Read the text the registering didOpen already stored (a refcount bump, not
@@ -539,7 +547,7 @@ impl ParseCoordinator {
         // wakes its readers (they fall back). Unreachable while this parse is inline on
         // the writer ticket (a `didClose` is gated behind the open); the guard is for
         // the off-ingress open flip (#6), where a `didClose`/reopen can race it.
-        let Some((text, incarnation, content_version, version_cancel)) =
+        let (text, incarnation, content_version, version_cancel) =
             self.documents.get(&uri).map(|doc| {
                 (
                     doc.text_arc(),
@@ -547,10 +555,7 @@ impl ParseCoordinator {
                     doc.content_version(),
                     doc.version_cancel_token(),
                 )
-            })
-        else {
-            return false;
-        };
+            })?;
 
         // Publish the watermark on whichever path resolves the parse below, but
         // **only if this lifetime is still current**: a close + reopen re-seeds the
@@ -640,11 +645,12 @@ impl ParseCoordinator {
                 }
                 advance_watermark();
                 self.notifier().log_language_events(&events).await;
-                // `current` is exactly "this call published the current tree": false when a
-                // racing `didChange`/reopen moved the text or incarnation on and the
-                // edit reparse won, in which case the open downstream must NOT re-run
-                // over the edit's tree.
-                return installed.current_at_completion;
+                // Carry the producing revision across this await. Admission
+                // must still reject an edit/reopen that won after completion.
+                return installed.current_at_completion.then_some(ParseLineage {
+                    incarnation,
+                    content_version,
+                });
             }
 
             // Parse produced no tree (timeout / parser unavailable / join error) but
@@ -672,7 +678,7 @@ impl ParseCoordinator {
             }
             advance_watermark();
             self.notifier().log_language_events(&events).await;
-            return false;
+            return None;
         }
 
         // No language detected at all → store no language, no tree.
@@ -696,7 +702,7 @@ impl ParseCoordinator {
         }
         advance_watermark();
         self.notifier().log_language_events(&events).await;
-        false
+        None
     }
 
     /// Re-parse a document after its parser finished installing, **off the

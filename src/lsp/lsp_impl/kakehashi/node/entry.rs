@@ -551,6 +551,7 @@ mod tests {
                 .parse_coordinator()
                 .parse_document(uri.clone(), Some("rust"), None)
                 .await
+                .is_some()
         );
         let params = NodeParams {
             text_document: TextDocumentIdentifier {
@@ -575,6 +576,7 @@ mod tests {
                         .parse_coordinator()
                         .parse_document(uri.clone(), Some("go"), None)
                         .await
+                        .is_some()
                 );
             })
             .await
