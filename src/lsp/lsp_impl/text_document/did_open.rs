@@ -1534,14 +1534,49 @@ print("hello")
         })
         .await
         .expect("the winning language selects the actual host server");
+        // Remove the first routing result so the next assertion must observe
+        // a fresh selection, rather than the connection opened above.
+        server.bridge.pool().close_host_bridge_document(&uri).await;
         server
             .documents
             .update_document(uri.clone(), "fn next_edit() {}".to_string(), None);
         parser.reparse_latest(&uri, Some(2)).await;
-        assert_eq!(
-            server.documents.get(&uri).unwrap().language_id(),
-            Some("rust")
+        let (label, text) = {
+            let document = server.documents.get(&uri).unwrap();
+            assert!(document.has_current_tree());
+            assert_eq!(document.language_id(), Some("rust"));
+            assert_eq!(
+                document
+                    .latest_snapshot_slot()
+                    .snapshot
+                    .unwrap()
+                    .language
+                    .as_deref(),
+                Some("rust")
+            );
+            (
+                document.language_id().unwrap().to_string(),
+                document.text().to_string(),
+            )
+        };
+        server.bridge.eager_open_host_document_on_servers(
+            &server.settings_manager.load_settings(),
+            &label,
+            &uri,
+            &text,
         );
+        timeout(Duration::from_secs(1), async {
+            while !server
+                .bridge
+                .pool()
+                .is_host_document_opened(&uri, "rust_ls")
+                .await
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the subsequent edit still selects the actual host server");
     }
 
     #[tokio::test]
