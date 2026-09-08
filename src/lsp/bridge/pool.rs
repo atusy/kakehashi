@@ -305,7 +305,22 @@ pub(crate) struct HostVirtualContents {
     // container, so a stale publisher holding the old DashMap guard can only
     // mutate detached state that current didOpen readers cannot observe.
     pub(crate) incarnation: u64,
+    /// Only accepted parse-label promotions establish this admission fence.
+    /// Explicit aliases keep their existing canonical request behavior.
+    promoted_language: Option<HostLanguageAdmission>,
     contents: DashMap<String, DashMap<String, Arc<str>>>,
+}
+
+pub(crate) struct HostLanguageAdmission {
+    pub(crate) language: String,
+    pub(crate) settings_generation: u64,
+    pub(crate) current_settings_generation: Arc<dyn Fn() -> u64 + Send + Sync>,
+}
+
+impl HostLanguageAdmission {
+    fn is_current(&self) -> bool {
+        (self.current_settings_generation)() == self.settings_generation
+    }
 }
 
 type LatestVirtualContents = DashMap<Url, HostVirtualContents>;
@@ -1626,6 +1641,13 @@ impl LanguageServerPool {
     }
 
     pub(crate) fn clear_host_routing_suppression(&self, host_uri: &Url) {
+        self.clear_host_document_routing(host_uri);
+        self.finish_all_virtual_routing(host_uri);
+    }
+
+    /// A host-language promotion invalidates real-document routing, while a
+    /// newer edit's virtual routing pass continues to own its current regions.
+    pub(super) fn clear_host_document_routing(&self, host_uri: &Url) {
         let uri = host_uri.to_string();
         self.host_routing_suppressed
             .retain(|(doc_uri, _), _| doc_uri != &uri);
@@ -1638,7 +1660,6 @@ impl LanguageServerPool {
         self.host_routing_rootless
             .retain(|(doc_uri, _), _| doc_uri != &uri);
         self.finish_all_host_routing(host_uri);
-        self.finish_all_virtual_routing(host_uri);
     }
 
     pub(crate) fn clear_host_routing_for_connection(&self, connection_key: &ConnectionKey) {
@@ -2120,6 +2141,37 @@ impl LanguageServerPool {
         )
     }
 
+    pub(super) fn set_promoted_host_language(
+        &self,
+        uri: &Url,
+        incarnation: u64,
+        admission: HostLanguageAdmission,
+    ) -> bool {
+        let Some(mut host) = self.latest_virtual_contents.get_mut(uri) else {
+            return false;
+        };
+        if host.incarnation != incarnation {
+            return false;
+        }
+        if admission.is_current() {
+            host.promoted_language = Some(admission);
+        }
+        true
+    }
+
+    /// Call under the host lifecycle lock, before routing or syncing. A settings
+    /// change expires the fence so a preserved label can acquire a new canonical
+    /// base without an old promotion rejecting its valid request contexts.
+    pub(crate) fn accepts_host_language(&self, host_uri: &Url, language: &str) -> bool {
+        self.latest_virtual_contents
+            .get(host_uri)
+            .is_none_or(|host| {
+                host.promoted_language.as_ref().is_none_or(|admission| {
+                    !admission.is_current() || admission.language == language
+                })
+            })
+    }
+
     pub(crate) fn current_host_incarnation(&self, host_uri: &Url) -> Option<u64> {
         self.latest_virtual_contents
             .get(host_uri)
@@ -2154,6 +2206,7 @@ impl LanguageServerPool {
             host_uri.clone(),
             HostVirtualContents {
                 incarnation,
+                promoted_language: None,
                 contents: DashMap::new(),
             },
         );

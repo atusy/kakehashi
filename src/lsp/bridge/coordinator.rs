@@ -609,6 +609,40 @@ impl BridgeCoordinator {
         self.pool.insert_connection(handle).await;
     }
 
+    #[cfg(all(test, unix))]
+    pub(crate) fn has_host_eager_batch_for_test(&self, uri: &Url) -> bool {
+        self.host_eager_open_tasks.contains_key(uri)
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) async fn insert_recording_test_connection(
+        &self,
+        server_name: &str,
+        path: &std::path::Path,
+    ) -> Arc<super::pool::ConnectionHandle> {
+        use super::pool::{ConnectionKey, ConnectionState};
+        let (handle, _) = super::pool::test_helpers::create_handle_with_command(
+            ConnectionState::Ready,
+            ConnectionKey::for_server(server_name),
+            vec![
+                "sh".into(),
+                "-c".into(),
+                "cat > \"$1\"".into(),
+                "record".into(),
+                path.to_str().unwrap().into(),
+            ],
+            Some(tower_lsp_server::ls_types::ServerCapabilities {
+                hover_provider: Some(tower_lsp_server::ls_types::HoverProviderCapability::Simple(
+                    true,
+                )),
+                ..Default::default()
+            }),
+        )
+        .await;
+        self.pool.insert_connection(handle.clone()).await;
+        handle
+    }
+
     /// Register a virtual document as opened, so [`Self::resolve_virtual_uri`]
     /// can recover its host and region for a test-driven region push, without
     /// a real downstream connection.
@@ -1778,6 +1812,9 @@ impl BridgeCoordinator {
                 configs = async {
                     let lifecycle = pool.host_lifecycle_lock(&host_uri_owned);
                     let _guard = lifecycle.write().await;
+                    if !pool.accepts_host_language(&host_uri_owned, &language_id) {
+                        return Vec::new();
+                    }
                     Self::resolve_document_routing(
                         &pool,
                         &host_uri_owned,

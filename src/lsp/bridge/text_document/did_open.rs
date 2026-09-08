@@ -356,6 +356,9 @@ impl LanguageServerPool {
     ) {
         let lifecycle = self.host_lifecycle_lock(host_uri);
         let _lifecycle_guard = lifecycle.write().await;
+        if !self.accepts_host_language(host_uri, language_id) {
+            return;
+        }
         let handle = match self
             .get_or_create_connection_wait_ready(
                 server_name,

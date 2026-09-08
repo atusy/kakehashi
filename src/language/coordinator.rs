@@ -1241,6 +1241,27 @@ impl LanguageCoordinator {
             && self.has_current_parser_registration(language_name, generation)
     }
 
+    /// Whether a stored host label carries parser or configuration identity
+    /// that a fallback parse must preserve. Explicit bridge languages count even
+    /// without a Tree-sitter parser; a wildcard server does not declare every
+    /// unknown client label to be a language.
+    pub(crate) fn is_declared_host_language(
+        &self,
+        language_id: &str,
+        settings: &WorkspaceSettings,
+    ) -> bool {
+        settings.languages.contains_key(language_id)
+            || self.resolve_base(language_id).is_some()
+            || self.has_parser_available(language_id)
+            || settings.language_servers.values().any(|server| {
+                server.languages.as_ref().is_some_and(|languages| {
+                    languages
+                        .iter()
+                        .any(|language| language != "*" && language == language_id)
+                })
+            })
+    }
+
     /// Parser-aware language-detection fallback chain for host documents;
     /// returns the first language with an available parser. Each stage is
     /// detect → base resolution → availability:

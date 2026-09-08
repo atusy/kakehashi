@@ -139,6 +139,11 @@ pub(in crate::lsp::bridge) async fn create_handle_with_key(
     create_handle_with_state_and_pid_keyed(state, key).await.0
 }
 
+#[cfg(unix)]
+pub(crate) fn advertise_routing_for_test(handle: &ConnectionHandle) {
+    handle.set_bridge_routing(true);
+}
+
 pub(in crate::lsp::bridge) async fn create_handle_accepting_textless_did_save(
     key: ConnectionKey,
 ) -> Arc<ConnectionHandle> {
@@ -226,14 +231,28 @@ pub(in crate::lsp::bridge) async fn create_handle_with_state_and_pid_keyed(
     state: ConnectionState,
     key: ConnectionKey,
 ) -> (Arc<ConnectionHandle>, u32) {
-    // Create a mock server process (sink — discards all input, no output)
-    let mut conn = AsyncBridgeConnection::spawn(vec![
-        "sh".to_string(),
-        "-c".to_string(),
-        "cat > /dev/null".to_string(),
-    ])
+    create_handle_with_command(
+        state,
+        key,
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "cat > /dev/null".to_string(),
+        ],
+        None,
+    )
     .await
-    .expect("should spawn sink process");
+}
+
+pub(in crate::lsp::bridge) async fn create_handle_with_command(
+    state: ConnectionState,
+    key: ConnectionKey,
+    command: Vec<String>,
+    capabilities: Option<tower_lsp_server::ls_types::ServerCapabilities>,
+) -> (Arc<ConnectionHandle>, u32) {
+    let mut conn = AsyncBridgeConnection::spawn(command)
+        .await
+        .expect("should spawn sink process");
 
     // Split connection and spawn reader task (new architecture)
     let (writer, reader) = conn.split();
@@ -255,5 +274,8 @@ pub(in crate::lsp::bridge) async fn create_handle_with_state_and_pid_keyed(
         crate::lsp::bridge::WorkspaceFolderSet::new(None),
         std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
     ));
+    if let Some(capabilities) = capabilities {
+        handle.set_server_capabilities(capabilities);
+    }
     (handle, pid)
 }
