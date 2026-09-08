@@ -283,9 +283,9 @@ binding above; ordering only governs how often a reusable discovery is *availabl
 when the request runs. In the reparse loop the order is
 `populate_injections` (discovery built, handed out, then the resolution) with the
 first `install_parse` — the tree and the discovery — landing from inside the
-populate work-unit at the hand-off, the second `install_parse` — the same
-version upgraded with the bridge / resolved regions — after the pass returns,
-then `mark_parse_finished` / `advance_watermark`
+populate work-unit at the hand-off, `complete_parse` — the same snapshot
+upgraded with the bridge / resolved regions — after the pass returns,
+then the watermark advance
 (`src/lsp/lsp_impl/coordinator/parse.rs`), and the semantic handler parks on the
 document's snapshot cell until the current version is published
 (`src/lsp/lsp_impl/text_document/semantic_tokens.rs`), so it always sees the discovery the

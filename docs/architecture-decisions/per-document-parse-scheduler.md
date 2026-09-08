@@ -69,17 +69,13 @@ couples concerns that are hard to reason about independently:
   (`try_parse_and_update_document` and analogues) that *writes the store*, and
   `update_document` **inserts on vacancy** — a second resurrection vector.
 
-Underneath, the store already keeps **two** monotonic counters that are two
-**axes** of one idea: `open_generations` (process-wide, used by the captures
-lineage to detect close-then-reopen — an *incarnation* counter) and
-`ParseState.generation` (per-lifetime, whose `mark_parse_finished` stale-check
-already refuses to record a superseded parse). Neither gates the tree write
-itself. The ingress writer ticket (`IngressOrderGate`,
-`src/lsp/ingress_order.rs`) is a *third* per-document sequence — intra-lifetime
-wire order, which restarts on reopen — and the reader-ordering watermark this
-design needs would be a *fourth*. They are four implementations of two axes:
-*which lifetime* (incarnation) and *where in that lifetime's wire order*
-(ticket).
+The ordering contract has two axes: *which lifetime* (incarnation) and *where
+in that lifetime's wire order* (the ingress writer ticket). The incarnation
+must survive close/reopen without reuse, while the ticket orders work within
+one lifetime. Historical parse-progress bookkeeping did not guard tree writes;
+its unread state has since been deleted without replacement (#1063). The
+[parse-snapshot architecture](parse-snapshot-architecture.md) describes the
+current publication contract and the separately retained reader watermark.
 
 The common root is that a document's parser readiness and parse scheduling have
 **no single owner**.
@@ -93,9 +89,8 @@ the parse-scheduling decision. Pair it with a **single per-document epoch** — 
 pair `(incarnation, ticket)` — that is the one source of truth for ordering,
 resurrection-safety, and parse-staleness: the retained process-wide open
 generation (the incarnation, monotonic across reopen) paired with the ingress
-writer ticket (intra-lifetime wire order), folding `ParseState.generation` and the
-otherwise-new reader watermark into those two axes, and taking over the
-`edit_lock`'s resurrection-guard duty at the tree write.
+writer ticket (intra-lifetime wire order), with publication checking those axes
+rather than relying on the `edit_lock` alone for resurrection safety.
 
 The owner is deliberately a scheduler rather than a mailbox actor that owns the
 document's text (the actor is Option 4, not chosen; see below). Because
@@ -168,10 +163,9 @@ Two derived quantities read off this one pair; the unification is of the
 - **Resurrection-safety (epoch-checked CAS writes).** Every tree write becomes an
   **atomic, non-inserting** store update checked against the full
   `(incarnation, ticket)` pair: it no-ops if the document is gone (`Vacant`), the
-  incarnation differs (a reopen happened), or the ticket moved. This folds both
-  `open_generations` (incarnation mismatch) and `ParseState.generation` (ticket
-  mismatch) into one comparison, generalizing the existing `mark_parse_finished`
-  stale-check from the parse-state to the tree itself. The owner's parse is one
+  incarnation differs (a reopen happened), or the ticket moved. The check
+  belongs to the tree publication itself, not to separate parse-progress
+  bookkeeping. The owner's parse is one
   writer; the reader on-demand fallbacks are the others (see below) — the guarantee
   holds only if **every** store-writing path uses this CAS.
 - **Close-then-reopen detection** is the incarnation half: a reopen draws a fresh
@@ -397,12 +391,11 @@ scheduler keeps the text in the store in the first place.
 - **Burst coalescing.** A run of edits collapses to one parse over the
   accumulated text, saving the per-edit reparse cost on injection-heavy documents
   (the cost force).
-- **One epoch, two axes, not four sequences.** Wire-order readiness,
+- **Explicit ordering axes.** Wire-order readiness,
   resurrection-safety, and parse-staleness key on a single composite epoch
   `(incarnation, ticket)` — the retained process-wide open generation paired with
-  the ingress ticket — into which `ParseState.generation` and the reader watermark
-  fold, and whose per-write check takes over the `edit_lock`'s resurrection-guard
-  duty. The incarnation half keeps the epoch monotonic across a reopen even though
+  the ingress ticket — whose per-write check establishes resurrection safety
+  at publication. The incarnation half keeps the epoch monotonic across a reopen even though
   tickets restart.
 - **The install/parse resurrection path is structurally closed** — a close removes
   the store entry and advances the epoch, so a later parse or shared-install
