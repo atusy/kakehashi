@@ -1968,7 +1968,7 @@ mod tests {
 
         server
             .parse_coordinator()
-            .parse_document(uri.clone(), Some("markdown"), None)
+            .parse_document(uri.clone(), Some("markdown"), None, None)
             .await;
 
         // The published snapshot must carry the derived discovery.
@@ -2047,7 +2047,7 @@ mod tests {
         // run before the first request — as didOpen arranges in production.
         server
             .parse_coordinator()
-            .parse_document(uri.clone(), Some("lua"), None)
+            .parse_document(uri.clone(), Some("lua"), None, None)
             .await;
 
         // First request: semanticTokens/full to get the initial result_id.

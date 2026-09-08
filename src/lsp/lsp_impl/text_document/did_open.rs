@@ -244,7 +244,7 @@ impl Kakehashi {
             }
         } else if self.is_cli_mode() {
             self.parse_coordinator()
-                .parse_document(uri.clone(), Some(&language_id), ticket)
+                .parse_document(uri.clone(), Some(&language_id), ticket, Some(incarnation))
                 .await;
             if !deferred_events.is_empty() {
                 self.notifier().log_language_events(&deferred_events).await;
@@ -274,7 +274,12 @@ impl Kakehashi {
             let deferred = std::mem::take(&mut deferred_events);
             tokio::spawn(async move {
                 let landed = parse
-                    .parse_document(parse_uri.clone(), Some(parse_language_id.as_str()), ticket)
+                    .parse_document(
+                        parse_uri.clone(),
+                        Some(parse_language_id.as_str()),
+                        ticket,
+                        Some(incarnation),
+                    )
                     .await;
                 // Publication grants a revision, not a permanent permission.
                 // The downstream rechecks it under its lifecycle lock so a
@@ -385,7 +390,7 @@ mod tests {
         );
         server
             .parse_coordinator()
-            .parse_document(uri.clone(), Some("rust"), None)
+            .parse_document(uri.clone(), Some("rust"), None, None)
             .await;
 
         let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
@@ -439,6 +444,39 @@ mod tests {
             !server.synthetic_diagnostics.has_active_task(&uri),
             "didClose must remove the install recovery diagnostic registration"
         );
+    }
+
+    #[tokio::test]
+    async fn delayed_open_parse_cannot_relabel_a_reopened_document() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), tree_sitter_rust::LANGUAGE.into());
+        let uri = Url::parse("file:///test/delayed-open.rs").unwrap();
+        let original =
+            server
+                .documents
+                .insert(uri.clone(), "fn old() {}".into(), Some("rust".into()), None);
+        server.documents.remove(&uri);
+        let reopened =
+            server
+                .documents
+                .insert(uri.clone(), "package main".into(), Some("go".into()), None);
+        assert_ne!(original, reopened);
+        // The spawned old-open task starts only after the new lifetime exists.
+        let result = server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("rust"), None, Some(original))
+            .await;
+        assert!(
+            result.is_none(),
+            "the delayed open must not parse the new lifetime"
+        );
+        let document = server.documents.get(&uri).unwrap();
+        assert_eq!(document.language_id(), Some("go"));
+        assert!(document.tree().is_none());
     }
 
     #[tokio::test]
@@ -1243,7 +1281,7 @@ print("hello")
             .insert(uri.clone(), text.clone(), Some("rust".to_string()), None);
         server
             .parse_coordinator()
-            .parse_document(uri.clone(), Some("rust"), None)
+            .parse_document(uri.clone(), Some("rust"), None, None)
             .await;
 
         let snapshot = server
@@ -1281,7 +1319,7 @@ print("hello")
         );
         server
             .parse_coordinator()
-            .parse_document(uri.clone(), Some("rust"), None)
+            .parse_document(uri.clone(), Some("rust"), None, None)
             .await;
         assert!(
             server
@@ -1351,7 +1389,7 @@ print("hello")
 
         server
             .parse_coordinator()
-            .parse_document(uri.clone(), Some("rust"), None)
+            .parse_document(uri.clone(), Some("rust"), None, None)
             .await;
 
         assert!(
@@ -1384,7 +1422,7 @@ print("hello")
         );
         server
             .parse_coordinator()
-            .parse_document(uri.clone(), Some("rust"), None)
+            .parse_document(uri.clone(), Some("rust"), None, None)
             .await;
         assert!(
             server
@@ -1750,7 +1788,7 @@ print("hello")
             .insert(uri.clone(), text.clone(), Some("rust".to_string()), None);
         server
             .parse_coordinator()
-            .parse_document(uri.clone(), Some("rust"), None)
+            .parse_document(uri.clone(), Some("rust"), None, None)
             .await;
 
         let snapshot = server
@@ -1792,7 +1830,7 @@ print("hello")
         );
         server
             .parse_coordinator()
-            .parse_document(uri.clone(), Some("rust"), None)
+            .parse_document(uri.clone(), Some("rust"), None, None)
             .await;
 
         let snapshot = server

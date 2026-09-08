@@ -272,7 +272,9 @@ the same epoch, so the loser's cache entries are the winner's.) There is one
 store: the **snapshot publish is the sole commit point**, and `Document::tree`
 and the incremental seed are derived from the published cell (Stage 3).
 `semanticTokens/refresh` gates on the publish; parse completion checks currency
-again after resolution. The open parse and successful install reparse return their producing
+again after resolution. The off-ingress open parse first checks the incarnation captured by its
+registering handler, before reading text or recording language. The open parse
+and successful install reparse return their producing
 `ParseLineage` (incarnation and content version). Their injection follow-ups must
 validate that lineage and a current tree under the lifecycle lock before
 cancelling or replacing eager work, and preserve that target through settle

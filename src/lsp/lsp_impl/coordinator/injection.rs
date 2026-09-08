@@ -1241,6 +1241,60 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn open_admission_accepts_same_revision_region_enrichment() {
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), tree_sitter_rust::LANGUAGE.into());
+        let uri = Url::parse("file:///enriched-open.rs").unwrap();
+        let text = "fn main() {}";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            text.into(),
+            Some("rust".into()),
+            parser.parse(text, None),
+        );
+        let view = server.documents.latest_snapshot(&uri).unwrap();
+        let first = view.slot.snapshot.unwrap();
+        let lineage = super::super::parse::ParseLineage {
+            incarnation,
+            content_version: view.content_version,
+        };
+        assert!(server.documents.complete_parse(
+            &uri,
+            crate::document::LanguageCheck::Expect(Some("rust")),
+            &first,
+            Some(crate::document::snapshot::ResolvedRegions::empty(
+                server.settings_manager.settings_generation()
+            )),
+        ));
+        let enriched = server
+            .documents
+            .latest_snapshot(&uri)
+            .unwrap()
+            .slot
+            .snapshot
+            .unwrap();
+        assert!(
+            !Arc::ptr_eq(&first, &enriched),
+            "enrichment replaces the immutable snapshot"
+        );
+        assert!(
+            server
+                .injection_coordinator()
+                .process_injections_for_parse(&uri, lineage)
+                .await,
+            "same-revision enrichment must retain open downstream eligibility"
+        );
+    }
+
     /// Publish `tree` as `uri`'s current parse snapshot under `language`,
     /// the way a settled parse would.
     fn publish_test_snapshot(

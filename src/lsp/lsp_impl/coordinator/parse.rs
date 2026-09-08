@@ -533,6 +533,7 @@ impl ParseCoordinator {
         uri: Url,
         language_id: Option<&str>,
         ticket: Option<u64>,
+        expected_incarnation: Option<u64>,
     ) -> Option<ParseLineage> {
         let mut events = Vec::new();
 
@@ -548,13 +549,16 @@ impl ParseCoordinator {
         // the writer ticket (a `didClose` is gated behind the open); the guard is for
         // the off-ingress open flip (#6), where a `didClose`/reopen can race it.
         let (text, incarnation, content_version, version_cancel) =
-            self.documents.get(&uri).map(|doc| {
-                (
+            self.documents.get(&uri).and_then(|doc| {
+                if expected_incarnation.is_some_and(|expected| doc.incarnation() != expected) {
+                    return None;
+                }
+                Some((
                     doc.text_arc(),
                     doc.incarnation(),
                     doc.content_version(),
                     doc.version_cancel_token(),
-                )
+                ))
             })?;
 
         // Publish the watermark on whichever path resolves the parse below, but

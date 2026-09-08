@@ -549,7 +549,7 @@ mod tests {
         assert!(
             server
                 .parse_coordinator()
-                .parse_document(uri.clone(), Some("rust"), None)
+                .parse_document(uri.clone(), Some("rust"), None, None)
                 .await
                 .is_some()
         );
@@ -574,7 +574,7 @@ mod tests {
                 assert!(
                     server
                         .parse_coordinator()
-                        .parse_document(uri.clone(), Some("go"), None)
+                        .parse_document(uri.clone(), Some("go"), None, None)
                         .await
                         .is_some()
                 );
