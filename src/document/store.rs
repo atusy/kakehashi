@@ -730,6 +730,10 @@ pub(crate) struct ParseInstall {
     /// same entry guard as the publish, so a reparse's refresh gate needs no
     /// probe of its own that a racing give-up could invalidate.
     pub(crate) tree_upgrade: bool,
+    /// This current publish replaced an existing label with a detected grammar.
+    /// An already opened host must be reconciled even if an edit overtakes
+    /// completion. Unlabelled inputs have no provisional eager host open.
+    pub(crate) host_language_changed: bool,
 }
 
 impl DocumentStore {
@@ -826,6 +830,14 @@ impl DocumentStore {
                     // A provisional label is refined atomically with the current
                     // tree. A stale publish must not establish language for an edit
                     // whose own detection may have selected a different grammar.
+                    let host_language_changed = current
+                        && doc.language_id().is_some()
+                        && detected.is_some()
+                        && doc.language_id() != detected.as_deref()
+                        && matches!(
+                            language,
+                            LanguageCheck::Record | LanguageCheck::RecordIfUnchanged(_)
+                        );
                     if current
                         && matches!(
                             language,
@@ -838,6 +850,7 @@ impl DocumentStore {
                         current,
                         published,
                         tree_upgrade: published && fills_placeholder,
+                        host_language_changed,
                     }
                 });
         // Likewise a rejected `snapshot` (still owned here: the publish
@@ -925,7 +938,8 @@ mod tests {
             ParseInstall {
                 current: false,
                 published: true,
-                tree_upgrade: false
+                tree_upgrade: false,
+                host_language_changed: false,
             }
         );
         assert!(store.get(&uri).unwrap().tree().is_none());
@@ -975,7 +989,8 @@ mod tests {
             ParseInstall {
                 current: false,
                 published: true,
-                tree_upgrade: false
+                tree_upgrade: false,
+                host_language_changed: false,
             }
         );
         assert_eq!(
@@ -1271,7 +1286,8 @@ mod tests {
             ParseInstall {
                 current: true,
                 published: true,
-                tree_upgrade: false
+                tree_upgrade: false,
+                host_language_changed: false,
             },
             "same version, same lifetime: the current parse, whichever allocation it read"
         );
@@ -1301,7 +1317,8 @@ mod tests {
             ParseInstall {
                 current: true,
                 published: true,
-                tree_upgrade: false
+                tree_upgrade: false,
+                host_language_changed: false,
             }
         );
         let doc = store.get(&uri).unwrap();
@@ -1594,7 +1611,8 @@ mod tests {
             ParseInstall {
                 current: true,
                 published: true,
-                tree_upgrade: false
+                tree_upgrade: false,
+                host_language_changed: false,
             }
         );
         assert!(store.get(&uri).unwrap().tree().is_some(), "tree visible");

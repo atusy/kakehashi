@@ -62,6 +62,7 @@ pub(super) struct InstallCoordinatorDeps {
     pub(super) settings_manager: std::sync::Arc<SettingsManager>,
     pub(super) auto_install: AutoInstallManager,
     pub(super) bridge: std::sync::Arc<BridgeCoordinator>,
+    pub(super) shutdown: tokio_util::sync::CancellationToken,
 }
 
 /// Installation/lifetime eligibility is distinct from ownership of a parse.
@@ -82,6 +83,7 @@ pub(crate) struct InstallCoordinator {
     settings_manager: std::sync::Arc<SettingsManager>,
     auto_install: AutoInstallManager,
     bridge: std::sync::Arc<BridgeCoordinator>,
+    shutdown: tokio_util::sync::CancellationToken,
 }
 
 impl InstallCoordinator {
@@ -96,6 +98,7 @@ impl InstallCoordinator {
             settings_manager: std::sync::Arc::clone(&server.settings_manager),
             auto_install: server.auto_install.clone(),
             bridge: std::sync::Arc::clone(&server.bridge),
+            shutdown: server.shutdown_token.clone(),
         })
     }
 
@@ -110,6 +113,7 @@ impl InstallCoordinator {
             settings_manager: deps.settings_manager,
             auto_install: deps.auto_install,
             bridge: deps.bridge,
+            shutdown: deps.shutdown,
         }
     }
 
@@ -441,6 +445,7 @@ impl InstallCoordinator {
             cache: std::sync::Arc::clone(&self.cache),
             settings_manager: std::sync::Arc::clone(&self.settings_manager),
             bridge: std::sync::Arc::clone(&self.bridge),
+            shutdown: self.shutdown.clone(),
         })
     }
 }

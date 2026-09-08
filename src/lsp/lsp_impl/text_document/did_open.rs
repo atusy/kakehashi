@@ -74,7 +74,6 @@ impl Kakehashi {
                 .insert(uri.clone(), text.clone(), language_name.clone(), None);
         self.bridge.open_tracker_incarnation(&uri, incarnation);
         self.bridge.open_host_incarnation(&uri, incarnation).await;
-        drop(edit_guard);
 
         // Host-tier hoist (parse-decoupled-document-lifecycle ADR): attach the real
         // host document to any `_self` host-bridge server *before* the parser load,
@@ -94,6 +93,8 @@ impl Kakehashi {
             self.bridge
                 .eager_open_host_document_on_servers(&settings, lang, &uri, &text);
         }
+
+        drop(edit_guard);
 
         // Check if we need to auto-install
         let mut deferred_events = Vec::new();
@@ -1454,6 +1455,339 @@ print("hello")
             server.documents.get(&uri).is_none(),
             "parse_document must not resurrect a document closed before it ran"
         );
+    }
+
+    #[cfg(unix)]
+    async fn recorded_host_messages(
+        path: &std::path::Path,
+        count: usize,
+    ) -> Vec<serde_json::Value> {
+        timeout(Duration::from_secs(3), async {
+            loop {
+                let bytes = tokio::fs::read(path).await.unwrap();
+                let mut reader = crate::lsp::bridge::BridgeReader::new(bytes.as_slice());
+                let mut messages = Vec::new();
+                loop {
+                    match reader.read_message().await {
+                        Ok(message) => messages.push(message),
+                        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                        Err(error) => panic!("invalid host wire message: {error}"),
+                    }
+                }
+                if messages.len() >= count {
+                    return messages;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("host wire messages must arrive")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn language_promotion_reasks_a_suppressing_routing_provider() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+        let mut settings = (*server.settings_manager.load_settings()).clone();
+        settings
+            .language_servers
+            .get_mut("rust_ls")
+            .unwrap()
+            .languages = Some(vec!["*".into()]);
+        settings
+            .languages
+            .insert("_".into(), settings.languages["rust"].clone());
+        server.settings_manager.apply_settings(settings);
+        let recording = tempfile::NamedTempFile::new().unwrap();
+        let handle = server
+            .bridge
+            .insert_recording_test_connection("rust_ls", recording.path())
+            .await;
+        crate::lsp::bridge::test_helpers::advertise_routing_for_test(&handle);
+        let uri = Url::parse("file:///test/suppressed-promotion.rs").unwrap();
+        let text = "fn edited() {}";
+        let incarnation =
+            server
+                .documents
+                .insert(uri.clone(), text.into(), Some("text".into()), None);
+        server.bridge.open_host_incarnation(&uri, incarnation).await;
+        server.bridge.eager_open_host_document_on_servers(
+            &server.settings_manager.load_settings(),
+            "text",
+            &uri,
+            text,
+        );
+        let messages = recorded_host_messages(recording.path(), 1).await;
+        assert_eq!(messages[0]["params"]["textDocument"]["languageId"], "text");
+        assert!(messages[0].get("id").is_some(), "routing is a request");
+        assert_eq!(
+            handle.router().route(serde_json::json!({
+                "jsonrpc": "2.0", "id": messages[0]["id"],
+                "result": { "routing": { "rust_ls": { "enabled": false } } }
+            })),
+            crate::lsp::bridge::RouteResult::Delivered
+        );
+        timeout(
+            Duration::from_secs(2),
+            server.bridge.pool().wait_for_host_routing(&uri),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            server.bridge.pool().host_routing_by_server(&uri, "rust_ls"),
+            Some(false)
+        );
+        assert!(
+            !server
+                .bridge
+                .pool()
+                .is_host_document_opened(&uri, "rust_ls")
+                .await
+        );
+
+        server
+            .parse_coordinator()
+            .reparse_latest(&uri, Some(1))
+            .await;
+        let messages = recorded_host_messages(recording.path(), 2).await;
+        assert_eq!(messages[1]["method"], messages[0]["method"]);
+        assert_eq!(messages[1]["params"]["textDocument"]["languageId"], "rust");
+        assert_ne!(messages[1]["id"], messages[0]["id"]);
+        assert_eq!(
+            handle.router().route(serde_json::json!({
+                "jsonrpc": "2.0", "id": messages[1]["id"],
+                "result": { "routing": { "rust_ls": { "enabled": true } } }
+            })),
+            crate::lsp::bridge::RouteResult::Delivered
+        );
+        let messages = recorded_host_messages(recording.path(), 3).await;
+        assert_eq!(messages[2]["method"], "textDocument/didOpen");
+        assert_eq!(messages[2]["params"]["textDocument"]["languageId"], "rust");
+    }
+
+    #[cfg(unix)]
+    #[rstest::rstest]
+    #[case(false, false)]
+    #[case(true, false)]
+    #[case(true, true)]
+    #[tokio::test]
+    async fn winning_edit_reopens_a_provisional_downstream_language(
+        #[case] cancel_after_publication: bool,
+        #[case] reload_before_reconciliation: bool,
+    ) {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+        let mut settings = (*server.settings_manager.load_settings()).clone();
+        settings
+            .language_servers
+            .get_mut("rust_ls")
+            .unwrap()
+            .languages = Some(vec!["*".into()]);
+        settings
+            .languages
+            .insert("_".into(), settings.languages["rust"].clone());
+        server.settings_manager.apply_settings(settings);
+        let recording = tempfile::NamedTempFile::new().unwrap();
+        server
+            .bridge
+            .insert_recording_test_connection("rust_ls", recording.path())
+            .await;
+        let uri = Url::parse("file:///test/provisional-wire.rs").unwrap();
+        let text = "fn edited() {}";
+        let incarnation =
+            server
+                .documents
+                .insert(uri.clone(), text.into(), Some("text".into()), None);
+        server.bridge.open_host_incarnation(&uri, incarnation).await;
+        server.bridge.eager_open_host_document_on_servers(
+            &server.settings_manager.load_settings(),
+            "text",
+            &uri,
+            text,
+        );
+        let messages = recorded_host_messages(recording.path(), 1).await;
+        assert_eq!(messages[0]["method"], "textDocument/didOpen");
+        assert_eq!(messages[0]["params"]["textDocument"]["languageId"], "text");
+
+        if cancel_after_publication {
+            let query = Query::new(
+                &tree_sitter_rust::LANGUAGE.into(),
+                r#"((function_item) @injection.content (#set! injection.language "lua"))"#,
+            )
+            .unwrap();
+            server
+                .language
+                .query_store()
+                .insert_injection_query("rust".into(), std::sync::Arc::new(query));
+            server.bridge.open_tracker_incarnation(&uri, incarnation);
+            let resolution_hold = server.cache.hold_resolution();
+            let lifecycle = server.bridge.pool().host_lifecycle_lock(&uri);
+            let guard = lifecycle.write().await;
+            let parser = server.parse_coordinator();
+            let parse_uri = uri.clone();
+            let parse =
+                tokio::spawn(async move { parser.reparse_latest(&parse_uri, Some(1)).await });
+            timeout(Duration::from_secs(3), async {
+                while server.documents.get(&uri).unwrap().language_id() != Some("rust") {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("first publication must establish the label");
+            timeout(Duration::from_secs(2), async {
+                while server.bridge.has_host_eager_batch_for_test(&uri) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("reconciliation cancelled the old eager batch");
+            let edit_lock = server.documents.edit_lock(&uri);
+            let edit_guard = timeout(Duration::from_secs(1), edit_lock.lock())
+                .await
+                .expect("waiting for a host response must not block edits");
+            if reload_before_reconciliation {
+                let mut updated = (*server.settings_manager.load_settings()).clone();
+                updated.languages.get_mut("rust").unwrap().base = Some("lua".into());
+                server
+                    .language
+                    .language_registry_for_parallel()
+                    .unregister("rust");
+                server
+                    .language
+                    .language_registry_for_parallel()
+                    .register("lua".into(), tree_sitter_lua::LANGUAGE.into());
+                server.language.set_base_mapping("rust", "lua");
+                server.settings_manager.apply_settings(updated);
+                server
+                    .documents
+                    .update_document(uri.clone(), "print(1)".into(), None);
+            }
+            drop(edit_guard);
+            parse.abort();
+            assert!(parse.await.unwrap_err().is_cancelled());
+            drop(resolution_hold);
+            drop(guard);
+        } else {
+            server
+                .parse_coordinator()
+                .reparse_latest(&uri, Some(1))
+                .await;
+        }
+        assert_eq!(
+            server.documents.get(&uri).unwrap().language_id(),
+            Some("rust")
+        );
+        let messages = recorded_host_messages(recording.path(), 3).await;
+        assert_eq!(messages[1]["method"], "textDocument/didClose");
+        assert_eq!(messages[2]["method"], "textDocument/didOpen");
+        assert_eq!(
+            messages[2]["params"]["textDocument"]["languageId"],
+            if reload_before_reconciliation {
+                "lua"
+            } else {
+                "rust"
+            }
+        );
+        assert_eq!(
+            messages[2]["params"]["textDocument"]["text"],
+            if reload_before_reconciliation {
+                "print(1)"
+            } else {
+                text
+            }
+        );
+        if reload_before_reconciliation {
+            assert_eq!(server.document_language(&uri).as_deref(), Some("lua"));
+            return;
+        }
+
+        // Leave the current incarnation live but its downstream slot vacant,
+        // exactly the gap between a relabel close and replacement eager open.
+        server.bridge.pool().close_host_bridge_document(&uri).await;
+        let settings = server.settings_manager.load_settings();
+        let stale = crate::lsp::bridge::HostDocument {
+            uri: &uri,
+            language_id: "lua",
+            text,
+        };
+        let result = timeout(Duration::from_secs(1), server.bridge.pool().send_host_raw_request(
+            "rust_ls", &settings.language_servers["rust_ls"], &stale,
+            "textDocument/hover", serde_json::json!({ "textDocument": { "uri": uri.as_str() }, "position": { "line": 0, "character": 0 } }), None,
+        )).await.expect("a pre-promotion request must be rejected before reaching the server");
+        assert!(result.is_err());
+        assert!(
+            !server
+                .bridge
+                .pool()
+                .is_host_document_opened(&uri, "rust_ls")
+                .await
+        );
+        server
+            .bridge
+            .pool()
+            .eager_open_host_document(
+                "rust_ls",
+                &settings.language_servers["rust_ls"],
+                &uri,
+                "text",
+                text,
+                None,
+            )
+            .await;
+        assert!(
+            !server
+                .bridge
+                .pool()
+                .is_host_document_opened(&uri, "rust_ls")
+                .await,
+            "a late provisional eager open cannot occupy the replacement slot"
+        );
+
+        // A later configuration can legitimately change an established label's
+        // canonical grammar. The old promotion fence must expire with settings.
+        let mut updated = (*settings).clone();
+        updated.languages.get_mut("rust").unwrap().base = Some("lua".into());
+        server
+            .language
+            .language_registry_for_parallel()
+            .unregister("rust");
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("lua".into(), tree_sitter_lua::LANGUAGE.into());
+        server.language.set_base_mapping("rust", "lua");
+        server.settings_manager.apply_settings(updated);
+        server
+            .documents
+            .update_document(uri.clone(), "print(1)".into(), None);
+        server
+            .parse_coordinator()
+            .reparse_latest(&uri, Some(2))
+            .await;
+        assert_eq!(
+            server.documents.get(&uri).unwrap().language_id(),
+            Some("rust")
+        );
+        let canonical = server.document_language(&uri).unwrap();
+        assert_eq!(canonical, "lua");
+        server
+            .bridge
+            .pool()
+            .eager_open_host_document(
+                "rust_ls",
+                &settings.language_servers["rust_ls"],
+                &uri,
+                &canonical,
+                "print(1)",
+                None,
+            )
+            .await;
+        let messages = recorded_host_messages(recording.path(), 5).await;
+        assert_eq!(messages[4]["method"], "textDocument/didOpen");
+        assert_eq!(messages[4]["params"]["textDocument"]["languageId"], "lua");
     }
 
     #[rstest::rstest]

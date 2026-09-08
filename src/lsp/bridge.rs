@@ -28,10 +28,13 @@ mod actor;
 mod client;
 mod client_progress;
 mod connection;
+#[cfg(all(test, unix))]
+pub(crate) use connection::BridgeReader;
 pub(crate) mod coordinator;
 pub(crate) mod envelope;
 mod inbound_request_registry;
 mod pool;
+pub(crate) use pool::HostLanguageAdmission;
 mod progress_registry;
 mod protocol;
 mod root_markers;
@@ -47,6 +50,8 @@ mod workspace;
 pub(crate) use actor::ForwardedRequestCancel;
 #[cfg(test)]
 pub(crate) use actor::OutboundMessage;
+#[cfg(all(test, unix))]
+pub(crate) use actor::RouteResult;
 pub(crate) use actor::UpstreamNotification;
 pub(crate) use actor::UpstreamRequest;
 pub(crate) use client_progress::{

@@ -156,6 +156,7 @@ pub(super) struct ParseCoordinatorDeps {
     pub(super) cache: std::sync::Arc<CacheCoordinator>,
     pub(super) settings_manager: std::sync::Arc<SettingsManager>,
     pub(super) bridge: std::sync::Arc<BridgeCoordinator>,
+    pub(super) shutdown: tokio_util::sync::CancellationToken,
 }
 
 pub(crate) struct ParseCoordinator {
@@ -167,6 +168,109 @@ pub(crate) struct ParseCoordinator {
     cache: std::sync::Arc<CacheCoordinator>,
     settings_manager: std::sync::Arc<SettingsManager>,
     bridge: std::sync::Arc<BridgeCoordinator>,
+    shutdown: tokio_util::sync::CancellationToken,
+}
+
+/// A label transition outlives the parse future that published it. Normal
+/// callers join the work; cancellation only detaches that join, while server
+/// shutdown still cancels the reconciliation through the shared token.
+#[derive(Clone)]
+struct HostLanguageReconciler {
+    language: std::sync::Arc<LanguageCoordinator>,
+    documents: std::sync::Arc<DocumentStore>,
+    bridge: std::sync::Arc<BridgeCoordinator>,
+    settings_manager: std::sync::Arc<SettingsManager>,
+    shutdown: tokio_util::sync::CancellationToken,
+    runtime: tokio::runtime::Handle,
+    settings_generation: u64,
+}
+
+impl HostLanguageReconciler {
+    fn spawn(
+        &self,
+        uri: &Url,
+        installed: crate::document::ParseInstall,
+        snapshot: &crate::document::snapshot::ParseSnapshot,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        if !installed.host_language_changed {
+            return None;
+        }
+        let this = self.clone();
+        let uri = uri.clone();
+        let language = snapshot.language.clone();
+        let incarnation = snapshot.incarnation;
+        Some(self.runtime.spawn(async move {
+            tokio::select! {
+                biased;
+                _ = this.shutdown.cancelled() => {}
+                _ = async {
+                    let still_current = || this.documents.get(&uri).is_some_and(|document| {
+                        document.incarnation() == incarnation
+                            && document.language_id() == language.as_deref()
+                    });
+                    let edit_lock = this.documents.edit_lock(&uri);
+                    let edit_guard = edit_lock.lock().await;
+                    if !still_current() {
+                        this.documents.remove_edit_lock_if_unshared(&uri, &edit_lock);
+                        return;
+                    }
+                    // Initial opens and debounce register under this same lock.
+                    // Cancel their old batch, then release ingress before waiting
+                    // for outstanding host requests to release the bridge lock.
+                    this.bridge.cancel_host_eager_open(&uri);
+                    drop(edit_guard);
+                    let settings_manager = this.settings_manager.clone();
+                    let admission = crate::lsp::bridge::HostLanguageAdmission {
+                        language: language.clone().expect("promotion carries a detected language"),
+                        settings_generation: this.settings_generation,
+                        current_settings_generation: std::sync::Arc::new(move || settings_manager.settings_generation()),
+                    };
+                    if !this.bridge.pool().reconcile_host_language(&uri, incarnation, admission, &still_current).await {
+                        if this.documents.get(&uri).is_none() {
+                            this.documents.remove_edit_lock_if_unshared(&uri, &edit_lock);
+                        }
+                        return;
+                    }
+                    // A later edit cannot erase an accepted language transition.
+                    // Re-admit against its lifetime/label, not its old version,
+                    // and read the latest text before registering replacement work.
+                    let _edit_guard = edit_lock.lock().await;
+                    let Some(document) = this.documents.get(&uri) else {
+                        this.documents.remove_edit_lock_if_unshared(&uri, &edit_lock);
+                        return;
+                    };
+                    if document.incarnation() != incarnation || document.language_id() != language.as_deref() {
+                        return;
+                    }
+                    let text = document.text_arc();
+                    let settings = this.settings_manager.load_settings_pair();
+                    // A reload can make the preserved label an alias for another
+                    // grammar while this task waits. Match current host contexts
+                    // instead of reopening with the pre-reload parser's name.
+                    let replacement = if settings.generation != this.settings_generation {
+                        this.language.detect_language(uri.path(), &text, None, document.language_id())
+                            .or_else(|| language.clone())
+                    } else {
+                        language.clone()
+                    };
+                    drop(document);
+                    if let Some(language) = replacement.as_deref() {
+                        this.bridge.eager_open_host_document_on_servers(
+                            &settings.settings, language, &uri, &text,
+                        );
+                    }
+                } => {}
+            }
+        }))
+    }
+}
+
+async fn join_host_reconciliation(uri: &Url, task: Option<tokio::task::JoinHandle<()>>) {
+    if let Some(task) = task
+        && let Err(error) = task.await
+    {
+        log::error!("Host language reconciliation failed for {uri:?}: {error}");
+    }
 }
 
 /// Run a populate work-unit cooperatively cancelled, but keep awaiting it.
@@ -200,6 +304,7 @@ impl ParseCoordinator {
             cache: std::sync::Arc::clone(&server.cache),
             settings_manager: std::sync::Arc::clone(&server.settings_manager),
             bridge: std::sync::Arc::clone(&server.bridge),
+            shutdown: server.shutdown_token.clone(),
         })
     }
 
@@ -213,7 +318,32 @@ impl ParseCoordinator {
             cache: deps.cache,
             settings_manager: deps.settings_manager,
             bridge: deps.bridge,
+            shutdown: deps.shutdown,
         }
+    }
+
+    fn host_language_reconciler(&self) -> HostLanguageReconciler {
+        HostLanguageReconciler {
+            language: self.language.clone(),
+            documents: self.documents.clone(),
+            bridge: self.bridge.clone(),
+            settings_manager: self.settings_manager.clone(),
+            shutdown: self.shutdown.clone(),
+            runtime: tokio::runtime::Handle::current(),
+            settings_generation: self.settings_manager.settings_generation(),
+        }
+    }
+
+    async fn install_and_reconcile(
+        &self,
+        uri: &Url,
+        check: crate::document::LanguageCheck<'_>,
+        snapshot: std::sync::Arc<crate::document::snapshot::ParseSnapshot>,
+    ) -> crate::document::ParseInstall {
+        let reconciler = self.host_language_reconciler();
+        let installed = self.documents.install_parse(uri, check, snapshot.clone());
+        join_host_reconciliation(uri, reconciler.spawn(uri, installed, &snapshot)).await;
+        installed
     }
 
     /// Shared parsing orchestration: run parser acquisition + parse logic as one
@@ -407,12 +537,12 @@ impl ParseCoordinator {
         // waits behind a stale publish and the evicted tree's teardown.
         let Some(entry_mint_epoch) = entry_mint_epoch else {
             return self
-                .documents
-                .install_parse(
+                .install_and_reconcile(
                     uri,
                     check.as_check(),
                     inputs.snapshot(PopulatedInjections::default()),
                 )
+                .await
                 .into();
         };
         let build_bridge_regions = self
@@ -425,8 +555,10 @@ impl ParseCoordinator {
         type First = (
             crate::document::ParseInstall,
             std::sync::Arc<crate::document::snapshot::ParseSnapshot>,
+            Option<tokio::task::JoinHandle<()>>,
         );
         let first = std::sync::Arc::new(std::sync::OnceLock::<First>::new());
+        let host_reconciler = self.host_language_reconciler();
         let regions = run_awaited_populate(&self.compute_pool, version_cancel, {
             let inputs = std::sync::Arc::clone(&inputs);
             let check = std::sync::Arc::clone(&check);
@@ -458,7 +590,8 @@ impl ParseCoordinator {
                             check.as_check(),
                             std::sync::Arc::clone(&snapshot),
                         );
-                        let _ = first.set((installed, snapshot));
+                        let reconciliation = host_reconciler.spawn(&pool_uri, installed, &snapshot);
+                        let _ = first.set((installed, snapshot, reconciliation));
                     },
                     Some(&cancel_for_work),
                 );
@@ -476,7 +609,11 @@ impl ParseCoordinator {
         // A work-unit the pool contained (it panicked) derived nothing: the
         // snapshot rides without regions, exactly as a refused pass.
         .unwrap_or_default();
-        match first.get() {
+        // The awaited work unit has dropped its cloned owner, even on panic.
+        let first = std::sync::Arc::into_inner(first)
+            .expect("populate work unit has completed")
+            .into_inner();
+        match first {
             // The pass handed its discovery out and the tree is published:
             // land the regions it resolved on the same version. Nothing to
             // land (skipped resolution, refused commit) publishes nothing —
@@ -484,7 +621,8 @@ impl ParseCoordinator {
             // the cell refused (a sibling parse of this version landed its
             // tree first) has nothing to upgrade: the regions would ride the
             // sibling's tree with a tree the readers never derived from.
-            Some((initial_install, first_snapshot)) => {
+            Some((initial_install, first_snapshot, reconciliation)) => {
+                join_host_reconciliation(uri, reconciliation).await;
                 let current_at_completion = initial_install.published
                     && self.documents.complete_parse(
                         uri,
@@ -499,18 +637,18 @@ impl ParseCoordinator {
                         } else {
                             check.as_check()
                         },
-                        first_snapshot,
+                        &first_snapshot,
                         regions.regions,
                     );
                 ParseCompletion {
-                    initial_install: *initial_install,
+                    initial_install,
                     current_at_completion,
                 }
             }
             // No hand-off: one install, whose currency is judged right now.
             None => self
-                .documents
-                .install_parse(uri, check.as_check(), inputs.snapshot(regions))
+                .install_and_reconcile(uri, check.as_check(), inputs.snapshot(regions))
+                .await
                 .into(),
         }
     }
@@ -690,20 +828,22 @@ impl ParseCoordinator {
             // through to the no-language path below which would null it out. Host
             // bridging needs only text + language (never a tree), so preserving the
             // language keeps a host-bridged document working after a parse failure.
-            let installed = self.documents.install_parse(
-                &uri,
-                crate::document::LanguageCheck::Record,
-                std::sync::Arc::new(crate::document::snapshot::ParseSnapshot {
-                    text: text.clone(),
-                    tree: None,
-                    language: Some(language_name.clone()),
-                    parsed_version: content_version,
-                    incarnation,
-                    injection_regions: None,
-                    regions: None,
-                    layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
-                }),
-            );
+            let installed = self
+                .install_and_reconcile(
+                    &uri,
+                    crate::document::LanguageCheck::Record,
+                    std::sync::Arc::new(crate::document::snapshot::ParseSnapshot {
+                        text: text.clone(),
+                        tree: None,
+                        language: Some(language_name.clone()),
+                        parsed_version: content_version,
+                        incarnation,
+                        injection_regions: None,
+                        regions: None,
+                        layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
+                    }),
+                )
+                .await;
             if installed.current {
                 self.documents
                     .mark_parse_finished(&uri, parse_generation, false);
@@ -714,20 +854,22 @@ impl ParseCoordinator {
         }
 
         // No language detected at all → store no language, no tree.
-        let installed = self.documents.install_parse(
-            &uri,
-            crate::document::LanguageCheck::Record,
-            std::sync::Arc::new(crate::document::snapshot::ParseSnapshot {
-                text: text.clone(),
-                tree: None,
-                language: None,
-                parsed_version: content_version,
-                incarnation,
-                injection_regions: None,
-                regions: None,
-                layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
-            }),
-        );
+        let installed = self
+            .install_and_reconcile(
+                &uri,
+                crate::document::LanguageCheck::Record,
+                std::sync::Arc::new(crate::document::snapshot::ParseSnapshot {
+                    text: text.clone(),
+                    tree: None,
+                    language: None,
+                    parsed_version: content_version,
+                    incarnation,
+                    injection_regions: None,
+                    regions: None,
+                    layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
+                }),
+            )
+            .await;
         if installed.current {
             self.documents
                 .mark_parse_finished(&uri, parse_generation, false);
@@ -1163,6 +1305,84 @@ impl ParseCoordinator {
 mod tests {
     use super::*;
     use tower_lsp_server::LspService;
+
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn language_reconciliation_survives_a_newer_edit(#[case] reload_before_admission: bool) {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///test/sticky-promotion.rs").unwrap();
+        let incarnation =
+            server
+                .documents
+                .insert(uri.clone(), "old text".into(), Some("text".into()), None);
+        server.bridge.open_host_incarnation(&uri, incarnation).await;
+        server
+            .bridge
+            .pool()
+            .set_host_routing_by_server(&uri, "old-server", false);
+        let snapshot = std::sync::Arc::new(crate::document::snapshot::ParseSnapshot {
+            text: std::sync::Arc::from("old text"),
+            tree: None,
+            language: Some("rust".into()),
+            parsed_version: 0,
+            incarnation,
+            injection_regions: None,
+            regions: None,
+            layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
+        });
+        let reconciler = server.parse_coordinator().host_language_reconciler();
+        let installed = server.documents.install_parse(
+            &uri,
+            crate::document::LanguageCheck::RecordIfUnchanged(Some("text")),
+            snapshot.clone(),
+        );
+        assert!(installed.host_language_changed);
+        let lock = server.documents.edit_lock(&uri);
+        let guard = lock.lock().await;
+        let task = reconciler.spawn(&uri, installed, &snapshot).unwrap();
+        server
+            .documents
+            .update_document(uri.clone(), "newer text".into(), None);
+        if reload_before_admission {
+            server
+                .settings_manager
+                .apply_settings((*server.settings_manager.load_settings()).clone());
+        }
+        let virtual_uri = Url::parse("file:///test/current-injection.lua").unwrap();
+        let virtual_routing = server
+            .bridge
+            .pool()
+            .begin_virtual_routing(&uri, &virtual_uri);
+        drop(guard);
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            server
+                .bridge
+                .pool()
+                .host_routing_by_server(&uri, "old-server"),
+            None,
+            "a newer edit must not strand the old routing decision"
+        );
+        assert_eq!(
+            server.bridge.pool().accepts_host_language(&uri, "text"),
+            reload_before_admission,
+            "a late old-generation reconciliation must not install a new fence"
+        );
+        assert_eq!(server.documents.get(&uri).unwrap().text(), "newer text");
+        assert!(
+            server
+                .bridge
+                .pool()
+                .is_virtual_routing_current(&uri, &virtual_uri, &virtual_routing),
+            "host reconciliation must preserve a newer edit's virtual routing pass"
+        );
+    }
 
     #[tokio::test]
     async fn reparse_without_detectable_language_publishes_giveup_snapshot() {

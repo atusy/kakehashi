@@ -929,6 +929,7 @@ impl InjectionCoordinator {
             settings_manager: std::sync::Arc::clone(&self.settings_manager),
             auto_install: self.auto_install.clone(),
             bridge: std::sync::Arc::clone(&self.bridge),
+            shutdown: self.shutdown.clone(),
         })
     }
 }

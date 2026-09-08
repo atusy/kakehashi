@@ -212,6 +212,35 @@ impl LanguageServerPool {
         self.finish_all_host_routing(uri);
         let lifecycle = self.host_lifecycle_lock(uri);
         let _lifecycle_guard = lifecycle.write().await;
+        self.close_host_bridge_document_locked(uri).await;
+        self.clear_host_routing_suppression(uri);
+    }
+
+    /// Revalidate the store label after waiting for host requests, then fence
+    /// lazy requests before freeing downstream slots. The caller must not hold
+    /// its edit lock while waiting here: host responses can take many seconds.
+    pub(crate) async fn reconcile_host_language(
+        &self,
+        uri: &Url,
+        incarnation: u64,
+        admission: super::super::pool::HostLanguageAdmission,
+        still_current: impl Fn() -> bool + Send + Sync,
+    ) -> bool {
+        let Some(lifecycle) = self.existing_host_lifecycle_lock(uri) else {
+            return false;
+        };
+        let guard = lifecycle.write().await;
+        if !still_current() || !self.set_promoted_host_language(uri, incarnation, admission) {
+            drop(guard);
+            self.remove_host_lifecycle_lock_if_unshared(uri, &lifecycle);
+            return false;
+        }
+        self.close_host_bridge_document_locked(uri).await;
+        self.clear_host_document_routing(uri);
+        true
+    }
+
+    async fn close_host_bridge_document_locked(&self, uri: &Url) {
         self.invalidate_diagnostic_host(uri);
         let Ok(uri_lsp) = host_url_to_lsp_uri(uri) else {
             return;
@@ -248,7 +277,6 @@ impl LanguageServerPool {
             .map(|(doc_uri, connection_key)| (connection_key, doc_uri))
             .collect::<Vec<_>>();
         docs.retain(|(doc_uri, _), _| *doc_uri != uri_string);
-        self.clear_host_routing_suppression(uri);
         for key in closed_keys {
             self.invalidate_diagnostic_document(&key);
         }
@@ -579,6 +607,12 @@ impl LanguageServerPool {
         let connection_key = handle.key();
         self.wait_for_host_routing(doc.uri).await;
         let host_lifecycle = self.request_host_lifecycle(doc.uri).await?;
+        if !self.accepts_host_language(doc.uri, doc.language_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "host language changed before request",
+            ));
+        }
         if self.is_host_routing_suppressed(doc.uri, connection_key) {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
