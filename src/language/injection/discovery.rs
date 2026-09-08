@@ -376,7 +376,10 @@ pub(crate) fn collect_all_injections_cancellable<'a>(
     cancel: Option<&crate::cancel::CancelToken>,
 ) -> Option<Vec<InjectionRegionInfo<'a>>> {
     let query = injection_query?;
-    if root.byte_range().len() >= 64 * 1024
+    // Keep the measured 2 KiB / 32 KiB controls on the serial path;
+    // scheduling and merging only pay off for larger trees.
+    const MIN_PARALLEL_BYTES: usize = 64 * 1024;
+    if root.byte_range().len() >= MIN_PARALLEL_BYTES
         && rayon::current_thread_index().is_some()
         && rayon::current_num_threads() > 1
         && let Some(regions) = try_collect_partitioned(root, text, query, cancel)
@@ -480,6 +483,9 @@ fn collect_query_roots<'a>(
     let mut work_items = 0;
 
     for root in roots {
+        if crate::cancel::is_cancelled(cancel) {
+            return None;
+        }
         let mut matches = cursor.matches(query, *root, text.as_bytes());
         while let Some(match_) = matches.next() {
             if crate::cancel::is_cancelled_periodically(cancel, &mut work_items) {
@@ -504,11 +510,8 @@ fn collect_query_roots<'a>(
                     language.clone(),
                     match_.pattern_index,
                 );
-                // `or_insert_with` so the per-pattern predicate scans
-                // (`has_include_children_for_pattern` / `effective_offset_for_pattern`)
-                // are skipped when this content-node range was already inserted by
-                // an earlier matching pattern for the same language. Same
-                // resulting language layers, fewer scans.
+                // Retain the first match for this range, language and pattern,
+                // including its capture-dependent runtime directives.
                 injections_map.entry(key).or_insert_with(|| {
                     let offset = runtime_offset_for_capture(query, match_, capture, text);
                     InjectionRegionInfo {
@@ -1871,6 +1874,117 @@ mod tests {
             for query in &queries {
                 assert_discovery_matches_reference(&fresh, &text, query);
             }
+        }
+    }
+
+    #[test]
+    fn partitioning_preserves_root_matches_and_ancestor_context() {
+        let text = "// α\nfn first() {}\n// β\nfn second() {}\n";
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(
+            &language,
+            r#"
+            ((source_file (line_comment) @injection.content (function_item) @helper)
+              (#contains? @helper "second")
+              (#set! injection.language "root"))
+            ((line_comment) @injection.content
+              (#has-parent? @injection.content "source_file")
+              (#has-ancestor? @injection.content "source_file")
+              (#offset! @injection.content 0 -1 1 1)
+              (#set! injection.language "child"))
+        "#,
+        )
+        .unwrap();
+        let tree = create_rust_parser().parse(text, None).unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let regions = pool
+            .install(|| try_collect_partitioned(&tree.root_node(), text, &query, None))
+            .unwrap();
+        assert!(regions.iter().any(|r| r.language == "root"));
+        assert_eq!(regions.iter().filter(|r| r.language == "child").count(), 2);
+        assert_discovery_matches_reference(&tree, text, &query);
+    }
+
+    #[test]
+    fn sibling_patterns_fall_back_to_the_full_query() {
+        let text = "// first\n// second\nfn main() {}\n";
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(
+            &language,
+            r#"
+            ((line_comment) @injection.content (line_comment) @helper
+              (#set! injection.language "comment"))
+        "#,
+        )
+        .unwrap();
+        assert!(!query.is_pattern_rooted(0));
+        let tree = create_rust_parser().parse(text, None).unwrap();
+        assert!(try_collect_partitioned(&tree.root_node(), text, &query, None).is_none());
+        assert_eq!(
+            collect_all_injections(&tree.root_node(), text, Some(&query))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_discovery_matches_reference(&tree, text, &query);
+    }
+
+    #[test]
+    fn partitioning_includes_anonymous_children() {
+        let text = "fn main() {}";
+        let tree = create_rust_parser().parse(text, None).unwrap();
+        let root = tree.root_node().named_child(0).unwrap();
+        let query = Query::new(
+            &tree_sitter_rust::LANGUAGE.into(),
+            r#"("fn" @injection.content (#set! injection.language "keyword"))"#,
+        )
+        .unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let regions = pool
+            .install(|| try_collect_partitioned(&root, text, &query, None))
+            .unwrap();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].content_node.kind(), "fn");
+        assert_eq!(
+            regions[0].content_node.id(),
+            reference_collect_all_injections(&root, text, Some(&query), None).unwrap()[0]
+                .content_node
+                .id()
+        );
+    }
+
+    #[test]
+    fn partitioning_observes_cancellation_after_starting() {
+        let text = "/* comment */\nfn item() {}\n".repeat(3000);
+        let tree = create_rust_parser().parse(&text, None).unwrap();
+        let query = Query::new(
+            &tree_sitter_rust::LANGUAGE.into(),
+            r#"((block_comment) @injection.content (#set! injection.language "comment"))"#,
+        )
+        .unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        for polls in [1, 2, 100] {
+            let cancel = crate::cancel::CancelToken::default();
+            cancel.cancel_after_polls(polls);
+            assert!(
+                pool.install(|| collect_all_injections_cancellable(
+                    &tree.root_node(),
+                    &text,
+                    Some(&query),
+                    Some(&cancel)
+                ))
+                .is_none()
+            );
+            assert!(cancel.is_cancelled());
         }
     }
 
