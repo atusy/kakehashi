@@ -235,6 +235,29 @@ impl DiagnosticScheduler {
     /// `textDocument/publishDiagnostics`.
     pub(crate) fn spawn_synthetic_diagnostic_task(&self, uri: Url) {
         let snapshot_data = self.prepare_diagnostic_snapshot(&uri);
+        self.spawn_prepared_synthetic_diagnostic_task(uri, snapshot_data);
+    }
+
+    pub(crate) fn spawn_synthetic_diagnostic_task_for_parse(
+        &self,
+        uri: Url,
+        parsed: super::parse::ParseLineage,
+    ) {
+        let snapshot_data = self
+            .snapshot_preparer
+            .prepare_diagnostic_snapshot_when_current(
+                &uri,
+                parsed.incarnation,
+                parsed.content_version,
+            );
+        self.spawn_prepared_synthetic_diagnostic_task(uri, snapshot_data);
+    }
+
+    fn spawn_prepared_synthetic_diagnostic_task(
+        &self,
+        uri: Url,
+        snapshot_data: Option<DiagnosticSnapshot>,
+    ) {
         let Some(lineage) = snapshot_data.as_ref().map(|snapshot| snapshot.lineage) else {
             return;
         };

@@ -1921,7 +1921,7 @@ mod tests {
         );
         server
             .parse_coordinator()
-            .parse_document(uri.clone(), Some("rust"), None)
+            .parse_document(uri.clone(), Some("rust"), None, None)
             .await;
 
         let publisher = DiagnosticPublisher::new(server);
@@ -1983,7 +1983,7 @@ mod tests {
         );
         server
             .parse_coordinator()
-            .parse_document(uri.clone(), Some("rust"), None)
+            .parse_document(uri.clone(), Some("rust"), None, None)
             .await;
 
         // The parked writer: mutation + pending mark stamped, republish not
@@ -2042,7 +2042,7 @@ mod tests {
         );
         server
             .parse_coordinator()
-            .parse_document(uri.clone(), Some("rust"), None)
+            .parse_document(uri.clone(), Some("rust"), None, None)
             .await;
         let publisher = DiagnosticPublisher::new(server);
         // Establish a recorded set and clear the seed's lag so nothing but
@@ -2251,7 +2251,7 @@ mod tests {
         );
         server
             .parse_coordinator()
-            .parse_document(uri.clone(), Some("rust"), None)
+            .parse_document(uri.clone(), Some("rust"), None, None)
             .await;
         let publisher = DiagnosticPublisher::new(server);
         publisher.publish_pull_layer(&uri, Vec::new()).await;
@@ -2419,7 +2419,7 @@ mod tests {
         );
         server
             .parse_coordinator()
-            .parse_document(uri.clone(), Some("rust"), None)
+            .parse_document(uri.clone(), Some("rust"), None, None)
             .await;
 
         let publisher = DiagnosticPublisher::new(server);
@@ -2498,7 +2498,7 @@ mod tests {
         );
         server
             .parse_coordinator()
-            .parse_document(uri.clone(), Some("rust"), None)
+            .parse_document(uri.clone(), Some("rust"), None, None)
             .await;
 
         let publisher = DiagnosticPublisher::new(server);
@@ -2573,7 +2573,7 @@ mod tests {
         );
         server
             .parse_coordinator()
-            .parse_document(uri.clone(), Some("rust"), None)
+            .parse_document(uri.clone(), Some("rust"), None, None)
             .await;
 
         let publisher = DiagnosticPublisher::new(server);

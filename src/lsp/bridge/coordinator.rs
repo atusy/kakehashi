@@ -116,6 +116,31 @@ struct EagerOpenBatch {
     cancel: CancellationToken,
 }
 
+/// Ownership of the eager batch claimed by an admitted lifecycle pass.
+/// Detached routing may only add work to this batch, never replace a later one.
+pub(crate) struct EagerOpenPass {
+    incarnation: u64,
+    generation: u64,
+    cancel: CancellationToken,
+    routing: VirtualRoutingGuard,
+}
+
+/// Release only the tokens owned by this pass, even if routing is aborted
+/// before its first poll. A newer token for the same virtual URI stays pending.
+struct VirtualRoutingGuard {
+    pool: Arc<LanguageServerPool>,
+    host_uri: Url,
+    tokens: HashMap<Url, Arc<tokio::sync::watch::Sender<bool>>>,
+}
+
+impl Drop for VirtualRoutingGuard {
+    fn drop(&mut self) {
+        for (uri, token) in &self.tokens {
+            self.pool.finish_virtual_routing(&self.host_uri, uri, token);
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) struct ForceStartTestControl {
     pub(crate) before_admission: Arc<tokio::sync::Notify>,
@@ -1310,6 +1335,44 @@ impl BridgeCoordinator {
         groups
     }
 
+    fn begin_eager_open_pass(
+        &self,
+        uri: &Url,
+        incarnation: u64,
+        routing_tokens: HashMap<Url, Arc<tokio::sync::watch::Sender<bool>>>,
+    ) -> EagerOpenPass {
+        let (generation, cancel) = self.supersede_eager_open_tasks(uri);
+        EagerOpenPass {
+            incarnation,
+            generation,
+            cancel,
+            routing: VirtualRoutingGuard {
+                pool: self.pool_arc(),
+                host_uri: uri.clone(),
+                tokens: routing_tokens,
+            },
+        }
+    }
+
+    /// Claim and register routing while the caller still holds the document's
+    /// lifecycle lock. The outer task counts as unfinished until all routed
+    /// child handles have been registered, including for CLI waiters.
+    pub(crate) fn spawn_eager_open_routing<F, Fut>(
+        &self,
+        uri: &Url,
+        incarnation: u64,
+        routing_tokens: HashMap<Url, Arc<tokio::sync::watch::Sender<bool>>>,
+        route: F,
+    ) where
+        F: FnOnce(EagerOpenPass) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let pass = self.begin_eager_open_pass(uri, incarnation, routing_tokens);
+        let generation = pass.generation;
+        let task = tokio::spawn(route(pass));
+        self.push_or_abort_eager_open_handle(uri, task.abort_handle(), generation);
+    }
+
     /// Eagerly spawn language servers and open virtual documents for detected injections.
     ///
     /// Sending `didOpen` up front (not just a handshake) lets downstream servers
@@ -1319,136 +1382,149 @@ impl BridgeCoordinator {
         settings: &WorkspaceSettings,
         host_language: &str,
         host_uri: &Url,
-        incarnation: u64,
+        pass: EagerOpenPass,
         injections: Vec<BridgeInjection>,
-        routing_tokens: HashMap<Url, Arc<tokio::sync::watch::Sender<bool>>>,
     ) {
-        // Convert host_uri to ls_types::Uri for VirtualDocumentUri construction
-        let host_uri_lsp = match crate::lsp::lsp_impl::url_to_uri(host_uri) {
-            Ok(uri) => uri,
-            Err(e) => {
-                log::warn!(
-                    target: "kakehashi::bridge",
-                    "Failed to convert host URI for eager open, skipping: {}",
-                    e
-                );
+        let EagerOpenPass {
+            incarnation,
+            generation,
+            cancel,
+            routing,
+        } = pass;
+        let routing_work = async {
+            // Convert host_uri to ls_types::Uri for VirtualDocumentUri construction
+            let host_uri_lsp = match crate::lsp::lsp_impl::url_to_uri(host_uri) {
+                Ok(uri) => uri,
+                Err(e) => {
+                    log::warn!(
+                        target: "kakehashi::bridge",
+                        "Failed to convert host URI for eager open, skipping: {}",
+                        e
+                    );
+                    return;
+                }
+            };
+
+            // Empty means current settings resolve no server for any injection —
+            // the batch belongs to removed configuration and must stop.
+            let (routed, routing_superseded) = self
+                .route_virtual_injections(
+                    settings,
+                    host_language,
+                    host_uri,
+                    &host_uri_lsp,
+                    injections,
+                    None,
+                    Some(&routing.tokens),
+                )
+                .await;
+            if routing_superseded {
                 return;
             }
-        };
-
-        // Empty means current settings resolve no server for any injection —
-        // the batch belongs to removed configuration and must stop.
-        let (routed, routing_superseded) = self
-            .route_virtual_injections(
-                settings,
-                host_language,
-                host_uri,
-                &host_uri_lsp,
-                injections,
-                None,
-                Some(&routing_tokens),
-            )
-            .await;
-        if routing_superseded {
-            return;
-        }
-        let resolved_groups = Self::eager_open_groups_for_configs(routed);
-        if resolved_groups.is_empty() {
-            self.cancel_eager_open(host_uri);
-            return;
-        }
-
-        // Drop the regions already open on each server's connection. A single
-        // server can receive different routing answers for different virtual
-        // documents, so group by the complete resolved connection key rather
-        // than only by server name or rootless-ness.
-        let mut server_groups: HashMap<ConnectionKey, (String, ServerGroup)> = HashMap::new();
-        for (server_name, (config, group_injections)) in resolved_groups {
-            for injection in group_injections {
-                let routing_uri = super::protocol::VirtualDocumentUri::new(
-                    &host_uri_lsp,
-                    &injection.language,
-                    &injection.region_id,
-                );
-                let Ok(routing_uri) = Url::parse(&routing_uri.to_uri_string()) else {
-                    continue;
-                };
-                let connection_key = self
-                    .pool
-                    .resolved_connection_key(&server_name, &config, &routing_uri)
-                    .await;
-                let entry = server_groups
-                    .entry(connection_key)
-                    .or_insert_with(|| (server_name.clone(), (Arc::clone(&config), Vec::new())));
-                entry.1.1.push(injection);
+            let resolved_groups = Self::eager_open_groups_for_configs(routed);
+            if resolved_groups.is_empty() {
+                return;
             }
-        }
 
-        let mut pending_groups: HashMap<ConnectionKey, (String, ServerGroup)> = HashMap::new();
-        for (connection_key, (server_name, (config, group_injections))) in server_groups {
-            let pending: Vec<BridgeInjection> = group_injections
-                .into_iter()
-                .filter(|injection| {
-                    !self.injection_open_on_connection(&host_uri_lsp, &connection_key, injection)
-                })
-                .collect();
-            if !pending.is_empty() {
-                pending_groups.insert(connection_key, (server_name, (config, pending)));
-            }
-        }
-        let server_groups = pending_groups;
-
-        // Every resolved injection is already sent/open — preserve the batch.
-        if server_groups.is_empty() {
-            return;
-        }
-
-        // Supersede previous batch: abort + insert empty placeholder BEFORE spawning.
-        // This closes the race window between spawn and registration. The returned
-        // token (stored in the batch, already in the map) is `select!`ed on by each
-        // task body to close the spawn→register window the abort handle can't reach (#435).
-        let (generation, cancel) = self.supersede_eager_open_tasks(host_uri);
-
-        // Spawn one task per server group, registering each handle immediately
-        for (connection_key, (server_name, (config, group_injections))) in server_groups {
-            log::debug!(
-                target: "kakehashi::bridge",
-                "Eager open: spawning {} on {} with {} injections",
-                server_name,
-                connection_key,
-                group_injections.len()
-            );
-
-            let pool = self.pool_arc();
-            let host_uri_owned = host_uri.clone();
-            let host_uri_lsp = host_uri_lsp.clone();
-            let cancel = cancel.clone();
-
-            let task = tokio::spawn(async move {
-                tokio::select! {
-                    biased;
-                    // Cancelled during the spawn→register window (or later) —
-                    // bail before the side effect.
-                    _ = cancel.cancelled() => {}
-                    _ = pool.eager_open_virtual_documents(
-                        &server_name,
-                        &config,
-                        &host_uri_owned,
+            // Drop the regions already open on each server's connection. A single
+            // server can receive different routing answers for different virtual
+            // documents, so group by the complete resolved connection key rather
+            // than only by server name or rootless-ness.
+            let mut server_groups: HashMap<ConnectionKey, (String, ServerGroup)> = HashMap::new();
+            for (server_name, (config, group_injections)) in resolved_groups {
+                for injection in group_injections {
+                    let routing_uri = super::protocol::VirtualDocumentUri::new(
                         &host_uri_lsp,
-                        super::text_document::OpenExpectation {
-                            incarnation,
-                            // The eager batch opens wherever the host routes now.
-                            connection: None,
-                            expected_connection: Some(connection_key.clone()),
-                        },
-                        group_injections,
-                    ) => {}
+                        &injection.language,
+                        &injection.region_id,
+                    );
+                    let Ok(routing_uri) = Url::parse(&routing_uri.to_uri_string()) else {
+                        continue;
+                    };
+                    let connection_key = self
+                        .pool
+                        .resolved_connection_key(&server_name, &config, &routing_uri)
+                        .await;
+                    let entry = server_groups.entry(connection_key).or_insert_with(|| {
+                        (server_name.clone(), (Arc::clone(&config), Vec::new()))
+                    });
+                    entry.1.1.push(injection);
                 }
-            });
+            }
 
-            // Register immediately — if concurrent cancel removed the entry
-            // or the generation is stale, the handle is aborted instead of leaked.
-            self.push_or_abort_eager_open_handle(host_uri, task.abort_handle(), generation);
+            let mut pending_groups: HashMap<ConnectionKey, (String, ServerGroup)> = HashMap::new();
+            for (connection_key, (server_name, (config, group_injections))) in server_groups {
+                let pending: Vec<BridgeInjection> = group_injections
+                    .into_iter()
+                    .filter(|injection| {
+                        !self.injection_open_on_connection(
+                            &host_uri_lsp,
+                            &connection_key,
+                            injection,
+                        )
+                    })
+                    .collect();
+                if !pending.is_empty() {
+                    pending_groups.insert(connection_key, (server_name, (config, pending)));
+                }
+            }
+            let server_groups = pending_groups;
+
+            // Every resolved injection is already sent/open; this routing task
+            // can finish the admitted batch without spawning child opens.
+            if server_groups.is_empty() {
+                return;
+            }
+
+            // The lifecycle pass already claimed the batch. Reuse its generation:
+            // routing must not replace a batch created by an edit during the wait.
+
+            // Spawn one task per server group, registering each handle immediately
+            for (connection_key, (server_name, (config, group_injections))) in server_groups {
+                log::debug!(
+                    target: "kakehashi::bridge",
+                    "Eager open: spawning {} on {} with {} injections",
+                    server_name,
+                    connection_key,
+                    group_injections.len()
+                );
+
+                let pool = self.pool_arc();
+                let host_uri_owned = host_uri.clone();
+                let host_uri_lsp = host_uri_lsp.clone();
+                let cancel = cancel.clone();
+
+                let task = tokio::spawn(async move {
+                    tokio::select! {
+                        biased;
+                        // Cancelled during the spawn→register window (or later) —
+                        // bail before the side effect.
+                        _ = cancel.cancelled() => {}
+                        _ = pool.eager_open_virtual_documents(
+                            &server_name,
+                            &config,
+                            &host_uri_owned,
+                            &host_uri_lsp,
+                            super::text_document::OpenExpectation {
+                                incarnation,
+                                // The eager batch opens wherever the host routes now.
+                                connection: None,
+                                expected_connection: Some(connection_key.clone()),
+                            },
+                            group_injections,
+                        ) => {}
+                    }
+                });
+
+                // Register immediately — if concurrent cancel removed the entry
+                // or the generation is stale, the handle is aborted instead of leaked.
+                self.push_or_abort_eager_open_handle(host_uri, task.abort_handle(), generation);
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {}
+            _ = routing_work => {}
         }
     }
 
@@ -1891,13 +1967,12 @@ impl BridgeCoordinator {
     ///
     /// Precondition: the `didOpen` that triggered the eager spawn has been
     /// **awaited to completion** (CLI mode awaits `did_open_impl`, which
-    /// registers every handle before returning). `supersede` inserts an
-    /// empty placeholder batch before the handles are pushed, so a caller
-    /// polling *concurrently with registration* could observe a zero-handle
-    /// batch as "finished"; conversely an empty batch must stay "finished"
-    /// here, because documents with no bridge-capable injections keep zero
-    /// handles forever and treating that as pending would stall them for
-    /// the caller's whole timeout.
+    /// registers the outer routing handle before returning). Routing registers
+    /// its child open handles before finishing, so the batch stays unfinished
+    /// across that handoff. `supersede` still briefly inserts an empty placeholder
+    /// before outer registration; callers must not poll during that synchronous
+    /// admission. A document with no bridge-capable injections needs no task,
+    /// so an absent or empty batch remains finished.
     pub(crate) fn eager_open_tasks_finished(&self, uri: &Url) -> bool {
         self.eager_open_tasks
             .get(uri)
@@ -3202,6 +3277,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_unpolled_routing_releases_only_its_own_tokens() {
+        let coordinator = BridgeCoordinator::new();
+        let host_uri = Url::parse("file:///cancel-routing.md").unwrap();
+        let old_uri = Url::parse("file:///old-virtual.lua").unwrap();
+        let shared_uri = Url::parse("file:///shared-virtual.lua").unwrap();
+        let tokens = HashMap::from([
+            (
+                old_uri.clone(),
+                coordinator.pool.begin_virtual_routing(&host_uri, &old_uri),
+            ),
+            (
+                shared_uri.clone(),
+                coordinator
+                    .pool
+                    .begin_virtual_routing(&host_uri, &shared_uri),
+            ),
+        ]);
+        coordinator.spawn_eager_open_routing(&host_uri, 1, tokens, |pass| async move {
+            let _pass = pass;
+            std::future::pending::<()>().await;
+        });
+        assert!(
+            !coordinator.eager_open_tasks_finished(&host_uri),
+            "routing is part of the tracked batch before its first poll"
+        );
+        let replacement = coordinator
+            .pool
+            .begin_virtual_routing(&host_uri, &shared_uri);
+        // This current-thread test has not yielded since spawn, so the routing
+        // body has never run. Its captured guard must still release the tokens.
+        coordinator.cancel_eager_open(&host_uri);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            coordinator
+                .pool
+                .wait_for_virtual_routing(&host_uri, &old_uri),
+        )
+        .await
+        .expect("aborted routing releases its waiter");
+        assert!(
+            coordinator
+                .pool
+                .is_virtual_routing_current(&host_uri, &shared_uri, &replacement)
+        );
+        assert!(
+            !*replacement.borrow(),
+            "old cleanup must not complete the replacement token"
+        );
+        coordinator
+            .pool
+            .finish_virtual_routing(&host_uri, &shared_uri, &replacement);
+    }
+
+    #[tokio::test]
+    async fn old_eager_routing_cannot_cancel_a_new_regions_batch() {
+        let coordinator = BridgeCoordinator::new();
+        let host_uri = Url::parse("file:///stale-routing.md").unwrap();
+        let old_injections = vec![injection("rust", "old-region")];
+        let old_routing =
+            coordinator.begin_virtual_routing_for_injections(&host_uri, &old_injections);
+        let old_pass = coordinator.begin_eager_open_pass(&host_uri, 1, old_routing);
+
+        // A subsequent edit discovers another region. Its routing token does
+        // not supersede the old region's token, but its eager batch owns the URI.
+        coordinator
+            .begin_virtual_routing_for_injections(&host_uri, &[injection("rust", "new-region")]);
+        let (_, newer_batch) = coordinator.supersede_eager_open_tasks(&host_uri);
+        coordinator
+            .eager_spawn_and_open_documents(
+                &WorkspaceSettings::default(),
+                "markdown",
+                &host_uri,
+                old_pass,
+                old_injections,
+            )
+            .await;
+
+        assert!(
+            !newer_batch.is_cancelled(),
+            "old empty routing must not cancel the new edit's batch"
+        );
+        coordinator.cancel_eager_open(&host_uri);
+    }
+
+    #[tokio::test]
     async fn eager_open_spawns_a_task_for_every_group_not_just_the_first() {
         // `eager_open_groups` deciding on two servers is worthless if the
         // dispatch loop below it only acts on one — the push-only server would
@@ -3215,16 +3375,16 @@ mod tests {
         }
         let host_uri = Url::parse("file:///test.md").unwrap();
         let injections = vec![injection("rust", "r1")];
-        coordinator.begin_virtual_routing_for_injections(&host_uri, &injections);
+        let routing_tokens =
+            coordinator.begin_virtual_routing_for_injections(&host_uri, &injections);
 
         coordinator
             .eager_spawn_and_open_documents(
                 &settings,
                 "markdown",
                 &host_uri,
-                1,
+                coordinator.begin_eager_open_pass(&host_uri, 1, routing_tokens),
                 injections,
-                HashMap::new(),
             )
             .await;
 

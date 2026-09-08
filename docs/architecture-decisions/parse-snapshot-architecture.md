@@ -271,12 +271,24 @@ admission; those commits are equivalent, keyed by the same tree coordinates unde
 the same epoch, so the loser's cache entries are the winner's.) There is one
 store: the **snapshot publish is the sole commit point**, and `Document::tree`
 and the incremental seed are derived from the published cell (Stage 3).
-`semanticTokens/refresh` gates on the publish; the tree-dependent downstream
-(`mark_parse_finished`, the open parse's follow-ups) gates on `current`, which is
-refused only when the inputs moved on or an equal-version sibling already landed
-the same tree — in either case the next pass seeds from the published snapshot, a
-self-correcting perf blip, never a served inconsistency. So no reader-visible
-divergence can arise.
+`semanticTokens/refresh` gates on the publish; parse completion checks currency
+again after resolution. The off-ingress open parse first checks the incarnation captured by its
+registering handler, before reading text or recording language. The open parse
+and successful install reparse return their producing
+`ParseLineage` (incarnation and content version). Their injection follow-ups must
+validate that lineage and a current tree under the lifecycle lock before
+cancelling or replacing eager work, and preserve that target through settle
+retries. Before releasing that lock, a pass claims the eager batch and registers
+its detached routing task. Routing inherits that batch's generation and cancellation
+token; it cannot cancel or replace a newer batch after awaiting a provider. Its
+owned routing-token guard releases only that pass's virtual-URI tokens on completion
+or cancellation, including cancellation before the task first runs. Both routing
+and spawned child opens count toward batch completion.
+Synthetic diagnostic preparation also checks the producing revision.
+A same-version region enrichment preserves the lineage; an edit or reopen does
+not. A completion-time Boolean alone cannot authorize later side effects. Installation
+eligibility alone also grants no follow-up: a current tree supplied by another
+parse returns no producing lineage to the waiting installer.
 
 ### 3. Reader contract — non-blocking, three classes
 
@@ -572,8 +584,8 @@ inside the existing safety contracts at each step:
   and the cell admits it, reported *current* iff it parsed the document's content
   version; a stale-but-consistent parse publishes as not current. The **snapshot
   publish is the sole commit point** — `semanticTokens/refresh` gates on the
-  publish result, the tree-dependent downstream (`mark_parse_finished`, the open
-  parse's follow-ups) on `current` (§2). `latest_snapshot` retains a servable
+  publish result; completion checks currency, and the open follow-up
+  validates the producing revision again at admission (§2). `latest_snapshot` retains a servable
   (stale) tree across an edit, while `Document::tree` — derived from the same
   cell — reads as absent until the reparse lands, so no reader sees a tree that
   predates the text. The populate pass runs *before* the install, on

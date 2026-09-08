@@ -6,11 +6,11 @@ use super::super::{Kakehashi, build_notifier, uri_to_url};
 use crate::document::DocumentStore;
 use crate::language::LanguageEvent;
 
-async fn spawn_synthetic_diagnostic_for_incarnation<F>(
+async fn spawn_synthetic_diagnostic_for_parse<F>(
     documents: &DocumentStore,
     diagnostic_scheduler: &crate::lsp::lsp_impl::coordinator::DiagnosticScheduler,
     uri: url::Url,
-    incarnation: u64,
+    lineage: crate::lsp::lsp_impl::coordinator::ParseLineage,
     after_lifecycle_lock: F,
 ) where
     F: std::future::Future<Output = ()>,
@@ -22,10 +22,10 @@ async fn spawn_synthetic_diagnostic_for_incarnation<F>(
         documents.remove_edit_lock_if_unshared(&uri, &edit_lock);
         return;
     };
-    let eligible = document.incarnation() == incarnation && document.has_current_tree();
+    let eligible = lineage.matches(&document) && document.has_current_tree();
     drop(document);
     if eligible {
-        diagnostic_scheduler.spawn_synthetic_diagnostic_task(uri);
+        diagnostic_scheduler.spawn_synthetic_diagnostic_task_for_parse(uri, lineage);
     }
 }
 
@@ -143,7 +143,7 @@ impl Kakehashi {
                     // spawn is pure wasted work and races the bridge-state sweep.
                     let is_cli_mode = self.is_cli_mode();
                     tokio::spawn(async move {
-                        let same_lifetime = install
+                        let completion = install
                             .maybe_auto_install_language(
                                 &lang,
                                 install_uri.clone(),
@@ -152,32 +152,16 @@ impl Kakehashi {
                                 true,
                             )
                             .await;
-                        if !same_lifetime {
+                        if !completion.same_lifetime {
                             return;
                         }
-                        // The skipped inline parse meant the handler's
-                        // process_injections (below) ran with no tree. Now that the
-                        // off-ingress reparse may have produced one, run the normal
-                        // post-parse injection workflow — injected-language install
-                        // and eager bridge spawn — which also keeps that injected
-                        // install off the ingress ticket. forward=false: open path.
-                        //
-                        // Gate on the document actually having a tree: install can
-                        // fail or be deduped (AlreadyInstalling) with no reparse, and
-                        // process_injections would otherwise cancel the eager-open
-                        // for a still-tree-less document.
-                        let has_tree = documents.get(&install_uri).is_some_and(|doc| {
-                            doc.incarnation() == incarnation && doc.has_current_tree()
-                        });
-                        if has_tree {
-                            let same_lifetime = injection
-                                .process_injections_for_incarnation(
-                                    &install_uri,
-                                    false,
-                                    incarnation,
-                                )
-                                .await;
-                            if !same_lifetime {
+                        // Only a parse published by this install grants open
+                        // downstream work. A sibling's current tree does not.
+                        if let Some(lineage) = completion.parsed {
+                            if !injection
+                                .process_injections_for_parse(&install_uri, lineage)
+                                .await
+                            {
                                 return;
                             }
                             // Re-fire the proactive synthetic diagnostic now that a
@@ -187,11 +171,11 @@ impl Kakehashi {
                             // first open of a just-installed parser. Skipped in CLI
                             // mode (#489), matching the handler's own gate.
                             if !is_cli_mode {
-                                spawn_synthetic_diagnostic_for_incarnation(
+                                spawn_synthetic_diagnostic_for_parse(
                                     &documents,
                                     &diagnostic_scheduler,
                                     install_uri,
-                                    incarnation,
+                                    lineage,
                                     std::future::ready(()),
                                 )
                                 .await;
@@ -260,7 +244,7 @@ impl Kakehashi {
             }
         } else if self.is_cli_mode() {
             self.parse_coordinator()
-                .parse_document(uri.clone(), Some(&language_id), ticket)
+                .parse_document(uri.clone(), Some(&language_id), ticket, Some(incarnation))
                 .await;
             if !deferred_events.is_empty() {
                 self.notifier().log_language_events(&deferred_events).await;
@@ -278,6 +262,7 @@ impl Kakehashi {
             let parse = self.parse_coordinator();
             let injection = self.injection_coordinator();
             let diagnostic_scheduler = self.diagnostic_scheduler();
+            let documents = std::sync::Arc::clone(&self.documents);
             let client = self.client.clone();
             let settings_manager = std::sync::Arc::clone(&self.settings_manager);
             let parse_uri = uri.clone();
@@ -289,26 +274,36 @@ impl Kakehashi {
             let deferred = std::mem::take(&mut deferred_events);
             tokio::spawn(async move {
                 let landed = parse
-                    .parse_document(parse_uri.clone(), Some(parse_language_id.as_str()), ticket)
+                    .parse_document(
+                        parse_uri.clone(),
+                        Some(parse_language_id.as_str()),
+                        ticket,
+                        Some(incarnation),
+                    )
                     .await;
-                // Run the open downstream only when THIS parse's install published the
-                // current tree — not merely when "a tree exists". A `didChange` racing
-                // this open parse can move the text on and let the edit reparse publish
-                // the newer tree (and run `process_injections(forward=true)`) first;
-                // this parse is then reported not current (`landed == false`). Re-running the open downstream
-                // (`process_injections(forward=false)`) over the edit's tree would
-                // supersede the edit's eager-open batch. When `landed` is false the
-                // edit reparse owns the current tree and already ran the correct
-                // downstream, so there is nothing for the open path to do. (A parse
-                // that produced no tree at all also returns false.)
-                if landed {
-                    injection.process_injections(&parse_uri, false).await;
+                // Publication grants a revision, not a permanent permission.
+                // The downstream rechecks it under its lifecycle lock so a
+                // delayed open cannot supersede the newer edit's eager batch.
+                if let Some(lineage) = landed {
+                    if !injection
+                        .process_injections_for_parse(&parse_uri, lineage)
+                        .await
+                    {
+                        return;
+                    }
                     if !deferred.is_empty() {
                         build_notifier(&client, &settings_manager)
                             .log_language_events(&deferred)
                             .await;
                     }
-                    diagnostic_scheduler.spawn_synthetic_diagnostic_task(parse_uri);
+                    spawn_synthetic_diagnostic_for_parse(
+                        &documents,
+                        &diagnostic_scheduler,
+                        parse_uri,
+                        lineage,
+                        std::future::ready(()),
+                    )
+                    .await;
                 }
             });
         }
@@ -361,11 +356,14 @@ mod tests {
         let weak_lock = std::sync::Arc::downgrade(&edit_lock);
         drop(edit_lock);
 
-        spawn_synthetic_diagnostic_for_incarnation(
+        spawn_synthetic_diagnostic_for_parse(
             &server.documents,
             &server.diagnostic_scheduler(),
             uri,
-            1,
+            crate::lsp::lsp_impl::coordinator::ParseLineage {
+                incarnation: 1,
+                content_version: 0,
+            },
             std::future::ready(()),
         )
         .await;
@@ -392,7 +390,7 @@ mod tests {
         );
         server
             .parse_coordinator()
-            .parse_document(uri.clone(), Some("rust"), None)
+            .parse_document(uri.clone(), Some("rust"), None, None)
             .await;
 
         let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
@@ -401,11 +399,14 @@ mod tests {
         let scheduler = server.diagnostic_scheduler();
         let recovery_uri = uri.clone();
         let recovery = tokio::spawn(async move {
-            spawn_synthetic_diagnostic_for_incarnation(
+            spawn_synthetic_diagnostic_for_parse(
                 &documents,
                 &scheduler,
                 recovery_uri,
-                incarnation,
+                crate::lsp::lsp_impl::coordinator::ParseLineage {
+                    incarnation,
+                    content_version: 0,
+                },
                 async move {
                     let _ = locked_tx.send(());
                     let _ = release_rx.await;
@@ -443,6 +444,97 @@ mod tests {
             !server.synthetic_diagnostics.has_active_task(&uri),
             "didClose must remove the install recovery diagnostic registration"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_open_cannot_register_diagnostics_for_an_edited_document() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+        server.bridge.insert_ready_test_connection("rust_ls").await;
+        let uri = Url::parse("file:///test/stale-open-diagnostic.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn original() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let original = server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("rust"), None, None)
+            .await
+            .expect("open parse completes");
+        server
+            .documents
+            .update_document(uri.clone(), "fn edited() {}".to_string(), None);
+        let edited = server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("rust"), None, None)
+            .await
+            .expect("edited parse completes");
+        assert_eq!(original.incarnation, edited.incarnation);
+        assert_ne!(original.content_version, edited.content_version);
+        assert!(!server.synthetic_diagnostics.has_active_task(&uri));
+
+        spawn_synthetic_diagnostic_for_parse(
+            &server.documents,
+            &server.diagnostic_scheduler(),
+            uri.clone(),
+            original,
+            std::future::ready(()),
+        )
+        .await;
+        assert!(
+            !server.synthetic_diagnostics.has_active_task(&uri),
+            "stale open must not register a task using the edited tree"
+        );
+
+        spawn_synthetic_diagnostic_for_parse(
+            &server.documents,
+            &server.diagnostic_scheduler(),
+            uri.clone(),
+            edited,
+            std::future::ready(()),
+        )
+        .await;
+        assert!(
+            server.synthetic_diagnostics.has_active_task(&uri),
+            "the current parse must be eligible for diagnostic registration"
+        );
+        server.synthetic_diagnostics.remove_document(&uri);
+    }
+
+    #[tokio::test]
+    async fn delayed_open_parse_cannot_relabel_a_reopened_document() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), tree_sitter_rust::LANGUAGE.into());
+        let uri = Url::parse("file:///test/delayed-open.rs").unwrap();
+        let original =
+            server
+                .documents
+                .insert(uri.clone(), "fn old() {}".into(), Some("rust".into()), None);
+        server.documents.remove(&uri);
+        let reopened =
+            server
+                .documents
+                .insert(uri.clone(), "package main".into(), Some("go".into()), None);
+        assert_ne!(original, reopened);
+        // The spawned old-open task starts only after the new lifetime exists.
+        let result = server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("rust"), None, Some(original))
+            .await;
+        assert!(
+            result.is_none(),
+            "the delayed open must not parse the new lifetime"
+        );
+        let document = server.documents.get(&uri).unwrap();
+        assert_eq!(document.language_id(), Some("go"));
+        assert!(document.tree().is_none());
     }
 
     #[tokio::test]
@@ -1247,7 +1339,7 @@ print("hello")
             .insert(uri.clone(), text.clone(), Some("rust".to_string()), None);
         server
             .parse_coordinator()
-            .parse_document(uri.clone(), Some("rust"), None)
+            .parse_document(uri.clone(), Some("rust"), None, None)
             .await;
 
         let snapshot = server
@@ -1285,7 +1377,7 @@ print("hello")
         );
         server
             .parse_coordinator()
-            .parse_document(uri.clone(), Some("rust"), None)
+            .parse_document(uri.clone(), Some("rust"), None, None)
             .await;
         assert!(
             server
@@ -1355,7 +1447,7 @@ print("hello")
 
         server
             .parse_coordinator()
-            .parse_document(uri.clone(), Some("rust"), None)
+            .parse_document(uri.clone(), Some("rust"), None, None)
             .await;
 
         assert!(
@@ -1388,7 +1480,7 @@ print("hello")
         );
         server
             .parse_coordinator()
-            .parse_document(uri.clone(), Some("rust"), None)
+            .parse_document(uri.clone(), Some("rust"), None, None)
             .await;
         assert!(
             server
@@ -1754,7 +1846,7 @@ print("hello")
             .insert(uri.clone(), text.clone(), Some("rust".to_string()), None);
         server
             .parse_coordinator()
-            .parse_document(uri.clone(), Some("rust"), None)
+            .parse_document(uri.clone(), Some("rust"), None, None)
             .await;
 
         let snapshot = server
@@ -1796,7 +1888,7 @@ print("hello")
         );
         server
             .parse_coordinator()
-            .parse_document(uri.clone(), Some("rust"), None)
+            .parse_document(uri.clone(), Some("rust"), None, None)
             .await;
 
         let snapshot = server
