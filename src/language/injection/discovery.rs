@@ -369,7 +369,23 @@ pub(crate) fn collect_all_injections<'a>(
 
 /// [`collect_all_injections`] with cooperative cancellation for a document
 /// version that became obsolete while the query cursor was walking matches.
+/// This remains a synchronous walk even when invoked on a Rayon worker.
 pub(crate) fn collect_all_injections_cancellable<'a>(
+    root: &Node<'a>,
+    text: &str,
+    injection_query: Option<&Query>,
+    cancel: Option<&crate::cancel::CancelToken>,
+) -> Option<Vec<InjectionRegionInfo<'a>>> {
+    collect_query_range(root, text, injection_query?, None, cancel)
+}
+
+/// Parallel discovery for guard-free snapshot population on the compute pool.
+///
+/// Rayon can execute other queued jobs while waiting for a window. Callers must
+/// not hold blocking guards or run inside a `OnceLock` initializer: a stolen job
+/// waiting for that same guard would prevent the outer call from completing.
+/// Ordinary readers use the serial collectors above, including cached layer walks.
+pub(crate) fn collect_all_injections_parallel_cancellable<'a>(
     root: &Node<'a>,
     text: &str,
     injection_query: Option<&Query>,
@@ -1627,7 +1643,13 @@ mod tests {
                 for _ in 0..20 {
                     if mode == 1 {
                         count += std::hint::black_box(pool.install(|| {
-                            collect_all_injections(&tree.root_node(), &text, Some(&query)).unwrap()
+                            collect_all_injections_parallel_cancellable(
+                                &tree.root_node(),
+                                &text,
+                                Some(&query),
+                                None,
+                            )
+                            .unwrap()
                         }))
                         .len();
                     } else if mode == 2 {
@@ -1788,6 +1810,21 @@ mod tests {
                 )
             );
         }
+        assert_eq!(
+            describe(
+                pool.install(|| collect_all_injections_parallel_cancellable(
+                    &tree.root_node(),
+                    text,
+                    Some(query),
+                    None
+                ))
+                .unwrap()
+            ),
+            describe(
+                reference_collect_all_injections(&tree.root_node(), text, Some(query), None)
+                    .unwrap()
+            ),
+        );
         assert_eq!(
             describe(
                 pool.install(|| collect_all_injections(&tree.root_node(), text, Some(query)))
@@ -2025,7 +2062,14 @@ mod tests {
                     .unwrap();
             assert_eq!(reference.len(), 10000);
             let actual = pool
-                .install(|| collect_all_injections(&tree.root_node(), &text, Some(&query)))
+                .install(|| {
+                    collect_all_injections_parallel_cancellable(
+                        &tree.root_node(),
+                        &text,
+                        Some(&query),
+                        None,
+                    )
+                })
                 .unwrap();
             assert_eq!(
                 actual
@@ -2121,7 +2165,7 @@ mod tests {
             let cancel = crate::cancel::CancelToken::default();
             cancel.cancel_after_polls(polls);
             assert!(
-                pool.install(|| collect_all_injections_cancellable(
+                pool.install(|| collect_all_injections_parallel_cancellable(
                     &tree.root_node(),
                     &text,
                     Some(&query),
