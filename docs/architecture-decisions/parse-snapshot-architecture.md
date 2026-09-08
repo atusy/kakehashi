@@ -697,7 +697,7 @@ inside the existing safety contracts at each step:
   in place; those are the vector, and they are removed in Stage 2.)
 - Snapshot readers see the parse's detected language directly through
   `ParseSnapshot.language`. Store-label readers, including host bridge routing,
-  additionally need a current publish to refine an unlabelled document when the
+  additionally need a current publish to refine a provisional document label when the
   open parse lost to an edit.
 - State and coupling shrink: two `watch` maps collapse to one, six store CAS /
   watermark methods to one publish primitive (tree writes done — `install_parse`;

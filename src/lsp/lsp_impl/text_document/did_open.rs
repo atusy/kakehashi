@@ -1465,6 +1465,94 @@ print("hello")
     /// re-sync (the diagnostics-don't-follow-edits bug). This pins the mechanism:
     /// the snapshot is `None` with the tree cleared and valid again once the
     /// reparse restores it.
+    #[rstest::rstest]
+    #[case(None)]
+    #[case(Some("text"))]
+    #[tokio::test]
+    async fn winning_edit_establishes_language_after_a_delayed_open(
+        #[case] initial_label: Option<&str>,
+    ) {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+        server.bridge.insert_ready_test_connection("rust_ls").await;
+        let uri = Url::parse("file:///test/open-edit-language.rs").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "fn original() {}".to_string(),
+            initial_label.map(str::to_string),
+            None,
+        );
+        server.bridge.open_host_incarnation(&uri, incarnation).await;
+
+        let edit_lock = server.documents.edit_lock(&uri);
+        let lifecycle = edit_lock.lock().await;
+        let parser = server.parse_coordinator();
+        let mut open =
+            Box::pin(parser.parse_document(uri.clone(), initial_label, None, Some(incarnation)));
+        // parse_document captures its input before its first await. Holding
+        // lifecycle admission ensures it cannot finish publication on this poll.
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(open.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        server
+            .documents
+            .update_document(uri.clone(), "fn edited() {}".to_string(), None);
+        drop(lifecycle);
+        parser.reparse_latest(&uri, Some(1)).await;
+        assert!(
+            open.await.is_none(),
+            "the old open owns no current completion"
+        );
+
+        let (label, text) = {
+            let document = server.documents.get(&uri).unwrap();
+            assert!(document.has_current_tree());
+            assert_eq!(document.language_id(), Some("rust"));
+            assert_eq!(
+                document
+                    .latest_snapshot_slot()
+                    .snapshot
+                    .unwrap()
+                    .language
+                    .as_deref(),
+                Some("rust")
+            );
+            (
+                document.language_id().unwrap().to_string(),
+                document.text().to_string(),
+            )
+        };
+        server.bridge.eager_open_host_document_on_servers(
+            &server.settings_manager.load_settings(),
+            &label,
+            &uri,
+            &text,
+        );
+        timeout(Duration::from_secs(1), async {
+            while !server
+                .bridge
+                .pool()
+                .is_host_document_opened(&uri, "rust_ls")
+                .await
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the winning language selects the actual host server");
+        server
+            .documents
+            .update_document(uri.clone(), "fn next_edit() {}".to_string(), None);
+        parser.reparse_latest(&uri, Some(2)).await;
+        assert_eq!(
+            server.documents.get(&uri).unwrap().language_id(),
+            Some("rust")
+        );
+    }
+
     #[tokio::test]
     async fn current_edit_parse_establishes_an_unlabelled_documents_language() {
         let (service, _socket) = LspService::new(Kakehashi::new);
@@ -1490,6 +1578,13 @@ print("hello")
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
         configure_rust_self_host(server);
+        let mut settings = (*server.settings_manager.load_settings()).clone();
+        settings
+            .language_servers
+            .get_mut("rust_ls")
+            .unwrap()
+            .languages = Some(vec!["*".into()]);
+        server.settings_manager.apply_settings(settings);
         let uri = Url::parse("file:///test/unresolved-label.rs").unwrap();
         server.documents.insert(
             uri.clone(),
@@ -1508,22 +1603,33 @@ print("hello")
         assert_eq!(document.language_id(), Some("rust"));
     }
 
+    #[rstest::rstest]
+    #[case(true)]
+    #[case(false)]
     #[tokio::test]
-    async fn current_edit_parse_preserves_configured_host_alias_routing() {
+    async fn current_edit_parse_preserves_declared_host_routing(#[case] configured_base: bool) {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
         configure_rust_self_host(server);
         let mut settings = (*server.settings_manager.load_settings()).clone();
         let mut alias = settings.languages["rust"].clone();
-        alias.base = Some("rust".to_string());
-        settings.languages.insert("custom-rust".to_string(), alias);
+        if configured_base {
+            alias.base = Some("rust".to_string());
+            settings.languages.insert("custom-rust".to_string(), alias);
+        } else {
+            // Only the bridge server declares custom-rust. The wildcard enables
+            // host bridging without defining that label's Tree-sitter grammar.
+            settings.languages.insert("_".to_string(), alias);
+        }
         settings
             .language_servers
             .get_mut("rust_ls")
             .unwrap()
             .languages = Some(vec!["custom-rust".to_string()]);
         server.settings_manager.apply_settings(settings);
-        server.language.set_base_mapping("custom-rust", "rust");
+        if configured_base {
+            server.language.set_base_mapping("custom-rust", "rust");
+        }
         server.bridge.insert_ready_test_connection("rust_ls").await;
         let uri = Url::parse("file:///test/host-alias.rs").unwrap();
         let incarnation = server.documents.insert(
@@ -1582,6 +1688,37 @@ print("hello")
         assert_eq!(
             server.documents.get(&uri).unwrap().language_id(),
             Some("custom-rust")
+        );
+    }
+
+    #[tokio::test]
+    async fn installer_label_refinement_keeps_its_regions_completion() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+        let uri = Url::parse("file:///test/installer-refinement.rs").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "fn installed() {}".to_string(),
+            Some("text".to_string()),
+            None,
+        );
+        let parsed = server
+            .parse_coordinator()
+            .reparse_installed_document(uri.clone(), "rust", Some(incarnation))
+            .await
+            .expect("the refined label must not reject its own regions completion");
+        let document = server.documents.get(&uri).unwrap();
+        assert!(parsed.matches(&document));
+        assert_eq!(document.language_id(), Some("rust"));
+        assert!(
+            document
+                .latest_snapshot_slot()
+                .snapshot
+                .unwrap()
+                .regions
+                .is_some(),
+            "the completion exercised the two-stage regions handoff"
         );
     }
 

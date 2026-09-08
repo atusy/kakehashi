@@ -940,12 +940,14 @@ mod tests {
         );
     }
 
-    /// The open parse records its detected language only when it is current:
+    /// A recording parse changes the stored language only when it is current:
     /// one that lost the race to a `didChange` publishes as stale but must
     /// not relabel the document under the edit's reparse, which was captured
     /// against the stored label.
-    #[test]
-    fn install_parse_records_the_language_only_when_current() {
+    #[rstest::rstest]
+    #[case(LanguageCheck::Record)]
+    #[case(LanguageCheck::RecordIfUnchanged(Some("markdown")))]
+    fn install_parse_records_the_language_only_when_current(#[case] language: LanguageCheck<'_>) {
         let store = DocumentStore::new();
         let uri = Url::parse("file:///relabel.md").unwrap();
         let text = "# doc\n";
@@ -967,7 +969,7 @@ mod tests {
             incarnation,
         );
         Arc::get_mut(&mut snapshot).unwrap().language = Some("relabelled".to_string());
-        let outcome = store.install_parse(&uri, LanguageCheck::Record, snapshot);
+        let outcome = store.install_parse(&uri, language, snapshot);
         assert_eq!(
             outcome,
             ParseInstall {
@@ -979,17 +981,17 @@ mod tests {
         assert_eq!(
             store.get(&uri).unwrap().language_id(),
             Some("markdown"),
-            "a stale open parse must not relabel the document"
+            "a stale recording parse must not relabel the document"
         );
     }
 
-    /// A reparse checks the stored language and publishes the tree without
-    /// relabelling the document: detection may resolve a stored `sh` to its
+    /// A preserving reparse checks the stored language and publishes its tree
+    /// without relabelling the document: detection may resolve a stored `sh` to its
     /// `bash` base, and the stored id stays `sh` (the snapshot carries the
     /// detected name). The open parse, which checks nothing, records what it
     /// detected — the label a client-supplied `text` becomes `markdown`.
     #[test]
-    fn install_parse_relabels_only_on_the_open_parse() {
+    fn install_parse_preserves_checked_labels_and_records_open_detection() {
         let store = DocumentStore::new();
         let uri = Url::parse("file:///label.md").unwrap();
         let text = "# doc\n";
@@ -1044,9 +1046,31 @@ mod tests {
         assert!(store.get(&uri2).unwrap().tree().is_some());
     }
 
+    #[test]
+    fn provisional_publish_cannot_overwrite_a_concurrent_label_refinement() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///refined.md").unwrap();
+        let text: Arc<str> = Arc::from("# document");
+        let incarnation = store.insert(uri.clone(), text.to_string(), None, None);
+        let version = store.get(&uri).unwrap().content_version();
+        store
+            .documents
+            .get_mut(&uri)
+            .unwrap()
+            .record_language(Some("configured".into()));
+        let result = store.install_parse(
+            &uri,
+            LanguageCheck::RecordIfUnchanged(None),
+            parse_snapshot(&text, Some(markdown_tree(&text)), version, incarnation),
+        );
+        assert_eq!(result, ParseInstall::default());
+        assert_eq!(store.get(&uri).unwrap().language_id(), Some("configured"));
+        assert!(store.get(&uri).unwrap().tree().is_none());
+    }
+
     /// A same-language, identical-text reopen draws a new lifetime with the
     /// revision counter back at zero: the incarnation is the only input that
-    /// tells the prior lifetime's parse apart, in both check modes.
+    /// tells the prior lifetime's parse apart, in all language check modes.
     #[test]
     fn install_parse_rejects_the_prior_lifetime_after_an_identical_reopen() {
         let store = DocumentStore::new();
@@ -1082,6 +1106,7 @@ mod tests {
         for language in [
             LanguageCheck::Expect(Some("markdown")),
             LanguageCheck::Record,
+            LanguageCheck::RecordIfUnchanged(Some("markdown")),
         ] {
             let stale = store.install_parse(
                 &uri,
