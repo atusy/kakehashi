@@ -124,7 +124,9 @@ impl DocumentStore {
         uris
     }
 
-    // Lock safety: Single insert() call - no read lock held before or during write
+    /// Register a new document lifetime. Production callers must hold this URI's
+    /// edit lock across registration, serializing both watermark seeding and
+    /// document insertion with `remove_preserving_edit_lock` and close cleanup.
     pub fn insert(
         &self,
         uri: Url,
@@ -441,6 +443,8 @@ impl DocumentStore {
 
     /// Remove a document while retaining its per-URI edit lock entry.
     ///
+    /// The caller must hold this URI's edit lock, shared with document
+    /// registration, across removal and the remaining lifecycle cleanup.
     /// Lifecycle teardown holds that lock across cleanup after the document is
     /// gone. Keeping the map entry makes a fast reopen wait on the same mutex
     /// instead of creating a fresh lock and racing the old lifetime's cleanup.
