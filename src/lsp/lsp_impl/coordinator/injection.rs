@@ -694,13 +694,20 @@ impl InjectionCoordinator {
                     // right now makes the rerun defer again, and its retry
                     // must be able to claim the slot this waiter held.
                     drop(claim);
-                    let _ = Box::pin(this.process_injections_after_lifecycle_lock(
-                        &uri,
-                        forward_did_change,
-                        required.or(Some(InjectionTarget::Incarnation(incarnation))),
-                        std::future::ready(()),
-                    ))
-                    .await;
+                    match required {
+                        Some(InjectionTarget::Parsed(lineage)) => {
+                            let _ = this.process_injections_for_parse(&uri, lineage).await;
+                        }
+                        _ => {
+                            let _ = this
+                                .process_injections_for_incarnation(
+                                    &uri,
+                                    forward_did_change,
+                                    incarnation,
+                                )
+                                .await;
+                        }
+                    }
                     return;
                 }
                 if tokio::time::Instant::now() >= deadline {

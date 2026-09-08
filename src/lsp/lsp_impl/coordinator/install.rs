@@ -64,6 +64,14 @@ pub(super) struct InstallCoordinatorDeps {
     pub(super) bridge: std::sync::Arc<BridgeCoordinator>,
 }
 
+/// Installation/lifetime eligibility is distinct from ownership of a parse.
+/// A sibling may supply the tree while this install is waiting.
+#[derive(Default)]
+pub(crate) struct InstallCompletion {
+    pub(crate) same_lifetime: bool,
+    pub(crate) parsed: Option<super::parse::ParseLineage>,
+}
+
 pub(crate) struct InstallCoordinator {
     client: Client,
     language: std::sync::Arc<LanguageCoordinator>,
@@ -172,6 +180,8 @@ impl InstallCoordinator {
     /// Delegates to `AutoInstallManager::try_install()`, dispatches its events, and
     /// reloads on success. An `AlreadyInstalling` caller waits for the shared
     /// install claim, then reloads its own document when the parser artifact exists.
+    /// `parsed` names only a parse published by this call; successful recovery
+    /// through a sibling's tree does not authorize open downstream work.
     pub(crate) async fn maybe_auto_install_language(
         &self,
         language: &str,
@@ -179,24 +189,29 @@ impl InstallCoordinator {
         is_injection: bool,
         expected_incarnation: Option<u64>,
         allow_recovery: bool,
-    ) -> bool {
+    ) -> InstallCompletion {
+        let mut parsed = None;
         if !self.same_document_incarnation(&uri, expected_incarnation) {
-            return false;
+            return InstallCompletion::default();
         }
 
         if self.language.has_parser_available(language) {
             if !is_injection && self.same_document_incarnation(&uri, expected_incarnation) {
-                self.parse_coordinator()
+                parsed = self
+                    .parse_coordinator()
                     .reparse_installed_document(uri.clone(), language, expected_incarnation)
                     .await;
             }
             if !self.same_document_incarnation(&uri, expected_incarnation) {
-                return false;
+                return InstallCompletion::default();
             }
             let recovered =
                 self.install_reparse_recovered(language, &uri, is_injection, expected_incarnation);
             if recovered {
-                return true;
+                return InstallCompletion {
+                    same_lifetime: true,
+                    parsed,
+                };
             }
         }
         let mut result = self.auto_install.try_install(language).await;
@@ -204,22 +219,26 @@ impl InstallCoordinator {
         self.dispatch_install_events(language, &result.events).await;
 
         if let Some(data_dir) = result.outcome.data_dir().cloned() {
-            self.reload_language_after_install(
-                language,
-                &data_dir,
-                uri.clone(),
-                is_injection,
-                expected_incarnation,
-                Some(&mut result),
-            )
-            .await;
+            parsed = self
+                .reload_language_after_install(
+                    language,
+                    &data_dir,
+                    uri.clone(),
+                    is_injection,
+                    expected_incarnation,
+                    Some(&mut result),
+                )
+                .await;
             let recovered =
                 self.install_reparse_recovered(language, &uri, is_injection, expected_incarnation);
             if recovered {
-                return true;
+                return InstallCompletion {
+                    same_lifetime: true,
+                    parsed,
+                };
             }
             drop(result);
-            return false;
+            return InstallCompletion::default();
         }
 
         // Every no-reparse outcome lands here — Failed/Unsupported/NoDataDir as
@@ -254,7 +273,8 @@ impl InstallCoordinator {
                 && self.same_document_incarnation(&uri, expected_incarnation)
             {
                 if !is_injection {
-                    self.parse_coordinator()
+                    parsed = self
+                        .parse_coordinator()
                         .reparse_installed_document(uri.clone(), language, expected_incarnation)
                         .await;
                 }
@@ -264,7 +284,10 @@ impl InstallCoordinator {
                     is_injection,
                     expected_incarnation,
                 ) {
-                    return true;
+                    return InstallCompletion {
+                        same_lifetime: true,
+                        parsed,
+                    };
                 }
                 if allow_recovery {
                     return Box::pin(self.maybe_auto_install_language(
@@ -276,7 +299,7 @@ impl InstallCoordinator {
                     ))
                     .await;
                 }
-                return false;
+                return InstallCompletion::default();
             }
             if terminal == crate::lsp::auto_install::InstallOutcome::Abandoned
                 && self.same_document_incarnation(&uri, expected_incarnation)
@@ -294,7 +317,10 @@ impl InstallCoordinator {
         } else {
             result.complete_claim();
         }
-        self.same_document_incarnation(&uri, expected_incarnation)
+        InstallCompletion {
+            same_lifetime: self.same_document_incarnation(&uri, expected_incarnation),
+            parsed,
+        }
     }
 
     /// Reload a language after installation and optionally re-parse the document.
@@ -310,7 +336,7 @@ impl InstallCoordinator {
         is_injection: bool,
         expected_incarnation: Option<u64>,
         claim: Option<&mut InstallResult>,
-    ) {
+    ) -> Option<super::parse::ParseLineage> {
         let reload = lock_settings_reload().await;
         let settings_snapshot = self.settings_manager.load_settings_pair();
         let (updated_raw_settings, updated_settings) = updated_settings_after_install(
@@ -348,7 +374,9 @@ impl InstallCoordinator {
             // injection reaches this same per-URI path after the claim completes.
             self.parse_coordinator()
                 .reparse_installed_document(uri, language, expected_incarnation)
-                .await;
+                .await
+        } else {
+            None
         }
     }
 
@@ -733,7 +761,7 @@ mod tests {
             data_dir: std::path::PathBuf::from("/installed"),
         });
 
-        assert!(waiter.await);
+        assert!(waiter.await.same_lifetime);
         assert!(server.documents.get(&first).unwrap().tree().is_some());
         assert!(server.documents.get(&second).unwrap().tree().is_some());
     }
@@ -770,7 +798,7 @@ mod tests {
             .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
         drop(claim);
 
-        assert!(waiter.await);
+        assert!(waiter.await.same_lifetime);
         assert!(server.documents.get(&uri).unwrap().tree().is_some());
     }
 
@@ -890,6 +918,77 @@ mod tests {
         assert!(server.documents.get(&uri).unwrap().tree().is_none());
     }
 
+    #[tokio::test]
+    async fn available_parser_reports_only_its_own_parse() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), tree_sitter_rust::LANGUAGE.into());
+        let uri = Url::parse("file:///own-install.rs").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "fn main() {}".into(),
+            Some("rust".into()),
+            None,
+        );
+        let install = server.install_coordinator();
+        let first = install
+            .maybe_auto_install_language("rust", uri.clone(), false, Some(incarnation), true)
+            .await;
+        assert!(first.same_lifetime);
+        let parsed = first.parsed.expect("this install published the parse");
+        assert!(parsed.matches(&server.documents.get(&uri).unwrap()));
+        let second = install
+            .maybe_auto_install_language("rust", uri.clone(), false, Some(incarnation), true)
+            .await;
+        assert!(
+            second.same_lifetime,
+            "already parsed is still successful recovery"
+        );
+        assert!(
+            second.parsed.is_none(),
+            "a current tree alone does not grant downstream work"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_completion_cannot_cancel_a_newer_edits_eager_batch() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), tree_sitter_rust::LANGUAGE.into());
+        let uri = Url::parse("file:///delayed-install.rs").unwrap();
+        let incarnation =
+            server
+                .documents
+                .insert(uri.clone(), "fn old() {}".into(), Some("rust".into()), None);
+        let completion = server
+            .install_coordinator()
+            .maybe_auto_install_language("rust", uri.clone(), false, Some(incarnation), true)
+            .await;
+        let parsed = completion.parsed.expect("install's own parse");
+        server
+            .documents
+            .update_document(uri.clone(), "fn edited() {}".into(), None);
+        server.parse_coordinator().reparse_latest(&uri, None).await;
+        assert!(server.documents.get(&uri).unwrap().has_current_tree());
+        let token = server.bridge.begin_test_eager_open_batch(&uri);
+        assert!(
+            !server
+                .injection_coordinator()
+                .process_injections_for_parse(&uri, parsed)
+                .await
+        );
+        assert!(
+            !token.is_cancelled(),
+            "a delayed install must leave the edit's batch intact"
+        );
+    }
+
     // `start_paused`: the healthy path returns without awaiting, so the bound
     // below needs no wall-clock time; a regressed guard instead parks on the
     // completion wait, the runtime goes idle, and the deadline fires at once.
@@ -937,7 +1036,7 @@ mod tests {
         )
         .await
         .expect("a stale task must return without awaiting an install");
-        assert!(!stale);
+        assert!(!stale.same_lifetime);
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(10), socket.next())
                 .await

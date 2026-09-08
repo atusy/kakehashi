@@ -6,11 +6,11 @@ use super::super::{Kakehashi, build_notifier, uri_to_url};
 use crate::document::DocumentStore;
 use crate::language::LanguageEvent;
 
-async fn spawn_synthetic_diagnostic_for_incarnation<F>(
+async fn spawn_synthetic_diagnostic_for_parse<F>(
     documents: &DocumentStore,
     diagnostic_scheduler: &crate::lsp::lsp_impl::coordinator::DiagnosticScheduler,
     uri: url::Url,
-    incarnation: u64,
+    lineage: crate::lsp::lsp_impl::coordinator::ParseLineage,
     after_lifecycle_lock: F,
 ) where
     F: std::future::Future<Output = ()>,
@@ -22,10 +22,10 @@ async fn spawn_synthetic_diagnostic_for_incarnation<F>(
         documents.remove_edit_lock_if_unshared(&uri, &edit_lock);
         return;
     };
-    let eligible = document.incarnation() == incarnation && document.has_current_tree();
+    let eligible = lineage.matches(&document) && document.has_current_tree();
     drop(document);
     if eligible {
-        diagnostic_scheduler.spawn_synthetic_diagnostic_task(uri);
+        diagnostic_scheduler.spawn_synthetic_diagnostic_task_for_parse(uri, lineage);
     }
 }
 
@@ -143,7 +143,7 @@ impl Kakehashi {
                     // spawn is pure wasted work and races the bridge-state sweep.
                     let is_cli_mode = self.is_cli_mode();
                     tokio::spawn(async move {
-                        let same_lifetime = install
+                        let completion = install
                             .maybe_auto_install_language(
                                 &lang,
                                 install_uri.clone(),
@@ -152,32 +152,16 @@ impl Kakehashi {
                                 true,
                             )
                             .await;
-                        if !same_lifetime {
+                        if !completion.same_lifetime {
                             return;
                         }
-                        // The skipped inline parse meant the handler's
-                        // process_injections (below) ran with no tree. Now that the
-                        // off-ingress reparse may have produced one, run the normal
-                        // post-parse injection workflow — injected-language install
-                        // and eager bridge spawn — which also keeps that injected
-                        // install off the ingress ticket. forward=false: open path.
-                        //
-                        // Gate on the document actually having a tree: install can
-                        // fail or be deduped (AlreadyInstalling) with no reparse, and
-                        // process_injections would otherwise cancel the eager-open
-                        // for a still-tree-less document.
-                        let has_tree = documents.get(&install_uri).is_some_and(|doc| {
-                            doc.incarnation() == incarnation && doc.has_current_tree()
-                        });
-                        if has_tree {
-                            let same_lifetime = injection
-                                .process_injections_for_incarnation(
-                                    &install_uri,
-                                    false,
-                                    incarnation,
-                                )
-                                .await;
-                            if !same_lifetime {
+                        // Only a parse published by this install grants open
+                        // downstream work. A sibling's current tree does not.
+                        if let Some(lineage) = completion.parsed {
+                            if !injection
+                                .process_injections_for_parse(&install_uri, lineage)
+                                .await
+                            {
                                 return;
                             }
                             // Re-fire the proactive synthetic diagnostic now that a
@@ -187,11 +171,11 @@ impl Kakehashi {
                             // first open of a just-installed parser. Skipped in CLI
                             // mode (#489), matching the handler's own gate.
                             if !is_cli_mode {
-                                spawn_synthetic_diagnostic_for_incarnation(
+                                spawn_synthetic_diagnostic_for_parse(
                                     &documents,
                                     &diagnostic_scheduler,
                                     install_uri,
-                                    incarnation,
+                                    lineage,
                                     std::future::ready(()),
                                 )
                                 .await;
@@ -278,6 +262,7 @@ impl Kakehashi {
             let parse = self.parse_coordinator();
             let injection = self.injection_coordinator();
             let diagnostic_scheduler = self.diagnostic_scheduler();
+            let documents = std::sync::Arc::clone(&self.documents);
             let client = self.client.clone();
             let settings_manager = std::sync::Arc::clone(&self.settings_manager);
             let parse_uri = uri.clone();
@@ -306,8 +291,14 @@ impl Kakehashi {
                             .log_language_events(&deferred)
                             .await;
                     }
-                    diagnostic_scheduler
-                        .spawn_synthetic_diagnostic_task_for_parse(parse_uri, lineage);
+                    spawn_synthetic_diagnostic_for_parse(
+                        &documents,
+                        &diagnostic_scheduler,
+                        parse_uri,
+                        lineage,
+                        std::future::ready(()),
+                    )
+                    .await;
                 }
             });
         }
@@ -360,11 +351,14 @@ mod tests {
         let weak_lock = std::sync::Arc::downgrade(&edit_lock);
         drop(edit_lock);
 
-        spawn_synthetic_diagnostic_for_incarnation(
+        spawn_synthetic_diagnostic_for_parse(
             &server.documents,
             &server.diagnostic_scheduler(),
             uri,
-            1,
+            crate::lsp::lsp_impl::coordinator::ParseLineage {
+                incarnation: 1,
+                content_version: 0,
+            },
             std::future::ready(()),
         )
         .await;
@@ -400,11 +394,14 @@ mod tests {
         let scheduler = server.diagnostic_scheduler();
         let recovery_uri = uri.clone();
         let recovery = tokio::spawn(async move {
-            spawn_synthetic_diagnostic_for_incarnation(
+            spawn_synthetic_diagnostic_for_parse(
                 &documents,
                 &scheduler,
                 recovery_uri,
-                incarnation,
+                crate::lsp::lsp_impl::coordinator::ParseLineage {
+                    incarnation,
+                    content_version: 0,
+                },
                 async move {
                     let _ = locked_tx.send(());
                     let _ = release_rx.await;

@@ -732,12 +732,14 @@ impl ParseCoordinator {
     /// tree lands (or another parse wins). Sustained editing falls back to the
     /// reader's on-demand parse; the parse actor replaces this with a proper
     /// coalescing loop.
+    /// Return the revision this call published, if it completed current.
+    /// A tree already supplied by another parse grants no downstream work.
     pub(crate) async fn reparse_installed_document(
         &self,
         uri: Url,
         installed_language: &str,
         required_incarnation: Option<u64>,
-    ) {
+    ) -> Option<ParseLineage> {
         /// Bound on the convergence retries (a burst of edits landing exactly as
         /// the install completes); past this the reader on-demand parse covers it.
         const MAX_REPARSE_ATTEMPTS: usize = 8;
@@ -757,20 +759,18 @@ impl ParseCoordinator {
         // text legitimately changes within a lifetime (a `didChange`), so only the
         // text is re-read per attempt.
         let (language_name, expected_language_id, expected_incarnation) = {
-            let Some(doc) = self.documents.get(&uri) else {
-                return;
-            };
+            let doc = self.documents.get(&uri)?;
             if doc.has_current_tree() {
-                return;
+                return None;
             }
             if required_incarnation.is_some_and(|required| doc.incarnation() != required) {
-                return;
+                return None;
             }
             let language_name =
                 self.language
                     .detect_language(uri.path(), doc.text(), None, doc.language_id());
             if language_name.is_some() && language_name.as_deref() != Some(installed_language) {
-                return;
+                return None;
             }
             (
                 language_name,
@@ -782,7 +782,7 @@ impl ParseCoordinator {
             // Give-up: release a parked first-parse waiter (bootstrap-gated).
             self.documents
                 .publish_giveup_snapshot(&uri, expected_incarnation);
-            return;
+            return None;
         };
         let load_result = self
             .language
@@ -793,9 +793,10 @@ impl ParseCoordinator {
             self.documents
                 .publish_giveup_snapshot(&uri, expected_incarnation);
             self.notifier().log_language_events(&events).await;
-            return;
+            return None;
         }
 
+        let mut completed = None;
         for _ in 0..MAX_REPARSE_ATTEMPTS {
             // Re-read the latest text each attempt. Gone => closed (no resurrect);
             // already has a tree => a concurrent parse won; a changed incarnation =>
@@ -884,6 +885,10 @@ impl ParseCoordinator {
                 ));
             }
             if installed.current_at_completion {
+                completed = Some(ParseLineage {
+                    incarnation: expected_incarnation,
+                    content_version,
+                });
                 break;
             }
             // Not current: the text moved under us (a concurrent `didChange`
@@ -899,6 +904,7 @@ impl ParseCoordinator {
         self.documents
             .publish_giveup_snapshot(&uri, expected_incarnation);
         self.notifier().log_language_events(&events).await;
+        completed
     }
 
     /// Re-parse `uri`'s **latest** store text off the ingress path, for the
