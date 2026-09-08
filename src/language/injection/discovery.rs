@@ -407,9 +407,10 @@ fn try_collect_partitioned<'a>(
     {
         return None;
     }
-    let chunk_size = root
-        .child_count()
-        .div_ceil(2 * rayon::current_num_threads());
+    // Bound each query's fan-out so concurrent documents can share the pool.
+    // Wider fan-out regressed four-document latency in the discovery experiment.
+    const MAX_DISCOVERY_WINDOWS: usize = 2;
+    let chunk_size = root.child_count().div_ceil(MAX_DISCOVERY_WINDOWS);
     let mut walk = root.walk();
     let mut ranges = Vec::new();
     let mut start = root.start_byte();
