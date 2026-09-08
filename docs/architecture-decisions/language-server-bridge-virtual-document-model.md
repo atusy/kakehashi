@@ -5,8 +5,13 @@
 Isolated virtual documents remain the default. Query-authored
 `#set! injection.combined` patterns are implemented: captures from the same
 query pattern and language share one bridge virtual document, with host-only
-gaps masked by coordinate-preserving whitespace. The separately proposed
-user-facing `isolation=false` configuration remains deferred.
+gaps masked by coordinate-preserving whitespace. Query-authored
+`#set! injection.dedent` is also supported for bridge virtual documents: it
+removes the common leading spaces/tabs from non-blank lines and records the
+removed UTF-16 columns in each line's host offset, so downstream positions
+still translate to the original source. Blank lines do not constrain the
+common indent. The separately proposed user-facing `isolation=false`
+configuration remains deferred.
 
 ## Context
 
