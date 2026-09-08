@@ -443,8 +443,10 @@ impl DocumentStore {
 
     /// Remove a document while retaining its per-URI edit lock entry.
     ///
-    /// The caller must hold this URI's edit lock, shared with document
+    /// Production callers must hold this URI's edit lock, shared with document
     /// registration, across removal and the remaining lifecycle cleanup.
+    /// The test-only `remove` helper bypasses this lifecycle protocol: it drops
+    /// the edit-lock entry and calls here without holding the lock.
     /// Lifecycle teardown holds that lock across cleanup after the document is
     /// gone. Keeping the map entry makes a fast reopen wait on the same mutex
     /// instead of creating a fresh lock and racing the old lifetime's cleanup.
