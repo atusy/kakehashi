@@ -1687,13 +1687,23 @@ print("hello")
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
         configure_rust_self_host(server);
+        let query = Query::new(
+            &tree_sitter_rust::LANGUAGE.into(),
+            r#"((line_comment) @injection.content (#set! injection.language "lua"))"#,
+        )
+        .unwrap();
+        server
+            .language
+            .query_store()
+            .insert_injection_query("rust".to_string(), std::sync::Arc::new(query));
         let uri = Url::parse("file:///test/installer-refinement.rs").unwrap();
         let incarnation = server.documents.insert(
             uri.clone(),
-            "fn installed() {}".to_string(),
+            "// print(1)\nfn installed() {}".to_string(),
             Some("text".to_string()),
             None,
         );
+        server.bridge.open_tracker_incarnation(&uri, incarnation);
         let parsed = server
             .parse_coordinator()
             .reparse_installed_document(uri.clone(), "rust", Some(incarnation))
