@@ -20,6 +20,11 @@ pub(crate) struct ComputePool {
 }
 
 impl ComputePool {
+    #[cfg(test)]
+    pub(crate) fn with_test_threads(threads: usize) -> Self {
+        Self::with_threads(threads)
+    }
+
     pub(crate) fn thread_count(&self) -> usize {
         self.pool.current_num_threads()
     }

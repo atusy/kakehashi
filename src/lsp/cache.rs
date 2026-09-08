@@ -341,7 +341,7 @@ impl CacheCoordinator {
         // Collect all injection regions from the parsed tree
         let profile_start = log::log_enabled!(target: "kakehashi::profile", log::Level::Debug)
             .then(std::time::Instant::now);
-        let regions = crate::language::injection::collect_all_injections_cancellable(
+        let regions = crate::language::injection::collect_all_injections_parallel_cancellable(
             &tree.root_node(),
             text,
             Some(injection_query.as_ref()),
