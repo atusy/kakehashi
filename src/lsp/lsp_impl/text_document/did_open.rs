@@ -1456,15 +1456,6 @@ print("hello")
         );
     }
 
-    /// Regression (parse-actor flip): the debounced diagnostic — which drives the
-    /// on-edit host re-sync (#431) that keeps a push host's diagnostics following
-    /// edits — must be scheduled AFTER the off-ingress reparse, not in the
-    /// `did_change` handler. The handler makes the tree stale, and
-    /// `prepare_diagnostic_snapshot` returns `None` without a tree, so scheduling
-    /// the debounce there would capture a `None` snapshot and silently skip the
-    /// re-sync (the diagnostics-don't-follow-edits bug). This pins the mechanism:
-    /// the snapshot is `None` with the tree cleared and valid again once the
-    /// reparse restores it.
     #[rstest::rstest]
     #[case(None)]
     #[case(Some("text"))]
@@ -1722,6 +1713,15 @@ print("hello")
         );
     }
 
+    /// Regression (parse-actor flip): the debounced diagnostic — which drives the
+    /// on-edit host re-sync (#431) that keeps a push host's diagnostics following
+    /// edits — must be scheduled AFTER the off-ingress reparse, not in the
+    /// `did_change` handler. The handler makes the tree stale, and
+    /// `prepare_diagnostic_snapshot` returns `None` without a tree, so scheduling
+    /// the debounce there would capture a `None` snapshot and silently skip the
+    /// re-sync (the diagnostics-don't-follow-edits bug). This pins the mechanism:
+    /// the snapshot is `None` with the tree cleared and valid again once the
+    /// reparse restores it.
     #[tokio::test]
     async fn diagnostic_snapshot_needs_the_reparsed_tree_not_the_cleared_one() {
         let (service, _socket) = LspService::new(Kakehashi::new);
