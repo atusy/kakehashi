@@ -1602,6 +1602,9 @@ fn push_coordinate_whitespace(output: &mut String, text: &str) {
 }
 
 #[cfg(test)]
+pub(crate) use tests::assert_discovery_matches_reference;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::language::LanguageCoordinator;
@@ -1777,7 +1780,7 @@ mod tests {
         Some(injections)
     }
 
-    fn assert_discovery_matches_reference(tree: &Tree, text: &str, query: &Query) {
+    pub(crate) fn assert_discovery_matches_reference(tree: &Tree, text: &str, query: &Query) {
         let describe = |regions: Vec<InjectionRegionInfo<'_>>| {
             regions
                 .into_iter()

@@ -22,6 +22,8 @@ pub(crate) use content::{
     NATIVE_PARSE_BUDGET, byte_to_point, byte_to_point_anchored, parse_with_deadline,
     parse_with_deadline_cancellable, parse_with_ranges,
 };
+#[cfg(test)]
+pub(crate) use discovery::assert_discovery_matches_reference;
 pub(crate) use discovery::{
     CacheableInjectionRegion, InjectionRegionInfo, InjectionResolver, REGION_IDENTITY_LAYER_BASE,
     RegionBoundary, ResolvedInjection, collect_all_injections,
