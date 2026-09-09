@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
-"""Summarize attested semantic-token A/B pair files."""
+"""Validation and statistics helpers for the attested pair collector."""
 
 from __future__ import annotations
 
-import argparse
-import json
 import statistics
 from collections import defaultdict
-from pathlib import Path
 from typing import Any, Iterable
 
 
@@ -201,20 +198,7 @@ def summarize_pairs(documents: Iterable[dict[str, Any]]) -> dict[str, Any]:
     return {"schema_version": 1, "scenarios": scenarios}
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("inputs", nargs="+", type=Path)
-    parser.add_argument("--output", type=Path)
-    args = parser.parse_args()
-
-    documents = [json.loads(path.read_text()) for path in args.inputs]
-    summary = summarize_pairs(documents)
-    rendered = json.dumps(summary, indent=2, sort_keys=True) + "\n"
-    if args.output:
-        args.output.write_text(rendered)
-    else:
-        print(rendered, end="")
-
-
 if __name__ == "__main__":
-    main()
+    raise SystemExit(
+        "Use collect_semantic_pairs.py: summaries require its attestation context."
+    )
