@@ -40,9 +40,9 @@ with `NVIM_LISTEN_ADDRESS` unset. Set `PROBE_BIN`, `PROBE_FILE`, `PROBE_CONFIG`,
 private JSON output, and runtime used by the experiment. `PROBE_SAMPLES` defaults
 to eight; `PROBE_LINE` defaults to zero-based line one. Choose a token-bearing
 line where inserted leading spaces only move its first token, such as a Rust
-`use` statement. Every accepted full/delta result must move that token to the
-latest unique position. The file is edited in memory and never saved.
-Set `PROBE_BURST=8` for eight edits per accepted response and
+`use` statement. Each completed sample must have a full/delta result that moves that token to
+the latest unique position. The file is edited in memory and never saved.
+Set `PROBE_BURST=8` for eight edits per sample and
 `PROBE_INTERVAL_MS=20` for their spacing. `follow_ms` measures from the last edit;
 `ready_ms` measures from the start of the burst. The final token array's SHA-256
 supports an untimed full-array equality checkpoint across the two binaries.
