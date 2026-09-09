@@ -164,11 +164,12 @@ impl Kakehashi {
     async fn token_snapshot_after_timeout(
         &self,
         uri: &Url,
+        generation: u64,
         supersede: &crate::cancel::CancelToken,
     ) -> TokenSnapshot {
         let edit_lock = self.documents.edit_lock(uri);
         let _guard = edit_lock.lock().await;
-        if supersede.is_cancelled() {
+        if supersede.is_cancelled() || self.cache.semantic_token_generation() != generation {
             return TokenSnapshot::Superseded;
         }
         if self.documents.latest_snapshot(uri).is_none() {
@@ -269,7 +270,10 @@ impl Kakehashi {
                     .await
                 {
                     SnapshotWait::Current(snapshot) => TokenSnapshot::Current(snapshot),
-                    SnapshotWait::Stale => self.token_snapshot_after_timeout(uri, supersede).await,
+                    SnapshotWait::Stale => {
+                        self.token_snapshot_after_timeout(uri, generation, supersede)
+                            .await
+                    }
                     SnapshotWait::Unparsed | SnapshotWait::Gone => TokenSnapshot::Absent,
                 };
                 match outcome {
@@ -1485,7 +1489,11 @@ mod tests {
             .update_document(uri.clone(), "fn main() { }".into(), None);
         publish_treeless(server, &uri, "fn main() { }", 1);
         let outcome = server
-            .token_snapshot_after_timeout(&uri, &crate::cancel::CancelToken::default())
+            .token_snapshot_after_timeout(
+                &uri,
+                server.cache.semantic_token_generation(),
+                &crate::cancel::CancelToken::default(),
+            )
             .await;
         assert!(
             matches!(outcome, TokenSnapshot::Current(snapshot) if snapshot.parsed_version == 1)
@@ -1671,6 +1679,7 @@ mod tests {
         drop(doc);
         drop(guard);
         assert!(matches!(request.await, TokenSnapshot::Superseded));
+        assert_eq!(server.cache.served_semantic_version(&uri), None);
     }
 
     #[tokio::test]
@@ -1778,7 +1787,13 @@ mod tests {
             .documents
             .insert(uri.clone(), "new".into(), None, None);
         assert!(matches!(
-            server.token_snapshot_after_timeout(&uri, &cancel).await,
+            server
+                .token_snapshot_after_timeout(
+                    &uri,
+                    server.cache.semantic_token_generation(),
+                    &cancel
+                )
+                .await,
             TokenSnapshot::Superseded
         ));
         assert_eq!(server.cache.served_semantic_version(&uri), None);
