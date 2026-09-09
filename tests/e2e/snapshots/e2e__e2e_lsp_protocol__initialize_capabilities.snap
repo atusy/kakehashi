@@ -56,6 +56,7 @@ expression: capabilities
   "documentLinkProvider": {
     "resolveProvider": true
   },
+  "colorProvider": true,
   "foldingRangeProvider": true,
   "declarationProvider": {
     "workDoneProgress": true

@@ -328,7 +328,7 @@ virt/host layers. Advertised only to clients with
 `codeActionLiteralSupport`; see the README's bridged-requests list for the
 palette/registered-list caveats.
 
-### Document color (experimental)
+### Document color
 
 [`textDocument/documentColor`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_documentColor)
 and [`textDocument/colorPresentation`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_colorPresentation)
@@ -346,8 +346,6 @@ Presentations whose primary edit (explicit, or the implicit label replacement)
 would corrupt the host document around the embedded block are dropped
 fail-closed; unsafe additional edits are dropped as one atomic set while the
 presentation itself survives.
-**Only available with the `KAKEHASHI_EXPERIMENTAL=true` environment variable** —
-without the opt-in the server does not advertise color support.
 
 ---
 

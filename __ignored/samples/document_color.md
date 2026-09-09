@@ -1,7 +1,7 @@
 # Document color host/virtual layer sample
 
-Run kakehashi with `KAKEHASHI_EXPERIMENTAL=true`, a Markdown language server
-that provides document colors, and a CSS language server for embedded blocks.
+Run kakehashi with a Markdown language server that provides document colors
+and a CSS language server for embedded blocks.
 Configure the Markdown language with:
 
 ```toml

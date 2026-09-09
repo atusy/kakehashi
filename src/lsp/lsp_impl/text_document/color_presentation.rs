@@ -17,12 +17,6 @@ impl Kakehashi {
         &self,
         params: ColorPresentationParams,
     ) -> Result<Vec<ColorPresentation>> {
-        // Experimental (KAKEHASHI_EXPERIMENTAL=true): without the opt-in the
-        // capability is not advertised, so answer a compliant empty result to
-        // any client that calls regardless.
-        if !self.experimental_enabled() {
-            return Ok(Vec::new());
-        }
         let raw_params = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
         let lsp_uri = params.text_document.uri;
         let virt = self.color_presentation_virt_layer(&lsp_uri, params.range, params.color);

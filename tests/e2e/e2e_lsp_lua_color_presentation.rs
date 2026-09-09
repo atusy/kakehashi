@@ -14,7 +14,7 @@
 //! Since lua-ls doesn't return colors, we use mock values to test the infrastructure.
 
 use crate::helpers::lua_bridge::{
-    create_lua_configured_client_experimental, shutdown_client, skip_if_lua_ls_unavailable,
+    create_lua_configured_client, shutdown_client, skip_if_lua_ls_unavailable,
 };
 use serde_json::json;
 
@@ -28,7 +28,7 @@ fn e2e_color_presentation_request_handled() {
     if skip_if_lua_ls_unavailable() {
         return;
     }
-    let (mut client, _config_dir) = create_lua_configured_client_experimental();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown document with Lua code block
     let markdown_content = r##"# Test Document
