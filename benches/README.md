@@ -32,6 +32,24 @@ queues edits before one request; cancellation cases exercise in-flight work.
 Neither measures a real editor's request scheduling or highlight rendering.
 Do not label these samples as time to visible highlight application.
 
+`profile/neovim_typing.lua` records a real Neovim client's edit, requests,
+refreshes, cancellations, responses, and completed token conversion. Run it in
+an isolated `nvim --clean --headless -l benches/profile/neovim_typing.lua` process
+with `NVIM_LISTEN_ADDRESS` unset. Set `PROBE_BIN`, `PROBE_FILE`, `PROBE_CONFIG`,
+`PROBE_OUTPUT`, and `KAKEHASHI_DATA_DIR` to the exact binary, fixture, config,
+private JSON output, and runtime used by the experiment. `PROBE_SAMPLES` defaults
+to eight; `PROBE_LINE` defaults to zero-based line one. Choose a token-bearing
+line where inserted leading spaces only move its first token, such as a Rust
+`use` statement. Every accepted full/delta result must move that token to the
+latest unique position. The file is edited in memory and never saved.
+
+The probe uses private Neovim semantic-token state, tested with 0.13-dev, and
+fails if the API or marker contract is unavailable. Read the ordered `events`
+array to distinguish an immediate first request from a later refresh-induced
+replacement; the scalar request/response timestamps describe the last events.
+`ready_ms` means full/delta token conversion completed, not that a screen frame
+was painted. This probe complements the isolated LSP comparisons.
+
 The baseline validation and paired collector were recovered from unmerged
 PR #899 (`15af9f9c1f43d9bd826a6e04ae889a28c15e8375`). No experimental server
 changes from that branch are included.
