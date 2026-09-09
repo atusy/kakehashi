@@ -1273,12 +1273,13 @@ impl ParseCoordinator {
             //   interest mark exists), OR it served the reload's current
             //   tree-less placeholder that this publish upgrades at the same
             //   version (otherwise its own didChange-driven request caught up).
-            // Successful responses from earlier edits were cleared at didChange,
-            // so they cannot refresh/cancel the client's current parked request.
-            // Net: at most one refresh per settle, none mid-burst, none for
-            // documents nobody highlights. Emitted from the parse loop, never
-            // didChange (synchronous clients can't answer a server request
-            // mid-notification).
+            // Successful responses from earlier edits no longer make this
+            // publish eligible. Eligibility is checked here: an accepted edit
+            // does not retract a recovery event already queued or a workspace
+            // refresh already in flight. Those refreshes, including non-edit
+            // invalidations, can still overlap later edits. Queue from the parse
+            // loop, never didChange (synchronous clients can't answer a server
+            // request mid-notification).
             if published
                 && should_emit_settle_refresh(
                     &self.documents,
