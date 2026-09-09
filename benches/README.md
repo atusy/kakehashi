@@ -51,6 +51,11 @@ The probe uses private Neovim semantic-token state, tested with 0.13-dev, and
 fails if the API or marker contract is unavailable. Read the ordered `events`
 array to distinguish an immediate first request from a later refresh-induced
 replacement; the scalar request/response timestamps describe the last events.
+`wire_response` records null results and errors delivered to Neovim's request
+callback; Neovim filters `RequestCancelled` acknowledgments before that callback.
+On an edit timeout, the probe exits unsuccessfully and writes a partial trace
+with an `error` field and `failed_sample`. It is diagnostic evidence, not a
+completed benchmark run.
 `ready_ms` means full/delta token conversion completed, not that a screen frame
 was painted. This probe complements the isolated LSP comparisons.
 
