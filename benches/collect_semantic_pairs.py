@@ -20,6 +20,7 @@ from typing import Any
 
 from semantic_summary import summarize_pairs, validate_collection
 
+METADATA_TIMEOUT_SECONDS = 30
 
 DEFAULT_SCENARIOS = ",".join(
     [
@@ -127,13 +128,15 @@ def run(
 def output(
     command: list[str], *, cwd: Path, env: dict[str, str] | None = None
 ) -> str:
-    return subprocess.check_output(command, cwd=cwd, env=env, text=True).strip()
+    return subprocess.check_output(
+        command, cwd=cwd, env=env, text=True, timeout=METADATA_TIMEOUT_SECONDS
+    ).strip()
 
 
 def optional_output(command: list[str], *, cwd: Path, env: dict[str, str]) -> str | None:
     try:
         return output(command, cwd=cwd, env=env)
-    except (FileNotFoundError, subprocess.CalledProcessError):
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return None
 
 
