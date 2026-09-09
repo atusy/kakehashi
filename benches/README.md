@@ -53,6 +53,8 @@ array to distinguish an immediate first request from a later refresh-induced
 replacement; the scalar request/response timestamps describe the last events.
 `wire_response` records null results and errors delivered to Neovim's request
 callback; Neovim filters `RequestCancelled` acknowledgments before that callback.
+`wire_reply` records reply arrival before this filter, including cancellation
+acknowledgments, but exposes only the request ID, not the response payload.
 On an edit timeout, the probe exits unsuccessfully and writes a partial trace
 with an `error` field and `failed_sample`. It is diagnostic evidence, not a
 completed benchmark run.
