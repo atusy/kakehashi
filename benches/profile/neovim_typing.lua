@@ -25,14 +25,14 @@ end
 local sem = vim.lsp.semantic_tokens
 local cls = sem.__STHighlighter
 local original = cls.process_response
-cls.process_response = function(self, response, client, request_id, version, is_range)
+cls.process_response = function(self, response, client, request_id, version, is_range, ...)
 	local origin = response_samples[request_id]
 	local sample = origin and origin.sample
 	if sample then
 		sample.response_ms = now() - origin.started
 		table.insert(sample.events, { event = "response", ms = sample.response_ms, id = request_id, version = version })
 	end
-	original(self, response, client, request_id, version, is_range)
+	original(self, response, client, request_id, version, is_range, ...)
 	if
 		sample
 		and sample == active
