@@ -135,6 +135,9 @@ impl Kakehashi {
         generation: u64,
         request_id: Option<crate::lsp::cache::RequestId>,
     ) -> Option<std::sync::Arc<crate::document::snapshot::ParseSnapshot>> {
+        if self.cache.semantic_token_generation() != generation {
+            return None;
+        }
         if snapshot.tree.is_some() && snapshot.language.is_some() {
             return Some(snapshot);
         }
@@ -1611,6 +1614,53 @@ mod tests {
             std::task::Poll::Ready(TokenSnapshot::Cancelled)
         ));
         assert_eq!(server.cache.served_semantic_version(&uri), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_recovery_rejects_a_tree_from_an_obsolete_generation() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///timeout-generation.rs").unwrap();
+        let text = "fn main() {}";
+        server
+            .documents
+            .insert(uri.clone(), "old".into(), Some("rust".into()), None);
+        publish_treeless(server, &uri, "old", 0);
+        server
+            .documents
+            .update_document(uri.clone(), text.into(), None);
+        let generation = server.cache.semantic_token_generation();
+        let lock = server.documents.edit_lock(&uri);
+        let guard = lock.lock().await;
+        let supersede = crate::cancel::CancelToken::default();
+        let mut request = std::pin::pin!(
+            server.current_snapshot_for_tokens(&uri, None, &supersede, generation, None,)
+        );
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        tokio::time::advance(crate::lsp::lsp_impl::snapshot_read::TOKEN_SETTLE_BACKSTOP).await;
+        assert!(futures::poll!(request.as_mut()).is_pending());
+
+        server.cache.bump_semantic_token_generation();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(text, None).unwrap();
+        let doc = server.documents.get(&uri).unwrap();
+        assert!(doc.publish_snapshot(&std::sync::Arc::new(
+            crate::document::snapshot::ParseSnapshot {
+                text: std::sync::Arc::from(text),
+                tree: Some(tree),
+                language: Some("rust".into()),
+                parsed_version: 1,
+                incarnation: doc.incarnation(),
+                injection_regions: None,
+                regions: None,
+                layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
+            }
+        )));
+        drop(doc);
+        drop(guard);
+        assert!(matches!(request.await, TokenSnapshot::Superseded));
     }
 
     #[tokio::test]
