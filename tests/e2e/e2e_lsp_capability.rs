@@ -74,10 +74,10 @@ fn e2e_color_capability_is_available_without_experimental_opt_in(#[case] capabil
             .and_then(|r| r.get("capabilities"))
             .expect("Should have capabilities in init response");
 
-        let advertised = capabilities.get(capability).is_some_and(|v| !v.is_null());
-        assert!(
-            advertised,
-            "{capability} advertised={advertised} with KAKEHASHI_EXPERIMENTAL set to {experimental:?}"
+        assert_eq!(
+            capabilities.get(capability),
+            Some(&json!(true)),
+            "{capability} must be enabled with KAKEHASHI_EXPERIMENTAL set to {experimental:?}"
         );
 
         shutdown_client(&mut client);
