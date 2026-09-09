@@ -644,9 +644,7 @@ fn measure(
 
     let mut samples = Vec::with_capacity(iters);
     for _ in 0..iters {
-        let start = Instant::now();
-        run_once(&mut server, scn, &mut baseline, &mut edit);
-        samples.push(start.elapsed());
+        samples.push(run_once(&mut server, scn, &mut baseline, &mut edit));
     }
     Measurement {
         samples,
@@ -778,8 +776,8 @@ fn measure_open(
         // has produced a tree the reader can tokenize, or the reader fell back to an
         // on-demand parse.
         let result = server.semantic_full(&uri);
-        validate_full_response(scn, &result);
         let elapsed = start.elapsed();
+        validate_full_response(scn, &result);
         if i >= warmup {
             samples.push(elapsed);
         }
@@ -823,14 +821,17 @@ fn run_once(
     scn: &Scenario,
     baseline: &mut Option<SemanticBaseline>,
     edit: &mut EditState,
-) {
+) -> Duration {
+    let start = Instant::now();
     match scn.kind {
         // Handled by `measure_open`, which never calls `run_once`.
         Kind::OpenFirstToken => unreachable!("OpenFirstToken uses measure_open"),
         Kind::CancelBurst { .. } => unreachable!("CancelBurst uses measure_cancel_burst"),
         Kind::Full => {
             let result = server.semantic_full(scn.uri);
+            let elapsed = start.elapsed();
             validate_full_response(scn, &result);
+            return elapsed;
         }
         Kind::Range {
             start_line,
@@ -841,9 +842,11 @@ fn run_once(
             let offset = (edit.range_next % variants.max(1)) * step;
             edit.range_next = edit.range_next.wrapping_add(1);
             let result = server.semantic_range(scn.uri, start_line + offset, end_line + offset);
+            let elapsed = start.elapsed();
             validate_token_payload(&result).unwrap_or_else(|error| {
                 panic!("invalid range response for {}: {error:?}", scn.name)
             });
+            return elapsed;
         }
         Kind::DeltaNoop => {
             let baseline = baseline.as_mut().expect("delta baseline");
@@ -914,6 +917,7 @@ fn run_once(
             });
         }
     }
+    start.elapsed()
 }
 
 fn validate_full_response_generators() {
