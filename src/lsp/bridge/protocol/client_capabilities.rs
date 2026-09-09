@@ -163,6 +163,7 @@ fn build_baseline_capabilities(advertise_configuration: bool) -> ClientCapabilit
         experimental: Some(serde_json::json!({
             "kakehashi": {
                 "bridgeRouting": true,
+                "bridgePeer": true,
             },
         })),
         ..Default::default()
@@ -467,6 +468,20 @@ pub(super) fn build_bridge_client_capabilities(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn downstream_initialize_advertises_bridge_peer_support() {
+        let capabilities = build_bridge_client_capabilities(None, false);
+        assert_eq!(
+            capabilities.experimental,
+            Some(serde_json::json!({
+                "kakehashi": {
+                    "bridgePeer": true,
+                    "bridgeRouting": true
+                }
+            }))
+        );
+    }
 
     #[test]
     fn bridge_client_capabilities_snapshot() {
