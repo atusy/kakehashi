@@ -134,6 +134,7 @@ pub(crate) struct ConnectionHandle {
     /// bridge-routing protocol. This starts false, is set from the initialize
     /// advertisement, and may be cleared after a downstream MethodNotFound.
     bridge_routing: AtomicBool,
+    type_hierarchy_provider: AtomicBool,
     /// Dynamic capability registrations from server-initiated `client/registerCapability` requests.
     ///
     /// Updated by the reader task, queried by request handlers via `has_capability()`.
@@ -185,6 +186,23 @@ pub(crate) struct ConnectionHandle {
 }
 
 impl ConnectionHandle {
+    /// Stop the writer while preserving a Ready handle for send-failure tests.
+    #[cfg(test)]
+    pub(crate) async fn cancel_writer_for_test(&self) {
+        if let Some(handle) = self
+            .writer_handle
+            .lock()
+            .recover_poison("ConnectionHandle::cancel_writer_for_test")
+            .as_ref()
+        {
+            handle.cancel();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(1), self.tx.closed())
+            .await
+            .expect("writer receiver should close after cancellation");
+        self.set_state(ConnectionState::Ready);
+    }
+
     /// Create a new ConnectionHandle in Ready state (test helper).
     ///
     /// Used in tests where we need a connection handle without going through
@@ -245,6 +263,7 @@ impl ConnectionHandle {
             next_request_id: AtomicI64::new(2),
             server_capabilities: OnceLock::new(),
             bridge_routing: AtomicBool::new(false),
+            type_hierarchy_provider: AtomicBool::new(false),
             dynamic_capabilities,
             connection_key,
             workspace_folders,
@@ -605,6 +624,15 @@ impl ConnectionHandle {
         let _ = self.server_capabilities.set(capabilities);
     }
 
+    pub(super) fn set_type_hierarchy_provider(&self, supported: bool) {
+        self.type_hierarchy_provider
+            .store(supported, Ordering::Release);
+    }
+
+    pub(crate) fn has_static_type_hierarchy_provider(&self) -> bool {
+        self.type_hierarchy_provider.load(Ordering::Acquire)
+    }
+
     /// Access the server capabilities from the initialize response.
     ///
     /// Returns `None` if capabilities haven't been set yet (server still initializing).
@@ -791,6 +819,14 @@ impl ConnectionHandle {
                     Some(OneOf::Left(true) | OneOf::Right(_))
                 )
             }
+            "textDocument/prepareCallHierarchy" => matches!(
+                caps.call_hierarchy_provider,
+                Some(
+                    tower_lsp_server::ls_types::CallHierarchyServerCapability::Simple(true)
+                        | tower_lsp_server::ls_types::CallHierarchyServerCapability::Options(_)
+                )
+            ),
+            "textDocument/prepareTypeHierarchy" => self.has_static_type_hierarchy_provider(),
             "inlayHint/resolve" => match caps.inlay_hint_provider.as_ref() {
                 Some(OneOf::Right(
                     tower_lsp_server::ls_types::InlayHintServerCapabilities::Options(options),
@@ -943,17 +979,18 @@ impl ConnectionHandle {
         }
     }
 
-    /// Begin graceful shutdown: transition to Closing (rejecting new requests) and
-    /// stop the liveness timer, since global shutdown (Tier 3) overrides liveness
-    /// (Tier 2) per ls-bridge-timeout-hierarchy. Only the timer is stopped — the reader task keeps
-    /// running to receive the shutdown response. Valid from Ready or Initializing
-    /// (ls-bridge-message-ordering/ls-bridge-graceful-shutdown).
+    /// Begin graceful shutdown: transition a live connection to Closing
+    /// (rejecting new requests) and stop the liveness timer. A Failed connection
+    /// stays Failed until shutdown completes so a still-mapped invalidated entry
+    /// remains retryable while detached teardown runs.
     pub(crate) fn begin_shutdown(&self) {
         // Stop the liveness timer (but not the reader task) per ls-bridge-timeout-hierarchy
         // Global shutdown (Tier 3) overrides liveness timeout (Tier 2)
         // Reader continues running to receive shutdown response
         self.reader_handle.stop_liveness_timer();
-        self.set_state(ConnectionState::Closing);
+        if self.state() != ConnectionState::Failed {
+            self.set_state(ConnectionState::Closing);
+        }
     }
 
     /// Complete the shutdown sequence.
@@ -976,8 +1013,26 @@ impl ConnectionHandle {
     /// No internal timeout (ls-bridge-timeout-hierarchy): the caller (`shutdown_all_with_timeout`) enforces the
     /// global budget so a slow server can use leftover time without N×timeout multiplication.
     pub(crate) async fn graceful_shutdown(&self) -> io::Result<()> {
-        // 1. Transition to Closing state
-        self.begin_shutdown();
+        self.graceful_shutdown_inner(true).await
+    }
+
+    /// Tear down an invalidated handle while keeping it retryable in the pool.
+    ///
+    /// Cleanup that can be cancelled leaves the handle mapped as `Failed`, so a
+    /// following acquisition repeats the purge. Moving it to `Closing` here
+    /// would instead make that acquisition fail fast until teardown completes.
+    pub(super) async fn graceful_shutdown_preserving_failed(&self) -> io::Result<()> {
+        self.graceful_shutdown_inner(false).await
+    }
+
+    async fn graceful_shutdown_inner(&self, transition_to_closing: bool) -> io::Result<()> {
+        // 1. Transition healthy handles to Closing. Invalidated handles stay
+        // Failed until terminal Closed so a still-mapped entry remains retryable.
+        if transition_to_closing {
+            self.begin_shutdown();
+        } else {
+            self.reader_handle.stop_liveness_timer();
+        }
 
         // 2. Stop writer task and reclaim the writer via 3-phase protocol
         // This ensures no concurrent writes to stdin during shutdown
@@ -1438,6 +1493,29 @@ mod tests {
             ConnectionState::Closing,
             "State should be Closing, not Failed - liveness timer should have been cancelled"
         );
+    }
+
+    #[tokio::test]
+    async fn invalidated_shutdown_keeps_failed_state_while_handshake_is_pending() {
+        let handle = crate::lsp::bridge::pool::test_helpers::create_handle_with_state(
+            ConnectionState::Failed,
+        )
+        .await;
+        let shutdown = {
+            let handle = Arc::clone(&handle);
+            tokio::spawn(async move { handle.graceful_shutdown_preserving_failed().await })
+        };
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            handle.state(),
+            ConnectionState::Failed,
+            "a still-mapped invalidated handle must remain retryable"
+        );
+
+        shutdown.abort();
+        let _ = shutdown.await;
+        handle.complete_shutdown();
     }
 
     /// Test that liveness timer does not start in Closing state (ls-bridge-timeout-hierarchy Phase 4).
@@ -2254,12 +2332,12 @@ mod tests {
     #[tokio::test]
     async fn has_capability_returns_true_for_enabled_providers() {
         use tower_lsp_server::ls_types::{
-            ColorProviderCapability, ColorProviderOptions, CompletionOptions,
-            DeclarationCapability, DeclarationOptions, DeclarationRegistrationOptions,
-            DocumentLinkOptions, HoverProviderCapability, ImplementationProviderCapability, OneOf,
-            SignatureHelpOptions, StaticTextDocumentColorProviderOptions,
-            TextDocumentRegistrationOptions, TextDocumentSyncCapability, TextDocumentSyncOptions,
-            TypeDefinitionProviderCapability,
+            CallHierarchyServerCapability, ColorProviderCapability, ColorProviderOptions,
+            CompletionOptions, DeclarationCapability, DeclarationOptions,
+            DeclarationRegistrationOptions, DocumentLinkOptions, HoverProviderCapability,
+            ImplementationProviderCapability, OneOf, SignatureHelpOptions,
+            StaticTextDocumentColorProviderOptions, TextDocumentRegistrationOptions,
+            TextDocumentSyncCapability, TextDocumentSyncOptions, TypeDefinitionProviderCapability,
         };
 
         type CapCase = (&'static str, Box<dyn Fn(&mut ServerCapabilities)>);
@@ -2360,6 +2438,12 @@ mod tests {
                 "textDocument/inlayHint",
                 Box::new(|c| {
                     c.inlay_hint_provider = Some(OneOf::Left(true));
+                }),
+            ),
+            (
+                "textDocument/prepareCallHierarchy",
+                Box::new(|c| {
+                    c.call_hierarchy_provider = Some(CallHierarchyServerCapability::Simple(true));
                 }),
             ),
             (
@@ -2483,6 +2567,16 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn type_hierarchy_capability_uses_the_preserved_raw_provider_bit() {
+        let handle = spawn_sink_handle().await;
+        handle.set_server_capabilities(ServerCapabilities::default());
+        assert!(!handle.has_capability("textDocument/prepareTypeHierarchy"));
+
+        handle.set_type_hierarchy_provider(true);
+        assert!(handle.has_capability("textDocument/prepareTypeHierarchy"));
+    }
+
     /// Table-driven test: has_capability returns false when capabilities are
     /// explicitly disabled via `Simple(false)` / `OneOf::Left(false)`.
     ///
@@ -2491,8 +2585,9 @@ mod tests {
     #[tokio::test]
     async fn has_capability_returns_false_for_explicitly_disabled() {
         use tower_lsp_server::ls_types::{
-            ColorProviderCapability, DeclarationCapability, HoverProviderCapability,
-            ImplementationProviderCapability, OneOf, TypeDefinitionProviderCapability,
+            CallHierarchyServerCapability, ColorProviderCapability, DeclarationCapability,
+            HoverProviderCapability, ImplementationProviderCapability, OneOf,
+            TypeDefinitionProviderCapability,
         };
 
         type CapCase = (&'static str, Box<dyn Fn(&mut ServerCapabilities)>);
@@ -2573,6 +2668,12 @@ mod tests {
                 }),
             ),
             (
+                "textDocument/prepareCallHierarchy",
+                Box::new(|c| {
+                    c.call_hierarchy_provider = Some(CallHierarchyServerCapability::Simple(false));
+                }),
+            ),
+            (
                 "textDocument/documentSymbol",
                 Box::new(|c| {
                     c.document_symbol_provider = Some(OneOf::Left(false));
@@ -2620,6 +2721,7 @@ mod tests {
             "textDocument/prepareRename",
             "textDocument/moniker",
             "textDocument/inlayHint",
+            "textDocument/prepareCallHierarchy",
             "textDocument/documentColor",
             "textDocument/colorPresentation",
             "textDocument/codeAction",

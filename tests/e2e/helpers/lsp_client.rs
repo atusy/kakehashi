@@ -719,6 +719,29 @@ impl LspClient {
     /// other notifications and server-to-client requests while waiting. Panics
     /// if the stream is malformed (a framing/parse error is surfaced, not
     /// hidden behind the `Option`).
+    /// Block until a `window/logMessage` whose message contains `marker`
+    /// arrives, skipping every other notification (the server forwards its
+    /// own log lines too, so the first log message is rarely the one a mock
+    /// raises as a barrier). `false` when the deadline passes first.
+    pub(crate) fn wait_for_log_message(&mut self, marker: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let Some(params) = self.wait_for_notification("window/logMessage", remaining) else {
+                return false;
+            };
+            if params["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(marker))
+            {
+                return true;
+            }
+        }
+    }
+
     pub(crate) fn wait_for_notification(
         &mut self,
         expected_method: &str,

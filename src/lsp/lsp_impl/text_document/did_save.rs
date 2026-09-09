@@ -64,8 +64,16 @@ impl Kakehashi {
         // Each path only touches an already-open document. The downstream
         // notification includes this tracked saved text when requested (#357).
         let pool = self.bridge.pool_arc();
-        if let Some((host_text, _, _)) = &saved_document {
-            pool.sync_and_notify_host_did_save(&uri, host_text).await;
+        if let Some((host_text, incarnation, content_version)) = &saved_document {
+            pool.sync_and_notify_host_did_save(
+                &uri,
+                host_text,
+                crate::lsp::bridge::HostRevision {
+                    incarnation: *incarnation,
+                    content_version: *content_version,
+                },
+            )
+            .await;
         }
         drop(edit_guard);
         if saved_document.is_none() {

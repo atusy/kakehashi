@@ -23,7 +23,7 @@ use serde_json::Value;
 use crate::config::settings::{BridgeServerConfig, WorkspaceSettings};
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
 use crate::lsp::bridge::actor::RouterCleanupGuard;
-use crate::lsp::bridge::envelope::{ENVELOPE_KEY, wrap_envelope};
+use crate::lsp::bridge::envelope::{ENVELOPE_KEY, HostRevision, wrap_envelope};
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionContext, CodeActionDisabled, CodeActionOrCommand, CodeActionParams,
     CodeActionResponse, DocumentChangeOperation, DocumentChanges, NumberOrString,
@@ -32,7 +32,9 @@ use tower_lsp_server::ls_types::{
 };
 use url::Url;
 
-use super::super::pool::{ConnectionHandle, ConnectionKey, LanguageServerPool, UpstreamId};
+use super::super::pool::{
+    ConnectionHandle, ConnectionKey, ConnectionState, LanguageServerPool, UpstreamId,
+};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, encode_command,
     host_position_within_region, response_has_jsonrpc_error, strip_bridge_local_versions,
@@ -72,6 +74,11 @@ pub(crate) struct CodeActionEnvelope {
     pub(crate) original_title: String,
     /// The downstream server's original `data` value (preserved verbatim).
     pub(crate) inner: Option<Value>,
+    /// Text revision (mutation count since open) the action was computed
+    /// against; a resolve refuses an action whose document has moved past
+    /// it. Missing for legacy data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) content_version: Option<u64>,
     /// Host open incarnation that produced this action. Missing for legacy data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) incarnation: Option<u64>,
@@ -108,6 +115,7 @@ pub(crate) struct CodeActionEnvelopeContext<'a> {
     injection_language: &'a str,
     offset: &'a RegionOffset,
     incarnation: Option<u64>,
+    content_version: Option<u64>,
 }
 
 /// Wrap `action.data` in a Kakehashi envelope for origin tracking, capturing
@@ -127,6 +135,7 @@ fn envelope_action_data(action: &mut CodeAction, ctx: &CodeActionEnvelopeContext
         offset: EnvelopeOffset::from(ctx.offset),
         original_title: action.title.clone(),
         inner: None,
+        content_version: ctx.content_version,
         incarnation: ctx.incarnation,
         host_layer: false,
     };
@@ -138,7 +147,12 @@ fn envelope_action_data(action: &mut CodeAction, ctx: &CodeActionEnvelopeContext
 /// forwarded verbatim, so no region/offset is captured (`host_layer = true`
 /// tells the resolve path to skip all coordinate translation). Captures the
 /// CURRENT (unsuffixed) title as `original_title`; call before suffixing.
-fn envelope_host_action(action: &mut CodeAction, server_name: &str, host_uri: &str) {
+fn envelope_host_action(
+    action: &mut CodeAction,
+    server_name: &str,
+    host_uri: &str,
+    revision: Option<HostRevision>,
+) {
     let inner = action.data.take();
     let envelope = CodeActionEnvelope {
         origin: server_name.to_string(),
@@ -153,7 +167,8 @@ fn envelope_host_action(action: &mut CodeAction, server_name: &str, host_uri: &s
         },
         original_title: action.title.clone(),
         inner: None,
-        incarnation: None,
+        content_version: revision.map(|r| r.content_version),
+        incarnation: revision.map(|r| r.incarnation),
         host_layer: true,
     };
     action.data = Some(wrap_envelope(&envelope, inner));
@@ -196,6 +211,7 @@ fn re_envelope_action(action: &mut CodeAction, envelope: &CodeActionEnvelope) {
             offset: envelope.offset.clone(),
             original_title: envelope.original_title.clone(),
             inner: None,
+            content_version: envelope.content_version,
             incarnation: envelope.incarnation,
             host_layer: envelope.host_layer,
         },
@@ -431,6 +447,7 @@ impl LanguageServerPool {
         region_end: Position,
         offset: RegionOffset,
         virtual_content: &str,
+        revision: HostRevision,
         upstream_request_id: Option<UpstreamId>,
         client_progress_token: Option<NumberOrString>,
         upstream_caps: UpstreamCodeActionCaps,
@@ -499,7 +516,10 @@ impl LanguageServerPool {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         let virtual_uri_string =
             VirtualDocumentUri::new(&host_uri_lsp, injection_language, region_id).to_uri_string();
-        let host_incarnation = self.current_host_incarnation(host_uri);
+        // The lifetime and revision the handler read together, not a fresh
+        // read here: a close and reopen between the two would pair one
+        // lifetime's revision with the other's incarnation, and a later
+        // same-shape edit could then satisfy both stamps at once.
         let virt = VirtLayerContext {
             request_virtual_uri: &virtual_uri_string,
             host_uri: &host_uri_lsp,
@@ -511,7 +531,8 @@ impl LanguageServerPool {
             injection_language,
             host_uri_string: host_uri.as_str(),
             server_name,
-            incarnation: host_incarnation,
+            incarnation: Some(revision.incarnation),
+            content_version: Some(revision.content_version),
         };
         Ok(Some(bridge_code_actions(
             actions,
@@ -520,6 +541,7 @@ impl LanguageServerPool {
             upstream_caps,
             handle.has_capability("codeAction/resolve"),
             Some(&virt),
+            None,
         )))
     }
 
@@ -1069,10 +1091,9 @@ impl LanguageServerPool {
         // handle, losing cancel forwarding and waiting out the full timeout.
         {
             let connections = self.connections().await;
-            if !connections
-                .get(connection_key)
-                .is_some_and(|current| Arc::ptr_eq(current, handle))
-            {
+            if !connections.get(connection_key).is_some_and(|current| {
+                Arc::ptr_eq(current, handle) && current.state() == ConnectionState::Ready
+            }) {
                 drop(connections);
                 warn!(
                     target: "kakehashi::bridge",
@@ -1116,6 +1137,15 @@ impl LanguageServerPool {
                 return None;
             }
         };
+        let producer_is_still_live = {
+            let connections = self.connections().await;
+            connections.get(connection_key).is_some_and(|current| {
+                Arc::ptr_eq(current, handle) && current.state() == ConnectionState::Ready
+            })
+        };
+        if !producer_is_still_live {
+            return None;
+        }
         parse_code_action_resolve_response(response)
     }
 }
@@ -1277,6 +1307,7 @@ pub(crate) struct VirtLayerContext<'a> {
     host_uri_string: &'a str,
     server_name: &'a str,
     incarnation: Option<u64>,
+    content_version: Option<u64>,
 }
 
 impl VirtLayerContext<'_> {
@@ -1288,6 +1319,7 @@ impl VirtLayerContext<'_> {
             injection_language: self.injection_language,
             offset: self.offset,
             incarnation: self.incarnation,
+            content_version: self.content_version,
         }
     }
 }
@@ -1332,6 +1364,7 @@ pub(crate) fn bridge_code_actions(
     upstream_caps: UpstreamCodeActionCaps,
     server_resolves: bool,
     virt: Option<&VirtLayerContext<'_>>,
+    host_revision: Option<HostRevision>,
 ) -> Vec<CodeActionOrCommand> {
     actions
         .into_iter()
@@ -1343,6 +1376,7 @@ pub(crate) fn bridge_code_actions(
                 upstream_caps,
                 server_resolves,
                 virt,
+                host_revision,
             )
         })
         .collect()
@@ -1361,6 +1395,7 @@ fn bridge_code_action(
     upstream_caps: UpstreamCodeActionCaps,
     server_resolves: bool,
     virt: Option<&VirtLayerContext<'_>>,
+    host_revision: Option<HostRevision>,
 ) -> Option<CodeActionOrCommand> {
     // The key's server IS the config server name the envelope and titles use;
     // deriving it here keeps one source of truth for the origin.
@@ -1497,7 +1532,7 @@ fn bridge_code_action(
                 // (host coordinates, no translation — #627). Otherwise it can
                 // never be completed here, so disable it.
                 if virt.is_none() && server_resolves && upstream_caps.can_envelope() {
-                    envelope_host_action(&mut action, server_name, host_uri);
+                    envelope_host_action(&mut action, server_name, host_uri, host_revision);
                     action.title = suffix_title(action.title, server_name);
                     return Some(CodeActionOrCommand::CodeAction(action));
                 }
@@ -1639,6 +1674,7 @@ fn disable_action(
 mod tests {
     use super::super::test_helpers::*;
     use super::*;
+    use crate::lsp::bridge::test_helpers::create_handle_with_key;
     use serde_json::json;
     use tower_lsp_server::ls_types::{CodeActionKind, CodeActionTriggerKind, Diagnostic, Position};
 
@@ -1654,6 +1690,65 @@ mod tests {
 
     fn make_virtual_uri_string() -> String {
         VirtualDocumentUri::new(&make_host_uri(), "lua", "region-0").to_uri_string()
+    }
+
+    #[tokio::test]
+    async fn resolve_response_rejects_a_retired_producer_after_send() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("ruff");
+        let handle = create_handle_with_key(ConnectionState::Ready, key).await;
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let upstream_id = UpstreamId::Number(77);
+        let request = {
+            let pool = Arc::clone(&pool);
+            let handle = Arc::clone(&handle);
+            let upstream_id = upstream_id.clone();
+            tokio::spawn(async move {
+                pool.send_code_action_resolve_on_handle(
+                    &handle,
+                    CodeAction {
+                        title: "old".into(),
+                        ..Default::default()
+                    },
+                    Some(upstream_id),
+                )
+                .await
+            })
+        };
+        let downstream_id = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(id) = handle
+                    .router()
+                    .lookup_downstream_ids(&upstream_id)
+                    .into_iter()
+                    .next()
+                {
+                    break id;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("resolve request must be admitted");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !handle.router().is_sent(downstream_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("resolve request must be sent before retirement");
+
+        handle.begin_shutdown();
+        let _ = handle.router().route(json!({
+            "jsonrpc": "2.0",
+            "id": downstream_id.as_i64(),
+            "result": { "title": "stale" }
+        }));
+
+        assert!(
+            request.await.unwrap().is_none(),
+            "a response from a no-longer-Ready code-action producer must be discarded"
+        );
     }
 
     fn range(start_line: u32, end_line: u32) -> Range {
@@ -1953,6 +2048,7 @@ mod tests {
             host_uri_string: "file:///test.md",
             server_name: "ruff",
             incarnation: Some(1),
+            content_version: Some(0),
         };
         Some(bridge_code_actions(
             actions,
@@ -1961,6 +2057,7 @@ mod tests {
             upstream_caps,
             server_resolves,
             Some(&virt),
+            None,
         ))
     }
 
@@ -2360,6 +2457,7 @@ mod tests {
             caps(true),
             false,
             None,
+            None,
         );
         assert_eq!(bridged.len(), 2);
         let CodeActionOrCommand::CodeAction(action) = &bridged[0] else {
@@ -2395,6 +2493,10 @@ mod tests {
             caps_resolve(),
             true, // host server advertises codeAction/resolve
             None, // host layer
+            Some(HostRevision {
+                incarnation: 1,
+                content_version: 0,
+            }),
         );
         assert_eq!(bridged.len(), 1);
         let CodeActionOrCommand::CodeAction(action) = &bridged[0] else {
@@ -2412,6 +2514,11 @@ mod tests {
         );
         assert_eq!(env.origin, "marksman");
         assert_eq!(env.host_uri, "file:///test.md");
+        assert_eq!(
+            env.incarnation,
+            Some(1),
+            "the host lifetime the actions were computed under rides in the envelope"
+        );
         assert_eq!(env.original_title, "Organize imports");
     }
 
@@ -2428,6 +2535,7 @@ mod tests {
             "file:///test.md",
             caps_resolve(),
             false, // host server does NOT advertise resolve
+            None,
             None,
         );
         let CodeActionOrCommand::CodeAction(action) = &bridged[0] else {
@@ -2468,6 +2576,7 @@ mod tests {
             caps_resolve(),
             true,
             None,
+            None,
         );
         assert_eq!(bridged.len(), 1);
         let CodeActionOrCommand::CodeAction(action) = &bridged[0] else {
@@ -2492,6 +2601,7 @@ mod tests {
             "file:///test.md",
             caps_resolve(),
             false,
+            None,
             None,
         );
         assert!(
@@ -2713,6 +2823,7 @@ mod tests {
             injection_language: "lua",
             offset,
             incarnation: Some(1),
+            content_version: None,
         }
     }
 
@@ -2825,6 +2936,7 @@ mod tests {
             "file:///test.md",
             caps(true),
             false,
+            None,
             None,
         );
         let CodeActionOrCommand::CodeAction(action) = &bridged[0] else {
@@ -3007,8 +3119,15 @@ mod tests {
         .unwrap();
         let key = ConnectionKey::new("sr|v", Some("file:///repo".to_string()));
 
-        let bridged =
-            bridge_code_actions(actions, &key, "file:///test.md", caps_resolve(), true, None);
+        let bridged = bridge_code_actions(
+            actions,
+            &key,
+            "file:///test.md",
+            caps_resolve(),
+            true,
+            None,
+            None,
+        );
         let CodeActionOrCommand::CodeAction(action) = &bridged[0] else {
             panic!("Expected CodeAction");
         };

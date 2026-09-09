@@ -614,10 +614,9 @@ impl LanguageServerPool {
         // drops (cleaning the router entry).
         {
             let connections = self.connections().await;
-            if !connections
-                .get(connection_key)
-                .is_some_and(|current| Arc::ptr_eq(current, handle))
-            {
+            if !connections.get(connection_key).is_some_and(|current| {
+                Arc::ptr_eq(current, handle) && current.state() == ConnectionState::Ready
+            }) {
                 drop(connections);
                 warn!(
                     target: "kakehashi::bridge",

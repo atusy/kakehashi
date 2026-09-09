@@ -37,7 +37,7 @@ pub(super) async fn perform_lsp_handshake(
     workspace_folders: Option<Vec<WorkspaceFolder>>,
     client_capabilities: Option<ClientCapabilities>,
     advertise_configuration: bool,
-) -> io::Result<(ServerCapabilities, bool)> {
+) -> io::Result<(ServerCapabilities, bool, bool)> {
     // 1. Build and send initialize request via the single-writer loop
     let init_request = build_initialize_request(
         init_request_id,
@@ -46,11 +46,6 @@ pub(super) async fn perform_lsp_handshake(
         workspace_folders,
         client_capabilities.as_ref(),
         advertise_configuration,
-        // Process-global opt-in, not Kakehashi's per-instance copy: the pool
-        // has no Kakehashi in scope, and both derive from the same one-shot
-        // env read (the per-instance AtomicBool exists only so unit tests can
-        // toggle Kakehashi-level gates; none of them reach this handshake).
-        crate::experimental::enabled(),
     );
     handle
         .send_request(init_request, init_request_id)
@@ -73,6 +68,7 @@ pub(super) async fn perform_lsp_handshake(
         );
     }
     let bridge_routing = parsed.bridge_routing;
+    let type_hierarchy_provider = parsed.type_hierarchy_provider;
     let capabilities = parsed.capabilities;
 
     // 4. Send initialized notification via the single-writer loop
@@ -99,7 +95,7 @@ pub(super) async fn perform_lsp_handshake(
         }
     }
 
-    Ok((capabilities, bridge_routing))
+    Ok((capabilities, bridge_routing, type_hierarchy_provider))
 }
 
 #[cfg(all(test, unix))]
@@ -140,7 +136,7 @@ mod tests {
             }))
             .unwrap();
 
-        let (capabilities, bridge_routing) = perform_lsp_handshake(
+        let (capabilities, bridge_routing, type_hierarchy_provider) = perform_lsp_handshake(
             &handle,
             RequestId::new(1),
             response_rx,
@@ -156,6 +152,7 @@ mod tests {
         assert!(capabilities.hover_provider.is_none());
         assert!(capabilities.completion_provider.is_some());
         assert!(!bridge_routing);
+        assert!(!type_hierarchy_provider);
         let mut messages = String::new();
         for _ in 0..200 {
             messages = std::fs::read_to_string(&output).unwrap_or_default();

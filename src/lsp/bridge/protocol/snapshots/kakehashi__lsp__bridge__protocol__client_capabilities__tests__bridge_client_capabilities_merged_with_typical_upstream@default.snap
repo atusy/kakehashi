@@ -140,7 +140,16 @@ expression: merged
       "dynamicRegistration": false,
       "tooltipSupport": true
     },
+    "colorProvider": {
+      "dynamicRegistration": false
+    },
+    "callHierarchy": {
+      "dynamicRegistration": false
+    },
     "moniker": {
+      "dynamicRegistration": false
+    },
+    "typeHierarchy": {
       "dynamicRegistration": false
     },
     "inlayHint": {

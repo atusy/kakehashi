@@ -1,9 +1,95 @@
 //! Runtime evaluation of Neovim query directives.
 
-use tree_sitter::{Query, QueryMatch, QueryPredicate};
+use std::cell::OnceCell;
+use std::collections::HashMap;
+
+use tree_sitter::{CaptureQuantifier, Query, QueryCapture, QueryMatch, QueryPredicate};
 
 use crate::language::query_predicates::lua_gsub_bytes;
 use crate::text::clamped_slice;
+
+/// Lazily count captures once per match, only when runtime uniqueness matters.
+/// Statically singleton captures and single-capture matches need no allocation.
+#[derive(Default)]
+pub(crate) struct CaptureCardinalities {
+    counts: OnceCell<HashMap<u32, u8>>,
+}
+
+impl CaptureCardinalities {
+    fn is_single(&self, query: &Query, match_: &QueryMatch, capture_id: u32) -> bool {
+        if match_.captures.len() == 1
+            || matches!(
+                query.capture_quantifiers(match_.pattern_index)[capture_id as usize],
+                CaptureQuantifier::One | CaptureQuantifier::ZeroOrOne
+            )
+        {
+            return true;
+        }
+        let counts = self.counts.get_or_init(|| {
+            let mut counts = HashMap::<u32, u8>::new();
+            for capture in match_.captures {
+                let count = counts.entry(capture.index).or_default();
+                *count = count.saturating_add(1).min(2);
+            }
+            counts
+        });
+        counts.get(&capture_id) == Some(&1)
+    }
+}
+
+/// Static metadata in query-file order; duplicate keys are last-write-wins.
+pub(crate) fn property_metadata(
+    query: &Query,
+    pattern_index: usize,
+    capture_id: Option<usize>,
+) -> Vec<(String, Option<String>)> {
+    query
+        .property_settings(pattern_index)
+        .iter()
+        .filter(|property| property.capture_id == capture_id)
+        .map(|property| {
+            (
+                property.key.to_string(),
+                property.value.as_ref().map(|value| value.to_string()),
+            )
+        })
+        .collect()
+}
+
+/// Evaluate a capture's metadata, including materialized `#gsub!` text.
+///
+/// `None` means text could not be resolved (multiple captured nodes or invalid
+/// final UTF-8). Geometry-only consumers can still expose static metadata;
+/// text consumers must not silently use the untransformed language instead.
+/// `#set! text`/`#gsub!` source ordering remains unsupported by the Rust query
+/// API: as before, gsub starts from source text, independently of properties.
+pub(crate) fn capture_metadata(
+    query: &Query,
+    match_: &QueryMatch,
+    capture: &QueryCapture,
+    source: &str,
+    cardinalities: &CaptureCardinalities,
+) -> Option<Vec<(String, Option<String>)>> {
+    let capture_id = capture.index;
+    let has_gsub = query.general_predicates(match_.pattern_index).iter().any(|directive| {
+        directive.operator.as_ref() == "gsub!"
+            && matches!(directive.args.first(), Some(tree_sitter::QueryPredicateArg::Capture(id)) if *id == capture_id)
+    });
+    let transformed = if has_gsub {
+        if !cardinalities.is_single(query, match_, capture_id) {
+            return None;
+        }
+        Some(capture_text(query, match_, capture, source)?)
+    } else {
+        None
+    };
+    let mut metadata = property_metadata(query, match_.pattern_index, Some(capture_id as usize));
+    if let Some(text) = transformed {
+        metadata.retain(|(key, _)| key != "text");
+        metadata.push(("text".into(), Some(text)));
+    }
+    Some(metadata)
+}
 
 /// A capture's directive-adjusted byte and point range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,6 +181,7 @@ pub(crate) fn capture_range(
         capture_id,
         node,
         source,
+        None,
     )
 }
 
@@ -104,6 +191,7 @@ fn capture_range_for_directives(
     capture_id: u32,
     node: tree_sitter::Node,
     source: &str,
+    known_single_capture: Option<bool>,
 ) -> CaptureRange {
     let raw = CaptureRange {
         start_byte: node.start_byte(),
@@ -113,7 +201,7 @@ fn capture_range_for_directives(
     };
     let mut offset = None;
     let mut trimmed = None;
-    let mut is_single_capture = None;
+    let mut is_single_capture = known_single_capture;
     for directive in directives {
         if !matches!(
             directive.args.first(),
@@ -309,47 +397,19 @@ fn trim_range(
     })
 }
 
-/// Whether this pattern can change the text observed for `capture_id`.
-pub(crate) fn has_text_directive(query: &Query, pattern_index: usize, capture_id: u32) -> bool {
-    query
-        .general_predicates(pattern_index)
-        .iter()
-        .any(|directive| {
-            matches!(directive.operator.as_ref(), "gsub!" | "offset!" | "trim!")
-                && matches!(
-                    directive.args.first(),
-                    Some(tree_sitter::QueryPredicateArg::Capture(id)) if *id == capture_id
-                )
-        })
-}
-
 /// Return one capture's text after applying its runtime directives in query
 /// order. Once `#gsub!` materializes text, later range directives do not alter
-/// it, matching Neovim's `metadata.text` precedence. A quantified capture with
-/// `#gsub!` is left unresolved rather than panicking the server.
-pub(crate) fn capture_text(
+/// it, matching Neovim's `metadata.text` precedence. The metadata evaluator
+/// has already verified that this capture identifies exactly one node.
+fn capture_text(
     query: &Query,
     match_: &QueryMatch,
-    capture_id: u32,
+    capture: &QueryCapture,
     source: &str,
 ) -> Option<String> {
+    let capture_id = capture.index;
+    let node = capture.node;
     let directives = query.general_predicates(match_.pattern_index);
-    let has_gsub = directives.iter().any(|directive| {
-        directive.operator.as_ref() == "gsub!"
-            && matches!(
-                directive.args.first(),
-                Some(tree_sitter::QueryPredicateArg::Capture(id)) if *id == capture_id
-            )
-    });
-    let mut nodes = match_
-        .captures
-        .iter()
-        .filter(|capture| capture.index == capture_id)
-        .map(|capture| capture.node);
-    let node = nodes.next()?;
-    if has_gsub && nodes.next().is_some() {
-        return None;
-    }
 
     let mut text = None;
     for (index, directive) in directives.iter().enumerate() {
@@ -375,6 +435,7 @@ pub(crate) fn capture_text(
                 capture_id,
                 node,
                 source,
+                Some(true),
             );
             clamped_slice(source, range.start_byte..range.end_byte)
                 .as_bytes()
@@ -387,7 +448,8 @@ pub(crate) fn capture_text(
     if let Some(text) = text {
         return String::from_utf8(text).ok();
     }
-    let range = capture_range_for_directives(directives, match_, capture_id, node, source);
+    let range =
+        capture_range_for_directives(directives, match_, capture_id, node, source, Some(true));
     Some(clamped_slice(source, range.start_byte..range.end_byte).to_owned())
 }
 

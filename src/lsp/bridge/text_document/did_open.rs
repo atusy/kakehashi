@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::super::pool::{
-    ConnectionHandleSender, ConnectionKey, INIT_TIMEOUT_SECS, LanguageServerPool,
+    ConnectionHandleSender, ConnectionKey, ConnectionState, INIT_TIMEOUT_SECS, LanguageServerPool,
 };
 use super::super::protocol::VirtualDocumentUri;
 use super::super::protocol::{RoutingLanguageServer, RoutingParams, RoutingTextDocument};
@@ -292,10 +292,9 @@ impl LanguageServerPool {
             // respawn replaced the handle mid-loop, stop: the purge lets the next
             // real request re-open cleanly.
             let connections = self.connections().await;
-            if !connections
-                .get(&connection_key)
-                .is_some_and(|current| Arc::ptr_eq(current, &handle))
-            {
+            if !connections.get(&connection_key).is_some_and(|current| {
+                Arc::ptr_eq(current, &handle) && current.state() == ConnectionState::Ready
+            }) {
                 log::debug!(
                     target: "kakehashi::bridge",
                     "Eager open: connection {} replaced mid-loop; stopping",
@@ -345,18 +344,18 @@ impl LanguageServerPool {
     /// support) starts analyzing and pushing diagnostics immediately, instead of
     /// only after the first host-bridged request lazily opens it. Fire-and-forget:
     /// failures are logged at debug and never propagated.
+    /// `doc.revision` must be `Some`: the lifetime the open was scheduled in.
     pub(crate) async fn eager_open_host_document(
         &self,
         server_name: &str,
         server_config: &crate::config::settings::BridgeServerConfig,
-        host_uri: &url::Url,
-        language_id: &str,
-        text: &str,
-        live_text_reader: Option<&(dyn Fn() -> Option<Arc<str>> + Send + Sync)>,
+        doc: &super::host::HostDocument<'_>,
+        live_text_reader: Option<super::host::HostTextReaderRef<'_>>,
     ) {
+        let host_uri = doc.uri;
         let lifecycle = self.host_lifecycle_lock(host_uri);
         let _lifecycle_guard = lifecycle.write().await;
-        if !self.accepts_host_language(host_uri, language_id) {
+        if !self.accepts_host_language(host_uri, doc.language_id) {
             return;
         }
         let handle = match self
@@ -422,7 +421,7 @@ impl LanguageServerPool {
         let routing_params = RoutingParams {
             text_document: RoutingTextDocument {
                 uri: host_uri.to_string(),
-                language_id: language_id.to_string(),
+                language_id: doc.language_id.to_string(),
                 host: None,
             },
             language_servers: BTreeMap::from([(
@@ -441,10 +440,9 @@ impl LanguageServerPool {
             match handle.request_routing(routing_params).await {
                 Ok(Some(answer)) => {
                     let connections = self.connections().await;
-                    if !connections
-                        .get(connection_key)
-                        .is_some_and(|current| Arc::ptr_eq(current, &handle))
-                    {
+                    if !connections.get(connection_key).is_some_and(|current| {
+                        Arc::ptr_eq(current, &handle) && current.state() == ConnectionState::Ready
+                    }) {
                         return;
                     }
                     if answer
@@ -485,25 +483,32 @@ impl LanguageServerPool {
         // `execute_host_request`, so a concurrent respawn purge cannot interleave
         // and leave sync state the replacement never saw.
         let connections = self.connections().await;
-        if !connections
-            .get(connection_key)
-            .is_some_and(|current| Arc::ptr_eq(current, &handle))
-        {
+        if !connections.get(connection_key).is_some_and(|current| {
+            Arc::ptr_eq(current, &handle) && current.state() == ConnectionState::Ready
+        }) {
             // Replaced by a respawn between wait-ready and here; the new connection
             // will sync lazily on its first request.
             return;
         }
+        // Under the lifecycle lock, right before the sync: a task of a
+        // superseded batch that unparks after a close and reopen would
+        // otherwise open the reopened document under the lifetime's old
+        // language (identical text lets the new batch fingerprint-dedup and
+        // never correct it).
+        if self.current_host_incarnation(host_uri) != doc.revision.map(|r| r.incarnation) {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "Eager host open: {} was closed or reopened since this open was scheduled; skipping",
+                host_uri
+            );
+            return;
+        }
         let mut docs = self.host_documents().await;
         let mut sender = ConnectionHandleSender(&handle);
-        let doc = super::host::HostDocument {
-            uri: host_uri,
-            language_id,
-            text,
-        };
         if let Err(e) = super::host::sync_host_document(
             &mut sender,
             &mut docs,
-            &doc,
+            doc,
             live_text_reader,
             connection_key,
         )

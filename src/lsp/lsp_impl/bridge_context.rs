@@ -244,6 +244,10 @@ pub(crate) struct PositionRequestContext {
     pub(crate) document: DocumentRequestContext,
     /// The cursor position within the document.
     pub(crate) position: Position,
+    /// Open-document lifetime of the snapshot that produced the region.
+    pub(crate) incarnation: u64,
+    /// Input revision of the snapshot that produced the region.
+    pub(crate) content_version: u64,
 }
 
 /// Document context plus a range.
@@ -265,6 +269,8 @@ struct PreambleResult {
     /// End-of-content derived for the bounds precheck, carried so no later
     /// stage re-derives it.
     region_end: Position,
+    incarnation: u64,
+    content_version: u64,
 }
 
 fn resolve_bridge_language_config_from_settings(
@@ -991,6 +997,8 @@ impl Kakehashi {
                 language_name,
                 upstream_request_id,
                 region_end,
+                incarnation: snapshot.incarnation(),
+                content_version: snapshot.content_version(),
             },
             position,
             range_end,
@@ -1013,8 +1021,7 @@ impl Kakehashi {
     /// resolved `layers.priorities`, the bridge dispatch is skipped entirely.
     ///
     /// Used by entry points outside the [`Self::walk_layers`] race — the
-    /// shared bridge preamble and the virt-only handlers (rangeFormatting's
-    /// region pass, documentColor) that have no host contributor yet.
+    /// shared bridge preamble and rangeFormatting's virtual-region pass.
     /// Handlers on the walk get layer membership from the race itself, and
     /// the diagnostics paths resolve the full layer config directly (they
     /// gate virt and host independently).
@@ -1297,6 +1304,7 @@ impl Kakehashi {
                                 uri: &t.uri,
                                 language_id: &t.language_id,
                                 text: &t.text,
+                                revision: Some(t.revision),
                             },
                             request_method,
                             params,
@@ -1318,7 +1326,7 @@ impl Kakehashi {
         // registry on this arm's completion would drop a live sibling's
         // cancel registrations. The one non-walk caller
         // (`will_save_wait_until`) sweeps for itself.
-        self.host_layer_result(result, request_method, |value| value)
+        self.host_layer_result(result, ctx, request_method, |value| value)
             .await
     }
 
@@ -1337,14 +1345,32 @@ impl Kakehashi {
     /// identity for the arms whose payload already IS the response, and the
     /// hook where a handler post-processes the winner (completion mints its
     /// resolve envelopes there, so only the winner pays for them).
+    /// `ctx` is the context the fan-out ran under: a result is surfaced only
+    /// while the document is still the lifetime that context read. Each
+    /// task discards a reply the downstream synchronized under another
+    /// lifetime, but a close and reopen can land after a task finished and
+    /// before the fan-in returned (a higher-priority server still pending,
+    /// concatenation still draining), and the task's own check compared two
+    /// values of the finished request.
     pub(crate) async fn host_layer_result<T, R>(
         &self,
         result: crate::lsp::aggregation::server::FanInResult<T>,
+        ctx: &HostRequestContext,
         request_method: &str,
         on_done: impl FnOnce(T) -> Option<R>,
     ) -> tower_lsp_server::jsonrpc::Result<Option<R>> {
         match result {
-            crate::lsp::aggregation::server::FanInResult::Done(value) => Ok(on_done(value)),
+            crate::lsp::aggregation::server::FanInResult::Done(value) => {
+                if !self.host_incarnation_is_current(&ctx.uri, Some(ctx.incarnation)) {
+                    log::debug!(
+                        target: "kakehashi::bridge",
+                        "{request_method} (host): {} was reopened before its result was surfaced; discarding it",
+                        ctx.uri
+                    );
+                    return Ok(None);
+                }
+                Ok(on_done(value))
+            }
             crate::lsp::aggregation::server::FanInResult::NoResult { errors } => {
                 if errors > 0 {
                     self.notifier()
@@ -1586,11 +1612,18 @@ impl Kakehashi {
         self.ensure_fresh_tree_for_bridge(lsp_uri).await;
         let (preamble, position, _) =
             self.resolve_bridge_preamble(lsp_uri, position, None, method_name)?;
+        let incarnation = preamble.incarnation;
+        let content_version = preamble.content_version;
         let document = self
             .preamble_to_document_context(preamble, method_name)
             .await?;
 
-        Some(PositionRequestContext { document, position })
+        Some(PositionRequestContext {
+            document,
+            position,
+            incarnation,
+            content_version,
+        })
     }
 
     /// Wait for / on-demand the document's tree before a sync bridge-preamble
@@ -1728,6 +1761,8 @@ impl Kakehashi {
                 resolved,
                 language_name: language_name.clone(),
                 upstream_request_id: upstream_request_id.clone(),
+                incarnation: snapshot.incarnation(),
+                content_version: snapshot.content_version(),
             };
             // A region that resolves to no bridge config contributes nothing.
             let Some(document) = self

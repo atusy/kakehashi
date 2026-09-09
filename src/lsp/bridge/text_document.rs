@@ -5,8 +5,13 @@
 //!
 //! The structure mirrors `lsp_impl/text_document/` for consistency.
 
+mod call_hierarchy;
 mod code_action;
 mod code_lens;
+pub(crate) use call_hierarchy::{
+    CallHierarchyDocumentRevision, CallHierarchyEnvelope, envelope_host_call_hierarchy_items,
+    extract_call_hierarchy_envelope,
+};
 mod color_presentation;
 
 pub(crate) use code_action::{
@@ -18,7 +23,7 @@ mod completion;
 pub(crate) use completion::{
     EnvelopeOffset, KakehashiEnvelope, bridge_host_completion_items, extract_envelope,
 };
-mod completion_item;
+pub(super) mod completion_item;
 mod declaration;
 mod definition;
 mod diagnostic;
@@ -54,3 +59,8 @@ mod signature_help;
 #[cfg(test)]
 pub(in crate::lsp::bridge) mod test_helpers;
 mod type_definition;
+mod type_hierarchy;
+pub(crate) use type_hierarchy::{
+    TypeHierarchyDocumentRevision, TypeHierarchyEnvelope, envelope_host_type_hierarchy_items,
+    extract_type_hierarchy_envelope, parse_type_hierarchy_items,
+};

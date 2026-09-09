@@ -106,9 +106,8 @@ embedded blocks. Works for any grammar, no setup required.
 ## Bridged features
 
 The features below are served by a language server configured for the
-embedded language — most of them also on the surrounding document itself,
-by a `bridge._self` host server (document color is the exception and stays
-injection-only).
+embedded language — also on the surrounding document itself where a
+`bridge._self` host server is configured.
 Placing the cursor outside an embedded
 code block yields no result from the injection bridges; with `bridge._self`
 configured, the host language's own servers still answer there.
@@ -135,7 +134,11 @@ embedded block (escape the region, break blockquote `> ` prefixes, or merge cont
 into the closing fence) are dropped fail-closed: an unsafe primary edit drops
 the item (at resolve time, the unsafe resolved response is discarded and the
 unresolved item is served instead), while an unsafe auto-import set — at either
-stage — is dropped whole and the completion itself still applies. Default combine strategy: `preferred`.
+stage — is dropped whole and the completion itself still applies. A resolve
+is refused, and the item returned unchanged, when the host document was
+closed and reopened since the item was produced (the list is meant to outlive
+ordinary edits: the editor filters it locally while the user keeps typing and
+resolves on accept). Default combine strategy: `preferred`.
 
 ### Signature help
 
@@ -210,7 +213,8 @@ configured, the default `preferred` strategy uses the first server in
 the servers named in `priorities` format the block one after another, each
 seeing the previous formatter's output (e.g. `black` then `isort`). The
 pipeline requires explicitly named servers — `"*"` is ignored there, since a
-reproducible pipeline needs a deterministic order.
+reproducible pipeline needs a deterministic order. It runs at most 64 named
+servers per region; `maxFanOut` can set a lower limit.
 
 A response whose edits would corrupt the host document around the embedded
 block (escape the region, break blockquote `> ` prefixes, or merge content
@@ -294,14 +298,14 @@ Lazy actions resolve back to their origin server (`codeAction/resolve`) —
 client-driven resolve routing additionally requires the client to declare
 `dataSupport` and `resolveSupport` covering `"edit"`; without those,
 injection-layer lazy actions are eagerly resolved by the bridge and
-host-layer ones are disabled or dropped. (Known limitation: CLIENT-driven
-resolve of lazy actions in runtime-range-adjusted regions (`#offset!` /
-`#trim!`) such as bundled
-YAML/TOML frontmatter always fails soft — the resolve freshness check cannot
-match there; the eager-resolve path taken for non-envelope clients bypasses
-that check.)
+host-layer ones are disabled or dropped. Runtime-range-adjusted regions
+(`#offset!` / `#trim!`, such as bundled YAML/TOML frontmatter) resolve like
+any other: the freshness check rebuilds the same adjusted geometry the
+action was minted from.
 Command-carrying actions execute through the bridged
-`workspace/executeCommand`.
+`workspace/executeCommand`. A resolve is refused, and the action returned
+unchanged, when the host document was edited (even a same-size edit inside
+the block) or reopened since the action was produced.
 
 Edit safety differs by layer and direction. An INJECTION-layer action edit
 that cannot be represented in the host document (touching another injection
@@ -325,18 +329,56 @@ virt/host layers. Advertised only to clients with
 `codeActionLiteralSupport`; see the README's bridged-requests list for the
 palette/registered-list caveats.
 
-### Document color (experimental)
+### Call hierarchy
+
+[`textDocument/prepareCallHierarchy`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_prepareCallHierarchy),
+[`callHierarchy/incomingCalls`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#callHierarchy_incomingCalls),
+and [`callHierarchy/outgoingCalls`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#callHierarchy_outgoingCalls)
+
+Call hierarchy works for both embedded virtual documents and host-language
+servers enabled with `bridge._self`. Prepared items remember the exact
+downstream process that produced them, so incoming and outgoing expansion do
+not silently switch to a replacement server. Virtual item ranges and call-site
+ranges are translated back to host coordinates; real external-file items stay
+in their original coordinate space. Results that point at another virtual
+region are filtered because their coordinates cannot be represented safely in
+the requesting host region.
+
+Expansion fails softly with `null` when an item has no kakehashi routing data,
+the host document changed or reopened, the embedded region moved or became
+non-contiguous, or the producing downstream connection was replaced. Returned
+callers and callees carry fresh routing data so clients can expand the tree
+recursively.
+
+### Type hierarchy
+
+Type hierarchy preparation and both expansion directions are bridged for
+embedded virtual documents and host-language bridge layers. Returned items
+remember their exact producing server and region, so recursive supertype and
+subtype requests return to that producer. Stale items from changed, reopened,
+moved, or reconfigured documents fail softly with `null`.
+Only items from the request's own virtual region are projected into host
+coordinates; items from another known virtual region are filtered, while real
+external-file URIs and their coordinate spaces are preserved.
+
+### Document color
 
 [`textDocument/documentColor`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_documentColor)
 and [`textDocument/colorPresentation`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_colorPresentation)
 
 Shows color swatches and color picker presentations for embedded blocks.
+Document colors can also combine embedded and host-language server results;
+set `layers.aggregation."textDocument/documentColor".strategy = "concatenated"`
+to retain both layers. Presentation routing is range-based because the LSP
+color item carries no producer identity: outside an injection the host server
+receives the real URI, range, and edits unchanged; inside an injection the
+default `virt → host` preference can select the virtual server even for a
+host-produced color. Configure `textDocument/colorPresentation` as
+`concatenated` to retain answers from both layers in that ambiguous case.
 Presentations whose primary edit (explicit, or the implicit label replacement)
 would corrupt the host document around the embedded block are dropped
 fail-closed; unsafe additional edits are dropped as one atomic set while the
 presentation itself survives.
-**Only available with the `KAKEHASHI_EXPERIMENTAL=true` environment variable** —
-without the opt-in the server does not advertise color support.
 
 ---
 
@@ -525,7 +567,7 @@ type Match = {
     name: string;                    // capture name without the '@', e.g. "context"
     node: NodeInfo;                  // { id, kind } — trackable like any other node
     range: { start: Position, end: Position };  // LSP Position (UTF-16), inline
-    metadata?: Metadata;             // capture-level (#set! @cap key value); absent when none
+    metadata?: Metadata;             // capture-level properties and runtime gsub text; absent when none
   }[];
 };
 
@@ -586,8 +628,12 @@ type CapturesDelta = {
   `(#set! @cap key value)` rides on that capture as its `metadata[key]` —
   e.g. `((codeblock) @context (#set! kind "block"))` lets a client label
   matches without parsing capture names. Repeated keys are last-write-wins.
-- **`#gsub!` transforms dynamic injection-language captures** before language
-  normalization. `#offset!` and `#trim!` also adjust a dynamic language's text
+- **`#gsub!` returns transformed text for arbitrary captures** as
+  `capture.metadata.text`, without changing the capture range or node identity.
+  Dynamic `@injection.language` resolution uses the same metadata and prefers
+  its `text` property over source text; static `#set! @capture text` works too.
+  Injection parser/bridge content continues to use the original source ranges.
+  `#offset!` and `#trim!` also adjust the transformation's input text
   until `#gsub!` materializes it; later range directives leave that text intact.
   Multiple transformations run in query order using the same Lua-pattern
   subset as `#lua-match?`; unsupported `%b`, `%f`, position
@@ -595,8 +641,9 @@ type CapturesDelta = {
   the prior text unchanged.
   Composition with `#set! @capture text ...` is not supported because the Rust
   tree-sitter API does not retain its source order relative to general
-  directives. The captures protocol itself has no transformed-text field, so
-  `#gsub!` does not add capture metadata to these responses.
+  directives. In that combination, gsub uses source text and its resolved result
+  overrides static `text`. Multiple-node captures or invalid final UTF-8 leave
+  only static capture metadata; dynamic injection-language resolution fails.
 - **Tolerant compilation**: if some patterns reference symbols absent from the
   grammar, the valid patterns still run and the rest are reported in `skipped`.
 - **`null` means "nothing here"**: the document isn't open, or no involved
@@ -611,7 +658,6 @@ type CapturesDelta = {
 
 kakehashi does not yet provide these LSP features:
 
-- Call hierarchy / type hierarchy
 - Workspace symbol search (`workspace/symbol`)
 
 (The static code-action and execute-command providers are advertised only to

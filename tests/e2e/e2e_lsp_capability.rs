@@ -46,16 +46,15 @@ fn e2e_capability_advertised(#[case] capability: &str) {
     shutdown_client(&mut client);
 }
 
-/// Experimental capabilities follow the `KAKEHASHI_EXPERIMENTAL=true`
-/// runtime opt-in: advertised with it, absent (or `null`) without it —
-/// hermetically, even when the developer's shell exports the variable.
+/// Color support is available with the experimental flag unset, disabled,
+/// or enabled, independent of the developer's environment.
 #[rstest]
 #[case("colorProvider")]
-fn e2e_experimental_capability_follows_the_env_opt_in(#[case] capability: &str) {
-    for (experimental, expected) in [(true, true), (false, false)] {
+fn e2e_color_capability_is_available_without_experimental_opt_in(#[case] capability: &str) {
+    for experimental in [None, Some("false"), Some("true")] {
         let builder = LspClient::builder();
-        let mut client = if experimental {
-            builder.env("KAKEHASHI_EXPERIMENTAL", "true")
+        let mut client = if let Some(value) = experimental {
+            builder.env("KAKEHASHI_EXPERIMENTAL", value)
         } else {
             builder.env_remove("KAKEHASHI_EXPERIMENTAL")
         }
@@ -75,10 +74,10 @@ fn e2e_experimental_capability_follows_the_env_opt_in(#[case] capability: &str) 
             .and_then(|r| r.get("capabilities"))
             .expect("Should have capabilities in init response");
 
-        let advertised = capabilities.get(capability).is_some_and(|v| !v.is_null());
         assert_eq!(
-            advertised, expected,
-            "{capability} advertised={advertised} with KAKEHASHI_EXPERIMENTAL set to {experimental}"
+            capabilities.get(capability),
+            Some(&json!(true)),
+            "{capability} must be enabled with KAKEHASHI_EXPERIMENTAL set to {experimental:?}"
         );
 
         shutdown_client(&mut client);

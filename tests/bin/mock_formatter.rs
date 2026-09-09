@@ -44,6 +44,24 @@
 //!   answers `textDocument/codeLens` with one UNRESOLVED lens (data only) and
 //!   `codeLens/resolve` by materializing a command that echoes the lens data.
 //!   Used by `tests/e2e/e2e_code_lens_resolve.rs` (#355).
+//! - `completion-resolve` / `completion-no-resolve` / `completion-resolve-plain` —
+//!   answer `textDocument/completion` with one item; the first two differ in
+//!   `completionProvider.resolveProvider`. `completion-resolve` answers a
+//!   resolve with `detail` and a `textEdit` on line 2 (the host verbatim
+//!   path); `completion-resolve-plain` fills only `detail`, so the reply
+//!   survives the virt edit guard inside a one-line region.
+//! - `code-action-lazy-delayed-resolve` / `code-lens-delayed-resolve` /
+//!   `document-link-delayed-resolve` / `completion-resolve-delayed` /
+//!   `completion-resolve-additional-edit` (lazy `additionalTextEdits` on the
+//!   second virtual line) /
+//!   `completion-resolve-reopen-delayed` /
+//!   `code-lens-reopen-delayed-resolve` / `document-link-reopen-delayed-resolve`
+//!   — like their base modes, but park the resolve reply (after a
+//!   `window/logMessage` `<kind>-resolve-started`) until the next
+//!   `textDocument/didChange` (the `-delayed-resolve` ones) or the reopened
+//!   lifetime's `textDocument/didOpen` (the `-reopen-delayed-` ones), so a
+//!   test can edit or close and reopen the host while the resolve is in
+//!   flight.
 //! - `inlay-hint-resolve` / `inlay-hint-resolve-replacement` — advertise
 //!   `inlayHintProvider.resolveProvider = true`; answer `textDocument/inlayHint`
 //!   with one hint (label part with a location and a command, an accept edit,
@@ -73,6 +91,9 @@
 //!   `documentLinkProvider` with `resolveProvider: false` and answer with a
 //!   link carrying opaque `data`: an ordinary payload, and one that occupies
 //!   the reserved `kakehashi` key.
+//! - `call-hierarchy-prepare` — advertises `callHierarchyProvider`, returns one
+//!   preparation item, and expands it through incoming calls while echoing the
+//!   downstream item for coordinate and envelope assertions.
 //! - `document-link` / `document-link-resolve` / `document-link-resolve-replacement` — advertise
 //!   `textDocument/documentLink` with one link whose tooltip identifies the
 //!   requested URI. The resolve mode initially returns data only and materializes
@@ -80,6 +101,8 @@
 //! - `document-link-slow-host` / `document-link-slow-virt` — like
 //!   `document-link`, but sleeps before answering and records request-start
 //!   and downstream `$/cancelRequest` markers under `MOCK_LSP_CANCEL_DIR`.
+//! - `document-color` — advertises `colorProvider`, returns one red color for
+//!   every open document, and presents it as `#ff0000`.
 //! - `diagnostics` — advertises `diagnosticProvider`; answers
 //!   `textDocument/diagnostic` with a full report carrying one diagnostic
 //!   that echoes the requested URI, but only for documents it received via
@@ -203,6 +226,18 @@ fn main() {
     // resolve` on the next `textDocument/inlayHint` — a deterministic
     // sent-state barrier for post-response freshness tests.
     let mut pending_inlay_resolve: Option<(Option<Value>, Value)> = None;
+    // The other delayed resolvers park their reply here (one in flight per
+    // test): `code-action-lazy-delayed-resolve` answers on the next
+    // `didChange`; `completion-resolve-reopen-delayed`,
+    // `code-lens-reopen-delayed-resolve` and
+    // `document-link-reopen-delayed-resolve` on the next `didOpen` — the
+    // reopened lifetime's, which the upstream forwards only after it has
+    // processed the close and the reopen, so the reply lands after them.
+    let mut pending_resolve: Option<(Option<Value>, Value)> = None;
+    let mut pending_call_hierarchy_incoming: Option<(Option<Value>, Value)> = None;
+    let mut pending_call_hierarchy_outgoing: Option<(Option<Value>, Value)> = None;
+    let mut pending_type_hierarchy_supertypes: Option<(Option<Value>, Value)> = None;
+    let mut pending_type_hierarchy_subtypes: Option<(Option<Value>, Value)> = None;
 
     while let Some(message) = read_message(&mut reader) {
         let method = message
@@ -224,7 +259,35 @@ fn main() {
                         "hoverProvider": true,
                         "textDocumentSync": 1
                     }),
-                    "code-lens" | "code-lens-replacement" | "code-lens-slow-resolve" => json!({
+                    "call-hierarchy-prepare"
+                    | "call-hierarchy-replacement"
+                    | "call-hierarchy-marker-incoming"
+                    | "call-hierarchy-slow-incoming"
+                    | "call-hierarchy-delayed-incoming"
+                    | "call-hierarchy-slow-outgoing"
+                    | "call-hierarchy-delayed-outgoing" => json!({
+                        "callHierarchyProvider": true,
+                        "textDocumentSync": 1
+                    }),
+                    "type-hierarchy-prepare"
+                    | "type-hierarchy-replacement"
+                    | "type-hierarchy-marker-supertypes"
+                    | "type-hierarchy-slow-supertypes"
+                    | "type-hierarchy-delayed-supertypes"
+                    | "type-hierarchy-marker-subtypes"
+                    | "type-hierarchy-slow-subtypes"
+                    | "type-hierarchy-delayed-subtypes" => json!({
+                        "typeHierarchyProvider": true,
+                        "textDocumentSync": 1
+                    }),
+                    "type-hierarchy-unsupported" => json!({
+                        "textDocumentSync": 1
+                    }),
+                    "code-lens"
+                    | "code-lens-replacement"
+                    | "code-lens-slow-resolve"
+                    | "code-lens-reopen-delayed-resolve"
+                    | "code-lens-delayed-resolve" => json!({
                         "codeLensProvider": { "resolveProvider": true },
                         "textDocumentSync": 1
                     }),
@@ -232,7 +295,9 @@ fn main() {
                         "codeLensProvider": { "resolveProvider": false },
                         "textDocumentSync": 1
                     }),
-                    "document-link-resolve"
+                    "document-link-reopen-delayed-resolve"
+                    | "document-link-delayed-resolve"
+                    | "document-link-resolve"
                     | "document-link-resolve-replacement"
                     | "document-link-slow-resolve" => json!({
                         "documentLinkProvider": { "resolveProvider": true },
@@ -247,6 +312,14 @@ fn main() {
                     "document-link-no-resolve-reserved-data"
                     | "document-link-no-resolve-plain-data" => json!({
                         "documentLinkProvider": { "resolveProvider": false },
+                        "textDocumentSync": 1
+                    }),
+                    "document-color"
+                    | "document-color-host"
+                    | "document-color-virt"
+                    | "document-color-empty-presentation"
+                    | "document-color-slow-presentation" => json!({
+                        "colorProvider": true,
                         "textDocumentSync": 1
                     }),
                     "inlay-hint-resolve"
@@ -295,7 +368,8 @@ fn main() {
                     | "code-action-lazy-retitle"
                     | "code-action-lazy-multistep"
                     | "code-action-lazy-fileop"
-                    | "code-action-lazy-oob" => {
+                    | "code-action-lazy-oob"
+                    | "code-action-lazy-delayed-resolve" => {
                         json!({
                             "codeActionProvider": { "resolveProvider": true },
                             "executeCommandProvider": { "commands": ["mock.run"] },
@@ -335,7 +409,13 @@ fn main() {
                     // `completion-no-resolve` answers completion the same way
                     // but does NOT advertise resolveProvider, so the bridge
                     // must not weigh its items down with routing envelopes.
-                    "completion-resolve" => json!({
+                    "completion-resolve"
+                    | "completion-resolve-plain"
+                    | "completion-resolve-echo-edit"
+                    | "completion-resolve-text"
+                    | "completion-resolve-reopen-delayed"
+                    | "completion-resolve-delayed"
+                    | "completion-resolve-additional-edit" => json!({
                         "completionProvider": { "resolveProvider": true },
                         "textDocumentSync": 1
                     }),
@@ -436,6 +516,20 @@ fn main() {
                         .and_then(Value::as_str),
                 ) {
                     documents.insert(uri.to_string(), text.to_string());
+                    // The `-reopen-delayed-` resolvers answer their parked
+                    // reply on the reopened lifetime's own `didOpen`: the
+                    // upstream has processed the close and the reopen by the
+                    // time it forwards this, so the reply is guaranteed to
+                    // land after them (a trigger request could overtake both).
+                    if matches!(
+                        mode.as_str(),
+                        "completion-resolve-reopen-delayed"
+                            | "code-lens-reopen-delayed-resolve"
+                            | "document-link-reopen-delayed-resolve"
+                    ) && let Some((pending_id, pending_result)) = pending_resolve.take()
+                    {
+                        respond(&mut writer, pending_id, pending_result);
+                    }
                     // `diagnostics-push` mode: spontaneously push one diagnostic on
                     // the virtual line 0 (no pull). The bridge translates it to host
                     // coordinates and publishes it to the editor (#427).
@@ -517,6 +611,40 @@ fn main() {
                     }
                     if mode == "inlay-hint-delayed-resolve"
                         && let Some((pending_id, pending_result)) = pending_inlay_resolve.take()
+                    {
+                        respond(&mut writer, pending_id, pending_result);
+                    }
+                    if matches!(
+                        mode.as_str(),
+                        "code-action-lazy-delayed-resolve"
+                            | "code-lens-delayed-resolve"
+                            | "document-link-delayed-resolve"
+                            | "completion-resolve-delayed"
+                    ) && let Some((pending_id, pending_result)) = pending_resolve.take()
+                    {
+                        respond(&mut writer, pending_id, pending_result);
+                    }
+                    if mode == "call-hierarchy-delayed-incoming"
+                        && let Some((pending_id, pending_result)) =
+                            pending_call_hierarchy_incoming.take()
+                    {
+                        respond(&mut writer, pending_id, pending_result);
+                    }
+                    if mode == "call-hierarchy-delayed-outgoing"
+                        && let Some((pending_id, pending_result)) =
+                            pending_call_hierarchy_outgoing.take()
+                    {
+                        respond(&mut writer, pending_id, pending_result);
+                    }
+                    if mode == "type-hierarchy-delayed-supertypes"
+                        && let Some((pending_id, pending_result)) =
+                            pending_type_hierarchy_supertypes.take()
+                    {
+                        respond(&mut writer, pending_id, pending_result);
+                    }
+                    if mode == "type-hierarchy-delayed-subtypes"
+                        && let Some((pending_id, pending_result)) =
+                            pending_type_hierarchy_subtypes.take()
                     {
                         respond(&mut writer, pending_id, pending_result);
                     }
@@ -717,14 +845,22 @@ fn main() {
                     .and_then(Value::as_str)
                     .filter(|uri| documents.contains_key(*uri))
                     .map(|uri| {
-                        json!({
+                        let mut result = json!({
                             "isIncomplete": false,
                             "items": [{
                                 "label": "./test",
                                 "kind": 19,
                                 "data": { "mockPath": uri }
                             }]
-                        })
+                        });
+                        if mode == "completion-resolve-echo-edit" {
+                            let position = &message["params"]["position"];
+                            result["items"][0]["textEdit"] = json!({
+                                "range": { "start": position, "end": position },
+                                "newText": "x"
+                            });
+                        }
+                        result
                     })
                     .unwrap_or(Value::Null);
                 respond(&mut writer, id, result);
@@ -750,15 +886,59 @@ fn main() {
                     .and_then(Value::as_str)
                     .unwrap_or("?")
                     .to_string();
-                item["detail"] = json!(format!("mock-resolved:{path}"));
-                item["textEdit"] = json!({
-                    "range": {
-                        "start": { "line": 2, "character": 4 },
-                        "end": { "line": 2, "character": 9 }
-                    },
-                    "newText": "resolved-edit"
-                });
-                respond(&mut writer, id, item);
+                item["detail"] = if mode == "completion-resolve-text" {
+                    json!(documents.get(&path))
+                } else {
+                    json!(format!("mock-resolved:{path}"))
+                };
+                // `completion-resolve-plain`: fill only `detail`, so the reply
+                // survives the bridge's edit guard inside a one-line region and
+                // a test can tell a resolved item from an unresolved one.
+                // `completion-resolve-additional-edit`: a lazy
+                // `additionalTextEdits` on the SECOND virtual line, so a test
+                // can assert the host range it is translated to depends on
+                // the region's live per-line offsets.
+                if mode == "completion-resolve-additional-edit" {
+                    item["additionalTextEdits"] = json!([{
+                        "range": {
+                            "start": { "line": 1, "character": 0 },
+                            "end": { "line": 1, "character": 0 }
+                        },
+                        // No newline: a prefixed (blockquote) region rejects
+                        // inserted lines, which would carry no prefix.
+                        "newText": "--[[resolved]] "
+                    }]);
+                }
+                if mode != "completion-resolve-plain"
+                    && mode != "completion-resolve-echo-edit"
+                    && mode != "completion-resolve-text"
+                    && mode != "completion-resolve-reopen-delayed"
+                    && mode != "completion-resolve-delayed"
+                    && mode != "completion-resolve-additional-edit"
+                {
+                    item["textEdit"] = json!({
+                        "range": {
+                            "start": { "line": 2, "character": 4 },
+                            "end": { "line": 2, "character": 9 }
+                        },
+                        "newText": "resolved-edit"
+                    });
+                }
+                // `completion-resolve-delayed` parks the reply until the next
+                // `didChange`, so a test can move the region while the
+                // resolve is in flight.
+                if mode == "completion-resolve-reopen-delayed"
+                    || mode == "completion-resolve-delayed"
+                {
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({ "type": 3, "message": "completion-resolve-started" }),
+                    );
+                    pending_resolve = Some((id, item));
+                } else {
+                    respond(&mut writer, id, item);
+                }
             }
             "textDocument/codeAction" => {
                 let result = message
@@ -772,6 +952,7 @@ fn main() {
                             || mode == "code-action-lazy-multistep"
                             || mode == "code-action-lazy-fileop"
                             || mode == "code-action-lazy-oob"
+                            || mode == "code-action-lazy-delayed-resolve"
                         {
                             // One LAZY action: data only, no edit. The payload is
                             // materialized on codeAction/resolve (below).
@@ -1011,26 +1192,32 @@ fn main() {
                 // observe which title actually reached the server. If the bridge
                 // failed to restore the original (unsuffixed) title before
                 // forwarding, the mock would see "... — mock-codeaction" here.
-                respond(
-                    &mut writer,
-                    id,
-                    json!({
-                        "title": response_title,
-                        "kind": "source.organizeImports",
-                        "data": data,
-                        "edit": {
-                            "changes": {
-                                target_uri: [{
-                                    "range": {
-                                        "start": { "line": 0, "character": 0 },
-                                        "end": { "line": 0, "character": 5 }
-                                    },
-                                    "newText": format!("organized:{title}")
-                                }]
-                            }
+                let result = json!({
+                    "title": response_title,
+                    "kind": "source.organizeImports",
+                    "data": data,
+                    "edit": {
+                        "changes": {
+                            target_uri: [{
+                                "range": {
+                                    "start": { "line": 0, "character": 0 },
+                                    "end": { "line": 0, "character": 5 }
+                                },
+                                "newText": format!("organized:{title}")
+                            }]
                         }
-                    }),
-                );
+                    }
+                });
+                if mode == "code-action-lazy-delayed-resolve" {
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({ "type": 3, "message": "code-action-resolve-started" }),
+                    );
+                    pending_resolve = Some((id, result));
+                } else {
+                    respond(&mut writer, id, result);
+                }
             }
             "workspace/executeCommand" => {
                 // The bridge stripped its routing prefix, so we see our OWN
@@ -1414,22 +1601,29 @@ fn main() {
                     .pointer("/params/range")
                     .cloned()
                     .unwrap_or(Value::Null);
-                respond(
-                    &mut writer,
-                    id,
-                    json!({
-                        "range": range,
-                        "command": {
-                            "title": format!(
-                                "{} resolved:{}",
-                                if mode == "code-lens-replacement" { "replacement" } else { "mock" },
-                                data["mock"].as_str().unwrap_or("?")
-                            ),
-                            "command": "mock.codelens"
-                        },
-                        "data": data
-                    }),
-                );
+                let result = json!({
+                    "range": range,
+                    "command": {
+                        "title": format!(
+                            "{} resolved:{}",
+                            if mode == "code-lens-replacement" { "replacement" } else { "mock" },
+                            data["mock"].as_str().unwrap_or("?")
+                        ),
+                        "command": "mock.codelens"
+                    },
+                    "data": data
+                });
+                if mode == "code-lens-reopen-delayed-resolve" || mode == "code-lens-delayed-resolve"
+                {
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({ "type": 3, "message": "code-lens-resolve-started" }),
+                    );
+                    pending_resolve = Some((id, result));
+                    continue;
+                }
+                respond(&mut writer, id, result);
             }
             "textDocument/documentLink" => {
                 if matches!(
@@ -1455,6 +1649,8 @@ fn main() {
                             "document-link-resolve"
                                 | "document-link-resolve-replacement"
                                 | "document-link-slow-resolve"
+                                | "document-link-reopen-delayed-resolve"
+                                | "document-link-delayed-resolve"
                         ) {
                             link["data"] = json!({ "mock": "link-1", "uri": uri });
                         } else if mode == "document-link-no-resolve-reserved-data" {
@@ -1468,6 +1664,57 @@ fn main() {
                         json!([link])
                     })
                     .unwrap_or(Value::Null);
+                respond(&mut writer, id, result);
+            }
+            "textDocument/documentColor" => {
+                let result = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .filter(|uri| documents.contains_key(*uri))
+                    .map(|_| {
+                        json!([{
+                            "range": {
+                                "start": { "line": 0, "character": 0 },
+                                "end": { "line": 0, "character": 4 }
+                            },
+                            "color": {
+                                "red": 1.0,
+                                "green": 0.0,
+                                "blue": 0.0,
+                                "alpha": 1.0
+                            }
+                        }])
+                    })
+                    .unwrap_or(Value::Null);
+                respond(&mut writer, id, result);
+            }
+            "textDocument/colorPresentation" => {
+                if mode == "document-color-slow-presentation" {
+                    record_mock_event(&mode, "request", &message);
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                }
+                let range = message.pointer("/params/range").cloned();
+                let result = if mode == "document-color-empty-presentation" {
+                    json!([])
+                } else {
+                    let (label, new_text) = if mode == "document-color-virt" {
+                        ("virt-color", "#00ff00")
+                    } else {
+                        ("host-color", "#ff0000")
+                    };
+                    message
+                        .pointer("/params/textDocument/uri")
+                        .and_then(Value::as_str)
+                        .filter(|uri| documents.contains_key(*uri))
+                        .and(range)
+                        .map(|range| {
+                            json!([{
+                                "label": label,
+                                "textEdit": { "range": range, "newText": new_text }
+                            }])
+                        })
+                        .unwrap_or(Value::Null)
+                };
                 respond(&mut writer, id, result);
             }
             "documentLink/resolve" => {
@@ -1494,24 +1741,32 @@ fn main() {
                     .cloned()
                     .unwrap_or(Value::Null);
                 data["receivedRange"] = range.clone();
-                respond(
-                    &mut writer,
-                    id,
-                    json!({
-                        "range": range,
-                        "target": data["uri"],
-                        "tooltip": format!(
-                            "{} resolved:{}",
-                            if mode == "document-link-resolve-replacement" {
-                                "replacement"
-                            } else {
-                                "mock"
-                            },
-                            data["mock"].as_str().unwrap_or("?")
-                        ),
-                        "data": data
-                    }),
-                );
+                let result = json!({
+                    "range": range,
+                    "target": data["uri"],
+                    "tooltip": format!(
+                        "{} resolved:{}",
+                        if mode == "document-link-resolve-replacement" {
+                            "replacement"
+                        } else {
+                            "mock"
+                        },
+                        data["mock"].as_str().unwrap_or("?")
+                    ),
+                    "data": data
+                });
+                if mode == "document-link-reopen-delayed-resolve"
+                    || mode == "document-link-delayed-resolve"
+                {
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({ "type": 3, "message": "document-link-resolve-started" }),
+                    );
+                    pending_resolve = Some((id, result));
+                } else {
+                    respond(&mut writer, id, result);
+                }
             }
             "textDocument/inlayHint" => {
                 // `inlay-hint-reopen-delayed-resolve`: the parked resolve is
@@ -1558,6 +1813,315 @@ fn main() {
                     })
                     .unwrap_or(Value::Null);
                 respond(&mut writer, id, result);
+            }
+            "textDocument/prepareCallHierarchy" => {
+                let result = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .filter(|uri| documents.contains_key(*uri))
+                    .map(|uri| {
+                        let position = message.pointer("/params/position").map(|position| {
+                            format!("{}:{}", position["line"], position["character"])
+                        });
+                        json!([{
+                            "name": "mock-call",
+                            "detail": position,
+                            "kind": 12,
+                            "uri": uri,
+                            "range": {
+                                "start": { "line": 0, "character": 0 },
+                                "end": { "line": 0, "character": 5 }
+                            },
+                            "selectionRange": {
+                                "start": { "line": 0, "character": 0 },
+                                "end": { "line": 0, "character": 4 }
+                            },
+                            "data": { "mock": "call-item" }
+                        }])
+                    })
+                    .unwrap_or(Value::Null);
+                respond(&mut writer, id, result);
+            }
+            "textDocument/prepareTypeHierarchy" => {
+                let position = message
+                    .pointer("/params/position")
+                    .map(|position| format!("{}:{}", position["line"], position["character"]));
+                let result = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .filter(|uri| documents.contains_key(*uri))
+                    .map(|uri| {
+                        json!([{
+                            "name": "MockChild",
+                            "detail": position,
+                            "kind": 5,
+                            "tags": [1],
+                            "uri": uri,
+                            "range": {
+                                "start": { "line": 0, "character": 0 },
+                                "end": { "line": 0, "character": 9 }
+                            },
+                            "selectionRange": {
+                                "start": { "line": 0, "character": 0 },
+                                "end": { "line": 0, "character": 9 }
+                            },
+                            "data": { "mock": "type-item" }
+                        }])
+                    })
+                    .unwrap_or(Value::Null);
+                respond(&mut writer, id, result);
+            }
+            "typeHierarchy/supertypes" => {
+                if mode == "type-hierarchy-marker-supertypes" {
+                    record_mock_event(&mode, "request", &message);
+                }
+                if mode == "type-hierarchy-slow-supertypes" {
+                    record_mock_event(&mode, "request", &message);
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({ "type": 3, "message": "type-hierarchy-supertypes-started" }),
+                    );
+                    continue;
+                }
+                let item = &message["params"]["item"];
+                let result = item["uri"]
+                    .as_str()
+                    .filter(|uri| documents.contains_key(*uri))
+                    .filter(|_| {
+                        matches!(
+                            item.pointer("/data/mock").and_then(Value::as_str),
+                            Some("type-item" | "parent-item")
+                        ) && item["tags"] == json!([1])
+                    })
+                    .map(|uri| {
+                        let (name, end, data) = if item["data"] == json!({ "mock": "parent-item" })
+                        {
+                            ("MockGrandparent", 15, "grandparent-item")
+                        } else {
+                            ("MockParent", 10, "parent-item")
+                        };
+                        json!([{
+                            "name": name,
+                            "kind": 5,
+                            "tags": [1],
+                            "uri": uri,
+                            "range": {
+                                "start": { "line": 0, "character": 0 },
+                                "end": { "line": 0, "character": end }
+                            },
+                            "selectionRange": {
+                                "start": { "line": 0, "character": 0 },
+                                "end": { "line": 0, "character": end }
+                            },
+                            "data": { "mock": data }
+                        }])
+                    })
+                    .unwrap_or(Value::Null);
+                if mode == "type-hierarchy-delayed-supertypes" {
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({ "type": 3, "message": "type-hierarchy-supertypes-started" }),
+                    );
+                    pending_type_hierarchy_supertypes = Some((id, result));
+                } else {
+                    respond(&mut writer, id, result);
+                }
+            }
+            "typeHierarchy/subtypes" => {
+                if mode == "type-hierarchy-marker-subtypes" {
+                    record_mock_event(&mode, "request", &message);
+                }
+                if mode == "type-hierarchy-slow-subtypes" {
+                    record_mock_event(&mode, "request", &message);
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({ "type": 3, "message": "type-hierarchy-subtypes-started" }),
+                    );
+                    continue;
+                }
+                let item = &message["params"]["item"];
+                let result = item["uri"]
+                    .as_str()
+                    .filter(|uri| documents.contains_key(*uri))
+                    .filter(|_| item["tags"] == json!([1]))
+                    .and_then(|uri| {
+                        let (name, end, data) =
+                            match item.pointer("/data/mock").and_then(Value::as_str) {
+                                Some("parent-item") => ("MockChild", 9, "type-item"),
+                                Some("type-item") => ("MockLeaf", 8, "leaf-item"),
+                                _ => return None,
+                            };
+                        Some(json!([{
+                            "name": name,
+                            "kind": 5,
+                            "tags": [1],
+                            "uri": uri,
+                            "range": {
+                                "start": { "line": 0, "character": 0 },
+                                "end": { "line": 0, "character": end }
+                            },
+                            "selectionRange": {
+                                "start": { "line": 0, "character": 0 },
+                                "end": { "line": 0, "character": end }
+                            },
+                            "data": { "mock": data }
+                        }]))
+                    })
+                    .unwrap_or(Value::Null);
+                if mode == "type-hierarchy-delayed-subtypes" {
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({ "type": 3, "message": "type-hierarchy-subtypes-started" }),
+                    );
+                    pending_type_hierarchy_subtypes = Some((id, result));
+                } else {
+                    respond(&mut writer, id, result);
+                }
+            }
+            "callHierarchy/incomingCalls" => {
+                if mode == "call-hierarchy-marker-incoming" {
+                    record_mock_event(&mode, "request", &message);
+                }
+                if mode == "call-hierarchy-slow-incoming" {
+                    record_mock_event(&mode, "request", &message);
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({ "type": 3, "message": "call-hierarchy-incoming-started" }),
+                    );
+                    continue;
+                }
+                let item = message.pointer("/params/item").cloned();
+                let result = item
+                    .as_ref()
+                    .and_then(|item| item.get("uri").and_then(Value::as_str))
+                    .filter(|uri| documents.contains_key(*uri))
+                    .map(|uri| {
+                        let observation = json!({
+                            "receivedUri": uri,
+                            "receivedRange": item.as_ref().and_then(|item| item.get("range")),
+                            "receivedSelectionRange": item
+                                .as_ref()
+                                .and_then(|item| item.get("selectionRange")),
+                            "receivedData": item.as_ref().and_then(|item| item.get("data")),
+                        });
+                        json!([{
+                            "from": {
+                                "name": "mock-caller",
+                                "detail": observation.to_string(),
+                                "kind": 12,
+                                "uri": uri,
+                                "range": {
+                                    "start": { "line": 0, "character": 0 },
+                                    "end": { "line": 0, "character": 5 }
+                                },
+                                "selectionRange": {
+                                    "start": { "line": 0, "character": 0 },
+                                    "end": { "line": 0, "character": 4 }
+                                },
+                                "data": { "mock": "incoming-caller" }
+                            },
+                            "fromRanges": [{
+                                "start": { "line": 0, "character": 1 },
+                                "end": { "line": 0, "character": 2 }
+                            }]
+                        }])
+                    })
+                    .unwrap_or(Value::Null);
+                if mode == "call-hierarchy-delayed-incoming" {
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({ "type": 3, "message": "call-hierarchy-incoming-started" }),
+                    );
+                    pending_call_hierarchy_incoming = Some((id, result));
+                } else {
+                    respond(&mut writer, id, result);
+                }
+            }
+            "callHierarchy/outgoingCalls" => {
+                if mode == "call-hierarchy-slow-outgoing" {
+                    record_mock_event(&mode, "request", &message);
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({ "type": 3, "message": "call-hierarchy-outgoing-started" }),
+                    );
+                    continue;
+                }
+                let item = message.pointer("/params/item").cloned();
+                let result = item
+                    .as_ref()
+                    .and_then(|item| item.get("uri").and_then(Value::as_str))
+                    .filter(|uri| documents.contains_key(*uri))
+                    .map(|uri| {
+                        let observation = json!({
+                            "receivedUri": uri,
+                            "receivedRange": item.as_ref().and_then(|item| item.get("range")),
+                            "receivedSelectionRange": item
+                                .as_ref()
+                                .and_then(|item| item.get("selectionRange")),
+                            "receivedData": item.as_ref().and_then(|item| item.get("data")),
+                        });
+                        json!([
+                            {
+                                "to": {
+                                    "name": "mock-callee",
+                                    "detail": observation.to_string(),
+                                    "kind": 12,
+                                    "uri": uri,
+                                    "range": {
+                                        "start": { "line": 0, "character": 0 },
+                                        "end": { "line": 0, "character": 5 }
+                                    },
+                                    "selectionRange": {
+                                        "start": { "line": 0, "character": 0 },
+                                        "end": { "line": 0, "character": 4 }
+                                    },
+                                    "data": { "mock": "outgoing-callee" }
+                                },
+                                "fromRanges": [{
+                                    "start": { "line": 0, "character": 1 },
+                                    "end": { "line": 0, "character": 2 }
+                                }]
+                            },
+                            {
+                                "to": {
+                                    "name": "external-callee",
+                                    "kind": 12,
+                                    "uri": "file:///external.lua",
+                                    "range": {
+                                        "start": { "line": 8, "character": 0 },
+                                        "end": { "line": 8, "character": 5 }
+                                    },
+                                    "selectionRange": {
+                                        "start": { "line": 8, "character": 0 },
+                                        "end": { "line": 8, "character": 4 }
+                                    },
+                                    "data": { "mock": "external-callee" }
+                                },
+                                "fromRanges": [{
+                                    "start": { "line": 0, "character": 2 },
+                                    "end": { "line": 0, "character": 3 }
+                                }]
+                            }
+                        ])
+                    })
+                    .unwrap_or(Value::Null);
+                if mode == "call-hierarchy-delayed-outgoing" {
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({ "type": 3, "message": "call-hierarchy-outgoing-started" }),
+                    );
+                    pending_call_hierarchy_outgoing = Some((id, result));
+                } else {
+                    respond(&mut writer, id, result);
+                }
             }
             "inlayHint/resolve" => {
                 if mode == "inlay-hint-marker-resolve" {
@@ -1859,10 +2423,13 @@ fn record_mock_event(mode: &str, event: &str, message: &Value) {
         "id": message.get("id").cloned().unwrap_or(Value::Null),
         "params": message.get("params").cloned().unwrap_or(Value::Null)
     });
-    let _ = std::fs::write(
-        dir.join(format!("{mode}.{event}.json")),
-        serde_json::to_vec(&payload).unwrap_or_default(),
-    );
+    // Write-then-rename: a test polls for the file and parses it as soon as
+    // it exists, and `fs::write` creates it before its content lands.
+    let path = dir.join(format!("{mode}.{event}.json"));
+    let staging = dir.join(format!("{mode}.{event}.json.tmp"));
+    if std::fs::write(&staging, serde_json::to_vec(&payload).unwrap_or_default()).is_ok() {
+        let _ = std::fs::rename(&staging, &path);
+    }
 }
 
 /// Send a JSON-RPC success response for `id` (no-op for notifications).

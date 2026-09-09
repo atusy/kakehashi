@@ -29,21 +29,24 @@ Partially implemented:
   no per-method request builders or response transformers. Handlers run the
   layer walk (`Kakehashi::walk_layers`, cross-layer-aggregation,
   `preferred` semantics): layers are tried lazily in `priorities` — by default
-  virt first, host as fallback. Five methods consume per-server identity in
+  virt first, host as fallback. Seven method families consume per-server identity in
   the host arm: codeAction for the `"{title} — {server}"` suffix, completion
-  and inlayHint for their resolve-routing envelopes, and codeLens and
-  documentLink for the winning server's resolve capability and envelope.
-  CodeAction, completion, and inlayHint build their own host arms; codeLens
-  and documentLink use the shared whole-document winner hook. Covered: definition, hover, declaration,
+  and inlayHint for their resolve-routing envelopes, codeLens and
+  documentLink for the winning server's resolve capability and envelope, and
+  call hierarchy and type hierarchy for follow-up routing.
+  CodeAction, completion, and inlayHint build custom host arms; codeLens and
+  documentLink use the shared whole-document winner hook. Covered: definition, hover, declaration,
   typeDefinition, implementation, references, completion, signatureHelp,
   documentHighlight, rename, prepareRename, linkedEditingRange, moniker,
-  inlayHint, documentSymbol, documentLink, foldingRange, codeLens,
+  inlayHint, documentSymbol, documentLink, documentColor, colorPresentation,
+  foldingRange, codeLens, prepareCallHierarchy, incomingCalls, outgoingCalls,
+  prepareTypeHierarchy, supertypes, subtypes,
   formatting, and rangeFormatting (which shares the formatting layer key).
   Diagnostics are covered with real cross-layer `concatenated` (the
   cross-layer-aggregation diagnostics phase): pull and synthetic push both
   merge host-server pulls (real URI) with the virt regions' results per the
-  layer strategy. Not covered: semantic tokens (native-only) and the experimental
-  documentColor/colorPresentation pair. `completionItem/resolve` routes by
+  layer strategy. Not covered: semantic tokens (native-only).
+  `completionItem/resolve` routes by
   the envelope stamped into `CompletionItem.data`; the host layer stamps one
   too (marked `host_layer`, so the resolve forwards VERBATIM — no coordinate
   translation and no injection-region edit guard). Both layers mint under
@@ -94,6 +97,74 @@ Partially implemented:
   non-contiguous combined injections fail soft before dispatch because a lazy
   edit could otherwise cross a masked host-only gap. Safe resolves apply the
   same all-or-nothing edit guard as initial hint retrieval.
+  `codeAction/resolve` carries and checks the same revision stamp before
+  dispatch and after the reply, and the incarnation after the reply as well.
+  `completionItem/resolve` carries no revision stamp: a completion list is
+  meant to outlive ordinary edits — the editor filters it locally while the
+  user keeps typing and resolves on accept — so before dispatch it checks the
+  incarnation and rebuilds the region (identity, start, contiguity and
+  language; the end and per-line offsets are read live for the translation),
+  and after the reply it checks the incarnation and refuses a reply the
+  document was edited under while the request was in flight. The downstream
+  computes the lazy fields against text synchronized immediately before the
+  resolve on its own connection. After connection acquisition and the bounded
+  parse wait, completion captures the current text and geometry under the host
+  edit lock. It keeps that lock through sync and request enqueue, using the
+  existing host sync or virtual content fingerprint/version tracking, and
+  releases it before waiting for the reply. This closes the deferred-forwarding
+  window in #1053 without adding a second revision watermark. A failed sync
+  suppresses the resolve. A contended lifecycle lock returns the item unresolved
+  instead of parking edits behind reconciliation. Successful virtual replies
+  carry the geometry used to translate their edits, so a repeated resolve can
+  reverse that translation correctly. Every host-layer producer (completion,
+  codeAction, codeLens, documentLink, inlayHint) stamps its items with the
+  incarnation the host text was read under (codeAction and inlayHint with its
+  revision as well), from one store read, and discards a reply the downstream
+  synchronized under another incarnation. Every resolve gate checks the
+  incarnation, then waits for the document's current parse — bounded by the
+  same short budget the request handlers use before their preamble — before
+  rebuilding the region, so a resolve issued during an ordinary post-edit
+  reparse is judged by its stamps; a reparse that outlasts that budget still
+  fails soft as a stale region. Code lens and document link, whose envelopes
+  carry no revision, rebuild the region again after the reply for a virtual
+  item (a host item re-checks the lifetime). Completion carries no revision
+  either — a completion list outlives edits — but rebuilds the region before
+  dispatch (identity, start, contiguity, language; the end and per-line
+  offsets are read live for translation) and refuses a reply the document
+  was edited under while it was in flight.
+  `callHierarchy/incomingCalls` and `callHierarchy/outgoingCalls` follow the
+  same exact-producer contract.
+  Preparation stamps each item with host content/incarnation, connection key
+  and generation, region geometry, and whether its URI/ranges were projected
+  from a virtual document. Expansion reverses only projected items, strips
+  progress and partial-result tokens that the bridge cannot transform, and
+  re-envelopes returned callers/callees for recursive expansion. Outgoing
+  `fromRanges` are caller-relative, so results translate them with the request
+  item's region offset only when that caller was projected from a virtual
+  document, regardless of whether the callee is virtual or real. Expansion rejects stale
+  content, reopen incarnations, moved/non-contiguous regions, and replaced
+  producers before dispatch, then rechecks content and producer identity after
+  the response; cancellation targets the exact downstream request. With both
+  expansion directions implemented, kakehashi advertises upstream
+  `callHierarchyProvider`.
+  `textDocument/prepareTypeHierarchy`, `typeHierarchy/supertypes`, and
+  `typeHierarchy/subtypes` follow the same preparation/exact-producer contract:
+  host items are enveloped without coordinate changes, while same-region
+  virtual items are projected to host coordinates and cross-region virtual
+  items are dropped. The envelope preserves the exact producer metadata needed
+  by expansion. Supertypes and subtypes restore only projected items to the
+  producing virtual URI, reject stale documents/regions/processes, and re-envelope
+  results for recursive traversal. With both directions implemented, kakehashi
+  advertises upstream `typeHierarchyProvider`.
+  Exact virtual-URI provenance survives `didClose` because downstream indexes
+  may still return closed documents. To keep this generation history bounded,
+  the pool retires and recreates a producer before admitting another request
+  once 65,536 canonical, scratch, or reserved aliases have been admitted.
+  A URI becomes exact provenance synchronously when `didOpen` enters the FIFO,
+  before its opened-state promotion can await. Retiring the process clears its
+  index and removes the matching generation from the registry; request-scoped
+  `Arc` leases retain that generation's provenance only until their in-flight
+  responses finish, so replacement cannot change URI classification mid-response.
   Formatting additionally supports the cross-layer
   `concatenated` pipeline: virt region edits apply first, the host
   formatter formats the intermediate text, and the chain collapses into one

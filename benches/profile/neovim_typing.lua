@@ -17,6 +17,8 @@ for _, key in ipairs({ "PROBE_BIN", "PROBE_FILE", "PROBE_CONFIG", "PROBE_OUTPUT"
 	assert(vim.env[key] and vim.env[key] ~= "", key .. " is required")
 end
 local uv = vim.uv
+local removed, remove_error, remove_code = uv.fs_unlink(vim.env.PROBE_OUTPUT)
+assert(removed or remove_code == "ENOENT", remove_error)
 local samples, active = {}, nil
 local response_samples = {}
 local function now()

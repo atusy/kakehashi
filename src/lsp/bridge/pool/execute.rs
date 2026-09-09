@@ -12,7 +12,9 @@ use log::warn;
 use tower_lsp_server::ls_types::{Position, Uri};
 use url::Url;
 
-use super::{ConnectionHandle, ConnectionHandleSender, LanguageServerPool, UpstreamId};
+use super::{
+    ConnectionHandle, ConnectionHandleSender, ConnectionState, LanguageServerPool, UpstreamId,
+};
 use crate::lsp::bridge::actor::RouterCleanupGuard;
 use crate::lsp::bridge::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, host_position_within_region_bounds,
@@ -128,6 +130,7 @@ impl LanguageServerPool {
             offset,
             virtual_content,
             upstream_request_id,
+            None,
             build_request,
             transform_response,
             None,
@@ -152,6 +155,7 @@ impl LanguageServerPool {
         offset: &RegionOffset,
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
+        expected_incarnation: Option<u64>,
         build_request: impl FnOnce(&VirtualDocumentUri, RequestId) -> JsonRpcRequest<P>,
         transform_response: impl FnOnce(serde_json::Value, &BridgeResponseContext<'_>) -> T,
         downstream_id_probe: Option<&std::sync::OnceLock<RequestId>>,
@@ -168,7 +172,13 @@ impl LanguageServerPool {
         // Build virtual document URI
         let virtual_uri = VirtualDocumentUri::new(&host_uri_lsp, injection_language, region_id);
 
-        let host_lifecycle = self.request_host_lifecycle(host_uri).await?;
+        let host_lifecycle = match expected_incarnation {
+            Some(expected) => {
+                self.request_host_lifecycle_for_incarnation(host_uri, expected)
+                    .await?
+            }
+            None => self.request_host_lifecycle(host_uri).await?,
+        };
         let routing_uri = url::Url::parse(&virtual_uri.to_uri_string())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         if self
@@ -232,10 +242,9 @@ impl LanguageServerPool {
         // connections → document tracker matches the respawn purge.
         {
             let connections = self.connections().await;
-            if !connections
-                .get(connection_key)
-                .is_some_and(|current| Arc::ptr_eq(current, &handle))
-            {
+            if !connections.get(connection_key).is_some_and(|current| {
+                Arc::ptr_eq(current, &handle) && current.state() == ConnectionState::Ready
+            }) {
                 drop(connections);
                 // router_guard drops here, cleaning up the router entry
                 if let Some(ref id) = upstream_request_id {
@@ -338,6 +347,79 @@ impl LanguageServerPool {
         build_request: impl FnOnce(&VirtualDocumentUri, RequestId) -> JsonRpcRequest<P>,
         transform_response: impl FnOnce(serde_json::Value, &BridgeResponseContext<'_>) -> T,
     ) -> io::Result<T> {
+        self.execute_position_bridge_request_with_handle_inner(
+            handle,
+            host_uri,
+            injection_language,
+            region_id,
+            offset,
+            virtual_content,
+            upstream_request_id,
+            None,
+            host_position,
+            region_end,
+            method,
+            build_request,
+            transform_response,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn execute_position_bridge_request_with_handle_for_incarnation<
+        T,
+        P: serde::Serialize,
+    >(
+        &self,
+        handle: Arc<ConnectionHandle>,
+        host_uri: &Url,
+        injection_language: &str,
+        region_id: &str,
+        offset: &RegionOffset,
+        virtual_content: &str,
+        upstream_request_id: Option<UpstreamId>,
+        expected_incarnation: u64,
+        host_position: Position,
+        region_end: Position,
+        method: &'static str,
+        build_request: impl FnOnce(&VirtualDocumentUri, RequestId) -> JsonRpcRequest<P>,
+        transform_response: impl FnOnce(serde_json::Value, &BridgeResponseContext<'_>) -> T,
+    ) -> io::Result<T> {
+        self.execute_position_bridge_request_with_handle_inner(
+            handle,
+            host_uri,
+            injection_language,
+            region_id,
+            offset,
+            virtual_content,
+            upstream_request_id,
+            Some(expected_incarnation),
+            host_position,
+            region_end,
+            method,
+            build_request,
+            transform_response,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_position_bridge_request_with_handle_inner<T, P: serde::Serialize>(
+        &self,
+        handle: Arc<ConnectionHandle>,
+        host_uri: &Url,
+        injection_language: &str,
+        region_id: &str,
+        offset: &RegionOffset,
+        virtual_content: &str,
+        upstream_request_id: Option<UpstreamId>,
+        expected_incarnation: Option<u64>,
+        host_position: Position,
+        region_end: Position,
+        method: &'static str,
+        build_request: impl FnOnce(&VirtualDocumentUri, RequestId) -> JsonRpcRequest<P>,
+        transform_response: impl FnOnce(serde_json::Value, &BridgeResponseContext<'_>) -> T,
+    ) -> io::Result<T> {
         // `region_end` is `region_host_end(virtual_content, offset)`, derived
         // once per request by the fan-out (deriving it is O(virtual_content))
         // and shared by every arm. The bound is SNAPSHOT-scoped, not
@@ -410,6 +492,7 @@ impl LanguageServerPool {
             offset,
             virtual_content,
             upstream_request_id,
+            expected_incarnation,
             build_request,
             transform_response,
             None,
@@ -447,6 +530,7 @@ mod tests {
                 &RegionOffset::new(0, 0),
                 "print('hello')",
                 Some(upstream_id),
+                None,
                 |_, request_id| {
                     JsonRpcRequest::new(
                         request_id.as_i64(),

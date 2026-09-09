@@ -568,6 +568,7 @@ pub(crate) fn bridge_host_completion_items(
     response: &mut tower_lsp_server::ls_types::CompletionResponse,
     server_name: &str,
     host_uri: &str,
+    incarnation: Option<u64>,
     server_resolves: bool,
 ) {
     use tower_lsp_server::ls_types::CompletionResponse;
@@ -577,7 +578,7 @@ pub(crate) fn bridge_host_completion_items(
     };
     for item in items.iter_mut() {
         if should_envelope(item.data.as_ref(), server_resolves) {
-            envelope_host_item(item, server_name, host_uri);
+            envelope_host_item(item, server_name, host_uri, incarnation);
         }
     }
 }
@@ -587,12 +588,17 @@ pub(crate) fn bridge_host_completion_items(
 /// document is forwarded verbatim, so no region/offset is captured
 /// (`host_layer = true` tells the resolve path to skip all coordinate
 /// translation and its region-geometry guards).
-pub(super) fn envelope_host_item(item: &mut CompletionItem, server_name: &str, host_uri: &str) {
+pub(super) fn envelope_host_item(
+    item: &mut CompletionItem,
+    server_name: &str,
+    host_uri: &str,
+    incarnation: Option<u64>,
+) {
     let inner = item.data.take();
     let envelope = KakehashiEnvelope {
         origin: server_name.to_string(),
         injection_language: String::new(),
-        incarnation: None,
+        incarnation,
         host_uri: host_uri.to_string(),
         region_id: String::new(),
         inner: None,
@@ -1333,7 +1339,7 @@ mod tests {
             items: vec![item()],
         });
         for response in [&mut array, &mut list] {
-            bridge_host_completion_items(response, "tsudoi-ls", "file:///doc.txt", true);
+            bridge_host_completion_items(response, "tsudoi-ls", "file:///doc.txt", Some(1), true);
         }
 
         for (shape, items) in [("array", must_items(&array)), ("list", must_items(&list))] {
@@ -1371,7 +1377,13 @@ mod tests {
                 ..Default::default()
             },
         ]);
-        bridge_host_completion_items(&mut response, "tsudoi-ls", "file:///doc.txt", false);
+        bridge_host_completion_items(
+            &mut response,
+            "tsudoi-ls",
+            "file:///doc.txt",
+            Some(1),
+            false,
+        );
 
         let items = must_items(&response);
         assert_eq!(
@@ -1406,7 +1418,7 @@ mod tests {
             data: Some(json!({"pathCompletion": "/tmp/test"})),
             ..Default::default()
         };
-        envelope_host_item(&mut item, "tsudoi-ls", "file:///test/doc.txt");
+        envelope_host_item(&mut item, "tsudoi-ls", "file:///test/doc.txt", Some(1));
 
         // The two fields a host envelope leaves at their defaults must not
         // ride the wire — this rides in every enveloped item of a response.
@@ -1427,6 +1439,11 @@ mod tests {
         assert_eq!(envelope.region_id, "");
         assert_eq!(envelope.region_end, None);
         assert_eq!(envelope.inner, Some(json!({"pathCompletion": "/tmp/test"})));
+        assert_eq!(
+            envelope.incarnation,
+            Some(1),
+            "the host lifetime the items were computed under rides in the envelope"
+        );
     }
 
     /// `host_layer` alone does not make an envelope host-layer: a conforming

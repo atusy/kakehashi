@@ -75,6 +75,15 @@ impl Kakehashi {
             return Ok(None);
         };
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(ctx.upstream_request_id.as_ref());
+        // The lifetime the text was read under travels with the items and a
+        // reply synchronized under another one is refused: a close and reopen
+        // racing the request would otherwise answer for the closed text under
+        // the reopened document's incarnation.
+        let expected_incarnation = ctx.incarnation;
+        let revision = crate::lsp::bridge::HostRevision {
+            incarnation: expected_incarnation,
+            content_version: ctx.content_version,
+        };
         let pool = self.bridge.pool_arc();
         let f = move |t: HostFanOutTask| {
             let params = raw_params.clone();
@@ -88,6 +97,7 @@ impl Kakehashi {
                             uri: &t.uri,
                             language_id: &t.language_id,
                             text: &t.text,
+                            revision: Some(revision),
                         },
                         METHOD,
                         params,
@@ -97,11 +107,21 @@ impl Kakehashi {
                 let Some(raw) = raw else {
                     return Ok(None);
                 };
+                if raw.incarnation != expected_incarnation {
+                    log::debug!(
+                        target: "kakehashi::bridge",
+                        "textDocument/completion (host): {} was reopened while {} answered; discarding items computed on the closed text",
+                        t.uri,
+                        t.server_name
+                    );
+                    return Ok(None);
+                }
                 let Some(response) = parse_host_verbatim::<CompletionResponse>(raw.value) else {
                     return Ok(None);
                 };
                 Ok(Some(HostCompletion {
                     response,
+                    incarnation: expected_incarnation,
                     // Two allocations per SERVER, versus an envelope per item
                     // in a task whose result the fan-in may well discard.
                     server_resolves: raw.handle.has_capability("completionItem/resolve"),
@@ -123,7 +143,7 @@ impl Kakehashi {
         )
         .await;
         // The envelope pass rides in `on_done`, so only the WINNER pays it.
-        self.host_layer_result(fan_in, METHOD, |won| {
+        self.host_layer_result(fan_in, &ctx, METHOD, |won| {
             won.map(HostCompletion::into_enveloped_response)
         })
         .await
@@ -191,6 +211,8 @@ struct HostCompletion {
     host_uri: String,
     /// Whether that server advertises `completionItem/resolve`.
     server_resolves: bool,
+    /// The host lifetime the items were computed under.
+    incarnation: u64,
 }
 
 impl HostCompletion {
@@ -199,6 +221,7 @@ impl HostCompletion {
             &mut self.response,
             &self.server_name,
             &self.host_uri,
+            Some(self.incarnation),
             self.server_resolves,
         );
         self.response
