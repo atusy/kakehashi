@@ -357,6 +357,7 @@ fn classify(req: &Request) -> Option<Role> {
         | "textDocument/inlayHint"
         | "textDocument/documentColor"
         | "textDocument/colorPresentation"
+        | "textDocument/prepareCallHierarchy"
         | "textDocument/diagnostic"
         | "kakehashi/captures/full"
         | "kakehashi/captures/full/delta"

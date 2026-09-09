@@ -94,6 +94,7 @@ impl LanguageServerPool {
             &offset,
             virtual_content,
             upstream_request_id,
+            None,
             |virtual_uri, request_id| {
                 build_formatting_request(virtual_uri, options, request_id, client_progress_token)
             },
