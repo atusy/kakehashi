@@ -130,12 +130,22 @@ for i = 1, count do
 		end
 	end
 	active.edit_call_ms = now() - active.started
-	assert(
-		vim.wait(60000, function()
-			return active.ready_ms ~= nil
-		end, 5),
-		"edit tokens timed out"
-	)
+	if not vim.wait(60000, function()
+		return active.ready_ms ~= nil
+	end, 5) then
+		local state = cls.active[buf] and cls.active[buf].client_state[id]
+		vim.fn.writefile({
+			vim.json.encode({
+				error = "edit tokens timed out",
+				samples = samples,
+				failed_sample = active,
+				buffer_version = vim.lsp.util.buf_versions[buf],
+				current_version = state and state.current_result.version,
+				active_request = state and state.active_request,
+			}),
+		}, vim.env.PROBE_OUTPUT)
+		error("edit tokens timed out; partial trace saved to PROBE_OUTPUT")
+	end
 	expected = expected + burst
 	assert(tracked_start() == expected, "response does not match the latest unique edit")
 	active.follow_ms = active.ready_ms - active.last_edit_ms
