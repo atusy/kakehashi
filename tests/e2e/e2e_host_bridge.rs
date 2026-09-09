@@ -186,6 +186,429 @@ priorities = ["virt", "host"]
 }
 
 #[test]
+fn e2e_document_colors_concatenate_virt_and_host_layers() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("document_colors.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[languages.markdown.bridge._self]
+enabled = true
+
+[languages.markdown.layers.aggregation."textDocument/documentColor"]
+strategy = "concatenated"
+priorities = ["virt", "host"]
+
+[languages.markdown.layers.aggregation."textDocument/colorPresentation"]
+strategy = "concatenated"
+priorities = ["virt", "host"]
+"#,
+    )
+    .expect("write config");
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        .env("KAKEHASHI_EXPERIMENTAL", "true")
+        .build();
+    let init = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-host-color": {
+                        "cmd": [mock_bin(), "document-color-host"],
+                        "languages": ["markdown"]
+                    },
+                    "mock-virt-color": {
+                        "cmd": [mock_bin(), "document-color-virt"],
+                        "languages": ["lua"]
+                    }
+                }
+            }
+        }),
+    );
+    assert_eq!(
+        init.pointer("/result/capabilities/colorProvider"),
+        Some(&json!(true))
+    );
+    client.send_notification("initialized", json!({}));
+
+    let uri = "file:///test_document_colors.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": "# Title\n\n> ```lua\n> red!\n> ```\n"
+            }
+        }),
+    );
+
+    let colors = (0..300)
+        .find_map(|_| {
+            let response = client.send_request(
+                "textDocument/documentColor",
+                json!({ "textDocument": { "uri": uri } }),
+            );
+            assert!(
+                response.get("error").is_none(),
+                "documentColor must not surface a top-level error; got: {:?}",
+                response.get("error")
+            );
+            let colors = response["result"].as_array().cloned().unwrap_or_default();
+            if colors.len() >= 2 {
+                Some(colors)
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                None
+            }
+        })
+        .expect("concatenated document colors should include virt and host results");
+
+    assert!(
+        colors.iter().any(|color| {
+            color["range"]
+                == json!({
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 0, "character": 4 }
+                })
+        }),
+        "host-layer documentColor should keep the host range: {colors:?}"
+    );
+    assert!(
+        colors.iter().any(|color| {
+            color["range"]
+                == json!({
+                    "start": { "line": 3, "character": 2 },
+                    "end": { "line": 3, "character": 6 }
+                })
+        }),
+        "virt-layer documentColor should translate the injected lua line and column: {colors:?}"
+    );
+
+    let presentation = client.send_request(
+        "textDocument/colorPresentation",
+        json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 0, "character": 4 }
+            },
+            "color": { "red": 1.0, "green": 0.0, "blue": 0.0, "alpha": 1.0 }
+        }),
+    );
+    assert_eq!(
+        presentation.pointer("/result/0"),
+        Some(&json!({
+            "label": "host-color",
+            "textEdit": {
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 0, "character": 4 }
+                },
+                "newText": "#ff0000"
+            }
+        })),
+        "a host document color should present through its host server: {presentation:?}"
+    );
+
+    let virtual_presentation = client.send_request(
+        "textDocument/colorPresentation",
+        json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": 3, "character": 2 },
+                "end": { "line": 3, "character": 6 }
+            },
+            "color": { "red": 1.0, "green": 0.0, "blue": 0.0, "alpha": 1.0 }
+        }),
+    );
+    assert_eq!(
+        virtual_presentation.pointer("/result/0"),
+        Some(&json!({
+            "label": "virt-color",
+            "textEdit": {
+                "range": {
+                    "start": { "line": 3, "character": 2 },
+                    "end": { "line": 3, "character": 6 }
+                },
+                "newText": "#00ff00"
+            }
+        })),
+        "an injected color should use the virtual server and translate its edit: {virtual_presentation:?}"
+    );
+    assert_eq!(
+        virtual_presentation.pointer("/result/1"),
+        Some(&json!({
+            "label": "host-color",
+            "textEdit": {
+                "range": {
+                    "start": { "line": 3, "character": 2 },
+                    "end": { "line": 3, "character": 6 }
+                },
+                "newText": "#ff0000"
+            }
+        })),
+        "concatenated colorPresentation should retain the host answer after virt: {virtual_presentation:?}"
+    );
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_color_presentation_cancel_reaches_host_after_empty_virt_arm() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("color_presentation_cancel.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[languages.markdown.bridge._self]
+enabled = true
+
+[languages.markdown.layers.aggregation."textDocument/colorPresentation"]
+strategy = "preferred"
+priorities = ["virt", "host"]
+
+[languages.markdown.layers.aggregation."textDocument/documentColor"]
+strategy = "concatenated"
+priorities = ["virt", "host"]
+"#,
+    )
+    .expect("write config");
+
+    let event_dir = tempfile::TempDir::new().expect("event dir");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        .env("KAKEHASHI_EXPERIMENTAL", "true")
+        .env("MOCK_LSP_CANCEL_DIR", event_dir.path().to_string_lossy())
+        .build();
+    let _init = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-host-color": {
+                        "cmd": [mock_bin(), "document-color-slow-presentation"],
+                        "languages": ["markdown"]
+                    },
+                    "mock-virt-color": {
+                        "cmd": [mock_bin(), "document-color-empty-presentation"],
+                        "languages": ["lua"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    let uri = "file:///test_color_presentation_cancel.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": "> ```lua\n> red!\n> ```\n"
+            }
+        }),
+    );
+
+    (0..100)
+        .find_map(|_| {
+            let response = client.send_request(
+                "textDocument/documentColor",
+                json!({ "textDocument": { "uri": uri } }),
+            );
+            if response["result"]
+                .as_array()
+                .is_some_and(|items| items.len() >= 2)
+            {
+                Some(())
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                None
+            }
+        })
+        .expect("host and virtual color servers should warm up");
+
+    let request_id = client.send_request_async(
+        "textDocument/colorPresentation",
+        json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": 1, "character": 2 },
+                "end": { "line": 1, "character": 6 }
+            },
+            "color": { "red": 1.0, "green": 0.0, "blue": 0.0, "alpha": 1.0 }
+        }),
+    );
+    let host_request = event_dir
+        .path()
+        .join("document-color-slow-presentation.request.json");
+    assert!(
+        (0..60).any(|_| {
+            if host_request.exists() {
+                true
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                false
+            }
+        }),
+        "host colorPresentation request should start"
+    );
+
+    client.send_notification("$/cancelRequest", json!({ "id": request_id }));
+    let response = client.receive_response_for_id_public(request_id);
+    assert_eq!(
+        response.pointer("/error/code").and_then(Value::as_i64),
+        Some(-32800),
+        "colorPresentation should answer RequestCancelled: {response:?}"
+    );
+
+    let host_cancel = event_dir
+        .path()
+        .join("document-color-slow-presentation.cancel.json");
+    assert!(
+        (0..60).any(|_| {
+            if host_cancel.exists() {
+                true
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                false
+            }
+        }),
+        "cancellation should reach the host server after the virt arm settles"
+    );
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_document_color_rejects_host_reopen_during_connection_admission() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("document_color_reopen.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[languages.markdown.bridge._self]
+enabled = true
+
+[languages.markdown.layers.aggregation."textDocument/documentColor"]
+priorities = ["host"]
+"#,
+    )
+    .expect("write config");
+
+    let barrier_dir = tempfile::TempDir::new().expect("barrier dir");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        .env("KAKEHASHI_EXPERIMENTAL", "true")
+        .env(
+            "KAKEHASHI_E2E_WHOLE_DOCUMENT_HOST_BARRIER_DIR",
+            barrier_dir.path().to_string_lossy(),
+        )
+        .build();
+    let _init = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-host-color": {
+                        "cmd": [mock_bin(), "document-color-host"],
+                        "languages": ["markdown"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    let uri = "file:///test_document_color_reopen.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": "old lifetime"
+            }
+        }),
+    );
+    let request_id = client.send_request_async(
+        "textDocument/documentColor",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+
+    let captured = barrier_dir.path().join("captured");
+    assert!(
+        (0..60).any(|_| {
+            if captured.exists() {
+                true
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                false
+            }
+        }),
+        "the old host context should be captured before dispatch admission"
+    );
+
+    client.send_notification(
+        "textDocument/didClose",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": "new lifetime"
+            }
+        }),
+    );
+
+    let reopen_barrier = client.send_request(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    assert!(
+        reopen_barrier.get("error").is_none(),
+        "the post-reopen reader barrier should complete: {reopen_barrier:?}"
+    );
+    std::fs::write(barrier_dir.path().join("release"), b"release")
+        .expect("release host request admission");
+
+    let response = client.receive_response_for_id_public(request_id);
+    assert_eq!(
+        response["result"],
+        json!([]),
+        "a request carrying the closed incarnation must not answer from the reopened document: {response:?}"
+    );
+
+    shutdown(&mut client);
+}
+
+#[test]
 fn e2e_whole_document_link_cancel_forwards_to_concatenated_layers() {
     let config_dir = tempfile::TempDir::new().expect("config dir");
     let config_path = config_dir.path().join("whole_doc_links_cancel.toml");
