@@ -358,3 +358,21 @@ fn e2e_virtual_completion_resolve_can_be_repeated_after_a_prefix_edit() {
     );
     shutdown_client(&mut client);
 }
+
+#[test]
+fn e2e_virtual_completion_resolve_reads_the_edited_fragment() {
+    let (mut client, _config_dir, item) = init_virtual_completion_client("completion-resolve-text");
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": MARKDOWN_URI, "version": 2 },
+            "contentChanges": [{ "text": "# Test\n\n```lua\nlocal changed = 2\n```\n" }]
+        }),
+    );
+    let response = client.send_request("completionItem/resolve", item);
+    assert_eq!(
+        response["result"]["detail"], "local changed = 2\n",
+        "{response}"
+    );
+    shutdown_client(&mut client);
+}

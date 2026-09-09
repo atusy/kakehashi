@@ -53,8 +53,8 @@ pub(crate) struct HostDocument<'a> {
     /// synchronized into a later lifetime (a close and reopen racing the
     /// request), and a text older than what this connection already holds
     /// for the same lifetime is refused rather than rolled back onto it.
-    /// `None` synchronizes verbatim (the initial open, speculative formatting
-    /// text, the eager on-edit re-sync).
+    /// `None` supplies no revision watermark. Production store-backed callers
+    /// stamp their text; speculative formatting carries its source revision.
     pub(crate) revision: Option<crate::lsp::bridge::envelope::HostRevision>,
 }
 
@@ -155,8 +155,9 @@ pub(crate) type HostTextReaderRef<'a> = &'a (dyn Fn() -> Option<(Arc<str>, u64)>
 /// send means the last task to take the lock observes the newest text, so
 /// concurrent re-syncs can no longer roll a host server back to stale content; a
 /// `None` return (document closed mid-sync) falls back to `doc.text`. Interactive
-/// requests, the formatting pipeline's speculative scratch text, and the initial
-/// `didOpen` pass `None` and are synced verbatim.
+/// requests and the formatting pipeline's speculative scratch text pass no
+/// live reader and sync their supplied text. Initial eager opens use a reader
+/// so a delayed connection starts with current text.
 pub(super) async fn sync_host_document<S: MessageSender>(
     sender: &mut S,
     docs: &mut std::collections::HashMap<(String, ConnectionKey), HostDocSyncState>,
@@ -176,7 +177,7 @@ pub(super) async fn sync_host_document<S: MessageSender>(
     let fp = fingerprint(text);
     // The revision the text being sent was read at: the live reader's own
     // (it read both under this lock), else the caller's stamp, else none
-    // (speculative text is synced verbatim and never moves the watermark).
+    // (unstamped text is synced verbatim and never moves the watermark).
     let content_version = live
         .as_ref()
         .map(|(_, version)| *version)

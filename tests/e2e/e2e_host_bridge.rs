@@ -1811,6 +1811,7 @@ fn init_host_completion_client(mode: &str) -> (LspClient, tempfile::TempDir, Val
             "capabilities": {},
             "workspaceFolders": null,
             "initializationOptions": {
+                "diagnosticsDebounceMs": 60_000,
                 "languageServers": {
                     "mock-host": {
                         "cmd": [mock_bin(), mode],
@@ -1932,5 +1933,80 @@ fn e2e_host_bridge_completion_skips_envelope_without_resolve_support() {
          routing envelope wrapped around it: {item}"
     );
 
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_host_completion_resolve_syncs_before_debounced_forwarding() {
+    let (mut client, _config_dir, item) = init_host_completion_client("completion-resolve-text");
+    let updated = "# Updated\n\nSee [reference].\n\n[reference]: https://example.com\n";
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": MARKDOWN_URI, "version": 2 },
+            "contentChanges": [{ "text": updated }]
+        }),
+    );
+    let response = client.send_request("completionItem/resolve", item);
+    assert_eq!(
+        response["result"]["detail"], updated,
+        "resolve must read the edited text without waiting for debounced host sync: {response}"
+    );
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_host_completion_resolve_allows_edits_while_the_reply_is_pending() {
+    let (mut client, _config_dir, item) = init_host_completion_client("completion-resolve-delayed");
+    let id = client.send_request_async("completionItem/resolve", item.clone());
+    assert!(client.wait_for_log_message(
+        "completion-resolve-started",
+        std::time::Duration::from_secs(10)
+    ));
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": MARKDOWN_URI, "version": 2 },
+            "contentChanges": [{ "text": "# Edited\n\nSee [reference].\n" }]
+        }),
+    );
+    // An ordinary host request synchronizes immediately even with the long
+    // diagnostic debounce. The mock releases the old reply on this didChange.
+    client.send_request_async(
+        "textDocument/completion",
+        json!({
+            "textDocument": { "uri": MARKDOWN_URI },
+            "position": { "line": 2, "character": 6 }
+        }),
+    );
+    let response = client.receive_response_for_id_public(id);
+    assert_eq!(
+        response["result"], item,
+        "edited-in-flight reply must be discarded: {response}"
+    );
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_host_completion_resolve_allows_reopen_while_the_reply_is_pending() {
+    let (mut client, _config_dir, item) =
+        init_host_completion_client("completion-resolve-reopen-delayed");
+    let id = client.send_request_async("completionItem/resolve", item.clone());
+    assert!(client.wait_for_log_message(
+        "completion-resolve-started",
+        std::time::Duration::from_secs(10)
+    ));
+    client.send_notification(
+        "textDocument/didClose",
+        json!({ "textDocument": { "uri": MARKDOWN_URI } }),
+    );
+    client.send_notification("textDocument/didOpen", json!({
+        "textDocument": { "uri": MARKDOWN_URI, "languageId": "markdown", "version": 1, "text": MARKDOWN }
+    }));
+    let response = client.receive_response_for_id_public(id);
+    assert_eq!(
+        response["result"], item,
+        "reopened-in-flight reply must be discarded: {response}"
+    );
     shutdown(&mut client);
 }

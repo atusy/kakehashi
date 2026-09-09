@@ -371,6 +371,7 @@ fn main() {
                     "completion-resolve"
                     | "completion-resolve-plain"
                     | "completion-resolve-echo-edit"
+                    | "completion-resolve-text"
                     | "completion-resolve-reopen-delayed"
                     | "completion-resolve-delayed"
                     | "completion-resolve-additional-edit" => json!({
@@ -820,7 +821,11 @@ fn main() {
                     .and_then(Value::as_str)
                     .unwrap_or("?")
                     .to_string();
-                item["detail"] = json!(format!("mock-resolved:{path}"));
+                item["detail"] = if mode == "completion-resolve-text" {
+                    json!(documents.get(&path))
+                } else {
+                    json!(format!("mock-resolved:{path}"))
+                };
                 // `completion-resolve-plain`: fill only `detail`, so the reply
                 // survives the bridge's edit guard inside a one-line region and
                 // a test can tell a resolved item from an unresolved one.
@@ -841,6 +846,7 @@ fn main() {
                 }
                 if mode != "completion-resolve-plain"
                     && mode != "completion-resolve-echo-edit"
+                    && mode != "completion-resolve-text"
                     && mode != "completion-resolve-reopen-delayed"
                     && mode != "completion-resolve-delayed"
                     && mode != "completion-resolve-additional-edit"

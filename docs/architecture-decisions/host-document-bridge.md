@@ -103,10 +103,17 @@ Partially implemented:
   language; the end and per-line offsets are read live for the translation),
   and after the reply it checks the incarnation and refuses a reply the
   document was edited under while the request was in flight. The downstream
-  computes the lazy fields against its own copy
-  of the text, which the bridge keeps in step (a resolve enqueued before the
-  virtual `didChange` for the latest host edit has been forwarded still
-  reaches the previous copy; see #1053). Every host-layer producer (completion,
+  computes the lazy fields against text synchronized immediately before the
+  resolve on its own connection. After connection acquisition and the bounded
+  parse wait, completion captures the current text and geometry under the host
+  edit lock. It keeps that lock through sync and request enqueue, using the
+  existing host sync or virtual content fingerprint/version tracking, and
+  releases it before waiting for the reply. This closes the deferred-forwarding
+  window in #1053 without adding a second revision watermark. A failed sync
+  suppresses the resolve. A contended lifecycle lock returns the item unresolved
+  instead of parking edits behind reconciliation. Successful virtual replies
+  carry the geometry used to translate their edits, so a repeated resolve can
+  reverse that translation correctly. Every host-layer producer (completion,
   codeAction, codeLens, documentLink, inlayHint) stamps its items with the
   incarnation the host text was read under (codeAction and inlayHint with its
   revision as well), from one store read, and discards a reply the downstream

@@ -5,14 +5,14 @@
 //! `CompletionItem.data` during the original completion fan-out.
 
 use tower_lsp_server::jsonrpc::Result;
-use tower_lsp_server::ls_types::{CompletionItem, Position};
+use tower_lsp_server::ls_types::CompletionItem;
 use url::Url;
 
 use super::super::Kakehashi;
-use crate::lsp::bridge::RegionOffset;
+use crate::lsp::bridge::{CompletionResolveDocument, HostRevision, RegionOffset};
 use crate::lsp::bridge::{KakehashiEnvelope, extract_envelope};
 use crate::lsp::current_upstream_id;
-use crate::lsp::lsp_impl::region_offset::resolve_region_offset;
+use crate::lsp::lsp_impl::region_offset::{resolve_region, resolved_region_geometry};
 
 impl Kakehashi {
     /// Handle a `completionItem/resolve` request.
@@ -39,107 +39,100 @@ impl Kakehashi {
         // boundary (the envelope round-trips through unprotected client `data`)
         // — it guards against accidental bypass, and the host path fails soft.
         let envelope = extract_envelope(&params);
-        // The region's live geometry, rebuilt by the gate below, so the
-        // resolved edits are translated and validated against the region as
-        // it is now rather than as it was when the item was produced.
-        let mut live_geometry = None;
-        // The text revision the downstream answers for; an edit landing while
-        // the request is in flight refuses the reply (below).
-        let mut revision_then = None;
         if let Some(envelope) = &envelope {
-            let Ok(host_url) = Url::parse(&envelope.host_uri) else {
-                log::warn!(
-                    target: "kakehashi::bridge",
-                    "completionItem/resolve: envelope host_uri {:?} is not a valid URL",
-                    envelope.host_uri
-                );
+            let Ok(uri) = Url::parse(&envelope.host_uri) else {
                 return Ok(params);
             };
-            // No text-revision gate here, unlike the inlay hint and code
-            // action resolves (an edit that lands while the resolve is in
-            // flight is refused after the reply instead): a completion list
-            // is designed to outlive edits
-            // (clients filter it locally while the user keeps typing and
-            // resolve on accept, which itself edits), and the downstream
-            // computes the lazy fields against its own copy of the text,
-            // which the bridge keeps in step (#1053 tracks the window where
-            // a resolve overtakes the forwarded virtual didChange). Only the
-            // lifetime and, on the virt layer, the region geometry are
-            // checked.
-            if !self.host_incarnation_is_current(&host_url, envelope.incarnation) {
-                log::debug!(
-                    target: "kakehashi::bridge",
-                    "completionItem/resolve: {} was reopened since the item was produced; returning item unresolved",
-                    envelope.host_uri
-                );
+            // Refuse an old lifetime before connection acquisition or a parse
+            // wait on the reopened document. Rechecked under the edit lock.
+            if !self.host_incarnation_is_current(&uri, envelope.incarnation) {
                 return Ok(params);
             }
-            // Read BEFORE the region rebuild: an edit landing between the
-            // rebuild and this read would pair geometry of revision N with
-            // revision N+1, and the post-reply check would then let a reply
-            // translated with the old geometry through. Read again after
-            // the rebuild; a moved revision means the geometry is not the
-            // revision's, and the item is returned unresolved (the editor
-            // resolves again on its next accept).
-            revision_then = self
-                .documents
-                .get(&host_url)
-                .map(|document| document.content_version());
-            if !envelope.is_host_layer() {
-                match self.completion_envelope_is_fresh(envelope).await {
-                    Some(geometry) => live_geometry = Some(geometry),
-                    None => return Ok(params),
-                }
-                let revision_after_rebuild = self
-                    .documents
-                    .get(&host_url)
-                    .map(|document| document.content_version());
-                if revision_after_rebuild != revision_then {
-                    log::debug!(
-                        target: "kakehashi::bridge",
-                        "completionItem/resolve: {} was edited while its region was rebuilt; returning item unresolved",
-                        envelope.host_uri
-                    );
-                    return Ok(params);
-                }
-            }
         }
-        // Kept for the post-response check; the gates above return `params`
-        // itself, so only a resolve that is actually dispatched pays for it.
         let unresolved = envelope.as_ref().map(|_| params.clone());
         let settings = self.settings_manager.load_settings();
         let pool = self.bridge.pool_arc();
         let upstream_id = current_upstream_id();
-        // Propagate a client `$/cancelRequest` as RequestCancelled instead of
-        // masking it as an unresolved-item success: the cancel IS forwarded
-        // downstream, and the -32800 that comes back is collapsed to "no usable
-        // response" by the fail-soft parsing. Mirrors `code_action_resolve_impl`.
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
-        let sweep_id = upstream_id.clone();
-        let dispatch =
-            pool.dispatch_completion_resolve(params, &settings, upstream_id, live_geometry);
-        // The cancel arm DROPS the in-flight dispatch, which then never reaches
-        // its own unregister. An RAII sweep covers that — and, unlike a trailing
-        // statement, also runs when this whole handler future is dropped (client
-        // disconnect / shutdown), which is how the entry leaked before. The
-        // CAPTURED id, not a re-read of the task-local: the sweep must target
-        // exactly the id the dispatch registered under.
         let _sweep = crate::lsp::lsp_impl::bridge_context::UpstreamRegistrySweepGuard::new(
             std::sync::Arc::clone(&pool),
-            sweep_id,
+            upstream_id.clone(),
         );
-        // A didChange/didClose/didOpen is allowed to proceed once the resolve
-        // was enqueued. Revalidate after the response: the lifetime, and the
-        // text revision the downstream answered for. Edits BEFORE dispatch
-        // are what a completion list is designed to outlive (the gate above
-        // rebuilt the region for them); an edit landing while the request
-        // was in flight makes the reply's coordinates belong to text the
-        // document no longer holds — an inserted line near the fence start
-        // keeps the region's identity and start yet moves every line the
-        // reply's edits name — so such a reply is refused.
         let resolve = async {
-            let resolved = dispatch.await;
-            if let (Some(envelope), Some(unresolved)) = (envelope, unresolved) {
+            let mut revision_then = None;
+            // Polled only after the origin connection is ready. Do not hold an
+            // edit lock during a handshake, parse wait, or downstream reply.
+            let document = async {
+                let envelope = envelope.as_ref()?;
+                let host_url = Url::parse(&envelope.host_uri).ok()?;
+                if !self.host_incarnation_is_current(&host_url, envelope.incarnation) {
+                    return None;
+                }
+                if !envelope.is_host_layer() {
+                    self.wait_for_resolve_parse(&host_url).await;
+                }
+                let edit_lock = self.documents.edit_lock(&host_url);
+                let edit_guard = std::sync::Arc::clone(&edit_lock).lock_owned().await;
+                let prepared = (|| {
+                    if !self.host_incarnation_is_current(&host_url, envelope.incarnation) {
+                        return None;
+                    }
+                    let (host_text, incarnation, content_version) = {
+                        let doc = self.documents.get(&host_url)?;
+                        (doc.text_arc(), doc.incarnation(), doc.content_version())
+                    };
+                    if Some(incarnation) != envelope.incarnation {
+                        return None;
+                    }
+                    let (language_id, text, geometry) = if envelope.is_host_layer() {
+                        (self.document_language(&host_url)?, host_text, None)
+                    } else {
+                        let region = resolve_region(
+                            &self.documents,
+                            &self.language,
+                            &self.bridge,
+                            &host_url,
+                            &envelope.region_id,
+                        )?;
+                        let text = std::sync::Arc::from(region.virtual_content.as_str());
+                        let (offset, end, contiguous, language) = resolved_region_geometry(region);
+                        if !completion_geometry_matches(envelope, &offset, contiguous, &language) {
+                            return None;
+                        }
+                        (language, text, Some((offset, end)))
+                    };
+                    Some((
+                        language_id,
+                        text,
+                        geometry,
+                        HostRevision {
+                            incarnation,
+                            content_version,
+                        },
+                    ))
+                })();
+                let Some((language_id, text, geometry, revision)) = prepared else {
+                    drop(edit_guard);
+                    self.documents
+                        .remove_edit_lock_if_unshared(&host_url, &edit_lock);
+                    return None;
+                };
+                revision_then = Some(revision.content_version);
+                Some(CompletionResolveDocument {
+                    host_uri: host_url,
+                    language_id,
+                    text,
+                    geometry,
+                    revision,
+                    edit_guard,
+                })
+            };
+            let resolved = pool
+                .dispatch_completion_resolve(params, &settings, upstream_id, document)
+                .await;
+            // Edits after enqueue are allowed to proceed, but their older
+            // reply must not surface coordinates for the superseded text.
+            if let (Some(envelope), Some(unresolved)) = (envelope.as_ref(), unresolved) {
                 let Ok(host_url) = Url::parse(&envelope.host_uri) else {
                     return unresolved;
                 };
@@ -174,51 +167,6 @@ impl Kakehashi {
             },
             None => Ok(resolve.await),
         }
-    }
-
-    /// Whether the envelope still names the region it was produced for; on
-    /// success, the region's live offset and end. Only the region's identity,
-    /// start and contiguity are compared — its end, and the per-line column
-    /// vector of a blockquoted fence, move with ordinary typing inside the
-    /// region, which a completion list is designed to outlive.
-    async fn completion_envelope_is_fresh(
-        &self,
-        envelope: &KakehashiEnvelope,
-    ) -> Option<(RegionOffset, Position)> {
-        let Ok(host_url) = Url::parse(&envelope.host_uri) else {
-            return None;
-        };
-        // A resolve issued while the post-edit reparse is still running would
-        // find no snapshot and read as a stale region; wait (bounded) for the
-        // current parse before rebuilding the region.
-        self.wait_for_resolve_parse(&host_url).await;
-        let Some((offset, region_end, contiguous, live_language)) = resolve_region_offset(
-            &self.documents,
-            &self.language,
-            &self.bridge,
-            &host_url,
-            &envelope.region_id,
-        ) else {
-            log::debug!(
-                target: "kakehashi::bridge",
-                "completionItem/resolve: region {} of {} is stale; returning item unresolved",
-                envelope.region_id,
-                envelope.host_uri
-            );
-            return None;
-        };
-        if !completion_geometry_matches(envelope, &offset, contiguous, &live_language) {
-            log::debug!(
-                target: "kakehashi::bridge",
-                "completionItem/resolve: region {} of {} moved, lost contiguity or changed language \
-                 (live offset {:?}, contiguous {contiguous}, language {live_language}); returning item unresolved",
-                envelope.region_id,
-                envelope.host_uri,
-                offset
-            );
-            return None;
-        }
-        Some((offset, region_end))
     }
 }
 

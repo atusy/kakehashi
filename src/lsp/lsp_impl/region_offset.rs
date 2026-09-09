@@ -161,6 +161,17 @@ pub(super) fn resolve_region_offset(
     host_url: &Url,
     region_id: &str,
 ) -> Option<(RegionOffset, Position, bool, String)> {
+    resolve_region(documents, language, bridge, host_url, region_id).map(resolved_region_geometry)
+}
+
+/// Resolve geometry and content from the same current snapshot.
+pub(super) fn resolve_region(
+    documents: &DocumentStore,
+    language: &Arc<LanguageCoordinator>,
+    bridge: &BridgeCoordinator,
+    host_url: &Url,
+    region_id: &str,
+) -> Option<ResolvedInjection> {
     // Snapshot is owned, so the document handle (a store lock) is released
     // before `detect_document_language` reaches back into the store.
     let snapshot = documents.get(host_url)?.snapshot()?;
@@ -179,13 +190,15 @@ pub(super) fn resolve_region_offset(
     // Exact-ID resolution also validates the tracker incarnation and rejects
     // an edit race: if this snapshot no longer contains the tracked layer, no
     // candidate has the ID and callers fall back safely.
-    Some(resolved_region_geometry(resolved))
+    Some(resolved)
 }
 
 /// Consume a resolved region into the geometry shared by freshness and edit
 /// validation. The end is derived from the exact virtual content rather than
 /// the raw content-node range, whose trailing named children may be excluded.
-fn resolved_region_geometry(resolved: ResolvedInjection) -> (RegionOffset, Position, bool, String) {
+pub(super) fn resolved_region_geometry(
+    resolved: ResolvedInjection,
+) -> (RegionOffset, Position, bool, String) {
     let start_line = resolved.region.line_range.start;
     let offset = RegionOffset::with_per_line_offsets(start_line, resolved.line_column_offsets);
     let region_end = region_host_end(&resolved.virtual_content, &offset);
