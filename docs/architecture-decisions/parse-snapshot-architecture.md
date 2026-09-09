@@ -461,8 +461,10 @@ Any reader that must resolve against **live** positions is position-critical
   Successful and tree-less responses record interest under the edit lock and
   validate snapshot currency, preventing old responses from restoring a cleared
   mark. Same-version tree-less upgrades and non-edit token changes retain their
-  refresh paths. The `CancelToken`
-  bail stays narrowed to reclaiming a superseded compute's CPU (§4).
+  refresh paths. Clearing interest changes future settle eligibility; it does not
+  retract already queued or in-flight recovery or non-edit workspace refreshes.
+  Those refreshes can still overlap subsequent edits. The `CancelToken` bail stays
+  narrowed to reclaiming a superseded compute's CPU (§4).
 - **Passively refreshed whole-document reads** — `documentSymbol` and pull-mode
   `textDocument/diagnostic` may serve the latest stale snapshot. The
   `whole_document_fan_out` family (`documentColor`, `documentLink`,
