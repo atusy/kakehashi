@@ -7,6 +7,10 @@
 -- spaces (default 1, suitable for the generated Rust fixture's use statement).
 local edit_line = tonumber(vim.env.PROBE_LINE or "1")
 local count = tonumber(vim.env.PROBE_SAMPLES or "8")
+local burst = tonumber(vim.env.PROBE_BURST or "1")
+local interval = tonumber(vim.env.PROBE_INTERVAL_MS or "20")
+assert(burst and burst > 0 and burst % 1 == 0, "invalid PROBE_BURST")
+assert(interval and interval >= 0, "invalid PROBE_INTERVAL_MS")
 assert(edit_line and edit_line >= 0 and edit_line % 1 == 0, "invalid PROBE_LINE")
 assert(count and count > 0 and count % 1 == 0, "invalid PROBE_SAMPLES")
 for _, key in ipairs({ "PROBE_BIN", "PROBE_FILE", "PROBE_CONFIG", "PROBE_OUTPUT" }) do
@@ -105,7 +109,14 @@ end
 local expected = tracked_start()
 for i = 1, count do
 	active = { started = now(), iteration = i, events = {} }
-	vim.api.nvim_buf_set_text(buf, edit_line, 0, edit_line, 0, { " " })
+	for edit = 1, burst do
+		active.ready_ms = nil
+		active.last_edit_ms = now() - active.started
+		vim.api.nvim_buf_set_text(buf, edit_line, 0, edit_line, 0, { " " })
+		if edit < burst and interval > 0 then
+			vim.wait(interval)
+		end
+	end
 	active.edit_call_ms = now() - active.started
 	assert(
 		vim.wait(60000, function()
@@ -113,8 +124,9 @@ for i = 1, count do
 		end, 5),
 		"edit tokens timed out"
 	)
-	expected = expected + 1
+	expected = expected + burst
 	assert(tracked_start() == expected, "response does not match the latest unique edit")
+	active.follow_ms = active.ready_ms - active.last_edit_ms
 	active.tracked_start = expected
 	active.token_count = #cls.active[buf].client_state[id].current_result.tokens / 5
 	active.started = nil
@@ -124,6 +136,9 @@ end
 vim.fn.writefile({
 	vim.json.encode({
 		samples = samples,
+		final_token_sha256 = vim.fn.sha256(vim.json.encode(cls.active[buf].client_state[id].current_result.tokens)),
+		burst = burst,
+		interval_ms = interval,
 		nvim = vim.version(),
 		file = vim.env.PROBE_FILE,
 		note = "ready is client token conversion completion, not visible UI paint",
