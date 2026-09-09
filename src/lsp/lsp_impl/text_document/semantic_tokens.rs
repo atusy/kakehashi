@@ -228,33 +228,37 @@ impl Kakehashi {
         let profile_start = log::log_enabled!(target: "kakehashi::profile", log::Level::Debug)
             .then(std::time::Instant::now);
         let result = async {
-            let wait = self.wait_for_current_snapshot(uri, TOKEN_SETTLE_BACKSTOP);
-            let outcome = match cancel_rx {
+            let wait = async {
+                match self
+                    .wait_for_current_snapshot(uri, TOKEN_SETTLE_BACKSTOP)
+                    .await
+                {
+                    SnapshotWait::Current(snapshot) => TokenSnapshot::Current(snapshot),
+                    SnapshotWait::Stale => self.token_snapshot_after_timeout(uri, supersede).await,
+                    SnapshotWait::Unparsed | SnapshotWait::Gone => TokenSnapshot::Absent,
+                }
+            };
+            match cancel_rx {
                 Some(rx) => {
                     tokio::select! {
                         biased;
                         // Fires on $/cancelRequest (and on forwarder teardown,
                         // which the compute-race arms below treat as cancel too).
-                        _ = rx => return TokenSnapshot::Cancelled,
+                        _ = rx => TokenSnapshot::Cancelled,
                         // Fires when a newer request for this document flips this
                         // request's tracker token — release the park (and its
                         // admission slot) instead of computing a discarded result.
-                        _ = supersede.cancelled() => return TokenSnapshot::Superseded,
+                        _ = supersede.cancelled() => TokenSnapshot::Superseded,
                         outcome = wait => outcome,
                     }
                 }
                 None => {
                     tokio::select! {
                         biased;
-                        _ = supersede.cancelled() => return TokenSnapshot::Superseded,
+                        _ = supersede.cancelled() => TokenSnapshot::Superseded,
                         outcome = wait => outcome,
                     }
                 }
-            };
-            match outcome {
-                SnapshotWait::Current(snapshot) => TokenSnapshot::Current(snapshot),
-                SnapshotWait::Stale => self.token_snapshot_after_timeout(uri, supersede).await,
-                SnapshotWait::Unparsed | SnapshotWait::Gone => TokenSnapshot::Absent,
             }
         }
         .await;
@@ -1461,6 +1465,38 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn token_timeout_lock_wait_remains_client_cancellable() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///timeout-cancel.rs").unwrap();
+        server
+            .documents
+            .insert(uri.clone(), "old".into(), None, None);
+        publish_treeless(server, &uri, "old", 0);
+        server
+            .documents
+            .update_document(uri.clone(), "new".into(), None);
+        let edit_lock = server.documents.edit_lock(&uri);
+        let _guard = edit_lock.lock().await;
+        let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel();
+        let supersede = crate::cancel::CancelToken::default();
+        let mut request = std::pin::pin!(server.current_snapshot_for_tokens(
+            &uri,
+            Some(&mut cancel_rx),
+            &supersede
+        ));
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        tokio::time::advance(crate::lsp::lsp_impl::snapshot_read::TOKEN_SETTLE_BACKSTOP).await;
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        cancel_tx.send(()).unwrap();
+        assert!(matches!(
+            futures::poll!(request.as_mut()),
+            std::task::Poll::Ready(TokenSnapshot::Cancelled)
+        ));
+        assert_eq!(server.cache.served_semantic_version(&uri), None);
+    }
+
     #[tokio::test]
     async fn cancelled_timeout_cannot_register_interest_for_a_reopened_document() {
         let (service, _socket) = LspService::new(Kakehashi::new);
@@ -1478,6 +1514,34 @@ mod tests {
         assert!(matches!(
             server.token_snapshot_after_timeout(&uri, &cancel).await,
             TokenSnapshot::Superseded
+        ));
+        assert_eq!(server.cache.served_semantic_version(&uri), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn token_timeout_lock_wait_remains_supersedable() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///timeout-supersede.rs").unwrap();
+        server
+            .documents
+            .insert(uri.clone(), "old".into(), None, None);
+        publish_treeless(server, &uri, "old", 0);
+        server
+            .documents
+            .update_document(uri.clone(), "new".into(), None);
+        let edit_lock = server.documents.edit_lock(&uri);
+        let _guard = edit_lock.lock().await;
+        let supersede = crate::cancel::CancelToken::default();
+        let mut request =
+            std::pin::pin!(server.current_snapshot_for_tokens(&uri, None, &supersede));
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        tokio::time::advance(crate::lsp::lsp_impl::snapshot_read::TOKEN_SETTLE_BACKSTOP).await;
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        supersede.cancel();
+        assert!(matches!(
+            futures::poll!(request.as_mut()),
+            std::task::Poll::Ready(TokenSnapshot::Superseded)
         ));
         assert_eq!(server.cache.served_semantic_version(&uri), None);
     }
