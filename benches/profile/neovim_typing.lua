@@ -18,6 +18,7 @@ for _, key in ipairs({ "PROBE_BIN", "PROBE_FILE", "PROBE_CONFIG", "PROBE_OUTPUT"
 end
 local uv = vim.uv
 local samples, active = {}, nil
+local response_samples = {}
 local function now()
 	return uv.hrtime() / 1e6
 end
@@ -25,18 +26,22 @@ local sem = vim.lsp.semantic_tokens
 local cls = sem.__STHighlighter
 local original = cls.process_response
 cls.process_response = function(self, response, client, request_id, version, is_range)
-	local sample = active
+	local origin = response_samples[request_id]
+	local sample = origin and origin.sample
 	if sample then
-		sample.response_ms = now() - sample.started
+		sample.response_ms = now() - origin.started
 		table.insert(sample.events, { event = "response", ms = sample.response_ms, id = request_id, version = version })
 	end
 	original(self, response, client, request_id, version, is_range)
 	if
 		sample
+		and sample == active
+		and sample.ready_ms == nil
+		and version == vim.lsp.util.buf_versions[self.bufnr]
 		and not is_range
 		and self.client_state[client.id].current_result.version == vim.lsp.util.buf_versions[self.bufnr]
 	then
-		sample.ready_ms = now() - sample.started
+		sample.ready_ms = now() - origin.started
 		sample.response_version = version
 	end
 end
@@ -58,35 +63,47 @@ local id = vim.lsp.start({
 	on_init = function(client)
 		local rpc_request = client.rpc.request
 		client.rpc.request = function(method, params, callback, notify_reply_callback, ...)
-			if active and method:find("semanticTokens", 1, true) then
-				active.wire_request_ms = now() - active.started
-				table.insert(active.events, { event = method, ms = active.wire_request_ms })
+			local sample = active and method:find("semanticTokens", 1, true) and active or nil
+			local origin = sample and { sample = sample, started = sample.started } or nil
+			local sent
+			if sample then
+				sample.wire_request_ms = now() - origin.started
+				sent = { event = method, ms = sample.wire_request_ms }
+				table.insert(sample.events, sent)
 			end
-			return rpc_request(method, params, function(err, result, request_id)
-				if active and method:find("semanticTokens", 1, true) then
-					table.insert(active.events, {
+			local success, request_id = rpc_request(method, params, function(err, result, reply_id)
+				if sample then
+					table.insert(sample.events, {
 						event = "wire_response",
 						method = method,
-						id = request_id,
-						ms = now() - active.started,
+						id = reply_id,
+						ms = now() - origin.started,
 						error = err,
 						null = result == nil or result == vim.NIL,
 					})
 				end
-				return callback(err, result, request_id)
-			end, function(request_id)
-				if active and method:find("semanticTokens", 1, true) then
-					table.insert(active.events, {
+				-- process_response may yield; it captures this origin before yielding.
+				response_samples[reply_id] = origin
+				local returned = vim.F.pack_len(callback(err, result, reply_id))
+				response_samples[reply_id] = nil
+				return vim.F.unpack_len(returned)
+			end, function(reply_id)
+				if sample then
+					table.insert(sample.events, {
 						event = "wire_reply",
 						method = method,
-						id = request_id,
-						ms = now() - active.started,
+						id = reply_id,
+						ms = now() - origin.started,
 					})
 				end
 				if notify_reply_callback then
-					return notify_reply_callback(request_id)
+					return notify_reply_callback(reply_id)
 				end
 			end, ...)
+			if sent then
+				sent.id = request_id
+			end
+			return success, request_id
 		end
 		local notify = client.rpc.notify
 		client.rpc.notify = function(method, params)
