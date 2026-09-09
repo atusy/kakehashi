@@ -128,6 +128,9 @@ impl Kakehashi {
     /// Register interest before re-reading a placeholder: publication can run
     /// outside the edit lock. A tree published before this read is consumed now;
     /// publication after it sees the interest and refreshes the empty response.
+    /// A concurrent upgrade can still queue a conservative recovery refresh.
+    /// Do not clear this shared mark after consuming a tree: another full/range
+    /// response may need it, and clearing cannot retract an already queued event.
     async fn resolve_empty_token_snapshot(
         &self,
         uri: &Url,
