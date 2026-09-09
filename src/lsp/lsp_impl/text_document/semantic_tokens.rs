@@ -125,6 +125,36 @@ impl Kakehashi {
         current
     }
 
+    /// Register interest before re-reading a placeholder: publication can run
+    /// outside the edit lock. A tree published before this read is consumed now;
+    /// publication after it sees the interest and refreshes the empty response.
+    async fn resolve_empty_token_snapshot(
+        &self,
+        uri: &Url,
+        snapshot: std::sync::Arc<crate::document::snapshot::ParseSnapshot>,
+        generation: u64,
+        request_id: Option<crate::lsp::cache::RequestId>,
+    ) -> Option<std::sync::Arc<crate::document::snapshot::ParseSnapshot>> {
+        if snapshot.tree.is_some() && snapshot.language.is_some() {
+            return Some(snapshot);
+        }
+        let edit_lock = self.documents.edit_lock(uri);
+        let _guard = edit_lock.lock().await;
+        if !self.semantic_snapshot_is_current(
+            uri,
+            snapshot.incarnation,
+            snapshot.parsed_version,
+            generation,
+            &edit_lock,
+        ) || request_id.is_some_and(|id| !self.cache.is_request_active(uri, id))
+        {
+            return None;
+        }
+        self.cache
+            .record_served_semantic_version(uri, snapshot.parsed_version);
+        self.documents.latest_snapshot(uri)?.slot.snapshot
+    }
+
     /// Register a failed current-snapshot wait, then recheck publication. The
     /// parse may have settled after the timeout but before this marker: in that
     /// case serve it now instead of losing the only refresh wakeup.
@@ -367,27 +397,16 @@ impl Kakehashi {
                 return Ok(None);
             }
         };
+        let Some(snapshot) = self
+            .resolve_empty_token_snapshot(&uri, snapshot, token_generation, Some(request_id))
+            .await
+        else {
+            self.cache.finish_request(&uri, request_id);
+            return Ok(None);
+        };
         let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
         else {
-            let edit_lock = self.documents.edit_lock(&uri);
-            let _guard = edit_lock.lock().await;
-            if !self.semantic_snapshot_is_current(
-                &uri,
-                snapshot.incarnation,
-                snapshot.parsed_version,
-                token_generation,
-                &edit_lock,
-            ) || !self.cache.is_request_active(&uri, request_id)
-            {
-                self.cache.finish_request(&uri, request_id);
-                return Ok(None);
-            }
-            // No detectable language, or resolved-but-tree-less (see
-            // `ParseSnapshot` for the causes): nothing to tokenize. The empty set
-            // IS this snapshot's served state — record it so the parse loop
-            // doesn't keep refreshing a document that has no tokens.
-            self.cache
-                .record_served_semantic_version(&uri, snapshot.parsed_version);
+            // The placeholder was rechecked after registering refresh interest.
             self.cache.finish_request(&uri, request_id);
             return Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
                 result_id: None,
@@ -760,23 +779,15 @@ impl Kakehashi {
                 return Ok(None);
             }
         };
+        let Some(snapshot) = self
+            .resolve_empty_token_snapshot(&uri, snapshot, token_generation, Some(request_id))
+            .await
+        else {
+            self.cache.finish_request(&uri, request_id);
+            return Ok(None);
+        };
         let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
         else {
-            let edit_lock = self.documents.edit_lock(&uri);
-            let _guard = edit_lock.lock().await;
-            if !self.semantic_snapshot_is_current(
-                &uri,
-                snapshot.incarnation,
-                snapshot.parsed_version,
-                token_generation,
-                &edit_lock,
-            ) || !self.cache.is_request_active(&uri, request_id)
-            {
-                self.cache.finish_request(&uri, request_id);
-                return Ok(None);
-            }
-            self.cache
-                .record_served_semantic_version(&uri, snapshot.parsed_version);
             self.cache.finish_request(&uri, request_id);
             return Ok(Some(SemanticTokensFullDeltaResult::Tokens(
                 SemanticTokens {
@@ -1178,21 +1189,14 @@ impl Kakehashi {
             incarnation: snapshot.incarnation,
             generation,
         };
+        let Some(snapshot) = self
+            .resolve_empty_token_snapshot(&uri, snapshot, generation, None)
+            .await
+        else {
+            return Err(crate::error::content_modified_error());
+        };
         let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
         else {
-            let edit_lock = self.documents.edit_lock(&uri);
-            let _guard = edit_lock.lock().await;
-            if !self.semantic_snapshot_is_current(
-                &uri,
-                snapshot.incarnation,
-                snapshot.parsed_version,
-                generation,
-                &edit_lock,
-            ) {
-                return Err(crate::error::content_modified_error());
-            }
-            self.cache
-                .record_served_semantic_version(&uri, snapshot.parsed_version);
             return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
                 result_id: None,
                 data: vec![],
@@ -1463,6 +1467,106 @@ mod tests {
         assert!(
             matches!(outcome, TokenSnapshot::Current(snapshot) if snapshot.parsed_version == 1)
         );
+    }
+
+    #[tokio::test]
+    async fn empty_token_response_consumes_a_same_version_tree_upgrade() {
+        for kind in ["full", "delta", "range"] {
+            let (service, _socket) = LspService::new(Kakehashi::new);
+            let server = service.inner();
+            let uri = Url::parse("file:///placeholder-upgrade.rs").unwrap();
+            let text = "fn main() {}";
+            let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+            server
+                .language
+                .language_registry_for_parallel()
+                .register("rust".into(), language.clone());
+            server.language.query_store().insert_highlight_query(
+                "rust".into(),
+                std::sync::Arc::new(
+                    tree_sitter::Query::new(&language, "(identifier) @function").unwrap(),
+                ),
+            );
+            server
+                .documents
+                .insert(uri.clone(), "old".into(), Some("rust".into()), None);
+            server.cache.record_served_semantic_version(&uri, 0);
+            server
+                .documents
+                .update_document(uri.clone(), text.into(), None);
+            server.cache.reset_semantic_refresh_interest(&uri);
+            publish_treeless(server, &uri, text, 1);
+            let edit_lock = server.documents.edit_lock(&uri);
+            let guard = edit_lock.lock().await;
+            let mut request = std::pin::pin!(async {
+                match kind {
+                    "full" => {
+                        let Some(SemanticTokensResult::Tokens(tokens)) = server
+                            .semantic_tokens_full_impl(full_params(&uri))
+                            .await
+                            .unwrap()
+                        else {
+                            panic!("expected full tokens")
+                        };
+                        tokens.data
+                    }
+                    "delta" => {
+                        let params = SemanticTokensDeltaParams {
+                            text_document: full_params(&uri).text_document,
+                            previous_result_id: "missing-baseline".into(),
+                            work_done_progress_params: Default::default(),
+                            partial_result_params: Default::default(),
+                        };
+                        let Some(SemanticTokensFullDeltaResult::Tokens(tokens)) = server
+                            .semantic_tokens_full_delta_impl(params)
+                            .await
+                            .unwrap()
+                        else {
+                            panic!("expected delta full fallback")
+                        };
+                        tokens.data
+                    }
+                    "range" => {
+                        let params = range_params(
+                            &uri,
+                            Range::new(Position::new(0, 0), Position::new(0, text.len() as u32)),
+                        );
+                        let Some(SemanticTokensRangeResult::Tokens(tokens)) =
+                            server.semantic_tokens_range_impl(params).await.unwrap()
+                        else {
+                            panic!("expected range tokens")
+                        };
+                        tokens.data
+                    }
+                    _ => unreachable!(),
+                }
+            });
+            assert!(futures::poll!(request.as_mut()).is_pending());
+            let mut parser = tree_sitter::Parser::new();
+            parser.set_language(&language).unwrap();
+            let tree = parser.parse(text, None).unwrap();
+            let doc = server.documents.get(&uri).unwrap();
+            assert!(doc.publish_snapshot(&std::sync::Arc::new(
+                crate::document::snapshot::ParseSnapshot {
+                    text: std::sync::Arc::from(text),
+                    tree: Some(tree),
+                    language: Some("rust".into()),
+                    parsed_version: 1,
+                    incarnation: doc.incarnation(),
+                    injection_regions: None,
+                    regions: None,
+                    layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
+                }
+            )));
+            drop(doc);
+            assert_eq!(server.cache.served_semantic_version(&uri), None);
+            drop(guard);
+            let tokens = request.await;
+            assert!(
+                !tokens.is_empty(),
+                "{kind}: the published tree must replace the captured placeholder"
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]
