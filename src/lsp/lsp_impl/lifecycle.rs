@@ -696,9 +696,7 @@ impl Kakehashi {
                 linked_editing_range_provider: Some(LinkedEditingRangeServerCapabilities::Simple(
                     true,
                 )),
-                color_provider: self
-                    .experimental_enabled()
-                    .then_some(ColorProviderCapability::Simple(true)),
+                color_provider: Some(ColorProviderCapability::Simple(true)),
                 moniker_provider: Some(OneOf::Left(true)),
                 // pull-first-diagnostic-forwarding: Pull-first diagnostic forwarding
                 diagnostic_provider: Some(DiagnosticServerCapabilities::Options(

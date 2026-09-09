@@ -209,7 +209,7 @@ priorities = ["virt", "host"]
     let mut client = LspClient::builder()
         .arg("--config-file")
         .arg(config_path.to_str().expect("temp path should be UTF-8"))
-        .env("KAKEHASHI_EXPERIMENTAL", "true")
+        .env_remove("KAKEHASHI_EXPERIMENTAL")
         .build();
     let init = client.send_request(
         "initialize",
@@ -387,7 +387,7 @@ priorities = ["virt", "host"]
     let mut client = LspClient::builder()
         .arg("--config-file")
         .arg(config_path.to_str().expect("temp path should be UTF-8"))
-        .env("KAKEHASHI_EXPERIMENTAL", "true")
+        .env_remove("KAKEHASHI_EXPERIMENTAL")
         .env("MOCK_LSP_CANCEL_DIR", event_dir.path().to_string_lossy())
         .build();
     let _init = client.send_request(
@@ -516,7 +516,7 @@ priorities = ["host"]
     let mut client = LspClient::builder()
         .arg("--config-file")
         .arg(config_path.to_str().expect("temp path should be UTF-8"))
-        .env("KAKEHASHI_EXPERIMENTAL", "true")
+        .env_remove("KAKEHASHI_EXPERIMENTAL")
         .env(
             "KAKEHASHI_E2E_WHOLE_DOCUMENT_HOST_BARRIER_DIR",
             barrier_dir.path().to_string_lossy(),

@@ -18,10 +18,7 @@ use super::request_id::RequestId;
 /// Build an LSP initialize request.
 ///
 /// `root_uri` and `workspace_folders` are forwarded from the upstream client;
-/// `upstream_capabilities` are merged into the bridge defaults. `experimental`
-/// is the process-wide `KAKEHASHI_EXPERIMENTAL=true` opt-in, threaded through
-/// to the declared client capabilities.
-#[allow(clippy::too_many_arguments)]
+/// `upstream_capabilities` are merged into the bridge defaults.
 pub(crate) fn build_initialize_request(
     request_id: RequestId,
     initialization_options: Option<serde_json::Value>,
@@ -29,7 +26,6 @@ pub(crate) fn build_initialize_request(
     workspace_folders: Option<Vec<WorkspaceFolder>>,
     upstream_capabilities: Option<&ClientCapabilities>,
     advertise_configuration: bool,
-    experimental: bool,
 ) -> JsonRpcRequest<InitializeParams> {
     let root_path = root_uri.as_deref().and_then(|uri| {
         url::Url::parse(uri)
@@ -48,7 +44,6 @@ pub(crate) fn build_initialize_request(
         capabilities: build_bridge_client_capabilities(
             upstream_capabilities,
             advertise_configuration,
-            experimental,
         ),
         initialization_options,
         ..Default::default()
@@ -295,29 +290,15 @@ mod tests {
     use super::*;
     use rstest::rstest;
 
-    /// Snapshot suffixes predate the runtime opt-in (they matched the old
-    /// "experimental" cargo feature); both variants now run in one process.
-    const EXPERIMENTAL_VARIANTS: [(bool, &str); 2] = [(false, "default"), (true, "experimental")];
-
     #[test]
     fn initialize_request_has_correct_structure() {
-        for (experimental, suffix) in EXPERIMENTAL_VARIANTS {
-            let request = build_initialize_request(
-                RequestId::new(1),
-                None,
-                None,
-                None,
-                None,
-                true,
-                experimental,
-            );
+        let request = build_initialize_request(RequestId::new(1), None, None, None, None, true);
 
-            insta::with_settings!({snapshot_suffix => suffix}, {
-                insta::assert_json_snapshot!(request, {
-                    ".params.processId" => "[PID]",
-                });
+        insta::with_settings!({snapshot_suffix => "default"}, {
+            insta::assert_json_snapshot!(request, {
+                ".params.processId" => "[PID]",
             });
-        }
+        });
     }
 
     #[test]
@@ -329,23 +310,20 @@ mod tests {
                 }
             }
         });
-        for (experimental, suffix) in EXPERIMENTAL_VARIANTS {
-            let request = build_initialize_request(
-                RequestId::new(42),
-                Some(options.clone()),
-                None,
-                None,
-                None,
-                true,
-                experimental,
-            );
+        let request = build_initialize_request(
+            RequestId::new(42),
+            Some(options.clone()),
+            None,
+            None,
+            None,
+            true,
+        );
 
-            insta::with_settings!({snapshot_suffix => suffix}, {
-                insta::assert_json_snapshot!(request, {
-                    ".params.processId" => "[PID]",
-                });
+        insta::with_settings!({snapshot_suffix => "default"}, {
+            insta::assert_json_snapshot!(request, {
+                ".params.processId" => "[PID]",
             });
-        }
+        });
     }
 
     #[test]
@@ -358,7 +336,6 @@ mod tests {
             None,
             None,
             true,
-            false,
         );
 
         let json = serde_json::to_value(&request).unwrap();
@@ -367,8 +344,7 @@ mod tests {
 
     #[test]
     fn initialize_request_has_null_root_uri_when_not_provided() {
-        let request =
-            build_initialize_request(RequestId::new(1), None, None, None, None, true, false);
+        let request = build_initialize_request(RequestId::new(1), None, None, None, None, true);
 
         let json = serde_json::to_value(&request).unwrap();
         assert!(json["params"]["rootUri"].is_null());
@@ -380,29 +356,25 @@ mod tests {
             uri: Uri::from_str("file:///home/user/project").unwrap(),
             name: "project".to_string(),
         }];
-        for (experimental, suffix) in EXPERIMENTAL_VARIANTS {
-            let request = build_initialize_request(
-                RequestId::new(1),
-                None,
-                None,
-                Some(folders.clone()),
-                None,
-                true,
-                experimental,
-            );
+        let request = build_initialize_request(
+            RequestId::new(1),
+            None,
+            None,
+            Some(folders.clone()),
+            None,
+            true,
+        );
 
-            insta::with_settings!({snapshot_suffix => suffix}, {
-                insta::assert_json_snapshot!(request, {
-                    ".params.processId" => "[PID]",
-                });
+        insta::with_settings!({snapshot_suffix => "default"}, {
+            insta::assert_json_snapshot!(request, {
+                ".params.processId" => "[PID]",
             });
-        }
+        });
     }
 
     #[test]
     fn initialize_request_has_null_workspace_folders_when_not_provided() {
-        let request =
-            build_initialize_request(RequestId::new(1), None, None, None, None, true, false);
+        let request = build_initialize_request(RequestId::new(1), None, None, None, None, true);
 
         let json = serde_json::to_value(&request).unwrap();
         assert!(json["params"]["workspaceFolders"].is_null());
@@ -418,7 +390,6 @@ mod tests {
             None,
             None,
             true,
-            false,
         );
 
         let json = serde_json::to_value(&request).unwrap();
@@ -427,8 +398,7 @@ mod tests {
 
     #[test]
     fn initialize_request_has_null_root_path_when_no_root_uri() {
-        let request =
-            build_initialize_request(RequestId::new(1), None, None, None, None, true, false);
+        let request = build_initialize_request(RequestId::new(1), None, None, None, None, true);
 
         let json = serde_json::to_value(&request).unwrap();
         assert!(json["params"]["rootPath"].is_null());
@@ -461,23 +431,14 @@ mod tests {
             ..Default::default()
         };
 
-        for (experimental, suffix) in EXPERIMENTAL_VARIANTS {
-            let request = build_initialize_request(
-                RequestId::new(1),
-                None,
-                None,
-                None,
-                Some(&upstream),
-                true,
-                experimental,
-            );
+        let request =
+            build_initialize_request(RequestId::new(1), None, None, None, Some(&upstream), true);
 
-            insta::with_settings!({snapshot_suffix => suffix}, {
-                insta::assert_json_snapshot!(request, {
-                    ".params.processId" => "[PID]",
-                });
+        insta::with_settings!({snapshot_suffix => "default"}, {
+            insta::assert_json_snapshot!(request, {
+                ".params.processId" => "[PID]",
             });
-        }
+        });
     }
 
     #[test]

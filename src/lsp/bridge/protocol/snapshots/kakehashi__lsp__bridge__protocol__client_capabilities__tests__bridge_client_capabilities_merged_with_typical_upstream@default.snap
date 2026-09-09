@@ -140,6 +140,9 @@ expression: merged
       "dynamicRegistration": false,
       "tooltipSupport": true
     },
+    "colorProvider": {
+      "dynamicRegistration": false
+    },
     "moniker": {
       "dynamicRegistration": false
     },
