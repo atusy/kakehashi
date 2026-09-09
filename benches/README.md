@@ -25,6 +25,10 @@ after validation. The manifest records source, binary, harness, runtime, fixture
 toolchain, and sample hashes. Keep raw samples and parser/query assets outside
 Git; commit only a compact report and provenance needed to reproduce it.
 Summaries report paired median differences and ranges; p95 is descriptive.
+The exploratory harness may retry cancellation attempts that finish before
+cancellation. The paired collector deliberately rejects runs with any such
+discarded attempts: inspect that race separately instead of automatically
+comparing latency distributions conditioned on different retained attempts.
 
 Timing limitations: ordinary typing includes local delta reconstruction and
 validation; cancellation timing ends at response receipt. Eight-edit typing
