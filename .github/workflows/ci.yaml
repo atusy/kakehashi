@@ -15,9 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # Not covered by any cargo command: a tests/e2e/*.rs with no `mod` line in
-      # main.rs compiles fine and simply never runs. CI also never builds the
-      # e2e binary (bare `cargo test`, no --features e2e), so this is the only
-      # place the omission can be caught here.
+      # main.rs compiles fine and simply never runs, even in the E2E job.
       - run: scripts/check_test_modules.sh
       - run: cargo check
 
@@ -29,6 +27,18 @@ jobs:
       - run: rustup component add rust-analyzer
       - run: make deps/tree-sitter
       - run: cargo test
+
+  resolve-e2e:
+    name: Resolve E2E
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # These suites exercise lazy resolve with real bridge subprocesses,
+      # including edits/reopens while replies are parked by the mock server.
+      - run: >-
+          cargo test --features e2e --test e2e --
+          e2e_completion_envelope:: e2e_host_bridge:: e2e_code_action::
+          e2e_code_lens_resolve:: e2e_lsp_lua_document_link:: --test-threads=2
 
   fmt:
     name: Format
