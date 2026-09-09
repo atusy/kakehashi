@@ -1,4 +1,9 @@
 import unittest
+import json
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
 
 from semantic_summary import conventional_median, summarize_pairs, validate_collection
 
@@ -47,6 +52,18 @@ def attested_document(pair_index, order="AB"):
 
 
 class SemanticSummaryTest(unittest.TestCase):
+    def test_standalone_invocation_cannot_publish_unattested_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            raw = Path(directory) / "raw.json"
+            output = Path(directory) / "summary.json"
+            raw.write_text(json.dumps({"pair_index": 1, "order": "AB", "runs": []}))
+            result = subprocess.run(
+                [sys.executable, str(Path(__file__).with_name("semantic_summary.py")),
+                 str(raw), "--output", str(output)], capture_output=True, text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(output.exists())
+
     def test_even_median_uses_both_middle_samples(self):
         self.assertEqual(conventional_median([1, 2, 100, 200]), 51.0)
 
