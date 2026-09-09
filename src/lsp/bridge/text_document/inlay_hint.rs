@@ -216,11 +216,14 @@ impl LanguageServerPool {
         region_id: &str,
         offset: RegionOffset,
         virtual_content: &str,
-        content_version: u64,
+        revision: crate::lsp::bridge::envelope::HostRevision,
         upstream_request_id: Option<UpstreamId>,
         client_progress_token: Option<NumberOrString>,
     ) -> io::Result<Option<Vec<InlayHint>>> {
-        let host_incarnation = self.current_host_incarnation(host_uri);
+        // The lifetime and revision the handler read together, not a fresh
+        // read here: a close and reopen between the two would pair one
+        // lifetime's revision with the other's incarnation, and a later
+        // same-shape edit could then satisfy both stamps at once.
         let handle = self
             .get_or_create_virtual_connection(
                 server_name,
@@ -270,8 +273,8 @@ impl LanguageServerPool {
                         host_uri: host_uri.as_str(),
                         region_id,
                         injection_language,
-                        incarnation: host_incarnation,
-                        content_version: Some(content_version),
+                        incarnation: Some(revision.incarnation),
+                        content_version: Some(revision.content_version),
                         connection_generation,
                         connection_key,
                         offset: ctx.offset,

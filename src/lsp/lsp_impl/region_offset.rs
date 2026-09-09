@@ -11,7 +11,9 @@
 //! translation nor a resolve gate can disagree with goto on the same region.
 //! The region's content-precise host end and contiguity are returned
 //! alongside so an edit translator can reject a range that escapes the
-//! region or targets a combined document with masked host gaps.
+//! region or targets a combined document with masked host gaps. The
+//! lifetime (incarnation) gate every resolve shares, and the revision gate
+//! the code action resolve adds, live here too.
 //!
 //! [`ShowDocumentTranslator`]: super::show_document_translation::ShowDocumentTranslator
 //! [`ApplyEditTranslator`]: super::apply_edit_translation::ApplyEditTranslator
@@ -27,7 +29,43 @@ use crate::language::injection::ResolvedInjection;
 use crate::language::{InjectionResolver, LanguageCoordinator};
 use crate::lsp::bridge::{BridgeCoordinator, EnvelopeOffset, RegionOffset, region_host_end};
 
+/// How long a resolve gate waits for the post-edit reparse before it reads the
+/// region as stale. Matches the request handlers' stale-snapshot deadline.
+const RESOLVE_PARSE_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+
 impl Kakehashi {
+    /// Whether the host document is still at the text revision a resolve
+    /// envelope was minted at. A same-shape edit inside a region keeps its
+    /// geometry, so the region gates admit it, yet the downstream's lazily
+    /// materialized fields were computed against the previous text; the
+    /// revision stamp is what refuses that. Envelopes without a stamp (a
+    /// mangled echo) fail closed.
+    pub(super) fn document_revision_is_current(
+        &self,
+        host_url: &Url,
+        expected: Option<u64>,
+    ) -> bool {
+        expected.is_some_and(|expected| {
+            self.documents
+                .get(host_url)
+                .is_some_and(|document| document.content_version() == expected)
+        })
+    }
+
+    /// Whether the host document is still the lifetime a resolve envelope
+    /// was minted under. A close and reopen restarts the revision count, so
+    /// the revision alone cannot tell a reopened document from the one the
+    /// item was computed on. Envelopes without a stamp fail closed.
+    pub(super) fn host_incarnation_is_current(
+        &self,
+        host_url: &Url,
+        expected: Option<u64>,
+    ) -> bool {
+        expected.is_some_and(|expected| {
+            self.bridge.pool_arc().current_host_incarnation(host_url) == Some(expected)
+        })
+    }
+
     /// Whether the injection region a resolve envelope names still resolves
     /// to the offset snapshot the envelope carries.
     ///
@@ -45,6 +83,11 @@ impl Kakehashi {
     /// and inlay hint need the region end and contiguity as well, so they
     /// call [`resolve_region_offset`] directly and compare the same offset.
     ///
+    /// The envelope's host incarnation is checked first, then the document
+    /// is awaited to its current parse: `didChange` clears
+    /// the tree and reparses off-ingress, and a resolve issued in that window
+    /// would otherwise find no snapshot and report the region stale.
+    ///
     /// Contiguity is deliberately NOT required here. A non-contiguous
     /// combined region masks its host gaps with whitespace, so its line
     /// geometry — and therefore range translation — stays valid; only
@@ -52,15 +95,39 @@ impl Kakehashi {
     /// (`method_requires_contiguous_injection`), and code lenses and document
     /// links are minted for them on purpose. Refusing to resolve what was
     /// deliberately produced would leave those items permanently unresolved.
-    pub(super) fn region_offset_is_fresh(
+    /// The parse wait a resolve gate pays before rebuilding its region: a hard
+    /// bound, unlike the request handlers' wait, whose first-parse backstop
+    /// (15s) is right for a request that needs an answer and wrong for a
+    /// gate that fails soft. A reparse still running when it expires reads as
+    /// a stale region; a close+reopen that lands between the lifetime check
+    /// and this wait would otherwise park the resolve on the reopened
+    /// lifetime's first parse.
+    pub(super) async fn wait_for_resolve_parse(&self, host_url: &Url) {
+        let _ = tokio::time::timeout(
+            RESOLVE_PARSE_WAIT,
+            self.wait_for_current_snapshot(host_url, RESOLVE_PARSE_WAIT),
+        )
+        .await;
+    }
+
+    pub(super) async fn region_offset_is_fresh(
         &self,
         host_uri: &str,
         region_id: &str,
         offset: &EnvelopeOffset,
+        incarnation: Option<u64>,
+        injection_language: &str,
     ) -> bool {
         let Ok(host_url) = Url::parse(host_uri) else {
             return false;
         };
+        // Lifetime first: an item from a closed and reopened document would
+        // otherwise park on the reopened lifetime's first parse only to be
+        // refused by the region rebuild.
+        if !self.host_incarnation_is_current(&host_url, incarnation) {
+            return false;
+        }
+        self.wait_for_resolve_parse(&host_url).await;
         resolve_region_offset(
             &self.documents,
             &self.language,
@@ -68,7 +135,14 @@ impl Kakehashi {
             &host_url,
             region_id,
         )
-        .is_some_and(|(live_offset, _, _, _)| live_offset == RegionOffset::from(offset))
+        // The language too: an edit can re-route a region (a shebang change
+        // under an `unknown` injection) while keeping its id and geometry,
+        // and an item produced for the old language must not resolve on the
+        // server the region now routes to. An envelope with no language
+        // (cleared by the client) names no region.
+        .is_some_and(|(live_offset, _, _, live_language)| {
+            live_offset == RegionOffset::from(offset) && live_language == injection_language
+        })
     }
 }
 
@@ -87,6 +161,17 @@ pub(super) fn resolve_region_offset(
     host_url: &Url,
     region_id: &str,
 ) -> Option<(RegionOffset, Position, bool, String)> {
+    resolve_region(documents, language, bridge, host_url, region_id).map(resolved_region_geometry)
+}
+
+/// Resolve geometry and content from the same current snapshot.
+pub(super) fn resolve_region(
+    documents: &DocumentStore,
+    language: &Arc<LanguageCoordinator>,
+    bridge: &BridgeCoordinator,
+    host_url: &Url,
+    region_id: &str,
+) -> Option<ResolvedInjection> {
     // Snapshot is owned, so the document handle (a store lock) is released
     // before `detect_document_language` reaches back into the store.
     let snapshot = documents.get(host_url)?.snapshot()?;
@@ -105,13 +190,15 @@ pub(super) fn resolve_region_offset(
     // Exact-ID resolution also validates the tracker incarnation and rejects
     // an edit race: if this snapshot no longer contains the tracked layer, no
     // candidate has the ID and callers fall back safely.
-    Some(resolved_region_geometry(resolved))
+    Some(resolved)
 }
 
 /// Consume a resolved region into the geometry shared by freshness and edit
 /// validation. The end is derived from the exact virtual content rather than
 /// the raw content-node range, whose trailing named children may be excluded.
-fn resolved_region_geometry(resolved: ResolvedInjection) -> (RegionOffset, Position, bool, String) {
+pub(super) fn resolved_region_geometry(
+    resolved: ResolvedInjection,
+) -> (RegionOffset, Position, bool, String) {
     let start_line = resolved.region.line_range.start;
     let offset = RegionOffset::with_per_line_offsets(start_line, resolved.line_column_offsets);
     let region_end = region_host_end(&resolved.virtual_content, &offset);
