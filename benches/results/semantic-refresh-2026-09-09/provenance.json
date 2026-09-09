@@ -1,0 +1,335 @@
+{
+  "artifact_root": "$HOME/.local/share/kakehashi-benchmarks/host-typing-2026-09-09",
+  "datasets": {
+    "single": {
+      "directory": "neovim-pairs-v4-guarded",
+      "manifest": {
+        "baseline": {
+          "source_commit": "17ab82bd300bf14e3b8f2c574d179d5e214a8987",
+          "profile": "profiling",
+          "binary_sha256": "056aa28dd67c5ef331daf00262e96dcd9642020d246a623dbb3a7bce6ab0a7ed"
+        },
+        "candidate": {
+          "source_commit": "d7da7e22b07bb4f1c890b1850724a3104d0fff52",
+          "profile": "profiling",
+          "sha256": "c320990be32c9bf8cb4643834c6db4a36cb3207c5e06e885cb26e1838370a4fa"
+        },
+        "probe_sha256": "c9eb7c385a65b8ef6df44cea528936130cbb70c71915e983e7b9009adf4ae158",
+        "collector_sha256": "39a59f963de6e8b4cc68e02d4b2dc629b1f109d29f084879a32fcd7aed0a2294",
+        "config_sha256": "d81d79ae1893690881692a8c2d917a5d9684b9ba0dbeafcf31f9992868ada1a9",
+        "runtime_manifest_sha256": "c7f0bd26d6667aca6204a79a807a42a80f51e3e6fa7129b9bf3c0ec1f1bc9ad0",
+        "fixtures": {
+          "rust-large": "a478125b66f2d678a1fd24e6b3e9f9df797034bb6801febd99f6ff8e9a62fc9c",
+          "markdown-large": "cb551f19c49a3f5155dd4f95ab52fb6e7d309d0226f035e0314a8112d5f3abee",
+          "rust-common": "4145ba0624e3c36d8f93cf79a6c545173810231d7e250dfc23a2ff6b4ce75e8a",
+          "rust-small": "e7e4edc4f821fae8824ce8e287793d50514656283245690b35f895d26add4902"
+        },
+        "warmup": 6,
+        "samples": 30,
+        "pairs": 4,
+        "platform": "macOS-26.5.1-arm64-arm-64bit",
+        "nvim": "NVIM v0.13.0-nightly+050fa30",
+        "probe_commit": "09b6088c1",
+        "semantic_runtime_sha256": "9b3149d875b93e87f4a068c2e585dca51d5b7680674dd58861d76664f73aeb1c",
+        "semantic_runtime_patch_sha256": "0bb7c8426c4c2e38dce3b6389d69b9ada1c0e80839f15d7b862ea3df8f4f6ab3",
+        "client_patch": "obsolete-reply guard and captured delta baseline; both variants use the same patched module",
+        "burst": 1,
+        "interval_ms": 20,
+        "metric": "last edit to current full/delta conversion completion"
+      },
+      "raw_files": [
+        {
+          "file": "pair-1-rust-large-A.json",
+          "sha256": "4ccda80523c207677d682a781b084d4f0c1b6d8e6c44a2372f682571571ee3dd",
+          "final_token_sha256": "efaee489d18a7e2fb844f0a47f349dc52f936c2c3c147c25d2610765daae04a0"
+        },
+        {
+          "file": "pair-1-rust-large-B.json",
+          "sha256": "f667e436dcff5e4adce1643422c4a4cb199c8de72aad04f142b5c4d2b2f3b98e",
+          "final_token_sha256": "efaee489d18a7e2fb844f0a47f349dc52f936c2c3c147c25d2610765daae04a0"
+        },
+        {
+          "file": "pair-1-markdown-large-A.json",
+          "sha256": "c14cb1d90064219bf0c01286d4ef114660293493d7e906692341c1dc53c59226",
+          "final_token_sha256": "18c3836950a34c63cae2b08e0a3a041d7fd992622367f8f68ead2098d7cd4fb4"
+        },
+        {
+          "file": "pair-1-markdown-large-B.json",
+          "sha256": "ae94adbfc49ae0827a4953ebe578af0b70bbb6c583cda8cf37162a4c86aaf15a",
+          "final_token_sha256": "18c3836950a34c63cae2b08e0a3a041d7fd992622367f8f68ead2098d7cd4fb4"
+        },
+        {
+          "file": "pair-1-rust-common-A.json",
+          "sha256": "e55d3bdba4a2704afe437f8927db0bc783f3d4cf26bc7f4fbb662af9e0dc94d5",
+          "final_token_sha256": "6925c83edbc5db5ad0427f68610494967c8935f84a2f3f7e26990849e0dca8fb"
+        },
+        {
+          "file": "pair-1-rust-common-B.json",
+          "sha256": "2dd43e7e59fbaf738a2bd228254b0b09aea7aa7bd6fe9f66152ed1ccd744ffe4",
+          "final_token_sha256": "6925c83edbc5db5ad0427f68610494967c8935f84a2f3f7e26990849e0dca8fb"
+        },
+        {
+          "file": "pair-1-rust-small-A.json",
+          "sha256": "6f9c3df174d5f553c70a240fdfb8a182dc224fa67e10bab23bbd1fc905428630",
+          "final_token_sha256": "8508589b6377c5c30b275bf397cbef696313a80707b367b613efc26040e29628"
+        },
+        {
+          "file": "pair-1-rust-small-B.json",
+          "sha256": "258d3e0e8c4019d4fba6aaf2b94e61e028ba031154788f664d10d9f55fb0f651",
+          "final_token_sha256": "8508589b6377c5c30b275bf397cbef696313a80707b367b613efc26040e29628"
+        },
+        {
+          "file": "pair-2-rust-large-B.json",
+          "sha256": "72f77f34b6dfb124fe0fae86630d9214ba07c0964a33eaa9719a42922aab41a7",
+          "final_token_sha256": "efaee489d18a7e2fb844f0a47f349dc52f936c2c3c147c25d2610765daae04a0"
+        },
+        {
+          "file": "pair-2-rust-large-A.json",
+          "sha256": "edc9194342d33f981becc4685f0e3a6d76f7e5591b748db9acceb6e6ac7ebd33",
+          "final_token_sha256": "efaee489d18a7e2fb844f0a47f349dc52f936c2c3c147c25d2610765daae04a0"
+        },
+        {
+          "file": "pair-2-markdown-large-B.json",
+          "sha256": "eeee3f886fd3a20791908c32213e5a6d2811e3e4947ca760ab56ac8907d09ca0",
+          "final_token_sha256": "18c3836950a34c63cae2b08e0a3a041d7fd992622367f8f68ead2098d7cd4fb4"
+        },
+        {
+          "file": "pair-2-markdown-large-A.json",
+          "sha256": "d793ec074cffbfacdc9a1a62ae84cd2a65178d6e7b3f29d70bcf15d57697fd0c",
+          "final_token_sha256": "18c3836950a34c63cae2b08e0a3a041d7fd992622367f8f68ead2098d7cd4fb4"
+        },
+        {
+          "file": "pair-2-rust-common-B.json",
+          "sha256": "b1a99a0bdfaa94226ee6e7c58ce58f09d3eee154ec15e34e172a3d7c56142543",
+          "final_token_sha256": "6925c83edbc5db5ad0427f68610494967c8935f84a2f3f7e26990849e0dca8fb"
+        },
+        {
+          "file": "pair-2-rust-common-A.json",
+          "sha256": "8d8bdfbca46ad5fbe92ff6629c5e884dd16832f2d500c1cc34ff7ae854ad17c5",
+          "final_token_sha256": "6925c83edbc5db5ad0427f68610494967c8935f84a2f3f7e26990849e0dca8fb"
+        },
+        {
+          "file": "pair-2-rust-small-B.json",
+          "sha256": "148a2bcc4ef0733830e62e7879602bc17eec305ca46c63247e0fbcbeb79746fc",
+          "final_token_sha256": "8508589b6377c5c30b275bf397cbef696313a80707b367b613efc26040e29628"
+        },
+        {
+          "file": "pair-2-rust-small-A.json",
+          "sha256": "b7323009599319125af3df4f1248c5155a523eab8c34fa84f14d27bea3da9b8a",
+          "final_token_sha256": "8508589b6377c5c30b275bf397cbef696313a80707b367b613efc26040e29628"
+        },
+        {
+          "file": "pair-3-rust-large-A.json",
+          "sha256": "6530ed9f4caf95696a2e21d41538de9a2d89c4ba8aa7dcc686b7c5c20dda7990",
+          "final_token_sha256": "efaee489d18a7e2fb844f0a47f349dc52f936c2c3c147c25d2610765daae04a0"
+        },
+        {
+          "file": "pair-3-rust-large-B.json",
+          "sha256": "94d693b50f03c8d6b4c869cfb6d6fd43dc1cfd54f0db37873ba15e8bf68b4326",
+          "final_token_sha256": "efaee489d18a7e2fb844f0a47f349dc52f936c2c3c147c25d2610765daae04a0"
+        },
+        {
+          "file": "pair-3-markdown-large-A.json",
+          "sha256": "7d3163e13f2f60485a564aed071ffed623d506af2cdf01339ff20e4e80c377f8",
+          "final_token_sha256": "18c3836950a34c63cae2b08e0a3a041d7fd992622367f8f68ead2098d7cd4fb4"
+        },
+        {
+          "file": "pair-3-markdown-large-B.json",
+          "sha256": "4329cc58d209ff8f5a1a25f6420df19d106ac280814378d8f365aacabaf94062",
+          "final_token_sha256": "18c3836950a34c63cae2b08e0a3a041d7fd992622367f8f68ead2098d7cd4fb4"
+        },
+        {
+          "file": "pair-3-rust-common-A.json",
+          "sha256": "f97cd68b0358f27682b3b5d0cc73ccad4310787f70a61f3d735822f3d687ae14",
+          "final_token_sha256": "6925c83edbc5db5ad0427f68610494967c8935f84a2f3f7e26990849e0dca8fb"
+        },
+        {
+          "file": "pair-3-rust-common-B.json",
+          "sha256": "221912dadb285f62bc5d16a332f45102880624abb0787d25a400d096e6bccb85",
+          "final_token_sha256": "6925c83edbc5db5ad0427f68610494967c8935f84a2f3f7e26990849e0dca8fb"
+        },
+        {
+          "file": "pair-3-rust-small-A.json",
+          "sha256": "11957afc78648567f290082e14a9ea76471bdd8449b623aed25d257f72b324cf",
+          "final_token_sha256": "8508589b6377c5c30b275bf397cbef696313a80707b367b613efc26040e29628"
+        },
+        {
+          "file": "pair-3-rust-small-B.json",
+          "sha256": "1bc32be5aaa87b4e928731b5199bff7914bb182cb317e42d2f0c53d4d817a507",
+          "final_token_sha256": "8508589b6377c5c30b275bf397cbef696313a80707b367b613efc26040e29628"
+        },
+        {
+          "file": "pair-4-rust-large-B.json",
+          "sha256": "73cd172ca6615d8d5cab9f3ac6ac38061aeb254b1789e95b472b36d4f0728788",
+          "final_token_sha256": "efaee489d18a7e2fb844f0a47f349dc52f936c2c3c147c25d2610765daae04a0"
+        },
+        {
+          "file": "pair-4-rust-large-A.json",
+          "sha256": "15121493b5dfff60b17874437258bfe457ae2d2476a68ed118a16cfb2ecffc5f",
+          "final_token_sha256": "efaee489d18a7e2fb844f0a47f349dc52f936c2c3c147c25d2610765daae04a0"
+        },
+        {
+          "file": "pair-4-markdown-large-B.json",
+          "sha256": "dcdce553642cd31c17992e29d2bb4a90336e98c0635907cb982fa7974c216e89",
+          "final_token_sha256": "18c3836950a34c63cae2b08e0a3a041d7fd992622367f8f68ead2098d7cd4fb4"
+        },
+        {
+          "file": "pair-4-markdown-large-A.json",
+          "sha256": "c7177b81b7c3998e9aeb4908c6e9d824596ffa61162fb1c5d68e8fdeeacabf77",
+          "final_token_sha256": "18c3836950a34c63cae2b08e0a3a041d7fd992622367f8f68ead2098d7cd4fb4"
+        },
+        {
+          "file": "pair-4-rust-common-B.json",
+          "sha256": "4a09861c7d8e2c741f1c64f9a6919df0cd0497e8480fca553be1869994eeef2c",
+          "final_token_sha256": "6925c83edbc5db5ad0427f68610494967c8935f84a2f3f7e26990849e0dca8fb"
+        },
+        {
+          "file": "pair-4-rust-common-A.json",
+          "sha256": "63e85ed74612eda89205d00d1b1b1af22ed10f33e04c2bd3afbe8ddd7f66fa45",
+          "final_token_sha256": "6925c83edbc5db5ad0427f68610494967c8935f84a2f3f7e26990849e0dca8fb"
+        },
+        {
+          "file": "pair-4-rust-small-B.json",
+          "sha256": "8a02cfb881dbeed79b14b9f3f39cd93bcc2c48b2ae65d9d4e23ed8862bda1223",
+          "final_token_sha256": "8508589b6377c5c30b275bf397cbef696313a80707b367b613efc26040e29628"
+        },
+        {
+          "file": "pair-4-rust-small-A.json",
+          "sha256": "dcecf3b41aee4f8db09b7adef387f917f3621b6a85a1bc907b8fbb6c220573d0",
+          "final_token_sha256": "8508589b6377c5c30b275bf397cbef696313a80707b367b613efc26040e29628"
+        }
+      ]
+    },
+    "burst": {
+      "directory": "neovim-burst-pairs-v4-guarded",
+      "manifest": {
+        "baseline": {
+          "source_commit": "17ab82bd300bf14e3b8f2c574d179d5e214a8987",
+          "profile": "profiling",
+          "binary_sha256": "056aa28dd67c5ef331daf00262e96dcd9642020d246a623dbb3a7bce6ab0a7ed"
+        },
+        "candidate": {
+          "source_commit": "d7da7e22b07bb4f1c890b1850724a3104d0fff52",
+          "profile": "profiling",
+          "sha256": "c320990be32c9bf8cb4643834c6db4a36cb3207c5e06e885cb26e1838370a4fa"
+        },
+        "probe_sha256": "c9eb7c385a65b8ef6df44cea528936130cbb70c71915e983e7b9009adf4ae158",
+        "collector_sha256": "6b0765df832afeec2ae4a366502b3330d7771e0919e0cbd312901e7ec6277457",
+        "config_sha256": "d81d79ae1893690881692a8c2d917a5d9684b9ba0dbeafcf31f9992868ada1a9",
+        "runtime_manifest_sha256": "c7f0bd26d6667aca6204a79a807a42a80f51e3e6fa7129b9bf3c0ec1f1bc9ad0",
+        "fixtures": {
+          "rust-large": "a478125b66f2d678a1fd24e6b3e9f9df797034bb6801febd99f6ff8e9a62fc9c",
+          "markdown-large": "cb551f19c49a3f5155dd4f95ab52fb6e7d309d0226f035e0314a8112d5f3abee"
+        },
+        "warmup": 6,
+        "samples": 30,
+        "pairs": 4,
+        "platform": "macOS-26.5.1-arm64-arm-64bit",
+        "nvim": "NVIM v0.13.0-nightly+050fa30",
+        "probe_commit": "09b6088c1",
+        "semantic_runtime_sha256": "9b3149d875b93e87f4a068c2e585dca51d5b7680674dd58861d76664f73aeb1c",
+        "semantic_runtime_patch_sha256": "0bb7c8426c4c2e38dce3b6389d69b9ada1c0e80839f15d7b862ea3df8f4f6ab3",
+        "client_patch": "obsolete-reply guard and captured delta baseline; both variants use the same patched module",
+        "burst": 8,
+        "interval_ms": 20,
+        "metric": "last edit to current full/delta conversion completion"
+      },
+      "raw_files": [
+        {
+          "file": "pair-1-rust-large-A.json",
+          "sha256": "f5945f94a0650161ad27d972064aa45c7312b88461856260d80e7543d53ea3f0",
+          "final_token_sha256": "ae72f55e1635dce8bafc25b75994c4310b2034c3a0a0b2721442bc424fa3d670"
+        },
+        {
+          "file": "pair-1-rust-large-B.json",
+          "sha256": "4002442b784481920bdb47ab13ed5108a9f10db7333a88bcc30b3db6dbdeadd4",
+          "final_token_sha256": "ae72f55e1635dce8bafc25b75994c4310b2034c3a0a0b2721442bc424fa3d670"
+        },
+        {
+          "file": "pair-1-markdown-large-A.json",
+          "sha256": "c6b7dbe2d9dddc4e3b54247702e3f82cd852e4904aec436712bcde7752e5b700",
+          "final_token_sha256": "ab2b8271306d92db6a0532c40f651c85c202e57157a1471fdb0f80bd24ca9bb0"
+        },
+        {
+          "file": "pair-1-markdown-large-B.json",
+          "sha256": "1a33e56cffd153c935e31b9d599950f7e3da0ac7d0433ac25a638290dc551bcd",
+          "final_token_sha256": "ab2b8271306d92db6a0532c40f651c85c202e57157a1471fdb0f80bd24ca9bb0"
+        },
+        {
+          "file": "pair-2-rust-large-B.json",
+          "sha256": "47fa80ae50dc9bcc092423779fdd950703c44fb874bae7b2c330e761382bcfc0",
+          "final_token_sha256": "ae72f55e1635dce8bafc25b75994c4310b2034c3a0a0b2721442bc424fa3d670"
+        },
+        {
+          "file": "pair-2-rust-large-A.json",
+          "sha256": "22a2f1429fe73c161d077f61a520fd0628c9a2c9ffd90ce51c7c75da3fd344b9",
+          "final_token_sha256": "ae72f55e1635dce8bafc25b75994c4310b2034c3a0a0b2721442bc424fa3d670"
+        },
+        {
+          "file": "pair-2-markdown-large-B.json",
+          "sha256": "db740f2c49b5cd16ddf352c9d2311a94d5780dab99dc945ea85880052a1a00af",
+          "final_token_sha256": "ab2b8271306d92db6a0532c40f651c85c202e57157a1471fdb0f80bd24ca9bb0"
+        },
+        {
+          "file": "pair-2-markdown-large-A.json",
+          "sha256": "48496d341e5867314d4f0fac674375e2f0d52648d8cac94bce7f58201cb44cf7",
+          "final_token_sha256": "ab2b8271306d92db6a0532c40f651c85c202e57157a1471fdb0f80bd24ca9bb0"
+        },
+        {
+          "file": "pair-3-rust-large-A.json",
+          "sha256": "eec437239c2eafc8930c775544d9863cb172179f462826c16fd42c1c76ebf08c",
+          "final_token_sha256": "ae72f55e1635dce8bafc25b75994c4310b2034c3a0a0b2721442bc424fa3d670"
+        },
+        {
+          "file": "pair-3-rust-large-B.json",
+          "sha256": "c7f8fed9743d2ac2208ad1e3d21a14d3a5bfdb9de837630b820c300f109274d2",
+          "final_token_sha256": "ae72f55e1635dce8bafc25b75994c4310b2034c3a0a0b2721442bc424fa3d670"
+        },
+        {
+          "file": "pair-3-markdown-large-A.json",
+          "sha256": "436fdfdd0de3ab39ae6a84daf68f7bb5d47717f28860b85b2fb79aacc8d3d47a",
+          "final_token_sha256": "ab2b8271306d92db6a0532c40f651c85c202e57157a1471fdb0f80bd24ca9bb0"
+        },
+        {
+          "file": "pair-3-markdown-large-B.json",
+          "sha256": "4553b77983745cfe071aa5e7d603df4c9394ebe4d725be1c74e2719db1268ca5",
+          "final_token_sha256": "ab2b8271306d92db6a0532c40f651c85c202e57157a1471fdb0f80bd24ca9bb0"
+        },
+        {
+          "file": "pair-4-rust-large-B.json",
+          "sha256": "54f7557b04f24a4e7efb49fd9a0aa6df273f65d34e47a730401a98d5bb69cb1c",
+          "final_token_sha256": "ae72f55e1635dce8bafc25b75994c4310b2034c3a0a0b2721442bc424fa3d670"
+        },
+        {
+          "file": "pair-4-rust-large-A.json",
+          "sha256": "265cb8ae0d07f78624a2ff9341d115ee273820d76ef6a50f89c818e4a49f4777",
+          "final_token_sha256": "ae72f55e1635dce8bafc25b75994c4310b2034c3a0a0b2721442bc424fa3d670"
+        },
+        {
+          "file": "pair-4-markdown-large-B.json",
+          "sha256": "55d442d48c3d61b84081e6b9fe3f0d58a41e324761a9e5508ce9ceddf8eb8191",
+          "final_token_sha256": "ab2b8271306d92db6a0532c40f651c85c202e57157a1471fdb0f80bd24ca9bb0"
+        },
+        {
+          "file": "pair-4-markdown-large-A.json",
+          "sha256": "b2e5e1ade221ea55404bbac6119b46317b7e19a8f10e45b03f5194fcb6442563",
+          "final_token_sha256": "ab2b8271306d92db6a0532c40f651c85c202e57157a1471fdb0f80bd24ca9bb0"
+        }
+      ]
+    }
+  },
+  "limitations": [
+    "Modified Neovim semantic runtime in both variants; not unmodified-editor performance.",
+    "Client conversion completion, not UI frame paint.",
+    "Single document, native configuration, workstation timing; no CPU or contention improvement claim."
+  ],
+  "neovim_patch": {
+    "base": "b7f9aceadd",
+    "commits": [
+      "167058b19f",
+      "31571222df"
+    ],
+    "patch_file": "neovim-semantic-token-races.patch",
+    "patch_sha256": "6ad637ac6c54111c1db719e1903591789ab09804aeaf5aafb7b00b07ddce2ab8"
+  }
+}
