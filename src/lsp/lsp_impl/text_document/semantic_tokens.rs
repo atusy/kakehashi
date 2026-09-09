@@ -172,6 +172,9 @@ impl Kakehashi {
     ) -> TokenSnapshot {
         let edit_lock = self.documents.edit_lock(uri);
         let _guard = edit_lock.lock().await;
+        // Reject work invalidated while awaiting this lock. Reloads do not take
+        // the edit lock, so a concurrent reload can still leave conservative
+        // recovery interest; this is not an atomic reload/refresh-dedup fence.
         if supersede.is_cancelled() || self.cache.semantic_token_generation() != generation {
             return TokenSnapshot::Superseded;
         }
