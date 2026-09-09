@@ -161,9 +161,12 @@ impl Kakehashi {
     /// Register a failed current-snapshot wait, then recheck publication. The
     /// parse may have settled after the timeout but before this marker: in that
     /// case serve it now instead of losing the only refresh wakeup.
+    /// An edit or reopen while acquiring the lock must not inherit this wait's
+    /// retry interest after clearing the previous interval's marker.
     async fn token_snapshot_after_timeout(
         &self,
         uri: &Url,
+        expected_edit: Option<(u64, u64)>,
         generation: u64,
         supersede: &crate::cancel::CancelToken,
     ) -> TokenSnapshot {
@@ -172,9 +175,12 @@ impl Kakehashi {
         if supersede.is_cancelled() || self.cache.semantic_token_generation() != generation {
             return TokenSnapshot::Superseded;
         }
-        if self.documents.latest_snapshot(uri).is_none() {
+        let Some(view) = self.documents.latest_snapshot(uri) else {
             self.documents.remove_edit_lock_if_unshared(uri, &edit_lock);
             return TokenSnapshot::Absent;
+        };
+        if expected_edit != Some((view.slot.current_incarnation, view.content_version)) {
+            return TokenSnapshot::Superseded;
         }
         self.cache.record_served_semantic_version(uri, 0);
         let Some(view) = self.documents.latest_snapshot(uri) else {
@@ -265,13 +271,19 @@ impl Kakehashi {
             .then(std::time::Instant::now);
         let result = async {
             let wait = async {
+                // Only timeout interest belongs to this starting edit. A
+                // successful wait may still consume a newer current snapshot.
+                let expected_edit = self
+                    .documents
+                    .latest_snapshot(uri)
+                    .map(|view| (view.slot.current_incarnation, view.content_version));
                 let outcome = match self
                     .wait_for_current_snapshot(uri, TOKEN_SETTLE_BACKSTOP)
                     .await
                 {
                     SnapshotWait::Current(snapshot) => TokenSnapshot::Current(snapshot),
                     SnapshotWait::Stale => {
-                        self.token_snapshot_after_timeout(uri, generation, supersede)
+                        self.token_snapshot_after_timeout(uri, expected_edit, generation, supersede)
                             .await
                     }
                     SnapshotWait::Unparsed | SnapshotWait::Gone => TokenSnapshot::Absent,
@@ -1491,6 +1503,10 @@ mod tests {
         let outcome = server
             .token_snapshot_after_timeout(
                 &uri,
+                server
+                    .documents
+                    .latest_snapshot(&uri)
+                    .map(|view| (view.slot.current_incarnation, view.content_version)),
                 server.cache.semantic_token_generation(),
                 &crate::cancel::CancelToken::default(),
             )
@@ -1635,6 +1651,42 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn timeout_interest_cannot_cross_an_accepted_edit() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///timeout-edit.rs").unwrap();
+        server
+            .documents
+            .insert(uri.clone(), "old".into(), None, None);
+        publish_treeless(server, &uri, "old", 0);
+        server
+            .documents
+            .update_document(uri.clone(), "first".into(), None);
+        let supersede = crate::cancel::CancelToken::default();
+        let mut request = std::pin::pin!(server.current_snapshot_for_tokens(
+            &uri,
+            None,
+            &supersede,
+            server.cache.semantic_token_generation(),
+            None,
+        ));
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        let lock = server.documents.edit_lock(&uri);
+        let guard = lock.lock().await;
+        tokio::time::advance(crate::lsp::lsp_impl::snapshot_read::TOKEN_SETTLE_BACKSTOP).await;
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        // The accepted didChange critical section advances text and clears
+        // interest while timeout recovery is queued behind its edit lock.
+        server
+            .documents
+            .update_document(uri.clone(), "second".into(), None);
+        server.cache.reset_semantic_refresh_interest(&uri);
+        drop(guard);
+        assert!(matches!(request.await, TokenSnapshot::Superseded));
+        assert_eq!(server.cache.served_semantic_version(&uri), None);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn timeout_recovery_rejects_a_tree_from_an_obsolete_generation() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
@@ -1679,6 +1731,68 @@ mod tests {
         drop(doc);
         drop(guard);
         assert!(matches!(request.await, TokenSnapshot::Superseded));
+        assert_eq!(server.cache.served_semantic_version(&uri), None);
+    }
+
+    #[tokio::test]
+    async fn successful_token_wait_can_follow_a_newer_edit() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///token-wait-newer-edit.rs").unwrap();
+        server
+            .documents
+            .insert(uri.clone(), "old".into(), None, None);
+        publish_treeless(server, &uri, "old", 0);
+        server
+            .documents
+            .update_document(uri.clone(), "first".into(), None);
+        let supersede = crate::cancel::CancelToken::default();
+        let mut request = std::pin::pin!(server.current_snapshot_for_tokens(
+            &uri,
+            None,
+            &supersede,
+            server.cache.semantic_token_generation(),
+            None,
+        ));
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        server
+            .documents
+            .update_document(uri.clone(), "second".into(), None);
+        publish_treeless(server, &uri, "second", 2);
+        assert!(matches!(
+            request.await,
+            TokenSnapshot::Current(snapshot) if snapshot.parsed_version == 2
+                && snapshot.text.as_ref() == "second"
+        ));
+    }
+
+    #[tokio::test]
+    async fn timeout_interest_cannot_cross_document_lifetimes() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///token-timeout-new-lifetime.rs").unwrap();
+        server
+            .documents
+            .insert(uri.clone(), "old".into(), None, None);
+        let expected_edit = server
+            .documents
+            .latest_snapshot(&uri)
+            .map(|view| (view.slot.current_incarnation, view.content_version));
+        server.documents.remove(&uri);
+        server
+            .documents
+            .insert(uri.clone(), "new".into(), None, None);
+        assert!(matches!(
+            server
+                .token_snapshot_after_timeout(
+                    &uri,
+                    expected_edit,
+                    server.cache.semantic_token_generation(),
+                    &crate::cancel::CancelToken::default(),
+                )
+                .await,
+            TokenSnapshot::Superseded
+        ));
         assert_eq!(server.cache.served_semantic_version(&uri), None);
     }
 
@@ -1790,6 +1904,10 @@ mod tests {
             server
                 .token_snapshot_after_timeout(
                     &uri,
+                    server
+                        .documents
+                        .latest_snapshot(&uri)
+                        .map(|view| { (view.slot.current_incarnation, view.content_version) }),
                     server.cache.semantic_token_generation(),
                     &cancel
                 )
