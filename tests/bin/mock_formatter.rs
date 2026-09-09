@@ -370,6 +370,7 @@ fn main() {
                     // must not weigh its items down with routing envelopes.
                     "completion-resolve"
                     | "completion-resolve-plain"
+                    | "completion-resolve-echo-edit"
                     | "completion-resolve-reopen-delayed"
                     | "completion-resolve-delayed"
                     | "completion-resolve-additional-edit" => json!({
@@ -778,14 +779,22 @@ fn main() {
                     .and_then(Value::as_str)
                     .filter(|uri| documents.contains_key(*uri))
                     .map(|uri| {
-                        json!({
+                        let mut result = json!({
                             "isIncomplete": false,
                             "items": [{
                                 "label": "./test",
                                 "kind": 19,
                                 "data": { "mockPath": uri }
                             }]
-                        })
+                        });
+                        if mode == "completion-resolve-echo-edit" {
+                            let position = &message["params"]["position"];
+                            result["items"][0]["textEdit"] = json!({
+                                "range": { "start": position, "end": position },
+                                "newText": "x"
+                            });
+                        }
+                        result
                     })
                     .unwrap_or(Value::Null);
                 respond(&mut writer, id, result);
@@ -831,6 +840,7 @@ fn main() {
                     }]);
                 }
                 if mode != "completion-resolve-plain"
+                    && mode != "completion-resolve-echo-edit"
                     && mode != "completion-resolve-reopen-delayed"
                     && mode != "completion-resolve-delayed"
                     && mode != "completion-resolve-additional-edit"

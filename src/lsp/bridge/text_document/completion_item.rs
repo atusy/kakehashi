@@ -294,7 +294,13 @@ impl LanguageServerPool {
         {
             Some(mut resolved) => {
                 if transform_completion_item(&mut resolved, &offset, region_end, None) {
-                    re_envelope_item(&mut resolved, &envelope);
+                    // A client may resolve this result again. Its ranges now
+                    // use the live geometry, so their next inverse mapping
+                    // must use that same geometry rather than the producer's.
+                    let mut resolved_envelope = envelope;
+                    resolved_envelope.offset = (&offset).into();
+                    resolved_envelope.region_end = Some((region_end.line, region_end.character));
+                    re_envelope_item(&mut resolved, &resolved_envelope);
                     resolved
                 } else {
                     // The resolved primary edit is unsafe for the injection

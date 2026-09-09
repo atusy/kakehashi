@@ -326,3 +326,35 @@ fn e2e_virtual_completion_resolve_reply_after_a_reopen_is_discarded() {
 
     shutdown_client(&mut client);
 }
+
+/// The returned item's ranges and its routing envelope must describe the
+/// same geometry, including when a client resolves that result again.
+#[test]
+fn e2e_virtual_completion_resolve_can_be_repeated_after_a_prefix_edit() {
+    let (mut client, _config_dir, item) = init_virtual_completion_client_on(
+        "completion-resolve-echo-edit",
+        "> ```lua\n> local x = 1\n> local y = 2\n> ```\n",
+        2,
+        5,
+    );
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": MARKDOWN_URI, "version": 2 },
+            "contentChanges": [{ "text": "> ```lua\n> local x = 1\n>local y = 2\n> ```\n" }]
+        }),
+    );
+    let first = client.send_request("completionItem/resolve", item);
+    assert!(first["result"]["detail"].is_string(), "{first}");
+    assert_eq!(
+        first["result"]["textEdit"]["range"]["start"],
+        json!({ "line": 2, "character": 4 }),
+        "{first}"
+    );
+    let second = client.send_request("completionItem/resolve", first["result"].clone());
+    assert_eq!(
+        second["result"]["textEdit"], first["result"]["textEdit"],
+        "re-resolving must not translate an already translated edit with the old prefix: {second}"
+    );
+    shutdown_client(&mut client);
+}
