@@ -42,6 +42,12 @@
 
 #[path = "support/semantic_baseline.rs"]
 mod semantic_baseline;
+#[path = "support/semantic_fixture.rs"]
+mod semantic_fixture;
+
+use semantic_fixture::{
+    FIXED_WIDTH_LINE_BYTES, FIXED_WIDTH_STATE_COUNT, fixed_width_marker_line, gen_sparse_rust,
+};
 
 use semantic_baseline::{
     SemanticBaseline, TRACKED_MARKER, tracked_marker_line, validate_token_payload,
@@ -222,7 +228,7 @@ impl Server {
         );
     }
 
-    fn did_change_replace_prefix(&mut self, uri: &str, version: i64, line: u32, text: &str) {
+    fn did_change_replace_marker_line(&mut self, uri: &str, version: i64, line: u32, text: &str) {
         self.notify(
             "textDocument/didChange",
             json!({
@@ -230,7 +236,7 @@ impl Server {
                 "contentChanges": [{
                     "range": {
                         "start": { "line": line, "character": 0 },
-                        "end": { "line": line, "character": FIXED_WIDTH_STATE_COUNT },
+                        "end": { "line": line, "character": FIXED_WIDTH_LINE_BYTES },
                     },
                     "text": text,
                 }],
@@ -385,28 +391,6 @@ fn gen_rust(funcs: usize) -> String {
 }
 
 const SPARSE_CONTROL_BOUNDARY_BYTES: usize = 32 * 1024;
-const FIXED_WIDTH_STATE_COUNT: usize = 128;
-
-/// Syntactically valid sparse Rust with exact byte size and a stable edit line.
-fn gen_sparse_rust(bytes: usize) -> String {
-    const PREFIX: &str = "/*";
-    let suffix = format!(
-        "*/\n{}{TRACKED_MARKER}\n",
-        " ".repeat(FIXED_WIDTH_STATE_COUNT)
-    );
-
-    assert!(bytes >= PREFIX.len() + suffix.len());
-    let mut source = String::with_capacity(bytes);
-    source.push_str(PREFIX);
-    source.extend(std::iter::repeat_n(
-        'x',
-        bytes - PREFIX.len() - suffix.len(),
-    ));
-    source.push_str(&suffix);
-    assert_eq!(source.len(), bytes);
-    source
-}
-
 /// Markdown with many fenced code blocks in rust/lua/python — each block is a
 /// separate injection region. Exercises the injection pipeline: included-range
 /// computation, active-region detection, and host/injection coordinate mapping.
@@ -797,7 +781,12 @@ fn validate_full_response(scn: &Scenario, result: &Value) {
 
 fn seed_baseline(server: &mut Server, scn: &Scenario) -> Option<SemanticBaseline> {
     match scn.kind {
-        Kind::Full | Kind::Range { .. } | Kind::OpenFirstToken | Kind::CancelBurst { .. } => None,
+        Kind::Full => {
+            // Cache-hit controls must be primed even with zero statistical warmups.
+            validate_full_response(scn, &server.semantic_full(scn.uri));
+            None
+        }
+        Kind::Range { .. } | Kind::OpenFirstToken | Kind::CancelBurst { .. } => None,
         Kind::DeltaNoop
         | Kind::EditDelta
         | Kind::TypingDelta
@@ -888,13 +877,9 @@ fn run_once(
         Kind::FixedWidthTypingDelta => {
             edit.version += 1;
             let state = edit.fixed_width_next;
-            let replacement = format!(
-                "{}x{}",
-                " ".repeat(state),
-                " ".repeat(FIXED_WIDTH_STATE_COUNT - state - 1)
-            );
+            let replacement = fixed_width_marker_line(state);
             edit.fixed_width_next += 1;
-            server.did_change_replace_prefix(scn.uri, edit.version, edit.line, &replacement);
+            server.did_change_replace_marker_line(scn.uri, edit.version, edit.line, &replacement);
             let baseline = baseline.as_mut().expect("typing baseline");
             baseline.expect_tracked_start(u32::try_from(state).expect("fixed state fits u32"));
             let result = server.semantic_delta(scn.uri, baseline.result_id());
