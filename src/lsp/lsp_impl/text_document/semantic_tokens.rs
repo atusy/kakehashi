@@ -125,6 +125,35 @@ impl Kakehashi {
         current
     }
 
+    /// Register a failed current-snapshot wait, then recheck publication. The
+    /// parse may have settled after the timeout but before this marker: in that
+    /// case serve it now instead of losing the only refresh wakeup.
+    async fn token_snapshot_after_timeout(
+        &self,
+        uri: &Url,
+        supersede: &crate::cancel::CancelToken,
+    ) -> TokenSnapshot {
+        let edit_lock = self.documents.edit_lock(uri);
+        let _guard = edit_lock.lock().await;
+        if supersede.is_cancelled() {
+            return TokenSnapshot::Superseded;
+        }
+        if self.documents.latest_snapshot(uri).is_none() {
+            self.documents.remove_edit_lock_if_unshared(uri, &edit_lock);
+            return TokenSnapshot::Absent;
+        }
+        self.cache.record_served_semantic_version(uri, 0);
+        let Some(view) = self.documents.latest_snapshot(uri) else {
+            return TokenSnapshot::Absent;
+        };
+        match view.slot.snapshot {
+            Some(snapshot) if snapshot.parsed_version == view.content_version => {
+                TokenSnapshot::Current(snapshot)
+            }
+            _ => TokenSnapshot::Stale,
+        }
+    }
+
     /// Latest-completed snapshot resolution (parse-snapshot ADR §3): returns
     /// the newest published snapshot, which may trail the input. The only
     /// wait is the bounded first-parse wait (no snapshot for this lifetime
@@ -224,7 +253,7 @@ impl Kakehashi {
             };
             match outcome {
                 SnapshotWait::Current(snapshot) => TokenSnapshot::Current(snapshot),
-                SnapshotWait::Stale => TokenSnapshot::Stale,
+                SnapshotWait::Stale => self.token_snapshot_after_timeout(uri, supersede).await,
                 SnapshotWait::Unparsed | SnapshotWait::Gone => TokenSnapshot::Absent,
             }
         }
@@ -309,13 +338,6 @@ impl Kakehashi {
                 })));
             }
             TokenSnapshot::Stale => {
-                // Register token interest (version 0, monotonic max — a real
-                // serve overwrites) so the settle-refresh gate re-drives this
-                // client even when EVERY request so far rejected: without a
-                // served mark the gate reads "nobody highlights this
-                // document" and the client would stay dark until its next
-                // didChange-driven request.
-                self.cache.record_served_semantic_version(&uri, 0);
                 self.cache.finish_request(&uri, request_id);
                 return Err(crate::error::content_modified_error());
             }
@@ -343,6 +365,19 @@ impl Kakehashi {
         };
         let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
         else {
+            let edit_lock = self.documents.edit_lock(&uri);
+            let _guard = edit_lock.lock().await;
+            if !self.semantic_snapshot_is_current(
+                &uri,
+                snapshot.incarnation,
+                snapshot.parsed_version,
+                token_generation,
+                &edit_lock,
+            ) || !self.cache.is_request_active(&uri, request_id)
+            {
+                self.cache.finish_request(&uri, request_id);
+                return Ok(None);
+            }
             // No detectable language, or resolved-but-tree-less (see
             // `ParseSnapshot` for the causes): nothing to tokenize. The empty set
             // IS this snapshot's served state — record it so the parse loop
@@ -696,13 +731,6 @@ impl Kakehashi {
                 )));
             }
             TokenSnapshot::Stale => {
-                // Register token interest (version 0, monotonic max — a real
-                // serve overwrites) so the settle-refresh gate re-drives this
-                // client even when EVERY request so far rejected: without a
-                // served mark the gate reads "nobody highlights this
-                // document" and the client would stay dark until its next
-                // didChange-driven request.
-                self.cache.record_served_semantic_version(&uri, 0);
                 self.cache.finish_request(&uri, request_id);
                 return Err(crate::error::content_modified_error());
             }
@@ -730,6 +758,19 @@ impl Kakehashi {
         };
         let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
         else {
+            let edit_lock = self.documents.edit_lock(&uri);
+            let _guard = edit_lock.lock().await;
+            if !self.semantic_snapshot_is_current(
+                &uri,
+                snapshot.incarnation,
+                snapshot.parsed_version,
+                token_generation,
+                &edit_lock,
+            ) || !self.cache.is_request_active(&uri, request_id)
+            {
+                self.cache.finish_request(&uri, request_id);
+                return Ok(None);
+            }
             self.cache
                 .record_served_semantic_version(&uri, snapshot.parsed_version);
             self.cache.finish_request(&uri, request_id);
@@ -1135,6 +1176,17 @@ impl Kakehashi {
         };
         let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
         else {
+            let edit_lock = self.documents.edit_lock(&uri);
+            let _guard = edit_lock.lock().await;
+            if !self.semantic_snapshot_is_current(
+                &uri,
+                snapshot.incarnation,
+                snapshot.parsed_version,
+                generation,
+                &edit_lock,
+            ) {
+                return Err(crate::error::content_modified_error());
+            }
             self.cache
                 .record_served_semantic_version(&uri, snapshot.parsed_version);
             return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
@@ -1358,6 +1410,76 @@ mod tests {
             })
             .unwrap_or(false);
         assert!(landed, "test snapshot must land");
+    }
+
+    #[tokio::test]
+    async fn tree_less_token_response_cannot_restore_interest_after_an_edit() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///empty-response-race.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".into(),
+            Some("rust".into()),
+            None,
+        );
+        publish_treeless(server, &uri, "fn main() {}", 0);
+        let edit_lock = server.documents.edit_lock(&uri);
+        let guard = edit_lock.lock().await;
+        let mut request = std::pin::pin!(server.semantic_tokens_full_impl(full_params(&uri)));
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        server
+            .documents
+            .update_document(uri.clone(), "fn main() { }".into(), None);
+        server.cache.reset_semantic_refresh_interest(&uri);
+        drop(guard);
+        assert!(request.await.unwrap().is_none());
+        assert_eq!(server.cache.served_semantic_version(&uri), None);
+    }
+
+    #[tokio::test]
+    async fn timed_out_token_wait_rechecks_a_parse_that_already_settled() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///timeout-publish-race.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".into(),
+            Some("rust".into()),
+            None,
+        );
+        publish_treeless(server, &uri, "fn main() {}", 0);
+        server
+            .documents
+            .update_document(uri.clone(), "fn main() { }".into(), None);
+        publish_treeless(server, &uri, "fn main() { }", 1);
+        let outcome = server
+            .token_snapshot_after_timeout(&uri, &crate::cancel::CancelToken::default())
+            .await;
+        assert!(
+            matches!(outcome, TokenSnapshot::Current(snapshot) if snapshot.parsed_version == 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_timeout_cannot_register_interest_for_a_reopened_document() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///timeout-reopen.rs").unwrap();
+        server
+            .documents
+            .insert(uri.clone(), "old".into(), None, None);
+        let (_, cancel) = server.cache.start_request(&uri);
+        server.cache.remove_document(&uri);
+        server.documents.remove(&uri);
+        server
+            .documents
+            .insert(uri.clone(), "new".into(), None, None);
+        assert!(matches!(
+            server.token_snapshot_after_timeout(&uri, &cancel).await,
+            TokenSnapshot::Superseded
+        ));
+        assert_eq!(server.cache.served_semantic_version(&uri), None);
     }
 
     fn full_params(uri: &Url) -> SemanticTokensParams {

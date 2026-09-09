@@ -125,12 +125,9 @@ fn parse_text_with_deadline(
     )
 }
 
-/// The settled+stale gate for the parse loop's `semanticTokens/refresh`
-/// emission (its full rationale lives at the call site): emit only when the
-/// published parse is still the LIVE content version (settled — mid-burst
-/// publishes skip; the newer text's own publish re-evaluates) AND some
-/// client's last served tokens predate it (a served-version mark exists and
-/// is older — no mark means nobody highlights this document).
+/// Heal a failed current-snapshot wait or a served tree-less placeholder once
+/// its parse settles. Successful responses from earlier edits are cleared by
+/// didChange: they must not cancel the client's parked current request.
 fn should_emit_settle_refresh(
     documents: &DocumentStore,
     cache: &CacheCoordinator,
@@ -1272,11 +1269,12 @@ impl ParseCoordinator {
             // - the document has SETTLED (this parse's version is still the
             //   live content_version — during a typing burst the scheduler is
             //   already reparsing newer text, whose own publish re-evaluates);
-            // - some client actually consumes this document's semantic tokens
-            //   (a served-version mark exists) AND its last served tokens
-            //   predate this snapshot, OR it served the reload's current
+            // - a token request timed out during THIS edit (a zero-version
+            //   interest mark exists), OR it served the reload's current
             //   tree-less placeholder that this publish upgrades at the same
             //   version (otherwise its own didChange-driven request caught up).
+            // Successful responses from earlier edits were cleared at didChange,
+            // so they cannot refresh/cancel the client's current parked request.
             // Net: at most one refresh per settle, none mid-burst, none for
             // documents nobody highlights. Emitted from the parse loop, never
             // didChange (synchronous clients can't answer a server request
@@ -1568,9 +1566,15 @@ mod tests {
             &documents, &cache, &uri, 0, false
         ));
 
-        // An edit bumps the live version; the publish for v1 finds the client
-        // stale (served 0 < 1) and the document settled (live == 1) -> emit.
+        // An accepted edit clears previous successful interest. A parked
+        // current request needs no workspace refresh when its parse publishes.
         documents.update_document(uri.clone(), "ab".into(), None);
+        cache.reset_semantic_refresh_interest(&uri);
+        assert!(!should_emit_settle_refresh(
+            &documents, &cache, &uri, 1, false
+        ));
+        // Only an expired wait records a retry obligation for this edit.
+        cache.record_served_semantic_version(&uri, 0);
         assert!(should_emit_settle_refresh(
             &documents, &cache, &uri, 1, false
         ));

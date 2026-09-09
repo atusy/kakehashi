@@ -433,9 +433,16 @@ Any reader that must resolve against **live** positions is position-critical
   handler — `didChange` deliberately does not emit refresh because a
   synchronous client (vim-lsp on Vim) cannot answer a server request while
   processing a notification; emitting from the off-ingress loop, after the
-  notification returns, avoids that reentrancy. Under serve-current the gate
-  rarely fires (a parked request records the served version at settle); it
-  remains for the backstop path and non-edit token changes. The `CancelToken`
+  notification returns, avoids that reentrancy. Each accepted edit clears the
+  previous edit's semantic refresh-interest mark without discarding delta
+  baselines. A successful response to an earlier edit must not make the new
+  parse cancel a parked current request through a workspace refresh. Only an
+  actual backstop expiry records retry interest; registration rechecks the
+  published snapshot so a parse racing the timeout cannot lose its wakeup.
+  Successful and tree-less responses record interest under the edit lock and
+  validate snapshot currency, preventing old responses from restoring a cleared
+  mark. Same-version tree-less upgrades and non-edit token changes retain their
+  refresh paths. The `CancelToken`
   bail stays narrowed to reclaiming a superseded compute's CPU (§4).
 - **Serve-stale, passively refreshed** — whole-document, no-position reads:
   `documentSymbol`, `documentColor`, plus the `whole_document_fan_out` family
