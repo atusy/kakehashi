@@ -3,27 +3,30 @@
 //! the original completion fan-out. Uses `send_request()` for FIFO ordering
 //! through the single writer task (ls-bridge-message-ordering).
 //!
-//! No document sync is sent here — `completionItem/resolve` carries no
-//! `textDocument`, and the completion that produced the item already opened
-//! the virtual document (virt) or synced the host one (host). If the
-//! downstream server has since restarted (or the connection was recreated),
-//! the resolve fails and we return the unresolved item with envelope intact:
-//! graceful degradation.
+//! The caller supplies current text and geometry under the document edit lock.
+//! Sync and resolve are enqueued together, then the lock is released before
+//! waiting for the reply. This prevents a resolve from overtaking the edit's
+//! deferred downstream synchronization.
 //!
 //! Two paths share that degradation. The VIRT path translates coordinates and
 //! additionally serves the unresolved item when the resolved primary edit is
 //! unsafe for the injection region — escapes it, breaks per-line prefixes, or
-//! merges content into the closing fence (see `resolve_guard_region_end`). The
+//! merges content into the closing fence (see `transform_completion_item`). The
 //! HOST path (#958) forwards verbatim: its item is already in host
 //! coordinates, so neither the translation nor that region guard applies.
 
+use std::future::Future;
+use std::io;
 use std::sync::Arc;
 
 use log::{debug, warn};
 use tower_lsp_server::ls_types::{CompletionItem, Position};
 use url::Url;
 
-use super::super::pool::{ConnectionHandle, LanguageServerPool, UpstreamId};
+use super::super::pool::{
+    ConnectionHandle, ConnectionHandleSender, LanguageServerPool, NotificationSendResult,
+    UpstreamId,
+};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, response_has_jsonrpc_error,
     translate_host_range_to_virtual,
@@ -32,12 +35,25 @@ use super::completion::{
     EnvelopeContext, KakehashiEnvelope, envelope_item_data, strip_envelope,
     transform_completion_item,
 };
+use super::host::{HostDocument, sync_host_document};
 use crate::config::settings::WorkspaceSettings;
 use crate::config::{
     merge_bridge_server_configs, resolve_with_wildcard, settings::BridgeServerConfig,
 };
 use crate::lsp::bridge::actor::RouterCleanupGuard;
 use crate::lsp::bridge::envelope::nests_reserved_key;
+use crate::lsp::bridge::{HostRevision, VirtualDocumentUri};
+
+/// Current resolve text and coordinates, protected until sync + enqueue.
+/// The preparer is awaited only after connection acquisition.
+pub(crate) struct CompletionResolveDocument {
+    pub(crate) host_uri: Url,
+    pub(crate) language_id: String,
+    pub(crate) text: Arc<str>,
+    pub(crate) geometry: Option<(RegionOffset, Position)>,
+    pub(crate) revision: HostRevision,
+    pub(crate) edit_guard: tokio::sync::OwnedMutexGuard<()>,
+}
 
 impl LanguageServerPool {
     /// Route a `completionItem/resolve` request to the origin downstream server.
@@ -48,11 +64,14 @@ impl LanguageServerPool {
     /// a host-layer item, `send_completion_resolve_request` (coordinate
     /// translation + region guard) otherwise. If any routing step fails (no
     /// envelope, server not configured), the item is returned as-is.
+    /// `document` captures current text and geometry after connection setup;
+    /// the edit guard is consumed by transport and released after enqueue.
     pub(crate) async fn dispatch_completion_resolve(
         &self,
         mut item: CompletionItem,
         settings: &WorkspaceSettings,
         upstream_id: Option<UpstreamId>,
+        document: impl Future<Output = Option<CompletionResolveDocument>>,
     ) -> CompletionItem {
         // Extract envelope — if absent, this item wasn't produced by Kakehashi
         let Some(envelope) = strip_envelope(&mut item) else {
@@ -88,11 +107,11 @@ impl LanguageServerPool {
         // flipping `host_layer` on a virt envelope to skip translation.
         if envelope.is_host_layer() {
             return self
-                .send_host_completion_resolve(&config, item, envelope, upstream_id)
+                .send_host_completion_resolve(&config, item, envelope, upstream_id, document)
                 .await;
         }
 
-        self.send_completion_resolve_request(&config, item, envelope, upstream_id)
+        self.send_completion_resolve_request(&config, item, envelope, upstream_id, document)
             .await
     }
 
@@ -107,6 +126,7 @@ impl LanguageServerPool {
         mut item: CompletionItem,
         envelope: KakehashiEnvelope,
         upstream_id: Option<UpstreamId>,
+        document: impl Future<Output = Option<CompletionResolveDocument>>,
     ) -> CompletionItem {
         let server_name = &envelope.origin;
         // `host_uri` comes from client-supplied `data` (the resolve params echo
@@ -166,11 +186,21 @@ impl LanguageServerPool {
             return item;
         }
 
+        let Some(document) = document.await else {
+            re_envelope_item(&mut item, &envelope);
+            return item;
+        };
         // Host coordinates throughout: the item goes out as served (minus the
         // envelope, already stripped) and the resolved reply needs no
         // translation on the way back.
         match self
-            .send_completion_resolve_on_handle(&handle, item.clone(), upstream_id)
+            .send_completion_resolve_on_handle(
+                &handle,
+                item.clone(),
+                upstream_id,
+                &envelope,
+                document,
+            )
             .await
         {
             Some(mut resolved) => {
@@ -196,6 +226,7 @@ impl LanguageServerPool {
         mut item: CompletionItem,
         envelope: KakehashiEnvelope,
         upstream_id: Option<UpstreamId>,
+        document: impl Future<Output = Option<CompletionResolveDocument>>,
     ) -> CompletionItem {
         let server_name = &envelope.origin;
         // Route to the SAME `(server, root)` connection the completion request
@@ -264,19 +295,38 @@ impl LanguageServerPool {
             return item;
         }
 
+        let Some(document) = document.await else {
+            re_envelope_item(&mut item, &envelope);
+            return item;
+        };
+        let Some((offset, region_end)) = document.geometry.clone() else {
+            re_envelope_item(&mut item, &envelope);
+            return item;
+        };
+
         // The original host-coordinate `item` is kept untouched for the
         // fail-soft returns below; the outgoing clone carries virtual ranges.
-        let outgoing = prepare_completion_resolve_item(&item, &envelope);
+        // Its ranges were produced under the ENVELOPE's offset, so that is
+        // what maps them back to virtual coordinates — the live offset (a
+        // later blockquote marker edited from `> ` to `>` changes a later
+        // line's column while the start stays) belongs to the reply, which
+        // the downstream computes against the virtual text as it is now.
+        let outgoing =
+            prepare_completion_resolve_item(&item, &RegionOffset::from(&envelope.offset));
 
         match self
-            .send_completion_resolve_on_handle(&handle, outgoing, upstream_id)
+            .send_completion_resolve_on_handle(&handle, outgoing, upstream_id, &envelope, document)
             .await
         {
             Some(mut resolved) => {
-                let offset = RegionOffset::from(&envelope.offset);
-                let region_end = resolve_guard_region_end(&envelope, &offset);
                 if transform_completion_item(&mut resolved, &offset, region_end, None) {
-                    re_envelope_item(&mut resolved, &envelope);
+                    // A client may resolve this result again. Its ranges now
+                    // use the live geometry, so their next inverse mapping
+                    // must use that same geometry rather than the producer's.
+                    let mut resolved_envelope = envelope;
+                    resolved_envelope.offset = (&offset).into();
+                    resolved_envelope.region_end = Some((region_end.line, region_end.character));
+                    re_envelope_item(&mut resolved, &resolved_envelope);
                     resolved
                 } else {
                     // The resolved primary edit is unsafe for the injection
@@ -314,11 +364,22 @@ impl LanguageServerPool {
         handle: &Arc<ConnectionHandle>,
         outgoing: CompletionItem,
         upstream_id: Option<UpstreamId>,
+        envelope: &KakehashiEnvelope,
+        document: CompletionResolveDocument,
     ) -> Option<CompletionItem> {
         // Route per-connection cancel state by this handle's pool key (#382) —
         // the same connection the completion ran on, recovered from the
         // envelope's host URI by the caller.
         let connection_key = handle.key();
+        // The edit lock must not park behind a lifecycle writer waiting for
+        // another downstream reply. Reordering these locks would conflict
+        // with close (edit -> lifecycle); contention therefore fails soft.
+        let lifecycle = self.existing_host_lifecycle_lock(&document.host_uri)?;
+        let lifecycle = lifecycle.try_read_owned().ok()?;
+        if self.current_host_incarnation(&document.host_uri) != Some(document.revision.incarnation)
+        {
+            return None;
+        }
 
         // Register in the upstream request registry FIRST for cancel lookup.
         if let Some(ref id) = upstream_id {
@@ -344,11 +405,99 @@ impl LanguageServerPool {
         let request = build_completion_resolve_request(outgoing, request_id);
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
 
-        if let Err(e) = handle.send_request(request, request_id) {
-            warn!(
-                target: "kakehashi::bridge",
-                "completionItem/resolve: failed to send request on {connection_key:?}: {e}"
-            );
+        let queued = async {
+            // Pin the generation through sync and enqueue, matching the normal
+            // request path and excluding concurrent connection replacement.
+            let connections = self.connections().await;
+            if !connections
+                .get(connection_key)
+                .is_some_and(|live| Arc::ptr_eq(live, handle))
+            {
+                return Err(io::Error::other("completion origin was replaced"));
+            }
+            if envelope.is_host_layer() {
+                if !self.accepts_host_language(&document.host_uri, &document.language_id)
+                    || self.is_host_routing_suppressed(&document.host_uri, connection_key)
+                {
+                    return Err(io::Error::other("host completion routing changed"));
+                }
+                let mut docs = self.host_documents().await;
+                if !docs.contains_key(&(document.host_uri.to_string(), connection_key.clone())) {
+                    return Err(io::Error::other("completion document is no longer open"));
+                }
+                sync_host_document(
+                    &mut ConnectionHandleSender(handle),
+                    &mut docs,
+                    &HostDocument {
+                        uri: &document.host_uri,
+                        language_id: &document.language_id,
+                        text: &document.text,
+                        revision: Some(document.revision),
+                    },
+                    None,
+                    connection_key,
+                )
+                .await?;
+                handle
+                    .send_request(request, request_id)
+                    .map_err(io::Error::from)?;
+            } else {
+                let uri = crate::lsp::lsp_impl::url_to_uri(&document.host_uri)
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                let virtual_uri =
+                    VirtualDocumentUri::new(&uri, &document.language_id, &envelope.region_id);
+                let routing_uri = Url::parse(&virtual_uri.to_uri_string())
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                if self.host_routing_by_server(&routing_uri, connection_key.server()) == Some(false)
+                {
+                    return Err(io::Error::other("virtual completion routing changed"));
+                }
+                let transition = self.open_transition_lock(&virtual_uri, connection_key);
+                let _transition = transition.lock().await;
+                // A restarted origin cannot interpret the old item's opaque
+                // data. Do not reopen it merely to resolve that old item.
+                if !self.is_document_opened_on_connection(&virtual_uri, connection_key) {
+                    return Err(io::Error::other("completion document is no longer open"));
+                }
+                if let Some(version) = self
+                    .increment_version_if_content_changed(
+                        &virtual_uri,
+                        connection_key,
+                        &document.text,
+                    )
+                    .await
+                {
+                    if !matches!(
+                        Self::send_didchange_for_virtual_doc(
+                            handle,
+                            &virtual_uri.to_uri_string(),
+                            &document.text,
+                            version,
+                        ),
+                        NotificationSendResult::Queued
+                    ) {
+                        return Err(io::Error::other("completion text sync was not queued"));
+                    }
+                    self.record_sent_content_fingerprint(
+                        &virtual_uri,
+                        connection_key,
+                        &document.text,
+                    )
+                    .await;
+                }
+                handle
+                    .send_request(request, request_id)
+                    .map_err(io::Error::from)?;
+            }
+            Ok::<_, io::Error>(())
+        }
+        .await;
+        // Editing, close/reopen, and background forwarding must be able to
+        // proceed while the origin computes the reply.
+        drop(document.edit_guard);
+        drop(lifecycle);
+        if let Err(error) = queued {
+            debug!(target: "kakehashi::bridge", "completionItem/resolve: {error}; returning unresolved");
             if let Some(ref id) = upstream_id {
                 self.unregister_upstream_request(id, connection_key);
             }
@@ -407,12 +556,9 @@ fn parse_completion_resolve_response(mut response: serde_json::Value) -> Option<
 /// would otherwise get them re-translated on the way back — a double shift
 /// the safety guard can't always catch). Mirrors the codeAction resolve path.
 /// The HOST path has no such translation to undo and skips this entirely.
-fn prepare_completion_resolve_item(
-    item: &CompletionItem,
-    envelope: &KakehashiEnvelope,
-) -> CompletionItem {
+fn prepare_completion_resolve_item(item: &CompletionItem, offset: &RegionOffset) -> CompletionItem {
     let mut outgoing = item.clone();
-    translate_item_ranges_host_to_virtual(&mut outgoing, &RegionOffset::from(&envelope.offset));
+    translate_item_ranges_host_to_virtual(&mut outgoing, offset);
     outgoing
 }
 
@@ -460,34 +606,6 @@ fn re_envelope_item(item: &mut CompletionItem, envelope: &KakehashiEnvelope) {
     envelope_item_data(item, &ctx);
 }
 
-/// The `region_end` the resolve-path prefix guard runs with.
-///
-/// Known limitation (pre-existing class, shared with the envelope's `offset`
-/// itself, which has translated resolve responses since #382): both are
-/// completion-time snapshots round-tripped through the client, so an edit
-/// arriving after the region moved translates against stale geometry. A live
-/// re-resolution needs a region identity the envelope doesn't carry — the
-/// codeAction path's freshness gate is the model if this ever bites. Normally the
-/// envelope carries the completion-time snapshot verbatim. A LEGACY envelope
-/// (minted before the field existed) has none, and the resolve path cannot
-/// recompute it — fall back to `(region start line, character 0)`, which is
-/// fully fail-closed: with `character == 0` the guard's boundary rule rejects
-/// every edit at or past the region start in per-line-prefixed regions (the
-/// unresolved item is served instead); unprefixed regions skip the prefix
-/// rules but stay subject to containment and the fence-boundary EOL rule,
-/// both fail-closed under this anchor. A permissive sentinel would disable the
-/// boundary rule entirely and let fence-row edits through — never trade that
-/// for fewer over-strips on envelopes that disappear after one session.
-fn resolve_guard_region_end(envelope: &KakehashiEnvelope, offset: &RegionOffset) -> Position {
-    envelope
-        .region_end
-        .map(|(line, character)| Position { line, character })
-        .unwrap_or(Position {
-            line: offset.line(),
-            character: 0,
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -516,68 +634,133 @@ mod tests {
         }
     }
 
-    // ==========================================================================
-    // resolve_guard_region_end tests
-    // ==========================================================================
-
-    #[test]
-    fn guard_region_end_uses_the_envelope_snapshot_when_carried() {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn completion_resolve_does_not_hold_edits_behind_a_lifecycle_writer() {
+        use crate::lsp::bridge::pool::test_helpers::create_handle_with_key;
+        use crate::lsp::bridge::{ConnectionKey, ConnectionState};
+        let pool = LanguageServerPool::new();
+        let handle =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("lua-ls"))
+                .await;
         let envelope = test_envelope();
-        let offset = RegionOffset::from(&envelope.offset);
-        assert_eq!(
-            resolve_guard_region_end(&envelope, &offset),
-            Position {
-                line: 9,
-                character: 0
+        let uri = Url::parse(&envelope.host_uri).unwrap();
+        pool.open_host_incarnation(&uri, 1).await;
+        let lifecycle = pool.existing_host_lifecycle_lock(&uri).unwrap();
+        let _writer = lifecycle.write().await;
+        let edit_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let document = CompletionResolveDocument {
+            host_uri: uri,
+            language_id: "markdown".into(),
+            text: Arc::from("text"),
+            geometry: None,
+            revision: HostRevision {
+                incarnation: 1,
+                content_version: 1,
             },
-        );
+            edit_guard: Arc::clone(&edit_lock).lock_owned().await,
+        };
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            pool.send_completion_resolve_on_handle(
+                &handle,
+                CompletionItem::default(),
+                None,
+                &envelope,
+                document,
+            ),
+        )
+        .await
+        .expect("a lifecycle writer must not park resolve while it holds the edit lock");
+        assert!(response.is_none());
+        assert!(edit_lock.try_lock().is_ok());
     }
 
-    #[test]
-    fn guard_region_end_falls_back_fail_closed_for_legacy_envelopes() {
-        let mut envelope = test_envelope();
-        envelope.region_end = None;
-        envelope.offset.line = 3;
-        envelope.offset.line_column_offsets = Some(vec![2, 2, 0]);
-        let offset = RegionOffset::from(&envelope.offset);
-
-        let region_end = resolve_guard_region_end(&envelope, &offset);
-        assert_eq!(
-            region_end,
-            Position {
-                line: 3,
-                character: 0
+    /// The parse may already be current while deferred forwarding has not
+    /// run. Seed exactly that state and observe the downstream wire order.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn virtual_completion_syncs_before_resolve_and_releases_edit_lock() {
+        use crate::lsp::bridge::pool::test_helpers::create_handle_with_command;
+        use crate::lsp::bridge::{ConnectionKey, ConnectionState};
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let key = ConnectionKey::for_server("lua-ls");
+        let (handle, _) = create_handle_with_command(
+            ConnectionState::Ready,
+            key.clone(),
+            vec![
+                "sh".into(),
+                "-c".into(),
+                "cat > \"$1\"".into(),
+                "sh".into(),
+                output.path().to_str().unwrap().into(),
+            ],
+            None,
+        )
+        .await;
+        let pool = LanguageServerPool::new();
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let envelope = test_envelope();
+        let uri = Url::parse(&envelope.host_uri).unwrap();
+        pool.open_host_incarnation(&uri, 1).await;
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&uri).unwrap(),
+            &envelope.injection_language,
+            &envelope.region_id,
+        );
+        pool.ensure_document_opened(
+            &mut ConnectionHandleSender(&handle),
+            &uri,
+            &virtual_uri,
+            "old text",
+            &key,
+        )
+        .await
+        .unwrap();
+        let edit_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let document = CompletionResolveDocument {
+            host_uri: uri,
+            language_id: envelope.injection_language.clone(),
+            text: Arc::from("current text"),
+            geometry: None,
+            revision: HostRevision {
+                incarnation: 1,
+                content_version: 2,
             },
-            "legacy fallback anchors the boundary at the region start"
-        );
-
-        // Fail-closed: with character 0 the guard's boundary rule rejects even
-        // a same-line, newline-free edit in this per-line-prefixed region —
-        // the resolve serves the unresolved item rather than guessing where
-        // the region really ends.
-        let mut resolved = CompletionItem {
-            label: "x".into(),
-            text_edit: Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(
-                tower_lsp_server::ls_types::TextEdit {
-                    range: tower_lsp_server::ls_types::Range {
-                        start: Position {
-                            line: 0,
-                            character: 0,
-                        },
-                        end: Position {
-                            line: 0,
-                            character: 3,
-                        },
-                    },
-                    new_text: "single".into(),
-                },
-            )),
-            ..Default::default()
+            edit_guard: Arc::clone(&edit_lock).lock_owned().await,
         };
-        assert!(
-            !transform_completion_item(&mut resolved, &offset, region_end, None),
-            "prefixed-region edits must be rejected under the legacy fallback"
+        let upstream = UpstreamId::Number(123);
+        let reply = pool.send_completion_resolve_on_handle(
+            &handle,
+            CompletionItem {
+                label: "x".into(),
+                ..Default::default()
+            },
+            Some(upstream.clone()),
+            &envelope,
+            document,
         );
+        tokio::pin!(reply);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::select! {
+                _ = &mut reply => panic!("reply must still be pending"),
+                guard = edit_lock.lock() => drop(guard),
+            }
+            // Releasing the edit lock must not require a response. Once the
+            // writer drains, the current text must precede the request.
+            let wire = loop {
+                let wire = std::fs::read_to_string(output.path()).unwrap();
+                if wire.contains("completionItem/resolve") { break wire; }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            };
+            let change = wire.find("textDocument/didChange").expect("current text must be synced");
+            assert!(wire.contains("current text"), "{wire}");
+            assert!(change < wire.find("completionItem/resolve").unwrap(), "{wire}");
+            let ids = handle.router().lookup_downstream_ids(&upstream);
+            assert_eq!(ids.len(), 1);
+            assert_eq!(handle.router().route(json!({"jsonrpc": "2.0", "id": ids[0].as_i64(), "result": {"label": "x", "detail": "resolved"}})), crate::lsp::bridge::RouteResult::Delivered);
+            assert_eq!(reply.await.unwrap().detail.as_deref(), Some("resolved"));
+        }).await.expect("sync and enqueue must not wait for the reply");
     }
 
     // ==========================================================================
@@ -686,6 +869,7 @@ mod tests {
             &mut item,
             "tsudoi-ls",
             "file:///test/doc.txt",
+            None,
         );
 
         for round in 1..=2 {
@@ -780,7 +964,7 @@ mod tests {
         let warnings = captured_warnings_for(|| {
             resolved = Some(runtime.block_on(async {
                 let (pool, settings) = pool_with_capability_less_origin().await;
-                pool.dispatch_completion_resolve(item, &settings, None)
+                pool.dispatch_completion_resolve(item, &settings, None, async { None })
                     .await
             }));
         });
@@ -803,7 +987,7 @@ mod tests {
         };
 
         let result = pool
-            .dispatch_completion_resolve(item.clone(), &settings, None)
+            .dispatch_completion_resolve(item.clone(), &settings, None, async { None })
             .await;
         assert_eq!(result.label, "plain");
         assert_eq!(result.data, Some(json!({"custom": true})));
@@ -817,7 +1001,7 @@ mod tests {
 
         let item = enveloped_item("nonexistent-ls");
         let result = pool
-            .dispatch_completion_resolve(item, &settings, None)
+            .dispatch_completion_resolve(item, &settings, None, async { None })
             .await;
 
         // Should be re-enveloped (routing info preserved for future attempts)
@@ -843,7 +1027,7 @@ mod tests {
 
         let item = enveloped_item("lua-ls");
         let result = pool
-            .dispatch_completion_resolve(item, &settings, None)
+            .dispatch_completion_resolve(item, &settings, None, async { None })
             .await;
 
         let envelope = extract_envelope(&result).expect("should have envelope");
@@ -883,10 +1067,11 @@ mod tests {
             &mut item,
             "tsudoi-ls",
             "file:///test/doc.txt",
+            None,
         );
 
         let result = pool
-            .dispatch_completion_resolve(item, &settings, None)
+            .dispatch_completion_resolve(item, &settings, None, async { None })
             .await;
 
         let envelope = extract_envelope(&result).expect("should have envelope");
@@ -925,7 +1110,7 @@ mod tests {
 
         let item = enveloped_item("lua-ls");
         let result = pool
-            .dispatch_completion_resolve(item, &settings, None)
+            .dispatch_completion_resolve(item, &settings, None, async { None })
             .await;
 
         let envelope = extract_envelope(&result).expect("should have envelope");
@@ -1011,7 +1196,7 @@ mod tests {
         // Go through the SAME request-preparation helper production uses, and
         // assert on the serialized request.
         let request = build_completion_resolve_request(
-            prepare_completion_resolve_item(&item, &envelope),
+            prepare_completion_resolve_item(&item, &RegionOffset::from(&envelope.offset)),
             RequestId::new(7),
         );
         let wire = serde_json::to_value(&request).unwrap();
@@ -1053,7 +1238,7 @@ mod tests {
             data: Some(json!({"resolve_id": 42})),
             ..Default::default()
         };
-        envelope_host_item(&mut item, "lua-ls", "file:///test/doc.md");
+        envelope_host_item(&mut item, "lua-ls", "file:///test/doc.md", None);
         let (result, warnings) = resolve_warnings_for(item);
         let envelope = extract_envelope(&result).expect("envelope restored");
         assert!(
@@ -1097,7 +1282,7 @@ mod tests {
             data: Some(forged.clone()),
             ..Default::default()
         };
-        envelope_host_item(&mut item, "lua-ls", "file:///test/doc.md");
+        envelope_host_item(&mut item, "lua-ls", "file:///test/doc.md", None);
         let (result, warnings) = resolve_warnings_for(item);
         let envelope = extract_envelope(&result).expect("envelope restored");
         assert!(envelope.is_host_layer());

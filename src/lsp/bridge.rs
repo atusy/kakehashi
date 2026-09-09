@@ -59,6 +59,7 @@ pub(crate) use client_progress::{
 };
 pub(crate) use coordinator::BridgeCoordinator;
 pub(crate) use coordinator::ResolvedServerConfig;
+pub(crate) use envelope::HostRevision;
 pub(crate) use inbound_request_registry::InboundRequestRegistry;
 #[cfg(test)]
 pub(crate) use pool::ConnectionState;
@@ -86,6 +87,7 @@ pub(crate) use protocol::translate_virtual_range_to_host;
 pub(crate) use protocol::workspace_edit_has_effect;
 pub(crate) use protocol::workspace_edit_preserves_line_prefixes;
 pub(crate) use protocol::workspace_edit_within_region;
+pub(crate) use text_document::completion_item::CompletionResolveDocument;
 pub(crate) use text_document::host::{HostDocument, HostTextReader, normalize_host_goto_result};
 pub(crate) use text_document::{
     CodeActionEnvelope, EnvelopeOffset, InlayHintDocumentRevision, InlayHintEnvelope,

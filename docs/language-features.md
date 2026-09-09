@@ -106,9 +106,8 @@ embedded blocks. Works for any grammar, no setup required.
 ## Bridged features
 
 The features below are served by a language server configured for the
-embedded language — most of them also on the surrounding document itself,
-by a `bridge._self` host server (document color is the exception and stays
-injection-only).
+embedded language — also on the surrounding document itself where a
+`bridge._self` host server is configured.
 Placing the cursor outside an embedded
 code block yields no result from the injection bridges; with `bridge._self`
 configured, the host language's own servers still answer there.
@@ -135,7 +134,11 @@ embedded block (escape the region, break blockquote `> ` prefixes, or merge cont
 into the closing fence) are dropped fail-closed: an unsafe primary edit drops
 the item (at resolve time, the unsafe resolved response is discarded and the
 unresolved item is served instead), while an unsafe auto-import set — at either
-stage — is dropped whole and the completion itself still applies. Default combine strategy: `preferred`.
+stage — is dropped whole and the completion itself still applies. A resolve
+is refused, and the item returned unchanged, when the host document was
+closed and reopened since the item was produced (the list is meant to outlive
+ordinary edits: the editor filters it locally while the user keeps typing and
+resolves on accept). Default combine strategy: `preferred`.
 
 ### Signature help
 
@@ -294,14 +297,14 @@ Lazy actions resolve back to their origin server (`codeAction/resolve`) —
 client-driven resolve routing additionally requires the client to declare
 `dataSupport` and `resolveSupport` covering `"edit"`; without those,
 injection-layer lazy actions are eagerly resolved by the bridge and
-host-layer ones are disabled or dropped. (Known limitation: CLIENT-driven
-resolve of lazy actions in runtime-range-adjusted regions (`#offset!` /
-`#trim!`) such as bundled
-YAML/TOML frontmatter always fails soft — the resolve freshness check cannot
-match there; the eager-resolve path taken for non-envelope clients bypasses
-that check.)
+host-layer ones are disabled or dropped. Runtime-range-adjusted regions
+(`#offset!` / `#trim!`, such as bundled YAML/TOML frontmatter) resolve like
+any other: the freshness check rebuilds the same adjusted geometry the
+action was minted from.
 Command-carrying actions execute through the bridged
-`workspace/executeCommand`.
+`workspace/executeCommand`. A resolve is refused, and the action returned
+unchanged, when the host document was edited (even a same-size edit inside
+the block) or reopened since the action was produced.
 
 Edit safety differs by layer and direction. An INJECTION-layer action edit
 that cannot be represented in the host document (touching another injection
@@ -325,18 +328,24 @@ virt/host layers. Advertised only to clients with
 `codeActionLiteralSupport`; see the README's bridged-requests list for the
 palette/registered-list caveats.
 
-### Document color (experimental)
+### Document color
 
 [`textDocument/documentColor`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_documentColor)
 and [`textDocument/colorPresentation`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_colorPresentation)
 
 Shows color swatches and color picker presentations for embedded blocks.
+Document colors can also combine embedded and host-language server results;
+set `layers.aggregation."textDocument/documentColor".strategy = "concatenated"`
+to retain both layers. Presentation routing is range-based because the LSP
+color item carries no producer identity: outside an injection the host server
+receives the real URI, range, and edits unchanged; inside an injection the
+default `virt → host` preference can select the virtual server even for a
+host-produced color. Configure `textDocument/colorPresentation` as
+`concatenated` to retain answers from both layers in that ambiguous case.
 Presentations whose primary edit (explicit, or the implicit label replacement)
 would corrupt the host document around the embedded block are dropped
 fail-closed; unsafe additional edits are dropped as one atomic set while the
 presentation itself survives.
-**Only available with the `KAKEHASHI_EXPERIMENTAL=true` environment variable** —
-without the opt-in the server does not advertise color support.
 
 ---
 

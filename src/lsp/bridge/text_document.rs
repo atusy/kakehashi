@@ -18,7 +18,7 @@ mod completion;
 pub(crate) use completion::{
     EnvelopeOffset, KakehashiEnvelope, bridge_host_completion_items, extract_envelope,
 };
-mod completion_item;
+pub(super) mod completion_item;
 mod declaration;
 mod definition;
 mod diagnostic;

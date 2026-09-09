@@ -398,7 +398,7 @@ foldingRange, linkedEditingRange, … — lives in `docs/language-features.md`.
 | hover | ✅ Implemented | Pass-through with position translation |
 | signatureHelp | ✅ Implemented | Pass-through |
 | completion | ✅ Implemented | Fail-closed edit guards; atomic additionalTextEdits drop |
-| completionItem/resolve | ✅ Implemented | Envelope-routed (virt and host layers); an unsafe resolved PRIMARY edit serves the unresolved item, unsafe additionalTextEdits drop as an atomic set. Host-layer items forward verbatim — already host coordinates, so no translation and no region guard |
+| completionItem/resolve | ✅ Implemented | Envelope-routed (virt and host layers); an unsafe resolved PRIMARY edit serves the unresolved item, unsafe additionalTextEdits drop as an atomic set. Host-layer items forward verbatim — already host coordinates, so no translation and no region guard (the lifetime stamp still gates them, and a reply the document was edited under in flight is refused) |
 | references | ✅ Implemented | Real-file URIs kept, cross-region virtual URIs dropped |
 | rename | ✅ Implemented | With workspace edit validation |
 | codeAction | ✅ Implemented | Edit-carrying, lazy (`codeAction/resolve` routed to the origin server), command-carrying (`workspace/executeCommand` name-routing + palette dispatch), host layer, multi-region menu merge; strict edit validation (cross-region / region bounds incl. per-line prefix floor) |
@@ -406,7 +406,8 @@ foldingRange, linkedEditingRange, … — lives in `docs/language-features.md`.
 | rangeFormatting | ✅ Implemented | Shares the formatting guards |
 | onTypeFormatting | ✅ Implemented | Shares the formatting guards |
 | inlayHint | ✅ Implemented | Unsafe accept-edit sets dropped whole; hint kept; `inlayHint/resolve` edits pass the same guard |
-| colorPresentation | ✅ Implemented | Experimental opt-in; unsafe presentations dropped |
+| documentColor | ✅ Implemented | Whole-document host/virt results follow the configured layer strategy |
+| colorPresentation | ✅ Implemented | Host edits pass through verbatim, unsafe virtual presentations are dropped |
 | documentHighlight | ✅ Implemented | Strategy-2 shape (single-document, position-mapped) |
 | diagnostics | ✅ Implemented | Push + pull with host translation |
 | semanticTokens | ❌ Not bridged | Native tree-sitter tokens ARE served (semantic-token-overlap-resolution); downstream-server tokens are not fetched or merged — doing so would enable the parallel fetch strategy |

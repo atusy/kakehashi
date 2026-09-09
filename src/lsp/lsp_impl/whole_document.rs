@@ -1,6 +1,6 @@
 //! Shared fan-out for whole-document bridged requests.
 //!
-//! documentLink, foldingRange, and codeLens all follow the same shape: no
+//! documentLink, documentColor, foldingRange, and codeLens all follow the same shape: no
 //! position parameter, so the request fans out to every resolved bridge
 //! virtual document, uses the preferred strategy within each document, and
 //! concatenates those results. This module hosts that shape once; the per-method
@@ -278,6 +278,17 @@ impl Kakehashi {
             };
             let (cancel_rx, _cancel_guard) =
                 self.subscribe_cancel(ctx.upstream_request_id.as_ref());
+            // The lifetime the text was read under travels with the items and
+            // a reply synchronized under another one is refused: a close and
+            // reopen racing the request would otherwise answer for the closed
+            // text under the reopened document's incarnation.
+            let expected_incarnation = ctx.incarnation;
+            let revision = crate::lsp::bridge::HostRevision {
+                incarnation: expected_incarnation,
+                content_version: ctx.content_version,
+            };
+            #[cfg(feature = "e2e")]
+            wait_for_host_admission_release().await;
             let pool = self.bridge.pool_arc();
             let fan_in = dispatch_host_preferred(
                 &ctx,
@@ -294,6 +305,7 @@ impl Kakehashi {
                                     uri: &t.uri,
                                     language_id: &t.language_id,
                                     text: &t.text,
+                                    revision: Some(revision),
                                 },
                                 method_name,
                                 params,
@@ -303,6 +315,15 @@ impl Kakehashi {
                         let Some(raw) = raw else {
                             return Ok(None);
                         };
+                        if raw.incarnation != expected_incarnation {
+                            log::debug!(
+                                target: "kakehashi::bridge",
+                                "{method_name} (host): {} was reopened while {} answered; discarding items computed on the closed text",
+                                t.uri,
+                                t.server_name
+                            );
+                            return Ok(None);
+                        }
                         let Some(items) = parse_host_verbatim::<Vec<T>>(raw.value) else {
                             return Ok(None);
                         };
@@ -310,7 +331,7 @@ impl Kakehashi {
                             items,
                             server_name: t.server_name,
                             host_uri: t.uri,
-                            incarnation: Some(raw.incarnation),
+                            incarnation: Some(expected_incarnation),
                             connection_generation: raw.connection_generation,
                             handle: raw.handle,
                         }))
@@ -320,8 +341,10 @@ impl Kakehashi {
                 cancel_rx,
             )
             .await;
-            self.host_layer_result(fan_in, method_name, |won| won.and_then(on_host_winner))
-                .await
+            self.host_layer_result(fan_in, &ctx, method_name, |won| {
+                won.and_then(on_host_winner)
+            })
+            .await
         };
 
         let result = self
@@ -338,6 +361,26 @@ impl Kakehashi {
             .await?;
 
         Ok(result.and_then(nonempty_whole_document_items))
+    }
+}
+
+#[cfg(feature = "e2e")]
+async fn wait_for_host_admission_release() {
+    let Ok(dir) = std::env::var("KAKEHASHI_E2E_WHOLE_DOCUMENT_HOST_BARRIER_DIR") else {
+        return;
+    };
+    let dir = std::path::Path::new(&dir);
+    if std::fs::create_dir_all(dir).is_err()
+        || std::fs::write(dir.join("captured"), b"captured").is_err()
+    {
+        return;
+    }
+    let release = dir.join("release");
+    for _ in 0..300 {
+        if release.exists() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 

@@ -14,7 +14,7 @@
 //! so this test verifies the bridge infrastructure works correctly by accepting empty results.
 
 use crate::helpers::lua_bridge::{
-    create_lua_configured_client_experimental, shutdown_client, skip_if_lua_ls_unavailable,
+    create_lua_configured_client, shutdown_client, skip_if_lua_ls_unavailable,
 };
 use serde_json::json;
 
@@ -24,7 +24,7 @@ fn e2e_document_color_request_handled() {
     if skip_if_lua_ls_unavailable() {
         return;
     }
-    let (mut client, _config_dir) = create_lua_configured_client_experimental();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown document with Lua code block
     // Note: lua-language-server typically doesn't provide colors for Lua code,
@@ -130,7 +130,7 @@ fn e2e_document_color_no_injections_returns_empty() {
     if skip_if_lua_ls_unavailable() {
         return;
     }
-    let (mut client, _config_dir) = create_lua_configured_client_experimental();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown document WITHOUT code blocks
     let markdown_content = r#"# Test Document

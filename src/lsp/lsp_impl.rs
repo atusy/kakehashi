@@ -434,8 +434,7 @@ pub struct Kakehashi {
     cli_mode: std::sync::atomic::AtomicBool,
     /// Runtime opt-in for experimental features (`KAKEHASHI_EXPERIMENTAL=true`,
     /// see [`crate::experimental`]) — currently the native lexical-resolution
-    /// layer and documentColor / colorPresentation (capability advertisement
-    /// and handlers). Copied from the environment once at construction; atomic
+    /// layer. Copied from the environment once at construction; atomic
     /// only so tests can toggle it per instance.
     experimental: std::sync::atomic::AtomicBool,
     /// Per-document coalescing scheduler for the off-ingress parse
