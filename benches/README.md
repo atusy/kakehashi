@@ -33,7 +33,9 @@ comparing latency distributions conditioned on different retained attempts.
 Timing boundaries: full/cache-hit, range, cold-open, and cancellation samples
 end at response receipt, before token validation. Delta scenarios, including
 no-op deltas and ordinary typing, include local baseline reconstruction and
-validation. Invalid responses fail collection in either case. Eight-edit typing
+validation. Invalid responses fail collection in either case. Full cache-hit
+controls issue one validated, untimed priming request before warmups, including
+when `KAKEHASHI_BENCH_WARMUP=0`. Cold-open scenarios remain cold. Eight-edit typing
 queues edits before one request; cancellation cases exercise in-flight work.
 Neither measures a real editor's request scheduling or highlight rendering.
 Do not label these samples as time to visible highlight application.

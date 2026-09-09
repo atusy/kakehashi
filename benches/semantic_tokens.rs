@@ -781,7 +781,12 @@ fn validate_full_response(scn: &Scenario, result: &Value) {
 
 fn seed_baseline(server: &mut Server, scn: &Scenario) -> Option<SemanticBaseline> {
     match scn.kind {
-        Kind::Full | Kind::Range { .. } | Kind::OpenFirstToken | Kind::CancelBurst { .. } => None,
+        Kind::Full => {
+            // Cache-hit controls must be primed even with zero statistical warmups.
+            validate_full_response(scn, &server.semantic_full(scn.uri));
+            None
+        }
+        Kind::Range { .. } | Kind::OpenFirstToken | Kind::CancelBurst { .. } => None,
         Kind::DeltaNoop
         | Kind::EditDelta
         | Kind::TypingDelta
