@@ -1,6 +1,6 @@
 -- Run with: env -u NVIM_LISTEN_ADDRESS nvim --clean --headless -l this-file.lua
--- Required environment: PROBE_BIN, PROBE_FILE, PROBE_CONFIG, PROBE_OUTPUT.
--- Set KAKEHASHI_DATA_DIR to the same attested runtime used by the server.
+-- Required environment: PROBE_BIN, PROBE_FILE, PROBE_CONFIG, PROBE_OUTPUT,
+-- and KAKEHASHI_DATA_DIR (the same attested runtime used by the server).
 -- Uses Neovim's private semantic-token state (tested with 0.13-dev); fails if
 -- that API changes. This measures client token conversion, not visible UI paint.
 -- PROBE_LINE is a zero-based line whose first token must shift with inserted
@@ -13,7 +13,7 @@ assert(burst and burst > 0 and burst % 1 == 0, "invalid PROBE_BURST")
 assert(interval and interval >= 0, "invalid PROBE_INTERVAL_MS")
 assert(edit_line and edit_line >= 0 and edit_line % 1 == 0, "invalid PROBE_LINE")
 assert(count and count > 0 and count % 1 == 0, "invalid PROBE_SAMPLES")
-for _, key in ipairs({ "PROBE_BIN", "PROBE_FILE", "PROBE_CONFIG", "PROBE_OUTPUT" }) do
+for _, key in ipairs({ "PROBE_BIN", "PROBE_FILE", "PROBE_CONFIG", "PROBE_OUTPUT", "KAKEHASHI_DATA_DIR" }) do
 	assert(vim.env[key] and vim.env[key] ~= "", key .. " is required")
 end
 local uv = vim.uv
