@@ -1,10 +1,14 @@
 import tempfile
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from collect_semantic_pairs import (
     DEFAULT_SCENARIOS,
+    output,
+    optional_output,
     manifest_sha256,
     normalize_captured_stdout,
     parse_server_env,
@@ -20,6 +24,18 @@ from collect_semantic_pairs import (
 
 
 class CollectSemanticPairsTest(unittest.TestCase):
+    def test_metadata_timeout_aborts_required_command(self):
+        with mock.patch("collect_semantic_pairs.METADATA_TIMEOUT_SECONDS", 0.05):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                output([sys.executable, "-c", "import time; time.sleep(5)"], cwd=Path.cwd())
+
+    def test_metadata_timeout_omits_optional_command(self):
+        with mock.patch("collect_semantic_pairs.METADATA_TIMEOUT_SECONDS", 0.05):
+            self.assertIsNone(optional_output(
+                [sys.executable, "-c", "import time; time.sleep(5)"],
+                cwd=Path.cwd(), env={},
+            ))
+
     def test_scenario_filters_are_normalized_for_execution_and_manifest(self):
         self.assertEqual(
             scenario_filter_terms(" rust, , markdown "),
