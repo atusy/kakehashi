@@ -206,3 +206,46 @@ fn validates_range_token_payload_shape() {
         Err(ValidationError::MissingTokenPayload)
     );
 }
+
+#[path = "../benches/support/semantic_fixture.rs"]
+mod semantic_fixture;
+
+#[test]
+fn sparse_edit_states_remain_valid_rust_at_exact_sizes() {
+    use semantic_fixture::{
+        FIXED_WIDTH_LINE_BYTES, FIXED_WIDTH_STATE_COUNT, fixed_width_marker_line, gen_sparse_rust,
+    };
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .unwrap();
+    for bytes in [32 * 1024 - 128, 32 * 1024, 32 * 1024 + 128, 64 * 1024] {
+        let initial = gen_sparse_rust(bytes);
+        assert!(
+            !parser
+                .parse(&initial, None)
+                .unwrap()
+                .root_node()
+                .has_error()
+        );
+        let line_start = initial.find('\n').unwrap() + 1;
+        let mut seen = std::collections::HashSet::new();
+        for state in 0..FIXED_WIDTH_STATE_COUNT {
+            let mut edited = initial.clone();
+            edited.replace_range(
+                line_start..line_start + FIXED_WIDTH_LINE_BYTES,
+                &fixed_width_marker_line(state),
+            );
+            assert_eq!(edited.len(), bytes);
+            assert!(seen.insert(edited.clone()));
+            assert_eq!(
+                edited.lines().nth(1).unwrap().find(TRACKED_MARKER),
+                Some(state)
+            );
+            assert!(
+                !parser.parse(&edited, None).unwrap().root_node().has_error(),
+                "bytes={bytes}, state={state}"
+            );
+        }
+    }
+}
