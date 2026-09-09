@@ -57,12 +57,24 @@ local id = vim.lsp.start({
 	},
 	on_init = function(client)
 		local rpc_request = client.rpc.request
-		client.rpc.request = function(method, params, ...)
+		client.rpc.request = function(method, params, callback, ...)
 			if active and method:find("semanticTokens", 1, true) then
 				active.wire_request_ms = now() - active.started
 				table.insert(active.events, { event = method, ms = active.wire_request_ms })
 			end
-			return rpc_request(method, params, ...)
+			return rpc_request(method, params, function(err, result, request_id)
+				if active and method:find("semanticTokens", 1, true) then
+					table.insert(active.events, {
+						event = "wire_response",
+						method = method,
+						id = request_id,
+						ms = now() - active.started,
+						error = err,
+						null = result == nil or result == vim.NIL,
+					})
+				end
+				return callback(err, result, request_id)
+			end, ...)
 		end
 		local notify = client.rpc.notify
 		client.rpc.notify = function(method, params)
