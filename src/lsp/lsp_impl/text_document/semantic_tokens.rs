@@ -1142,6 +1142,8 @@ impl Kakehashi {
         &self,
         params: SemanticTokensRangeParams,
     ) -> Result<Option<SemanticTokensRangeResult>> {
+        let upstream_id = current_upstream_id();
+        let (mut cancel_rx, _subscription_guard) = self.subscribe_cancel(upstream_id.as_ref());
         let lsp_uri = params.text_document.uri;
         let range = params.range;
 
@@ -1202,10 +1204,18 @@ impl Kakehashi {
             incarnation: snapshot.incarnation,
             generation,
         };
-        let Some(snapshot) = self
-            .resolve_empty_token_snapshot(&uri, snapshot, generation, None)
-            .await
-        else {
+        let resolve = self.resolve_empty_token_snapshot(&uri, snapshot, generation, None);
+        let resolved = match cancel_rx.as_mut() {
+            Some(rx) => {
+                tokio::select! {
+                    biased;
+                    _ = rx => return Err(Error::request_cancelled()),
+                    snapshot = resolve => snapshot,
+                }
+            }
+            None => resolve.await,
+        };
+        let Some(snapshot) = resolved else {
             return Err(crate::error::content_modified_error());
         };
         let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
@@ -1717,6 +1727,40 @@ mod tests {
                 assert_eq!(server.cache.served_semantic_version(&uri), None);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn range_placeholder_lock_wait_is_cancellable_without_superseding_full() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///range-placeholder-cancel.rs").unwrap();
+        server
+            .documents
+            .insert(uri.clone(), "old".into(), None, None);
+        publish_treeless(server, &uri, "old", 0);
+        let (full_request_id, full_cancel) = server.cache.start_request(&uri);
+        let lock = server.documents.edit_lock(&uri);
+        let _guard = lock.lock().await;
+        let mut request = std::pin::pin!(crate::lsp::request_id::CURRENT_REQUEST_ID.scope(
+            Some(tower_lsp_server::jsonrpc::Id::Number(43)),
+            server.semantic_tokens_range_impl(range_params(
+                &uri,
+                Range::new(Position::new(0, 0), Position::new(0, 3)),
+            )),
+        ));
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        assert!(server.cache.is_request_active(&uri, full_request_id));
+        server
+            .bridge
+            .cancel_forwarder()
+            .notify_cancel(&crate::lsp::bridge::UpstreamId::Number(43));
+        let std::task::Poll::Ready(result) = futures::poll!(request.as_mut()) else {
+            panic!("cancellation must release the viewport's placeholder wait")
+        };
+        assert_eq!(result.unwrap_err().code, Error::request_cancelled().code);
+        assert_eq!(server.cache.served_semantic_version(&uri), None);
+        assert!(server.cache.is_request_active(&uri, full_request_id));
+        assert!(!full_cancel.is_cancelled());
     }
 
     #[tokio::test]
