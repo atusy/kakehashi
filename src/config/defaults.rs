@@ -101,6 +101,7 @@ fn default_language_servers() -> HashMap<String, BridgeServerConfig> {
             // invisible. `Some(false)` and `None` are indistinguishable at
             // every consumer, so writing it costs nothing.
             force_start: Some(false),
+            client_capabilities: None,
             settings: None,
             // Spell out the built-in default (every server enabled) so the
             // template documents the opt-out knob: setting this to `false`

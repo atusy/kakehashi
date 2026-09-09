@@ -409,6 +409,32 @@ pub struct BridgeServerConfig {
     /// kakehashi (passthrough), exactly like `initialization_options`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings: Option<Value>,
+    /// Override the client capabilities kakehashi advertises to this server.
+    ///
+    /// Deep-merged over the capabilities kakehashi would otherwise send in
+    /// `initialize` (after the editor's own capabilities are folded in), so
+    /// values written here always win. The merge only sets keys, never
+    /// removes them: disable a boolean capability with an explicit `false`,
+    /// e.g. `clientCapabilities = { window = { workDoneProgress = false } }`
+    /// to stop a progress-chatty server from streaming `$/progress`. Disable
+    /// an object-typed capability via its inner boolean (e.g.
+    /// `window = { showDocument = { support = false } }`) — `false` in place
+    /// of an object is an invalid shape a strict server may reject.
+    ///
+    /// Two fields are protected and reverted with a warning:
+    /// `general.positionEncodings` (kakehashi's coordinate translation
+    /// depends on it) and `workspace.workspaceEdit.changeAnnotationSupport`
+    /// (annotated edits would lose their confirmation gate in the bridge).
+    /// Forcing `workspace.configuration` on or off is honored but
+    /// warned when it contradicts kakehashi's own gate: enabled without
+    /// `settings`, every configuration pull is answered null; disabled with
+    /// `settings`, the server may never read them. Adding capabilities the
+    /// editor or kakehashi cannot actually handle may invite downstream
+    /// requests that fail; reducing capabilities is safe apart from the
+    /// protected fields. Consumed only at `initialize` time — a change
+    /// relaunches this server's connections on the next config reload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_capabilities: Option<Value>,
     /// Marker files/directories that locate the workspace root for this
     /// server, mirroring Neovim's `vim.fs.root` `(string|string[])[]` shape:
     /// entries are tried in list order (earlier = higher priority) and each
@@ -1879,6 +1905,29 @@ mod tests {
     }
 
     #[test]
+    fn should_parse_bridge_server_config_client_capabilities() {
+        // `clientCapabilities` is an opaque JSON override deep-merged over the
+        // capabilities the bridge advertises to this server (issue #976).
+        let config_json = r#"{
+            "cmd": ["basedpyright-langserver", "--stdio"],
+            "languages": ["python"],
+            "clientCapabilities": {
+                "window": { "workDoneProgress": false }
+            }
+        }"#;
+
+        let config: BridgeServerConfig = serde_json::from_str(config_json).unwrap();
+
+        assert_eq!(
+            config
+                .client_capabilities
+                .as_ref()
+                .and_then(|c| c.pointer("/window/workDoneProgress")),
+            Some(&serde_json::Value::Bool(false)),
+        );
+    }
+
+    #[test]
     fn should_parse_bridge_server_config_minimal() {
         // Test that only required fields need to be present
         let config_json = r#"{
@@ -2061,6 +2110,7 @@ mod tests {
             prefer_shared_instance: None,
             force_start: None,
             enabled,
+            client_capabilities: None,
             settings: None,
         };
 
@@ -2231,6 +2281,7 @@ mod tests {
             prefer_shared_instance: None,
             force_start: None,
             enabled: None,
+            client_capabilities: None,
             settings: None,
         };
         let servers = HashMap::from([
@@ -2271,6 +2322,7 @@ mod tests {
             prefer_shared_instance: None,
             force_start: None,
             enabled,
+            client_capabilities: None,
             settings: None,
         };
 
@@ -2356,6 +2408,7 @@ mod tests {
                 prefer_shared_instance: None,
                 force_start: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         )]);
@@ -2380,6 +2433,7 @@ mod tests {
                 prefer_shared_instance: None,
                 force_start: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         )]);
@@ -2559,6 +2613,7 @@ mod tests {
             prefer_shared_instance: None,
             force_start: None,
             enabled: None,
+            client_capabilities: None,
             settings: None,
         };
 

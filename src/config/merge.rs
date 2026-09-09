@@ -143,6 +143,13 @@ pub(crate) fn merge_bridge_server_configs(
             (Some(b), Some(o)) => Some(deep_merge_json(b, o)),
             _ => overlay.settings.clone().or(base.settings.clone()),
         },
+        client_capabilities: match (&base.client_capabilities, &overlay.client_capabilities) {
+            (Some(b), Some(o)) => Some(deep_merge_json(b, o)),
+            _ => overlay
+                .client_capabilities
+                .clone()
+                .or(base.client_capabilities.clone()),
+        },
         workspace_markers: overlay
             .workspace_markers
             .clone()
@@ -396,7 +403,15 @@ fn merge_bridge_maps(
 /// This implements the deep merge semantics required for initialization_options:
 /// - If both are objects, merge their keys recursively
 /// - If either is not an object, overlay wins (including null values)
-fn deep_merge_json(base: &serde_json::Value, overlay: &serde_json::Value) -> serde_json::Value {
+///
+/// Also reused by the bridge to fold a user's `clientCapabilities` override
+/// into the advertised capabilities (issue #976) — the two merges must not
+/// drift apart, or a key that combines across config layers would replace at
+/// advertise time.
+pub(crate) fn deep_merge_json(
+    base: &serde_json::Value,
+    overlay: &serde_json::Value,
+) -> serde_json::Value {
     use serde_json::Value;
 
     match (base, overlay) {
@@ -830,6 +845,7 @@ mod tests {
                         prefer_shared_instance: None,
                         force_start: None,
                         enabled: None,
+                        client_capabilities: None,
                         settings: None,
                     },
                 ),
@@ -844,6 +860,7 @@ mod tests {
                         prefer_shared_instance: None,
                         force_start: None,
                         enabled: None,
+                        client_capabilities: None,
                         settings: None,
                     },
                 ),
@@ -910,6 +927,7 @@ mod tests {
                         prefer_shared_instance: None,
                         force_start: None,
                         enabled: None,
+                        client_capabilities: None,
                         settings: None,
                     },
                 ),
@@ -928,6 +946,7 @@ mod tests {
                         prefer_shared_instance: None,
                         force_start: None,
                         enabled: None,
+                        client_capabilities: None,
                         settings: None,
                     },
                 ),
@@ -988,6 +1007,7 @@ mod tests {
                     prefer_shared_instance: None,
                     force_start: None,
                     enabled: None,
+                    client_capabilities: None,
                     settings: None,
                 },
             )])),
@@ -1380,6 +1400,7 @@ mod tests {
                 prefer_shared_instance: None,
                 force_start: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         )]);
@@ -1399,6 +1420,7 @@ mod tests {
                 prefer_shared_instance: None,
                 force_start: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         )]);
@@ -1419,6 +1441,7 @@ mod tests {
                     prefer_shared_instance: None,
                     force_start: None,
                     enabled: None,
+                    client_capabilities: None,
                     settings: None,
                 },
             ),
@@ -1433,6 +1456,7 @@ mod tests {
                     prefer_shared_instance: None,
                     force_start: None,
                     enabled: None,
+                    client_capabilities: None,
                     settings: None,
                 },
             ),
@@ -1445,6 +1469,57 @@ mod tests {
         assert_eq!(
             init_opts.get("linkedProjects"),
             Some(&json!(["./Cargo.toml"]))
+        );
+    }
+
+    /// `clientCapabilities` deep-merges like `initializationOptions`/`settings`:
+    /// a wildcard's override and a concrete server's override combine key-wise
+    /// (specific wins on conflict), so `_.clientCapabilities` can set a fleet-wide
+    /// mask that individual servers refine rather than replace (issue #976).
+    #[test]
+    fn test_merge_bridge_server_configs_client_capabilities_deep_merge() {
+        use serde_json::json;
+        use settings::BridgeServerConfig;
+
+        let base = BridgeServerConfig {
+            client_capabilities: Some(json!({
+                "window": {"workDoneProgress": false}
+            })),
+            ..Default::default()
+        };
+        let overlay = BridgeServerConfig {
+            client_capabilities: Some(json!({
+                "window": {"showDocument": {"support": false}},
+                "textDocument": {"completion": {"completionItem": {"snippetSupport": false}}}
+            })),
+            ..Default::default()
+        };
+
+        let merged = merge_bridge_server_configs(&base, &overlay);
+        let caps = merged.client_capabilities.unwrap();
+        assert_eq!(
+            caps.pointer("/window/workDoneProgress"),
+            Some(&json!(false)),
+            "wildcard-level key must survive the merge"
+        );
+        assert_eq!(
+            caps.pointer("/window/showDocument/support"),
+            Some(&json!(false)),
+            "sibling keys under a shared object must combine, not replace"
+        );
+        assert_eq!(
+            caps.pointer("/textDocument/completion/completionItem/snippetSupport"),
+            Some(&json!(false)),
+        );
+
+        // One side only → that side is used verbatim.
+        let merged = merge_bridge_server_configs(&base, &BridgeServerConfig::default());
+        assert_eq!(
+            merged
+                .client_capabilities
+                .unwrap()
+                .pointer("/window/workDoneProgress"),
+            Some(&json!(false)),
         );
     }
 
@@ -1465,6 +1540,7 @@ mod tests {
             prefer_shared_instance: None,
             force_start: None,
             enabled: None,
+            client_capabilities: None,
             settings: None,
         };
 
@@ -1478,6 +1554,7 @@ mod tests {
             prefer_shared_instance: None,
             force_start: None,
             enabled: None,
+            client_capabilities: None,
             settings: None,
         };
         let merged = merge_bridge_server_configs(&base, &inheriting);
@@ -1523,6 +1600,7 @@ mod tests {
             on_type_formatting_triggers: None,
             prefer_shared_instance: prefer,
             force_start: None,
+            client_capabilities: None,
             settings: None,
             enabled: None,
         };
@@ -1565,6 +1643,7 @@ mod tests {
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
             force_start: force,
+            client_capabilities: None,
             settings: None,
             enabled: None,
         };
@@ -1602,6 +1681,7 @@ mod tests {
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
             force_start: None,
+            client_capabilities: None,
             settings: None,
             enabled,
         };
@@ -1653,6 +1733,7 @@ mod tests {
             prefer_shared_instance: None,
             force_start: None,
             enabled: None,
+            client_capabilities: None,
             settings: None,
         };
         let overlay = BridgeServerConfig {
@@ -1668,6 +1749,7 @@ mod tests {
             prefer_shared_instance: None,
             force_start: None,
             enabled: None,
+            client_capabilities: None,
             settings: None,
         };
 
@@ -1688,6 +1770,7 @@ mod tests {
         // `initialization_options`: nested objects deep-merge, scalars take the
         // overlay (downstream-settings-propagation).
         let base = BridgeServerConfig {
+            client_capabilities: None,
             settings: Some(json!({
                 "rust-analyzer": {
                     "cargo": { "features": "all", "noDefaultFeatures": false },
@@ -1697,6 +1780,7 @@ mod tests {
             ..Default::default()
         };
         let overlay = BridgeServerConfig {
+            client_capabilities: None,
             settings: Some(json!({
                 "rust-analyzer": {
                     "cargo": { "features": ["foo"] }
@@ -1759,6 +1843,7 @@ mod tests {
             prefer_shared_instance: None,
             force_start: None,
             enabled: None,
+            client_capabilities: None,
             settings: None,
         };
 
@@ -1913,6 +1998,7 @@ mod tests {
                     prefer_shared_instance: None,
                     force_start: None,
                     enabled: None,
+                    client_capabilities: None,
                     settings: None,
                 },
             ),
@@ -1928,6 +2014,7 @@ mod tests {
                     prefer_shared_instance: None,
                     force_start: None,
                     enabled: None,
+                    client_capabilities: None,
                     settings: None,
                 },
             ),
@@ -1970,6 +2057,7 @@ mod tests {
                     prefer_shared_instance: None,
                     force_start: None,
                     enabled: None,
+                    client_capabilities: None,
                     settings: None,
                 },
             ),
@@ -1985,6 +2073,7 @@ mod tests {
                     prefer_shared_instance: None,
                     force_start: None,
                     enabled: None,
+                    client_capabilities: None,
                     settings: None,
                 },
             ),
@@ -2406,6 +2495,7 @@ mod tests {
             prefer_shared_instance: None,
             force_start: None,
             enabled,
+            client_capabilities: None,
             settings: None,
         };
 
