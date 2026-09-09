@@ -553,6 +553,7 @@ def main() -> None:
             source_files = [
                 "benches/semantic_tokens.rs",
                 "benches/support/semantic_baseline.rs",
+                "benches/support/semantic_fixture.rs",
                 "benches/collect_semantic_pairs.py",
                 "benches/semantic_summary.py",
             ]
