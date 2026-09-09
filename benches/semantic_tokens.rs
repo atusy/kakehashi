@@ -26,7 +26,7 @@
 //!   cargo bench --bench semantic_tokens --features e2e
 //! ```
 //!
-//! A/B comparison (the common case — see benches/compare_head_vs_main.sh):
+//! A/B comparison (the common case — see benches/README.md):
 //! ```sh
 //! KAKEHASHI_BENCH_BIN_A=/tmp/kakehashi-main KAKEHASHI_BENCH_LABEL_A=main \
 //! KAKEHASHI_BENCH_BIN_B=/tmp/kakehashi-head KAKEHASHI_BENCH_LABEL_B=head \
@@ -35,12 +35,24 @@
 //!
 //! Tunables (env): `KAKEHASHI_BENCH_ITERS` (default 80),
 //! `KAKEHASHI_BENCH_WARMUP` (default 10), `KAKEHASHI_BENCH_SCENARIOS`
-//! (optional comma-separated scenario-name substrings).
+//! (optional comma-separated scenario-name substrings), and
+//! `KAKEHASHI_BENCH_SAMPLES_FILE` (optional raw JSON output). Reproducible
+//! comparisons should use `benches/collect_semantic_pairs.py`, which supplies
+//! the fixture and binary attestations required by raw output.
 
+#[path = "support/semantic_baseline.rs"]
+mod semantic_baseline;
+
+use semantic_baseline::{
+    SemanticBaseline, TRACKED_MARKER, tracked_marker_line, validate_token_payload,
+};
 use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 // ───────────────────────────── Minimal LSP client ─────────────────────────────
@@ -52,8 +64,10 @@ use std::time::{Duration, Instant};
 struct Server {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    responses: Receiver<Result<Value, String>>,
+    reader: Option<JoinHandle<()>>,
     next_id: i64,
+    buffered_responses: HashMap<i64, Value>,
 }
 
 impl Server {
@@ -68,12 +82,25 @@ impl Server {
             .unwrap_or_else(|e| panic!("failed to spawn server binary {bin:?}: {e}"));
 
         let stdin = child.stdin.take().expect("stdin");
-        let stdout = BufReader::new(child.stdout.take().expect("stdout"));
+        let stdout = child.stdout.take().expect("stdout");
+        let (sender, responses) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut stdout = BufReader::new(stdout);
+            loop {
+                let message = recv_message(&mut stdout);
+                let should_stop = message.is_err();
+                if sender.send(message).is_err() || should_stop {
+                    break;
+                }
+            }
+        });
         let mut server = Server {
             child,
             stdin,
-            stdout,
+            responses,
+            reader: Some(reader),
             next_id: 0,
+            buffered_responses: HashMap::new(),
         };
 
         server.request(
@@ -177,7 +204,46 @@ impl Server {
         );
     }
 
+    /// Insert a new leading space without returning to an earlier document
+    /// state. This models sustained typing without whole-document cache hits.
+    fn did_change_insert_space(&mut self, uri: &str, version: i64, line: u32) {
+        self.notify(
+            "textDocument/didChange",
+            json!({
+                "textDocument": { "uri": uri, "version": version },
+                "contentChanges": [{
+                    "range": {
+                        "start": { "line": line, "character": 0 },
+                        "end": { "line": line, "character": 0 },
+                    },
+                    "text": " ",
+                }],
+            }),
+        );
+    }
+
+    fn did_change_replace_prefix(&mut self, uri: &str, version: i64, line: u32, text: &str) {
+        self.notify(
+            "textDocument/didChange",
+            json!({
+                "textDocument": { "uri": uri, "version": version },
+                "contentChanges": [{
+                    "range": {
+                        "start": { "line": line, "character": 0 },
+                        "end": { "line": line, "character": FIXED_WIDTH_STATE_COUNT },
+                    },
+                    "text": text,
+                }],
+            }),
+        );
+    }
+
     fn request(&mut self, method: &str, params: Value) -> Value {
+        let id = self.send_request(method, params);
+        self.recv_response(id)
+    }
+
+    fn send_request(&mut self, method: &str, params: Value) -> i64 {
         self.next_id += 1;
         let id = self.next_id;
         self.send(&json!({
@@ -186,7 +252,7 @@ impl Server {
             "method": method,
             "params": params,
         }));
-        self.recv_response(id)
+        id
     }
 
     fn notify(&mut self, method: &str, params: Value) {
@@ -206,49 +272,72 @@ impl Server {
     /// Read messages until the response for `id` arrives, skipping
     /// notifications and server-to-client requests.
     fn recv_response(&mut self, id: i64) -> Value {
+        let response = self.recv_raw_response(id);
+        if let Some(error) = response.get("error") {
+            panic!("server returned a JSON-RPC error for request id={id}: {error}");
+        }
+        response.get("result").cloned().unwrap_or(Value::Null)
+    }
+
+    fn recv_raw_response(&mut self, id: i64) -> Value {
+        if let Some(response) = self.buffered_responses.remove(&id) {
+            return response;
+        }
+
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            if Instant::now() > deadline {
-                panic!("timed out waiting for response id={id}");
-            }
-            let msg = self.recv_message();
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or(Duration::ZERO);
+            let msg = self
+                .responses
+                .recv_timeout(remaining)
+                .unwrap_or_else(|error| panic!("failed waiting for response id={id}: {error}"))
+                .unwrap_or_else(|error| panic!("failed reading server response: {error}"));
             // Server-to-client requests carry a "method"; skip them.
             if msg.get("method").is_some() {
                 continue;
             }
-            if msg.get("id").and_then(Value::as_i64) == Some(id) {
-                // Fail fast on a JSON-RPC error: a misconfigured server (missing
-                // parser/query, bad setup) must not silently produce Null and
-                // bogus timings.
-                if let Some(error) = msg.get("error") {
-                    panic!("server returned a JSON-RPC error for request id={id}: {error}");
-                }
-                return msg.get("result").cloned().unwrap_or(Value::Null);
+            let Some(response_id) = msg.get("id").and_then(Value::as_i64) else {
+                continue;
+            };
+            if response_id == id {
+                return msg;
             }
+            self.buffered_responses.insert(response_id, msg);
         }
     }
+}
 
-    fn recv_message(&mut self) -> Value {
-        // Parse Content-Length framing.
-        let mut content_length = None;
-        loop {
-            let mut line = String::new();
-            if self.stdout.read_line(&mut line).unwrap() == 0 {
-                panic!("server closed stdout unexpectedly");
-            }
-            let trimmed = line.trim_end();
-            if trimmed.is_empty() {
-                break; // end of headers
-            }
-            if let Some(v) = trimmed.strip_prefix("Content-Length:") {
-                content_length = Some(v.trim().parse::<usize>().expect("content-length"));
-            }
+fn recv_message(stdout: &mut impl BufRead) -> Result<Value, String> {
+    let mut content_length = None;
+    loop {
+        let mut line = String::new();
+        let read = stdout
+            .read_line(&mut line)
+            .map_err(|error| format!("failed reading LSP header: {error}"))?;
+        if read == 0 {
+            return Err("server closed stdout unexpectedly".to_owned());
         }
-        let len = content_length.expect("missing Content-Length");
-        let mut buf = vec![0u8; len];
-        self.stdout.read_exact(&mut buf).unwrap();
-        serde_json::from_slice(&buf).expect("valid json body")
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some(value) = trimmed.strip_prefix("Content-Length:") {
+            content_length = Some(
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|error| format!("invalid Content-Length: {error}"))?,
+            );
+        }
     }
+    let len = content_length.ok_or_else(|| "missing Content-Length".to_owned())?;
+    let mut body = vec![0_u8; len];
+    stdout
+        .read_exact(&mut body)
+        .map_err(|error| format!("failed reading LSP body: {error}"))?;
+    serde_json::from_slice(&body).map_err(|error| format!("invalid JSON body: {error}"))
 }
 
 impl Drop for Server {
@@ -256,6 +345,9 @@ impl Drop for Server {
         // Best-effort shutdown; kill if it doesn't exit promptly.
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
     }
 }
 
@@ -266,6 +358,8 @@ impl Drop for Server {
 fn gen_rust(funcs: usize) -> String {
     let mut s = String::with_capacity(funcs * 400);
     s.push_str("use std::collections::HashMap;\nuse std::fmt;\n\n");
+    s.push_str(TRACKED_MARKER);
+    s.push_str("\n\n");
     for i in 0..funcs {
         s.push_str(&format!(
             "/// Documentation comment for function number {i}.\n\
@@ -290,6 +384,29 @@ fn gen_rust(funcs: usize) -> String {
     s
 }
 
+const SPARSE_CONTROL_BOUNDARY_BYTES: usize = 32 * 1024;
+const FIXED_WIDTH_STATE_COUNT: usize = 128;
+
+/// Syntactically valid sparse Rust with exact byte size and a stable edit line.
+fn gen_sparse_rust(bytes: usize) -> String {
+    const PREFIX: &str = "/*";
+    let suffix = format!(
+        "*/\n{}{TRACKED_MARKER}\n",
+        " ".repeat(FIXED_WIDTH_STATE_COUNT)
+    );
+
+    assert!(bytes >= PREFIX.len() + suffix.len());
+    let mut source = String::with_capacity(bytes);
+    source.push_str(PREFIX);
+    source.extend(std::iter::repeat_n(
+        'x',
+        bytes - PREFIX.len() - suffix.len(),
+    ));
+    source.push_str(&suffix);
+    assert_eq!(source.len(), bytes);
+    source
+}
+
 /// Markdown with many fenced code blocks in rust/lua/python — each block is a
 /// separate injection region. Exercises the injection pipeline: included-range
 /// computation, active-region detection, and host/injection coordinate mapping.
@@ -300,9 +417,15 @@ fn gen_markdown_injections(blocks: usize) -> String {
         s.push_str(&format!(
             "## Section {i}\n\nProse describing the code in section {i} before the fence.\n\n"
         ));
+        let tracked_marker = if i == 0 {
+            format!("{TRACKED_MARKER}\n")
+        } else {
+            String::new()
+        };
         match i % 3 {
             0 => s.push_str(&format!(
                 "```rust\n\
+                 {tracked_marker}\
                  fn rust_block_{i}(x: i32) -> i32 {{\n\
                 \x20   let doubled = x * 2; // a comment\n\
                 \x20   let label = \"section {i}\";\n\
@@ -336,6 +459,8 @@ fn gen_markdown_injections(blocks: usize) -> String {
 /// forcing the non-ASCII branch of byte→UTF-16 column conversion on most lines.
 fn gen_unicode_rust(funcs: usize) -> String {
     let mut s = String::with_capacity(funcs * 300);
+    s.push_str(TRACKED_MARKER);
+    s.push_str("\n\n");
     for i in 0..funcs {
         s.push_str(&format!(
             "/// 関数番号 {i} のドキュメントコメント — 日本語の説明文です。\n\
@@ -356,6 +481,8 @@ fn gen_unicode_rust(funcs: usize) -> String {
 /// lua-match regex cache pool optimizes.
 fn gen_rust_predicate_heavy(groups: usize) -> String {
     let mut s = String::with_capacity(groups * 320);
+    s.push_str(TRACKED_MARKER);
+    s.push_str("\n\n");
     for i in 0..groups {
         s.push_str(&format!(
             "pub const MAX_VALUE_{i}: u64 = {i};\n\
@@ -378,15 +505,23 @@ struct Stats {
     median: Duration,
     p25: Duration,
     p75: Duration,
+    p95: Duration,
 }
 
 fn summarize(mut samples: Vec<Duration>) -> Stats {
     samples.sort_unstable();
     let pick = |q: f64| samples[((samples.len() as f64 * q) as usize).min(samples.len() - 1)];
+    let middle = samples.len() / 2;
+    let median = if samples.len().is_multiple_of(2) {
+        (samples[middle - 1] + samples[middle]) / 2
+    } else {
+        samples[middle]
+    };
     Stats {
-        median: pick(0.50),
+        median,
         p25: pick(0.25),
         p75: pick(0.75),
+        p95: pick(0.95),
     }
 }
 
@@ -413,6 +548,17 @@ enum Kind {
     /// so each measured request pays incremental reparse + cache invalidation +
     /// delta diff on top of the (full) token recompute.
     EditDelta,
+    /// Sustained typing through unique document states. Unlike `EditDelta`,
+    /// this never toggles back to a previously cached snapshot.
+    TypingDelta,
+    /// Unique same-width edit states, preserving the scenario's exact byte size.
+    FixedWidthTypingDelta,
+    /// Several edits arrive before the one semantic-token request whose result
+    /// is still useful to an editor.
+    TypingBurst { edits: usize },
+    /// Several full requests become obsolete and are explicitly cancelled
+    /// before the one response an editor can still use.
+    CancelBurst { obsolete: usize },
     /// Cold-open latency: each iteration opens a FRESH document and times
     /// `didOpen` → first `semanticTokens/full` response — the editor-visible
     /// "open the file, see highlights" latency. The one scenario that captures
@@ -429,6 +575,7 @@ struct EditState {
     insert_next: bool,
     line: u32,
     range_next: u32,
+    fixed_width_next: usize,
 }
 
 struct Scenario {
@@ -444,6 +591,12 @@ struct Scenario {
 struct Binary {
     label: String,
     path: String,
+    sha256: String,
+}
+
+struct Measurement {
+    samples: Vec<Duration>,
+    discarded_attempts: usize,
 }
 
 /// Run one scenario against one binary and return per-request timing samples.
@@ -454,7 +607,17 @@ fn measure(
     data_dir: &str,
     iters: usize,
     warmup: usize,
-) -> Vec<Duration> {
+) -> Measurement {
+    if matches!(scn.kind, Kind::FixedWidthTypingDelta) {
+        assert!(
+            warmup + iters <= FIXED_WIDTH_STATE_COUNT,
+            "{} requires at most {FIXED_WIDTH_STATE_COUNT} total fixed-width states",
+            scn.name
+        );
+    }
+    if let Kind::CancelBurst { obsolete } = scn.kind {
+        return measure_cancel_burst(bin, scn, data_dir, iters, warmup, obsolete);
+    }
     if let Kind::OpenFirstToken = scn.kind {
         return measure_open(bin, scn, data_dir, iters, warmup);
     }
@@ -463,31 +626,130 @@ fn measure(
     // Let the initial parse settle (didOpen parse may be async).
     std::thread::sleep(Duration::from_millis(300));
 
-    // For delta/edit scenarios we need a valid previous result_id; seed it from a
-    // full request, then keep it current (a no-op delta may or may not rotate).
-    let mut prev_result_id = seed_result_id(&mut server, scn);
-
-    // did_open used version 1; edits continue from there. Edit a line in the
-    // middle of the document (representative of typical cursor position).
+    // Delta scenarios retain and validate the complete client-side baseline,
+    // rather than treating a fresh resultId as proof of a current response.
+    let mut baseline = seed_baseline(&mut server, scn);
     let mut edit = EditState {
         version: 1,
         // First edit must insert (the document opens with no extra space).
         insert_next: true,
-        line: (scn.content.lines().count() / 2) as u32,
+        line: baseline.as_ref().map_or(0, SemanticBaseline::tracked_line),
         range_next: 0,
+        fixed_width_next: 0,
     };
 
     for _ in 0..warmup {
-        run_once(&mut server, scn, &mut prev_result_id, &mut edit);
+        run_once(&mut server, scn, &mut baseline, &mut edit);
     }
 
     let mut samples = Vec::with_capacity(iters);
     for _ in 0..iters {
         let start = Instant::now();
-        run_once(&mut server, scn, &mut prev_result_id, &mut edit);
+        run_once(&mut server, scn, &mut baseline, &mut edit);
         samples.push(start.elapsed());
     }
-    samples
+    Measurement {
+        samples,
+        discarded_attempts: 0,
+    }
+}
+
+fn measure_cancel_burst(
+    bin: &Binary,
+    scn: &Scenario,
+    data_dir: &str,
+    iters: usize,
+    warmup: usize,
+    obsolete: usize,
+) -> Measurement {
+    let mut server = Server::start(&bin.path, data_dir);
+    server.did_open(scn.uri, scn.language_id, &scn.content);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let tracked_line = tracked_marker_line(&scn.content)
+        .unwrap_or_else(|error| panic!("invalid tracked marker for {}: {error:?}", scn.name));
+    let mut baseline = SemanticBaseline::from_full(&server.semantic_full(scn.uri), tracked_line)
+        .unwrap_or_else(|error| panic!("invalid semantic baseline for {}: {error:?}", scn.name));
+    let mut version = 1_i64;
+    let required = warmup + iters;
+    let max_attempts = required.saturating_mul(20).max(20);
+    let mut retained = 0_usize;
+    let mut discarded = 0_usize;
+    let mut samples = Vec::with_capacity(iters);
+
+    for _ in 0..max_attempts {
+        if retained == required {
+            break;
+        }
+
+        let mut obsolete_ids = Vec::with_capacity(obsolete);
+        for _ in 0..obsolete {
+            version += 1;
+            server.did_change_insert_space(scn.uri, version, tracked_line);
+            baseline
+                .record_prefix_insert(1)
+                .expect("tracked position remains valid");
+            let id = server.send_request(
+                "textDocument/semanticTokens/full",
+                json!({ "textDocument": { "uri": scn.uri } }),
+            );
+            // Give dispatch a chance to start computation. If it completes in
+            // this interval, the attempt is classified as unusable below.
+            std::thread::sleep(Duration::from_millis(1));
+            server.notify("$/cancelRequest", json!({ "id": id }));
+            obsolete_ids.push(id);
+        }
+
+        version += 1;
+        let started = Instant::now();
+        server.did_change_insert_space(scn.uri, version, tracked_line);
+        baseline
+            .record_prefix_insert(1)
+            .expect("tracked position remains valid");
+        let result = server.semantic_full(scn.uri);
+        let elapsed = started.elapsed();
+        baseline.apply_response(&result).unwrap_or_else(|error| {
+            panic!("invalid semantic response for {}: {error:?}", scn.name)
+        });
+
+        let mut all_cancelled = true;
+        for id in obsolete_ids {
+            let response = server.recv_raw_response(id);
+            match response.pointer("/error/code").and_then(Value::as_i64) {
+                Some(-32800) => {}
+                None if response.get("result").is_some() => all_cancelled = false,
+                code => panic!(
+                    "obsolete request {id} returned unexpected status {code:?} for {}: {response}",
+                    scn.name
+                ),
+            }
+        }
+
+        if !all_cancelled {
+            discarded += 1;
+            continue;
+        }
+        if retained >= warmup {
+            samples.push(elapsed);
+        }
+        retained += 1;
+    }
+
+    assert_eq!(
+        retained, required,
+        "could not retain {required} cancellation samples for {} after {max_attempts} attempts; discarded {discarded}",
+        scn.name
+    );
+    if discarded > 0 {
+        eprintln!(
+            "{}: discarded {discarded} attempts whose obsolete request completed before cancellation",
+            scn.name
+        );
+    }
+    Measurement {
+        samples,
+        discarded_attempts: discarded,
+    }
 }
 
 /// Cold-open latency loop for [`Kind::OpenFirstToken`]. Each iteration opens a
@@ -505,7 +767,7 @@ fn measure_open(
     data_dir: &str,
     iters: usize,
     warmup: usize,
-) -> Vec<Duration> {
+) -> Measurement {
     let mut server = Server::start(&bin.path, data_dir);
     let mut samples = Vec::with_capacity(iters);
     for i in 0..(warmup + iters) {
@@ -515,21 +777,43 @@ fn measure_open(
         // Blocks until the server answers — i.e. until the (off-ingress) open parse
         // has produced a tree the reader can tokenize, or the reader fell back to an
         // on-demand parse.
-        let _ = server.semantic_full(&uri);
+        let result = server.semantic_full(&uri);
+        validate_full_response(scn, &result);
         let elapsed = start.elapsed();
         if i >= warmup {
             samples.push(elapsed);
         }
     }
-    samples
+    Measurement {
+        samples,
+        discarded_attempts: 0,
+    }
 }
 
-fn seed_result_id(server: &mut Server, scn: &Scenario) -> String {
+fn validate_full_response(scn: &Scenario, result: &Value) {
+    let tracked_line = tracked_marker_line(&scn.content)
+        .unwrap_or_else(|error| panic!("invalid tracked marker for {}: {error:?}", scn.name));
+    SemanticBaseline::from_full(result, tracked_line)
+        .unwrap_or_else(|error| panic!("invalid full response for {}: {error:?}", scn.name));
+}
+
+fn seed_baseline(server: &mut Server, scn: &Scenario) -> Option<SemanticBaseline> {
     match scn.kind {
-        Kind::Full | Kind::Range { .. } | Kind::OpenFirstToken => String::new(),
-        // Both delta-based scenarios need an initial result_id to diff against.
-        Kind::DeltaNoop | Kind::EditDelta => {
-            result_id_of(&server.semantic_full(scn.uri)).unwrap_or_default()
+        Kind::Full | Kind::Range { .. } | Kind::OpenFirstToken | Kind::CancelBurst { .. } => None,
+        Kind::DeltaNoop
+        | Kind::EditDelta
+        | Kind::TypingDelta
+        | Kind::FixedWidthTypingDelta
+        | Kind::TypingBurst { .. } => {
+            let tracked_line = tracked_marker_line(&scn.content).unwrap_or_else(|error| {
+                panic!("invalid tracked marker for {}: {error:?}", scn.name)
+            });
+            Some(
+                SemanticBaseline::from_full(&server.semantic_full(scn.uri), tracked_line)
+                    .unwrap_or_else(|error| {
+                        panic!("invalid semantic baseline for {}: {error:?}", scn.name)
+                    }),
+            )
         }
     }
 }
@@ -537,14 +821,16 @@ fn seed_result_id(server: &mut Server, scn: &Scenario) -> String {
 fn run_once(
     server: &mut Server,
     scn: &Scenario,
-    prev_result_id: &mut String,
+    baseline: &mut Option<SemanticBaseline>,
     edit: &mut EditState,
 ) {
     match scn.kind {
         // Handled by `measure_open`, which never calls `run_once`.
         Kind::OpenFirstToken => unreachable!("OpenFirstToken uses measure_open"),
+        Kind::CancelBurst { .. } => unreachable!("CancelBurst uses measure_cancel_burst"),
         Kind::Full => {
-            let _ = server.semantic_full(scn.uri);
+            let result = server.semantic_full(scn.uri);
+            validate_full_response(scn, &result);
         }
         Kind::Range {
             start_line,
@@ -554,14 +840,17 @@ fn run_once(
         } => {
             let offset = (edit.range_next % variants.max(1)) * step;
             edit.range_next = edit.range_next.wrapping_add(1);
-            let _ = server.semantic_range(scn.uri, start_line + offset, end_line + offset);
+            let result = server.semantic_range(scn.uri, start_line + offset, end_line + offset);
+            validate_token_payload(&result).unwrap_or_else(|error| {
+                panic!("invalid range response for {}: {error:?}", scn.name)
+            });
         }
         Kind::DeltaNoop => {
-            let result = server.semantic_delta(scn.uri, prev_result_id);
-            // Keep the id valid for the next request whether or not it rotated.
-            if let Some(id) = result_id_of(&result) {
-                *prev_result_id = id;
-            }
+            let baseline = baseline.as_mut().expect("delta baseline");
+            let result = server.semantic_delta(scn.uri, baseline.result_id());
+            baseline.apply_response(&result).unwrap_or_else(|error| {
+                panic!("invalid semantic response for {}: {error:?}", scn.name)
+            });
         }
         Kind::EditDelta => {
             // Apply one toggle edit, then request a delta against the prior id.
@@ -569,56 +858,96 @@ fn run_once(
             edit.insert_next = !edit.insert_next;
             edit.version += 1;
             server.did_change_toggle(scn.uri, edit.version, edit.line, insert);
-            // Fall back to a full request if we don't yet have a valid id
-            // (e.g. a prior delta was cancelled and returned no result).
-            let result = if prev_result_id.is_empty() {
-                server.semantic_full(scn.uri)
+            let baseline = baseline.as_mut().expect("edit baseline");
+            let updated = if insert {
+                baseline.record_prefix_insert(1)
             } else {
-                server.semantic_delta(scn.uri, prev_result_id)
+                baseline.record_prefix_delete(1)
             };
-            if let Some(id) = result_id_of(&result) {
-                *prev_result_id = id;
+            updated.expect("tracked position remains valid");
+            let result = server.semantic_delta(scn.uri, baseline.result_id());
+            baseline.apply_response(&result).unwrap_or_else(|error| {
+                panic!("invalid semantic response for {}: {error:?}", scn.name)
+            });
+        }
+        Kind::TypingDelta => {
+            edit.version += 1;
+            server.did_change_insert_space(scn.uri, edit.version, edit.line);
+            let baseline = baseline.as_mut().expect("typing baseline");
+            baseline
+                .record_prefix_insert(1)
+                .expect("tracked position remains valid");
+            let result = server.semantic_delta(scn.uri, baseline.result_id());
+            baseline.apply_response(&result).unwrap_or_else(|error| {
+                panic!("invalid semantic response for {}: {error:?}", scn.name)
+            });
+        }
+        Kind::FixedWidthTypingDelta => {
+            edit.version += 1;
+            let state = edit.fixed_width_next;
+            let replacement = format!(
+                "{}x{}",
+                " ".repeat(state),
+                " ".repeat(FIXED_WIDTH_STATE_COUNT - state - 1)
+            );
+            edit.fixed_width_next += 1;
+            server.did_change_replace_prefix(scn.uri, edit.version, edit.line, &replacement);
+            let baseline = baseline.as_mut().expect("typing baseline");
+            baseline.expect_tracked_start(u32::try_from(state).expect("fixed state fits u32"));
+            let result = server.semantic_delta(scn.uri, baseline.result_id());
+            baseline.apply_response(&result).unwrap_or_else(|error| {
+                panic!("invalid semantic response for {}: {error:?}", scn.name)
+            });
+        }
+        Kind::TypingBurst { edits } => {
+            for _ in 0..edits {
+                edit.version += 1;
+                server.did_change_insert_space(scn.uri, edit.version, edit.line);
             }
+            let baseline = baseline.as_mut().expect("typing baseline");
+            baseline
+                .record_prefix_insert(u32::try_from(edits).expect("edit count fits u32"))
+                .expect("tracked position remains valid");
+            let result = server.semantic_delta(scn.uri, baseline.result_id());
+            baseline.apply_response(&result).unwrap_or_else(|error| {
+                panic!("invalid semantic response for {}: {error:?}", scn.name)
+            });
         }
     }
 }
 
-fn result_id_of(result: &Value) -> Option<String> {
-    result
-        .get("resultId")
-        .and_then(Value::as_str)
-        .map(str::to_string)
+fn validate_full_response_generators() {
+    for content in [
+        gen_rust(1),
+        gen_rust_predicate_heavy(1),
+        gen_markdown_injections(1),
+        gen_unicode_rust(1),
+    ] {
+        tracked_marker_line(&content).expect("full-response generator has one fixed marker");
+    }
 }
 
 fn main() {
-    // Ensure parsers/queries exist, and reuse the test data dir both binaries read.
-    let data_dir: PathBuf = kakehashi::install::test_support::test_data_dir_path();
-    std::fs::create_dir_all(&data_dir).expect("create data dir");
-    kakehashi::install::test_support::ensure_test_languages_installed(&data_dir)
-        .expect("install test languages");
-    let data_dir = data_dir.to_string_lossy().to_string();
-
-    let iters = env_usize("KAKEHASHI_BENCH_ITERS", 80);
-    let warmup = env_usize("KAKEHASHI_BENCH_WARMUP", 10);
-
-    let binaries = resolve_binaries();
+    validate_full_response_generators();
+    let validate_scenarios = std::env::var_os("KAKEHASHI_BENCH_VALIDATE_SCENARIOS").is_some();
+    let prepare_data_dir = std::env::var_os("KAKEHASHI_BENCH_PREPARE_DATA_DIR");
 
     let scenarios = vec![
         Scenario {
-            name: "rust_small/full",
+            name: "rust_small/full_cache_hit",
             language_id: "rust",
             uri: "file:///bench/small.rs",
             content: gen_rust(15),
             kind: Kind::Full,
-            targets: "token-index resolution, Arc mappings, lazy filter_captures",
+            targets: "small exact-snapshot semantic cache-hit control",
         },
         Scenario {
-            name: "rust_large/full",
+            name: "rust_large/full_cache_hit",
             language_id: "rust",
             uri: "file:///bench/large.rs",
             content: gen_rust(150),
             kind: Kind::Full,
-            targets: "per-token String removal, ASCII fast-path, Arc mappings (amplified)",
+            targets: "large exact-snapshot semantic cache-hit control",
         },
         Scenario {
             name: "rust_large/range",
@@ -634,28 +963,28 @@ fn main() {
             targets: "range request variation with scrolling viewports; first miss seeds full-cache filtering",
         },
         Scenario {
-            name: "rust_predicate_heavy/full",
+            name: "rust_predicate_heavy/full_cache_hit",
             language_id: "rust",
             uri: "file:///bench/predicates.rs",
             content: gen_rust_predicate_heavy(120),
             kind: Kind::Full,
-            targets: "#lua-match? predicate evaluation — shared regex lazy-DFA cache pool",
+            targets: "predicate-heavy exact-snapshot semantic cache-hit control",
         },
         Scenario {
-            name: "markdown_injections/full",
+            name: "markdown_injections/full_cache_hit",
             language_id: "markdown",
             uri: "file:///bench/injections.md",
             content: gen_markdown_injections(60),
             kind: Kind::Full,
-            targets: "active-region binary search, line/col index, host_lines sharing",
+            targets: "injection document exact-snapshot semantic cache-hit control",
         },
         Scenario {
-            name: "markdown_injections_large/full",
+            name: "markdown_injections_large/full_cache_hit",
             language_id: "markdown",
             uri: "file:///bench/injections_large.md",
             content: gen_markdown_injections(150),
             kind: Kind::Full,
-            targets: "injection pipeline at scale (amplifies region/coord work)",
+            targets: "large injection document exact-snapshot semantic cache-hit control",
         },
         Scenario {
             name: "markdown_injections_large/range",
@@ -671,12 +1000,12 @@ fn main() {
             targets: "range request variation across markdown injections; first miss seeds full-cache filtering",
         },
         Scenario {
-            name: "unicode_rust/full",
+            name: "unicode_rust/full_cache_hit",
             language_id: "rust",
             uri: "file:///bench/unicode.rs",
             content: gen_unicode_rust(150),
             kind: Kind::Full,
-            targets: "byte→UTF-16 conversion (non-ASCII fallback) + token path",
+            targets: "Unicode document exact-snapshot semantic cache-hit control",
         },
         Scenario {
             name: "rust_large/delta_noop",
@@ -695,12 +1024,84 @@ fn main() {
             targets: "edit→reparse→retokenize→delta diff (host path under typing)",
         },
         Scenario {
+            name: "rust_large/typing_delta",
+            language_id: "rust",
+            uri: "file:///bench/large_typing.rs",
+            content: gen_rust(150),
+            kind: Kind::TypingDelta,
+            targets: "unique edit states→reparse→retokenize→delta; excludes A/B cache returns",
+        },
+        Scenario {
+            name: "rust_sparse_32k_minus/typing_delta",
+            language_id: "rust",
+            uri: "file:///bench/sparse_32k_minus.rs",
+            content: gen_sparse_rust(SPARSE_CONTROL_BOUNDARY_BYTES - 128),
+            kind: Kind::FixedWidthTypingDelta,
+            targets: "sparse low-match control just below 32 KiB",
+        },
+        Scenario {
+            name: "rust_sparse_32k_exact/typing_delta",
+            language_id: "rust",
+            uri: "file:///bench/sparse_32k_exact.rs",
+            content: gen_sparse_rust(SPARSE_CONTROL_BOUNDARY_BYTES),
+            kind: Kind::FixedWidthTypingDelta,
+            targets: "sparse low-match control at 32 KiB",
+        },
+        Scenario {
+            name: "rust_sparse_32k_plus/typing_delta",
+            language_id: "rust",
+            uri: "file:///bench/sparse_32k_plus.rs",
+            content: gen_sparse_rust(SPARSE_CONTROL_BOUNDARY_BYTES + 128),
+            kind: Kind::FixedWidthTypingDelta,
+            targets: "sparse low-match control just above 32 KiB",
+        },
+        Scenario {
+            name: "rust_sparse_64k/typing_delta",
+            language_id: "rust",
+            uri: "file:///bench/sparse_64k.rs",
+            content: gen_sparse_rust(64 * 1024),
+            kind: Kind::FixedWidthTypingDelta,
+            targets: "sparse low-match query walk at 64 KiB",
+        },
+        Scenario {
+            name: "rust_large/typing_burst",
+            language_id: "rust",
+            uri: "file:///bench/large_typing_burst.rs",
+            content: gen_rust(150),
+            kind: Kind::TypingBurst { edits: 8 },
+            targets: "eight queued unique edits→current delta; latest-state follow latency",
+        },
+        Scenario {
+            name: "rust_xlarge/cancel_burst",
+            language_id: "rust",
+            uri: "file:///bench/large_supersede.rs",
+            content: gen_rust(600),
+            kind: Kind::CancelBurst { obsolete: 4 },
+            targets: "current-token latency after four explicitly cancelled edit states",
+        },
+        Scenario {
             name: "markdown_injections/edit_delta",
             language_id: "markdown",
             uri: "file:///bench/injections_edit.md",
             content: gen_markdown_injections(60),
             kind: Kind::EditDelta,
             targets: "edit→reparse→injection re-detect→cache invalidation→delta (typing)",
+        },
+        Scenario {
+            name: "markdown_injections/typing_delta",
+            language_id: "markdown",
+            uri: "file:///bench/injections_typing.md",
+            content: gen_markdown_injections(60),
+            kind: Kind::TypingDelta,
+            targets: "unique edit states→injection reuse→delta; excludes A/B cache returns",
+        },
+        Scenario {
+            name: "markdown_injections/typing_burst",
+            language_id: "markdown",
+            uri: "file:///bench/injections_typing_burst.md",
+            content: gen_markdown_injections(60),
+            kind: Kind::TypingBurst { edits: 8 },
+            targets: "eight queued unique edits→current injection delta; latest-state follow latency",
         },
         // Cold-open latency scenarios for the #6 off-ingress flip. The reader gates
         // on the **host parse** via the watermark (≤200ms budget), then falls back to
@@ -740,6 +1141,43 @@ fn main() {
         },
     ];
     let scenarios = filter_scenarios(scenarios);
+    for scenario in &scenarios {
+        tracked_marker_line(&scenario.content)
+            .unwrap_or_else(|error| panic!("invalid scenario {}: {error:?}", scenario.name));
+    }
+    if validate_scenarios {
+        return;
+    }
+    if let Some(path) = prepare_data_dir {
+        let path = PathBuf::from(path);
+        std::fs::create_dir_all(&path).expect("create benchmark fixture");
+        kakehashi::install::test_support::ensure_test_languages_installed(&path)
+            .expect("install benchmark fixture languages");
+        validate_fixture(&path);
+        println!("prepared benchmark fixture at {}", path.display());
+        return;
+    }
+
+    // An explicit fixture is attested input: verify it without installing or
+    // otherwise mutating it. The implicit checkout-local fixture retains the
+    // convenient install-on-first-run behavior for interactive use.
+    let data_dir = if let Some(path) = std::env::var_os("KAKEHASHI_BENCH_DATA_DIR") {
+        let path = PathBuf::from(path);
+        validate_fixture(&path);
+        path
+    } else {
+        let path = kakehashi::install::test_support::test_data_dir_path();
+        std::fs::create_dir_all(&path).expect("create data dir");
+        kakehashi::install::test_support::ensure_test_languages_installed(&path)
+            .expect("install test languages");
+        path
+    };
+    let data_dir = data_dir.to_string_lossy().to_string();
+
+    let iters = env_usize("KAKEHASHI_BENCH_ITERS", 80);
+    let warmup = env_usize("KAKEHASHI_BENCH_WARMUP", 10);
+
+    let binaries = resolve_binaries();
 
     println!();
     println!("semantic-tokens benchmark  (iters={iters}, warmup={warmup}, lower is better)");
@@ -748,23 +1186,111 @@ fn main() {
     }
     println!();
 
+    let mut raw_runs = Vec::new();
+
     if binaries.len() == 2 {
         print_ab_header(&binaries[0].label, &binaries[1].label);
         for scn in &scenarios {
             // Interleave A and B at the scenario level (separate processes); the
             // two runs are back-to-back to minimize machine drift between them.
-            let a = summarize(measure(&binaries[0], scn, &data_dir, iters, warmup));
-            let b = summarize(measure(&binaries[1], scn, &data_dir, iters, warmup));
+            let a_measurement = measure(&binaries[0], scn, &data_dir, iters, warmup);
+            let b_measurement = measure(&binaries[1], scn, &data_dir, iters, warmup);
+            record_raw_run(&mut raw_runs, &binaries[0], scn, &a_measurement);
+            record_raw_run(&mut raw_runs, &binaries[1], scn, &b_measurement);
+            let a = summarize(a_measurement.samples);
+            let b = summarize(b_measurement.samples);
             print_ab_row(scn, &a, &b);
         }
     } else {
         print_single_header();
         for scn in &scenarios {
-            let s = summarize(measure(&binaries[0], scn, &data_dir, iters, warmup));
+            let measurement = measure(&binaries[0], scn, &data_dir, iters, warmup);
+            record_raw_run(&mut raw_runs, &binaries[0], scn, &measurement);
+            let s = summarize(measurement.samples);
             print_single_row(scn, &s);
         }
     }
+    write_raw_samples(iters, warmup, &binaries, raw_runs);
     println!();
+}
+
+fn record_raw_run(
+    raw_runs: &mut Vec<Value>,
+    bin: &Binary,
+    scn: &Scenario,
+    measurement: &Measurement,
+) {
+    raw_runs.push(json!({
+        "binary_label": bin.label,
+        "binary_path": bin.path,
+        "binary_sha256": bin.sha256,
+        "scenario": scn.name,
+        "document_bytes": scn.content.len(),
+        "samples_ns": measurement.samples.iter().map(Duration::as_nanos).collect::<Vec<_>>(),
+        "validation": {
+            "retained_samples": measurement.samples.len(),
+            "discarded_attempts": measurement.discarded_attempts,
+        },
+    }));
+}
+
+fn write_raw_samples(iters: usize, warmup: usize, binaries: &[Binary], raw_runs: Vec<Value>) {
+    let Some(path) = std::env::var_os("KAKEHASHI_BENCH_SAMPLES_FILE") else {
+        return;
+    };
+    assert!(
+        binaries.iter().all(|binary| !binary.sha256.is_empty()),
+        "raw samples require attested binary SHA-256 values"
+    );
+    let output = json!({
+        "schema_version": 3,
+        "pair_index": env_optional("KAKEHASHI_BENCH_PAIR_INDEX"),
+        "order": env_optional("KAKEHASHI_BENCH_ORDER"),
+        "iterations": iters,
+        "warmup_iterations": warmup,
+        "harness_commit": env_optional("KAKEHASHI_BENCH_HARNESS_COMMIT"),
+        "harness_sha256": env_optional("KAKEHASHI_BENCH_HARNESS_SHA256"),
+        "fixture_sha256": env_optional("KAKEHASHI_BENCH_FIXTURE_SHA256"),
+        "binaries": binaries.iter().map(|bin| json!({
+            "label": bin.label,
+            "path": bin.path,
+            "sha256": bin.sha256,
+        })).collect::<Vec<_>>(),
+        "runs": raw_runs,
+    });
+    let bytes = serde_json::to_vec_pretty(&output).expect("serialize raw benchmark samples");
+    std::fs::write(&path, bytes)
+        .unwrap_or_else(|error| panic!("write raw samples to {:?}: {error}", path));
+}
+
+fn validate_fixture(data_dir: &std::path::Path) {
+    assert!(
+        data_dir.join(".installed").is_file(),
+        "attested fixture has no .installed marker: {}",
+        data_dir.display()
+    );
+    let parser_entries = std::fs::read_dir(data_dir.join("parser"))
+        .unwrap_or_else(|error| panic!("read fixture parsers in {}: {error}", data_dir.display()))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read fixture parser entry");
+    for language in kakehashi::install::test_support::TEST_LANGUAGES {
+        assert!(
+            parser_entries.iter().any(|entry| {
+                entry.path().file_stem().and_then(|stem| stem.to_str()) == Some(language)
+            }),
+            "attested fixture has no {language} parser: {}",
+            data_dir.display()
+        );
+        assert!(
+            data_dir
+                .join("queries")
+                .join(language)
+                .join(".kakehashi-install-complete")
+                .is_file(),
+            "attested fixture has incomplete {language} queries: {}",
+            data_dir.display()
+        );
+    }
 }
 
 fn filter_scenarios(scenarios: Vec<Scenario>) -> Vec<Scenario> {
@@ -794,19 +1320,20 @@ fn filter_scenarios(scenarios: Vec<Scenario>) -> Vec<Scenario> {
 
 fn print_single_header() {
     println!(
-        "{:<34} {:>10} {:>10} {:>10}",
-        "scenario", "median", "p25", "p75"
+        "{:<34} {:>10} {:>10} {:>10} {:>10}",
+        "scenario", "median", "p25", "p75", "p95"
     );
-    println!("{}", "-".repeat(68));
+    println!("{}", "-".repeat(79));
 }
 
 fn print_single_row(scn: &Scenario, s: &Stats) {
     println!(
-        "{:<34} {:>9.3}ms {:>9.3}ms {:>9.3}ms",
+        "{:<34} {:>9.3}ms {:>9.3}ms {:>9.3}ms {:>9.3}ms",
         scn.name,
         ms(s.median),
         ms(s.p25),
-        ms(s.p75)
+        ms(s.p75),
+        ms(s.p95)
     );
     println!("    └ targets: {}", scn.targets);
 }
@@ -817,7 +1344,7 @@ fn print_ab_header(label_a: &str, label_b: &str) {
         "scenario",
         format!("{label_a} (med)"),
         format!("{label_b} (med)"),
-        "Δ (B vs A)"
+        format!("Δ ({label_b} vs {label_a})")
     );
     println!("{}", "-".repeat(72));
 }
@@ -835,6 +1362,7 @@ fn print_ab_row(scn: &Scenario, a: &Stats, b: &Stats) {
         "{:<34} {:>10.3}ms {:>10.3}ms {:>8}{:.1}%",
         scn.name, am, bm, sign, delta_pct
     );
+    println!("    p95: {:>10.3}ms {:>10.3}ms", ms(a.p95), ms(b.p95));
     println!("    └ targets: {}", scn.targets);
 }
 
@@ -847,6 +1375,10 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn env_optional(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|value| !value.is_empty())
+}
+
 /// Resolve which binaries to benchmark from the environment.
 /// A/B mode if both `_A` and `_B` are set; otherwise single-binary mode.
 fn resolve_binaries() -> Vec<Binary> {
@@ -857,10 +1389,12 @@ fn resolve_binaries() -> Vec<Binary> {
             Binary {
                 label: std::env::var("KAKEHASHI_BENCH_LABEL_A").unwrap_or_else(|_| "A".into()),
                 path: a,
+                sha256: std::env::var("KAKEHASHI_BENCH_SHA256_A").unwrap_or_default(),
             },
             Binary {
                 label: std::env::var("KAKEHASHI_BENCH_LABEL_B").unwrap_or_else(|_| "B".into()),
                 path: b,
+                sha256: std::env::var("KAKEHASHI_BENCH_SHA256_B").unwrap_or_default(),
             },
         ];
     }
@@ -869,5 +1403,6 @@ fn resolve_binaries() -> Vec<Binary> {
     vec![Binary {
         label: "binary".into(),
         path: single,
+        sha256: std::env::var("KAKEHASHI_BENCH_SHA256").unwrap_or_default(),
     }]
 }
