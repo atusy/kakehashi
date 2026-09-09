@@ -108,6 +108,7 @@ impl Kakehashi {
         // scratch (#348).
         let ticket = crate::lsp::current_writer_ticket();
         self.documents.apply_edit(&uri, text, &edits);
+        self.cache.reset_semantic_refresh_interest(&uri);
 
         // NOTE: We intentionally do NOT invalidate the semantic token cache here.
         // The cached tokens (with their result_id) are needed for delta calculations.
@@ -164,6 +165,38 @@ mod tests {
     use tower_lsp_server::ls_types::{
         TextDocumentContentChangeEvent, VersionedTextDocumentIdentifier,
     };
+
+    #[tokio::test]
+    async fn did_change_does_not_carry_successful_token_interest_into_the_next_edit() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = url::Url::parse("file:///test/token-edit.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        server.cache.record_served_semantic_version(&uri, 0);
+        server
+            .did_change_impl(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: crate::lsp::lsp_impl::url_to_uri(&uri).unwrap(),
+                    version: 2,
+                },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: "fn main() { }".to_string(),
+                }],
+            })
+            .await;
+        assert_eq!(
+            server.cache.served_semantic_version(&uri),
+            None,
+            "the previous edit's successful response must not request a settle refresh"
+        );
+    }
 
     #[tokio::test]
     async fn did_change_aborts_an_in_flight_saved_diagnostic() {
