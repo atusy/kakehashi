@@ -54,11 +54,9 @@ fn init_client_with_mode(
         }),
     );
     assert!(initialized.get("error").is_none(), "{initialized}");
-    assert!(
-        initialized["result"]["capabilities"]
-            .get("typeHierarchyProvider")
-            .is_none(),
-        "prepare+supertypes stack must not advertise until subtypes lands"
+    assert_eq!(
+        initialized["result"]["capabilities"]["typeHierarchyProvider"], true,
+        "the complete type hierarchy surface must be advertised"
     );
     client.send_notification("initialized", json!({}));
     (client, config_dir)
@@ -137,6 +135,15 @@ fn supertypes(client: &mut LspClient, item: Value) -> Vec<Value> {
         .expect("supertype array")
 }
 
+fn subtypes(client: &mut LspClient, item: Value) -> Vec<Value> {
+    let response = client.send_request("typeHierarchy/subtypes", json!({ "item": item }));
+    assert!(response.get("error").is_none(), "{response}");
+    response["result"]
+        .as_array()
+        .cloned()
+        .expect("subtype array")
+}
+
 fn wait_for_log_message(client: &mut LspClient, needle: &str) -> Option<Value> {
     for _ in 0..20 {
         let message = client.wait_for_notification("window/logMessage", Duration::from_secs(1));
@@ -213,6 +220,283 @@ fn supertypes_preserve_host_item_coordinates() {
     );
     assert_eq!(parent["data"]["kakehashi"]["host_layer"], true);
     shutdown(&mut client);
+}
+
+#[test]
+fn subtypes_restore_virtual_items_and_re_envelope_recursive_results() {
+    let (mut client, _config_dir) = init_client(false);
+    let uri = "file:///test_type_hierarchy_subtypes.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri, "languageId": "markdown", "version": 1,
+            "text": "> ```lua\n> MockChild\n> ```\n"
+        }}),
+    );
+    let child = prepare(&mut client, uri, 1, 3).remove(0);
+    let parent = supertypes(&mut client, child).remove(0);
+
+    let child = subtypes(&mut client, parent).remove(0);
+    assert_eq!(child["name"], "MockChild");
+    assert_eq!(child["uri"], uri);
+    assert_eq!(
+        child["range"]["start"],
+        json!({ "line": 1, "character": 2 })
+    );
+    assert_eq!(child["tags"], json!([1]));
+    assert_eq!(
+        child["data"]["kakehashi"]["inner"],
+        json!({ "mock": "type-item" })
+    );
+    let leaf = subtypes(&mut client, child).remove(0);
+    assert_eq!(leaf["name"], "MockLeaf");
+    assert_eq!(leaf["uri"], uri);
+    assert_eq!(
+        leaf["data"]["kakehashi"]["inner"],
+        json!({ "mock": "leaf-item" })
+    );
+    shutdown(&mut client);
+}
+
+#[test]
+fn subtypes_preserve_host_item_coordinates() {
+    let (mut client, _config_dir) = init_client(true);
+    let uri = "file:///test_type_hierarchy_subtypes.lua";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri, "languageId": "lua", "version": 1, "text": "MockChild\n"
+        }}),
+    );
+    let child = prepare(&mut client, uri, 0, 1).remove(0);
+    let parent = supertypes(&mut client, child).remove(0);
+
+    let child = subtypes(&mut client, parent).remove(0);
+    assert_eq!(child["uri"], uri);
+    assert_eq!(
+        child["range"]["start"],
+        json!({ "line": 0, "character": 0 })
+    );
+    assert_eq!(child["data"]["kakehashi"]["host_layer"], true);
+    shutdown(&mut client);
+}
+
+#[test]
+fn subtypes_without_a_routing_envelope_return_null() {
+    let (mut client, _config_dir) = init_client(false);
+    let response = client.send_request(
+        "typeHierarchy/subtypes",
+        json!({ "item": {
+            "name": "Foreign", "kind": 5, "uri": "file:///foreign.lua",
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 7 } },
+            "selectionRange": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 7 } }
+        }}),
+    );
+    assert_eq!(response["result"], Value::Null);
+    shutdown(&mut client);
+}
+
+#[test]
+fn subtypes_reject_stale_content_before_dispatch() {
+    let event_dir = tempfile::TempDir::new().expect("event dir");
+    let request_file = event_dir
+        .path()
+        .join("type-hierarchy-marker-subtypes.request.json");
+    let (mut client, _config_dir) = init_client_with_mode(
+        false,
+        "type-hierarchy-marker-subtypes",
+        Some(event_dir.path()),
+    );
+    let uri = "file:///test_stale_subtype_content.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri, "languageId": "markdown", "version": 1,
+            "text": "```lua\nMockChild\n```\n"
+        }}),
+    );
+    let child = prepare(&mut client, uri, 1, 1).remove(0);
+    let parent = supertypes(&mut client, child).remove(0);
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": uri, "version": 2 },
+            "contentChanges": [{ "text": "```lua\nChanged\n```\n" }]
+        }),
+    );
+
+    let response = client.send_request("typeHierarchy/subtypes", json!({ "item": parent }));
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["result"], Value::Null);
+    assert!(
+        !request_file.exists(),
+        "stale subtype must not reach downstream"
+    );
+    shutdown(&mut client);
+}
+
+#[test]
+fn subtypes_reject_stale_virtual_geometry_and_language_before_dispatch() {
+    let event_dir = tempfile::TempDir::new().expect("event dir");
+    let request_file = event_dir
+        .path()
+        .join("type-hierarchy-marker-subtypes.request.json");
+    let (mut client, _config_dir) = init_client_with_mode(
+        false,
+        "type-hierarchy-marker-subtypes",
+        Some(event_dir.path()),
+    );
+    let uri = "file:///test_stale_subtype_geometry.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri, "languageId": "markdown", "version": 1,
+            "text": "```lua\nMockChild\n```\n"
+        }}),
+    );
+    let child = prepare(&mut client, uri, 1, 1).remove(0);
+    let parent = supertypes(&mut client, child).remove(0);
+    for (pointer, replacement) in [
+        ("/data/kakehashi/offset/line", json!(99)),
+        ("/data/kakehashi/injection_language", json!("luau")),
+        ("/data/kakehashi/region_id", json!("missing-region")),
+    ] {
+        let mut stale = parent.clone();
+        *stale.pointer_mut(pointer).expect("envelope field") = replacement;
+        let response = client.send_request("typeHierarchy/subtypes", json!({ "item": stale }));
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(response["result"], Value::Null);
+    }
+    assert!(
+        !request_file.exists(),
+        "stale subtype provenance must fail before downstream dispatch"
+    );
+    shutdown(&mut client);
+}
+
+fn assert_subtypes_discard_response_after_document_change(host_layer: bool) {
+    let (mut client, _config_dir) =
+        init_client_with_mode(host_layer, "type-hierarchy-delayed-subtypes", None);
+    let (uri, language_id, text, line, character) = if host_layer {
+        (
+            "file:///test_delayed_subtype.lua",
+            "lua",
+            "MockChild\n",
+            0,
+            1,
+        )
+    } else {
+        (
+            "file:///test_delayed_subtype.md",
+            "markdown",
+            "```lua\nMockChild\n```\n",
+            1,
+            1,
+        )
+    };
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri, "languageId": language_id, "version": 1, "text": text
+        }}),
+    );
+    let child = prepare(&mut client, uri, line, character).remove(0);
+    let parent = supertypes(&mut client, child).remove(0);
+
+    let request_id = client.send_request_async("typeHierarchy/subtypes", json!({ "item": parent }));
+    assert!(
+        wait_for_log_message(&mut client, "type-hierarchy-subtypes-started").is_some(),
+        "downstream subtype request must reach the sent-state barrier"
+    );
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": uri, "version": 2 },
+            "contentChanges": [{ "text": text.replace("MockChild", "Changed") }]
+        }),
+    );
+    let response = client.receive_response_for_id_public(request_id);
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["result"], Value::Null);
+    shutdown(&mut client);
+}
+
+#[test]
+fn subtypes_discard_stale_responses_for_both_layers() {
+    assert_subtypes_discard_response_after_document_change(false);
+    assert_subtypes_discard_response_after_document_change(true);
+}
+
+fn assert_subtypes_cancel_targets_exact_downstream_request(host_layer: bool) {
+    let event_dir = tempfile::TempDir::new().expect("event dir");
+    let request_file = event_dir
+        .path()
+        .join("type-hierarchy-slow-subtypes.request.json");
+    let cancel_file = event_dir
+        .path()
+        .join("type-hierarchy-slow-subtypes.cancel.json");
+    let (mut client, _config_dir) = init_client_with_mode(
+        host_layer,
+        "type-hierarchy-slow-subtypes",
+        Some(event_dir.path()),
+    );
+    let (uri, language_id, text, line, character) = if host_layer {
+        (
+            "file:///test_cancel_subtype.lua",
+            "lua",
+            "MockChild\n",
+            0,
+            1,
+        )
+    } else {
+        (
+            "file:///test_cancel_subtype.md",
+            "markdown",
+            "```lua\nMockChild\n```\n",
+            1,
+            1,
+        )
+    };
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri, "languageId": language_id, "version": 1, "text": text
+        }}),
+    );
+    let child = prepare(&mut client, uri, line, character).remove(0);
+    let parent = supertypes(&mut client, child).remove(0);
+
+    let request_id = client.send_request_async("typeHierarchy/subtypes", json!({ "item": parent }));
+    assert!(
+        wait_for_log_message(&mut client, "type-hierarchy-subtypes-started").is_some(),
+        "downstream subtype request must start"
+    );
+    assert!(
+        request_file.exists(),
+        "downstream subtype request must be recorded"
+    );
+    client.send_notification("$/cancelRequest", json!({ "id": request_id }));
+    let response = client.receive_response_for_id_public(request_id);
+    assert_eq!(response["error"]["code"], -32800, "{response}");
+    let forwarded = (0..200).any(|_| {
+        if cancel_file.exists() {
+            true
+        } else {
+            std::thread::sleep(Duration::from_millis(50));
+            false
+        }
+    });
+    assert!(forwarded, "subtype cancel must reach downstream");
+    let request: Value = serde_json::from_slice(&std::fs::read(request_file).unwrap()).unwrap();
+    let cancel: Value = serde_json::from_slice(&std::fs::read(cancel_file).unwrap()).unwrap();
+    assert_eq!(cancel["params"]["id"], request["id"]);
+    shutdown(&mut client);
+}
+
+#[test]
+fn subtypes_cancel_exact_downstream_request_for_both_layers() {
+    assert_subtypes_cancel_targets_exact_downstream_request(false);
+    assert_subtypes_cancel_targets_exact_downstream_request(true);
 }
 
 #[test]

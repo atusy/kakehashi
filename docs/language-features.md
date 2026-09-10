@@ -352,13 +352,14 @@ recursively.
 
 ### Type hierarchy
 
-[`textDocument/prepareTypeHierarchy`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_prepareTypeHierarchy)
-
-Type-hierarchy preparation works for both embedded virtual documents and
-host-language servers enabled with `bridge._self`. Virtual item URIs and ranges
-are translated back to host coordinates, while real external-file items remain
-unchanged. Each prepared item retains the producing server's opaque `data` in a
-kakehashi routing envelope for the subsequent supertype and subtype requests.
+Type hierarchy preparation and both expansion directions are bridged for
+embedded virtual documents and host-language bridge layers. Returned items
+remember their exact producing server and region, so recursive supertype and
+subtype requests return to that producer. Stale items from changed, reopened,
+moved, or reconfigured documents fail softly with `null`.
+Only items from the request's own virtual region are projected into host
+coordinates; items from another known virtual region are filtered, while real
+external-file URIs and their coordinate spaces are preserved.
 
 ### Document color
 
@@ -652,7 +653,6 @@ type CapturesDelta = {
 
 kakehashi does not yet provide these LSP features:
 
-- Type hierarchy
 - Workspace symbol search (`workspace/symbol`)
 
 (The static code-action and execute-command providers are advertised only to
