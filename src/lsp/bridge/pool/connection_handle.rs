@@ -134,6 +134,7 @@ pub(crate) struct ConnectionHandle {
     /// bridge-routing protocol. This starts false, is set from the initialize
     /// advertisement, and may be cleared after a downstream MethodNotFound.
     bridge_routing: AtomicBool,
+    type_hierarchy_provider: AtomicBool,
     /// Dynamic capability registrations from server-initiated `client/registerCapability` requests.
     ///
     /// Updated by the reader task, queried by request handlers via `has_capability()`.
@@ -262,6 +263,7 @@ impl ConnectionHandle {
             next_request_id: AtomicI64::new(2),
             server_capabilities: OnceLock::new(),
             bridge_routing: AtomicBool::new(false),
+            type_hierarchy_provider: AtomicBool::new(false),
             dynamic_capabilities,
             connection_key,
             workspace_folders,
@@ -622,6 +624,11 @@ impl ConnectionHandle {
         let _ = self.server_capabilities.set(capabilities);
     }
 
+    pub(super) fn set_type_hierarchy_provider(&self, supported: bool) {
+        self.type_hierarchy_provider
+            .store(supported, Ordering::Release);
+    }
+
     /// Access the server capabilities from the initialize response.
     ///
     /// Returns `None` if capabilities haven't been set yet (server still initializing).
@@ -815,6 +822,9 @@ impl ConnectionHandle {
                         | tower_lsp_server::ls_types::CallHierarchyServerCapability::Options(_)
                 )
             ),
+            "textDocument/prepareTypeHierarchy" => {
+                self.type_hierarchy_provider.load(Ordering::Acquire)
+            }
             "inlayHint/resolve" => match caps.inlay_hint_provider.as_ref() {
                 Some(OneOf::Right(
                     tower_lsp_server::ls_types::InlayHintServerCapabilities::Options(options),
@@ -2553,6 +2563,16 @@ mod tests {
                 "has_capability({method}) should return true when enabled",
             );
         }
+    }
+
+    #[tokio::test]
+    async fn type_hierarchy_capability_uses_the_preserved_raw_provider_bit() {
+        let handle = spawn_sink_handle().await;
+        handle.set_server_capabilities(ServerCapabilities::default());
+        assert!(!handle.has_capability("textDocument/prepareTypeHierarchy"));
+
+        handle.set_type_hierarchy_provider(true);
+        assert!(handle.has_capability("textDocument/prepareTypeHierarchy"));
     }
 
     /// Table-driven test: has_capability returns false when capabilities are

@@ -15,6 +15,7 @@ mod aggregation;
 mod ingress_order;
 mod lsp_impl;
 mod progress;
+mod protocol_response_patch;
 mod request_id;
 mod semantic_request_tracker;
 mod settings;
@@ -23,6 +24,7 @@ pub use bridge::LanguageServerPool;
 pub use ingress_order::IngressOrderGate;
 pub(crate) use ingress_order::{current_writer_ticket, reclaim_current_writer_sequence};
 pub use lsp_impl::Kakehashi;
+pub use protocol_response_patch::ProtocolResponsePatch;
 pub(crate) use request_id::current_upstream_id;
 pub use request_id::{CancelForwarder, RequestIdCapture};
 pub(crate) use settings::{

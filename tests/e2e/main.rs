@@ -71,5 +71,6 @@ mod e2e_semantic_tokens_refresh;
 mod e2e_shared_instance;
 mod e2e_stable_region_id;
 mod e2e_synthetic_push_diagnostic;
+mod e2e_type_hierarchy;
 mod e2e_window_notifications;
 mod e2e_workspace_folder_config;
