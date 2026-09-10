@@ -61,6 +61,20 @@ impl DynamicCapabilityRegistry {
             .any(|r| r.method == method)
     }
 
+    /// Run `f` while a matching registration remains protected from
+    /// unregistration. The read lease linearizes request admission before the
+    /// unregister writer can remove the capability and acknowledge it.
+    pub(crate) fn with_registration<R>(&self, method: &str, f: impl FnOnce() -> R) -> Option<R> {
+        let guard = self
+            .registrations
+            .read()
+            .recover_poison("DynamicCapabilityRegistry::with_registration");
+        guard
+            .values()
+            .any(|registration| registration.method == method)
+            .then(f)
+    }
+
     /// Whether any dynamic registration of `method` sets the boolean
     /// `registerOptions.<flag>`.
     ///
@@ -142,6 +156,22 @@ mod tests {
         let unreg = make_unregistration("1", "textDocument/completion");
         registry.unregister(vec![unreg]);
 
+        assert!(!registry.has_registration("textDocument/completion"));
+    }
+
+    #[test]
+    fn registration_read_lease_orders_unregistration_after_admission() {
+        let registry = DynamicCapabilityRegistry::new();
+        registry.register(vec![make_registration("1", "textDocument/completion")]);
+        let write_is_excluded = registry.with_registration("textDocument/completion", || {
+            registry.registrations.try_write().is_err()
+        });
+        assert_eq!(
+            write_is_excluded,
+            Some(true),
+            "admission callback must execute while the unregister write lock is excluded"
+        );
+        registry.unregister(vec![make_unregistration("1", "textDocument/completion")]);
         assert!(!registry.has_registration("textDocument/completion"));
     }
 
