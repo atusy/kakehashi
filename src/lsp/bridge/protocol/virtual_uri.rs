@@ -171,6 +171,41 @@ impl VirtualDocumentUri {
         uri.contains(Self::SCRATCH_ID_MARKER) && Self::is_virtual_uri(uri)
     }
 
+    /// Recover the canonical virtual URI whose region a formatting scratch
+    /// URI belongs to. The scratch suffix is `{marker}{run}-{step}` immediately
+    /// before the language extension.
+    pub(crate) fn canonical_uri_for_scratch(uri: &str) -> Option<String> {
+        if !Self::is_scratch_uri(uri) {
+            return None;
+        }
+        let url = url::Url::parse(uri).ok()?;
+        let path = url.path();
+        let filename_start = path.rfind('/').map_or(0, |slash| slash + 1);
+        let filename = &path[filename_start..];
+        let virtual_name = filename.strip_prefix(VIRTUAL_URI_PREFIX)?;
+        let (region_id, extension) = virtual_name.split_once('.')?;
+        let marker = region_id.rfind(Self::SCRATCH_ID_MARKER)?;
+        let (run, step) = region_id[marker + Self::SCRATCH_ID_MARKER.len()..].split_once('-')?;
+        let run_number = run.parse::<usize>().ok()?;
+        let step_number = step.parse::<usize>().ok()?;
+        if run_number.to_string() != run || step_number.to_string() != step {
+            return None;
+        }
+        let canonical_path = format!(
+            "{}{}{}.{}",
+            &path[..filename_start],
+            VIRTUAL_URI_PREFIX,
+            &region_id[..marker],
+            extension
+        );
+        Some(format!(
+            "{}{}{}",
+            &url[..url::Position::BeforePath],
+            canonical_path,
+            &url[url::Position::AfterPath..]
+        ))
+    }
+
     /// Format: `{scheme}:///{host_dir}/kakehashi-virtual-uri-{region_id}.{ext}`,
     /// preserving the host URI's scheme (file://, https://, …) and directory so
     /// downstream servers can resolve relative imports and discover project
@@ -307,6 +342,67 @@ mod tests {
             VirtualDocumentUri::is_scratch_uri(&uri),
             "scratch virtual URI must be detected: {uri}"
         );
+    }
+
+    #[test]
+    fn canonical_uri_for_scratch_removes_only_numeric_run_step_suffix() {
+        let host_uri = Url::parse("file:///project/doc.md").unwrap();
+        let canonical = VirtualDocumentUri::new(&url_to_uri(&host_uri), "python", "01ARZ3NDEKTSV4");
+        let scratch_id = format!("01ARZ3NDEKTSV4{}7-2", VirtualDocumentUri::SCRATCH_ID_MARKER);
+        let scratch =
+            VirtualDocumentUri::new(&url_to_uri(&host_uri), "python", &scratch_id).to_uri_string();
+
+        assert_eq!(
+            VirtualDocumentUri::canonical_uri_for_scratch(&scratch),
+            Some(canonical.to_uri_string())
+        );
+        assert!(
+            VirtualDocumentUri::canonical_uri_for_scratch(
+                "file:///project/kakehashi-virtual-uri-region-kakehashi-scratch-run-step.py"
+            )
+            .is_none()
+        );
+        assert!(
+            VirtualDocumentUri::canonical_uri_for_scratch(
+                "file:///project/kakehashi-virtual-uri-region-kakehashi-scratch-01-2.py"
+            )
+            .is_none()
+        );
+
+        let mut scratch_with_suffix = Url::parse(&scratch).unwrap();
+        scratch_with_suffix.set_query(Some("version=1.2-kakehashi-scratch-note"));
+        scratch_with_suffix.set_fragment(Some("part.3"));
+        let mut canonical_with_suffix = Url::parse(&canonical.to_uri_string()).unwrap();
+        canonical_with_suffix.set_query(scratch_with_suffix.query());
+        canonical_with_suffix.set_fragment(scratch_with_suffix.fragment());
+        assert_eq!(
+            VirtualDocumentUri::canonical_uri_for_scratch(scratch_with_suffix.as_str()),
+            Some(canonical_with_suffix.to_string())
+        );
+
+        for language in ["foo.bar", "foo bar", "foo-kakehashi-scratch-bar"] {
+            for host_uri in [
+                url_to_uri(&Url::parse("file:///project/doc.md").unwrap()),
+                "untitled:test".parse().unwrap(),
+            ] {
+                let canonical = VirtualDocumentUri::new(&host_uri, language, "region");
+                let scratch = VirtualDocumentUri::new(
+                    &host_uri,
+                    language,
+                    &format!("region{}3-4", VirtualDocumentUri::SCRATCH_ID_MARKER),
+                );
+                let mut scratch_url = Url::parse(&scratch.to_uri_string()).unwrap();
+                scratch_url.set_query(Some("version=1.2"));
+                scratch_url.set_fragment(Some("part.3"));
+                let mut canonical_url = Url::parse(&canonical.to_uri_string()).unwrap();
+                canonical_url.set_query(scratch_url.query());
+                canonical_url.set_fragment(scratch_url.fragment());
+                assert_eq!(
+                    VirtualDocumentUri::canonical_uri_for_scratch(scratch_url.as_str()),
+                    Some(canonical_url.to_string())
+                );
+            }
+        }
     }
 
     #[test]
