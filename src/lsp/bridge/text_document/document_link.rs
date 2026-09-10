@@ -20,7 +20,7 @@ use serde_json::Value;
 use tower_lsp_server::ls_types::DocumentLink;
 use url::Url;
 
-use super::super::pool::{ConnectionKey, LanguageServerPool, UpstreamId};
+use super::super::pool::{ConnectionKey, ConnectionState, LanguageServerPool, UpstreamId};
 use super::super::protocol::{
     DocumentParams, JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
     build_whole_document_request, response_has_jsonrpc_error,
@@ -383,9 +383,9 @@ impl LanguageServerPool {
 
         let send_result = {
             let connections = self.connections().await;
-            let producer_is_live = connections
-                .get(connection_key)
-                .is_some_and(|current| Arc::ptr_eq(current, &handle));
+            let producer_is_live = connections.get(connection_key).is_some_and(|current| {
+                Arc::ptr_eq(current, &handle) && current.state() == ConnectionState::Ready
+            });
             let generation_matches = envelope.connection_generation.is_some_and(|expected| {
                 self.document_connection_generation(connection_key) == expected
             });
@@ -427,6 +427,19 @@ impl LanguageServerPool {
                 return link;
             }
         };
+
+        let producer_is_still_live = {
+            let connections = self.connections().await;
+            connections.get(connection_key).is_some_and(|current| {
+                Arc::ptr_eq(current, &handle)
+                    && current.state() == ConnectionState::Ready
+                    && self.document_connection_generation(connection_key) == expected_generation
+            })
+        };
+        if !producer_is_still_live {
+            re_envelope_link(&mut link, &envelope);
+            return link;
+        }
 
         match parse_document_link_resolve_response(response) {
             Some(mut resolved) => {
@@ -513,6 +526,9 @@ fn transform_document_link_response_to_host(
 mod tests {
     use super::super::test_helpers::*;
     use super::*;
+    use crate::lsp::bridge::test_helpers::{
+        create_handle_advertising_resolve_methods, wait_for_sent_request,
+    };
     use rstest::rstest;
     use serde_json::json;
 
@@ -548,6 +564,58 @@ mod tests {
                 host_layer: false,
             },
         )
+    }
+
+    #[tokio::test]
+    async fn resolve_response_rejects_a_retired_producer_after_send() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("lua-ls");
+        let handle = create_handle_advertising_resolve_methods(key.clone()).await;
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let host_uri = Url::parse("file:///test.lua").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
+        let generation = pool.document_connection_generation(&key);
+        let link = unresolved_link(Some(json!({ "token": 1 })));
+        let envelope = DocumentLinkEnvelope {
+            origin: "lua-ls".into(),
+            host_uri: host_uri.to_string(),
+            region_id: String::new(),
+            injection_language: String::new(),
+            incarnation: Some(1),
+            connection_generation: Some(generation),
+            connection_key: Some(key),
+            offset: EnvelopeOffset::from(&RegionOffset::new(0, 0)),
+            inner: Some(json!({ "token": 1 })),
+            host_layer: true,
+        };
+        let upstream_id = UpstreamId::Number(77);
+        let request = {
+            let pool = Arc::clone(&pool);
+            let upstream_id = upstream_id.clone();
+            tokio::spawn(async move {
+                pool.send_document_link_resolve_request(
+                    &BridgeServerConfig::default(),
+                    link,
+                    envelope,
+                    Some(upstream_id),
+                )
+                .await
+            })
+        };
+        let downstream_id = wait_for_sent_request(&handle, &upstream_id).await;
+        handle.begin_shutdown();
+        let _ = handle.router().route(json!({
+            "jsonrpc": "2.0",
+            "id": downstream_id.as_i64(),
+            "result": {
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } },
+                "target": "file:///stale.lua"
+            }
+        }));
+
+        let result = request.await.unwrap();
+        assert!(result.target.is_none());
+        assert!(extract_document_link_envelope(&result).is_some());
     }
 
     fn unresolved_link(data: Option<serde_json::Value>) -> DocumentLink {

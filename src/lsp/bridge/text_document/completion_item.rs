@@ -24,8 +24,8 @@ use tower_lsp_server::ls_types::{CompletionItem, Position};
 use url::Url;
 
 use super::super::pool::{
-    ConnectionHandle, ConnectionHandleSender, LanguageServerPool, NotificationSendResult,
-    UpstreamId,
+    ConnectionHandle, ConnectionHandleSender, ConnectionState, LanguageServerPool,
+    NotificationSendResult, UpstreamId,
 };
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, response_has_jsonrpc_error,
@@ -409,11 +409,12 @@ impl LanguageServerPool {
             // Pin the generation through sync and enqueue, matching the normal
             // request path and excluding concurrent connection replacement.
             let connections = self.connections().await;
-            if !connections
-                .get(connection_key)
-                .is_some_and(|live| Arc::ptr_eq(live, handle))
-            {
-                return Err(io::Error::other("completion origin was replaced"));
+            if !connections.get(connection_key).is_some_and(|live| {
+                Arc::ptr_eq(live, handle) && live.state() == ConnectionState::Ready
+            }) {
+                return Err(io::Error::other(
+                    "completion origin was replaced or retired",
+                ));
             }
             if envelope.is_host_layer() {
                 if !self.accepts_host_language(&document.host_uri, &document.language_id)
@@ -513,7 +514,13 @@ impl LanguageServerPool {
         }
 
         match response {
-            Ok(response) => parse_completion_resolve_response(response),
+            Ok(response) => {
+                let connections = self.connections().await;
+                let producer_is_live = connections.get(connection_key).is_some_and(|current| {
+                    Arc::ptr_eq(current, handle) && current.state() == ConnectionState::Ready
+                });
+                producer_is_live.then(|| parse_completion_resolve_response(response))?
+            }
             Err(e) => {
                 warn!(
                     target: "kakehashi::bridge",
@@ -674,6 +681,115 @@ mod tests {
         .expect("a lifecycle writer must not park resolve while it holds the edit lock");
         assert!(response.is_none());
         assert!(edit_lock.try_lock().is_ok());
+    }
+
+    /// A producer that retires while its resolve is in flight must not have
+    /// its late reply surfaced: the opaque data the reply was computed from
+    /// belongs to a process the pool is already tearing down.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolve_response_rejects_a_retired_producer_after_send() {
+        use crate::lsp::bridge::pool::test_helpers::create_handle_with_command;
+        use crate::lsp::bridge::{ConnectionKey, ConnectionState};
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let key = ConnectionKey::for_server("lua-ls");
+        let (handle, _) = create_handle_with_command(
+            ConnectionState::Ready,
+            key.clone(),
+            vec![
+                "sh".into(),
+                "-c".into(),
+                "cat > \"$1\"".into(),
+                "sh".into(),
+                output.path().to_str().unwrap().into(),
+            ],
+            None,
+        )
+        .await;
+        let pool = Arc::new(LanguageServerPool::new());
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let envelope = test_envelope();
+        let uri = Url::parse(&envelope.host_uri).unwrap();
+        pool.open_host_incarnation(&uri, 1).await;
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&uri).unwrap(),
+            &envelope.injection_language,
+            &envelope.region_id,
+        );
+        pool.ensure_document_opened(
+            &mut ConnectionHandleSender(&handle),
+            &uri,
+            &virtual_uri,
+            "text",
+            &key,
+        )
+        .await
+        .unwrap();
+        let edit_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let document = CompletionResolveDocument {
+            host_uri: uri,
+            language_id: envelope.injection_language.clone(),
+            text: Arc::from("text"),
+            geometry: None,
+            revision: HostRevision {
+                incarnation: 1,
+                content_version: 1,
+            },
+            edit_guard: Arc::clone(&edit_lock).lock_owned().await,
+        };
+        let upstream_id = UpstreamId::Number(77);
+        let request = {
+            let pool = Arc::clone(&pool);
+            let handle = Arc::clone(&handle);
+            let upstream_id = upstream_id.clone();
+            tokio::spawn(async move {
+                pool.send_completion_resolve_on_handle(
+                    &handle,
+                    CompletionItem {
+                        label: "old".into(),
+                        ..Default::default()
+                    },
+                    Some(upstream_id),
+                    &envelope,
+                    document,
+                )
+                .await
+            })
+        };
+        let downstream_id = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(id) = handle
+                    .router()
+                    .lookup_downstream_ids(&upstream_id)
+                    .into_iter()
+                    .next()
+                {
+                    break id;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("resolve request must be admitted");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !handle.router().is_sent(downstream_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("resolve request must be sent before retirement");
+
+        handle.begin_shutdown();
+        let _ = handle.router().route(json!({
+            "jsonrpc": "2.0",
+            "id": downstream_id.as_i64(),
+            "result": { "label": "stale" }
+        }));
+
+        assert!(
+            request.await.unwrap().is_none(),
+            "a response from a no-longer-Ready completion producer must be discarded"
+        );
     }
 
     /// The parse may already be current while deferred forwarding has not

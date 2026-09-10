@@ -6,8 +6,9 @@
 //! - Host-to-virtual mappings (for didClose propagation)
 //! - Opened state (for LSP spec compliance - ls-bridge-message-ordering)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
 use tokio::sync::Mutex;
@@ -18,6 +19,40 @@ use url::Url;
 
 use super::ConnectionKey;
 use crate::lsp::bridge::protocol::VirtualDocumentUri;
+
+struct VirtualUriObserverState {
+    connection_key: ConnectionKey,
+    generation: u64,
+    uris: Arc<std::sync::Mutex<HashSet<String>>>,
+}
+
+pub(crate) struct VirtualUriObserver {
+    id: u64,
+    observers: Arc<DashMap<u64, VirtualUriObserverState>>,
+    uris: Arc<std::sync::Mutex<HashSet<String>>>,
+}
+
+impl VirtualUriObserver {
+    pub(crate) fn insert(&self, uri: String) {
+        self.uris
+            .lock()
+            .recover_poison("VirtualUriObserver::uris")
+            .insert(uri);
+    }
+
+    pub(crate) fn snapshot(&self) -> HashSet<String> {
+        self.uris
+            .lock()
+            .recover_poison("VirtualUriObserver::uris")
+            .clone()
+    }
+}
+
+impl Drop for VirtualUriObserver {
+    fn drop(&mut self) {
+        self.observers.remove(&self.id);
+    }
+}
 
 /// Hash of a virtual document's extracted content, used to skip re-sending an
 /// unchanged `didChange` (#422). Mirrors the host path's fingerprint
@@ -102,6 +137,10 @@ pub(crate) struct DocumentTracker {
     /// Enables O(1) lookup in `get_all_connections_for_virtual_uri()`, replacing the
     /// previous O(N×M) scan over `host_to_virtual`.
     virtual_to_servers: DashMap<String, Vec<ConnectionKey>>,
+    /// Active request-scoped observers of virtual URIs issued by a connection.
+    /// Closed URI provenance lives only until the observing request completes.
+    virtual_uri_observers: Arc<DashMap<u64, VirtualUriObserverState>>,
+    next_virtual_uri_observer_id: AtomicU64,
     /// Pre-send claims keyed by exact connection. Waiters park until the owner
     /// promotes the claim after enqueue or finishes rollback.
     open_claims: DashMap<(ConnectionKey, String), Arc<tokio::sync::Notify>>,
@@ -121,6 +160,8 @@ impl DocumentTracker {
             host_to_virtual: Mutex::new(HashMap::new()),
             opened_documents: DashMap::new(),
             virtual_to_servers: DashMap::new(),
+            virtual_uri_observers: Arc::new(DashMap::new()),
+            next_virtual_uri_observer_id: AtomicU64::new(0),
             open_claims: DashMap::new(),
             connection_generations: DashMap::new(),
         }
@@ -150,7 +191,7 @@ impl DocumentTracker {
     /// Initializes the document version and a waiter-visible claim, but does not
     /// expose the URI as opened until `mark_open_sent` runs after FIFO enqueue.
     ///
-    /// On send failure, call `unclaim_document()` to roll back.
+    /// On send failure, call `rollback_open_claim_if()` to roll back.
     pub(super) async fn try_claim_for_open(
         &self,
         virtual_uri: &VirtualDocumentUri,
@@ -247,40 +288,18 @@ impl DocumentTracker {
         if newly_opened {
             *self.opened_documents.entry(uri_string.clone()).or_insert(0) += 1;
         }
-        notify.notify_waiters();
-        true
-    }
-
-    /// Roll back a claim made by `try_claim_for_open()`.
-    ///
-    /// Called when the didOpen send fails, so the document can be
-    /// claimed again on a future attempt. Removes both the version
-    /// entry initialized by `try_claim_for_open()`. Pre-send claims are not in
-    /// the opened refcount or reverse index, so rollback must not touch either.
-    pub(super) async fn unclaim_document(
-        &self,
-        virtual_uri: &VirtualDocumentUri,
-        connection_key: &ConnectionKey,
-    ) {
-        let uri_string = virtual_uri.to_uri_string();
-        // Remove version first (mirrors claim order)
-        {
-            let mut versions = self.document_versions.lock().await;
-            if let Some(docs) = versions.get_mut(connection_key) {
-                docs.remove(&uri_string);
+        let generation = self.connection_generation(connection_key);
+        for observer in self.virtual_uri_observers.iter() {
+            if observer.connection_key == *connection_key && observer.generation == generation {
+                observer
+                    .uris
+                    .lock()
+                    .recover_poison("VirtualUriObserverState::uris")
+                    .insert(uri_string.clone());
             }
         }
-        // Drop any fingerprint symmetrically with the version (#422) — benign today
-        // (unclaim runs right after a failed didOpen, before any didChange recorded a
-        // fingerprint) but keeps the two maps consistent if that ever changes.
-        if let Some(docs) = self
-            .document_fingerprints
-            .lock()
-            .recover_poison("DocumentTracker::document_fingerprints")
-            .get_mut(connection_key)
-        {
-            docs.remove(&uri_string);
-        }
+        notify.notify_waiters();
+        true
     }
 
     /// Test helper: record the host→virtual mapping, opened ref-count, and version.
@@ -599,7 +618,7 @@ impl DocumentTracker {
     ///
     /// Used to roll back registration when didOpen send fails after
     /// register-before-send. Only removes from `host_to_virtual`; the
-    /// caller must also call `unclaim_document()` to roll back the claim.
+    /// caller must also call `rollback_open_claim_if()` to roll back the claim.
     pub(super) async fn unregister_virtual_doc(
         &self,
         host_uri: &Url,
@@ -646,6 +665,10 @@ impl DocumentTracker {
         expected_claim: &Arc<tokio::sync::Notify>,
     ) -> bool {
         let uri_string = virtual_uri.to_uri_string();
+        // Keep version deletion and claim removal atomic from an observer's
+        // perspective. The versions → claims order matches claim creation, so
+        // an observer can never see a never-enqueued version without its claim.
+        let mut versions = self.document_versions.lock().await;
         let Some((_, notify)) = self
             .open_claims
             .remove_if(&(connection_key.clone(), uri_string.clone()), |_, claim| {
@@ -654,7 +677,18 @@ impl DocumentTracker {
         else {
             return false;
         };
-        self.unclaim_document(virtual_uri, connection_key).await;
+        if let Some(docs) = versions.get_mut(connection_key) {
+            docs.remove(&uri_string);
+        }
+        drop(versions);
+        if let Some(docs) = self
+            .document_fingerprints
+            .lock()
+            .recover_poison("DocumentTracker::rollback_open_claim_if")
+            .get_mut(connection_key)
+        {
+            docs.remove(&uri_string);
+        }
         let mut host_map = self.host_to_virtual.lock().await;
         if let Some(docs) = host_map.get_mut(host_uri) {
             docs.retain(|doc| {
@@ -680,6 +714,50 @@ impl DocumentTracker {
             .get(host_uri)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Observe confirmed virtual URIs for an in-flight request.
+    ///
+    /// Callers that need an enqueue-consistent namespace hold the pool's
+    /// `connections` admission guard across this registration and request
+    /// enqueue. Observer insertion happens only after the single seed await, so
+    /// cancellation cannot strand an entry.
+    pub(super) async fn observe_virtual_uris_for_connection(
+        &self,
+        connection_key: &ConnectionKey,
+        generation: u64,
+    ) -> VirtualUriObserver {
+        let id = self
+            .next_virtual_uri_observer_id
+            .fetch_add(1, Ordering::Relaxed);
+        let uris = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        if self.connection_generation(connection_key) == generation {
+            let versions = self.document_versions.lock().await;
+            if let Some(documents) = versions.get(connection_key) {
+                let issued = documents.keys().filter(|uri| {
+                    !self
+                        .open_claims
+                        .contains_key(&(connection_key.clone(), (*uri).clone()))
+                });
+                uris.lock()
+                    .recover_poison("VirtualUriObserver::seed")
+                    .extend(issued.cloned());
+            }
+        }
+        let observer = VirtualUriObserver {
+            id,
+            observers: Arc::clone(&self.virtual_uri_observers),
+            uris: Arc::clone(&uris),
+        };
+        self.virtual_uri_observers.insert(
+            id,
+            VirtualUriObserverState {
+                connection_key: connection_key.clone(),
+                generation,
+                uris,
+            },
+        );
+        observer
     }
 
     /// Remove and return all virtual documents for a host URI.
@@ -2115,5 +2193,79 @@ mod tests {
                 .await,
             None
         );
+    }
+
+    #[tokio::test]
+    async fn virtual_uri_observer_retains_closed_uri_only_for_request_lifetime() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///project/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", "lua-0");
+        let key = ConnectionKey::for_server("lua");
+        let generation = tracker.connection_generation(&key);
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, &key)
+            .await;
+        let observer = tracker
+            .observe_virtual_uris_for_connection(&key, generation)
+            .await;
+        tracker.untrack_document(&virtual_uri, &key).await;
+
+        assert!(observer.snapshot().contains(&virtual_uri.to_uri_string()));
+
+        drop(observer);
+        assert!(tracker.virtual_uri_observers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn virtual_uri_observer_does_not_seed_unenqueued_open_claims() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///project/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", "pending");
+        let key = ConnectionKey::for_server("lua");
+        assert!(tracker.try_claim_for_open(&virtual_uri, &key).await);
+
+        let observer = tracker
+            .observe_virtual_uris_for_connection(&key, tracker.connection_generation(&key))
+            .await;
+
+        assert!(!observer.snapshot().contains(&virtual_uri.to_uri_string()));
+        let claim = tracker
+            .open_claim_waiter(&virtual_uri, &key)
+            .expect("claim should exist");
+        assert!(
+            tracker
+                .rollback_open_claim_if(&host_uri, &virtual_uri, &key, &claim)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_keeps_claim_visible_until_version_is_removed() {
+        use futures::FutureExt;
+
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///project/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", "pending");
+        let key = ConnectionKey::for_server("lua");
+        assert!(tracker.try_claim_for_open(&virtual_uri, &key).await);
+        let claim = tracker
+            .open_claim_waiter(&virtual_uri, &key)
+            .expect("claim should exist");
+        let versions = tracker.document_versions.lock().await;
+        let mut rollback =
+            std::pin::pin!(tracker.rollback_open_claim_if(&host_uri, &virtual_uri, &key, &claim,));
+
+        assert!(
+            rollback.as_mut().now_or_never().is_none(),
+            "rollback should wait for the version lock"
+        );
+        assert!(
+            tracker.open_claim_waiter(&virtual_uri, &key).is_some(),
+            "claim must exclude the pending version until both are removed"
+        );
+
+        drop(versions);
+        assert!(rollback.await);
+        assert!(tracker.open_claim_waiter(&virtual_uri, &key).is_none());
     }
 }
