@@ -70,6 +70,7 @@ impl LanguageServerPool {
             virtual_content,
             upstream_request_id,
             Some(expected_incarnation),
+            None,
             |virtual_uri, request_id| {
                 build_inline_value_request(
                     virtual_uri,

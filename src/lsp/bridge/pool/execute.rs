@@ -131,6 +131,7 @@ impl LanguageServerPool {
             virtual_content,
             upstream_request_id,
             None,
+            None,
             build_request,
             transform_response,
             None,
@@ -156,6 +157,7 @@ impl LanguageServerPool {
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
         expected_incarnation: Option<u64>,
+        attempted: Option<Arc<std::sync::atomic::AtomicBool>>,
         build_request: impl FnOnce(&VirtualDocumentUri, RequestId) -> JsonRpcRequest<P>,
         transform_response: impl FnOnce(serde_json::Value, &BridgeResponseContext<'_>) -> T,
         downstream_id_probe: Option<&std::sync::OnceLock<RequestId>>,
@@ -208,7 +210,6 @@ impl LanguageServerPool {
         }
         self.apply_host_routing_workspace_folders(&routing_uri, connection_key.server(), &handle)
             .await?;
-
         // Register in the upstream request registry before downstream router
         // registration for cancel lookup. This relative order matters: if a
         // cancel arrives between pool and router registration,
@@ -299,6 +300,9 @@ impl LanguageServerPool {
                     self.unregister_upstream_request(id, connection_key);
                 }
                 return Err(e.into());
+            }
+            if let Some(attempted) = attempted {
+                attempted.store(true, std::sync::atomic::Ordering::Release);
             }
         }
         drop(host_lifecycle);
@@ -509,6 +513,7 @@ impl LanguageServerPool {
             virtual_content,
             upstream_request_id,
             expected_incarnation,
+            None,
             build_request,
             transform_response,
             None,
@@ -546,6 +551,7 @@ mod tests {
                 &RegionOffset::new(0, 0),
                 "print('hello')",
                 Some(upstream_id),
+                None,
                 None,
                 |_, request_id| {
                     JsonRpcRequest::new(
@@ -636,6 +642,50 @@ mod tests {
         .await;
         assert_concurrent_downstream_ids_are_unique(UpstreamId::Number(42), "numeric-upstream-id")
             .await;
+    }
+
+    #[tokio::test]
+    async fn routing_suppression_does_not_mark_virtual_bridge_attempted() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let host_uri = test_host_uri("suppressed-virtual-marker");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        let handle = create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("test-server"),
+        )
+        .await;
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&host_uri_lsp, "lua", TEST_ULID_LUA_0);
+        let routing_uri = Url::parse(&virtual_uri.to_uri_string()).unwrap();
+        pool.set_host_routing_by_server(&routing_uri, "test-server", false);
+        let attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let result = pool
+            .execute_bridge_request_observed(
+                handle,
+                &host_uri,
+                "lua",
+                TEST_ULID_LUA_0,
+                &RegionOffset::new(0, 0),
+                "print('hello')",
+                None,
+                Some(1),
+                Some(Arc::clone(&attempted)),
+                |_, request_id| {
+                    JsonRpcRequest::new(
+                        request_id.as_i64(),
+                        "test/request",
+                        serde_json::Value::Null,
+                    )
+                },
+                |_, _| (),
+                None,
+            )
+            .await;
+
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::NotConnected);
+        assert!(!attempted.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[tokio::test]

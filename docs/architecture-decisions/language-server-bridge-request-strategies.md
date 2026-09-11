@@ -7,12 +7,14 @@
 
 ## Decision–Implementation Gap
 
-10 of the 11 per-method strategies described below are implemented
+All 11 per-method strategies described below are at least partially implemented
 (definition, hover, signatureHelp, completion, references, rename,
 codeAction, formatting, documentHighlight, diagnostics). Semantic-token range
 requests now support the ordinary preferred host/virt/native layer walk when
-the requested range is wholly owned by one injection; full/delta bridging and
-the progressive native/downstream merge described below remain unimplemented.
+the requested range is wholly owned by one injection. Full requests establish
+a current native baseline, then synchronously overlay all selected host and
+virtual layers in priority order. Full/delta can re-enter that full overlay when
+a bridge becomes applicable, but merged responses do not establish a delta lineage.
 
 ## Context
 
@@ -62,38 +64,26 @@ affects how we handle features that can return cross-file results.
 
 **Implement different bridge strategies based on LSP method characteristics, with careful handling of cross-file results and edit operations.**
 
-### Strategy 1: Parallel Fetch with Progressive Refinement
+### Strategy 1: Semantic Token Aggregation
 
 **Applies to**: `textDocument/semanticTokens/full`, `textDocument/semanticTokens/range`
 
-```
-                    ┌─────────────────────────────┐
- Request ──────────▶│      kakehashi          │
-                    │  ┌─────────────────────┐    │
-                    │  │ Tree-sitter tokens  │────│───▶ Immediate response
-                    │  │ (local, fast)       │    │     (use if bridge slow)
-                    │  └─────────────────────┘    │
-                    │           ▼                 │
-                    │  ┌─────────────────────┐    │
-                    │  │ Bridge to server    │────│───▶ rust-analyzer
-                    │  │ (async)             │    │
-                    │  └─────────────────────┘    │
-                    │           │                 │
-                    │           ▼                 │
-                    │  ┌─────────────────────┐    │
-                    │  │ Merge results       │────│───▶ Final response
-                    │  │ (prefer bridged)    │    │     (replaces initial)
-                    │  └─────────────────────┘    │
-                    └─────────────────────────────┘
-```
+**Full behavior**:
+1. Establish the native serve-current baseline, preserving cancellation,
+   supersession, and delta-cache semantics.
+2. Fan out to the selected host and virtual bridge layers and wait for the
+   barrier to settle.
+3. Return one synchronous merged response. Higher-priority spans replace
+   overlapping lower-priority spans; uncovered lower-layer fragments remain.
 
-**Behavior**:
-1. Fetch Tree-sitter tokens and bridged tokens **in parallel**
-2. If bridged response arrives first → use it directly
-3. If Tree-sitter response arrives first → return it immediately as provisional response
-4. When bridged response arrives → send updated tokens (via `textDocument/semanticTokens/full` refresh mechanism)
+**Range behavior**: For a range contained in an injection, query the selected
+virtual, host, and native layers with the `preferred` strategy. Remap downstream
+legends and coordinates, reject invalid transformations, and retain native
+tokens as the fallback.
 
-**Rationale**: Users see instant syntax highlighting from Tree-sitter while richer type-aware tokens arrive asynchronously.
+**Rationale**: One JSON-RPC request has one response. Full requests therefore
+merge all selected layers before responding; range requests retain the
+lower-latency preferred-layer path appropriate to their bounded viewport.
 
 ### Strategy 2: Full Delegation with Response Filtering
 
@@ -349,7 +339,7 @@ When multiple servers are configured for a language:
 
 | Method | Merging Strategy (as implemented; rows marked *aspirational* never shipped) |
 |--------|------------------|
-| Semantic Tokens | Range: `preferred` for injection-contained requests, with legend remapping and native fallback. Full/delta progressive merge remains aspirational |
+| Semantic Tokens | Range: `preferred` for injection-contained requests, with legend remapping and native fallback. Full: synchronous native/host/virtual overlay. Full/delta re-enters the full overlay when a bridge becomes applicable, without a merged delta lineage |
 | Go-to-Definition | `preferred`: first non-empty result (query in `priorities` order) |
 | Find References | `preferred` by default (first non-empty); *concatenate + dedupe is aspirational* |
 | Completion | `preferred` by default (first non-empty); *list merging is aspirational* |
@@ -414,7 +404,8 @@ foldingRange, linkedEditingRange, … — lives in `docs/language-features.md`.
 | documentHighlight | ✅ Implemented | Strategy-2 shape (single-document, position-mapped) |
 | diagnostics | ✅ Implemented | Push + pull with host translation |
 | semanticTokens/range | ✅ Implemented | Injection-contained requests use preferred virt/host/native layers; downstream legends and coordinates are translated, invalid tokens drop |
-| semanticTokens/full, full/delta | ❌ Not bridged | Native tree-sitter tokens ARE served; downstream-server tokens are not yet fetched or progressively merged |
+| semanticTokens/full | ✅ Implemented | Current native baseline plus synchronous host/virt overlay; higher-priority spans replace overlaps and uncovered native spans remain |
+| semanticTokens/full/delta | ⚠️ Full fallback only | A native delta lineage re-enters full aggregation when a bridge becomes applicable. The merged full response omits `resultId`, so it cannot become a delta baseline; native-only full results retain their existing lineage |
 
 ### Original Implementation Priority
 

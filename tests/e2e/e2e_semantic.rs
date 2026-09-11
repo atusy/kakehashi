@@ -419,8 +419,7 @@ fn test_semantic_tokens_result_id() {
 /// semantic tokens (tests the @markup.strong capture).
 #[test]
 fn test_semantic_tokens_markdown_inline_bold() {
-    // Use debug mode to capture server logs
-    let mut client = LspClient::with_debug(true);
+    let mut client = LspClient::new();
 
     // Initialize server with custom capture mapping for markup.strong -> keyword
     client.send_request(
@@ -523,12 +522,6 @@ fn test_semantic_tokens_markdown_inline_bold() {
         })
         .collect();
     eprintln!("All tokens: {:?}", token_info);
-
-    // Drain and print server stderr for debugging
-    let stderr_output = client.drain_stderr();
-    if !stderr_output.is_empty() {
-        eprintln!("Server stderr:\n{}", stderr_output);
-    }
 
     // The bold text is on line 2 (0-indexed)
     // We expect to see a token for the bold text from markdown_inline injection
