@@ -337,6 +337,7 @@ impl InjectionCoordinator {
             return false;
         }
         let incarnation = document.incarnation();
+        let content_version = document.content_version();
         drop(document);
 
         // Stored language first (see `document_language`): parser-aware
@@ -392,11 +393,14 @@ impl InjectionCoordinator {
                 .evict_source(uri, &DiagnosticSource::Region(region_id));
         }
 
-        if forward_did_change {
-            self.bridge
-                .forward_didchange_to_opened_docs(uri, incarnation, &injections)
-                .await;
-        }
+        self.publish_virtual_contents(
+            uri,
+            incarnation,
+            content_version,
+            &injections,
+            forward_did_change,
+        )
+        .await;
 
         let languages: HashSet<String> =
             injections.iter().map(|inj| inj.language.clone()).collect();
@@ -450,6 +454,31 @@ impl InjectionCoordinator {
             },
         );
         true
+    }
+
+    async fn publish_virtual_contents(
+        &self,
+        uri: &Url,
+        incarnation: u64,
+        content_version: u64,
+        injections: &[BridgeInjection],
+        forward_did_change: bool,
+    ) {
+        if forward_did_change {
+            self.bridge
+                .forward_didchange_to_opened_docs(uri, incarnation, content_version, injections)
+                .await;
+        } else {
+            // Initial didOpen has no downstream didChange to forward, but eager
+            // didOpen still needs the host revision that workspace-wide results
+            // use to project virtual locations safely.
+            self.bridge.record_latest_virtual_contents(
+                uri,
+                incarnation,
+                content_version,
+                injections,
+            );
+        }
     }
 
     /// Check injected languages and handle missing parsers: auto-install when enabled,
@@ -942,7 +971,7 @@ fn parser_enabled_injection_language(language: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{InjectionTarget, parser_enabled_injection_language};
+    use super::{BridgeInjection, InjectionTarget, parser_enabled_injection_language};
 
     #[test]
     fn explicit_plaintext_does_not_request_a_parser() {
@@ -1316,6 +1345,44 @@ mod tests {
             })
             .unwrap_or(false);
         assert!(landed, "test publish must land");
+    }
+
+    #[tokio::test]
+    async fn initial_injection_pass_publishes_virtual_host_identity() {
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///initial-injection.md").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "host".to_owned(),
+            Some("markdown".to_owned()),
+            None,
+        );
+        let content_version = server.documents.get(&uri).unwrap().content_version();
+        server.bridge.open_host_incarnation(&uri, incarnation).await;
+        let injection = BridgeInjection {
+            language: "lua".to_owned(),
+            region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            content: "print('ready')".to_owned(),
+        };
+
+        server
+            .injection_coordinator()
+            .publish_virtual_contents(
+                &uri,
+                incarnation,
+                content_version,
+                std::slice::from_ref(&injection),
+                false,
+            )
+            .await;
+
+        assert_eq!(
+            server
+                .bridge
+                .latest_virtual_content_for_test(&uri, &injection),
+            Some((injection.content, (incarnation, content_version)))
+        );
     }
 
     /// The snapshot fast path of `resolve_injection_data` must produce

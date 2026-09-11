@@ -483,6 +483,11 @@ impl LanguageServerPool {
                         &virtual_uri,
                         connection_key,
                         &document.text,
+                        version,
+                        Some((
+                            document.revision.incarnation,
+                            document.revision.content_version,
+                        )),
                     )
                     .await;
                 }
