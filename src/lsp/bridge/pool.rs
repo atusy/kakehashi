@@ -35,7 +35,9 @@ pub(crate) use connection_handle::{ConnectionHandle, NotificationSendResult};
 pub(crate) use connection_key::ConnectionKey;
 pub(crate) use connection_state::ConnectionState;
 use document_tracker::DocumentTracker;
-pub(crate) use document_tracker::{OpenedVirtualDoc, VirtualUriObserver};
+pub(crate) use document_tracker::{
+    ConfirmedDocumentRevision, OpenedVirtualDoc, VirtualUriObserver,
+};
 pub(crate) use dynamic_capability_registry::DynamicCapabilityRegistry;
 pub(crate) use message_sender::{ConnectionHandleSender, MessageSender};
 use pending_reopen::PendingReopenRegistry;
@@ -139,6 +141,25 @@ fn shutdown_invalidated_connection(key: ConnectionKey, handle: Arc<ConnectionHan
     });
 }
 
+pub(crate) struct WorkspaceFolderChange<'a> {
+    generation: &'a AtomicU64,
+    _lock: tokio::sync::MutexGuard<'a, ()>,
+}
+
+impl WorkspaceFolderChange<'_> {
+    /// Publish the workspace/settings transaction as stable. Dropping without
+    /// finishing deliberately leaves it odd: a cancelled handler may have
+    /// reconciled only part of the downstream state.
+    pub(crate) fn finish(self) {
+        let previous = self.generation.fetch_add(1, Ordering::AcqRel);
+        debug_assert_eq!(
+            previous & 1,
+            1,
+            "workspace change must finish from odd state"
+        );
+    }
+}
+
 use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -163,6 +184,12 @@ use super::protocol::{
 /// initializing server (ls-bridge-timeout-hierarchy Tier 0: 30-60s recommended). A downstream
 /// server that doesn't respond within this window fails with a timeout error.
 pub(crate) const INIT_TIMEOUT_SECS: u64 = 30;
+
+struct WaitReadyOptions<'a> {
+    timeout: Duration,
+    rootless: bool,
+    admit: Option<&'a (dyn Fn() -> bool + Sync)>,
+}
 
 use super::actor::{
     OUTBOUND_QUEUE_CAPACITY, OutboundMessage, ResponseRouter, ServerRequestDeps,
@@ -489,6 +516,12 @@ pub struct LanguageServerPool {
     /// initialize, then updated by `workspace/didChangeWorkspaceFolders` and
     /// snapshotted for each later downstream handshake.
     workspace_folders: super::WorkspaceFolderSet,
+    /// Advances before every non-empty upstream workspace-folder change.
+    /// Document-free requests carry this generation from producer selection
+    /// through wire admission so an incapable shared process cannot outlive
+    /// the client-workspace proof used to select it.
+    workspace_generation: AtomicU64,
+    workspace_change_lock: Mutex<()>,
     /// Client capabilities forwarded from upstream client.
     ///
     /// Set once via `set_client_capabilities()` after receiving the upstream initialize request.
@@ -596,6 +629,8 @@ impl LanguageServerPool {
             consecutive_panic_counts: std::sync::Mutex::new(HashMap::new()),
             root_uri: arc_swap::ArcSwap::new(Arc::new(None)),
             workspace_folders: super::WorkspaceFolderSet::new(None),
+            workspace_generation: AtomicU64::new(0),
+            workspace_change_lock: Mutex::new(()),
             client_capabilities: OnceLock::new(),
             log_message_level: AtomicU8::new(
                 crate::config::settings::LogMessageLevel::Info.as_u8(),
@@ -793,15 +828,15 @@ impl LanguageServerPool {
     /// Update the upstream client workspace snapshot used by future
     /// client-fallback downstream connections.
     ///
-    /// Returns whether the event described a change at all, so the caller
+    /// Returns a transaction token when the event described a change, so the caller
     /// (`did_change_workspace_folders_impl`) can skip the settings reload it
-    /// owns for an event this function already found to be a no-op, instead
-    /// of duplicating the emptiness check.
+    /// owns for an event this function already found to be a no-op. The caller
+    /// finishes it only after root-relative settings are published.
     pub(crate) async fn apply_workspace_folder_change(
         &self,
         added: Vec<tower_lsp_server::ls_types::WorkspaceFolder>,
         removed: &[tower_lsp_server::ls_types::WorkspaceFolder],
-    ) -> bool {
+    ) -> Option<WorkspaceFolderChange<'_>> {
         // An event naming neither an addition nor a removal describes no
         // change: `WorkspaceFolderSet::apply_change` is a no-op for it, so the
         // client workspace snapshot cannot move. Returning here rather than
@@ -811,9 +846,18 @@ impl LanguageServerPool {
         // invalidated, recycled, and armed for re-open over a notification
         // that named nothing.
         if added.is_empty() && removed.is_empty() {
-            return false;
+            return None;
         }
 
+        let change_lock = self.workspace_change_lock.lock().await;
+        // A dropped transaction leaves the generation odd. The next complete
+        // update owns that dirty epoch and recycles every client-workspace
+        // producer below, because replaying only this event could not repair a
+        // delta missed by the cancelled update.
+        let recovering = self.workspace_generation.load(Ordering::Acquire) & 1 != 0;
+        if !recovering {
+            self.workspace_generation.fetch_add(1, Ordering::AcqRel);
+        }
         self.workspace_folders.apply_change(added.clone(), removed);
         self.set_root_uri(
             self.workspace_folders()
@@ -823,7 +867,21 @@ impl LanguageServerPool {
         let mut connections = self.connections.lock().await;
         let mut invalidated = Vec::new();
         for (key, handle) in connections.iter() {
-            let follows_client_workspace = key.is_client_fallback();
+            let follows_client_workspace = key.is_client_fallback() || key.is_workspace();
+            // A shared producer can have learned a client folder either from
+            // initialize or a later marker-less acquisition. Its folder set
+            // intentionally has no per-source provenance, so forwarding a
+            // removal could discard a root that an open marker-owned document
+            // still needs. Recycle only when the removed folder is actually
+            // present; re-open then re-announces every still-live marker root.
+            let shared_lost_folder = key.is_shared()
+                && removed
+                    .iter()
+                    .any(|folder| handle.workspace_folders().contains(folder));
+            if shared_lost_folder || recovering && (follows_client_workspace || key.is_shared()) {
+                invalidated.push(key.clone());
+                continue;
+            }
             if !follows_client_workspace {
                 // Marker-owned connections derive their folders from the
                 // marker-root walk, not this client snapshot. A shared
@@ -890,7 +948,10 @@ impl LanguageServerPool {
         for (key, handle) in stale_handles {
             shutdown_invalidated_connection(key, handle);
         }
-        true
+        Some(WorkspaceFolderChange {
+            generation: &self.workspace_generation,
+            _lock: change_lock,
+        })
     }
 
     /// Set the upstream client capabilities.
@@ -1766,6 +1827,15 @@ impl LanguageServerPool {
             .await
     }
 
+    pub(super) async fn confirmed_virtual_document_revisions_for_connection(
+        &self,
+        connection_key: &ConnectionKey,
+    ) -> HashMap<String, document_tracker::ConfirmedDocumentRevision> {
+        self.document_tracker
+            .confirmed_document_revisions_for_connection(connection_key)
+            .await
+    }
+
     /// Find ALL connections (`(server, root)` keys) that have opened a given
     /// virtual document URI.
     ///
@@ -2011,8 +2081,11 @@ impl LanguageServerPool {
                 config,
                 key.clone(),
                 marker,
-                Duration::from_secs(INIT_TIMEOUT_SECS),
-                false,
+                WaitReadyOptions {
+                    timeout: Duration::from_secs(INIT_TIMEOUT_SECS),
+                    rootless: false,
+                    admit: None,
+                },
             )
             .await
         {
@@ -2336,6 +2409,148 @@ impl LanguageServerPool {
                 )
             }),
         );
+    }
+
+    fn uri_is_within_root(uri: &Url, root: &Url) -> bool {
+        if uri.scheme() != root.scheme()
+            || uri.username() != root.username()
+            || uri.password() != root.password()
+            || uri.host_str() != root.host_str()
+            || uri.port_or_known_default() != root.port_or_known_default()
+        {
+            return false;
+        }
+        if uri.scheme() == "file"
+            && let (Ok(uri_path), Ok(root_path)) = (
+                super::root_markers::normalized_root_url(uri).to_file_path(),
+                super::root_markers::normalized_root_url(root).to_file_path(),
+            )
+        {
+            return uri_path.starts_with(root_path);
+        }
+        let Some(mut root_segments) = root.path_segments().map(Iterator::collect::<Vec<_>>) else {
+            return uri == root;
+        };
+        while root_segments.last() == Some(&"") {
+            root_segments.pop();
+        }
+        uri.path_segments()
+            .is_some_and(|segments| segments.collect::<Vec<_>>().starts_with(&root_segments))
+    }
+
+    fn host_is_in_client_workspace(&self, host_uri: &Url) -> bool {
+        if let Some(folders) = self.workspace_folders() {
+            return folders.iter().any(|folder| {
+                Url::parse(folder.uri.as_str())
+                    .is_ok_and(|root| Self::uri_is_within_root(host_uri, &root))
+            });
+        }
+        self.root_uri().is_some_and(|root| {
+            Url::parse(&root).is_ok_and(|root| Self::uri_is_within_root(host_uri, &root))
+        })
+    }
+
+    fn host_is_in_workspace_producer_scope(
+        &self,
+        handle: &ConnectionHandle,
+        host_uri: &Url,
+    ) -> bool {
+        if handle.key().is_workspace()
+            && handle.supports_initial_workspace_folders()
+            && let Some(folders) = handle.workspace_folders().snapshot()
+        {
+            return folders.iter().any(|folder| {
+                Url::parse(folder.uri.as_str())
+                    .is_ok_and(|root| Self::uri_is_within_root(host_uri, &root))
+            });
+        }
+        handle
+            .key()
+            .marker_root()
+            .or_else(|| handle.spawn_root())
+            .map_or_else(
+                || self.host_is_in_client_workspace(host_uri),
+                |root| Url::parse(root).is_ok_and(|root| Self::uri_is_within_root(host_uri, &root)),
+            )
+    }
+
+    pub(super) async fn open_recorded_workspace_virtual_documents(
+        &self,
+        handle: &Arc<ConnectionHandle>,
+        server_config: &crate::config::settings::BridgeServerConfig,
+    ) -> io::Result<()> {
+        if handle.key().is_shared() || handle.key().is_client_fallback() {
+            return Ok(());
+        }
+        let languages = server_config.languages.as_deref().unwrap_or_default();
+        let accepts_all = languages
+            .iter()
+            .any(|language| language == crate::config::settings::LANGUAGES_WILDCARD);
+        let mut documents = Vec::new();
+        for host in &self.latest_virtual_contents {
+            if !self.host_is_in_workspace_producer_scope(handle, host.key()) {
+                continue;
+            }
+            let _publication = host
+                .publication
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for language in &host.contents {
+                if !accepts_all && !languages.iter().any(|accepted| accepted == language.key()) {
+                    continue;
+                }
+                for region in language.value() {
+                    documents.push((
+                        host.key().clone(),
+                        host.incarnation,
+                        language.key().clone(),
+                        region.key().clone(),
+                        Arc::clone(region.value()),
+                    ));
+                }
+            }
+        }
+
+        for (host_uri, incarnation, language, region_id, content) in documents {
+            let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(&host_uri) else {
+                continue;
+            };
+            let virtual_uri = VirtualDocumentUri::new(&host_uri_lsp, &language, &region_id);
+            let Ok(routing_uri) = Url::parse(&virtual_uri.to_uri_string()) else {
+                continue;
+            };
+            if self
+                .host_routing_by_server(&routing_uri, handle.key().server())
+                .is_some_and(|enabled| !enabled)
+            {
+                continue;
+            }
+            let Some(lifecycle) = self.existing_host_lifecycle_lock(&host_uri) else {
+                continue;
+            };
+            let _lifecycle = lifecycle.write().await;
+            if self.current_host_incarnation(&host_uri) != Some(incarnation) {
+                continue;
+            }
+            let connections = self.connections().await;
+            if !connections.get(handle.key()).is_some_and(|current| {
+                Arc::ptr_eq(current, handle) && current.state() == ConnectionState::Ready
+            }) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "workspace producer was replaced before virtual documents opened",
+                ));
+            }
+            self.ensure_document_opened(
+                &mut ConnectionHandleSender(handle),
+                &host_uri,
+                &virtual_uri,
+                &content,
+                handle.key(),
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     fn record_latest_virtual_content_batch<'a>(
@@ -2713,6 +2928,306 @@ impl LanguageServerPool {
         document_uri: Option<&Url>,
         timeout: Duration,
     ) -> io::Result<Arc<ConnectionHandle>> {
+        self.get_or_create_connection_wait_ready_with_admit(
+            server_name,
+            server_config,
+            document_uri,
+            timeout,
+            None,
+        )
+        .await
+    }
+
+    /// Acquire one producer for a document-free client-workspace request.
+    ///
+    /// Use a document-free workspace key rather than any document-routing key.
+    /// Marker-less documents join either the shared process or the client
+    /// fallback, including documents outside the client workspace. Only a
+    /// distinct key guarantees that workspace-wide results cannot depend on
+    /// document-open history.
+    pub(super) async fn get_or_create_workspace_connection_wait_ready_admitted(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        timeout: Duration,
+        admit: &(dyn Fn() -> bool + Sync),
+    ) -> io::Result<(Arc<ConnectionHandle>, u64)> {
+        let workspace_generation = self.workspace_generation.load(Ordering::Acquire);
+        if workspace_generation & 1 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "client workspace update is in progress",
+            ));
+        }
+        let handle = self
+            .acquire_resolved_wait_ready(
+                server_name,
+                server_config,
+                ConnectionKey::workspace(server_name),
+                None,
+                WaitReadyOptions {
+                    timeout,
+                    rootless: false,
+                    admit: Some(admit),
+                },
+            )
+            .await?;
+        if !admit()
+            || self.workspace_generation.load(Ordering::Acquire) != workspace_generation
+            || workspace_generation & 1 != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "client workspace changed while selecting a producer",
+            ));
+        }
+        Ok((handle, workspace_generation))
+    }
+
+    /// Acquire the complete producer set for a document-free workspace request.
+    ///
+    /// One process is sufficient only when its live folder snapshot proves it
+    /// serves the complete client workspace. A server without workspace-folder
+    /// support is scoped to its initialize `rootUri`, so secondary client roots
+    /// need exact-root processes of their own.
+    pub(super) async fn get_or_create_workspace_connections_wait_ready_admitted(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        timeout: Duration,
+        admit: &(dyn Fn() -> bool + Sync),
+    ) -> io::Result<(Vec<Arc<ConnectionHandle>>, u64)> {
+        let initial_workspace_generation = self.workspace_generation.load(Ordering::Acquire);
+        if initial_workspace_generation & 1 != 0 || !admit() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "client workspace update is in progress",
+            ));
+        }
+        // `Some([])` is an explicit empty workspace, unlike `None` where the
+        // deprecated rootUri remains the fallback scope. Do not acquire a
+        // marker-less producer here: doing so can announce rootUri onto and
+        // then reuse a shared process that still serves unrelated marker roots.
+        if self
+            .workspace_folders()
+            .is_some_and(|folders| folders.is_empty())
+        {
+            return Ok((Vec::new(), initial_workspace_generation));
+        }
+        let primary = self
+            .get_or_create_workspace_connection_wait_ready_admitted(
+                server_name,
+                server_config,
+                timeout,
+                admit,
+            )
+            .await;
+        let Some(folders) = self.workspace_folders() else {
+            return primary.map(|(handle, generation)| (vec![handle], generation));
+        };
+        let mut roots = Vec::with_capacity(folders.len());
+        for folder in folders {
+            let root = Url::parse(folder.uri.as_str()).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid workspace folder URI: {error}"),
+                )
+            })?;
+            let root = super::root_markers::normalized_root_url(&root);
+            if roots.iter().any(|(existing, _): &(Url, _)| {
+                super::root_markers::same_root_uri(existing.as_str(), root.as_str())
+            }) {
+                continue;
+            }
+            roots.push((root, folder));
+        }
+        if roots.is_empty() {
+            return primary.map(|(handle, generation)| (vec![handle], generation));
+        }
+        if let Ok((primary, workspace_generation)) = &primary
+            && self.workspace_handle_covers_roots(primary, &roots)
+        {
+            return Ok((vec![Arc::clone(primary)], *workspace_generation));
+        }
+
+        let workspace_generation = primary
+            .as_ref()
+            .map_or(initial_workspace_generation, |(_, generation)| *generation);
+
+        let workspace_admit = || {
+            admit()
+                && self.workspace_generation.load(Ordering::Acquire) == workspace_generation
+                && workspace_generation & 1 == 0
+        };
+        let primary_handle = primary.ok().map(|(handle, _)| handle);
+        let primary_root = primary_handle
+            .as_ref()
+            .and_then(|handle| handle.spawn_root())
+            .map(str::to_owned);
+        let primary_covers_spawn_root = primary_handle.as_ref().is_some_and(|primary| {
+            !primary.supports_initial_workspace_folders()
+                && primary_root.as_deref().is_some_and(|spawn_root| {
+                    roots.iter().any(|(root, _)| {
+                        super::root_markers::same_root_uri(spawn_root, root.as_str())
+                    })
+                })
+        });
+        let mut handles = primary_covers_spawn_root
+            .then_some(primary_handle)
+            .flatten()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let uncovered: Vec<_> = roots
+            .into_iter()
+            .filter(|(root, _)| {
+                !primary_covers_spawn_root
+                    || !primary_root.as_deref().is_some_and(|spawn_root| {
+                        super::root_markers::same_root_uri(spawn_root, root.as_str())
+                    })
+            })
+            .collect();
+        // Reuse an equivalent marker key already in the pool. ConnectionKey's
+        // hash identity preserves the original URI spelling, while root scope
+        // treats trailing-slash and percent-encoding variants as one path.
+        let existing_keys: Vec<_> = {
+            let connections = self.connections.lock().await;
+            connections
+                .keys()
+                .filter(|key| key.server() == server_name && key.marker_root().is_some())
+                .cloned()
+                .collect()
+        };
+        let targets = uncovered.into_iter().map(|(root, folder)| {
+            let key = existing_keys
+                .iter()
+                .find(|key| {
+                    key.marker_root().is_some_and(|existing| {
+                        super::root_markers::same_root_uri(existing, root.as_str())
+                    })
+                })
+                .cloned()
+                .unwrap_or_else(|| ConnectionKey::new(server_name, Some(root.as_str().to_owned())));
+            (key, root, folder)
+        });
+        // The primary probe may consume its entire initialization timeout.
+        // Root-scoped producers are independent processes, so give their
+        // concurrent acquisition batch a fresh per-process readiness window
+        // instead of inheriting an exhausted primary budget.
+        let secondary_timeout = timeout;
+        let acquisitions = targets.map(|(key, root, folder)| async move {
+            self.acquire_resolved_wait_ready(
+                server_name,
+                server_config,
+                key,
+                Some((root, folder)),
+                WaitReadyOptions {
+                    timeout: secondary_timeout,
+                    rootless: false,
+                    admit: Some(&workspace_admit),
+                },
+            )
+            .await
+        });
+        for handle in futures::future::join_all(acquisitions)
+            .await
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            if !handles
+                .iter()
+                .any(|existing| Arc::ptr_eq(existing, &handle))
+            {
+                handles.push(handle);
+            }
+        }
+        if !workspace_admit() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "client workspace changed while selecting producers",
+            ));
+        }
+        Ok((handles, workspace_generation))
+    }
+
+    pub(crate) fn workspace_generation(&self) -> u64 {
+        self.workspace_generation.load(Ordering::Acquire)
+    }
+
+    fn same_workspace_root_sets<'a>(
+        expected: impl Iterator<Item = &'a str>,
+        actual: impl Iterator<Item = &'a str>,
+    ) -> bool {
+        let deduplicate = |roots: &mut Vec<&'a str>, root: &'a str| {
+            if !roots
+                .iter()
+                .any(|known| super::root_markers::same_root_uri(known, root))
+            {
+                roots.push(root);
+            }
+        };
+        let mut expected_roots = Vec::new();
+        expected.for_each(|root| deduplicate(&mut expected_roots, root));
+        let mut actual_roots = Vec::new();
+        actual.for_each(|root| deduplicate(&mut actual_roots, root));
+
+        expected_roots.len() == actual_roots.len()
+            && expected_roots.iter().all(|expected| {
+                actual_roots
+                    .iter()
+                    .any(|actual| super::root_markers::same_root_uri(expected, actual))
+            })
+    }
+
+    fn workspace_handle_covers_roots(
+        &self,
+        handle: &ConnectionHandle,
+        roots: &[(Url, tower_lsp_server::ls_types::WorkspaceFolder)],
+    ) -> bool {
+        if !handle.supports_initial_workspace_folders() {
+            return false;
+        }
+        let Some(actual) = handle.workspace_folders().snapshot() else {
+            return false;
+        };
+        Self::same_workspace_root_sets(
+            roots.iter().map(|(root, _)| root.as_str()),
+            actual.iter().map(|folder| folder.uri.as_str()),
+        )
+    }
+
+    pub(super) fn shared_serves_client_workspace(&self, handle: &ConnectionHandle) -> bool {
+        if handle.supports_initial_workspace_folders() {
+            let expected = self.workspace_folders().or_else(|| {
+                self.root_uri()
+                    .and_then(|root| Url::parse(&root).ok())
+                    .and_then(super::root_markers::workspace_at_root)
+                    .map(|(_root, folder)| vec![folder])
+            });
+            let actual = handle.workspace_folders().snapshot();
+            return match (expected, actual) {
+                (None, None) => true,
+                (Some(expected), Some(actual)) => Self::same_workspace_root_sets(
+                    expected.iter().map(|folder| folder.uri.as_str()),
+                    actual.iter().map(|folder| folder.uri.as_str()),
+                ),
+                _ => false,
+            };
+        }
+        match (self.root_uri(), handle.spawn_root()) {
+            (Some(expected), Some(actual)) => super::root_markers::same_root_uri(&expected, actual),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    async fn get_or_create_connection_wait_ready_with_admit(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        document_uri: Option<&Url>,
+        timeout: Duration,
+        admit: Option<&(dyn Fn() -> bool + Sync)>,
+    ) -> io::Result<Arc<ConnectionHandle>> {
         // `timeout` is the caller's overall budget; the incapable-shared divert
         // below acquires a second connection, so track elapsed time and hand it
         // only the remaining budget rather than a fresh full `timeout`.
@@ -2735,8 +3250,11 @@ impl LanguageServerPool {
                 server_config,
                 connection_key,
                 marker.clone(),
-                timeout,
-                rootless,
+                WaitReadyOptions {
+                    timeout,
+                    rootless,
+                    admit,
+                },
             )
             .await?;
 
@@ -2782,8 +3300,11 @@ impl LanguageServerPool {
                         server_config,
                         per_root_key,
                         marker,
-                        remaining,
-                        false,
+                        WaitReadyOptions {
+                            timeout: remaining,
+                            rootless: false,
+                            admit,
+                        },
                     )
                     .await;
             }
@@ -2810,9 +3331,13 @@ impl LanguageServerPool {
         server_config: &crate::config::settings::BridgeServerConfig,
         connection_key: ConnectionKey,
         marker: Option<(Url, tower_lsp_server::ls_types::WorkspaceFolder)>,
-        timeout: Duration,
-        rootless: bool,
+        options: WaitReadyOptions<'_>,
     ) -> io::Result<Arc<ConnectionHandle>> {
+        let WaitReadyOptions {
+            timeout,
+            rootless,
+            admit,
+        } = options;
         match self
             .get_or_create_connection_resolved(
                 server_name,
@@ -2825,12 +3350,20 @@ impl LanguageServerPool {
                 // stays within `timeout` overall.
                 timeout,
                 rootless,
-                None,
+                admit,
             )
             .await
         {
             Ok(handle) => {
                 handle.wait_for_ready(timeout).await?;
+                if admit.is_some_and(|admit| !admit()) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        format!(
+                            "bridge: acquire for {connection_key} was superseded while waiting"
+                        ),
+                    ));
+                }
                 Ok(handle)
             }
             Err(e) => {
@@ -2853,6 +3386,14 @@ impl LanguageServerPool {
                         })?
                 };
                 handle.wait_for_ready(timeout).await?;
+                if admit.is_some_and(|admit| !admit()) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        format!(
+                            "bridge: acquire for {connection_key} was superseded while waiting"
+                        ),
+                    ));
+                }
                 Ok(handle)
             }
         }
@@ -4417,6 +4958,18 @@ mod tests {
     // and OpenedVirtualDoc live in their respective submodules.
     // This file contains integration tests that exercise cross-module behavior.
 
+    #[test]
+    fn workspace_root_sets_deduplicate_equivalent_spellings_before_comparison() {
+        assert!(LanguageServerPool::same_workspace_root_sets(
+            ["file:///repo", "file:///repo/"].into_iter(),
+            ["file:///repo"].into_iter(),
+        ));
+        assert!(!LanguageServerPool::same_workspace_root_sets(
+            ["file:///repo", "file:///repo/"].into_iter(),
+            ["file:///repo", "file:///other"].into_iter(),
+        ));
+    }
+
     /// A client `window/workDoneProgress/cancel` for a bridge-minted token is
     /// routed to the owning downstream with its ORIGINAL token restored.
     #[tokio::test]
@@ -4574,7 +5127,9 @@ mod tests {
         pool.set_workspace_folders(Some(vec![original.clone()]));
 
         pool.apply_workspace_folder_change(vec![replacement.clone()], &[original])
-            .await;
+            .await
+            .expect("non-empty change")
+            .finish();
 
         assert_eq!(pool.root_uri().as_deref(), Some("file:///replacement"));
         assert_eq!(pool.workspace_folders(), Some(vec![replacement]));
@@ -4601,7 +5156,9 @@ mod tests {
         };
 
         pool.apply_workspace_folder_change(vec![added.clone()], &[])
-            .await;
+            .await
+            .expect("non-empty change")
+            .finish();
 
         assert_eq!(capable.workspace_folders().snapshot(), Some(vec![added]));
         assert!(
@@ -4621,7 +5178,10 @@ mod tests {
             name: "added".to_string(),
         };
 
-        pool.apply_workspace_folder_change(vec![added], &[]).await;
+        pool.apply_workspace_folder_change(vec![added], &[])
+            .await
+            .expect("non-empty change")
+            .finish();
 
         assert!(
             !pool.connections.lock().await.contains_key(&key),
@@ -4655,7 +5215,10 @@ mod tests {
             name: "added".to_string(),
         };
 
-        pool.apply_workspace_folder_change(vec![added], &[]).await;
+        pool.apply_workspace_folder_change(vec![added], &[])
+            .await
+            .expect("non-empty change")
+            .finish();
 
         assert!(
             pool.pending_reopen.claim(&incapable_key).is_some(),
@@ -4693,7 +5256,11 @@ mod tests {
         pool.set_root_uri(Some(original.uri.to_string()));
         pool.set_workspace_folders(Some(vec![original.clone()]));
 
-        pool.apply_workspace_folder_change(Vec::new(), &[]).await;
+        assert!(
+            pool.apply_workspace_folder_change(Vec::new(), &[])
+                .await
+                .is_none()
+        );
 
         assert!(
             pool.connections.lock().await.contains_key(&key),
@@ -4726,7 +5293,9 @@ mod tests {
             }],
             &[],
         )
-        .await;
+        .await
+        .expect("non-empty change")
+        .finish();
 
         assert!(pool.connections.lock().await.contains_key(&key));
         assert_eq!(handle.workspace_folders().snapshot(), None);
@@ -4757,10 +5326,42 @@ mod tests {
                 name: "repo".to_string(),
             }],
         )
-        .await;
+        .await
+        .expect("non-empty change")
+        .finish();
 
         assert!(pool.connections.lock().await.contains_key(&key));
         assert_eq!(handle.workspace_folders().snapshot(), Some(vec![marker]));
+    }
+
+    #[tokio::test]
+    async fn workspace_folder_removal_recycles_shared_producer_that_served_it() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::shared("shared");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        handle.set_server_capabilities(capable_workspace_folders_caps());
+        let removed = tower_lsp_server::ls_types::WorkspaceFolder {
+            uri: "file:///removed".parse().unwrap(),
+            name: "removed".to_string(),
+        };
+        handle
+            .workspace_folders()
+            .replace(Some(vec![removed.clone()]));
+        pool.insert_connection(Arc::clone(&handle)).await;
+
+        pool.apply_workspace_folder_change(Vec::new(), &[removed])
+            .await
+            .expect("non-empty change")
+            .finish();
+
+        assert!(
+            !pool.connections.lock().await.contains_key(&key),
+            "a shared producer that served a removed client folder must not be reused"
+        );
+        assert!(
+            pool.pending_reopen.claim(&key).is_some(),
+            "the replacement must reopen documents so marker-owned roots are announced again"
+        );
     }
 
     /// Capabilities of a server that accepts initialize-supplied workspace
@@ -6302,6 +6903,187 @@ mod tests {
     // - Writing didOpen notification to downstream
     // - Post-condition: document marked as opened
     // - Rollback on send failure
+
+    #[tokio::test]
+    async fn workspace_producers_open_recorded_virtual_documents_in_their_root_scope() {
+        let pool = LanguageServerPool::new();
+        pool.set_root_uri(Some("file:///workspace/a".to_owned()));
+        pool.set_workspace_folders(Some(vec![
+            tower_lsp_server::ls_types::WorkspaceFolder {
+                uri: "file:///workspace/a".parse().unwrap(),
+                name: "a".to_owned(),
+            },
+            tower_lsp_server::ls_types::WorkspaceFolder {
+                uri: "file:///workspace/b".parse().unwrap(),
+                name: "b".to_owned(),
+            },
+        ]));
+        let primary_host = Url::parse("file:///workspace/a/inside.md").unwrap();
+        let secondary_host = Url::parse("file:///workspace/b/inside.md").unwrap();
+        let outside_host = Url::parse("file:///outside/history.md").unwrap();
+        let primary = crate::lsp::bridge::coordinator::BridgeInjection {
+            language: "lua".to_owned(),
+            region_id: TEST_ULID_LUA_0.to_owned(),
+            content: "primary".to_owned(),
+        };
+        let secondary = crate::lsp::bridge::coordinator::BridgeInjection {
+            language: "lua".to_owned(),
+            region_id: TEST_ULID_LUA_1.to_owned(),
+            content: "secondary".to_owned(),
+        };
+        let outside = crate::lsp::bridge::coordinator::BridgeInjection {
+            language: "lua".to_owned(),
+            region_id: "01ARZ3NDEKTSV4RRFFQ69G5OUT".to_owned(),
+            content: "outside".to_owned(),
+        };
+        for (host, injection) in [
+            (&primary_host, &primary),
+            (&secondary_host, &secondary),
+            (&outside_host, &outside),
+        ] {
+            pool.open_host_incarnation(host, 1).await;
+            pool.record_latest_virtual_contents(host, 1, 0, std::slice::from_ref(injection));
+        }
+        let primary_key = ConnectionKey::workspace("lua");
+        let primary_handle =
+            create_handle_with_key(ConnectionState::Ready, primary_key.clone()).await;
+        record_test_spawn_root(&primary_handle, "file:///workspace/a");
+        let secondary_key = ConnectionKey::new("lua", Some("file:///workspace/b".to_owned()));
+        let secondary_handle =
+            create_handle_with_key(ConnectionState::Ready, secondary_key.clone()).await;
+        record_test_spawn_root(&secondary_handle, "file:///workspace/b");
+        pool.connections().await.extend([
+            (primary_key.clone(), Arc::clone(&primary_handle)),
+            (secondary_key.clone(), Arc::clone(&secondary_handle)),
+        ]);
+        let config = crate::config::settings::BridgeServerConfig {
+            languages: Some(vec!["lua".to_owned()]),
+            ..Default::default()
+        };
+
+        pool.open_recorded_workspace_virtual_documents(&primary_handle, &config)
+            .await
+            .unwrap();
+        pool.open_recorded_workspace_virtual_documents(&secondary_handle, &config)
+            .await
+            .unwrap();
+
+        let primary_revisions = pool
+            .confirmed_virtual_document_revisions_for_connection(&primary_key)
+            .await;
+        let secondary_revisions = pool
+            .confirmed_virtual_document_revisions_for_connection(&secondary_key)
+            .await;
+        let primary_uri = VirtualDocumentUri::new(
+            &url_to_uri(&primary_host),
+            &primary.language,
+            &primary.region_id,
+        )
+        .to_uri_string();
+        let secondary_uri = VirtualDocumentUri::new(
+            &url_to_uri(&secondary_host),
+            &secondary.language,
+            &secondary.region_id,
+        )
+        .to_uri_string();
+        let outside_uri = VirtualDocumentUri::new(
+            &url_to_uri(&outside_host),
+            &outside.language,
+            &outside.region_id,
+        )
+        .to_uri_string();
+        assert_eq!(primary_revisions[&primary_uri].host_identity, Some((1, 0)));
+        assert!(!primary_revisions.contains_key(&secondary_uri));
+        assert!(!primary_revisions.contains_key(&outside_uri));
+        assert_eq!(
+            secondary_revisions[&secondary_uri].host_identity,
+            Some((1, 0))
+        );
+        assert!(!secondary_revisions.contains_key(&primary_uri));
+        assert!(!secondary_revisions.contains_key(&outside_uri));
+
+        let folder_capable_key = ConnectionKey::workspace("folder-lua");
+        let folder_capable = create_handle_advertising_workspace_symbols_with_initial_folders(
+            folder_capable_key.clone(),
+        )
+        .await;
+        record_test_spawn_root(&folder_capable, "file:///workspace/a");
+        folder_capable.workspace_folders().replace(Some(vec![
+            tower_lsp_server::ls_types::WorkspaceFolder {
+                uri: "file:///workspace/a".parse().unwrap(),
+                name: "a".to_owned(),
+            },
+            tower_lsp_server::ls_types::WorkspaceFolder {
+                uri: "file:///workspace/b".parse().unwrap(),
+                name: "b".to_owned(),
+            },
+        ]));
+        pool.connections()
+            .await
+            .insert(folder_capable_key.clone(), Arc::clone(&folder_capable));
+        pool.open_recorded_workspace_virtual_documents(&folder_capable, &config)
+            .await
+            .unwrap();
+        let folder_capable_revisions = pool
+            .confirmed_virtual_document_revisions_for_connection(&folder_capable_key)
+            .await;
+        assert!(folder_capable_revisions.contains_key(&primary_uri));
+        assert!(folder_capable_revisions.contains_key(&secondary_uri));
+        assert!(!folder_capable_revisions.contains_key(&outside_uri));
+    }
+
+    #[test]
+    fn workspace_producer_scope_normalizes_equivalent_file_uri_paths() {
+        let encoded = Url::parse("file:///workspace/%7Eproject/main.md").unwrap();
+        let literal = Url::parse("file:///workspace/~project").unwrap();
+
+        assert!(LanguageServerPool::uri_is_within_root(&encoded, &literal));
+    }
+
+    #[test]
+    fn rootless_workspace_producer_does_not_claim_cached_hosts() {
+        let pool = LanguageServerPool::new();
+        let host = Url::parse("file:///workspace/doc.md").unwrap();
+
+        assert!(!pool.host_is_in_client_workspace(&host));
+    }
+
+    #[tokio::test]
+    async fn workspace_producer_aborts_when_a_recorded_virtual_didopen_cannot_enqueue() {
+        let pool = LanguageServerPool::new();
+        let host = Url::parse("file:///workspace/doc.md").unwrap();
+        let injection = crate::lsp::bridge::coordinator::BridgeInjection {
+            language: "lua".to_owned(),
+            region_id: TEST_ULID_LUA_0.to_owned(),
+            content: "print('ready')".to_owned(),
+        };
+        pool.open_host_incarnation(&host, 1).await;
+        pool.record_latest_virtual_contents(&host, 1, 0, std::slice::from_ref(&injection));
+        let key = ConnectionKey::workspace("lua");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        record_test_spawn_root(&handle, "file:///workspace");
+        pool.connections()
+            .await
+            .insert(key.clone(), Arc::clone(&handle));
+        handle.cancel_writer_for_test().await;
+        let config = crate::config::settings::BridgeServerConfig {
+            languages: Some(vec!["lua".to_owned()]),
+            ..Default::default()
+        };
+
+        let error = pool
+            .open_recorded_workspace_virtual_documents(&handle, &config)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert!(
+            pool.confirmed_virtual_document_revisions_for_connection(&key)
+                .await
+                .is_empty(),
+            "the producer must not proceed with a partially opened document set"
+        );
+    }
 
     /// Test that ensure_document_opened sends didOpen when document is not yet opened.
     ///

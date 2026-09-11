@@ -26,6 +26,10 @@ enum ConnectionRoot {
     /// found). Such documents use the single client-rooted fallback connection
     /// unless shared-instance routing applies.
     ClientFallback,
+    /// Isolated producer for document-free client-workspace requests. No
+    /// document routing path constructs this key, so its server index cannot
+    /// depend on which marker-less files happened to be opened.
+    Workspace,
     /// One connection shared across *every* root for a `preferSharedInstance`
     /// server (#391), and — because they have no root to isolate by — every
     /// marker-less document of such a server too. Kept distinct from
@@ -74,6 +78,13 @@ impl ConnectionKey {
         }
     }
 
+    pub(crate) fn workspace(server: impl Into<String>) -> Self {
+        Self {
+            server: server.into(),
+            root: ConnectionRoot::Workspace,
+        }
+    }
+
     /// Whether this is a shared-instance key (#391).
     pub(crate) fn is_shared(&self) -> bool {
         matches!(self.root, ConnectionRoot::Shared)
@@ -82,6 +93,10 @@ impl ConnectionKey {
     /// Whether this key is the client-root fallback (no resolved marker root).
     pub(crate) fn is_client_fallback(&self) -> bool {
         matches!(self.root, ConnectionRoot::ClientFallback)
+    }
+
+    pub(crate) fn is_workspace(&self) -> bool {
+        matches!(self.root, ConnectionRoot::Workspace)
     }
 
     /// Build a key with no resolved root (client-root fallback).
@@ -111,7 +126,9 @@ impl ConnectionKey {
     pub(crate) fn marker_root(&self) -> Option<&str> {
         match &self.root {
             ConnectionRoot::Marker(root) => Some(root),
-            ConnectionRoot::ClientFallback | ConnectionRoot::Shared => None,
+            ConnectionRoot::ClientFallback | ConnectionRoot::Workspace | ConnectionRoot::Shared => {
+                None
+            }
         }
     }
 }
@@ -121,6 +138,7 @@ impl fmt::Display for ConnectionKey {
         match &self.root {
             ConnectionRoot::Marker(root) => write!(f, "{}@{}", self.server, root),
             ConnectionRoot::ClientFallback => write!(f, "{}", self.server),
+            ConnectionRoot::Workspace => write!(f, "{}#workspace", self.server),
             ConnectionRoot::Shared => write!(f, "{}#shared", self.server),
         }
     }
@@ -183,6 +201,19 @@ mod tests {
         assert_eq!(shared, ConnectionKey::shared("tsgo"));
         assert_ne!(shared, ConnectionKey::shared("pyright"));
         assert!(!ConnectionKey::for_server("tsgo").is_shared());
+    }
+
+    #[test]
+    fn workspace_key_is_distinct_from_every_document_route() {
+        let workspace = ConnectionKey::workspace("tsgo");
+        assert!(workspace.is_workspace());
+        assert_ne!(workspace, ConnectionKey::for_server("tsgo"));
+        assert_ne!(workspace, ConnectionKey::shared("tsgo"));
+        assert_ne!(
+            workspace,
+            ConnectionKey::new("tsgo", Some("file:///repo".into()))
+        );
+        assert_eq!(workspace.to_string(), "tsgo#workspace");
     }
 
     #[test]
