@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use dashmap::{DashMap, DashSet};
 use tokio::sync::Mutex;
@@ -27,6 +27,8 @@ struct VirtualUriProvenance {
     queued: DashSet<String>,
     reservations: DashSet<String>,
     admitted: AtomicUsize,
+    revision: AtomicU64,
+    mutation: std::sync::RwLock<()>,
 }
 
 /// Retire a healthy producer before exact URI provenance can grow with an
@@ -69,14 +71,47 @@ impl VirtualUriProvenance {
     }
 
     fn confirm(&self, uri: String) {
+        let _mutation = self
+            .mutation
+            .write()
+            .recover_poison("VirtualUriProvenance::mutation");
+        let was_visible = self.contains(&uri);
         self.insert_issued(uri.clone());
         self.reservations.remove(&uri);
+        if !was_visible {
+            self.revision.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn insert_queued(&self, uri: String) {
+        let _mutation = self
+            .mutation
+            .write()
+            .recover_poison("VirtualUriProvenance::mutation");
+        let was_visible = self.contains(&uri);
+        self.queued.insert(uri);
+        if !was_visible {
+            self.revision.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn rollback_queued(&self, uri: &str) {
+        let _mutation = self
+            .mutation
+            .write()
+            .recover_poison("VirtualUriProvenance::mutation");
+        let removed = self.queued.remove(uri).is_some();
+        self.release_reservation(uri);
+        if removed && !self.issued.contains(uri) && !self.scratch.contains(uri) {
+            self.revision.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     #[cfg(test)]
     fn remove_issued(&self, uri: &str) {
         if self.issued.remove(uri).is_some() {
             self.admitted.fetch_sub(1, Ordering::AcqRel);
+            self.revision.fetch_add(1, Ordering::AcqRel);
         }
     }
 }
@@ -104,6 +139,22 @@ impl VirtualUriObserver {
             return true;
         }
         self.provenance.contains(uri)
+    }
+
+    pub(crate) fn provenance_read_guard(&self) -> std::sync::RwLockReadGuard<'_, ()> {
+        self.provenance
+            .mutation
+            .read()
+            .recover_poison("VirtualUriProvenance::mutation")
+    }
+
+    pub(crate) fn provenance_revision(&self) -> u64 {
+        self.provenance.revision.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_provenance_for_test(&self, uri: String) {
+        self.provenance.insert_queued(uri);
     }
 }
 
@@ -400,8 +451,7 @@ impl DocumentTracker {
             return false;
         }
         self.provenance_for_generation(connection_key, expected_generation)
-            .queued
-            .insert(uri);
+            .insert_queued(uri);
         true
     }
 
@@ -962,8 +1012,7 @@ impl DocumentTracker {
             .iter()
             .filter(|entry| &entry.key().0 == connection_key)
         {
-            provenance.queued.remove(&uri_string);
-            provenance.release_reservation(&uri_string);
+            provenance.rollback_queued(&uri_string);
         }
         if let Some(docs) = versions.get_mut(connection_key) {
             docs.remove(&uri_string);
@@ -2596,6 +2645,23 @@ mod tests {
         assert!(observer.contains(&virtual_uri.to_uri_string()));
     }
 
+    #[test]
+    fn observer_local_uri_does_not_advance_shared_provenance_revision() {
+        let tracker = DocumentTracker::new();
+        let key = ConnectionKey::for_server("lua");
+        let generation = tracker.connection_generation(&key);
+        let first = tracker.observe_virtual_uris_for_connection(&key, generation);
+        let concurrent = tracker.observe_virtual_uris_for_connection(&key, generation);
+        let revision = concurrent.provenance_revision();
+        let local_uri = "file:///project/local.lua";
+
+        first.insert(local_uri.into());
+
+        assert!(first.contains(local_uri));
+        assert!(!concurrent.contains(local_uri));
+        assert_eq!(concurrent.provenance_revision(), revision);
+    }
+
     #[tokio::test]
     async fn virtual_uri_observer_seeds_uri_closed_before_request_until_generation_purge() {
         let tracker = DocumentTracker::new();
@@ -2786,6 +2852,73 @@ mod tests {
             !tracker.try_claim_for_open(&rejected, &key).await,
             "queued publication must not release its claim reservation"
         );
+    }
+
+    #[tokio::test]
+    async fn confirming_queued_provenance_does_not_advance_visibility_revision() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///project/queued.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", "queued-visible");
+        let key = ConnectionKey::for_server("lua");
+        let generation = tracker.connection_generation(&key);
+        assert!(tracker.try_claim_for_open(&virtual_uri, &key).await);
+        let claim = tracker
+            .open_claim_waiter(&virtual_uri, &key)
+            .expect("claim identity");
+        assert!(tracker.mark_open_queued(&virtual_uri, &key, generation, &claim));
+        let observer = tracker.observe_virtual_uris_for_connection(&key, generation);
+        let queued_revision = observer.provenance_revision();
+
+        assert!(
+            tracker
+                .mark_open_sent(&virtual_uri, &key, generation, &claim)
+                .await
+        );
+
+        assert!(observer.contains(&virtual_uri.to_uri_string()));
+        assert_eq!(observer.provenance_revision(), queued_revision);
+    }
+
+    #[test]
+    fn requeueing_visible_provenance_does_not_advance_visibility_revision() {
+        let provenance = VirtualUriProvenance::default();
+        let uri = "file:///project/reopened.lua".to_owned();
+        provenance.insert_queued(uri.clone());
+        let queued_revision = provenance.revision.load(Ordering::Acquire);
+
+        provenance.insert_queued(uri.clone());
+        assert_eq!(provenance.revision.load(Ordering::Acquire), queued_revision);
+
+        provenance.confirm(uri.clone());
+        provenance.rollback_queued(&uri);
+        let issued_revision = provenance.revision.load(Ordering::Acquire);
+        provenance.insert_queued(uri);
+        assert_eq!(provenance.revision.load(Ordering::Acquire), issued_revision);
+    }
+
+    #[tokio::test]
+    async fn rolling_back_queued_provenance_advances_visibility_revision() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///project/rolled-back.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", "rolled-back");
+        let key = ConnectionKey::for_server("lua");
+        let generation = tracker.connection_generation(&key);
+        assert!(tracker.try_claim_for_open(&virtual_uri, &key).await);
+        let claim = tracker
+            .open_claim_waiter(&virtual_uri, &key)
+            .expect("claim identity");
+        assert!(tracker.mark_open_queued(&virtual_uri, &key, generation, &claim));
+        let observer = tracker.observe_virtual_uris_for_connection(&key, generation);
+        let queued_revision = observer.provenance_revision();
+
+        assert!(
+            tracker
+                .rollback_open_claim_if(&host_uri, &virtual_uri, &key, &claim)
+                .await
+        );
+
+        assert!(!observer.contains(&virtual_uri.to_uri_string()));
+        assert_eq!(observer.provenance_revision(), queued_revision + 1);
     }
 
     #[tokio::test]

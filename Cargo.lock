@@ -985,6 +985,7 @@ dependencies = [
  "filetime",
  "flate2",
  "futures",
+ "globset",
  "ignore",
  "indexmap",
  "insta",
