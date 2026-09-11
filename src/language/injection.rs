@@ -20,14 +20,15 @@ pub(crate) const MAX_INJECTION_DEPTH: usize = 10;
 
 pub(crate) use content::{
     NATIVE_PARSE_BUDGET, byte_to_point, byte_to_point_anchored, parse_with_deadline,
-    parse_with_deadline_cancellable, parse_with_ranges,
+    parse_with_deadline_cancellable, parse_with_ranges, parse_with_ranges_cancellable,
 };
 #[cfg(test)]
 pub(crate) use discovery::assert_discovery_matches_reference;
 pub(crate) use discovery::{
     CacheableInjectionRegion, InjectionRegionInfo, InjectionResolver, REGION_IDENTITY_LAYER_BASE,
     RegionBoundary, ResolvedInjection, collect_all_injections,
-    collect_all_injections_parallel_cancellable, detect_injection, effective_content_range,
+    collect_all_injections_parallel_cancellable, detect_injection_cancellable,
+    effective_content_range,
 };
 #[cfg(test)]
 pub(crate) use offset::effective_offset_for_pattern;

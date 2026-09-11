@@ -37,7 +37,7 @@ Partially implemented:
   CodeAction, completion, and inlayHint build custom host arms; codeLens and
   documentLink use the shared whole-document winner hook. Covered: definition, hover, declaration,
   typeDefinition, implementation, references, completion, signatureHelp,
-  documentHighlight, rename, prepareRename, linkedEditingRange, moniker,
+  documentHighlight, rename, prepareRename, linkedEditingRange, selectionRange, moniker,
   inlayHint, inlineValue, documentSymbol, documentLink, documentColor, colorPresentation,
   foldingRange, codeLens,
   prepareCallHierarchy, incomingCalls, outgoingCalls, prepareTypeHierarchy,
