@@ -485,6 +485,8 @@ impl LanguageServerPool {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
     }
@@ -510,6 +512,8 @@ impl LanguageServerPool {
             params,
             upstream_request_id,
             Some(expected_incarnation),
+            None,
+            None,
             None,
             None,
         )
@@ -540,6 +544,8 @@ impl LanguageServerPool {
             Some(expected_incarnation),
             Some(revision_text_reader),
             None,
+            None,
+            None,
         )
         .await
     }
@@ -557,6 +563,8 @@ impl LanguageServerPool {
         upstream_request_id: Option<UpstreamId>,
         expected_incarnation: u64,
         attempted: Arc<std::sync::atomic::AtomicBool>,
+        selected: Arc<std::sync::atomic::AtomicBool>,
+        valid_response: Arc<std::sync::atomic::AtomicBool>,
     ) -> io::Result<Option<HostRawResponse>> {
         self.send_host_raw_request_inner(
             server_name,
@@ -568,6 +576,8 @@ impl LanguageServerPool {
             Some(expected_incarnation),
             None,
             Some(attempted),
+            Some(selected),
+            Some(valid_response),
         )
         .await
     }
@@ -584,13 +594,27 @@ impl LanguageServerPool {
         expected_incarnation: Option<u64>,
         revision_text_reader: Option<HostTextReader>,
         attempted: Option<Arc<std::sync::atomic::AtomicBool>>,
+        selected: Option<Arc<std::sync::atomic::AtomicBool>>,
+        valid_response: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> io::Result<Option<HostRawResponse>> {
         strip_progress_tokens(&mut params);
-        let handle = self
+        let handle = match self
             .get_or_create_connection(server_name, server_config, Some(doc.uri))
-            .await?;
+            .await
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                if let Some(selected) = selected {
+                    selected.store(true, std::sync::atomic::Ordering::Release);
+                }
+                return Err(error);
+            }
+        };
         if !handle.has_capability(method) {
             return Ok(None);
+        }
+        if let Some(selected) = selected {
+            selected.store(true, std::sync::atomic::Ordering::Release);
         }
         // Carried out with the response so a caller that must name this exact
         // connection (the `workspace/executeCommand` routing token) or ask what
@@ -598,6 +622,7 @@ impl LanguageServerPool {
         // that would repeat the marker filesystem walk on a request-frequency
         // path (execute-command-routing-token).
         let answering = Arc::clone(&handle);
+        let response_observer = valid_response;
         let (value, incarnation, connection_generation) = self
             .execute_host_request(
                 handle,
@@ -608,6 +633,11 @@ impl LanguageServerPool {
                 attempted,
                 |request_id| JsonRpcRequest::new(request_id.as_i64(), method, params),
                 move |response, incarnation, connection_generation| {
+                    if response.get("result").is_some()
+                        && let Some(valid_response) = response_observer
+                    {
+                        valid_response.store(true, std::sync::atomic::Ordering::Release);
+                    }
                     (
                         parse_host_raw_response(response, method),
                         incarnation,

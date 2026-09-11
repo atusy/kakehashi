@@ -112,8 +112,9 @@ impl LanguageServerPool {
         client_progress_token: Option<NumberOrString>,
         expected_incarnation: Option<u64>,
         attempted: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        selected: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> io::Result<Option<SemanticTokens>> {
-        let handle = self
+        let handle = match self
             .get_or_create_virtual_connection(
                 server_name,
                 server_config,
@@ -121,7 +122,16 @@ impl LanguageServerPool {
                 injection_language,
                 region_id,
             )
-            .await?;
+            .await
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                if let Some(selected) = selected {
+                    selected.store(true, std::sync::atomic::Ordering::Release);
+                }
+                return Err(error);
+            }
+        };
         if !handle.has_capability(FULL_METHOD) {
             return Ok(None);
         }
@@ -132,6 +142,9 @@ impl LanguageServerPool {
             Position::new(offset.line(), offset.column_for_line(0)),
             region_end,
         );
+        if let Some(selected) = selected {
+            selected.store(true, std::sync::atomic::Ordering::Release);
+        }
         self.execute_bridge_request_observed(
             handle,
             host_uri,
@@ -146,9 +159,8 @@ impl LanguageServerPool {
                 build_semantic_tokens_full_request(virtual_uri, request_id, client_progress_token)
             },
             |response, ctx| {
-                transform_semantic_tokens_response_to_host(
+                transform_semantic_tokens_full_response_to_host(
                     response,
-                    FULL_METHOD,
                     &legend,
                     ctx.offset,
                     region_end,
@@ -158,7 +170,7 @@ impl LanguageServerPool {
             },
             None,
         )
-        .await
+        .await?
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -302,6 +314,39 @@ fn transform_semantic_tokens_response_to_host(
     )
 }
 
+fn transform_semantic_tokens_full_response_to_host(
+    mut response: serde_json::Value,
+    legend: &SemanticTokensLegend,
+    offset: &RegionOffset,
+    region_end: Position,
+    virtual_content: &str,
+    host_range: Range,
+) -> io::Result<Option<SemanticTokens>> {
+    if response_has_jsonrpc_error(&response, FULL_METHOD) {
+        return Err(io::Error::other(
+            "downstream semanticTokens/full returned a JSON-RPC error",
+        ));
+    }
+    let result = response
+        .get_mut("result")
+        .map(serde_json::Value::take)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "missing semantic token result")
+        })?;
+    if result.is_null() {
+        return Ok(None);
+    }
+    transform_semantic_tokens_result_to_host_strict(
+        result,
+        legend,
+        offset,
+        region_end,
+        virtual_content,
+        host_range,
+    )
+    .map(Some)
+}
+
 pub(crate) fn transform_semantic_tokens_result_to_host(
     result: serde_json::Value,
     legend: &SemanticTokensLegend,
@@ -310,7 +355,53 @@ pub(crate) fn transform_semantic_tokens_result_to_host(
     virtual_content: &str,
     host_range: Range,
 ) -> Option<SemanticTokens> {
-    let result: SemanticTokensRangeResult = serde_json::from_value(result).ok()?;
+    transform_semantic_tokens_result_to_host_inner(
+        result,
+        legend,
+        offset,
+        region_end,
+        virtual_content,
+        host_range,
+        false,
+    )
+    .ok()
+}
+
+pub(crate) fn transform_semantic_tokens_result_to_host_strict(
+    result: serde_json::Value,
+    legend: &SemanticTokensLegend,
+    offset: &RegionOffset,
+    region_end: Position,
+    virtual_content: &str,
+    host_range: Range,
+) -> io::Result<SemanticTokens> {
+    transform_semantic_tokens_result_to_host_inner(
+        result,
+        legend,
+        offset,
+        region_end,
+        virtual_content,
+        host_range,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn transform_semantic_tokens_result_to_host_inner(
+    result: serde_json::Value,
+    legend: &SemanticTokensLegend,
+    offset: &RegionOffset,
+    region_end: Position,
+    virtual_content: &str,
+    host_range: Range,
+    reject_invalid_coordinates: bool,
+) -> io::Result<SemanticTokens> {
+    let result: SemanticTokensRangeResult = serde_json::from_value(result).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid semantic token result: {error}"),
+        )
+    })?;
     let data = match result {
         SemanticTokensRangeResult::Tokens(tokens) => tokens.data,
         SemanticTokensRangeResult::Partial(partial) => partial.data,
@@ -318,25 +409,73 @@ pub(crate) fn transform_semantic_tokens_result_to_host(
     let mapper = PositionMapper::new(virtual_content);
     let mut absolute_line = 0u32;
     let mut absolute_start = 0u32;
+    let mut previous_end = None;
     let mut host_tokens = Vec::with_capacity(data.len());
 
     for token in data {
-        absolute_line = absolute_line.checked_add(token.delta_line)?;
+        absolute_line = absolute_line.checked_add(token.delta_line).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "semantic token line overflow")
+        })?;
         absolute_start = if token.delta_line == 0 {
-            absolute_start.checked_add(token.delta_start)?
+            absolute_start
+                .checked_add(token.delta_start)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "semantic token column overflow")
+                })?
         } else {
             token.delta_start
         };
         let start = Position::new(absolute_line, absolute_start);
         if token.length == 0 {
+            if reject_invalid_coordinates {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "semantic token length must be positive",
+                ));
+            }
             continue;
         }
-        let end = Position::new(absolute_line, absolute_start.checked_add(token.length)?);
+        let end = Position::new(
+            absolute_line,
+            absolute_start.checked_add(token.length).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "semantic token length overflow")
+            })?,
+        );
         if mapper.position_to_byte_strict(start).is_none()
             || mapper.position_to_byte_strict(end).is_none()
         {
+            if reject_invalid_coordinates {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "semantic token position is outside the document",
+                ));
+            }
             continue;
         }
+        if reject_invalid_coordinates && token.token_type as usize >= legend.token_types.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "semantic token type is outside the advertised legend",
+            ));
+        }
+        if reject_invalid_coordinates
+            && legend.token_modifiers.len() < u32::BITS as usize
+            && token.token_modifiers_bitset >> legend.token_modifiers.len() != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "semantic token modifiers are outside the advertised legend",
+            ));
+        }
+        if reject_invalid_coordinates
+            && previous_end.is_some_and(|(line, end)| line == absolute_line && absolute_start < end)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "semantic tokens overlap",
+            ));
+        }
+        previous_end = Some((absolute_line, end.character));
         let Some(token_type) = remap_token_type(token.token_type, legend) else {
             continue;
         };
@@ -359,7 +498,7 @@ pub(crate) fn transform_semantic_tokens_result_to_host(
         result_id: None,
         data: encode_absolute_tokens(host_tokens),
     };
-    Some(filter_semantic_tokens_by_range(&tokens, &host_range))
+    Ok(filter_semantic_tokens_by_range(&tokens, &host_range))
 }
 
 fn remap_token_type(index: u32, legend: &SemanticTokensLegend) -> Option<u32> {
@@ -680,5 +819,79 @@ mod tests {
         assert_eq!(tokens.data[1].delta_start, 2);
         assert_eq!(tokens.data[1].token_type, 17);
         assert_eq!(tokens.data[1].token_modifiers_bitset, 1 << 3);
+    }
+
+    #[test]
+    fn full_response_distinguishes_valid_empty_from_invalid_payloads() {
+        let legend = SemanticTokensLegend {
+            token_types: vec![SemanticTokenType::VARIABLE],
+            token_modifiers: Vec::new(),
+        };
+        let transform = |response| {
+            transform_semantic_tokens_full_response_to_host(
+                response,
+                &legend,
+                &RegionOffset::new(0, 0),
+                Position::new(0, 4),
+                "code",
+                Range::new(Position::new(0, 0), Position::new(0, 4)),
+            )
+        };
+
+        assert!(transform(json!({ "result": null })).unwrap().is_none());
+        assert!(
+            transform(json!({ "result": { "data": [] } }))
+                .unwrap()
+                .is_some()
+        );
+        assert!(transform(json!({ "result": { "data": "bad" } })).is_err());
+        assert!(
+            transform(json!({ "result": { "data": [0, 0, 1, 1, 0] } })).is_err(),
+            "a token type outside the advertised legend is malformed"
+        );
+        assert!(
+            transform(json!({ "result": { "data": [0, 0, 0, 0, 0] } })).is_err(),
+            "a zero-length token is malformed"
+        );
+        assert!(
+            transform(json!({ "result": { "data": [0, 0, 1, 0, 1] } })).is_err(),
+            "a modifier outside the advertised legend is malformed"
+        );
+        assert!(
+            transform(json!({
+                "result": { "data": [0, 0, 3, 0, 0, 0, 2, 1, 0, 0] }
+            }))
+            .is_err(),
+            "overlapping tokens violate the advertised client capability"
+        );
+        assert!(
+            transform_semantic_tokens_full_response_to_host(
+                json!({ "result": { "data": [0, 0, 1, 0, 0] } }),
+                &SemanticTokensLegend {
+                    token_types: vec![SemanticTokenType::new("custom")],
+                    token_modifiers: Vec::new(),
+                },
+                &RegionOffset::new(0, 0),
+                Position::new(0, 4),
+                "code",
+                Range::new(Position::new(0, 0), Position::new(0, 4)),
+            )
+            .unwrap()
+            .is_some_and(|tokens| tokens.data.is_empty()),
+            "an advertised custom token type remains a valid skipped token"
+        );
+        assert!(
+            transform(json!({
+                "result": { "data": [0, 5, 1, 0, 0] }
+            }))
+            .is_err(),
+            "a non-empty response outside the virtual document is not a valid empty result"
+        );
+        assert!(
+            transform(json!({
+                "error": { "code": -32603, "message": "failed" }
+            }))
+            .is_err()
+        );
     }
 }

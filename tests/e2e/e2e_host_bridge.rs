@@ -722,7 +722,7 @@ priorities = ["virt", "native"]
     let uri = "file:///test_semantic_delta_reentry.md";
     open_inline_value_document(&mut client, uri, 1, "# heading\n");
 
-    let previous_result_id = (0..300)
+    let (previous_result_id, previous_data) = (0..300)
         .find_map(|_| {
             let response = client.send_request(
                 "textDocument/semanticTokens/full",
@@ -731,7 +731,16 @@ priorities = ["virt", "native"]
             response
                 .pointer("/result/resultId")
                 .and_then(Value::as_str)
-                .map(str::to_string)
+                .map(|id| {
+                    (
+                        id.to_string(),
+                        response
+                            .pointer("/result/data")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default(),
+                    )
+                })
                 .or_else(|| {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                     None
@@ -760,11 +769,26 @@ priorities = ["virt", "native"]
                     || response.pointer("/error/code") == Some(&json!(-32801)),
                 "{response:?}"
             );
-            response
+            let data = response
                 .pointer("/result/data")
                 .and_then(Value::as_array)
-                .filter(|data| data.chunks_exact(5).any(|token| token == [1, 0, 4, 17, 8]))
                 .cloned()
+                .or_else(|| {
+                    let edits = response.pointer("/result/edits")?.as_array()?;
+                    let mut data = previous_data.clone();
+                    for edit in edits {
+                        let start = edit.get("start")?.as_u64()? as usize;
+                        let delete_count = edit.get("deleteCount")?.as_u64()? as usize;
+                        let replacement = edit
+                            .get("data")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default();
+                        data.splice(start..start + delete_count, replacement);
+                    }
+                    Some(data)
+                });
+            data.filter(|data| data.chunks_exact(5).any(|token| token == [1, 0, 4, 17, 8]))
                 .or_else(|| {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                     None
@@ -1563,6 +1587,370 @@ priorities = ["virt"]
         b"release",
     )
     .expect("release delayed server before shutdown");
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_semantic_tokens_full_delta_tracks_the_merged_bridge_result() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("semantic_tokens_full_delta.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[languages.markdown.layers.aggregation."textDocument/semanticTokens/full"]
+priorities = ["virt", "native"]
+"#,
+    )
+    .expect("write config");
+    let event_dir = tempfile::TempDir::new().expect("event dir");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        .env(
+            "KAKEHASHI_E2E_INLINE_VALUE_CHANGE_DIR",
+            event_dir.path().to_string_lossy(),
+        )
+        .build();
+    let _init = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-virt-semantic-full": {
+                        "cmd": [mock_bin(), "semantic-tokens-full-changing"],
+                        "languages": ["lua"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    let uri = "file:///test_semantic_tokens_full_delta.md";
+    open_inline_value_document(&mut client, uri, 1, "> ```lua\n> old!\n> ```\n");
+
+    let initial = (0..300)
+        .find_map(|_| {
+            let response = client.send_request(
+                "textDocument/semanticTokens/full",
+                json!({ "textDocument": { "uri": uri } }),
+            );
+            let result = response.get("result")?;
+            (result.get("resultId").and_then(Value::as_str).is_some()
+                && result.get("data").and_then(Value::as_array).is_some())
+            .then(|| result.clone())
+            .or_else(|| {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                None
+            })
+        })
+        .expect("bridged full result should establish a wire baseline");
+    let previous_result_id = initial["resultId"]
+        .as_str()
+        .expect("full resultId")
+        .to_string();
+    let initial_data = initial["data"].as_array().expect("full data").clone();
+    assert!(
+        initial_data
+            .chunks_exact(5)
+            .any(|token| token == json!([1, 2, 4, 17, 8]).as_array().unwrap()),
+        "the initial full result must contain the rebased virtual-server token: {initial:?}"
+    );
+
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": uri, "version": 2 },
+            "contentChanges": [{ "text": "> ```lua\n> changed\n> ```\n" }]
+        }),
+    );
+    assert!(
+        (0..60).any(|_| {
+            if event_dir.path().join("changed").exists() {
+                true
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                false
+            }
+        }),
+        "didChange should be admitted before the delta request"
+    );
+
+    let delta_response = client.send_request(
+        "textDocument/semanticTokens/full/delta",
+        json!({
+            "textDocument": { "uri": uri },
+            "previousResultId": previous_result_id
+        }),
+    );
+    assert!(delta_response.get("error").is_none(), "{delta_response:?}");
+    let edits = delta_response
+        .pointer("/result/edits")
+        .and_then(Value::as_array)
+        .expect("a valid merged baseline should produce delta edits");
+    assert_eq!(edits.len(), 1, "the delta algorithm emits one splice");
+    assert!(
+        delta_response
+            .pointer("/result/resultId")
+            .and_then(Value::as_str)
+            .is_some(),
+        "the merged delta should establish its next baseline"
+    );
+    let edit = &edits[0];
+    let start = edit["start"].as_u64().expect("edit start") as usize;
+    let delete_count = edit["deleteCount"].as_u64().expect("delete count") as usize;
+    let replacement = edit
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut reconstructed = initial_data;
+    reconstructed.splice(start..start + delete_count, replacement);
+
+    let current_full = client.send_request(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    let current_data = current_full["result"]["data"]
+        .as_array()
+        .expect("current full data")
+        .clone();
+    assert!(
+        current_data
+            .chunks_exact(5)
+            .any(|token| token == json!([1, 2, 7, 17, 8]).as_array().unwrap()),
+        "the changed full result must contain the updated rebased virtual-server token: {current_full:?}"
+    );
+    assert_eq!(
+        reconstructed, current_data,
+        "applying the delta must reproduce the same host/virt/native token set as full"
+    );
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_semantic_tokens_full_delta_clears_a_removed_virtual_overlay() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir
+        .path()
+        .join("semantic_tokens_virt_only_delta.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[languages.markdown.layers.aggregation."textDocument/semanticTokens/full"]
+priorities = ["virt"]
+"#,
+    )
+    .expect("write config");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-virt-semantic-full": {
+                        "cmd": [mock_bin(), "semantic-tokens-full-virt"],
+                        "languages": ["lua"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    let uri = "file:///test_semantic_tokens_removed_virtual_overlay.md";
+    open_inline_value_document(&mut client, uri, 1, "```lua\ncode\n```\n");
+
+    let initial = (0..300)
+        .find_map(|_| {
+            let response = client.send_request(
+                "textDocument/semanticTokens/full",
+                json!({ "textDocument": { "uri": uri } }),
+            );
+            let result = response.get("result")?;
+            (result.get("resultId").and_then(Value::as_str).is_some()
+                && result
+                    .get("data")
+                    .and_then(Value::as_array)
+                    .is_some_and(|data| !data.is_empty()))
+            .then(|| result.clone())
+            .or_else(|| {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                None
+            })
+        })
+        .expect("virtual overlay should establish a non-empty wire baseline");
+    let previous_result_id = initial["resultId"].as_str().expect("resultId");
+    let mut reconstructed = initial["data"].as_array().expect("token data").clone();
+
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": uri, "version": 2 },
+            "contentChanges": [{ "text": "plain text\n" }]
+        }),
+    );
+    let delta = (0..300)
+        .find_map(|_| {
+            let response = client.send_request(
+                "textDocument/semanticTokens/full/delta",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "previousResultId": previous_result_id
+                }),
+            );
+            response
+                .pointer("/result/edits")
+                .and_then(Value::as_array)
+                .map(|edits| (response.clone(), edits.clone()))
+                .or_else(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    None
+                })
+        })
+        .expect("removed virtual overlay should produce a clearing delta");
+    for edit in &delta.1 {
+        let start = edit["start"].as_u64().expect("edit start") as usize;
+        let delete_count = edit["deleteCount"].as_u64().expect("delete count") as usize;
+        let replacement = edit
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        reconstructed.splice(start..start + delete_count, replacement);
+    }
+    assert!(
+        reconstructed.is_empty(),
+        "the stale virtual tokens must clear"
+    );
+    assert!(
+        delta
+            .0
+            .pointer("/result/resultId")
+            .and_then(Value::as_str)
+            .is_some(),
+        "the empty overlay must establish its next baseline"
+    );
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_semantic_tokens_full_delta_rejects_stale_commits() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir
+        .path()
+        .join("semantic_tokens_full_delta_stale.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[languages.markdown.layers.aggregation."textDocument/semanticTokens/full"]
+priorities = ["virt", "native"]
+"#,
+    )
+    .expect("write config");
+    let barrier_dir = tempfile::TempDir::new().expect("barrier dir");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        .env(
+            "KAKEHASHI_E2E_SEMANTIC_DELTA_COMMIT_BARRIER_DIR",
+            barrier_dir.path().to_string_lossy(),
+        )
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-virt-semantic-full": {
+                        "cmd": [mock_bin(), "semantic-tokens-full-changing"],
+                        "languages": ["lua"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    let uri = "file:///test_semantic_tokens_full_delta_stale.md";
+    open_inline_value_document(&mut client, uri, 1, "> ```lua\n> old!\n> ```\n");
+
+    let previous_result_id = (0..300)
+        .find_map(|_| {
+            let response = client.send_request(
+                "textDocument/semanticTokens/full",
+                json!({ "textDocument": { "uri": uri } }),
+            );
+            response
+                .pointer("/result/resultId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    None
+                })
+        })
+        .expect("bridged full result should establish a wire baseline");
+    let delta_id = client.send_request_async(
+        "textDocument/semanticTokens/full/delta",
+        json!({
+            "textDocument": { "uri": uri },
+            "previousResultId": previous_result_id
+        }),
+    );
+    let captured = barrier_dir.path().join("captured");
+    assert!(
+        (0..60).any(|_| {
+            if captured.exists() {
+                true
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                false
+            }
+        }),
+        "the delta response should reach its final lifecycle fence"
+    );
+
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": uri, "version": 2 },
+            "contentChanges": [{ "text": "> ```lua\n> changed\n> ```\n" }]
+        }),
+    );
+    let ingress_barrier = client.send_request(
+        "textDocument/hover",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 1, "character": 2 }
+        }),
+    );
+    assert!(
+        ingress_barrier.get("error").is_none(),
+        "{ingress_barrier:?}"
+    );
+    std::fs::write(barrier_dir.path().join("release"), b"release")
+        .expect("release delta commit barrier");
+
+    let response = client.receive_response_for_id_public(delta_id);
+    assert_eq!(
+        response["result"],
+        Value::Null,
+        "a delta computed before didChange must not commit afterwards: {response:?}"
+    );
+
     shutdown(&mut client);
 }
 
