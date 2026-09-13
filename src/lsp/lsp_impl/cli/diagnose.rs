@@ -96,6 +96,11 @@ impl Kakehashi {
             ));
         }
 
+        // Push-only servers publish asynchronously after didOpen. LSP has no
+        // push-completion signal, so give diagnostic-cache activity a bounded
+        // quiet period before taking the one-shot pull snapshot.
+        self.settle_push_diagnostics(&url, ready_timeout).await;
+
         // Counts requests that fail AFTER the server came up (crash, error
         // response, per-step timeout) — the ready-wait above cannot see those,
         // and the diagnostic fan-in collapses them into empty results, so

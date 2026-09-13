@@ -14,7 +14,12 @@ use std::time::Duration;
 use tower_lsp_server::ls_types::{InitializeParams, InitializedParams, WorkspaceFolder};
 use url::Url;
 
+use crate::config::settings::LayerSource;
 use crate::language::InjectionResolver;
+use crate::lsp::aggregation::server::priority::entry_names;
+use crate::lsp::aggregation::server::{expand_priorities, truncate_entries};
+
+use super::super::bridge_context::resolve_aggregation_config_from_settings;
 
 use super::super::{Kakehashi, url_to_uri};
 
@@ -150,6 +155,144 @@ impl Kakehashi {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         true
+    }
+
+    /// Give push-driven diagnostic servers a bounded chance to settle after
+    /// their eager `didOpen` notifications.
+    ///
+    /// LSP advertises pull diagnostics but has no corresponding capability for
+    /// push diagnostics. A Ready server without `textDocument/diagnostic` may
+    /// publish diagnostics, may publish only when there is something to report,
+    /// or may never publish at all. Consequently, absence of a cache slot is
+    /// not an operational error and cannot be used as a completion signal.
+    ///
+    /// Instead, when the selected diagnostic fan-out contains at least one
+    /// non-pull server whose `pushFallback` is enabled, wait until the host's
+    /// diagnostic-cache revision has stayed unchanged for one configured
+    /// diagnostic debounce interval, capped by `timeout`. Any cache mutation
+    /// restarts the quiet window. The subsequent ordinary diagnostic pull then
+    /// consumes whatever push fallback data actually arrived.
+    pub(crate) async fn settle_push_diagnostics(&self, uri: &Url, timeout: Duration) {
+        const METHOD: &str = "textDocument/diagnostic";
+
+        let Some(language_name) = self.document_language(uri) else {
+            return;
+        };
+        let settings = self.settings_manager.load_settings();
+        let layer_cfg = self.resolve_layer_config(&language_name, METHOD);
+        let mut candidate_names: HashSet<String> = HashSet::new();
+
+        // Virt sources: mirror the pull path's cross-layer gate and its exact
+        // per-language priorities/maxFanOut selection. Servers excluded from
+        // the eventual diagnostic fan-out must not make the CLI wait.
+        if layer_cfg.allows(LayerSource::Virt)
+            && let Some(injection_query) = self.language.injection_query(&language_name)
+            && let Some(snapshot) = self.documents.get(uri).and_then(|doc| doc.snapshot())
+        {
+            let regions = InjectionResolver::resolve_all(
+                &self.language,
+                self.bridge.node_tracker(),
+                uri,
+                snapshot.tree(),
+                snapshot.text(),
+                injection_query.as_ref(),
+                snapshot.incarnation(),
+            );
+            for resolved in regions {
+                let agg = resolve_aggregation_config_from_settings(
+                    &settings,
+                    &language_name,
+                    &resolved.injection_language,
+                    METHOD,
+                );
+                if !agg.push_fallback {
+                    continue;
+                }
+                let configs = self.bridge_configs_for_injection_language(
+                    &language_name,
+                    &resolved.injection_language,
+                );
+                let selected = truncate_entries(
+                    expand_priorities(&agg.priorities, &configs),
+                    agg.max_fan_out,
+                );
+                candidate_names.extend(entry_names(&selected));
+            }
+        }
+
+        // Host source: the same cross-layer gate plus the host aggregation's
+        // priorities/maxFanOut selection. `_self` opt-in is enforced by
+        // resolve_host_bridge_context.
+        if layer_cfg.allows(LayerSource::Host)
+            && let Ok(lsp_uri) = url_to_uri(uri)
+            && let Some(ctx) = self.resolve_host_bridge_context(&lsp_uri, METHOD)
+        {
+            let host_push_fallback = settings
+                .resolve_host_language_settings(&language_name)
+                .map(|language| language.resolve_host_aggregation(METHOD).push_fallback)
+                .unwrap_or(false);
+            if host_push_fallback {
+                let selected = truncate_entries(
+                    expand_priorities(&ctx.priorities, &ctx.configs),
+                    ctx.max_fan_out,
+                );
+                candidate_names.extend(entry_names(&selected));
+            }
+        }
+
+        if candidate_names.is_empty() {
+            return;
+        }
+
+        // There is no push capability bit. Match the normal pushFallback
+        // classification: once Ready, a server known not to support pull
+        // diagnostics is a possible push contributor. Servers that failed the
+        // preceding ready wait are absent here and are reported by that wait.
+        let candidates: HashSet<&str> = candidate_names.iter().map(String::as_str).collect();
+        if self
+            .bridge
+            .pool()
+            .servers_known_incapable(&candidates, METHOD)
+            .await
+            .is_empty()
+        {
+            return;
+        }
+
+        let settle = Duration::from_millis(settings.diagnostics_debounce_ms).min(timeout);
+        if settle.is_zero() {
+            return;
+        }
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        let (_, mut observed_revision) = self.diagnostics.snapshot_with_revision(uri);
+        let mut quiet_since = tokio::time::Instant::now();
+
+        loop {
+            let now = tokio::time::Instant::now();
+            if now.duration_since(quiet_since) >= settle || now >= deadline {
+                return;
+            }
+
+            // Poll the revision rather than cache slots: push entries may be
+            // folded into PullLayer or compacted while preserving their final
+            // diagnostics, so slot shape is deliberately not a synchronization
+            // contract.
+            let remaining_quiet = settle.saturating_sub(now.duration_since(quiet_since));
+            let remaining_total = deadline.saturating_duration_since(now);
+            tokio::time::sleep(
+                remaining_quiet
+                    .min(remaining_total)
+                    .min(Duration::from_millis(10)),
+            )
+            .await;
+
+            let (_, current_revision) = self.diagnostics.snapshot_with_revision(uri);
+            if current_revision != observed_revision {
+                observed_revision = current_revision;
+                quiet_since = tokio::time::Instant::now();
+            }
+        }
     }
 
     /// Wait (up to `timeout` per server) until every downstream server

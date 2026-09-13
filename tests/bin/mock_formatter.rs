@@ -115,6 +115,12 @@
 //!   `didChange`. Used by `tests/e2e/e2e_push_diagnostics.rs` to prove a downstream's
 //!   spontaneous push reaches the editor in host coordinates and that an empty push
 //!   clears it (#427).
+//! - `diagnostics-push-empty` — push-only, but publishes an empty diagnostics list
+//!   on `didOpen`. Used by CLI diagnose tests to prove an explicit clean push is
+//!   folded normally.
+//! - `diagnostics-push-delayed` — push-only, but waits briefly after `didOpen`
+//!   before publishing. Used by CLI diagnose tests to prove the bounded settle
+//!   window captures asynchronous push diagnostics rather than racing them.
 //! - `diagnostics-push-pullcap` — advertises `diagnosticProvider` (pull-driven)
 //!   AND spontaneously pushes one diagnostic on `didOpen`. Used by
 //!   `tests/e2e/e2e_push_diagnostics.rs` to prove `pullFallback = false` still
@@ -508,6 +514,19 @@ fn main() {
                         || mode == "diagnostics-push-crash"
                         || mode == "diagnostics-push-pullcap"
                     {
+                        notify(
+                            &mut writer,
+                            "textDocument/publishDiagnostics",
+                            push_diagnostics(uri, true),
+                        );
+                    } else if mode == "diagnostics-push-empty" {
+                        notify(
+                            &mut writer,
+                            "textDocument/publishDiagnostics",
+                            push_diagnostics(uri, false),
+                        );
+                    } else if mode == "diagnostics-push-delayed" {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
                         notify(
                             &mut writer,
                             "textDocument/publishDiagnostics",
