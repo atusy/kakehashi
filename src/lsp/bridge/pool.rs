@@ -5399,6 +5399,7 @@ mod tests {
                 "region-0",
                 RegionOffset::new(3, 0),
                 "print('hello')",
+                &[],
                 Some(UpstreamId::Number(1)), // upstream_request_id
             )
             .await;
@@ -5485,6 +5486,7 @@ mod tests {
                 "region-0",
                 RegionOffset::new(3, 0),
                 "print('hello')",
+                &[],
                 Some(UpstreamId::Number(2)), // upstream_request_id
             )
             .await;
@@ -7258,6 +7260,7 @@ mod tests {
                 "region-0",
                 RegionOffset::new(3, 0),
                 "print('hello')",
+                &[],
                 Some(UpstreamId::Number(1)), // upstream_request_id
             )
             .await;

@@ -241,6 +241,7 @@ mod tests {
             injection_language: "rust".to_string(),
             virtual_content: "x".to_string(),
             line_column_offsets: vec![3],
+            protected_host_ranges: Vec::new(),
             contiguous: true,
         };
 
