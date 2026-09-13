@@ -52,7 +52,8 @@ use crate::lsp::aggregation::server::{
 };
 use crate::lsp::bridge::{
     ClientProgressAggregator, ClientProgressDeregisterGuard, RegionOffset, ResolvedServerConfig,
-    UpstreamId, VirtualDocumentUri, translate_virtual_range_to_host,
+    UpstreamId, VirtualDocumentUri, range_intersects_protected, text_edit_safe_in_region,
+    translate_virtual_range_to_host,
 };
 use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
 use crate::lsp::lsp_impl::text_document::{
@@ -306,10 +307,11 @@ impl Kakehashi {
 
         let mut seen_edit_ranges = std::collections::HashSet::new();
         for resolved in all_regions.iter() {
-            // Non-contiguous combined injections contain masked host-only gaps.
-            // A formatter returns a contiguous whole-document replacement, which
-            // would replace those real host gaps as well and corrupt the document.
-            if !resolved.contiguous {
+            // Ordinary non-contiguous combined injections remain fail-closed.
+            // A protected-gap document may format through the concatenated
+            // pipeline because its final virtual text is projected back as
+            // individual edits that cannot cross immutable host spans.
+            if !resolved.contiguous && resolved.protected_host_ranges.is_empty() {
                 continue;
             }
             let configs = self
@@ -324,6 +326,9 @@ impl Kakehashi {
             );
             let pipeline =
                 plan_region_format(agg.strategy, &agg.priorities, &configs, agg.max_fan_out);
+            if !resolved.contiguous && !matches!(pipeline, RegionFormatPlan::Concatenated(_)) {
+                continue;
+            }
             match &pipeline {
                 RegionFormatPlan::Skip => {
                     log::warn!(
@@ -1044,7 +1049,7 @@ async fn dispatch_concatenated_formatting(
     // server would spam the log for a single formatting request.
     let budget_exhaustion_warned = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    let pipeline_fut = run_sequential_format_pipeline(original_virtual, &server_names, {
+    let pipeline_fut = run_sequential_format_pipeline(original_virtual.clone(), &server_names, {
         let pool = Arc::clone(&pool);
         let open_scratch = Arc::clone(&open_scratch);
         move |server_name, current_text| {
@@ -1381,6 +1386,14 @@ async fn dispatch_concatenated_formatting(
     }
 
     let final_text = final_text?;
+    if !region_ctx.resolved.protected_host_ranges.is_empty() {
+        return project_protected_formatting_edits(
+            &original_virtual,
+            &final_text,
+            &offset,
+            &region_ctx.resolved.protected_host_ranges,
+        );
+    }
     // Decision point 4: the virtual output starts at column 0 of the embedded
     // language, so every continuation line must re-gain its host prefix before
     // the whole-region replacement is emitted.
@@ -1389,6 +1402,97 @@ async fn dispatch_concatenated_formatting(
         range: replacement_range,
         new_text: final_text,
     }])
+}
+
+/// Project a formatter's final virtual text onto the editable host spans of a
+/// protected combined injection. Changes wholly inside protected host syntax
+/// are synthetic and disappear. A change that crosses a protected boundary is
+/// fail-closed unless both sides are whitespace-only formatter cleanup.
+fn project_protected_formatting_edits(
+    original: &str,
+    formatted: &str,
+    offset: &RegionOffset,
+    protected: &[Range],
+) -> Option<Vec<TextEdit>> {
+    use similar::{ChangeTag, TextDiff};
+
+    if original == formatted {
+        return None;
+    }
+
+    let diff = TextDiff::from_chars(original, formatted);
+    let mapper = crate::text::PositionMapper::new(original);
+    let region_end = crate::lsp::bridge::region_host_end(original, offset);
+    let mut edits = Vec::new();
+    let mut current: Option<(usize, usize, String)> = None;
+    let mut old_byte = 0usize;
+
+    let flush = |current: &mut Option<(usize, usize, String)>, edits: &mut Vec<TextEdit>| {
+        let Some((start, end, new_text)) = current.take() else {
+            return Some(());
+        };
+        let old_text = &original[start..end];
+        // Formatter removal/normalization of structural whitespace at the
+        // virtual document edges belongs to the host layout, not embedded code.
+        if (start == 0 || end == original.len())
+            && old_text.chars().all(char::is_whitespace)
+            && new_text.chars().all(char::is_whitespace)
+        {
+            return Some(());
+        }
+        let mut range = Range {
+            start: mapper.byte_to_position(start)?,
+            end: mapper.byte_to_position(end)?,
+        };
+        translate_virtual_range_to_host(&mut range, offset);
+
+        let contains = protected.iter().any(|gap| {
+            let start = (range.start.line, range.start.character);
+            let end = (range.end.line, range.end.character);
+            let gap_start = (gap.start.line, gap.start.character);
+            let gap_end = (gap.end.line, gap.end.character);
+            gap_start <= start && end <= gap_end && start < end
+        });
+        if contains {
+            return Some(());
+        }
+        if range_intersects_protected(&range, protected) {
+            if old_text.chars().all(char::is_whitespace)
+                && new_text.chars().all(char::is_whitespace)
+            {
+                return Some(());
+            }
+            return None;
+        }
+
+        let edit = TextEdit { range, new_text };
+        if !text_edit_safe_in_region(&edit, offset, region_end) {
+            return None;
+        }
+        edits.push(edit);
+        Some(())
+    };
+
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Equal => {
+                flush(&mut current, &mut edits)?;
+                old_byte += change.value().len();
+            }
+            ChangeTag::Delete => {
+                let edit = current.get_or_insert_with(|| (old_byte, old_byte, String::new()));
+                old_byte += change.value().len();
+                edit.1 = old_byte;
+            }
+            ChangeTag::Insert => {
+                let edit = current.get_or_insert_with(|| (old_byte, old_byte, String::new()));
+                edit.2.push_str(change.value());
+            }
+        }
+    }
+    flush(&mut current, &mut edits)?;
+
+    (!edits.is_empty()).then_some(edits)
 }
 
 /// A scratch virtual document opened during a concatenated-formatting run that
@@ -1968,6 +2072,7 @@ mod tests {
             injection_language: language.to_string(),
             virtual_content: String::new(),
             line_column_offsets: vec![0],
+            protected_host_ranges: Vec::new(),
             contiguous: true,
         }
     }
@@ -2858,5 +2963,58 @@ mod tests {
         // with the surrounding pre-existing tests, this guards the intent
         // of the fix.
         baseline_token.cancel();
+    }
+
+    #[test]
+    fn protected_formatting_keeps_edits_outside_gap() {
+        let offset = RegionOffset::new(0, 0);
+        let gap = Range {
+            start: Position::new(0, 3),
+            end: Position::new(0, 4),
+        };
+        let edits = project_protected_formatting_edits("aa 0 bb", "AA 0 BB", &offset, &[gap])
+            .expect("outside changes should survive");
+        assert_eq!(edits.len(), 2);
+        assert!(
+            edits
+                .iter()
+                .all(|edit| !crate::lsp::bridge::range_intersects_protected(&edit.range, &[gap]))
+        );
+    }
+
+    #[test]
+    fn protected_formatting_drops_synthetic_changes_inside_gap() {
+        let offset = RegionOffset::new(0, 0);
+        let gap = Range {
+            start: Position::new(0, 3),
+            end: Position::new(0, 6),
+        };
+        assert!(
+            project_protected_formatting_edits("aa 000 bb", "aa 0 bb", &offset, &[gap]).is_none()
+        );
+    }
+
+    #[test]
+    fn protected_formatting_rejects_non_whitespace_boundary_crossing() {
+        let offset = RegionOffset::new(0, 0);
+        let gap = Range {
+            start: Position::new(0, 3),
+            end: Position::new(0, 4),
+        };
+        assert!(project_protected_formatting_edits("aaX0 bb", "aaY bb", &offset, &[gap]).is_none());
+    }
+
+    #[test]
+    fn protected_formatting_allows_insertion_at_gap_boundary() {
+        let offset = RegionOffset::new(0, 0);
+        let gap = Range {
+            start: Position::new(0, 2),
+            end: Position::new(0, 3),
+        };
+        let edits = project_protected_formatting_edits("aa0bb", "aa 0bb", &offset, &[gap])
+            .expect("boundary insertion is outside the half-open gap");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].range.start, Position::new(0, 2));
+        assert_eq!(edits[0].range.end, Position::new(0, 2));
     }
 }

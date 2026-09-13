@@ -12,8 +12,8 @@
 use std::collections::HashMap;
 
 use tower_lsp_server::ls_types::{
-    AnnotatedTextEdit, DocumentChangeOperation, DocumentChanges, OneOf, Position, ResourceOp,
-    TextDocumentEdit, TextEdit, Uri, WorkspaceEdit,
+    AnnotatedTextEdit, DocumentChangeOperation, DocumentChanges, OneOf, Position, Range,
+    ResourceOp, TextDocumentEdit, TextEdit, Uri, WorkspaceEdit,
 };
 
 use super::translation::{RegionOffset, translate_virtual_range_to_host};
@@ -328,6 +328,25 @@ pub(crate) fn text_edit_within_region(
     in_region(e.range.start) && in_region(e.range.end)
 }
 
+/// Whether a host-coordinate edit range intersects immutable host syntax.
+///
+/// Protected ranges are half-open. A zero-width insertion exactly at either
+/// boundary is therefore safe; an insertion strictly inside the range is not.
+pub(crate) fn range_intersects_protected(range: &Range, protected: &[Range]) -> bool {
+    let point = range.start == range.end;
+    protected.iter().any(|gap| {
+        let start = (range.start.line, range.start.character);
+        let end = (range.end.line, range.end.character);
+        let gap_start = (gap.start.line, gap.start.character);
+        let gap_end = (gap.end.line, gap.end.character);
+        if point {
+            gap_start < start && start < gap_end
+        } else {
+            start < gap_end && gap_start < end
+        }
+    })
+}
+
 /// Combined per-edit safety check for response transforms: an
 /// already-host-translated edit is safe iff it stays inside the region AND
 /// preserves its structure (per-line prefixes and the newline separating
@@ -545,6 +564,33 @@ fn position_after(a: Position, b: Position) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn protected_ranges_are_half_open_for_insertions() {
+        let p = |line, character| Position { line, character };
+        let gap = Range {
+            start: p(3, 5),
+            end: p(3, 11),
+        };
+        let insertion = |at| Range { start: at, end: at };
+        assert!(!range_intersects_protected(&insertion(p(3, 5)), &[gap]));
+        assert!(range_intersects_protected(&insertion(p(3, 7)), &[gap]));
+        assert!(!range_intersects_protected(&insertion(p(3, 11)), &[gap]));
+        assert!(range_intersects_protected(
+            &Range {
+                start: p(3, 4),
+                end: p(3, 6)
+            },
+            &[gap],
+        ));
+        assert!(!range_intersects_protected(
+            &Range {
+                start: p(3, 11),
+                end: p(3, 12)
+            },
+            &[gap],
+        ));
+    }
 
     fn make_host_uri() -> Uri {
         crate::lsp::lsp_impl::url_to_uri(&url::Url::parse("file:///test.md").unwrap()).unwrap()

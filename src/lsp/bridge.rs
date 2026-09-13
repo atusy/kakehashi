@@ -81,8 +81,10 @@ pub(crate) use protocol::VirtualDocumentUri;
 pub(crate) use protocol::decode_command;
 pub(crate) use protocol::host_position_within_region_bounds;
 pub(crate) use protocol::location_link_to_location;
+pub(crate) use protocol::range_intersects_protected;
 pub(crate) use protocol::region_host_end;
 pub(crate) use protocol::strip_bridge_local_versions;
+pub(crate) use protocol::text_edit_safe_in_region;
 pub(crate) use protocol::transform_workspace_edit_to_host;
 pub(crate) use protocol::translate_virtual_range_to_host;
 pub(crate) use protocol::workspace_edit_has_effect;
@@ -190,6 +192,7 @@ mod tests {
                 "region-0",
                 RegionOffset::new(3, 0),
                 virtual_content,
+                &[],
                 Some(UpstreamId::Number(1)), // upstream_request_id
             )
             .await;
