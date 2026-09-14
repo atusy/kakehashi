@@ -185,6 +185,23 @@ pub(crate) struct ConnectionHandle {
 }
 
 impl ConnectionHandle {
+    /// Stop the writer while preserving a Ready handle for send-failure tests.
+    #[cfg(test)]
+    pub(crate) async fn cancel_writer_for_test(&self) {
+        if let Some(handle) = self
+            .writer_handle
+            .lock()
+            .recover_poison("ConnectionHandle::cancel_writer_for_test")
+            .as_ref()
+        {
+            handle.cancel();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(1), self.tx.closed())
+            .await
+            .expect("writer receiver should close after cancellation");
+        self.set_state(ConnectionState::Ready);
+    }
+
     /// Create a new ConnectionHandle in Ready state (test helper).
     ///
     /// Used in tests where we need a connection handle without going through
@@ -950,17 +967,18 @@ impl ConnectionHandle {
         }
     }
 
-    /// Begin graceful shutdown: transition to Closing (rejecting new requests) and
-    /// stop the liveness timer, since global shutdown (Tier 3) overrides liveness
-    /// (Tier 2) per ls-bridge-timeout-hierarchy. Only the timer is stopped — the reader task keeps
-    /// running to receive the shutdown response. Valid from Ready or Initializing
-    /// (ls-bridge-message-ordering/ls-bridge-graceful-shutdown).
+    /// Begin graceful shutdown: transition a live connection to Closing
+    /// (rejecting new requests) and stop the liveness timer. A Failed connection
+    /// stays Failed until shutdown completes so a still-mapped invalidated entry
+    /// remains retryable while detached teardown runs.
     pub(crate) fn begin_shutdown(&self) {
         // Stop the liveness timer (but not the reader task) per ls-bridge-timeout-hierarchy
         // Global shutdown (Tier 3) overrides liveness timeout (Tier 2)
         // Reader continues running to receive shutdown response
         self.reader_handle.stop_liveness_timer();
-        self.set_state(ConnectionState::Closing);
+        if self.state() != ConnectionState::Failed {
+            self.set_state(ConnectionState::Closing);
+        }
     }
 
     /// Complete the shutdown sequence.
