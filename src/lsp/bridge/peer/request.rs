@@ -231,7 +231,8 @@ pub(in crate::lsp::bridge) async fn handle(
                     if outcome != super::super::pool::NotificationSendResult::Queued {
                         log::warn!(
                             target: "kakehashi::bridge::peer",
-                            "Could not queue peer cancellation for request {}: {:?}",
+                            "{}: could not queue peer cancellation for request {}: {:?}",
+                            peer.key(),
                             downstream_id.as_i64(),
                             outcome
                         );
