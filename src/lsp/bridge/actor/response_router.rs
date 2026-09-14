@@ -224,7 +224,7 @@ impl ResponseRouter {
         let mut state = self
             .state
             .lock()
-            .recover_poison("ResponseRouter::register_with_upstream");
+            .recover_poison("ResponseRouter::register_with_upstream_liveness_mode");
 
         if !state.accepting {
             return Err(RegisterError::Closed);
