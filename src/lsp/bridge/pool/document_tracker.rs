@@ -8,9 +8,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use tokio::sync::Mutex;
 
 use crate::error::LockResultExt;
@@ -20,37 +20,90 @@ use url::Url;
 use super::ConnectionKey;
 use crate::lsp::bridge::protocol::VirtualDocumentUri;
 
-struct VirtualUriObserverState {
-    connection_key: ConnectionKey,
-    generation: u64,
-    uris: Arc<std::sync::Mutex<HashSet<String>>>,
+#[derive(Default)]
+struct VirtualUriProvenance {
+    issued: DashSet<String>,
+    scratch: DashSet<String>,
+    queued: DashSet<String>,
+    reservations: DashSet<String>,
+    admitted: AtomicUsize,
+}
+
+/// Retire a healthy producer before exact URI provenance can grow with an
+/// editor session forever. Replacement purges both this history and the
+/// downstream process index that could still return its closed documents.
+pub(super) const MAX_VIRTUAL_URI_PROVENANCE_PER_GENERATION: usize = 65_536;
+
+impl VirtualUriProvenance {
+    fn contains(&self, uri: &str) -> bool {
+        self.issued.contains(uri) || self.scratch.contains(uri) || self.queued.contains(uri)
+    }
+
+    fn insert_issued(&self, uri: String) {
+        if VirtualDocumentUri::canonical_uri_for_scratch(&uri).is_some() {
+            self.scratch.insert(uri);
+        } else {
+            self.issued.insert(uri);
+        }
+    }
+
+    fn reserve(&self, uri: &str) -> bool {
+        if self.issued.contains(uri) || self.scratch.contains(uri) {
+            return true;
+        }
+        if self.reservations.insert(uri.to_string()) {
+            let previous = self.admitted.fetch_add(1, Ordering::AcqRel);
+            if previous >= MAX_VIRTUAL_URI_PROVENANCE_PER_GENERATION {
+                self.admitted.fetch_sub(1, Ordering::AcqRel);
+                self.reservations.remove(uri);
+                return false;
+            }
+        }
+        true
+    }
+
+    fn release_reservation(&self, uri: &str) {
+        if self.reservations.remove(uri).is_some() {
+            self.admitted.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    fn confirm(&self, uri: String) {
+        self.insert_issued(uri.clone());
+        self.reservations.remove(&uri);
+    }
+
+    #[cfg(test)]
+    fn remove_issued(&self, uri: &str) {
+        if self.issued.remove(uri).is_some() {
+            self.admitted.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
 }
 
 pub(crate) struct VirtualUriObserver {
-    id: u64,
-    observers: Arc<DashMap<u64, VirtualUriObserverState>>,
-    uris: Arc<std::sync::Mutex<HashSet<String>>>,
+    provenance: Arc<VirtualUriProvenance>,
+    explicit_uris: std::sync::Mutex<HashSet<String>>,
 }
 
 impl VirtualUriObserver {
     pub(crate) fn insert(&self, uri: String) {
-        self.uris
+        self.explicit_uris
             .lock()
-            .recover_poison("VirtualUriObserver::uris")
+            .recover_poison("VirtualUriObserver::explicit_uris")
             .insert(uri);
     }
 
-    pub(crate) fn snapshot(&self) -> HashSet<String> {
-        self.uris
+    pub(crate) fn contains(&self, uri: &str) -> bool {
+        if self
+            .explicit_uris
             .lock()
-            .recover_poison("VirtualUriObserver::uris")
-            .clone()
-    }
-}
-
-impl Drop for VirtualUriObserver {
-    fn drop(&mut self) {
-        self.observers.remove(&self.id);
+            .recover_poison("VirtualUriObserver::explicit_uris")
+            .contains(uri)
+        {
+            return true;
+        }
+        self.provenance.contains(uri)
     }
 }
 
@@ -137,10 +190,13 @@ pub(crate) struct DocumentTracker {
     /// Enables O(1) lookup in `get_all_connections_for_virtual_uri()`, replacing the
     /// previous O(N×M) scan over `host_to_virtual`.
     virtual_to_servers: DashMap<String, Vec<ConnectionKey>>,
-    /// Active request-scoped observers of virtual URIs issued by a connection.
-    /// Closed URI provenance lives only until the observing request completes.
-    virtual_uri_observers: Arc<DashMap<u64, VirtualUriObserverState>>,
-    next_virtual_uri_observer_id: AtomicU64,
+    /// Every virtual URI whose didOpen reached a connection generation.
+    /// Downstream indexes may return a URI after didClose, so provenance must
+    /// survive until the producing process is purged.
+    /// Exact canonical, scratch, and queued URI provenance for each producer
+    /// generation. The Arc lets in-flight requests retain an immutable-generation
+    /// lease after the registry entry is purged during producer replacement.
+    virtual_uri_provenance: DashMap<(ConnectionKey, u64), Arc<VirtualUriProvenance>>,
     /// Pre-send claims keyed by exact connection. Waiters park until the owner
     /// promotes the claim after enqueue or finishes rollback.
     open_claims: DashMap<(ConnectionKey, String), Arc<tokio::sync::Notify>>,
@@ -160,8 +216,7 @@ impl DocumentTracker {
             host_to_virtual: Mutex::new(HashMap::new()),
             opened_documents: DashMap::new(),
             virtual_to_servers: DashMap::new(),
-            virtual_uri_observers: Arc::new(DashMap::new()),
-            next_virtual_uri_observer_id: AtomicU64::new(0),
+            virtual_uri_provenance: DashMap::new(),
             open_claims: DashMap::new(),
             connection_generations: DashMap::new(),
         }
@@ -171,6 +226,50 @@ impl DocumentTracker {
         self.connection_generations
             .get(connection_key)
             .map_or(0, |generation| *generation)
+    }
+
+    fn provenance_for_generation(
+        &self,
+        connection_key: &ConnectionKey,
+        generation: u64,
+    ) -> Arc<VirtualUriProvenance> {
+        self.virtual_uri_provenance
+            .entry((connection_key.clone(), generation))
+            .or_default()
+            .clone()
+    }
+
+    pub(super) fn virtual_uri_provenance_limit_reached(
+        &self,
+        connection_key: &ConnectionKey,
+    ) -> bool {
+        let generation = self.connection_generation(connection_key);
+        self.virtual_uri_provenance
+            .get(&(connection_key.clone(), generation))
+            .is_some_and(|state| {
+                state.admitted.load(Ordering::Acquire) >= MAX_VIRTUAL_URI_PROVENANCE_PER_GENERATION
+            })
+    }
+
+    #[cfg(test)]
+    pub(super) fn saturate_virtual_uri_provenance(&self, connection_key: &ConnectionKey) {
+        let generation = self.connection_generation(connection_key);
+        let provenance = self.provenance_for_generation(connection_key, generation);
+        for index in 0..MAX_VIRTUAL_URI_PROVENANCE_PER_GENERATION {
+            provenance
+                .issued
+                .insert(format!("file:///virtual-{index}.lua"));
+        }
+        provenance
+            .admitted
+            .store(MAX_VIRTUAL_URI_PROVENANCE_PER_GENERATION, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(super) async fn lock_document_versions_for_test(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, HashMap<ConnectionKey, HashMap<String, i32>>> {
+        self.document_versions.lock().await
     }
 
     /// Check if a virtual document is opened on a downstream server.
@@ -186,7 +285,8 @@ impl DocumentTracker {
     /// Atomically claim a virtual document URI for opening.
     ///
     /// Returns `true` if this caller won the claim (URI was newly inserted).
-    /// Returns `false` if another caller already claimed it.
+    /// Returns `false` if another caller already claimed it or the connection
+    /// generation must be recycled before accepting another distinct URI.
     ///
     /// Initializes the document version and a waiter-visible claim, but does not
     /// expose the URI as opened until `mark_open_sent` runs after FIFO enqueue.
@@ -213,6 +313,13 @@ impl DocumentTracker {
             let claim_key = (connection_key.clone(), uri_string.clone());
             if docs.contains_key(&uri_string) || self.open_claims.contains_key(&claim_key) {
                 return false; // Already claimed by another caller
+            }
+            let generation = self.connection_generation(connection_key);
+            if !self
+                .provenance_for_generation(connection_key, generation)
+                .reserve(&uri_string)
+            {
+                return false;
             }
             docs.insert(uri_string.clone(), 1);
             self.open_claims
@@ -260,14 +367,66 @@ impl DocumentTracker {
         connections
     }
 
-    /// Promote a pre-send claim only after didOpen is confirmed enqueued.
-    pub(super) fn mark_open_sent(
+    /// Publish exact provenance immediately after didOpen enters the FIFO.
+    /// This is synchronous so caller cancellation cannot leave a downstream-open
+    /// URI invisible while detached opened-state promotion waits on an async lock.
+    pub(super) fn mark_open_queued(
         &self,
         virtual_uri: &VirtualDocumentUri,
         connection_key: &ConnectionKey,
+        expected_generation: u64,
+        expected_claim: &Arc<tokio::sync::Notify>,
+    ) -> bool {
+        if self.connection_generation(connection_key) != expected_generation {
+            return false;
+        }
+        let uri = virtual_uri.to_uri_string();
+        if !self
+            .open_claims
+            .get(&(connection_key.clone(), uri.clone()))
+            .is_some_and(|claim| Arc::ptr_eq(&claim, expected_claim))
+        {
+            return false;
+        }
+        self.provenance_for_generation(connection_key, expected_generation)
+            .queued
+            .insert(uri);
+        true
+    }
+
+    /// Promote a pre-send claim only after didOpen is confirmed enqueued.
+    pub(super) async fn mark_open_sent(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+        expected_generation: u64,
         expected_claim: &Arc<tokio::sync::Notify>,
     ) -> bool {
         let uri_string = virtual_uri.to_uri_string();
+        if self.connection_generation(connection_key) != expected_generation {
+            return false;
+        }
+        // Serialize reservation removal with provenance insertion using the
+        // same mutex as `try_claim_for_open`, so capacity never has a gap.
+        let versions = self.document_versions.lock().await;
+        if self.connection_generation(connection_key) != expected_generation {
+            return false;
+        }
+        let Some(claim) = self
+            .open_claims
+            .get(&(connection_key.clone(), uri_string.clone()))
+        else {
+            return false;
+        };
+        if !Arc::ptr_eq(&claim, expected_claim) {
+            return false;
+        }
+        let provenance = self.provenance_for_generation(connection_key, expected_generation);
+        // Insert confirmed history before releasing the claim reservation. The
+        // versions lock serializes this transfer with claim admission, while
+        // the ordering also keeps lock-free capacity readers from seeing a gap.
+        provenance.confirm(uri_string.clone());
+        drop(claim);
         let Some((_, notify)) = self
             .open_claims
             .remove_if(&(connection_key.clone(), uri_string.clone()), |_, claim| {
@@ -276,6 +435,7 @@ impl DocumentTracker {
         else {
             return false;
         };
+        provenance.queued.remove(&uri_string);
         let mut servers = self
             .virtual_to_servers
             .entry(uri_string.clone())
@@ -288,16 +448,7 @@ impl DocumentTracker {
         if newly_opened {
             *self.opened_documents.entry(uri_string.clone()).or_insert(0) += 1;
         }
-        let generation = self.connection_generation(connection_key);
-        for observer in self.virtual_uri_observers.iter() {
-            if observer.connection_key == *connection_key && observer.generation == generation {
-                observer
-                    .uris
-                    .lock()
-                    .recover_poison("VirtualUriObserverState::uris")
-                    .insert(uri_string.clone());
-            }
-        }
+        drop(versions);
         notify.notify_waiters();
         true
     }
@@ -321,7 +472,16 @@ impl DocumentTracker {
             .entry((connection_key.clone(), virtual_uri.to_uri_string()))
             .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
             .clone();
-        assert!(self.mark_open_sent(virtual_uri, connection_key, &claim));
+        let generation = self.connection_generation(connection_key);
+        assert!(
+            self.provenance_for_generation(connection_key, generation)
+                .reserve(&virtual_uri.to_uri_string()),
+            "test helper must remain within the provenance bound"
+        );
+        assert!(
+            self.mark_open_sent(virtual_uri, connection_key, generation, &claim)
+                .await
+        );
     }
 
     /// Register close-cleanup ownership without exposing the document to
@@ -575,6 +735,8 @@ impl DocumentTracker {
             .or_insert(0);
         *generation = generation.wrapping_add(1);
         drop(generation);
+        self.virtual_uri_provenance
+            .retain(|(key, _), _| key != connection_key);
         // Take this connection's version map; its keys are the virtual URIs it
         // had open. Done first so the per-URI refcount/reverse-index cleanup
         // below mirrors `untrack_document` exactly, once per opened document.
@@ -677,6 +839,14 @@ impl DocumentTracker {
         else {
             return false;
         };
+        for provenance in self
+            .virtual_uri_provenance
+            .iter()
+            .filter(|entry| &entry.key().0 == connection_key)
+        {
+            provenance.queued.remove(&uri_string);
+            provenance.release_reservation(&uri_string);
+        }
         if let Some(docs) = versions.get_mut(connection_key) {
             docs.remove(&uri_string);
         }
@@ -716,48 +886,25 @@ impl DocumentTracker {
             .unwrap_or_default()
     }
 
-    /// Observe confirmed virtual URIs for an in-flight request.
+    /// View confirmed virtual URIs for one producer generation.
     ///
-    /// Callers that need an enqueue-consistent namespace hold the pool's
-    /// `connections` admission guard across this registration and request
-    /// enqueue. Observer insertion happens only after the single seed await, so
-    /// cancellation cannot strand an entry.
-    pub(super) async fn observe_virtual_uris_for_connection(
+    /// The generation histories are shared instead of cloned per request. They
+    /// retain URIs through didClose and are purged only with the producer, so an
+    /// in-flight response can classify exact provenance without multiplying the
+    /// bounded history by the number of concurrent requests.
+    pub(super) fn observe_virtual_uris_for_connection(
         &self,
         connection_key: &ConnectionKey,
         generation: u64,
     ) -> VirtualUriObserver {
-        let id = self
-            .next_virtual_uri_observer_id
-            .fetch_add(1, Ordering::Relaxed);
-        let uris = Arc::new(std::sync::Mutex::new(HashSet::new()));
-        if self.connection_generation(connection_key) == generation {
-            let versions = self.document_versions.lock().await;
-            if let Some(documents) = versions.get(connection_key) {
-                let issued = documents.keys().filter(|uri| {
-                    !self
-                        .open_claims
-                        .contains_key(&(connection_key.clone(), (*uri).clone()))
-                });
-                uris.lock()
-                    .recover_poison("VirtualUriObserver::seed")
-                    .extend(issued.cloned());
-            }
-        }
-        let observer = VirtualUriObserver {
-            id,
-            observers: Arc::clone(&self.virtual_uri_observers),
-            uris: Arc::clone(&uris),
-        };
-        self.virtual_uri_observers.insert(
-            id,
-            VirtualUriObserverState {
-                connection_key: connection_key.clone(),
-                generation,
-                uris,
+        VirtualUriObserver {
+            provenance: if self.connection_generation(connection_key) == generation {
+                self.provenance_for_generation(connection_key, generation)
+            } else {
+                Arc::new(VirtualUriProvenance::default())
             },
-        );
-        observer
+            explicit_uris: std::sync::Mutex::new(HashSet::new()),
+        }
     }
 
     /// Remove and return all virtual documents for a host URI.
@@ -2196,7 +2343,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn virtual_uri_observer_retains_closed_uri_only_for_request_lifetime() {
+    async fn virtual_uri_observer_retains_uri_closed_during_request() {
         let tracker = DocumentTracker::new();
         let host_uri = Url::parse("file:///project/doc.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", "lua-0");
@@ -2205,15 +2352,233 @@ mod tests {
         tracker
             .register_opened_document(&host_uri, &virtual_uri, &key)
             .await;
-        let observer = tracker
-            .observe_virtual_uris_for_connection(&key, generation)
+        let observer = tracker.observe_virtual_uris_for_connection(&key, generation);
+        tracker.untrack_document(&virtual_uri, &key).await;
+
+        assert!(observer.contains(&virtual_uri.to_uri_string()));
+    }
+
+    #[tokio::test]
+    async fn virtual_uri_observer_seeds_uri_closed_before_request_until_generation_purge() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///project/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", "lua-0");
+        let key = ConnectionKey::for_server("lua");
+        let generation = tracker.connection_generation(&key);
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, &key)
             .await;
         tracker.untrack_document(&virtual_uri, &key).await;
 
-        assert!(observer.snapshot().contains(&virtual_uri.to_uri_string()));
+        let observer = tracker.observe_virtual_uris_for_connection(&key, generation);
+        assert!(observer.contains(&virtual_uri.to_uri_string()));
+        tracker.purge_connection(&key).await;
+        assert!(
+            observer.contains(&virtual_uri.to_uri_string()),
+            "an in-flight generation lease survives registry purge"
+        );
+        let observer = tracker.observe_virtual_uris_for_connection(&key, generation);
+        assert!(!observer.contains(&virtual_uri.to_uri_string()));
+    }
+
+    #[tokio::test]
+    async fn scratch_uri_history_retains_exact_provenance() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///project/doc.md").unwrap();
+        let key = ConnectionKey::for_server("formatter");
+        let generation = tracker.connection_generation(&key);
+        let before = VirtualDocumentUri::new(
+            &url_to_uri(&host_uri),
+            "lua",
+            &format!("region{}0-1", VirtualDocumentUri::SCRATCH_ID_MARKER),
+        );
+        tracker
+            .register_opened_document(&host_uri, &before, &key)
+            .await;
+        tracker.untrack_document(&before, &key).await;
+
+        let open = VirtualDocumentUri::new(
+            &url_to_uri(&host_uri),
+            "lua",
+            &format!("region{}0-open", VirtualDocumentUri::SCRATCH_ID_MARKER),
+        );
+        tracker
+            .register_opened_document(&host_uri, &open, &key)
+            .await;
+
+        let observer = tracker.observe_virtual_uris_for_connection(&key, generation);
+        assert!(observer.contains(&before.to_uri_string()));
+        assert!(!observer.contains(
+            &VirtualDocumentUri::canonical_uri_for_scratch(&before.to_uri_string()).unwrap()
+        ));
+        assert!(observer.contains(&open.to_uri_string()));
+
+        let during = VirtualDocumentUri::new(
+            &url_to_uri(&host_uri),
+            "lua",
+            &format!("region{}0-2", VirtualDocumentUri::SCRATCH_ID_MARKER),
+        );
+        tracker
+            .register_opened_document(&host_uri, &during, &key)
+            .await;
+        assert!(observer.contains(&during.to_uri_string()));
+    }
+
+    #[tokio::test]
+    async fn scratch_uri_history_retains_old_exact_aliases_until_generation_purge() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///project/doc.md").unwrap();
+        let key = ConnectionKey::for_server("formatter");
+        let host_lsp_uri = url_to_uri(&host_uri);
+        let mut oldest = None;
+        let mut newest = None;
+
+        for step in 0..=1024 {
+            let uri = VirtualDocumentUri::new(
+                &host_lsp_uri,
+                "lua",
+                &format!("region{}0-{step}", VirtualDocumentUri::SCRATCH_ID_MARKER),
+            );
+            oldest.get_or_insert_with(|| uri.to_uri_string());
+            newest = Some(uri.to_uri_string());
+            tracker
+                .register_opened_document(&host_uri, &uri, &key)
+                .await;
+            tracker.untrack_document(&uri, &key).await;
+        }
+
+        let observer =
+            tracker.observe_virtual_uris_for_connection(&key, tracker.connection_generation(&key));
+        assert!(observer.contains(oldest.as_ref().unwrap()));
+        assert!(observer.contains(newest.as_ref().unwrap()));
+        assert!(!observer.contains(
+            &VirtualDocumentUri::canonical_uri_for_scratch(newest.as_ref().unwrap()).unwrap()
+        ));
 
         drop(observer);
-        assert!(tracker.virtual_uri_observers.is_empty());
+        tracker.purge_connection(&key).await;
+        let observer =
+            tracker.observe_virtual_uris_for_connection(&key, tracker.connection_generation(&key));
+        assert!(!observer.contains(oldest.as_ref().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn virtual_uri_provenance_requests_generation_recycle_at_its_bound() {
+        let tracker = DocumentTracker::new();
+        let key = ConnectionKey::for_server("lua");
+        tracker.saturate_virtual_uri_provenance(&key);
+
+        assert!(tracker.virtual_uri_provenance_limit_reached(&key));
+        tracker.purge_connection(&key).await;
+        assert!(!tracker.virtual_uri_provenance_limit_reached(&key));
+    }
+
+    #[tokio::test]
+    async fn virtual_uri_provenance_reserves_the_last_slot_atomically() {
+        let tracker = Arc::new(DocumentTracker::new());
+        let key = ConnectionKey::for_server("lua");
+        let generation = tracker.connection_generation(&key);
+        tracker.saturate_virtual_uri_provenance(&key);
+        tracker
+            .provenance_for_generation(&key, generation)
+            .remove_issued("file:///virtual-0.lua");
+        let host_uri = url_to_uri(&Url::parse("file:///host.md").unwrap());
+        let first = VirtualDocumentUri::new(&host_uri, "lua", "first");
+        let second = VirtualDocumentUri::new(&host_uri, "lua", "second");
+
+        let (first_won, second_won) = tokio::join!(
+            tracker.try_claim_for_open(&first, &key),
+            tracker.try_claim_for_open(&second, &key),
+        );
+
+        assert_ne!(
+            first_won, second_won,
+            "exactly one claim reserves the last slot"
+        );
+        assert!(tracker.virtual_uri_provenance_limit_reached(&key));
+    }
+
+    #[tokio::test]
+    async fn virtual_uri_provenance_promotion_keeps_the_last_slot_reserved() {
+        let tracker = Arc::new(DocumentTracker::new());
+        let key = ConnectionKey::for_server("lua");
+        let generation = tracker.connection_generation(&key);
+        tracker.saturate_virtual_uri_provenance(&key);
+        tracker
+            .provenance_for_generation(&key, generation)
+            .remove_issued("file:///virtual-0.lua");
+        let host_uri = url_to_uri(&Url::parse("file:///host.md").unwrap());
+        let promoted = VirtualDocumentUri::new(&host_uri, "lua", "promoted");
+        let rejected = VirtualDocumentUri::new(&host_uri, "lua", "rejected");
+        assert!(tracker.try_claim_for_open(&promoted, &key).await);
+        let claim = tracker
+            .open_claim_waiter(&promoted, &key)
+            .expect("last slot is reserved");
+
+        let (promoted, rejected) = tokio::join!(
+            tracker.mark_open_sent(&promoted, &key, generation, &claim),
+            tracker.try_claim_for_open(&rejected, &key),
+        );
+
+        assert!(promoted);
+        assert!(!rejected, "promotion must not expose a temporary free slot");
+        assert!(tracker.virtual_uri_provenance_limit_reached(&key));
+    }
+
+    #[tokio::test]
+    async fn queued_provenance_keeps_the_last_claim_slot_reserved() {
+        let tracker = DocumentTracker::new();
+        let key = ConnectionKey::for_server("lua");
+        let generation = tracker.connection_generation(&key);
+        tracker.saturate_virtual_uri_provenance(&key);
+        tracker
+            .provenance_for_generation(&key, generation)
+            .remove_issued("file:///virtual-0.lua");
+        let host_uri = url_to_uri(&Url::parse("file:///host.md").unwrap());
+        let queued = VirtualDocumentUri::new(&host_uri, "lua", "queued");
+        let rejected = VirtualDocumentUri::new(&host_uri, "lua", "rejected");
+        assert!(tracker.try_claim_for_open(&queued, &key).await);
+        let claim = tracker
+            .open_claim_waiter(&queued, &key)
+            .expect("last slot is reserved");
+
+        assert!(tracker.mark_open_queued(&queued, &key, generation, &claim));
+        assert!(tracker.virtual_uri_provenance_limit_reached(&key));
+        assert!(
+            !tracker.try_claim_for_open(&rejected, &key).await,
+            "queued publication must not release its claim reservation"
+        );
+    }
+
+    #[tokio::test]
+    async fn old_generation_promotion_can_roll_back_a_new_generation_claim() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///host.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", "old");
+        let key = ConnectionKey::for_server("lua");
+        let generation = tracker.connection_generation(&key);
+        tracker.purge_connection(&key).await;
+        assert!(tracker.try_claim_for_open(&virtual_uri, &key).await);
+        tracker
+            .register_pending_document(&host_uri, &virtual_uri, &key)
+            .await;
+        let claim = tracker
+            .open_claim_waiter(&virtual_uri, &key)
+            .expect("claim is pending");
+
+        assert!(
+            !tracker
+                .mark_open_sent(&virtual_uri, &key, generation, &claim)
+                .await
+        );
+        assert!(
+            tracker
+                .rollback_open_claim_if(&host_uri, &virtual_uri, &key, &claim)
+                .await
+        );
+        assert!(!tracker.is_document_opened(&virtual_uri));
+        assert!(tracker.host_virtual_docs(&host_uri).await.is_empty());
+        assert!(tracker.try_claim_for_open(&virtual_uri, &key).await);
     }
 
     #[tokio::test]
@@ -2224,11 +2589,10 @@ mod tests {
         let key = ConnectionKey::for_server("lua");
         assert!(tracker.try_claim_for_open(&virtual_uri, &key).await);
 
-        let observer = tracker
-            .observe_virtual_uris_for_connection(&key, tracker.connection_generation(&key))
-            .await;
+        let observer =
+            tracker.observe_virtual_uris_for_connection(&key, tracker.connection_generation(&key));
 
-        assert!(!observer.snapshot().contains(&virtual_uri.to_uri_string()));
+        assert!(!observer.contains(&virtual_uri.to_uri_string()));
         let claim = tracker
             .open_claim_waiter(&virtual_uri, &key)
             .expect("claim should exist");

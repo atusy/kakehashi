@@ -97,6 +97,9 @@ opt-in to a sequential formatter pipeline driven by `priorities`.
    would otherwise be undefined. An explicit `priorities = []` is *not* that
    misconfiguration: under aggregation-priorities-wildcard it is the
    deliberate per-method kill switch, and the region runs nothing.
+   The pipeline executes at most 64 named servers per region even when
+   `maxFanOut` is absent or larger. This bounds the scratch identity space and
+   protocol work for one explicit action; `maxFanOut` may impose a lower cap.
 
 3. **Sequential application (single pass).** The pipeline seeds its initial region
    text from the host document **after parse completion** — never a half-parsed
@@ -198,8 +201,8 @@ opt-in to a sequential formatter pipeline driven by `priorities`.
    the original on a no-op / complete failure / cancellation). The **invariant**
    is that no downstream document the rest of the bridge relies on is ever left
    holding speculative text. The **recommended** mechanism is to run the pipeline
-   against a **throwaway scratch document** (a unique virtual URI, `didOpen`/
-   `didClose` per run) so the canonical virtual document is never speculatively
+   against a **throwaway scratch document** (a URI unique among active runs,
+   `didOpen`/`didClose` per run) so the canonical virtual document is never speculatively
    mutated at all. This is preferred over mutating the shared document and
    reconciling afterward with a corrective `didChange`, because the shared-mutation
    approach has two hazards under tower-lsp's concurrent request processing:
@@ -235,6 +238,14 @@ opt-in to a sequential formatter pipeline driven by `priorities`.
    runners, hot-reloaders — can recognize and ignore. (Scratch documents are
    virtual LSP documents whose content is delivered via `didOpen`; a recognizable
    name bounds the blast radius if a server resolves the path on disk.)
+
+   Run identifiers come from a bounded pool of 256 slots. A slot remains leased
+   until every detached `didClose` for that run has completed, then its URI
+   namespace may be reused. Together with the 64-step ceiling this bounds exact
+   scratch provenance per canonical region without allowing two live runs to
+   share a URI. If cleanup cannot be scheduled because no Tokio runtime exists,
+   the slot is deliberately leaked instead of being reused while its downstream
+   document may still be open.
 
 The pipeline reuses the existing per-server virtual-document and
 position-translation machinery; the new parts are (a) strategy dispatch, (b) the
@@ -330,7 +341,9 @@ change without affecting the config surface.
   active code folds, or bookmarks within the region until option D is taken.
 - **Scratch-document overhead**: isolating speculative state (Decision point 7)
   costs a `didOpen`/`didClose` of a throwaway document per pipeline step — extra
-  protocol traffic to keep the canonical document untouched.
+  protocol traffic to keep the canonical document untouched. More than 256
+  concurrent region pipelines wait for a scratch slot, and a pipeline is capped
+  at 64 steps, trading extreme fan-out for bounded provenance.
 - **`priorities` semantics overload**: for formatting, `priorities` becomes an
   allowlist+order (servers not listed do not run), unlike `preferred` where it is
   only a tie-break ordering. Documented, but a behavioral nuance.

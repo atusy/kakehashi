@@ -52,9 +52,9 @@ fn init_client_with_mode(
             "initializationOptions": initialization_options
         }),
     );
-    assert!(
-        initialized["result"]["capabilities"]["callHierarchyProvider"].is_null(),
-        "capability stays hidden until incomingCalls and outgoingCalls are implemented"
+    assert_eq!(
+        initialized["result"]["capabilities"]["callHierarchyProvider"], true,
+        "the complete call-hierarchy surface is advertised"
     );
     client.send_notification("initialized", json!({}));
     (client, config_dir)
@@ -81,7 +81,11 @@ fn prepare_with_retry(client: &mut LspClient, uri: &str, line: u64, character: u
 }
 
 fn incoming_calls(client: &mut LspClient, item: Value) -> Vec<Value> {
-    let response = client.send_request("callHierarchy/incomingCalls", json!({ "item": item }));
+    call_hierarchy_calls(client, "callHierarchy/incomingCalls", item)
+}
+
+fn call_hierarchy_calls(client: &mut LspClient, method: &str, item: Value) -> Vec<Value> {
+    let response = client.send_request(method, json!({ "item": item }));
     assert!(response.get("error").is_none(), "{response}");
     response["result"]
         .as_array()
@@ -89,11 +93,35 @@ fn incoming_calls(client: &mut LspClient, item: Value) -> Vec<Value> {
         .expect("incoming call array")
 }
 
+fn outgoing_calls(client: &mut LspClient, item: Value) -> Vec<Value> {
+    call_hierarchy_calls(client, "callHierarchy/outgoingCalls", item)
+}
+
 #[test]
 fn incoming_calls_without_a_routing_envelope_return_null() {
     let (mut client, _config_dir) = init_client(false);
     let response = client.send_request(
         "callHierarchy/incomingCalls",
+        json!({ "item": {
+            "name": "foreign",
+            "kind": 12,
+            "uri": "file:///foreign.lua",
+            "range": { "start": { "line": 0, "character": 0 },
+                       "end": { "line": 0, "character": 1 } },
+            "selectionRange": { "start": { "line": 0, "character": 0 },
+                                "end": { "line": 0, "character": 1 } }
+        }}),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["result"], Value::Null);
+    shutdown(&mut client);
+}
+
+#[test]
+fn outgoing_calls_without_a_routing_envelope_return_null() {
+    let (mut client, _config_dir) = init_client(false);
+    let response = client.send_request(
+        "callHierarchy/outgoingCalls",
         json!({ "item": {
             "name": "foreign",
             "kind": 12,
@@ -275,9 +303,104 @@ fn incoming_calls_preserve_host_item_coordinates() {
 }
 
 #[test]
-fn incoming_calls_reject_items_from_stale_document_content() {
+fn outgoing_calls_restore_virtual_item_and_translate_caller_ranges_to_host() {
     let (mut client, _config_dir) = init_client(false);
-    let uri = "file:///test_stale_incoming_calls.md";
+    let uri = "file:///test_outgoing_calls.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri,
+            "languageId": "markdown",
+            "version": 1,
+            "text": "> ```lua\n> call()\n> ```\n"
+        }}),
+    );
+
+    let item = prepare_with_retry(&mut client, uri, 1, 3).remove(0);
+    let calls = outgoing_calls(&mut client, item);
+    assert_eq!(calls.len(), 2);
+    let callee = &calls[0]["to"];
+    assert_eq!(callee["uri"], uri);
+    assert_eq!(
+        callee["range"]["start"],
+        json!({ "line": 1, "character": 2 })
+    );
+    assert_eq!(
+        calls[0]["fromRanges"][0],
+        json!({
+            "start": { "line": 1, "character": 3 },
+            "end": { "line": 1, "character": 4 }
+        })
+    );
+    assert_eq!(
+        callee["data"]["kakehashi"]["inner"],
+        json!({ "mock": "outgoing-callee" })
+    );
+    let observation: Value =
+        serde_json::from_str(callee["detail"].as_str().expect("mock observation")).unwrap();
+    assert!(
+        observation["receivedUri"]
+            .as_str()
+            .is_some_and(|uri| uri.contains("kakehashi-virtual-uri-"))
+    );
+    assert_eq!(
+        observation["receivedRange"]["start"],
+        json!({ "line": 0, "character": 0 })
+    );
+    assert_eq!(observation["receivedData"], json!({ "mock": "call-item" }));
+
+    let external = &calls[1];
+    assert_eq!(external["to"]["uri"], "file:///external.lua");
+    assert_eq!(
+        external["to"]["range"]["start"],
+        json!({ "line": 8, "character": 0 })
+    );
+    assert_eq!(
+        external["fromRanges"][0]["start"],
+        json!({ "line": 1, "character": 4 })
+    );
+    assert_eq!(
+        external["to"]["data"]["kakehashi"]["inner"],
+        json!({ "mock": "external-callee" })
+    );
+    shutdown(&mut client);
+}
+
+#[test]
+fn outgoing_calls_preserve_host_item_and_caller_coordinates() {
+    let (mut client, _config_dir) = init_client(true);
+    let uri = "file:///test_outgoing_calls.lua";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri,
+            "languageId": "lua",
+            "version": 1,
+            "text": "call()\n"
+        }}),
+    );
+
+    let item = prepare_with_retry(&mut client, uri, 0, 1).remove(0);
+    let calls = outgoing_calls(&mut client, item);
+    assert_eq!(calls[0]["to"]["uri"], uri);
+    assert_eq!(
+        calls[0]["to"]["range"]["start"],
+        json!({ "line": 0, "character": 0 })
+    );
+    assert_eq!(
+        calls[0]["fromRanges"][0]["start"],
+        json!({ "line": 0, "character": 1 })
+    );
+    let observation: Value =
+        serde_json::from_str(calls[0]["to"]["detail"].as_str().expect("mock observation")).unwrap();
+    assert_eq!(observation["receivedUri"], uri);
+    assert_eq!(observation["receivedData"], json!({ "mock": "call-item" }));
+    shutdown(&mut client);
+}
+
+fn assert_call_hierarchy_rejects_stale_content(method: &str) {
+    let (mut client, _config_dir) = init_client(false);
+    let uri = "file:///test_stale_call_hierarchy.md";
     client.send_notification(
         "textDocument/didOpen",
         json!({ "textDocument": {
@@ -296,17 +419,22 @@ fn incoming_calls_reject_items_from_stale_document_content() {
             "contentChanges": [{ "text": "```lua\nchanged()\n```\n" }]
         }),
     );
-    let response =
-        client.send_request("callHierarchy/incomingCalls", json!({ "item": stale_item }));
+    let response = client.send_request(method, json!({ "item": stale_item }));
     assert!(response.get("error").is_none(), "{response}");
     assert_eq!(response["result"], Value::Null);
     shutdown(&mut client);
 }
 
 #[test]
-fn incoming_calls_reject_stale_virtual_geometry() {
+fn call_hierarchy_expansion_rejects_stale_document_content() {
+    for method in ["callHierarchy/incomingCalls", "callHierarchy/outgoingCalls"] {
+        assert_call_hierarchy_rejects_stale_content(method);
+    }
+}
+
+fn assert_call_hierarchy_rejects_stale_geometry(method: &str) {
     let (mut client, _config_dir) = init_client(false);
-    let uri = "file:///test_stale_incoming_geometry.md";
+    let uri = "file:///test_stale_call_hierarchy_geometry.md";
     client.send_notification(
         "textDocument/didOpen",
         json!({ "textDocument": {
@@ -319,7 +447,7 @@ fn incoming_calls_reject_stale_virtual_geometry() {
 
     let mut item = prepare_with_retry(&mut client, uri, 1, 1).remove(0);
     item["data"]["kakehashi"]["offset"]["line"] = json!(99);
-    let response = client.send_request("callHierarchy/incomingCalls", json!({ "item": item }));
+    let response = client.send_request(method, json!({ "item": item }));
     assert!(response.get("error").is_none(), "{response}");
     assert_eq!(response["result"], Value::Null);
     shutdown(&mut client);
@@ -361,6 +489,13 @@ fn incoming_calls_reject_stale_canonical_injection_language_before_dispatch() {
 }
 
 #[test]
+fn call_hierarchy_expansion_rejects_stale_virtual_geometry() {
+    for method in ["callHierarchy/incomingCalls", "callHierarchy/outgoingCalls"] {
+        assert_call_hierarchy_rejects_stale_geometry(method);
+    }
+}
+
+#[test]
 fn incoming_calls_discard_response_after_document_change() {
     let (mut client, _config_dir) =
         init_client_with_mode(false, "call-hierarchy-delayed-incoming", None);
@@ -385,6 +520,39 @@ fn incoming_calls_discard_response_after_document_change() {
             .is_some_and(|message| message.contains("call-hierarchy-incoming-started"))),
         "incoming request must reach the downstream sent-state barrier: {started:?}"
     );
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": uri, "version": 2 },
+            "contentChanges": [{ "text": "```lua\nchanged()\n```\n" }]
+        }),
+    );
+    let response = client.receive_response_for_id_public(request_id);
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["result"], Value::Null);
+    shutdown(&mut client);
+}
+
+#[test]
+fn outgoing_calls_discard_response_after_document_change() {
+    let (mut client, _config_dir) =
+        init_client_with_mode(false, "call-hierarchy-delayed-outgoing", None);
+    let uri = "file:///test_delayed_outgoing.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri,
+            "languageId": "markdown",
+            "version": 1,
+            "text": "```lua\ncall()\n```\n"
+        }}),
+    );
+    let item = prepare_with_retry(&mut client, uri, 1, 1).remove(0);
+
+    let request_id =
+        client.send_request_async("callHierarchy/outgoingCalls", json!({ "item": item }));
+    let started = wait_for_log_message(&mut client, "call-hierarchy-outgoing-started");
+    assert!(started.is_some(), "outgoing request must reach downstream");
     client.send_notification(
         "textDocument/didChange",
         json!({
@@ -441,7 +609,54 @@ fn incoming_calls_cancel_targets_exact_downstream_request() {
     shutdown(&mut client);
 }
 
-fn assert_replaced_call_hierarchy_producer_fails_soft(host_layer: bool, change_pool_key: bool) {
+#[test]
+fn outgoing_calls_cancel_targets_exact_downstream_request() {
+    let event_dir = tempfile::TempDir::new().expect("event dir");
+    let request_file = event_dir
+        .path()
+        .join("call-hierarchy-slow-outgoing.request.json");
+    let cancel_file = event_dir
+        .path()
+        .join("call-hierarchy-slow-outgoing.cancel.json");
+    let (mut client, _config_dir) =
+        init_client_with_mode(true, "call-hierarchy-slow-outgoing", Some(event_dir.path()));
+    let uri = "file:///test_cancel_outgoing.lua";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri, "languageId": "lua", "version": 1, "text": "call()\n"
+        }}),
+    );
+    let item = prepare_with_retry(&mut client, uri, 0, 1).remove(0);
+
+    let request_id =
+        client.send_request_async("callHierarchy/outgoingCalls", json!({ "item": item }));
+    let started = wait_for_log_message(&mut client, "call-hierarchy-outgoing-started");
+    assert!(started.is_some(), "downstream request must start");
+    assert!(request_file.exists(), "downstream request must be recorded");
+    client.send_notification("$/cancelRequest", json!({ "id": request_id }));
+    let response = client.receive_response_for_id_public(request_id);
+    assert_eq!(response["error"]["code"], -32800, "{response}");
+    let forwarded = (0..200).any(|_| {
+        if cancel_file.exists() {
+            true
+        } else {
+            std::thread::sleep(Duration::from_millis(50));
+            false
+        }
+    });
+    assert!(forwarded, "cancel must reach downstream");
+    let request: Value = serde_json::from_slice(&std::fs::read(request_file).unwrap()).unwrap();
+    let cancel: Value = serde_json::from_slice(&std::fs::read(cancel_file).unwrap()).unwrap();
+    assert_eq!(cancel["params"]["id"], request["id"]);
+    shutdown(&mut client);
+}
+
+fn assert_replaced_call_hierarchy_producer_fails_soft(
+    method: &str,
+    host_layer: bool,
+    change_pool_key: bool,
+) {
     let (mut client, _config_dir) = init_client(host_layer);
     let (uri, language_id, text, line, character) = if host_layer {
         ("file:///test_replace_incoming.lua", "lua", "call()\n", 0, 1)
@@ -517,8 +732,12 @@ fn assert_replaced_call_hierarchy_producer_fails_soft(host_layer: bool, change_p
         );
     }
     assert_eq!(
-        incoming_calls(&mut client, replacement_item.clone()).len(),
-        1
+        call_hierarchy_calls(&mut client, method, replacement_item.clone()).len(),
+        if method.ends_with("outgoingCalls") {
+            2
+        } else {
+            1
+        }
     );
     // Keep current content/incarnation/geometry and replace only producer
     // identity, isolating the key and generation checks.
@@ -527,26 +746,29 @@ fn assert_replaced_call_hierarchy_producer_fails_soft(host_layer: bool, change_p
     stale_item["data"]["kakehashi"]["connection_generation"] =
         old_envelope["connection_generation"].clone();
     stale_item["data"]["kakehashi"]["inner"] = old_envelope["inner"].clone();
-    let response =
-        client.send_request("callHierarchy/incomingCalls", json!({ "item": stale_item }));
+    let response = client.send_request(method, json!({ "item": stale_item }));
     assert!(response.get("error").is_none(), "{response}");
     assert_eq!(response["result"], Value::Null);
     shutdown(&mut client);
 }
 
 #[test]
-fn incoming_calls_reject_same_key_replacement_for_both_layers() {
-    assert_replaced_call_hierarchy_producer_fails_soft(false, false);
-    assert_replaced_call_hierarchy_producer_fails_soft(true, false);
+fn call_hierarchy_expansion_rejects_same_key_replacement_for_both_layers() {
+    for method in ["callHierarchy/incomingCalls", "callHierarchy/outgoingCalls"] {
+        assert_replaced_call_hierarchy_producer_fails_soft(method, false, false);
+        assert_replaced_call_hierarchy_producer_fails_soft(method, true, false);
+    }
 }
 
 #[test]
-fn incoming_calls_reject_different_key_equal_generation_for_both_layers() {
-    assert_replaced_call_hierarchy_producer_fails_soft(false, true);
-    assert_replaced_call_hierarchy_producer_fails_soft(true, true);
+fn call_hierarchy_expansion_rejects_different_key_equal_generation_for_both_layers() {
+    for method in ["callHierarchy/incomingCalls", "callHierarchy/outgoingCalls"] {
+        assert_replaced_call_hierarchy_producer_fails_soft(method, false, true);
+        assert_replaced_call_hierarchy_producer_fails_soft(method, true, true);
+    }
 }
 
-fn assert_reopened_call_hierarchy_item_fails_soft(host_layer: bool) {
+fn assert_reopened_call_hierarchy_item_fails_soft(method: &str, host_layer: bool) {
     let (mut client, _config_dir) = init_client(host_layer);
     let (uri, language_id, text, line, character) = if host_layer {
         ("file:///test_reopen_incoming.lua", "lua", "call()\n", 0, 1)
@@ -579,15 +801,24 @@ fn assert_reopened_call_hierarchy_item_fails_soft(host_layer: bool) {
         old_item["data"]["kakehashi"]["incarnation"],
         current_item["data"]["kakehashi"]["incarnation"]
     );
-    assert_eq!(incoming_calls(&mut client, current_item).len(), 1);
-    let response = client.send_request("callHierarchy/incomingCalls", json!({ "item": old_item }));
+    assert_eq!(
+        call_hierarchy_calls(&mut client, method, current_item).len(),
+        if method.ends_with("outgoingCalls") {
+            2
+        } else {
+            1
+        }
+    );
+    let response = client.send_request(method, json!({ "item": old_item }));
     assert!(response.get("error").is_none(), "{response}");
     assert_eq!(response["result"], Value::Null);
     shutdown(&mut client);
 }
 
 #[test]
-fn incoming_calls_reject_items_from_reopened_documents_for_both_layers() {
-    assert_reopened_call_hierarchy_item_fails_soft(false);
-    assert_reopened_call_hierarchy_item_fails_soft(true);
+fn call_hierarchy_expansion_rejects_items_from_reopened_documents_for_both_layers() {
+    for method in ["callHierarchy/incomingCalls", "callHierarchy/outgoingCalls"] {
+        assert_reopened_call_hierarchy_item_fails_soft(method, false);
+        assert_reopened_call_hierarchy_item_fails_soft(method, true);
+    }
 }
