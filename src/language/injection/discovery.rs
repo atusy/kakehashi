@@ -1179,8 +1179,7 @@ impl InjectionResolver {
             .iter()
             .flat_map(|region| region.gap_ranges.iter().cloned())
             .collect();
-        explicit_gaps.sort_by_key(|range| (range.start, range.end));
-        explicit_gaps.dedup();
+        explicit_gaps = merge_touching_ranges(explicit_gaps);
         let has_explicit_gaps = !explicit_gaps.is_empty();
         if regions.len() == 1 && !has_explicit_gaps {
             let first = regions[0];
@@ -1573,6 +1572,21 @@ impl InjectionResolver {
         }
         (!crate::cancel::is_cancelled(cancel)).then_some(resolved)
     }
+}
+
+fn merge_touching_ranges(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
+    ranges.sort_by_key(|range| (range.start, range.end));
+    let mut merged: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if let Some(last) = merged.last_mut()
+            && range.start <= last.end
+        {
+            last.end = last.end.max(range.end);
+        } else {
+            merged.push(range);
+        }
+    }
+    merged
 }
 
 fn subtract_ranges(included: &[Range<usize>], gaps: &[Range<usize>]) -> Vec<Range<usize>> {
@@ -3287,6 +3301,27 @@ mod tests {
             ),
             ")"
         );
+    }
+
+    #[test]
+    fn overlapping_and_touching_explicit_gaps_merge_before_rendering() {
+        assert_eq!(
+            merge_touching_ranges(vec![0..4, 2..6, 6..8, 10..12]),
+            vec![0..8, 10..12]
+        );
+
+        let text = "abcdef";
+        let gaps = merge_touching_ranges(vec![0..4, 2..6]);
+        let (content, _) = build_combined_virtual_content_with_gaps(
+            text,
+            0..text.len(),
+            &[],
+            &gaps,
+            Some("X"),
+            None,
+            None,
+        );
+        assert_eq!(content, "X     ");
     }
 
     #[test]
