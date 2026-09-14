@@ -2130,6 +2130,100 @@ mod tests {
         );
     }
 
+    /// Forward one peer request through the reader and return the fresh
+    /// downstream id once the target's writer has put it on the wire.
+    async fn forward_peer_request(
+        router: &ResponseRouter,
+        deps: &ServerRequestDeps,
+        peer: &Arc<crate::lsp::bridge::pool::ConnectionHandle>,
+        outer_id: i64,
+    ) -> crate::lsp::bridge::protocol::RequestId {
+        handle_message(
+            json!({
+                "jsonrpc": "2.0",
+                "id": outer_id,
+                "method": "kakehashi/bridge/peer/request",
+                "params": {
+                    "id": peer.key().peer_id(),
+                    "method": "textDocument/formatting",
+                    "params": { "textDocument": { "uri": "file:///repo/main.ts" } }
+                }
+            }),
+            router,
+            "[tsudoi] ",
+            deps,
+        )
+        .await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let [downstream_id] = peer.router().pending_ids()[..]
+                && peer.router().is_sent(downstream_id)
+            {
+                return downstream_id;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the target writer never sent the forwarded request"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// ADR invariant: a cancel arriving after the outer request is accepted
+    /// releases the caller and targets the exact inner request, which stays
+    /// pending as cancelled so the target's late answer is still absorbed.
+    #[tokio::test]
+    async fn origin_cancel_releases_the_caller_and_keeps_the_sent_inner_request() {
+        let router = ResponseRouter::new();
+        let (deps, (mut response_rx, _upstream_rx, _window_rx)) =
+            dummy_server_request_deps_with_rx();
+        let peer = crate::lsp::bridge::pool::test_helpers::create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("oxfmt"),
+        )
+        .await;
+        deps.peer_directory.register(&peer);
+        let downstream_id = forward_peer_request(&router, &deps, &peer, 41).await;
+
+        handle_message(
+            json!({
+                "jsonrpc": "2.0",
+                "method": "$/cancelRequest",
+                "params": { "id": 41 }
+            }),
+            &router,
+            "[tsudoi] ",
+            &deps,
+        )
+        .await;
+
+        let OutboundMessage::Untracked(response) = response_rx.recv().await.unwrap() else {
+            panic!("server-request responses are untracked")
+        };
+        assert_eq!(response["id"], 41);
+        assert_eq!(response["error"]["code"], -32800);
+        assert!(
+            !deps
+                .inbound_request_registry
+                .is_registered(deps.progress_connection_id, &jsonrpc::Id::Number(41))
+        );
+        assert_eq!(
+            peer.router().pending_count(),
+            1,
+            "a sent inner request stays pending until the target answers"
+        );
+        assert_eq!(
+            peer.router().route(json!({
+                "jsonrpc": "2.0",
+                "id": downstream_id.as_i64(),
+                "result": []
+            })),
+            RouteResult::ReceiverDropped,
+            "the late answer is absorbed, never delivered to the released caller"
+        );
+        assert_eq!(peer.router().pending_count(), 0);
+    }
+
     #[tokio::test]
     async fn handle_message_rejects_peer_request_when_origin_limit_is_full() {
         let router = ResponseRouter::new();
