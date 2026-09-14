@@ -1432,14 +1432,6 @@ fn project_protected_formatting_edits(
             return Some(());
         };
         let old_text = &original[start..end];
-        // Formatter removal/normalization of structural whitespace at the
-        // virtual document edges belongs to the host layout, not embedded code.
-        if (start == 0 || end == original.len())
-            && old_text.chars().all(char::is_whitespace)
-            && new_text.chars().all(char::is_whitespace)
-        {
-            return Some(());
-        }
         let mut range = Range {
             start: mapper.byte_to_position(start)?,
             end: mapper.byte_to_position(end)?,
@@ -1451,7 +1443,11 @@ fn project_protected_formatting_edits(
             let end = (range.end.line, range.end.character);
             let gap_start = (gap.start.line, gap.start.character);
             let gap_end = (gap.end.line, gap.end.character);
-            gap_start <= start && end <= gap_end && start < end
+            if start == end {
+                gap_start < start && start < gap_end
+            } else {
+                gap_start <= start && end <= gap_end
+            }
         });
         if contains {
             return Some(());
@@ -3002,6 +2998,55 @@ mod tests {
             end: Position::new(0, 4),
         };
         assert!(project_protected_formatting_edits("aaX0 bb", "aaY bb", &offset, &[gap]).is_none());
+    }
+
+    #[test]
+    fn protected_formatting_drops_point_insertion_inside_gap_only() {
+        let offset = RegionOffset::new(0, 0);
+        let gap = Range {
+            start: Position::new(0, 3),
+            end: Position::new(0, 6),
+        };
+        let edits = project_protected_formatting_edits("aa 000 bb", "AA 0x00 bb", &offset, &[gap])
+            .expect("outside edit should survive an insertion inside the gap");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(
+            edits[0].range,
+            Range::new(Position::new(0, 0), Position::new(0, 2))
+        );
+        assert_eq!(edits[0].new_text, "AA");
+    }
+
+    #[test]
+    fn protected_formatting_keeps_editable_edge_whitespace_changes() {
+        let offset = RegionOffset::new(0, 0);
+        let leading_gap = Range {
+            start: Position::new(0, 3),
+            end: Position::new(0, 4),
+        };
+        let leading =
+            project_protected_formatting_edits(" aa0bb", "aa0bb", &offset, &[leading_gap])
+                .expect("editable leading whitespace should be projected");
+        assert_eq!(leading.len(), 1);
+        assert_eq!(
+            leading[0].range,
+            Range::new(Position::new(0, 0), Position::new(0, 1)),
+        );
+        assert!(leading[0].new_text.is_empty());
+
+        let trailing_gap = Range {
+            start: Position::new(0, 2),
+            end: Position::new(0, 3),
+        };
+        let trailing =
+            project_protected_formatting_edits("aa0bb ", "aa0bb", &offset, &[trailing_gap])
+                .expect("editable trailing whitespace should be projected");
+        assert_eq!(trailing.len(), 1);
+        assert_eq!(
+            trailing[0].range,
+            Range::new(Position::new(0, 5), Position::new(0, 6)),
+        );
+        assert!(trailing[0].new_text.is_empty());
     }
 
     #[test]

@@ -122,7 +122,7 @@ pub(crate) struct InjectionRegionInfo<'a> {
     pub combined: bool,
     /// Host-owned ranges explicitly captured as `@injection.gap` in this match.
     pub gap_ranges: Vec<Range<usize>>,
-    /// Single-line placeholder used to present an explicit gap to downstream tools.
+    /// Fallback single-line synthetic text used to present an explicit gap downstream.
     pub gap_placeholder: Option<String>,
     /// Optional first-line token for a multiline explicit gap.
     pub gap_prefix: Option<String>,
@@ -1276,6 +1276,10 @@ impl InjectionResolver {
             }
         }
         included.sort_by_key(|range| (range.start, range.end));
+        // Explicit host-owned gaps win even when they are nested inside a
+        // broader @injection.content capture (for example an interpolation
+        // inside a string node captured with include-children).
+        included = subtract_ranges(&included, &explicit_gaps);
         let mut covered_until = group_start;
         let contiguous = included.iter().all(|range| {
             if range.start > covered_until {
@@ -1284,8 +1288,15 @@ impl InjectionResolver {
             covered_until = covered_until.max(range.end);
             true
         }) && covered_until >= group_end;
-        let protected_byte_ranges = complement_ranges(group_start..group_end, &included);
-        let protected_host_ranges = host_lsp_ranges(text, &protected_byte_ranges);
+        // Keep legacy non-contiguous combined injections fail-closed. The
+        // protected-edit bridge is enabled only when the query explicitly
+        // opts into @injection.gap.
+        let protected_host_ranges = if has_explicit_gaps {
+            let protected_byte_ranges = complement_ranges(group_start..group_end, &included);
+            host_lsp_ranges(text, &protected_byte_ranges)
+        } else {
+            Vec::new()
+        };
         let gap_placeholder = first.gap_placeholder.as_deref();
         let gap_prefix = first.gap_prefix.as_deref();
         let gap_suffix = first.gap_suffix.as_deref();
@@ -1299,13 +1310,23 @@ impl InjectionResolver {
             gap_suffix,
         );
 
+        let (start_line, start_column) = position_of_byte(
+            text,
+            group_start,
+            first_cacheable.byte_range.start,
+            first_cacheable.line_range.start as usize,
+        );
+        let (end_row, end_column) = position_of_byte(
+            text,
+            group_end,
+            first_cacheable.byte_range.start,
+            first_cacheable.line_range.start as usize,
+        );
+        let end_line = if end_column > 0 { end_row + 1 } else { end_row };
         let mut combined_region = first_cacheable.clone();
-        combined_region.byte_range.end = group_end;
-        combined_region.line_range.end = active_indices
-            .iter()
-            .map(|&index| cacheable[index].line_range.end)
-            .max()
-            .unwrap_or(combined_region.line_range.end);
+        combined_region.byte_range = group_start..group_end;
+        combined_region.line_range = start_line..end_line;
+        combined_region.start_column = start_column;
         combined_region.content_hash = CacheableInjectionRegion::hash_content(&virtual_content);
         let resolved_language =
             Self::resolve_language(coordinator, &first.language, &virtual_content);
@@ -1554,6 +1575,37 @@ impl InjectionResolver {
     }
 }
 
+fn subtract_ranges(included: &[Range<usize>], gaps: &[Range<usize>]) -> Vec<Range<usize>> {
+    let mut result = Vec::new();
+    for range in included {
+        if range.start >= range.end {
+            continue;
+        }
+        let mut cursor = range.start;
+        for gap in gaps {
+            if gap.end <= cursor {
+                continue;
+            }
+            if gap.start >= range.end {
+                break;
+            }
+            let gap_start = gap.start.max(range.start).min(range.end);
+            let gap_end = gap.end.max(gap_start).min(range.end);
+            if gap_start > cursor {
+                result.push(cursor..gap_start);
+            }
+            cursor = cursor.max(gap_end);
+            if cursor >= range.end {
+                break;
+            }
+        }
+        if cursor < range.end {
+            result.push(cursor..range.end);
+        }
+    }
+    result
+}
+
 fn complement_ranges(span: Range<usize>, included: &[Range<usize>]) -> Vec<Range<usize>> {
     let mut protected = Vec::new();
     let mut cursor = span.start;
@@ -1698,15 +1750,9 @@ fn mask_outside_ranges_with_gaps(
             continue;
         }
 
-        if let Some(range) = included_range
-            && range.start <= cursor
-            && cursor < range.end
-        {
-            let end = range.end.min(span.end);
-            output.push_str(clamped_slice(text, cursor..end));
-            cursor = end;
-            continue;
-        }
+        // Host-owned syntax has precedence over an overlapping content
+        // capture. The caller normally subtracts gaps from `included`, but
+        // retaining this precedence here keeps the renderer fail-safe.
         if let Some(range) = gap_range
             && range.start <= cursor
             && cursor < range.end
@@ -1720,6 +1766,15 @@ fn mask_outside_ranges_with_gaps(
                 prefix,
                 suffix,
             ));
+            cursor = end;
+            continue;
+        }
+        if let Some(range) = included_range
+            && range.start <= cursor
+            && cursor < range.end
+        {
+            let end = range.end.min(span.end);
+            output.push_str(clamped_slice(text, cursor..end));
             cursor = end;
             continue;
         }
@@ -2846,6 +2901,10 @@ mod tests {
         assert!(resolved[0].virtual_content.contains("</div>"));
         assert!(!resolved[0].virtual_content.contains("let close"));
         assert!(!resolved[0].contiguous);
+        assert!(
+            resolved[0].protected_host_ranges.is_empty(),
+            "ordinary combined injections must keep the legacy fail-closed path",
+        );
 
         let regions = collect_all_injections(&tree.root_node(), text, Some(&query)).unwrap();
         let second_id = InjectionResolver::calculate_region_id(&tracker, &uri, &regions[1], 0)
@@ -3065,6 +3124,82 @@ mod tests {
     }
 
     #[test]
+    fn leading_explicit_gap_widens_combined_region_geometry() {
+        let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser
+            .set_language(&language)
+            .expect("set markdown language");
+        let text = "```python\nprint(1)\n```\n";
+        let tree = parser.parse(text, None).expect("parse markdown");
+        let query = Query::new(
+            &language,
+            r##"
+                ((fenced_code_block
+                   (info_string) @injection.gap
+                   (code_fence_content) @injection.content)
+                 (#set! injection.language "python")
+                 (#set! injection.combined)
+                 (#set! injection.gap-placeholder "#"))
+            "##,
+        )
+        .expect("valid query");
+        let coordinator = test_coordinator();
+        let tracker = NodeTracker::new();
+        let uri = test_uri("leading-gap");
+
+        let resolved =
+            InjectionResolver::resolve_all(&coordinator, &tracker, &uri, &tree, text, &query, 0);
+
+        assert_eq!(resolved.len(), 1);
+        let gap_start = text.find("python").unwrap();
+        assert_eq!(resolved[0].region.byte_range.start, gap_start);
+        assert_eq!(resolved[0].region.line_range.start, 0);
+        assert_eq!(resolved[0].region.start_column, 3);
+        assert!(resolved[0].virtual_content.starts_with("#"));
+    }
+
+    #[test]
+    fn explicit_gap_inside_included_content_stays_protected() {
+        let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser
+            .set_language(&language)
+            .expect("set markdown language");
+        let text = "```python\nprint(1)\n```\n";
+        let tree = parser.parse(text, None).expect("parse markdown");
+        let query = Query::new(
+            &language,
+            r#"
+                ((fenced_code_block
+                   (info_string) @injection.gap) @injection.content
+                 (#set! injection.language "python")
+                 (#set! injection.combined)
+                 (#set! injection.include-children)
+                 (#set! injection.gap-placeholder "None"))
+            "#,
+        )
+        .expect("valid query");
+        let coordinator = test_coordinator();
+        let tracker = NodeTracker::new();
+        let uri = test_uri("nested-gap");
+
+        let resolved =
+            InjectionResolver::resolve_all(&coordinator, &tracker, &uri, &tree, text, &query, 0);
+
+        assert_eq!(resolved.len(), 1);
+        assert!(!resolved[0].virtual_content.contains("python"));
+        assert!(resolved[0].virtual_content.contains("None"));
+        assert_eq!(
+            resolved[0].protected_host_ranges,
+            vec![tower_lsp_server::ls_types::Range::new(
+                tower_lsp_server::ls_types::Position::new(0, 3),
+                tower_lsp_server::ls_types::Position::new(0, 9),
+            )],
+        );
+    }
+
+    #[test]
     fn explicit_gap_preserves_utf16_width_and_host_range() {
         let text = "left ${🙂} right\n";
         let gap_start = text.find("${").unwrap();
@@ -3121,6 +3256,16 @@ mod tests {
                 tower_lsp_server::ls_types::Position::new(0, 4),
                 tower_lsp_server::ls_types::Position::new(2, 1),
             )]
+        );
+    }
+
+    #[test]
+    fn subtract_ranges_removes_nested_explicit_gap() {
+        let included = 2..14;
+        let gap = 5..8;
+        assert_eq!(
+            subtract_ranges(std::slice::from_ref(&included), std::slice::from_ref(&gap)),
+            vec![2..5, 8..14]
         );
     }
 
