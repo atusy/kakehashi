@@ -454,6 +454,12 @@ mod tests {
                 .resolve(&origin_key, "kakehashi-peer:6:tsudoi:fallback")
                 .is_none()
         );
+        assert!(
+            directory
+                .resolve(peer.key(), "kakehashi-peer:6:tsudoi:fallback")
+                .is_some_and(|resolved| Arc::ptr_eq(&resolved, &origin)),
+            "the same id resolves for another caller, so the None above is self-exclusion"
+        );
     }
 
     #[tokio::test]
