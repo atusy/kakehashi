@@ -285,6 +285,8 @@ pub(in crate::lsp::bridge) async fn handle(
 /// verbatim once its shape is valid (integer `code`, string `message`);
 /// extra members a server attaches are the caller's business.
 fn normalize_response(response: serde_json::Value) -> jsonrpc::Result<serde_json::Value> {
+    // The router only delivers objects it extracted an id from, so this arm
+    // is defensive; it keeps the function total over its input type.
     let serde_json::Value::Object(mut envelope) = response else {
         return Err(request_failed(
             "malformedResponse",
