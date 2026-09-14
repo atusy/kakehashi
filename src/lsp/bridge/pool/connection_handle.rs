@@ -631,7 +631,9 @@ impl ConnectionHandle {
     /// Dropping the writer task handle cancels a write parked on a full stdin
     /// pipe; the writer then drops its owned process handle, which force-kills
     /// the downstream child. This is required when graceful shutdown cannot
-    /// make progress because the writer itself is the failed resource.
+    /// make progress because the writer itself is the failed resource. Once a
+    /// graceful shutdown has reclaimed the writer handle there is nothing left
+    /// to abort here, and the shutdown's own deadline bounds the child instead.
     pub(in crate::lsp::bridge) fn fail_and_abort_writer(&self) {
         let mut state = self
             .state
