@@ -14,6 +14,7 @@
 
 mod helpers;
 
+mod e2e_call_hierarchy;
 mod e2e_cancel_request;
 mod e2e_cli_diagnose;
 mod e2e_cli_format;
