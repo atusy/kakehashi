@@ -2597,6 +2597,60 @@ mod tests {
     }
 
     #[test]
+    fn resolve_all_combined_dedent_preserves_masked_gaps_and_offsets() {
+        let mut parser = create_rust_parser();
+        let text = "/*\n    alpha\n      beta\n*/\nlet x = 0;\n/*\n    gamma\n*/";
+        let tree = parse_rust_code(&mut parser, text);
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(
+            &language,
+            r#"
+                ((block_comment) @injection.content
+                 (#set! injection.language "rust")
+                 (#set! injection.combined)
+                 (#set! injection.dedent)
+                 (#offset! @injection.content 1 0 0 -2))
+            "#,
+        )
+        .expect("valid query");
+
+        let resolved = InjectionResolver::resolve_all(
+            &test_coordinator(),
+            &NodeTracker::new(),
+            &test_uri("combined_dedent"),
+            &tree,
+            text,
+            &query,
+            0,
+        );
+
+        assert_eq!(resolved.len(), 1);
+        let resolved = &resolved[0];
+        assert!(!resolved.contiguous);
+        assert!(resolved.virtual_content.starts_with("alpha\n  beta\n"));
+        assert!(resolved.virtual_content.ends_with("gamma\n"));
+        assert!(!resolved.virtual_content.contains("let x = 0"));
+        let alpha_line = resolved
+            .virtual_content
+            .lines()
+            .position(|line| line == "alpha")
+            .expect("dedented alpha line");
+        let beta_line = resolved
+            .virtual_content
+            .lines()
+            .position(|line| line == "  beta")
+            .expect("dedented beta line");
+        let gamma_line = resolved
+            .virtual_content
+            .lines()
+            .position(|line| line == "gamma")
+            .expect("dedented gamma line");
+        assert_eq!(resolved.line_column_offsets[alpha_line], 4);
+        assert_eq!(resolved.line_column_offsets[beta_line], 4);
+        assert_eq!(resolved.line_column_offsets[gamma_line], 4);
+    }
+
+    #[test]
     fn resolve_all_combines_regions_marked_combined() {
         let mut parser = create_rust_parser();
         let text = r#"fn main() { let open = "<div>"; let close = "</div>"; }"#;
