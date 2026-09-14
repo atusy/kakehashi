@@ -574,9 +574,11 @@ impl ResponseRouter {
             .get(&id)
             .map(|pending| (pending.delivery, pending.write_claimed_at))
         {
-            Some((RequestDelivery::CancelledWriting, claimed_at)) => {
-                let until = claimed_at.map(|claimed_at| claimed_at + write_budget);
-                if let Some(until) = until.filter(|until| *until > tokio::time::Instant::now()) {
+            // A writing entry always carries its claim instant: only
+            // `claim_for_write` produces `Writing`, and it records the instant.
+            Some((RequestDelivery::CancelledWriting, Some(claimed_at))) => {
+                let until = claimed_at + write_budget;
+                if until > tokio::time::Instant::now() {
                     return PeerCancelExpiry::WriteInProgress { until };
                 }
             }
