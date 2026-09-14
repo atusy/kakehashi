@@ -79,6 +79,11 @@ struct PendingRequest {
     /// router entry settles, without retaining the response receiver itself.
     _settled_tx: Option<oneshot::Sender<()>>,
     delivery: RequestDelivery,
+    /// When the FIFO writer claimed this request's bytes. A cancelled peer
+    /// write is judged wedged by its age since this instant, not by the
+    /// request's own deadline, because a frame can sit queued behind earlier
+    /// traffic for most of that deadline.
+    write_claimed_at: Option<tokio::time::Instant>,
     /// The waiter distinguishes bridge transport failure from a genuine
     /// downstream JSON-RPC error via [`ResponseRouter::take_failure`].
     track_failure: bool,
@@ -104,6 +109,21 @@ pub(crate) enum LivenessExpiry {
 pub(crate) enum BridgeFailure {
     ConnectionLost,
     RequestTimeout,
+}
+
+/// Outcome of [`ResponseRouter::expire_peer_cancel`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PeerCancelExpiry {
+    /// The entry is gone: it settled earlier, or its write had completed and
+    /// the entry was retired now without touching the connection.
+    Settled,
+    /// The write is in progress but younger than the budget; check again once
+    /// it would have consumed a full budget since the writer claimed it.
+    WriteInProgress { until: tokio::time::Instant },
+    /// The write consumed a full budget without completing. Admission is
+    /// closed and every waiter has been failed; the caller must abort the
+    /// writer, which will otherwise stay parked on the child's stdin.
+    Wedged,
 }
 
 impl ResponseRouter {
@@ -201,6 +221,7 @@ impl ResponseRouter {
                 response_tx: tx,
                 _settled_tx: settled_tx,
                 delivery: RequestDelivery::Queued,
+                write_claimed_at: None,
                 track_failure,
             },
         );
@@ -312,6 +333,7 @@ impl ResponseRouter {
         match pending.delivery {
             RequestDelivery::Queued => {
                 pending.delivery = RequestDelivery::Writing;
+                pending.write_claimed_at = Some(tokio::time::Instant::now());
                 return true;
             }
             RequestDelivery::Writing
@@ -490,26 +512,45 @@ impl ResponseRouter {
         }
     }
 
-    /// Expire one cancelled peer request at its original deadline.
+    /// Expire one cancelled peer request whose cleanup timer fired.
     ///
-    /// Returns true only when its write is still blocked. In that case request
-    /// admission is closed and every waiter is failed under the same lock, so a
-    /// concurrent write completion/response cannot turn a healthy connection
-    /// failure into a false positive.
-    pub(crate) fn expire_peer_cancel(&self, id: RequestId) -> bool {
+    /// Only a write that has consumed a full `write_budget` since the writer
+    /// claimed it counts as wedged: the request deadline this timer was armed
+    /// with also covers time spent queued behind earlier frames, so a frame
+    /// claimed late is given a fresh budget instead of faulting a healthy
+    /// connection. On a wedged write, admission is closed and every pending
+    /// entry is drained under one lock, so no waiter is lost and no new
+    /// request slips in; the drained waiters are failed after the lock is
+    /// released. A write that finishes in the same instant as the check is
+    /// still treated as wedged: after a full budget of no progress the
+    /// connection has already earned that verdict.
+    pub(crate) fn expire_peer_cancel(
+        &self,
+        id: RequestId,
+        write_budget: std::time::Duration,
+    ) -> PeerCancelExpiry {
         let mut state = self
             .state
             .lock()
             .recover_poison("ResponseRouter::expire_peer_cancel");
-        match state.pending.get(&id).map(|pending| pending.delivery) {
-            Some(RequestDelivery::CancelledWriting) => {}
-            Some(RequestDelivery::CancelledSent) => {
+        match state
+            .pending
+            .get(&id)
+            .map(|pending| (pending.delivery, pending.write_claimed_at))
+        {
+            Some((RequestDelivery::CancelledWriting, claimed_at)) => {
+                let until = claimed_at.map(|claimed_at| claimed_at + write_budget);
+                if let Some(until) = until.filter(|until| *until > tokio::time::Instant::now()) {
+                    return PeerCancelExpiry::WriteInProgress { until };
+                }
+            }
+            Some((RequestDelivery::CancelledSent, _)) => {
                 state.pending.remove(&id);
                 state.failures.remove(&id);
                 Self::remove_cancel_mapping_inner(&mut state, id);
-                return false;
+                return PeerCancelExpiry::Settled;
             }
-            _ => return false,
+            _ => return PeerCancelExpiry::Settled,
         }
 
         state.accepting = false;
@@ -548,7 +589,7 @@ impl ResponseRouter {
                 self.take_failure(request_id);
             }
         }
-        true
+        PeerCancelExpiry::Wedged
     }
 
     pub(crate) fn take_failure(&self, id: RequestId) -> Option<BridgeFailure> {
@@ -1074,7 +1115,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    const WRITE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+    #[tokio::test(start_paused = true)]
     async fn peer_write_expiry_distinguishes_connection_failure_victims() {
         let router = ResponseRouter::new();
         let peer_id = RequestId::new(1);
@@ -1084,7 +1127,12 @@ mod tests {
         let victim_id = RequestId::new(2);
         let victim_rx = router.register(victim_id).unwrap();
 
-        assert!(router.expire_peer_cancel(peer_id));
+        tokio::time::advance(WRITE_BUDGET).await;
+        assert_eq!(
+            router.expire_peer_cancel(peer_id, WRITE_BUDGET),
+            PeerCancelExpiry::Wedged
+        );
+        assert!(!router.is_accepting());
         let peer_error = peer_rx.await.unwrap();
         let victim_error = victim_rx.await.unwrap();
         assert_eq!(
@@ -1095,6 +1143,41 @@ mod tests {
             victim_error["error"]["message"],
             "bridge: connection failed after peer write timeout"
         );
+    }
+
+    /// A frame can wait in the FIFO for most of its request deadline; the
+    /// wedge verdict must count from the writer's claim, or a healthy
+    /// connection that merely dequeued the frame late is killed.
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_peer_write_gets_a_full_budget_from_its_claim() {
+        let router = ResponseRouter::new();
+        let peer_id = RequestId::new(1);
+        let (_peer_rx, _epoch, _settled_rx) = router.register_peer(peer_id).unwrap();
+        let _victim_rx = router.register(RequestId::new(2)).unwrap();
+        tokio::time::advance(WRITE_BUDGET - std::time::Duration::from_millis(100)).await;
+        assert!(router.claim_for_write(peer_id));
+        let claimed_at = tokio::time::Instant::now();
+        assert_eq!(router.cancel_peer(peer_id), Some(true));
+
+        tokio::time::advance(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            router.expire_peer_cancel(peer_id, WRITE_BUDGET),
+            PeerCancelExpiry::WriteInProgress {
+                until: claimed_at + WRITE_BUDGET
+            }
+        );
+        assert!(
+            router.is_accepting(),
+            "a young write is not a wedge verdict"
+        );
+        assert_eq!(router.pending_count(), 2);
+
+        tokio::time::advance(WRITE_BUDGET).await;
+        assert_eq!(
+            router.expire_peer_cancel(peer_id, WRITE_BUDGET),
+            PeerCancelExpiry::Wedged
+        );
+        assert_eq!(router.pending_count(), 0);
     }
 
     /// Test that register_with_upstream stores upstream->downstream mapping.

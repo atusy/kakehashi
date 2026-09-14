@@ -5,7 +5,9 @@ use std::{borrow::Cow, sync::Arc};
 use serde::Deserialize;
 use tower_lsp_server::jsonrpc;
 
-use crate::lsp::bridge::actor::{RouterCleanupGuard, ServerRequestDeps, send_server_response};
+use crate::lsp::bridge::actor::{
+    PeerCancelExpiry, RouterCleanupGuard, ServerRequestDeps, send_server_response,
+};
 use crate::lsp::bridge::inbound_request_registry::PeerRequestPermit;
 use crate::lsp::bridge::pool::ConnectionHandle;
 use crate::lsp::bridge::protocol::JsonRpcNotification;
@@ -74,18 +76,33 @@ fn validate_params(params: &PeerRequestParams) -> jsonrpc::Result<()> {
     Ok(())
 }
 
+/// Retire a cancelled peer request once the target settles it, or judge its
+/// write wedged after it has consumed a full request budget since the writer
+/// claimed it. The first check runs at the request deadline; a frame claimed
+/// late in that window is re-checked when its own budget elapses.
 async fn cleanup_cancelled_peer(
     peer: Arc<ConnectionHandle>,
     downstream_id: RequestId,
-    settled_rx: tokio::sync::oneshot::Receiver<()>,
+    mut settled_rx: tokio::sync::oneshot::Receiver<()>,
     deadline: tokio::time::Instant,
     _permit: Arc<PeerRequestPermit>,
 ) {
-    tokio::select! {
-        _ = settled_rx => {}
-        _ = tokio::time::sleep_until(deadline) => {
-            if peer.router().expire_peer_cancel(downstream_id) {
-                peer.fail_and_abort_writer();
+    let mut expiry = deadline;
+    loop {
+        tokio::select! {
+            _ = &mut settled_rx => return,
+            _ = tokio::time::sleep_until(expiry) => {
+                match peer
+                    .router()
+                    .expire_peer_cancel(downstream_id, super::super::pool::REQUEST_TIMEOUT)
+                {
+                    PeerCancelExpiry::Settled => return,
+                    PeerCancelExpiry::WriteInProgress { until } => expiry = until,
+                    PeerCancelExpiry::Wedged => {
+                        peer.fail_and_abort_writer();
+                        return;
+                    }
+                }
             }
         }
     }
@@ -425,6 +442,54 @@ mod tests {
             "capacity returns only after target cleanup and outer delivery settle"
         );
         drop(remaining);
+    }
+
+    /// The cleanup timer is armed with the request deadline, but a frame the
+    /// writer claimed late must still get a full budget before its
+    /// connection is torn down.
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_peer_cleanup_gives_a_late_claim_a_full_budget() {
+        use crate::lsp::bridge::pool::REQUEST_TIMEOUT;
+
+        let registry = InboundRequestRegistry::default();
+        let (_cancel, _generation, permit) = registry
+            .try_register_peer(ProgressConnectionId::for_test(1), jsonrpc::Id::Number(1))
+            .unwrap();
+        let peer =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("oxfmt"))
+                .await;
+        let (request_id, _response_rx, settled_rx) = peer.register_peer_request().unwrap();
+        let deadline = tokio::time::Instant::now() + REQUEST_TIMEOUT;
+        let queue_wait = REQUEST_TIMEOUT - std::time::Duration::from_secs(1);
+        tokio::time::advance(queue_wait).await;
+        assert!(peer.router().claim_for_write(request_id));
+        assert_eq!(peer.router().cancel_peer(request_id), Some(true));
+        let cleanup = tokio::spawn(cleanup_cancelled_peer(
+            peer.clone(),
+            request_id,
+            settled_rx,
+            deadline,
+            Arc::new(permit),
+        ));
+
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !cleanup.is_finished(),
+            "the late claim is re-checked, not failed"
+        );
+        assert_eq!(peer.state(), ConnectionState::Ready);
+        assert_eq!(peer.router().pending_count(), 1);
+
+        tokio::time::advance(queue_wait).await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), cleanup)
+            .await
+            .expect("cleanup ends once the write consumed its own budget")
+            .unwrap();
+        assert_eq!(peer.state(), ConnectionState::Failed);
+        assert_eq!(peer.router().pending_count(), 0);
     }
 
     #[test]
