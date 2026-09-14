@@ -111,6 +111,32 @@ pub(crate) enum BridgeFailure {
     RequestTimeout,
 }
 
+/// A peer request's response receiver, the liveness epoch it started (if
+/// any), and the receiver that fires when its router entry settles.
+pub(crate) type PeerRegistration = (
+    oneshot::Receiver<serde_json::Value>,
+    Option<u64>,
+    oneshot::Receiver<()>,
+);
+
+/// Why a registration was refused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RegisterError {
+    /// The connection's reader or writer is terminal; nothing registers again.
+    Closed,
+    /// A request with this id is still pending.
+    DuplicateId,
+}
+
+impl std::fmt::Display for RegisterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Closed => "bridge: connection no longer accepts requests",
+            Self::DuplicateId => "bridge: duplicate request ID",
+        })
+    }
+}
+
 /// Outcome of [`ResponseRouter::expire_peer_cancel`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PeerCancelExpiry {
@@ -156,13 +182,15 @@ impl ResponseRouter {
     ///
     /// Like `register()`, but also stores an upstream→downstream ID mapping so
     /// `$/cancelRequest` can be translated and forwarded. `upstream_id` is `None`
-    /// for internal requests. Returns `None` if the downstream ID is already pending.
+    /// for internal requests. Returns `None` if the downstream ID is already
+    /// pending or the router is closed.
     pub(crate) fn register_with_upstream(
         &self,
         downstream_id: RequestId,
         upstream_id: Option<UpstreamId>,
     ) -> Option<oneshot::Receiver<serde_json::Value>> {
         self.register_with_upstream_liveness(downstream_id, upstream_id)
+            .ok()
             .map(|(rx, _)| rx)
     }
 
@@ -172,18 +200,14 @@ impl ResponseRouter {
         &self,
         downstream_id: RequestId,
         upstream_id: Option<UpstreamId>,
-    ) -> Option<(oneshot::Receiver<serde_json::Value>, Option<u64>)> {
+    ) -> Result<(oneshot::Receiver<serde_json::Value>, Option<u64>), RegisterError> {
         self.register_with_upstream_liveness_mode(downstream_id, upstream_id, false, None)
     }
 
     pub(crate) fn register_peer(
         &self,
         downstream_id: RequestId,
-    ) -> Option<(
-        oneshot::Receiver<serde_json::Value>,
-        Option<u64>,
-        oneshot::Receiver<()>,
-    )> {
+    ) -> Result<PeerRegistration, RegisterError> {
         let (settled_tx, settled_rx) = oneshot::channel();
         self.register_with_upstream_liveness_mode(downstream_id, None, true, Some(settled_tx))
             .map(|(response_rx, epoch)| (response_rx, epoch, settled_rx))
@@ -195,16 +219,18 @@ impl ResponseRouter {
         upstream_id: Option<UpstreamId>,
         track_failure: bool,
         settled_tx: Option<oneshot::Sender<()>>,
-    ) -> Option<(oneshot::Receiver<serde_json::Value>, Option<u64>)> {
+    ) -> Result<(oneshot::Receiver<serde_json::Value>, Option<u64>), RegisterError> {
         let (tx, rx) = oneshot::channel();
         let mut state = self
             .state
             .lock()
             .recover_poison("ResponseRouter::register_with_upstream");
 
-        // Prevent duplicate registration
-        if !state.accepting || state.pending.contains_key(&downstream_id) {
-            return None;
+        if !state.accepting {
+            return Err(RegisterError::Closed);
+        }
+        if state.pending.contains_key(&downstream_id) {
+            return Err(RegisterError::DuplicateId);
         }
         let starts_liveness = state
             .pending
@@ -238,7 +264,7 @@ impl ResponseRouter {
             state.downstream_to_upstream.insert(downstream_id, upstream);
         }
 
-        Some((rx, liveness_epoch))
+        Ok((rx, liveness_epoch))
     }
 
     pub(crate) fn liveness_epoch(&self) -> u64 {
@@ -1099,6 +1125,22 @@ mod tests {
         assert!(
             router.register(RequestId::new(2)).is_none(),
             "a terminal router must reject new requests"
+        );
+    }
+
+    #[test]
+    fn registration_names_why_it_was_refused() {
+        let router = ResponseRouter::new();
+        let _rx = router.register_peer(RequestId::new(1)).unwrap();
+        assert_eq!(
+            router.register_peer(RequestId::new(1)).err(),
+            Some(RegisterError::DuplicateId)
+        );
+
+        router.fail_all("gone");
+        assert_eq!(
+            router.register_peer(RequestId::new(2)).err(),
+            Some(RegisterError::Closed)
         );
     }
 

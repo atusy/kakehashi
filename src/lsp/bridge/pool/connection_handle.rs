@@ -1201,7 +1201,7 @@ impl ConnectionHandle {
         let (response_rx, liveness_epoch, settled_rx) = self
             .router()
             .register_peer(request_id)
-            .ok_or_else(|| io::Error::other("bridge: duplicate request ID"))?;
+            .map_err(|error| io::Error::other(error.to_string()))?;
         if let Some(epoch) = liveness_epoch
             && self.state() == ConnectionState::Ready
         {
@@ -1221,7 +1221,7 @@ impl ConnectionHandle {
         let (response_rx, liveness_epoch) = self
             .router()
             .register_with_upstream_liveness(request_id, upstream_id)
-            .ok_or_else(|| io::Error::other("bridge: duplicate request ID"))?;
+            .map_err(|error| io::Error::other(error.to_string()))?;
 
         // If pending went 0->1 and we're in Ready state, start liveness timer
         if let Some(epoch) = liveness_epoch
