@@ -1246,6 +1246,8 @@ fn main() {
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 if command == "mock.peer" {
+                    // Ids 5000-5001 are this flow's server-initiated requests,
+                    // a block apart from applyEdit's 4000 like every other flow.
                     let target_name = message
                         .pointer("/params/arguments/0")
                         .and_then(Value::as_str)
