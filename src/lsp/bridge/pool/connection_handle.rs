@@ -1514,7 +1514,16 @@ mod tests {
             handle.send_notification(huge),
             NotificationSendResult::Queued
         );
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // The child never reads, so once the writer has taken the frame off the
+        // queue the only place it can be is parked mid-write.
+        let dequeued = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while handle.tx.capacity() < handle.tx.max_capacity() {
+            assert!(
+                std::time::Instant::now() < dequeued,
+                "the writer never picked up the frame"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
 
         handle.fail_and_abort_writer();
         assert_eq!(handle.state(), ConnectionState::Failed);
