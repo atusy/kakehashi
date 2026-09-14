@@ -357,17 +357,36 @@ mod tests {
 
     #[test]
     fn lifecycle_methods_are_denied_with_a_machine_readable_reason() {
-        let params = PeerRequestParams {
+        for method in [
+            "initialize",
+            "initialized",
+            "shutdown",
+            "exit",
+            "$/cancelRequest",
+        ] {
+            let params = PeerRequestParams {
+                id: "denols".to_string(),
+                method: method.to_string(),
+                params: OptionalParams::Missing,
+            };
+            let error = validate_params(&params).unwrap_err();
+            assert_eq!(
+                error.code,
+                jsonrpc::ErrorCode::ServerError(-32803),
+                "{method}"
+            );
+            assert_eq!(
+                error.data,
+                Some(serde_json::json!({ "reason": "methodDenied" })),
+                "{method}"
+            );
+        }
+        let allowed = PeerRequestParams {
             id: "denols".to_string(),
-            method: "shutdown".to_string(),
+            method: "textDocument/formatting".to_string(),
             params: OptionalParams::Missing,
         };
-        let error = validate_params(&params).unwrap_err();
-        assert_eq!(error.code, jsonrpc::ErrorCode::ServerError(-32803));
-        assert_eq!(
-            error.data,
-            Some(serde_json::json!({ "reason": "methodDenied" }))
-        );
+        validate_params(&allowed).unwrap();
     }
 
     #[test]
