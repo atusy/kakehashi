@@ -45,9 +45,12 @@ impl<'de> Deserialize<'de> for OptionalParams {
 }
 
 fn request_failed(reason: &'static str, message: impl Into<String>) -> jsonrpc::Error {
+    let message = message.into();
+    // Wrapped transport errors already carry the bridge prefix.
+    let message = message.strip_prefix("bridge: ").unwrap_or(&message);
     jsonrpc::Error {
         code: jsonrpc::ErrorCode::ServerError(-32803),
-        message: Cow::Owned(format!("bridge/peer: {}", message.into())),
+        message: Cow::Owned(format!("bridge/peer: {message}")),
         data: Some(serde_json::json!({ "reason": reason })),
     }
 }
@@ -312,6 +315,15 @@ mod tests {
                 "error": { "code": -32601, "message": "missing" }
             })
         );
+    }
+
+    #[test]
+    fn wrapped_transport_errors_carry_one_prefix() {
+        let error = request_failed(
+            "forwardFailed",
+            crate::lsp::bridge::pool::BridgeError::QueueFull.to_string(),
+        );
+        assert_eq!(error.message, "bridge/peer: request queue full");
     }
 
     #[test]
