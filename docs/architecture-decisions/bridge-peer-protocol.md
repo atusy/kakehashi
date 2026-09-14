@@ -5,7 +5,7 @@
 - [bridge-routing-protocol](bridge-routing-protocol.md) — the existing kakehashi→downstream custom request and the per-side dispatch rule
 - [ls-bridge-message-ordering](ls-bridge-message-ordering.md) — downstream request IDs, cancellation, response routing, and the single-writer connection transport
 - [ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md) — the per-root `ConnectionKey` slots exposed as peers
-- [ls-bridge-timeout-hierarchy](ls-bridge-timeout-hierarchy.md) — the managed downstream-request deadline inherited by peer requests
+- [ls-bridge-timeout-hierarchy](ls-bridge-timeout-hierarchy.md) — the managed downstream-request deadline inherited by peer requests, and the registry entry for the cancelled peer write expiry this decision introduces
 
 ## Context
 
