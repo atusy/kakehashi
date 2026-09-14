@@ -115,7 +115,7 @@ fn peer_command_until_discovered(client: &mut LspClient, target: &str, method: &
 fn downstream_server_discovers_and_proxies_to_a_running_peer() {
     let (mut client, _config_dir) = init_client();
 
-    let report = peer_command_until_discovered(&mut client, "mock-target", "custom/ping");
+    let report = peer_command_until_discovered(&mut client, "mock-target", "custom/echo");
     assert_eq!(
         report["bridgePeer"], true,
         "kakehashi must advertise the peer API in the downstream initialize"
@@ -133,8 +133,15 @@ fn downstream_server_discovers_and_proxies_to_a_running_peer() {
     );
     assert_eq!(
         report["forwarded"]["result"],
-        json!({ "result": null }),
-        "the target's answer (null for an unknown method) is relayed wrapped: {report:?}"
+        json!({
+            "result": {
+                "method": "custom/echo",
+                "hasParams": true,
+                "params": { "probe": true }
+            }
+        }),
+        "the inner method and params must reach the target unchanged and its \
+         answer come back wrapped: {report:?}"
     );
 
     shutdown(&mut client);

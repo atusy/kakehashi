@@ -2298,6 +2298,18 @@ fn main() {
                     .unwrap_or(Value::Null);
                 respond(&mut writer, id, result);
             }
+            // Echoes what arrived so a proxying test can prove the method
+            // and params reached this server unchanged, including whether
+            // `params` was present at all.
+            "custom/echo" => respond(
+                &mut writer,
+                id,
+                json!({
+                    "method": method,
+                    "hasParams": message.get("params").is_some(),
+                    "params": message.get("params"),
+                }),
+            ),
             _ => {
                 // Unknown REQUESTS get a null result so the client never
                 // hangs; notifications are ignored.
