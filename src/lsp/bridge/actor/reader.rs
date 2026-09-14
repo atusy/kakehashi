@@ -2035,7 +2035,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_message_answers_peer_discovery_from_downstream_only() {
+    async fn handle_message_answers_peer_discovery_on_a_downstream_connection() {
         let router = ResponseRouter::new();
         let (deps, (mut response_rx, _upstream_rx, _window_rx)) =
             dummy_server_request_deps_with_rx();

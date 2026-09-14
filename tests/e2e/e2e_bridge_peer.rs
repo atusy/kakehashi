@@ -140,6 +140,23 @@ fn downstream_server_discovers_and_proxies_to_a_running_peer() {
     shutdown(&mut client);
 }
 
+/// The peer methods exist only on downstream connections; the editor-facing
+/// service must not dispatch them (bridge-peer-protocol, per-side dispatch).
+#[test]
+fn peer_methods_are_not_editor_facing() {
+    let (mut client, _config_dir) = init_client();
+
+    for method in ["kakehashi/bridge/peer", "kakehashi/bridge/peer/request"] {
+        let response = client.send_request(method, json!({}));
+        assert_eq!(
+            response["error"]["code"], -32601,
+            "{method} must be MethodNotFound on the editor side: {response:?}"
+        );
+    }
+
+    shutdown(&mut client);
+}
+
 #[test]
 fn lifecycle_methods_are_denied_over_the_wire() {
     let (mut client, _config_dir) = init_client();
