@@ -2,6 +2,7 @@
 
 **Related Decisions**:
 - [bridge-client-control-protocol](bridge-client-control-protocol.md) — the sibling `kakehashi/bridge/*` family (client→kakehashi); the `capabilities.experimental` discovery convention, the stopped set, and the liveness classification this protocol reuses
+- [bridge-peer-protocol](bridge-peer-protocol.md) — the downstream→kakehashi→downstream family that forms the explicit downstream-side dispatch surface
 - [ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md) — the `ConnectionKey` model, per-root pooling, shared instances, and the workspace-folder capability fallback that a `workspaceFolders` override interacts with
 - [aggregation-priorities-wildcard](aggregation-priorities-wildcard.md) — the ordered-allowlist `priorities` semantics reused for provider selection
 - [language-server-bridge-request-strategies](language-server-bridge-request-strategies.md) — the `preferred` strategy whose fan-out/fan-in machinery this protocol dispatches
@@ -428,9 +429,10 @@ costing round trips, and waits, after the first.
 
 Method dispatch is **per side**: the editor-facing custom methods
 (`kakehashi/bridge/client/*` and the rest) are not registered on downstream
-connections, and `kakehashi/bridge/routing` is not an editor-facing method
-— a downstream server sending control-protocol requests back at kakehashi
-is answered `MethodNotFound`, never dispatched.
+connections, and `kakehashi/bridge/routing` is not an editor-facing method.
+The downstream-facing `kakehashi/bridge/peer*` family added by
+bridge-peer-protocol is the explicit exception on that side; it does not make
+the editor-facing control protocol callable from downstream connections.
 
 ### Provider Selection: Aggregation Machinery, `preferred` Dispatch
 

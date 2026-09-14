@@ -19,7 +19,6 @@
 //! been an eager one, not a request) — the same
 //! full-content sync the virt path uses for its `didChange` forwarding.
 
-use std::collections::hash_map::Entry;
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::sync::Arc;
@@ -160,13 +159,16 @@ pub(crate) type HostTextReaderRef<'a> = &'a (dyn Fn() -> Option<(Arc<str>, u64)>
 /// so a delayed connection starts with current text.
 pub(super) async fn sync_host_document<S: MessageSender>(
     sender: &mut S,
-    docs: &mut std::collections::HashMap<(String, ConnectionKey), HostDocSyncState>,
+    docs: &mut std::collections::HashMap<
+        String,
+        std::collections::HashMap<ConnectionKey, HostDocSyncState>,
+    >,
     doc: &HostDocument<'_>,
     live_text_reader: Option<HostTextReaderRef<'_>>,
     connection_key: &ConnectionKey,
 ) -> io::Result<()> {
     let uri_lsp = host_url_to_lsp_uri(doc.uri)?;
-    let key = (doc.uri.to_string(), connection_key.clone());
+    let uri_string = doc.uri.to_string();
     // With a live reader, read the document's CURRENT text under this lock so a
     // late-unparking eager re-sync sends the latest text, not the snapshot it was
     // spawned with (#422); a `None` read (closed mid-sync) falls back to the
@@ -183,28 +185,50 @@ pub(super) async fn sync_host_document<S: MessageSender>(
         .map(|(_, version)| *version)
         .or(doc.revision.map(|revision| revision.content_version));
 
-    match docs.entry(key) {
-        Entry::Vacant(entry) => {
-            let notification = JsonRpcNotification::new(
-                "textDocument/didOpen",
-                DidOpenTextDocumentParams {
-                    text_document: TextDocumentItem::new(
-                        uri_lsp,
-                        doc.language_id.to_string(),
-                        1,
-                        text.to_string(),
-                    ),
+    let did_open = || {
+        JsonRpcNotification::new(
+            "textDocument/didOpen",
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem::new(
+                    uri_lsp.clone(),
+                    doc.language_id.to_string(),
+                    1,
+                    text.to_string(),
+                ),
+            },
+        )
+    };
+
+    // Steady-state resyncs find both levels present; look up by borrowed
+    // key and clone only on the miss path that inserts.
+    let Some(connections) = docs.get_mut(&uri_string) else {
+        sender.send_notification(did_open()).await?;
+        docs.insert(
+            uri_string,
+            std::collections::HashMap::from([(
+                connection_key.clone(),
+                HostDocSyncState {
+                    version: 1,
+                    fingerprint: fp,
+                    content_version,
+                },
+            )]),
+        );
+        return Ok(());
+    };
+    match connections.get_mut(connection_key) {
+        None => {
+            sender.send_notification(did_open()).await?;
+            connections.insert(
+                connection_key.clone(),
+                HostDocSyncState {
+                    version: 1,
+                    fingerprint: fp,
+                    content_version,
                 },
             );
-            sender.send_notification(notification).await?;
-            entry.insert(HostDocSyncState {
-                version: 1,
-                fingerprint: fp,
-                content_version,
-            });
         }
-        Entry::Occupied(mut entry) => {
-            let state = entry.get_mut();
+        Some(state) => {
             // Two requests of the same lifetime can reach this lock in the
             // reverse of the order their text was read in; syncing the older
             // text would roll the downstream back to it, and the request's
@@ -296,7 +320,10 @@ impl LanguageServerPool {
 
         let mut docs = self.host_documents().await;
         for (connection_key, handle) in &handles {
-            if !docs.contains_key(&(uri_string.clone(), connection_key.clone())) {
+            if !docs
+                .get(&uri_string)
+                .is_some_and(|connections| connections.contains_key(connection_key))
+            {
                 continue;
             }
             let notification = JsonRpcNotification::new(
@@ -310,12 +337,13 @@ impl LanguageServerPool {
             handle.send_notification(notification);
         }
         let closed_keys = docs
-            .keys()
-            .filter(|(doc_uri, _)| doc_uri == &uri_string)
+            .get(&uri_string)
+            .into_iter()
+            .flat_map(|connections| connections.keys())
             .cloned()
-            .map(|(doc_uri, connection_key)| (connection_key, doc_uri))
+            .map(|connection_key| (connection_key, uri_string.clone()))
             .collect::<Vec<_>>();
-        docs.retain(|(doc_uri, _), _| *doc_uri != uri_string);
+        docs.remove(&uri_string);
         for key in closed_keys {
             self.invalidate_diagnostic_document(&key);
         }
@@ -390,7 +418,10 @@ impl LanguageServerPool {
             let Some(include_text) = handle.did_save_include_text() else {
                 continue;
             };
-            let Some(state) = docs.get_mut(&(uri_string.clone(), connection_key.clone())) else {
+            let Some(state) = docs
+                .get_mut(&uri_string)
+                .and_then(|connections| connections.get_mut(connection_key))
+            else {
                 continue;
             };
             let mut sender = ConnectionHandleSender(handle);
@@ -440,7 +471,10 @@ impl LanguageServerPool {
             if !can_notify_host_document(handle, &supports) {
                 continue;
             }
-            if !docs.contains_key(&(uri_string.clone(), connection_key.clone())) {
+            if !docs
+                .get(&uri_string)
+                .is_some_and(|connections| connections.contains_key(connection_key))
+            {
                 continue;
             }
             let notification = JsonRpcNotification::new(method, params);
@@ -689,7 +723,8 @@ impl LanguageServerPool {
         let document_is_open = self
             .host_documents()
             .await
-            .contains_key(&(cache_key.1.clone(), cache_key.0.clone()));
+            .get(&cache_key.1)
+            .is_some_and(|connections| connections.contains_key(&cache_key.0));
         let report = match report {
             Ok(report) => report,
             Err(error) => {
@@ -1267,6 +1302,39 @@ mod tests {
         }
     }
 
+    struct FailingSender;
+
+    impl MessageSender for FailingSender {
+        async fn send_notification<P: serde::Serialize + Send>(
+            &mut self,
+            _notification: JsonRpcNotification<P>,
+        ) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "test backpressure",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_initial_sync_does_not_publish_an_empty_uri_bucket() {
+        let mut docs = std::collections::HashMap::new();
+        let uri = Url::parse("file:///test/failed.md").unwrap();
+
+        let error = sync_host_document(
+            &mut FailingSender,
+            &mut docs,
+            &host_doc(&uri, "text"),
+            None,
+            &ConnectionKey::for_server("srv"),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(!docs.contains_key(uri.as_str()));
+    }
+
     #[tokio::test]
     async fn sync_sends_didopen_once_then_versioned_didchange_on_drift() {
         use crate::lsp::bridge::actor::OutboundMessage;
@@ -1496,16 +1564,16 @@ mod tests {
         let uri_b = Url::parse("file:///test/b.md").unwrap();
         {
             let mut docs = pool.host_documents().await;
-            docs.insert(
-                (uri_a.to_string(), ConnectionKey::for_server("srv")),
+            docs.entry(uri_a.to_string()).or_default().insert(
+                ConnectionKey::for_server("srv"),
                 HostDocSyncState {
                     version: 1,
                     fingerprint: 1,
                     content_version: None,
                 },
             );
-            docs.insert(
-                (uri_b.to_string(), ConnectionKey::for_server("srv")),
+            docs.entry(uri_b.to_string()).or_default().insert(
+                ConnectionKey::for_server("srv"),
                 HostDocSyncState {
                     version: 1,
                     fingerprint: 2,
@@ -1518,11 +1586,13 @@ mod tests {
 
         let docs = pool.host_documents().await;
         assert!(
-            !docs.contains_key(&(uri_a.to_string(), ConnectionKey::for_server("srv"))),
+            !docs.contains_key(uri_a.as_str()),
             "closed uri's state must be dropped"
         );
         assert!(
-            docs.contains_key(&(uri_b.to_string(), ConnectionKey::for_server("srv"))),
+            docs.get(uri_b.as_str()).is_some_and(
+                |connections| connections.contains_key(&ConnectionKey::for_server("srv"))
+            ),
             "other documents must be untouched"
         );
     }

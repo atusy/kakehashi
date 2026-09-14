@@ -31,6 +31,7 @@ The async bridge architecture defines timeout systems across several decisions:
 7. **Binding-Reuse Validation Budget** (bridge-routing-protocol): Bounds the *caller's wait* on filesystem revalidation along binding-driven reuse paths — capped by the sweep's remaining budget on re-open sweeps, a dedicated implementation-defined budget on lazy-open/retry paths, and the global shutdown ceiling always. It does not bound the underlying OS call or its worker capacity, which may outlive every deadline (capacity returns only when the call does)
 8. **Per-Downstream Response Cap** (language-server-bridge): A flat 30s bound on each bridge-managed downstream request — excluding control-protocol pass-through, the lifecycle handshake, and routing-provider requests; shipped, and not a tier (see the dedicated section below)
 9. **Inbound Response-Send Bound** (ls-bridge-message-ordering): Bounds how long the reader waits to hand a response to a *downstream-initiated* request onto the wire — 5s-class, capped by the earliest active lifecycle deadline, and on expiry the connection fails by conditional compare-transition from its current state
+10. **Cancelled Peer Write Expiry** (bridge-peer-protocol): Bounds how long a cancelled downstream peer request may sit claimed by the target's writer without its write completing — one response cap from the claim; on expiry the target connection fails, its writer is aborted, and every request pending on it is answered (see the dedicated section below)
 
 ### The Problem
 
@@ -168,19 +169,54 @@ Global Shutdown overrides all (highest priority)
 bound this hierarchy did not previously register):
 - **Duration**: 30s fixed
 - **Scope**: bridge-managed downstream requests, one wait at a time —
-  **not** control-protocol pass-through, which carries no bridge-imposed
-  timeout by contract (bridge-client-control-protocol); not the lifecycle
+  including downstream peer requests, which are bridge-managed by
+  bridge-peer-protocol; **not** control-protocol pass-through, which
+  carries no bridge-imposed timeout by contract
+  (bridge-client-control-protocol); not the lifecycle
   handshake, which the shutdown deadline bounds; and not routing-provider
   requests, whose routing deadline is their sole bound
   (bridge-routing-protocol) and is shorter besides. It is also
   neither tier: Tier 1 engages only for a multi-server fan-out and is still
   Phase 3, and Tier 2 resets on any decoded server message, so it bounds
   *silence* rather than a request
-- **On expiry**: that request alone fails; the connection is not faulted
+- **On expiry**: that request alone fails; the connection is not faulted.
+  A frame the writer is still writing at expiry stays tracked as cancelled
+  until that write completes, so Tier 2 keeps observing a stalled writer
+  (at most one frame per connection can be mid-write); completion retires it
 - **Precedence**: connection closure and the shutdown deadline both cut it
   short, so it never extends a teardown
 - **Status**: shipped, and the reason the absence of Tier 1 is not currently
   observable as an unbounded request
+
+**Cancelled Peer Write Expiry** (**not a tier** — a connection-faulting
+bound registered here):
+- **Duration**: one per-downstream response cap, counted from the instant
+  the target's writer claimed the cancelled frame — never from the outer
+  request's acceptance, so time spent queued behind earlier frames does not
+  count
+- **Scope**: a downstream peer request (bridge-peer-protocol) whose caller
+  stopped waiting, by cancelling or by reaching the response cap, while its
+  write was in progress. One whose write completed is retired without
+  touching the connection once the target answers or the cap passes
+- **Why a separate bound**: Tier 2 resets on every decoded downstream
+  message, so a server that stops reading stdin while still emitting
+  progress or log notifications never trips it, and the parked write would
+  pin the writer task and the child indefinitely. The cancelled request is
+  the one case with no waiter left to time out, so kakehashi must decide the
+  connection's fate itself; an uncancelled request's response cap already
+  retires it alone
+- **On expiry**: the write has not completed within a full cap of its claim
+  (only whole-frame completion is observable, so slow steady consumption
+  past the cap counts the same), and the target is treated as wedged on
+  stdin — `Ready` → `Failed`, request
+  admission closed, every pending request on it answered (an internal
+  error, or `RequestCancelled` for one already cancelled while queued), the
+  writer task aborted (which force-kills the child); the pool replaces the
+  slot on the next request as for any failed connection
+- **Precedence**: settlement of the entry (a late answer, or any drain)
+  cancels the timer; a graceful shutdown that has already reclaimed the
+  writer leaves nothing to abort and bounds the child by its own deadline;
+  the global shutdown ceiling applies as everywhere
 
 ## Consequences
 
@@ -192,7 +228,7 @@ bound this hierarchy did not previously register):
 
 ### Negative
 
-- **Multiple concepts**: Three timeout *tiers* in Phase 1 (four in Phase 3), plus the tier-exempt deadlines registered here (per-slot control shutdown, routing decision, binding-reuse validation, per-downstream response cap, inbound response-send bound)
+- **Multiple concepts**: Three timeout *tiers* in Phase 1 (four in Phase 3), plus the tier-exempt deadlines registered here (per-slot control shutdown, routing decision, binding-reuse validation, per-downstream response cap, inbound response-send bound, cancelled peer write expiry)
 - **Tuning required**: Implementation-defined values need careful selection
 
 ### Neutral
@@ -226,6 +262,7 @@ Let implementation details determine which timeout wins.
 - **[ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md)**: Per-request timeout *(Phase 3)*
 - **[ls-bridge-graceful-shutdown](ls-bridge-graceful-shutdown.md)**: Global shutdown timeout
 - **[bridge-routing-protocol](bridge-routing-protocol.md)**: Routing decision deadline and binding-reuse validation budget; Tier-1/Tier-2 exemptions for routing queries
+- **[bridge-peer-protocol](bridge-peer-protocol.md)**: Downstream peer requests as bridge-managed requests under the response cap and Tier 2; the cancelled peer write expiry
 
 ## Summary
 

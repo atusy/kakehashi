@@ -49,6 +49,9 @@ struct ResponseRouterState {
     liveness_epoch: u64,
     /// Pending requests waiting for responses.
     pending: HashMap<RequestId, PendingRequest>,
+    /// Out-of-band provenance for responses synthesized by bridge failures,
+    /// recorded only for entries registered with `track_failure`.
+    failures: HashMap<RequestId, BridgeFailure>,
     /// Maps upstream request ID (from client) to downstream request IDs (to LS).
     ///
     /// Used for $/cancelRequest forwarding: when the client cancels request 42,
@@ -72,7 +75,22 @@ struct ResponseRouterState {
 
 struct PendingRequest {
     response_tx: oneshot::Sender<serde_json::Value>,
+    /// Present when a cleanup task watches this entry's settlement (peer
+    /// requests): it waits for the sender to drop when the entry leaves the
+    /// map, without retaining the response receiver itself. Absent, nothing
+    /// will ever retire a cancelled entry after its write completes, so
+    /// `mark_sent` retires it directly.
+    settled_tx: Option<oneshot::Sender<()>>,
     delivery: RequestDelivery,
+    /// When the FIFO writer claimed this request's bytes. A cancelled peer
+    /// write is judged wedged by its age since this instant, not by the
+    /// request's own deadline, because a frame can sit queued behind earlier
+    /// traffic for most of that deadline. Only whole-frame completion is
+    /// observable.
+    write_claimed_at: Option<tokio::time::Instant>,
+    /// The waiter distinguishes bridge transport failure from a genuine
+    /// downstream JSON-RPC error via [`ResponseRouter::take_failure`].
+    track_failure: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -81,12 +99,61 @@ enum RequestDelivery {
     Writing,
     Sent,
     CancelledQueued,
+    CancelledWriting,
+    CancelledSent,
 }
 
 pub(crate) enum LivenessExpiry {
     Stale { current_epoch: u64 },
     Idle,
     Failed { pending_count: usize },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BridgeFailure {
+    ConnectionLost,
+    RequestTimeout,
+}
+
+/// A peer request's response receiver, the liveness epoch it started (if
+/// any), and the receiver that fires when its router entry settles.
+pub(in crate::lsp::bridge) type PeerRegistration = (
+    oneshot::Receiver<serde_json::Value>,
+    Option<u64>,
+    oneshot::Receiver<()>,
+);
+
+/// Why a registration was refused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::lsp::bridge) enum RegisterError {
+    /// The connection's reader or writer is terminal; nothing registers again.
+    Closed,
+    /// A request with this id is still pending.
+    DuplicateId,
+}
+
+impl std::fmt::Display for RegisterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Closed => "bridge: connection no longer accepts requests",
+            Self::DuplicateId => "bridge: duplicate request ID",
+        })
+    }
+}
+
+/// Outcome of [`ResponseRouter::expire_peer_cancel`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PeerCancelExpiry {
+    /// The entry is gone: it settled earlier, or its write had completed and
+    /// the entry was retired now without touching the connection.
+    Settled,
+    /// The write is in progress but younger than the budget; check again once
+    /// it would have consumed a full budget since the writer claimed it.
+    WriteInProgress { until: tokio::time::Instant },
+    /// The write consumed a full budget without completing. Admission is
+    /// closed and every waiter has been failed; the caller must abort the
+    /// writer, which will otherwise stay parked on the child's stdin.
+    Wedged,
 }
 
 impl ResponseRouter {
@@ -97,6 +164,7 @@ impl ResponseRouter {
                 accepting: true,
                 liveness_epoch: 0,
                 pending: HashMap::new(),
+                failures: HashMap::new(),
                 upstream_to_downstream: HashMap::new(),
                 downstream_to_upstream: HashMap::new(),
             }),
@@ -118,32 +186,55 @@ impl ResponseRouter {
     ///
     /// Like `register()`, but also stores an upstream→downstream ID mapping so
     /// `$/cancelRequest` can be translated and forwarded. `upstream_id` is `None`
-    /// for internal requests. Returns `None` if the downstream ID is already pending.
+    /// for internal requests. Returns `None` if the downstream ID is already
+    /// pending or the router is closed.
     pub(crate) fn register_with_upstream(
         &self,
         downstream_id: RequestId,
         upstream_id: Option<UpstreamId>,
     ) -> Option<oneshot::Receiver<serde_json::Value>> {
         self.register_with_upstream_liveness(downstream_id, upstream_id)
+            .ok()
             .map(|(rx, _)| rx)
     }
 
     /// Register and atomically report whether this request transitions the
     /// set of downstream-progressing requests from empty to non-empty.
-    pub(crate) fn register_with_upstream_liveness(
+    pub(in crate::lsp::bridge) fn register_with_upstream_liveness(
         &self,
         downstream_id: RequestId,
         upstream_id: Option<UpstreamId>,
-    ) -> Option<(oneshot::Receiver<serde_json::Value>, Option<u64>)> {
+    ) -> Result<(oneshot::Receiver<serde_json::Value>, Option<u64>), RegisterError> {
+        self.register_with_upstream_liveness_mode(downstream_id, upstream_id, false, None)
+    }
+
+    pub(in crate::lsp::bridge) fn register_peer(
+        &self,
+        downstream_id: RequestId,
+    ) -> Result<PeerRegistration, RegisterError> {
+        let (settled_tx, settled_rx) = oneshot::channel();
+        self.register_with_upstream_liveness_mode(downstream_id, None, true, Some(settled_tx))
+            .map(|(response_rx, epoch)| (response_rx, epoch, settled_rx))
+    }
+
+    fn register_with_upstream_liveness_mode(
+        &self,
+        downstream_id: RequestId,
+        upstream_id: Option<UpstreamId>,
+        track_failure: bool,
+        settled_tx: Option<oneshot::Sender<()>>,
+    ) -> Result<(oneshot::Receiver<serde_json::Value>, Option<u64>), RegisterError> {
         let (tx, rx) = oneshot::channel();
         let mut state = self
             .state
             .lock()
-            .recover_poison("ResponseRouter::register_with_upstream");
+            .recover_poison("ResponseRouter::register_with_upstream_liveness_mode");
 
-        // Prevent duplicate registration
-        if !state.accepting || state.pending.contains_key(&downstream_id) {
-            return None;
+        if !state.accepting {
+            return Err(RegisterError::Closed);
+        }
+        if state.pending.contains_key(&downstream_id) {
+            return Err(RegisterError::DuplicateId);
         }
         let starts_liveness = state
             .pending
@@ -158,7 +249,10 @@ impl ResponseRouter {
             downstream_id,
             PendingRequest {
                 response_tx: tx,
+                settled_tx,
                 delivery: RequestDelivery::Queued,
+                write_claimed_at: None,
+                track_failure,
             },
         );
 
@@ -174,7 +268,7 @@ impl ResponseRouter {
             state.downstream_to_upstream.insert(downstream_id, upstream);
         }
 
-        Some((rx, liveness_epoch))
+        Ok((rx, liveness_epoch))
     }
 
     pub(crate) fn liveness_epoch(&self) -> u64 {
@@ -247,7 +341,9 @@ impl ResponseRouter {
                     pending.delivery = RequestDelivery::CancelledQueued;
                 }
                 RequestDelivery::Writing | RequestDelivery::Sent => sent.push(id),
-                RequestDelivery::CancelledQueued => {}
+                RequestDelivery::CancelledQueued
+                | RequestDelivery::CancelledWriting
+                | RequestDelivery::CancelledSent => {}
             }
         }
         (true, sent)
@@ -267,9 +363,15 @@ impl ResponseRouter {
         match pending.delivery {
             RequestDelivery::Queued => {
                 pending.delivery = RequestDelivery::Writing;
+                pending.write_claimed_at = Some(tokio::time::Instant::now());
                 return true;
             }
-            RequestDelivery::Writing | RequestDelivery::Sent => return false,
+            RequestDelivery::Writing
+            | RequestDelivery::Sent
+            | RequestDelivery::CancelledWriting
+            | RequestDelivery::CancelledSent => {
+                return false;
+            }
             RequestDelivery::CancelledQueued => {}
         }
 
@@ -290,15 +392,31 @@ impl ResponseRouter {
     }
 
     /// Record successful completion of the writer-side request write.
+    ///
+    /// A cancelled entry that nothing watches was kept only as evidence of a
+    /// stalled writer; once its write completes that evidence is moot and
+    /// its waiter is long gone, so it is retired here and the target's late
+    /// answer is dropped as unknown. A watched entry (a peer request) moves
+    /// to `CancelledSent` so its cleanup can absorb the answer or expire it.
     pub(crate) fn mark_sent(&self, id: RequestId) {
         let mut state = self
             .state
             .lock()
             .recover_poison("ResponseRouter::mark_sent");
-        if let Some(pending) = state.pending.get_mut(&id)
-            && pending.delivery == RequestDelivery::Writing
-        {
-            pending.delivery = RequestDelivery::Sent;
+        let Some(pending) = state.pending.get_mut(&id) else {
+            return;
+        };
+        match pending.delivery {
+            RequestDelivery::Writing => pending.delivery = RequestDelivery::Sent,
+            RequestDelivery::CancelledWriting if pending.settled_tx.is_some() => {
+                pending.delivery = RequestDelivery::CancelledSent;
+            }
+            RequestDelivery::CancelledWriting => {
+                state.pending.remove(&id);
+                state.failures.remove(&id);
+                Self::remove_cancel_mapping_inner(&mut state, id);
+            }
+            _ => {}
         }
     }
 
@@ -368,6 +486,17 @@ impl ResponseRouter {
         state.pending.len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn pending_ids(&self) -> Vec<RequestId> {
+        self.state
+            .lock()
+            .recover_poison("ResponseRouter::pending_ids")
+            .pending
+            .keys()
+            .copied()
+            .collect()
+    }
+
     /// Requests that can still make downstream progress. Cancelled queued
     /// entries remain only until the FIFO writer discards them.
     pub(crate) fn awaiting_downstream_count(&self) -> usize {
@@ -391,12 +520,169 @@ impl ResponseRouter {
     pub(crate) fn remove(&self, id: RequestId) -> bool {
         let mut state = self.state.lock().recover_poison("ResponseRouter::remove");
         let removed = state.pending.remove(&id).is_some();
+        state.failures.remove(&id);
 
         if removed {
             Self::remove_cancel_mapping_inner(&mut state, id);
         }
 
         removed
+    }
+
+    /// Retire a request whose waiter gave up at its deadline; returns whether
+    /// the entry was removed.
+    ///
+    /// An entry the writer is still writing is kept as cancelled instead:
+    /// removing it would hide a stalled frame from the liveness timer, which
+    /// counts only pending entries, and a target that stopped reading stdin
+    /// would then look idle while every later frame queued behind it timed
+    /// out alone. Kept, the frame's late completion still moves it to
+    /// `CancelledSent`, so the target's eventual answer is absorbed.
+    pub(crate) fn retire_on_timeout(&self, id: RequestId) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .recover_poison("ResponseRouter::retire_on_timeout");
+        match state.pending.get_mut(&id) {
+            None => false,
+            Some(pending) if pending.delivery == RequestDelivery::Writing => {
+                pending.delivery = RequestDelivery::CancelledWriting;
+                false
+            }
+            Some(_) => {
+                state.pending.remove(&id);
+                state.failures.remove(&id);
+                Self::remove_cancel_mapping_inner(&mut state, id);
+                true
+            }
+        }
+    }
+
+    /// Mark a peer request cancelled and report whether its downstream write
+    /// had started, which requires an exact `$/cancelRequest`.
+    ///
+    /// A request still queued is dropped here. One whose write started stays
+    /// pending as cancelled until the target answers or the cleanup task
+    /// expires it, so its response (or its wedged write) is still observed.
+    /// `None` means the entry had already settled.
+    pub(crate) fn cancel_peer(&self, id: RequestId) -> Option<bool> {
+        let mut state = self
+            .state
+            .lock()
+            .recover_poison("ResponseRouter::cancel_peer");
+        let pending = state.pending.get_mut(&id)?;
+        match pending.delivery {
+            RequestDelivery::Queued => {
+                state.pending.remove(&id);
+                state.failures.remove(&id);
+                Self::remove_cancel_mapping_inner(&mut state, id);
+                Some(false)
+            }
+            RequestDelivery::Writing => {
+                pending.delivery = RequestDelivery::CancelledWriting;
+                Some(true)
+            }
+            RequestDelivery::Sent => {
+                pending.delivery = RequestDelivery::CancelledSent;
+                Some(true)
+            }
+            // Peer requests carry no upstream id, so the writer-discard state
+            // is unreachable here; treating it like an already cancelled
+            // entry keeps the match exhaustive without inventing a path.
+            RequestDelivery::CancelledQueued
+            | RequestDelivery::CancelledWriting
+            | RequestDelivery::CancelledSent => Some(false),
+        }
+    }
+
+    /// Expire one cancelled peer request whose cleanup timer fired.
+    ///
+    /// Only a write still incomplete a full `write_budget` after the writer
+    /// claimed it counts as wedged: the request deadline this timer was armed
+    /// with also covers time spent queued behind earlier frames, so a frame
+    /// claimed late is given a fresh budget instead of faulting a healthy
+    /// connection. On a wedged write, admission is closed and every pending
+    /// entry is drained under one lock, so no waiter is lost and no new
+    /// request slips in; the drained waiters are failed after the lock is
+    /// released. A write that finishes in the same instant as the check is
+    /// still treated as wedged: a frame that took a full budget has already
+    /// earned that verdict, whether it stalled or merely crawled.
+    pub(crate) fn expire_peer_cancel(
+        &self,
+        id: RequestId,
+        write_budget: std::time::Duration,
+    ) -> PeerCancelExpiry {
+        let mut state = self
+            .state
+            .lock()
+            .recover_poison("ResponseRouter::expire_peer_cancel");
+        match state
+            .pending
+            .get(&id)
+            .map(|pending| (pending.delivery, pending.write_claimed_at))
+        {
+            // A writing entry always carries its claim instant: only
+            // `claim_for_write` produces `Writing`, and it records the instant.
+            Some((RequestDelivery::CancelledWriting, Some(claimed_at))) => {
+                let until = claimed_at + write_budget;
+                if until > tokio::time::Instant::now() {
+                    return PeerCancelExpiry::WriteInProgress { until };
+                }
+            }
+            Some((RequestDelivery::CancelledSent, _)) => {
+                state.pending.remove(&id);
+                state.failures.remove(&id);
+                Self::remove_cancel_mapping_inner(&mut state, id);
+                return PeerCancelExpiry::Settled;
+            }
+            _ => return PeerCancelExpiry::Settled,
+        }
+
+        state.accepting = false;
+        let entries = state.pending.drain().collect::<Vec<_>>();
+        for (request_id, pending) in &entries {
+            if pending.track_failure {
+                let failure = if *request_id == id {
+                    BridgeFailure::RequestTimeout
+                } else {
+                    BridgeFailure::ConnectionLost
+                };
+                state.failures.insert(*request_id, failure);
+            }
+        }
+        state.upstream_to_downstream.clear();
+        state.downstream_to_upstream.clear();
+        drop(state);
+        self.terminal.notify_waiters();
+        for (request_id, pending) in entries {
+            let (code, message) = if pending.delivery == RequestDelivery::CancelledQueued {
+                (-32800, "bridge: request cancelled before downstream write")
+            } else if request_id == id {
+                (-32603, "bridge: cancelled peer write timed out")
+            } else {
+                (-32603, "bridge: connection failed after peer write timeout")
+            };
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request_id.as_i64(),
+                "error": {
+                    "code": code,
+                    "message": message
+                }
+            });
+            if pending.response_tx.send(response).is_err() {
+                self.take_failure(request_id);
+            }
+        }
+        PeerCancelExpiry::Wedged
+    }
+
+    pub(crate) fn take_failure(&self, id: RequestId) -> Option<BridgeFailure> {
+        let mut state = self
+            .state
+            .lock()
+            .recover_poison("ResponseRouter::take_failure");
+        state.failures.remove(&id)
     }
 
     /// Fail a single pending request with an error response.
@@ -415,6 +701,12 @@ impl ResponseRouter {
             .recover_poison("ResponseRouter::fail_request");
 
         let pending = state.pending.remove(&id);
+        if pending
+            .as_ref()
+            .is_some_and(|pending| pending.track_failure)
+        {
+            state.failures.insert(id, BridgeFailure::ConnectionLost);
+        }
 
         // Clean up bidirectional cancel map entries in O(1)
         Self::remove_cancel_mapping_inner(&mut state, id);
@@ -432,7 +724,9 @@ impl ResponseRouter {
                         "message": format!("bridge: {}", reason)
                     }
                 });
-                let _ = pending.response_tx.send(error_response);
+                if pending.response_tx.send(error_response).is_err() {
+                    self.take_failure(id);
+                }
                 true
             }
             None => false,
@@ -451,6 +745,11 @@ impl ResponseRouter {
         let mut state = self.state.lock().recover_poison("ResponseRouter::fail_all");
         state.accepting = false;
         let entries: Vec<_> = state.pending.drain().collect();
+        for (id, pending) in &entries {
+            if pending.track_failure {
+                state.failures.insert(*id, BridgeFailure::ConnectionLost);
+            }
+        }
 
         // Clear both cancel map directions
         state.upstream_to_downstream.clear();
@@ -474,7 +773,9 @@ impl ResponseRouter {
                     "message": message
                 }
             });
-            let _ = pending.response_tx.send(error_response);
+            if pending.response_tx.send(error_response).is_err() {
+                self.take_failure(id);
+            }
         }
     }
 
@@ -509,6 +810,11 @@ impl ResponseRouter {
         // Publish the connection failure before waking any drained waiter.
         state.accepting = false;
         let entries: Vec<_> = state.pending.drain().collect();
+        for (id, pending) in &entries {
+            if pending.track_failure {
+                state.failures.insert(*id, BridgeFailure::ConnectionLost);
+            }
+        }
         state.upstream_to_downstream.clear();
         state.downstream_to_upstream.clear();
         drop(state);
@@ -529,7 +835,9 @@ impl ResponseRouter {
                     "message": message
                 }
             });
-            let _ = pending.response_tx.send(error_response);
+            if pending.response_tx.send(error_response).is_err() {
+                self.take_failure(id);
+            }
         }
         LivenessExpiry::Failed {
             pending_count: awaiting,
@@ -588,6 +896,7 @@ mod tests {
     fn new_router_has_no_pending_requests() {
         let router = ResponseRouter::new();
         assert_eq!(router.pending_count(), 0);
+        assert_eq!(router.awaiting_downstream_count(), 0);
     }
 
     #[test]
@@ -611,6 +920,21 @@ mod tests {
         let rx2 = router.register(id);
         assert!(rx2.is_none(), "duplicate ID should return None");
         assert_eq!(router.pending_count(), 1, "count should not increase");
+    }
+
+    #[test]
+    fn cancel_peer_notifies_only_after_downstream_write_starts() {
+        let router = ResponseRouter::new();
+        let queued = RequestId::new(1);
+        let writing = RequestId::new(2);
+        let _queued_rx = router.register(queued).unwrap();
+        let _writing_rx = router.register(writing).unwrap();
+        assert!(router.claim_for_write(writing));
+
+        assert_eq!(router.cancel_peer(queued), Some(false));
+        assert_eq!(router.cancel_peer(writing), Some(true));
+        assert_eq!(router.pending_count(), 1);
+        assert_eq!(router.awaiting_downstream_count(), 1);
     }
 
     #[tokio::test]
@@ -851,6 +1175,205 @@ mod tests {
             router.register(RequestId::new(2)).is_none(),
             "a terminal router must reject new requests"
         );
+    }
+
+    /// A frame the writer is still writing when its waiter times out must
+    /// stay pending: it is the only evidence of a stalled writer the liveness
+    /// timer can see. Once the write completes that evidence is moot, and an
+    /// unwatched entry must not linger waiting for an answer nobody wants.
+    #[tokio::test]
+    async fn timed_out_write_in_progress_stays_visible_until_it_completes() {
+        let router = ResponseRouter::new();
+        let writing = RequestId::new(1);
+        let queued = RequestId::new(2);
+        let _writing_rx = router.register(writing).unwrap();
+        let _queued_rx = router.register(queued).unwrap();
+        assert!(router.claim_for_write(writing));
+
+        assert!(
+            !router.retire_on_timeout(writing),
+            "a frame being written is kept"
+        );
+        assert!(
+            router.retire_on_timeout(queued),
+            "a frame never claimed is dropped"
+        );
+        assert_eq!(router.awaiting_downstream_count(), 1);
+
+        router.mark_sent(writing);
+        assert_eq!(
+            router.pending_count(),
+            0,
+            "completion retires the unwatched entry"
+        );
+        assert_eq!(
+            router.route(serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": null })),
+            RouteResult::NotFound
+        );
+    }
+
+    /// A watched (peer) entry keeps the cancelled-sent state on completion so
+    /// its cleanup task can absorb the answer or expire it.
+    #[tokio::test]
+    async fn watched_cancelled_write_stays_pending_after_completion() {
+        let router = ResponseRouter::new();
+        let peer_id = RequestId::new(1);
+        let (rx, _epoch, mut settled_rx) = router.register_peer(peer_id).unwrap();
+        assert!(router.claim_for_write(peer_id));
+        assert_eq!(router.cancel_peer(peer_id), Some(true));
+        drop(rx);
+
+        router.mark_sent(peer_id);
+        assert_eq!(router.pending_count(), 1);
+        assert!(
+            matches!(
+                settled_rx.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ),
+            "not yet settled"
+        );
+        assert_eq!(
+            router.route(serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": null })),
+            RouteResult::ReceiverDropped
+        );
+        assert_eq!(router.pending_count(), 0);
+    }
+
+    #[test]
+    fn registration_names_why_it_was_refused() {
+        let router = ResponseRouter::new();
+        let _rx = router.register_peer(RequestId::new(1)).unwrap();
+        assert_eq!(
+            router.register_peer(RequestId::new(1)).err(),
+            Some(RegisterError::DuplicateId)
+        );
+
+        router.fail_all("gone");
+        assert_eq!(
+            router.register_peer(RequestId::new(2)).err(),
+            Some(RegisterError::Closed)
+        );
+    }
+
+    #[test]
+    fn connection_liveness_expiry_is_not_a_peer_request_deadline() {
+        let router = ResponseRouter::new();
+        let (_older_rx, epoch) = router
+            .register_with_upstream_liveness(RequestId::new(1), None)
+            .unwrap();
+        let (_peer_rx, peer_epoch, _settled_rx) = router.register_peer(RequestId::new(2)).unwrap();
+        assert_eq!(
+            peer_epoch, None,
+            "the older request owns the liveness timer"
+        );
+
+        assert!(matches!(
+            router.fail_all_if_awaiting_downstream(epoch.unwrap(), "expired", || {}),
+            LivenessExpiry::Failed { pending_count: 2 }
+        ));
+        assert_eq!(
+            router.take_failure(RequestId::new(2)),
+            Some(BridgeFailure::ConnectionLost),
+            "a later peer request is a victim of connection-wide liveness failure"
+        );
+    }
+
+    /// The budget the peer cleanup passes in production, so these tests model
+    /// the real cap rather than a number that drifts from it.
+    const WRITE_BUDGET: std::time::Duration = crate::lsp::bridge::pool::REQUEST_TIMEOUT;
+
+    #[tokio::test(start_paused = true)]
+    async fn peer_write_expiry_distinguishes_connection_failure_victims() {
+        let router = ResponseRouter::new();
+        let peer_id = RequestId::new(1);
+        let (peer_rx, _epoch, _settled_rx) = router.register_peer(peer_id).unwrap();
+        assert!(router.claim_for_write(peer_id));
+        assert_eq!(router.cancel_peer(peer_id), Some(true));
+        let victim_id = RequestId::new(2);
+        let victim_rx = router.register(victim_id).unwrap();
+
+        tokio::time::advance(WRITE_BUDGET).await;
+        assert_eq!(
+            router.expire_peer_cancel(peer_id, WRITE_BUDGET),
+            PeerCancelExpiry::Wedged
+        );
+        assert!(!router.is_accepting());
+        let peer_error = peer_rx.await.unwrap();
+        let victim_error = victim_rx.await.unwrap();
+        assert_eq!(
+            peer_error["error"]["message"],
+            "bridge: cancelled peer write timed out"
+        );
+        assert_eq!(
+            victim_error["error"]["message"],
+            "bridge: connection failed after peer write timeout"
+        );
+    }
+
+    /// A cancelled request whose write completed is merely awaiting an answer
+    /// the caller no longer wants; expiring it retires the entry and must
+    /// leave the connection and its other requests untouched.
+    #[tokio::test(start_paused = true)]
+    async fn expiring_a_sent_peer_cancel_keeps_the_connection() {
+        let router = ResponseRouter::new();
+        let peer_id = RequestId::new(1);
+        let (_peer_rx, _epoch, settled_rx) = router.register_peer(peer_id).unwrap();
+        let mut bystander_rx = router.register(RequestId::new(2)).unwrap();
+        assert!(router.claim_for_write(peer_id));
+        router.mark_sent(peer_id);
+        assert_eq!(router.cancel_peer(peer_id), Some(true));
+        tokio::time::advance(WRITE_BUDGET).await;
+
+        assert_eq!(
+            router.expire_peer_cancel(peer_id, WRITE_BUDGET),
+            PeerCancelExpiry::Settled
+        );
+        assert!(router.is_accepting());
+        assert_eq!(
+            router.pending_count(),
+            1,
+            "only the cancelled entry is retired"
+        );
+        assert!(
+            settled_rx.await.is_err(),
+            "retiring the entry settles its cleanup"
+        );
+        assert!(bystander_rx.try_recv().is_err(), "no bystander was failed");
+    }
+
+    /// A frame can wait in the FIFO for most of its request deadline; the
+    /// wedge verdict must count from the writer's claim, or a healthy
+    /// connection that merely dequeued the frame late is killed.
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_peer_write_gets_a_full_budget_from_its_claim() {
+        let router = ResponseRouter::new();
+        let peer_id = RequestId::new(1);
+        let (_peer_rx, _epoch, _settled_rx) = router.register_peer(peer_id).unwrap();
+        let _victim_rx = router.register(RequestId::new(2)).unwrap();
+        tokio::time::advance(WRITE_BUDGET - std::time::Duration::from_millis(100)).await;
+        assert!(router.claim_for_write(peer_id));
+        let claimed_at = tokio::time::Instant::now();
+        assert_eq!(router.cancel_peer(peer_id), Some(true));
+
+        tokio::time::advance(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            router.expire_peer_cancel(peer_id, WRITE_BUDGET),
+            PeerCancelExpiry::WriteInProgress {
+                until: claimed_at + WRITE_BUDGET
+            }
+        );
+        assert!(
+            router.is_accepting(),
+            "a young write is not a wedge verdict"
+        );
+        assert_eq!(router.pending_count(), 2);
+
+        tokio::time::advance(WRITE_BUDGET).await;
+        assert_eq!(
+            router.expire_peer_cancel(peer_id, WRITE_BUDGET),
+            PeerCancelExpiry::Wedged
+        );
+        assert_eq!(router.pending_count(), 0);
     }
 
     /// Test that register_with_upstream stores upstream->downstream mapping.
