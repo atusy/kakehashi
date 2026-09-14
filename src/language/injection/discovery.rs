@@ -1706,7 +1706,19 @@ fn render_gap_segment(
     let multiline = clamped_slice(text, full_gap.clone()).contains('\n');
     let is_first = segment.start == full_gap.start;
     let is_last = segment.end == full_gap.end;
-    let token = if multiline {
+    let combined_edge_token = if multiline && is_first && is_last {
+        match (prefix, suffix) {
+            (Some(prefix), Some(suffix)) => Some([prefix, suffix].concat()),
+            (Some(prefix), None) => Some([prefix, placeholder.unwrap_or("")].concat()),
+            (None, Some(suffix)) => Some([placeholder.unwrap_or(""), suffix].concat()),
+            (None, None) => placeholder.map(str::to_owned),
+        }
+    } else {
+        None
+    };
+    let token = if multiline && is_first && is_last {
+        combined_edge_token.as_deref()
+    } else if multiline {
         if is_first {
             prefix.or(placeholder)
         } else if is_last {
@@ -3261,6 +3273,28 @@ mod tests {
         );
         assert_eq!(token_padded_to_utf16_width("None\n", 6), None);
         assert_eq!(token_padded_to_utf16_width("None\r", 6), None);
+    }
+
+    #[test]
+    fn newline_terminated_single_segment_gap_renders_both_wrapper_edges() {
+        let text = "abc\n";
+        let full_gap = 0..text.len();
+
+        assert_eq!(
+            render_gap_segment(
+                text,
+                &full_gap,
+                full_gap.clone(),
+                Some("0"),
+                Some("(0"),
+                Some(")"),
+            ),
+            "(0)\n"
+        );
+        assert_eq!(
+            render_gap_segment(text, &full_gap, full_gap.clone(), Some("0"), None, None),
+            "0  \n"
+        );
     }
 
     #[test]
