@@ -75,9 +75,12 @@ struct ResponseRouterState {
 
 struct PendingRequest {
     response_tx: oneshot::Sender<serde_json::Value>,
-    /// Peer cancellation cleanup waits for this sender to be dropped when the
-    /// router entry settles, without retaining the response receiver itself.
-    _settled_tx: Option<oneshot::Sender<()>>,
+    /// Present when a cleanup task watches this entry's settlement (peer
+    /// requests): it waits for the sender to drop when the entry leaves the
+    /// map, without retaining the response receiver itself. Absent, nothing
+    /// will ever retire a cancelled entry after its write completes, so
+    /// `mark_sent` retires it directly.
+    settled_tx: Option<oneshot::Sender<()>>,
     delivery: RequestDelivery,
     /// When the FIFO writer claimed this request's bytes. A cancelled peer
     /// write is judged wedged by its age since this instant, not by the
@@ -246,7 +249,7 @@ impl ResponseRouter {
             downstream_id,
             PendingRequest {
                 response_tx: tx,
-                _settled_tx: settled_tx,
+                settled_tx,
                 delivery: RequestDelivery::Queued,
                 write_claimed_at: None,
                 track_failure,
@@ -389,17 +392,31 @@ impl ResponseRouter {
     }
 
     /// Record successful completion of the writer-side request write.
+    ///
+    /// A cancelled entry that nothing watches was kept only as evidence of a
+    /// stalled writer; once its write completes that evidence is moot and
+    /// its waiter is long gone, so it is retired here and the target's late
+    /// answer is dropped as unknown. A watched entry (a peer request) moves
+    /// to `CancelledSent` so its cleanup can absorb the answer or expire it.
     pub(crate) fn mark_sent(&self, id: RequestId) {
         let mut state = self
             .state
             .lock()
             .recover_poison("ResponseRouter::mark_sent");
-        if let Some(pending) = state.pending.get_mut(&id) {
-            pending.delivery = match pending.delivery {
-                RequestDelivery::Writing => RequestDelivery::Sent,
-                RequestDelivery::CancelledWriting => RequestDelivery::CancelledSent,
-                delivery => delivery,
-            };
+        let Some(pending) = state.pending.get_mut(&id) else {
+            return;
+        };
+        match pending.delivery {
+            RequestDelivery::Writing => pending.delivery = RequestDelivery::Sent,
+            RequestDelivery::CancelledWriting if pending.settled_tx.is_some() => {
+                pending.delivery = RequestDelivery::CancelledSent;
+            }
+            RequestDelivery::CancelledWriting => {
+                state.pending.remove(&id);
+                state.failures.remove(&id);
+                Self::remove_cancel_mapping_inner(&mut state, id);
+            }
+            _ => {}
         }
     }
 
@@ -1162,13 +1179,14 @@ mod tests {
 
     /// A frame the writer is still writing when its waiter times out must
     /// stay pending: it is the only evidence of a stalled writer the liveness
-    /// timer can see.
+    /// timer can see. Once the write completes that evidence is moot, and an
+    /// unwatched entry must not linger waiting for an answer nobody wants.
     #[tokio::test]
-    async fn timed_out_write_in_progress_stays_visible_to_liveness() {
+    async fn timed_out_write_in_progress_stays_visible_until_it_completes() {
         let router = ResponseRouter::new();
         let writing = RequestId::new(1);
         let queued = RequestId::new(2);
-        let writing_rx = router.register(writing).unwrap();
+        let _writing_rx = router.register(writing).unwrap();
         let _queued_rx = router.register(queued).unwrap();
         assert!(router.claim_for_write(writing));
 
@@ -1182,12 +1200,41 @@ mod tests {
         );
         assert_eq!(router.awaiting_downstream_count(), 1);
 
-        drop(writing_rx);
         router.mark_sent(writing);
         assert_eq!(
+            router.pending_count(),
+            0,
+            "completion retires the unwatched entry"
+        );
+        assert_eq!(
             router.route(serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": null })),
-            RouteResult::ReceiverDropped,
-            "the late answer is absorbed once the write completes"
+            RouteResult::NotFound
+        );
+    }
+
+    /// A watched (peer) entry keeps the cancelled-sent state on completion so
+    /// its cleanup task can absorb the answer or expire it.
+    #[tokio::test]
+    async fn watched_cancelled_write_stays_pending_after_completion() {
+        let router = ResponseRouter::new();
+        let peer_id = RequestId::new(1);
+        let (rx, _epoch, mut settled_rx) = router.register_peer(peer_id).unwrap();
+        assert!(router.claim_for_write(peer_id));
+        assert_eq!(router.cancel_peer(peer_id), Some(true));
+        drop(rx);
+
+        router.mark_sent(peer_id);
+        assert_eq!(router.pending_count(), 1);
+        assert!(
+            matches!(
+                settled_rx.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ),
+            "not yet settled"
+        );
+        assert_eq!(
+            router.route(serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": null })),
+            RouteResult::ReceiverDropped
         );
         assert_eq!(router.pending_count(), 0);
     }

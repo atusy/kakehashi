@@ -181,7 +181,8 @@ bound this hierarchy did not previously register):
   *silence* rather than a request
 - **On expiry**: that request alone fails; the connection is not faulted.
   A frame the writer is still writing at expiry stays tracked as cancelled
-  rather than removed, so Tier 2 keeps observing the stalled writer
+  until that write completes, so Tier 2 keeps observing a stalled writer
+  (at most one frame per connection can be mid-write); completion retires it
 - **Precedence**: connection closure and the shutdown deadline both cut it
   short, so it never extends a teardown
 - **Status**: shipped, and the reason the absence of Tier 1 is not currently
