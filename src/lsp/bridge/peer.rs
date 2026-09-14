@@ -212,36 +212,36 @@ pub(in crate::lsp::bridge) async fn list_result(
 }
 
 #[cfg(test)]
-fn peer_keys<'a>(
-    keys: impl IntoIterator<Item = &'a ConnectionKey>,
-    origin: &ConnectionKey,
-) -> Vec<ConnectionKey> {
-    keys.into_iter()
-        .filter(|key| *key != origin)
-        .cloned()
-        .collect()
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::lsp::bridge::pool::{HostDocSyncState, test_helpers::create_handle_with_key};
 
-    #[test]
-    fn peer_list_excludes_only_the_origin_connection() {
-        let origin = ConnectionKey::new("tsudoi", Some("file:///repo/a".to_string()));
+    /// Per-root pooling makes a same-name connection at another root a
+    /// legitimate peer; only the caller's exact slot is hidden.
+    #[tokio::test]
+    async fn peer_list_excludes_only_the_origin_connection() {
+        let directory = PeerDirectory::default();
+        let origin_key = ConnectionKey::new("tsudoi", Some("file:///repo/a".to_string()));
         let same_server_other_root =
             ConnectionKey::new("tsudoi", Some("file:///repo/b".to_string()));
         let formatter = ConnectionKey::new("denols", Some("file:///repo/a".to_string()));
-        let keys = [
-            origin.clone(),
-            same_server_other_root.clone(),
-            formatter.clone(),
-        ];
+        let origin = create_handle_with_key(ConnectionState::Ready, origin_key.clone()).await;
+        let sibling =
+            create_handle_with_key(ConnectionState::Ready, same_server_other_root.clone()).await;
+        let denols = create_handle_with_key(ConnectionState::Ready, formatter.clone()).await;
+        for handle in [&origin, &sibling, &denols] {
+            directory.register(handle);
+        }
 
+        let ids = |peers: Vec<Peer>| peers.into_iter().map(|peer| peer.id).collect::<Vec<_>>();
         assert_eq!(
-            peer_keys(keys.iter(), &origin),
-            vec![same_server_other_root, formatter]
+            ids(directory.list(&origin_key, None, None).await),
+            vec![formatter.peer_id(), same_server_other_root.peer_id()]
+        );
+        assert_eq!(
+            ids(directory.list(&origin_key, Some("tsudoi"), None).await),
+            vec![same_server_other_root.peer_id()],
+            "a name filter must not turn self-exclusion into name-exclusion"
         );
     }
 
