@@ -1495,7 +1495,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn aborting_a_wedged_writer_kills_its_downstream_process() {
-        use crate::lsp::bridge::pool::test_helpers::{create_handle_with_command, process_stat};
+        use crate::lsp::bridge::pool::test_helpers::{
+            FULL_PIPE_PAYLOAD_BYTES, create_handle_with_command, process_stat,
+        };
 
         let (handle, pid) = create_handle_with_command(
             ConnectionState::Ready,
@@ -1504,10 +1506,9 @@ mod tests {
             None,
         )
         .await;
-        // Far larger than the kernel pipe buffer, so the write parks.
         let huge = crate::lsp::bridge::protocol::JsonRpcNotification::new(
             "blocked",
-            serde_json::json!({ "data": "x".repeat(4 * 1024 * 1024) }),
+            serde_json::json!({ "data": "x".repeat(FULL_PIPE_PAYLOAD_BYTES) }),
         );
         assert_eq!(
             handle.send_notification(huge),

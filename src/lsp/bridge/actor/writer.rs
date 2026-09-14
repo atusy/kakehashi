@@ -343,7 +343,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn cancel_reclaims_writer_blocked_on_full_stdin_pipe() {
-        use crate::lsp::bridge::pool::test_helpers::process_stat;
+        use crate::lsp::bridge::pool::test_helpers::{FULL_PIPE_PAYLOAD_BYTES, process_stat};
 
         let mut conn = AsyncBridgeConnection::spawn(vec!["sleep".to_string(), "30".to_string()])
             .await
@@ -354,8 +354,8 @@ mod tests {
         let (tx, rx) = mpsc::channel(16);
         let handle = spawn_writer_task(writer, rx, Arc::clone(&router));
 
-        // Far larger than the kernel pipe buffer so the write parks mid-frame.
-        let huge = json!({"method": "blocked", "params": {"data": "x".repeat(4 * 1024 * 1024)}});
+        let huge =
+            json!({"method": "blocked", "params": {"data": "x".repeat(FULL_PIPE_PAYLOAD_BYTES)}});
         tx.send(OutboundMessage::Untracked(huge)).await.unwrap();
 
         // Let the writer task pick the message up and block on the full pipe.
