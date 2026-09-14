@@ -1064,7 +1064,7 @@ impl DocumentTracker {
         let mut connections = self
             .virtual_to_servers
             .get(uri)
-            .map(|keys| keys.clone())
+            .map(|keys| keys.value().clone())
             .unwrap_or_default();
         if let Ok(host_uri) = Url::parse(uri) {
             let host_to_virtual = self.host_to_virtual.lock().await;
