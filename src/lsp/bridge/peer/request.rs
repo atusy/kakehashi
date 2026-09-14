@@ -268,29 +268,44 @@ pub(in crate::lsp::bridge) async fn handle(
     });
 }
 
+/// Strip the JSON-RPC envelope of a peer's response down to the branch the
+/// caller receives.
+///
+/// The envelope is judged the way the bridge judges its own responses: by
+/// its `id` (already routed) and by carrying exactly one of `result` and
+/// `error`. A `jsonrpc` member is not required, so a peer whose responses
+/// the bridge accepts for its managed requests is never reported as
+/// malformed only to peer callers. A downstream error object is relayed
+/// verbatim once its shape is valid (integer `code`, string `message`);
+/// extra members a server attaches are the caller's business.
 fn normalize_response(response: serde_json::Value) -> jsonrpc::Result<serde_json::Value> {
-    if response.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0") {
+    let serde_json::Value::Object(mut envelope) = response else {
         return Err(request_failed(
             "malformedResponse",
-            "peer returned a response without jsonrpc: 2.0",
+            "peer returned a response that is not a JSON object",
         ));
-    }
-    match (response.get("result"), response.get("error")) {
+    };
+    match (envelope.remove("result"), envelope.remove("error")) {
         (Some(result), None) => Ok(serde_json::json!({ "result": result })),
-        (None, Some(error)) => serde_json::from_value::<jsonrpc::Error>(error.clone())
-            .and_then(serde_json::to_value)
-            .map(|error| serde_json::json!({ "error": error }))
-            .map_err(|_| {
-                request_failed(
-                    "malformedResponse",
-                    "peer returned a malformed JSON-RPC error object",
-                )
-            }),
+        (None, Some(error)) if is_error_object(&error) => Ok(serde_json::json!({ "error": error })),
+        (None, Some(_)) => Err(request_failed(
+            "malformedResponse",
+            "peer returned a malformed JSON-RPC error object",
+        )),
         _ => Err(request_failed(
             "malformedResponse",
             "peer returned an invalid JSON-RPC response envelope",
         )),
     }
+}
+
+fn is_error_object(error: &serde_json::Value) -> bool {
+    error.as_object().is_some_and(|error| {
+        error.get("code").is_some_and(serde_json::Value::is_i64)
+            && error
+                .get("message")
+                .is_some_and(serde_json::Value::is_string)
+    })
 }
 
 #[cfg(test)]
@@ -364,6 +379,29 @@ mod tests {
         .unwrap();
         let error = validate_params(&explicit_null).unwrap_err();
         assert_eq!(error.code, jsonrpc::ErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn responses_without_a_jsonrpc_member_are_relayed_like_the_bridge_accepts_them() {
+        assert_eq!(
+            normalize_response(serde_json::json!({ "id": 93, "result": 1 })).unwrap(),
+            serde_json::json!({ "result": 1 })
+        );
+    }
+
+    #[test]
+    fn decorated_downstream_errors_are_relayed_verbatim() {
+        assert_eq!(
+            normalize_response(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 94,
+                "error": { "code": -32001, "message": "custom", "data": null, "trace": ["x"] }
+            }))
+            .unwrap(),
+            serde_json::json!({
+                "error": { "code": -32001, "message": "custom", "data": null, "trace": ["x"] }
+            })
+        );
     }
 
     #[test]
@@ -520,13 +558,27 @@ mod tests {
 
     #[test]
     fn malformed_downstream_error_is_not_relayed() {
-        let error = normalize_response(serde_json::json!({
-            "jsonrpc": "2.0", "id": 92,
-            "error": { "message": "missing code" }
+        for error in [
+            serde_json::json!({ "message": "missing code" }),
+            serde_json::json!({ "code": "-1", "message": "string code" }),
+            serde_json::json!({ "code": -1 }),
+            serde_json::json!("not an object"),
+        ] {
+            let error = normalize_response(serde_json::json!({
+                "jsonrpc": "2.0", "id": 92, "error": error
+            }))
+            .unwrap_err();
+            assert_eq!(
+                error.data,
+                Some(serde_json::json!({ "reason": "malformedResponse" }))
+            );
+        }
+        let both = normalize_response(serde_json::json!({
+            "id": 95, "result": null, "error": { "code": -1, "message": "m" }
         }))
         .unwrap_err();
         assert_eq!(
-            error.data,
+            both.data,
             Some(serde_json::json!({ "reason": "malformedResponse" }))
         );
     }
