@@ -1487,26 +1487,48 @@ mod tests {
         // Router is accessible (test passes if no panic)
     }
 
+    /// A child that never reads stdin leaves the writer parked mid-frame on a
+    /// full pipe; aborting must unpark that write and kill the child, not
+    /// merely flip the state. Unix-only: spawns `sleep`, probes via `ps`.
     #[cfg(unix)]
     #[tokio::test]
     async fn aborting_a_wedged_writer_kills_its_downstream_process() {
-        use crate::lsp::bridge::pool::test_helpers::{
-            create_handle_with_state_and_pid, process_stat,
-        };
+        use crate::lsp::bridge::pool::test_helpers::{create_handle_with_command, process_stat};
 
-        let (handle, pid) = create_handle_with_state_and_pid(ConnectionState::Ready).await;
+        let (handle, pid) = create_handle_with_command(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("wedged"),
+            vec!["sleep".to_string(), "30".to_string()],
+            None,
+        )
+        .await;
+        // Far larger than the kernel pipe buffer, so the write parks.
+        let huge = crate::lsp::bridge::protocol::JsonRpcNotification::new(
+            "blocked",
+            serde_json::json!({ "data": "x".repeat(4 * 1024 * 1024) }),
+        );
+        assert_eq!(
+            handle.send_notification(huge),
+            NotificationSendResult::Queued
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
         handle.fail_and_abort_writer();
         assert_eq!(handle.state(), ConnectionState::Failed);
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            match process_stat(pid).expect("ps should inspect the test child") {
-                None => break,
-                Some(stat) if stat.starts_with('Z') => break,
-                Some(stat) => {
+            match process_stat(pid) {
+                Err(error) => {
+                    eprintln!("Skipping child-liveness assertion: ps unavailable ({error})");
+                    return;
+                }
+                Ok(None) => break,
+                Ok(Some(stat)) if stat.starts_with('Z') => break,
+                Ok(Some(stat)) => {
                     assert!(
                         std::time::Instant::now() < deadline,
-                        "child {pid} survived writer abort (stat {stat})"
+                        "child {pid} survived writer abort while parked on a full pipe (stat {stat})"
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
