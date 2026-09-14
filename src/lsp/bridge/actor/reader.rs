@@ -2193,7 +2193,8 @@ mod tests {
         let router = ResponseRouter::new();
         let (deps, (mut response_rx, _upstream_rx, _window_rx)) =
             dummy_server_request_deps_with_rx();
-        for n in 0..16 {
+        let capacity = deps.response_tx.max_capacity();
+        for n in 0..capacity {
             deps.response_tx
                 .try_send(OutboundMessage::Untracked(json!({ "occupied": n })))
                 .unwrap();
@@ -2216,7 +2217,7 @@ mod tests {
             _ = tokio::task::yield_now() => {}
         }
 
-        for _ in 0..16 {
+        for _ in 0..capacity {
             let _occupied = response_rx.recv().await.unwrap();
         }
         dispatch.await;
