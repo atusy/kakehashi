@@ -1,7 +1,7 @@
 # Bridge Peer Protocol
 
 **Related Decisions**:
-- [bridge-client-control-protocol](bridge-client-control-protocol.md) — the planned editor-facing connection API; peer requests reuse its pass-through boundary but are available only to downstream servers
+- [bridge-client-control-protocol](bridge-client-control-protocol.md) — the planned editor-facing connection API; peer requests reuse its pass-through framing (no translation) but are available only to downstream servers and, unlike its untimed pass-through class, are bridge-managed for timeout purposes
 - [bridge-routing-protocol](bridge-routing-protocol.md) — the existing kakehashi→downstream custom request and the per-side dispatch rule
 - [ls-bridge-message-ordering](ls-bridge-message-ordering.md) — downstream request IDs, cancellation, response routing, and the single-writer connection transport
 - [ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md) — the per-root `ConnectionKey` slots exposed as peers
@@ -77,9 +77,15 @@ because they would take over the target connection's lifecycle. Cancellation is
 instead expressed by cancelling the outer request: kakehashi drops the inner
 request if it is still queued, otherwise keeps it pending until the target
 answers or its deadline expires and best-effort queues `$/cancelRequest`, and
-in either case answers the caller with `RequestCancelled` (`-32800`). Peer requests
-inherit the ordinary managed downstream-request deadline (currently 30 seconds)
-and Tier-2 liveness accounting.
+in either case answers the caller with `RequestCancelled` (`-32800`).
+
+Peer requests are bridge-managed requests, not the untimed control-protocol
+pass-through class: they inherit the per-downstream response cap (currently 30
+seconds) and Tier-2 liveness accounting. A cancelled peer request whose write
+has still not completed one full cap after the target's writer claimed it is
+judged wedged: kakehashi fails that target connection, aborts its writer, and
+answers every request pending on it. That bound is registered as the cancelled
+peer write expiry in ls-bridge-timeout-hierarchy.
 
 The successful outer result strips the internal JSON-RPC fields and contains
 exactly one branch:
@@ -123,6 +129,10 @@ with a failure of kakehashi to perform the forwarding.
 - Per-side dispatch must remain strict: downstream peer methods are not an
   editor control surface, and planned editor-facing `bridge/client/*` methods
   are not thereby made callable from downstream connections.
+- A target connection may be faulted for a cancelled peer write only after
+  that write has made no progress for a full response cap since the writer
+  claimed it; time the frame spent queued behind earlier traffic never counts,
+  so a late-dequeued frame cannot fault a healthy connection.
 
 ## Considered Options
 
@@ -164,7 +174,10 @@ API from becoming a second routing/spawn policy.
 - A peer is discoverable only after something else has started it. The protocol
   cannot select a configured but dormant formatter.
 - Slow arbitrary requests share the existing timeout and liveness policy; they
-  can contribute to a target connection being classified as failed.
+  can contribute to a target connection being classified as failed. A
+  cancelled peer write that stays unwritten for a full response cap faults the
+  shared target connection for every editor request on it, whereas an
+  uncancelled one merely times out alone.
 - Each calling connection may have at most 64 peer requests awaiting settlement,
   bounding router entries and forwarding tasks even when targets consume input
   without answering.
