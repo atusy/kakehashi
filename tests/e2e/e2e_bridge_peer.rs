@@ -20,7 +20,9 @@ const MARKDOWN: &str = "# Test\n\n```lua\nlocal x = 1\n```\n";
 const MARKDOWN_URI: &str = "file:///test_bridge_peer.md";
 
 /// The routed command name kakehashi decodes back to the caller's exact
-/// client-fallback connection (execute-command-routing-token).
+/// client-fallback connection. The layout is the normative one in
+/// execute-command-routing-token (tag `c`, empty root), so this test is a
+/// consumer of that contract rather than of an implementation detail.
 const CALLER_COMMAND: &str = "kakehashi|c|mock-caller||mock.peer";
 
 fn init_client() -> (LspClient, tempfile::TempDir) {
@@ -142,6 +144,8 @@ fn downstream_server_discovers_and_proxies_to_a_running_peer() {
 fn lifecycle_methods_are_denied_over_the_wire() {
     let (mut client, _config_dir) = init_client();
 
+    // Every retry asks to forward `shutdown`, but denial precedes peer
+    // resolution, so no target ever receives a lifecycle request.
     let report = peer_command_until_discovered(&mut client, "mock-target", "shutdown");
     assert_eq!(report["forwarded"]["error"]["code"], -32803);
     assert_eq!(
