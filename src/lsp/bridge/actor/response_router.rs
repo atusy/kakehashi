@@ -113,7 +113,7 @@ pub(crate) enum BridgeFailure {
 
 /// A peer request's response receiver, the liveness epoch it started (if
 /// any), and the receiver that fires when its router entry settles.
-pub(crate) type PeerRegistration = (
+pub(in crate::lsp::bridge) type PeerRegistration = (
     oneshot::Receiver<serde_json::Value>,
     Option<u64>,
     oneshot::Receiver<()>,
@@ -121,7 +121,7 @@ pub(crate) type PeerRegistration = (
 
 /// Why a registration was refused.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RegisterError {
+pub(in crate::lsp::bridge) enum RegisterError {
     /// The connection's reader or writer is terminal; nothing registers again.
     Closed,
     /// A request with this id is still pending.
@@ -196,7 +196,7 @@ impl ResponseRouter {
 
     /// Register and atomically report whether this request transitions the
     /// set of downstream-progressing requests from empty to non-empty.
-    pub(crate) fn register_with_upstream_liveness(
+    pub(in crate::lsp::bridge) fn register_with_upstream_liveness(
         &self,
         downstream_id: RequestId,
         upstream_id: Option<UpstreamId>,
@@ -204,7 +204,7 @@ impl ResponseRouter {
         self.register_with_upstream_liveness_mode(downstream_id, upstream_id, false, None)
     }
 
-    pub(crate) fn register_peer(
+    pub(in crate::lsp::bridge) fn register_peer(
         &self,
         downstream_id: RequestId,
     ) -> Result<PeerRegistration, RegisterError> {
