@@ -199,7 +199,7 @@ pub(in crate::lsp::bridge) async fn handle(
             return;
         }
     };
-    let mut router_guard = RouterCleanupGuard::new(peer.clone().router().clone(), downstream_id);
+    let mut router_guard = RouterCleanupGuard::new(peer.router().clone(), downstream_id);
     // Register before the inner send: a $/cancelRequest arriving immediately
     // after the outer request must not fall into a send/register gap.
     let inner_params = match params.params {
