@@ -184,6 +184,7 @@ impl Kakehashi {
                         &t.region_id,
                         t.offset,
                         &t.virtual_content,
+                        &t.protected_host_ranges,
                         t.upstream_id,
                     )
                     .await

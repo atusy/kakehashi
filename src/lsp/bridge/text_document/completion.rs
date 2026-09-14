@@ -15,14 +15,14 @@ use serde_json::Value;
 
 use crate::config::settings::BridgeServerConfig;
 use crate::lsp::bridge::envelope::{ENVELOPE_KEY, should_envelope, wrap_envelope};
-use tower_lsp_server::ls_types::{CompletionItem, CompletionList, Position};
+use tower_lsp_server::ls_types::{CompletionItem, CompletionList, Position, Range};
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::translate_virtual_range_to_host;
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request,
-    response_has_jsonrpc_error, text_edit_safe_in_region,
+    range_intersects_protected, response_has_jsonrpc_error, text_edit_safe_in_region,
 };
 use tower_lsp_server::ls_types::TextDocumentPositionParams;
 
@@ -48,6 +48,7 @@ impl LanguageServerPool {
         region_id: &str,
         offset: RegionOffset,
         virtual_content: &str,
+        protected_host_ranges: &[Range],
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Option<CompletionList>> {
         let host_incarnation = self.current_host_incarnation(host_uri);
@@ -82,11 +83,12 @@ impl LanguageServerPool {
                 build_completion_request(virtual_uri, host_position, &offset, request_id)
             },
             |response, ctx| {
-                transform_completion_response_to_host(
+                transform_completion_response_to_host_protected(
                     response,
                     ctx.offset,
                     region_end,
                     Some(host_position.line),
+                    protected_host_ranges,
                     origin.has_capability("completionItem/resolve"),
                     &EnvelopeContext {
                         server_name,
@@ -96,6 +98,7 @@ impl LanguageServerPool {
                         region_id,
                         offset: ctx.offset,
                         region_end: Some(region_end),
+                        protected_host_ranges,
                         host_layer: false,
                     },
                 )
@@ -129,11 +132,32 @@ fn build_completion_request(
 /// [`should_envelope`] selects — the origin advertises
 /// `completionItem/resolve`, or the payload squats on the reserved key — has
 /// its `data` wrapped in a routing envelope; the rest pass through bare.
+#[cfg(test)]
 fn transform_completion_response_to_host(
+    response: serde_json::Value,
+    offset: &RegionOffset,
+    region_end: Position,
+    request_host_line: Option<u32>,
+    server_resolves: bool,
+    envelope_ctx: &EnvelopeContext<'_>,
+) -> Option<CompletionList> {
+    transform_completion_response_to_host_protected(
+        response,
+        offset,
+        region_end,
+        request_host_line,
+        &[],
+        server_resolves,
+        envelope_ctx,
+    )
+}
+
+fn transform_completion_response_to_host_protected(
     mut response: serde_json::Value,
     offset: &RegionOffset,
     region_end: Position,
     request_host_line: Option<u32>,
+    protected_host_ranges: &[Range],
     server_resolves: bool,
     envelope_ctx: &EnvelopeContext<'_>,
 ) -> Option<CompletionList> {
@@ -168,7 +192,13 @@ fn transform_completion_response_to_host(
     // under the same policy as the host layer.
     let before = list.items.len();
     list.items.retain_mut(|item| {
-        if !transform_completion_item(item, offset, region_end, request_host_line) {
+        if !transform_completion_item_protected(
+            item,
+            offset,
+            region_end,
+            request_host_line,
+            protected_host_ranges,
+        ) {
             return false;
         }
         if should_envelope(item.data.as_ref(), server_resolves) {
@@ -200,11 +230,12 @@ fn transform_completion_response_to_host(
 /// An unsafe `additionalTextEdits` member drops the whole array instead:
 /// the primary insertion still applies, though possibly semantically
 /// incomplete (e.g. without its auto-import) — availability over fidelity.
-pub(super) fn transform_completion_item(
+pub(super) fn transform_completion_item_protected(
     item: &mut CompletionItem,
     offset: &RegionOffset,
     region_end: Position,
     request_host_line: Option<u32>,
+    protected_host_ranges: &[Range],
 ) -> bool {
     // A multi-line insertion is unsafe only where its INSERTION POINT's
     // neighborhood is prefixed — a mixed region (single-element `[n]` offsets:
@@ -238,6 +269,7 @@ pub(super) fn transform_completion_item(
             tower_lsp_server::ls_types::CompletionTextEdit::Edit(edit) => {
                 translate_virtual_range_to_host(&mut edit.range, offset);
                 if !text_edit_safe_in_region(edit, offset, region_end)
+                    || range_intersects_protected(&edit.range, protected_host_ranges)
                     || snippet_unsafe(&edit.new_text, Some(edit.range.start.line))
                 {
                     return false;
@@ -252,9 +284,11 @@ pub(super) fn transform_completion_item(
                     range: edit.insert,
                     new_text: std::mem::take(&mut edit.new_text),
                 };
-                let insert_ok = text_edit_safe_in_region(&probe, offset, region_end);
+                let insert_ok = text_edit_safe_in_region(&probe, offset, region_end)
+                    && !range_intersects_protected(&probe.range, protected_host_ranges);
                 probe.range = edit.replace;
-                let replace_ok = text_edit_safe_in_region(&probe, offset, region_end);
+                let replace_ok = text_edit_safe_in_region(&probe, offset, region_end)
+                    && !range_intersects_protected(&probe.range, protected_host_ranges);
                 edit.new_text = probe.new_text;
                 // Check BOTH client-selectable ranges: with unequal starts,
                 // the minimum line could be unprefixed while the other range
@@ -300,10 +334,10 @@ pub(super) fn transform_completion_item(
         for edit in additional_edits.iter_mut() {
             translate_virtual_range_to_host(&mut edit.range, offset);
         }
-        if !additional_edits
-            .iter()
-            .all(|edit| text_edit_safe_in_region(edit, offset, region_end))
-        {
+        if !additional_edits.iter().all(|edit| {
+            text_edit_safe_in_region(edit, offset, region_end)
+                && !range_intersects_protected(&edit.range, protected_host_ranges)
+        }) {
             log::warn!(
                 target: "kakehashi::bridge",
                 "completion: dropped an item's additionalTextEdits ({}): a member is unsafe for the injection region (escapes it, breaks line prefixes, or merges content into the closing fence)",
@@ -441,6 +475,10 @@ pub(crate) struct KakehashiEnvelope {
     /// fully fail-closed guard in prefixed regions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region_end: Option<(u32, u32)>,
+    /// Immutable host-owned spans that existed when this completion item was
+    /// produced. Resolve requires the live parse to expose the same spans.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protected_host_ranges: Vec<Range>,
     /// Host-layer item (`bridge._self`, #958): it is already in host
     /// coordinates, so `completionItem/resolve` routes to the host server
     /// VERBATIM — no virtual URI, region, or offset translation.
@@ -521,6 +559,7 @@ pub(crate) struct EnvelopeContext<'a> {
     /// Region end (host coords) snapshot for the resolve-path safety guard;
     /// `None` only when re-enveloping a legacy envelope that never carried it.
     pub region_end: Option<Position>,
+    pub protected_host_ranges: &'a [Range],
     /// Carries the layer through a re-envelope: a host-layer item resolved
     /// once must still route through the host path on the NEXT resolve.
     /// Minting sites use `false` (virt) or [`envelope_host_item`].
@@ -542,6 +581,7 @@ pub(crate) fn envelope_item_data(item: &mut CompletionItem, ctx: &EnvelopeContex
         inner: None,
         offset: EnvelopeOffset::from(ctx.offset),
         region_end: ctx.region_end.map(|end| (end.line, end.character)),
+        protected_host_ranges: ctx.protected_host_ranges.to_vec(),
         host_layer: ctx.host_layer,
     };
     item.data = Some(wrap_envelope(&envelope, inner));
@@ -609,6 +649,7 @@ pub(super) fn envelope_host_item(
             line_column_offsets: None,
         },
         region_end: None,
+        protected_host_ranges: Vec::new(),
         host_layer: true,
     };
     item.data = Some(wrap_envelope(&envelope, inner));
@@ -674,6 +715,7 @@ mod tests {
                 region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
                 offset,
                 region_end: Some(region_end),
+                protected_host_ranges: &[],
                 host_layer: false,
             },
         )
@@ -1258,6 +1300,7 @@ mod tests {
             region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
             offset: &offset,
             region_end: Some(TEST_REGION_END),
+            protected_host_ranges: &[],
             host_layer: false,
         };
         envelope_item_data(&mut item, &ctx);
@@ -1466,6 +1509,7 @@ mod tests {
                 region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
                 offset: &offset,
                 region_end: Some(TEST_REGION_END),
+                protected_host_ranges: &[],
                 host_layer: true,
             },
         );
@@ -1490,6 +1534,7 @@ mod tests {
                 region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
                 offset: &offset,
                 region_end: Some(TEST_REGION_END),
+                protected_host_ranges: &[],
                 host_layer: false,
             },
         );
@@ -1516,6 +1561,7 @@ mod tests {
             region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
             offset: &offset,
             region_end: Some(TEST_REGION_END),
+            protected_host_ranges: &[],
             host_layer: false,
         };
         envelope_item_data(&mut item, &ctx);
@@ -1559,6 +1605,7 @@ mod tests {
                 region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
                 offset: &offset,
                 region_end: Some(TEST_REGION_END),
+                protected_host_ranges: &[],
                 host_layer: false,
             },
         );

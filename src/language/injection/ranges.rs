@@ -29,6 +29,46 @@ pub(crate) fn has_combined_for_pattern(query: &tree_sitter::Query, pattern_index
 /// This is a value-less property — its **presence** alone means "include children"
 /// (the injection parser sees the full content node including named children).
 /// When absent, named children should be excluded via `set_included_ranges()`.
+fn injection_property_value(
+    query: &tree_sitter::Query,
+    pattern_index: usize,
+    key: &str,
+) -> Option<String> {
+    for predicate in get_all_predicates(query, pattern_index) {
+        if let UnifiedPredicate::Property(prop) = predicate
+            && prop.key.as_ref() == key
+            && let Some(value) = &prop.value
+        {
+            return Some(value.as_ref().to_string());
+        }
+    }
+    None
+}
+
+/// Placeholder token used for explicit `@injection.gap` captures.
+pub(crate) fn gap_placeholder_for_pattern(
+    query: &tree_sitter::Query,
+    pattern_index: usize,
+) -> Option<String> {
+    injection_property_value(query, pattern_index, "injection.gap-placeholder")
+}
+
+/// First-line token for a multiline explicit gap.
+pub(crate) fn gap_prefix_for_pattern(
+    query: &tree_sitter::Query,
+    pattern_index: usize,
+) -> Option<String> {
+    injection_property_value(query, pattern_index, "injection.gap-prefix")
+}
+
+/// Last-line token for a multiline explicit gap.
+pub(crate) fn gap_suffix_for_pattern(
+    query: &tree_sitter::Query,
+    pattern_index: usize,
+) -> Option<String> {
+    injection_property_value(query, pattern_index, "injection.gap-suffix")
+}
+
 pub(crate) fn has_include_children_for_pattern(
     query: &tree_sitter::Query,
     pattern_index: usize,
@@ -376,6 +416,31 @@ mod tests {
                 column: end_col,
             },
         }
+    }
+
+    #[test]
+    fn gap_properties_read_values_and_ignore_valueless_flags() {
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(
+            &language,
+            r#"
+                ((raw_string_literal) @injection.content
+                  (#set! injection.gap-placeholder "None")
+                  (#set! injection.gap-prefix "(0")
+                  (#set! injection.gap-suffix ")"))
+                ((line_comment) @injection.content
+                  (#set! injection.gap-placeholder))
+            "#,
+        )
+        .expect("valid query");
+
+        assert_eq!(
+            gap_placeholder_for_pattern(&query, 0).as_deref(),
+            Some("None")
+        );
+        assert_eq!(gap_prefix_for_pattern(&query, 0).as_deref(), Some("(0"));
+        assert_eq!(gap_suffix_for_pattern(&query, 0).as_deref(), Some(")"));
+        assert_eq!(gap_placeholder_for_pattern(&query, 1), None);
     }
 
     #[test]
