@@ -101,9 +101,10 @@ Bridge-level failures use `RequestFailed` (`-32803`) and `data.reason`:
 | `requestTimeout` | The managed downstream request deadline elapsed |
 | `malformedResponse` | The target returned an invalid JSON-RPC response envelope |
 
-Malformed outer parameters use `InvalidParams` (`-32602`). A valid downstream
-error remains data in a successful outer result; it is not confused with a
-failure of kakehashi to perform the forwarding.
+Malformed outer parameters use `InvalidParams` (`-32602`); unknown outer
+members are ignored, as LSP extends parameter objects by addition. A valid
+downstream error remains data in a successful outer result; it is not confused
+with a failure of kakehashi to perform the forwarding.
 
 ## Invariants
 

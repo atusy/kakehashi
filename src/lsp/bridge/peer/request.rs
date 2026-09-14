@@ -24,8 +24,10 @@ const DENIED_METHODS: &[&str] = &[
     "$/cancelRequest",
 ];
 
+/// Unknown members are ignored, as LSP extends parameter objects by
+/// addition; a caller that sends `workDoneToken` or a member from a newer
+/// kakehashi must keep working against this one.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct PeerRequestParams {
     id: String,
     method: String,
@@ -360,6 +362,18 @@ mod tests {
             error.data,
             Some(serde_json::json!({ "reason": "methodDenied" }))
         );
+    }
+
+    #[test]
+    fn unknown_outer_members_are_ignored() {
+        let params = PeerRequestParams::deserialize(&serde_json::json!({
+            "id": "peer",
+            "method": "custom/request",
+            "workDoneToken": "token",
+            "futureFilter": true
+        }))
+        .unwrap();
+        assert_eq!(params.method, "custom/request");
     }
 
     #[test]

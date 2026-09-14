@@ -133,8 +133,10 @@ impl PeerDirectory {
     }
 }
 
+/// Unknown members are ignored so a filter added later does not break
+/// discovery for servers that already send it.
 #[derive(Default, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct PeerParams {
     #[serde(default)]
     text_document: OptionalFilter<TextDocumentIdentifier>,
@@ -303,6 +305,25 @@ mod tests {
         .unwrap();
 
         assert_eq!(result, serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn peer_discovery_ignores_unknown_members() {
+        let directory = PeerDirectory::default();
+        let origin_key = ConnectionKey::for_server("tsudoi");
+        let peer =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("oxfmt"))
+                .await;
+        directory.register(&peer);
+
+        let result = list_result(
+            &directory,
+            &origin_key,
+            &serde_json::json!({ "params": { "workDoneToken": "token", "name": "oxfmt" } }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result[0]["name"], "oxfmt");
     }
 
     #[tokio::test]
