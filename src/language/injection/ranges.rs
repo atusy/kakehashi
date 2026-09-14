@@ -24,6 +24,22 @@ pub(crate) fn has_combined_for_pattern(query: &tree_sitter::Query, pattern_index
     false
 }
 
+/// Checks whether the given pattern has `#set! injection.dedent`.
+///
+/// The property is value-less: its presence asks the bridge virtual document
+/// to remove the common leading ASCII whitespace from non-blank lines while
+/// preserving host coordinate mapping through per-line offsets.
+pub(crate) fn has_dedent_for_pattern(query: &tree_sitter::Query, pattern_index: usize) -> bool {
+    for predicate in get_all_predicates(query, pattern_index) {
+        if let UnifiedPredicate::Property(prop) = predicate
+            && prop.key.as_ref() == "injection.dedent"
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Checks whether the given pattern has `#set! injection.include-children`.
 ///
 /// This is a value-less property — its **presence** alone means "include children"
@@ -461,6 +477,23 @@ mod tests {
             has_combined_for_pattern(&query, 1),
             "Pattern with #set! injection.combined should return true"
         );
+    }
+
+    #[test]
+    fn test_has_dedent_for_pattern() {
+        let query_str = r#"
+            ((raw_string_literal) @injection.content
+              (#set! injection.language "regex"))
+
+            ((line_comment) @injection.content
+              (#set! injection.language "yaml")
+              (#set! injection.dedent))
+        "#;
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, query_str).expect("valid query");
+
+        assert!(!has_dedent_for_pattern(&query, 0));
+        assert!(has_dedent_for_pattern(&query, 1));
     }
 
     #[test]
