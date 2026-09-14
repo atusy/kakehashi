@@ -2224,6 +2224,40 @@ mod tests {
         assert_eq!(peer.router().pending_count(), 0);
     }
 
+    /// When the origin's reader exits, its in-flight peer requests are
+    /// retired the same way an explicit cancel retires them.
+    #[tokio::test]
+    async fn origin_death_retires_its_forwarded_peer_requests() {
+        let router = ResponseRouter::new();
+        let (deps, (mut response_rx, _upstream_rx, _window_rx)) =
+            dummy_server_request_deps_with_rx();
+        let peer = crate::lsp::bridge::pool::test_helpers::create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("oxfmt"),
+        )
+        .await;
+        deps.peer_directory.register(&peer);
+        let downstream_id = forward_peer_request(&router, &deps, &peer, 42).await;
+
+        deps.inbound_request_registry
+            .cancel_connection(deps.progress_connection_id);
+
+        let OutboundMessage::Untracked(response) = response_rx.recv().await.unwrap() else {
+            panic!("server-request responses are untracked")
+        };
+        assert_eq!(response["id"], 42);
+        assert_eq!(response["error"]["code"], -32800);
+        assert_eq!(
+            peer.router().route(json!({
+                "jsonrpc": "2.0",
+                "id": downstream_id.as_i64(),
+                "result": []
+            })),
+            RouteResult::ReceiverDropped
+        );
+        assert_eq!(peer.router().pending_count(), 0);
+    }
+
     #[tokio::test]
     async fn handle_message_rejects_peer_request_when_origin_limit_is_full() {
         let router = ResponseRouter::new();
