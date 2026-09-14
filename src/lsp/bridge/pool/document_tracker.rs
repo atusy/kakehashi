@@ -459,7 +459,7 @@ impl DocumentTracker {
     /// `try_claim_for_open` already initialises both. They exist so test
     /// helpers can call this directly without going through the claim path.
     #[cfg(test)]
-    pub(in crate::lsp::bridge) async fn register_opened_document(
+    pub(super) async fn register_opened_document(
         &self,
         host_uri: &Url,
         virtual_uri: &VirtualDocumentUri,
@@ -1053,6 +1053,19 @@ impl DocumentTracker {
         self.virtual_to_servers
             .get(virtual_uri)
             .is_some_and(|entry| entry.value().contains(connection_key))
+    }
+
+    /// Test seam for modules outside the pool that need an opened injection
+    /// on record; production callers go through the pool.
+    #[cfg(test)]
+    pub(in crate::lsp::bridge) async fn register_opened_document_for_test(
+        &self,
+        host_uri: &Url,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+    ) {
+        self.register_opened_document(host_uri, virtual_uri, connection_key)
+            .await;
     }
 
     /// Connections that currently serve `uri` either as that exact downstream

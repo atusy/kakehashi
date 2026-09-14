@@ -371,7 +371,7 @@ mod tests {
             VirtualDocumentUri::new(&url_to_uri(&host_uri).unwrap(), "typescript", "ts-0");
         directory
             .document_tracker
-            .register_opened_document(&host_uri, &virtual_uri, &denols_key)
+            .register_opened_document_for_test(&host_uri, &virtual_uri, &denols_key)
             .await;
 
         for uri in [host_uri.as_str(), &virtual_uri.to_uri_string()] {
