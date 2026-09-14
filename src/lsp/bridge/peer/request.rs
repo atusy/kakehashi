@@ -8,7 +8,9 @@ use tower_lsp_server::jsonrpc;
 use crate::lsp::bridge::actor::{
     PeerCancelExpiry, RouterCleanupGuard, ServerRequestDeps, send_server_response,
 };
-use crate::lsp::bridge::inbound_request_registry::PeerRequestPermit;
+use crate::lsp::bridge::inbound_request_registry::{
+    MAX_IN_FLIGHT_PEER_REQUESTS_PER_CONNECTION, PeerRequestPermit,
+};
 use crate::lsp::bridge::pool::ConnectionHandle;
 use crate::lsp::bridge::protocol::JsonRpcNotification;
 use crate::lsp::bridge::protocol::RequestId;
@@ -154,7 +156,10 @@ pub(in crate::lsp::bridge) async fn handle(
             id,
             request_failed(
                 "unknownPeer",
-                "peer is absent, is the caller, or is not running",
+                format!(
+                    "peer '{}' is absent, is the caller, or is not running",
+                    params.id
+                ),
             ),
         );
         send_server_response(&response_tx, response, &server_prefix, METHOD).await;
@@ -169,7 +174,10 @@ pub(in crate::lsp::bridge) async fn handle(
             id,
             request_failed(
                 "tooManyRequests",
-                "too many peer requests are awaiting responses",
+                format!(
+                    "{MAX_IN_FLIGHT_PEER_REQUESTS_PER_CONNECTION} peer requests from this \
+                     connection are already awaiting settlement"
+                ),
             ),
         );
         send_server_response(&response_tx, response, &server_prefix, METHOD).await;
@@ -289,9 +297,7 @@ fn normalize_response(response: serde_json::Value) -> jsonrpc::Result<serde_json
 mod tests {
     use super::*;
     use crate::lsp::bridge::ProgressConnectionId;
-    use crate::lsp::bridge::inbound_request_registry::{
-        InboundRequestRegistry, MAX_IN_FLIGHT_PEER_REQUESTS_PER_CONNECTION,
-    };
+    use crate::lsp::bridge::inbound_request_registry::InboundRequestRegistry;
     use crate::lsp::bridge::pool::{
         ConnectionKey, ConnectionState, test_helpers::create_handle_with_key,
     };

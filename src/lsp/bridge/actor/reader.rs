@@ -2178,6 +2178,10 @@ mod tests {
         assert_eq!(response["id"], 1000);
         assert_eq!(response["error"]["data"]["reason"], "tooManyRequests");
         assert_eq!(
+            response["error"]["message"],
+            "bridge/peer: 64 peer requests from this connection are already awaiting settlement"
+        );
+        assert_eq!(
             peer.router().pending_count(),
             0,
             "rejection happens before target router/task state is created"
@@ -2221,6 +2225,10 @@ mod tests {
         };
         assert_eq!(response["id"], 77);
         assert_eq!(response["error"]["data"]["reason"], "unknownPeer");
+        assert_eq!(
+            response["error"]["message"],
+            "bridge/peer: peer 'missing' is absent, is the caller, or is not running"
+        );
     }
 
     #[tokio::test]
