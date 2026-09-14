@@ -1251,11 +1251,39 @@ impl ConnectionHandle {
         .await
     }
 
+    /// Wait for a managed request's answer until `deadline`. On timeout the
+    /// router entry is retired, except that a frame the writer is still
+    /// writing stays tracked as cancelled so a stalled writer remains visible
+    /// to the liveness timer.
     pub(in crate::lsp::bridge) async fn wait_for_response_until(
         &self,
         request_id: RequestId,
         response_rx: tokio::sync::oneshot::Receiver<serde_json::Value>,
         deadline: tokio::time::Instant,
+    ) -> io::Result<serde_json::Value> {
+        self.wait_for_response_inner(request_id, response_rx, deadline, true)
+            .await
+    }
+
+    /// Like [`Self::wait_for_response_until`], but a timeout leaves the router
+    /// entry untouched: the peer handler retires it itself so it can also
+    /// send the inner `$/cancelRequest` and watch a stalled write.
+    pub(in crate::lsp::bridge) async fn wait_for_peer_response_until(
+        &self,
+        request_id: RequestId,
+        response_rx: tokio::sync::oneshot::Receiver<serde_json::Value>,
+        deadline: tokio::time::Instant,
+    ) -> io::Result<serde_json::Value> {
+        self.wait_for_response_inner(request_id, response_rx, deadline, false)
+            .await
+    }
+
+    async fn wait_for_response_inner(
+        &self,
+        request_id: RequestId,
+        response_rx: tokio::sync::oneshot::Receiver<serde_json::Value>,
+        deadline: tokio::time::Instant,
+        retire_on_timeout: bool,
     ) -> io::Result<serde_json::Value> {
         use tokio::time::timeout_at;
 
@@ -1290,8 +1318,9 @@ impl ConnectionHandle {
                 Err(io::Error::other("bridge: response channel closed"))
             }
             Err(_) => {
-                // Timeout - clean up pending entry
-                self.router().remove(request_id);
+                if retire_on_timeout {
+                    self.router().retire_on_timeout(request_id);
+                }
                 Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "bridge: request timeout",
@@ -1328,6 +1357,25 @@ mod tests {
     /// Create a default DynamicCapabilityRegistry for tests that don't need it.
     fn default_dynamic_caps() -> Arc<DynamicCapabilityRegistry> {
         Arc::new(DynamicCapabilityRegistry::new())
+    }
+
+    /// The generic timeout must not erase the one entry that proves the
+    /// writer is stalled on a frame.
+    #[tokio::test]
+    async fn timeout_keeps_a_frame_the_writer_is_still_writing() {
+        let handle = crate::lsp::bridge::pool::test_helpers::create_handle_with_state(
+            ConnectionState::Ready,
+        )
+        .await;
+        let (request_id, response_rx) = handle.register_request().unwrap();
+        assert!(handle.router().claim_for_write(request_id));
+
+        let error = handle
+            .wait_for_response_until(request_id, response_rx, tokio::time::Instant::now())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(handle.router().awaiting_downstream_count(), 1);
     }
 
     #[test]

@@ -89,8 +89,10 @@ pass-through class: they inherit the per-downstream response cap (currently 30
 seconds) and Tier-2 liveness accounting. A cancelled peer request whose write
 has still not completed one full cap after the target's writer claimed it is
 judged wedged: kakehashi fails that target connection, aborts its writer, and
-answers every request pending on it. That bound is registered as the cancelled
-peer write expiry in ls-bridge-timeout-hierarchy.
+answers every request pending on it. An uncancelled peer request that reaches
+its cap while its write is still in progress is judged the same way once the
+caller has been answered `requestTimeout`. That bound is registered as the
+cancelled peer write expiry in ls-bridge-timeout-hierarchy.
 
 The successful outer result strips the internal JSON-RPC fields and contains
 exactly one branch:
@@ -183,9 +185,9 @@ API from becoming a second routing/spawn policy.
   cannot select a configured but dormant formatter.
 - Slow arbitrary requests share the existing timeout and liveness policy; they
   can contribute to a target connection being classified as failed. A
-  cancelled peer write that stays unwritten for a full response cap faults the
-  shared target connection for every editor request on it, whereas an
-  uncancelled one merely times out alone.
+  peer write that stays unwritten for a full response cap after its caller
+  cancelled or timed out faults the shared target connection for every editor
+  request on it.
 - Each calling connection may have at most 64 peer requests awaiting settlement,
   bounding router entries and forwarding tasks even when targets consume input
   without answering.

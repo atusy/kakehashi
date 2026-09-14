@@ -2325,6 +2325,65 @@ mod tests {
         );
     }
 
+    /// A target that stops reading stdin parks the writer on a large
+    /// uncancelled peer request. The caller's timeout must not erase that
+    /// evidence: the stalled frame is judged by its age and the connection
+    /// torn down, instead of staying Ready with a writer wedged forever.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn stalled_uncancelled_peer_write_fails_the_target_after_the_timeout() {
+        use crate::lsp::bridge::pool::test_helpers::{
+            FULL_PIPE_PAYLOAD_BYTES, create_handle_with_command,
+        };
+
+        let router = ResponseRouter::new();
+        let (deps, (mut response_rx, _upstream_rx, _window_rx)) =
+            dummy_server_request_deps_with_rx();
+        let (peer, _pid) = create_handle_with_command(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("wedged"),
+            vec!["sleep".to_string(), "30".to_string()],
+            None,
+        )
+        .await;
+        deps.peer_directory.register(&peer);
+        handle_message(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 45,
+                "method": "kakehashi/bridge/peer/request",
+                "params": {
+                    "id": peer.key().peer_id(),
+                    "method": "custom/huge",
+                    "params": { "data": "x".repeat(FULL_PIPE_PAYLOAD_BYTES) }
+                }
+            }),
+            &router,
+            "[tsudoi] ",
+            &deps,
+        )
+        .await;
+
+        let OutboundMessage::Untracked(response) = response_rx.recv().await.unwrap() else {
+            panic!("server-request responses are untracked")
+        };
+        assert_eq!(response["id"], 45);
+        assert_eq!(response["error"]["data"]["reason"], "requestTimeout");
+
+        for _ in 0..1000 {
+            if peer.state() == ConnectionState::Failed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            peer.state(),
+            ConnectionState::Failed,
+            "the stalled write must fault the target once it has consumed a full budget"
+        );
+        assert_eq!(peer.router().pending_count(), 0);
+    }
+
     #[tokio::test]
     async fn handle_message_rejects_peer_request_when_origin_limit_is_full() {
         let router = ResponseRouter::new();

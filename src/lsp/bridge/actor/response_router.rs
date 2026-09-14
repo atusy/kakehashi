@@ -512,6 +512,35 @@ impl ResponseRouter {
         removed
     }
 
+    /// Retire a request whose waiter gave up at its deadline; returns whether
+    /// the entry was removed.
+    ///
+    /// An entry the writer is still writing is kept as cancelled instead:
+    /// removing it would hide a stalled frame from the liveness timer, which
+    /// counts only pending entries, and a target that stopped reading stdin
+    /// would then look idle while every later frame queued behind it timed
+    /// out alone. Kept, the frame's late completion still moves it to
+    /// `CancelledSent`, so the target's eventual answer is absorbed.
+    pub(crate) fn retire_on_timeout(&self, id: RequestId) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .recover_poison("ResponseRouter::retire_on_timeout");
+        match state.pending.get_mut(&id) {
+            None => false,
+            Some(pending) if pending.delivery == RequestDelivery::Writing => {
+                pending.delivery = RequestDelivery::CancelledWriting;
+                false
+            }
+            Some(_) => {
+                state.pending.remove(&id);
+                state.failures.remove(&id);
+                Self::remove_cancel_mapping_inner(&mut state, id);
+                true
+            }
+        }
+    }
+
     /// Mark a peer request cancelled and report whether its downstream write
     /// had started, which requires an exact `$/cancelRequest`.
     ///
@@ -1129,6 +1158,38 @@ mod tests {
             router.register(RequestId::new(2)).is_none(),
             "a terminal router must reject new requests"
         );
+    }
+
+    /// A frame the writer is still writing when its waiter times out must
+    /// stay pending: it is the only evidence of a stalled writer the liveness
+    /// timer can see.
+    #[tokio::test]
+    async fn timed_out_write_in_progress_stays_visible_to_liveness() {
+        let router = ResponseRouter::new();
+        let writing = RequestId::new(1);
+        let queued = RequestId::new(2);
+        let writing_rx = router.register(writing).unwrap();
+        let _queued_rx = router.register(queued).unwrap();
+        assert!(router.claim_for_write(writing));
+
+        assert!(
+            !router.retire_on_timeout(writing),
+            "a frame being written is kept"
+        );
+        assert!(
+            router.retire_on_timeout(queued),
+            "a frame never claimed is dropped"
+        );
+        assert_eq!(router.awaiting_downstream_count(), 1);
+
+        drop(writing_rx);
+        router.mark_sent(writing);
+        assert_eq!(
+            router.route(serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": null })),
+            RouteResult::ReceiverDropped,
+            "the late answer is absorbed once the write completes"
+        );
+        assert_eq!(router.pending_count(), 0);
     }
 
     #[test]

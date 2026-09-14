@@ -179,7 +179,9 @@ bound this hierarchy did not previously register):
   neither tier: Tier 1 engages only for a multi-server fan-out and is still
   Phase 3, and Tier 2 resets on any decoded server message, so it bounds
   *silence* rather than a request
-- **On expiry**: that request alone fails; the connection is not faulted
+- **On expiry**: that request alone fails; the connection is not faulted.
+  A frame the writer is still writing at expiry stays tracked as cancelled
+  rather than removed, so Tier 2 keeps observing the stalled writer
 - **Precedence**: connection closure and the shutdown deadline both cut it
   short, so it never extends a teardown
 - **Status**: shipped, and the reason the absence of Tier 1 is not currently
@@ -191,10 +193,10 @@ bound registered here):
   the target's writer claimed the cancelled frame — never from the outer
   request's acceptance, so time spent queued behind earlier frames does not
   count
-- **Scope**: a downstream peer request (bridge-peer-protocol) cancelled
-  after its write started. An uncancelled peer request at the same point
-  merely fails alone under the response cap; a cancelled one whose write
-  completed is retired at the cap without touching the connection
+- **Scope**: a downstream peer request (bridge-peer-protocol) whose caller
+  stopped waiting, by cancelling or by reaching the response cap, while its
+  write was in progress. One whose write completed is retired without
+  touching the connection once the target answers or the cap passes
 - **Why a separate bound**: Tier 2 resets on every decoded downstream
   message, so a server that stops reading stdin while still emitting
   progress or log notifications never trips it, and the parked write would

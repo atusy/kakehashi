@@ -236,45 +236,47 @@ pub(in crate::lsp::bridge) async fn handle(
     let deadline = tokio::time::Instant::now() + super::super::pool::REQUEST_TIMEOUT;
     let permit = Arc::new(permit);
     tokio::spawn(async move {
-        let body = tokio::select! {
-            response = peer.wait_for_response_until(downstream_id, response_rx, deadline) => {
-                router_guard.disarm();
-                match response {
-                    Ok(response) => normalize_response(response),
-                    Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
-                        Err(request_failed("requestTimeout", error.to_string()))
-                    }
-                    Err(error) => Err(request_failed("connectionLost", error.to_string())),
-                }
+        enum Outcome {
+            Response(std::io::Result<serde_json::Value>),
+            Cancelled,
+        }
+        let outcome = tokio::select! {
+            response = peer.wait_for_peer_response_until(downstream_id, response_rx, deadline) => {
+                Outcome::Response(response)
             }
-            _ = cancel.cancelled() => {
-                let cancellation = peer.router().cancel_peer(downstream_id);
-                let should_notify = cancellation.unwrap_or(false);
-                if cancellation.is_some() {
-                    router_guard.disarm();
-                }
-                if should_notify {
-                    let outcome = peer.send_notification(JsonRpcNotification::new(
-                        "$/cancelRequest",
-                        serde_json::json!({ "id": downstream_id.as_i64() }),
-                    ));
-                    if outcome != super::super::pool::NotificationSendResult::Queued {
-                        log::warn!(
-                            target: "kakehashi::bridge::peer",
-                            "{}: could not queue peer cancellation for request {}: {:?}",
-                            peer.key(),
-                            downstream_id.as_i64(),
-                            outcome
-                        );
-                    }
-                    tokio::spawn(cleanup_cancelled_peer(
-                        peer.clone(),
-                        downstream_id,
-                        settled_rx,
-                        deadline,
-                        Arc::clone(&permit),
-                    ));
-                }
+            _ = cancel.cancelled() => Outcome::Cancelled,
+        };
+        let body = match outcome {
+            Outcome::Response(Ok(response)) => {
+                router_guard.disarm();
+                normalize_response(response)
+            }
+            Outcome::Response(Err(error)) if error.kind() == std::io::ErrorKind::TimedOut => {
+                // The caller is gone either way; a frame still being written
+                // is judged by its age from here on, exactly as on cancel.
+                abandon_in_flight(
+                    &peer,
+                    downstream_id,
+                    &mut router_guard,
+                    settled_rx,
+                    tokio::time::Instant::now(),
+                    &permit,
+                );
+                Err(request_failed("requestTimeout", error.to_string()))
+            }
+            Outcome::Response(Err(error)) => {
+                router_guard.disarm();
+                Err(request_failed("connectionLost", error.to_string()))
+            }
+            Outcome::Cancelled => {
+                abandon_in_flight(
+                    &peer,
+                    downstream_id,
+                    &mut router_guard,
+                    settled_rx,
+                    deadline,
+                    &permit,
+                );
                 Err(jsonrpc::Error::request_cancelled())
             }
         };
@@ -285,6 +287,48 @@ pub(in crate::lsp::bridge) async fn handle(
         };
         send_server_response(&response_tx, response, &server_prefix, METHOD).await;
     });
+}
+
+/// Stop waiting for the inner request: drop it if still queued, otherwise
+/// keep it pending as cancelled, ask the target to cancel it, and watch its
+/// settlement from `first_check` on so a stalled write is eventually judged
+/// by its age. `None` from the router means the entry settled concurrently,
+/// in which case the guard stays armed to sweep it.
+fn abandon_in_flight(
+    peer: &Arc<ConnectionHandle>,
+    downstream_id: RequestId,
+    router_guard: &mut RouterCleanupGuard,
+    settled_rx: tokio::sync::oneshot::Receiver<()>,
+    first_check: tokio::time::Instant,
+    permit: &Arc<PeerRequestPermit>,
+) {
+    match peer.router().cancel_peer(downstream_id) {
+        None => {}
+        Some(false) => router_guard.disarm(),
+        Some(true) => {
+            router_guard.disarm();
+            let outcome = peer.send_notification(JsonRpcNotification::new(
+                "$/cancelRequest",
+                serde_json::json!({ "id": downstream_id.as_i64() }),
+            ));
+            if outcome != super::super::pool::NotificationSendResult::Queued {
+                log::warn!(
+                    target: "kakehashi::bridge::peer",
+                    "{}: could not queue peer cancellation for request {}: {:?}",
+                    peer.key(),
+                    downstream_id.as_i64(),
+                    outcome
+                );
+            }
+            tokio::spawn(cleanup_cancelled_peer(
+                Arc::clone(peer),
+                downstream_id,
+                settled_rx,
+                first_check,
+                Arc::clone(permit),
+            ));
+        }
+    }
 }
 
 /// Strip the JSON-RPC envelope of a peer's response down to the branch the
