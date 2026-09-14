@@ -80,6 +80,19 @@ fn validate_params(params: &PeerRequestParams) -> jsonrpc::Result<()> {
             "inner params must be an object, array, or omitted",
         ));
     }
+    // The target streams partial results as `$/progress` on its own
+    // connection, which nothing routes back to the caller, and the final
+    // response may then legitimately be empty. Refuse rather than lose data.
+    if matches!(
+        &params.params,
+        OptionalParams::Present(value) if value.get("partialResultToken").is_some()
+    ) {
+        return Err(request_failed(
+            "partialResultsUnsupported",
+            "inner params carry a partialResultToken, whose $/progress stream is not \
+             routed to the caller; omit it to receive the full result",
+        ));
+    }
     Ok(())
 }
 
@@ -399,6 +412,30 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(params.method, "custom/request");
+    }
+
+    #[test]
+    fn partial_result_tokens_are_refused_rather_than_silently_dropped() {
+        let params = PeerRequestParams::deserialize(&serde_json::json!({
+            "id": "peer",
+            "method": "workspace/symbol",
+            "params": { "query": "x", "partialResultToken": "t" }
+        }))
+        .unwrap();
+        let error = validate_params(&params).unwrap_err();
+        assert_eq!(error.code, jsonrpc::ErrorCode::ServerError(-32803));
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({ "reason": "partialResultsUnsupported" }))
+        );
+
+        let work_done_only = PeerRequestParams::deserialize(&serde_json::json!({
+            "id": "peer",
+            "method": "workspace/symbol",
+            "params": { "query": "x", "workDoneToken": "t" }
+        }))
+        .unwrap();
+        validate_params(&work_done_only).unwrap();
     }
 
     #[test]

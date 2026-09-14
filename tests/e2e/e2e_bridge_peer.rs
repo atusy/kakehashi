@@ -74,12 +74,17 @@ fn shutdown(client: &mut LspClient) {
     client.send_notification("exit", json!(null));
 }
 
-/// Execute `mock.peer` on the caller, asking it to forward `method` to the
-/// peer named `target`, and return the caller's report.
-fn peer_command(client: &mut LspClient, target: &str, method: &str) -> Value {
+/// Execute `mock.peer` on the caller, asking it to forward `method` (with
+/// `params`, or the mock's default when null) to the peer named `target`, and
+/// return the caller's report.
+fn peer_command(client: &mut LspClient, target: &str, method: &str, params: Value) -> Value {
+    let mut arguments = vec![json!(target), json!(method)];
+    if !params.is_null() {
+        arguments.push(params);
+    }
     let response = client.send_request(
         "workspace/executeCommand",
-        json!({ "command": CALLER_COMMAND, "arguments": [target, method] }),
+        json!({ "command": CALLER_COMMAND, "arguments": arguments }),
     );
     assert!(
         response.get("error").is_none(),
@@ -91,10 +96,15 @@ fn peer_command(client: &mut LspClient, target: &str, method: &str) -> Value {
 
 /// The target becomes discoverable only once it is running; retry until the
 /// caller reports it.
-fn peer_command_until_discovered(client: &mut LspClient, target: &str, method: &str) -> Value {
+fn peer_command_until_discovered(
+    client: &mut LspClient,
+    target: &str,
+    method: &str,
+    params: Value,
+) -> Value {
     let mut last = Value::Null;
     for _ in 0..300 {
-        let report = peer_command(client, target, method);
+        let report = peer_command(client, target, method, params.clone());
         assert!(
             report.is_object(),
             "the dispatch failed soft instead of reaching the caller: {report:?}"
@@ -115,7 +125,8 @@ fn peer_command_until_discovered(client: &mut LspClient, target: &str, method: &
 fn downstream_server_discovers_and_proxies_to_a_running_peer() {
     let (mut client, _config_dir) = init_client();
 
-    let report = peer_command_until_discovered(&mut client, "mock-target", "custom/echo");
+    let report =
+        peer_command_until_discovered(&mut client, "mock-target", "custom/echo", Value::Null);
     assert_eq!(
         report["bridgePeer"], true,
         "kakehashi must advertise the peer API in the downstream initialize"
@@ -164,13 +175,34 @@ fn peer_methods_are_not_editor_facing() {
     shutdown(&mut client);
 }
 
+/// A request whose partial results would stream to nobody is refused with
+/// its own reason instead of answering with an empty final result.
+#[test]
+fn partial_result_tokens_are_refused_over_the_wire() {
+    let (mut client, _config_dir) = init_client();
+
+    let report = peer_command_until_discovered(
+        &mut client,
+        "mock-target",
+        "custom/echo",
+        json!({ "partialResultToken": "batch-1" }),
+    );
+    assert_eq!(report["forwarded"]["error"]["code"], -32803);
+    assert_eq!(
+        report["forwarded"]["error"]["data"]["reason"], "partialResultsUnsupported",
+        "{report:?}"
+    );
+
+    shutdown(&mut client);
+}
+
 #[test]
 fn lifecycle_methods_are_denied_over_the_wire() {
     let (mut client, _config_dir) = init_client();
 
     // Every retry asks to forward `shutdown`, but denial precedes peer
     // resolution, so no target ever receives a lifecycle request.
-    let report = peer_command_until_discovered(&mut client, "mock-target", "shutdown");
+    let report = peer_command_until_discovered(&mut client, "mock-target", "shutdown", Value::Null);
     assert_eq!(report["forwarded"]["error"]["code"], -32803);
     assert_eq!(
         report["forwarded"]["error"]["data"]["reason"], "methodDenied",

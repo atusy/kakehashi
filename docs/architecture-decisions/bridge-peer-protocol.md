@@ -72,6 +72,11 @@ virtual/host coordinate mapping occurs: the caller is responsible for using the
 target's downstream-facing document identities and protocol state correctly.
 
 `params`, when present, must be an object or array as required by JSON-RPC.
+Inner params carrying a `partialResultToken` are refused: the target streams
+partial results as `$/progress` on its own connection, nothing routes that
+stream to the caller, and the final response may then legitimately be empty.
+Work-done progress on a caller-supplied `workDoneToken` is likewise not routed
+to the caller, but omitting it loses nothing.
 `initialize`, `initialized`, `shutdown`, `exit`, and `$/cancelRequest` are denied
 because they would take over the target connection's lifecycle. Cancellation is
 instead expressed by cancelling the outer request: kakehashi drops the inner
@@ -102,6 +107,7 @@ Bridge-level failures use `RequestFailed` (`-32803`) and `data.reason`:
 |---|---|
 | `unknownPeer` | The id is absent, names the caller, or is not currently running |
 | `methodDenied` | The inner method controls the connection lifecycle |
+| `partialResultsUnsupported` | The inner params carry a `partialResultToken`, whose result stream would not reach the caller |
 | `forwardFailed` | The inner request could not be queued |
 | `tooManyRequests` | The caller already has 64 peer requests awaiting settlement |
 | `connectionLost` | The target connection ended before answering |

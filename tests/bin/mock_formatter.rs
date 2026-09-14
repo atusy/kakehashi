@@ -1258,6 +1258,10 @@ fn main() {
                         .and_then(Value::as_str)
                         .unwrap_or("custom/ping")
                         .to_string();
+                    let inner_params = message
+                        .pointer("/params/arguments/2")
+                        .cloned()
+                        .unwrap_or_else(|| json!({ "probe": true }));
                     request_with_params(
                         &mut writer,
                         json!(5000),
@@ -1277,7 +1281,7 @@ fn main() {
                             json!({
                                 "id": peer["id"],
                                 "method": inner_method,
-                                "params": { "probe": true }
+                                "params": inner_params
                             }),
                         );
                         read_response(&mut reader, &mut writer, 5001)
