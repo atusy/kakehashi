@@ -159,6 +159,13 @@ async fn writer_loop(
                         target: "kakehashi::bridge::writer",
                         "Writer task received stop signal, draining queue"
                     );
+                    // Refuse new frames before draining. A frame accepted
+                    // after the last `try_recv` would be dropped with the
+                    // receiver, leaving its router entry to age out at the
+                    // response cap; closed, a late `try_send` fails at once
+                    // and the sender retires its own entry. Frames already
+                    // buffered are still drained below.
+                    rx.close();
                     // Drain remaining messages (best-effort write)
                     while let Ok(msg) = rx.try_recv() {
                         match write_or_cancelled(&mut writer, &msg, &router, &cancel_token).await {
@@ -383,6 +390,47 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A frame enqueued after the shutdown drain began must be refused, not
+    /// silently dropped with the receiver. The drain is parked on a child
+    /// that never reads, so the window between "drain started" and "task
+    /// returned" is held open deterministically on this current-thread
+    /// runtime. Unix-only: spawns `sleep`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn graceful_stop_closes_the_queue_before_draining() {
+        use crate::lsp::bridge::pool::test_helpers::FULL_PIPE_PAYLOAD_BYTES;
+
+        let mut conn = AsyncBridgeConnection::spawn(vec!["sleep".to_string(), "30".to_string()])
+            .await
+            .expect("should spawn sleep process");
+        let (writer, _reader) = conn.split();
+        let router = Arc::new(ResponseRouter::new());
+        let (tx, rx) = mpsc::channel(16);
+        let mut handle = spawn_writer_task(writer, rx, Arc::clone(&router));
+        let huge =
+            json!({"method": "blocked", "params": {"data": "x".repeat(FULL_PIPE_PAYLOAD_BYTES)}});
+        tx.try_send(OutboundMessage::Untracked(huge)).unwrap();
+
+        tokio::select! {
+            biased;
+            // Phase 1 sends the stop signal synchronously, then parks on idle.
+            _ = handle.stop_and_reclaim() => panic!("the drain cannot finish: the child never reads"),
+            _ = async {
+                for _ in 0..20 {
+                    tokio::task::yield_now().await;
+                }
+                assert!(
+                    matches!(
+                        tx.try_send(OutboundMessage::Untracked(json!({"late": true}))),
+                        Err(mpsc::error::TrySendError::Closed(_))
+                    ),
+                    "a frame offered after the drain began must be refused"
+                );
+            } => {}
+        }
+        handle.cancel();
     }
 
     /// Test that writer task maintains FIFO order.
