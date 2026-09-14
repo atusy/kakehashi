@@ -485,8 +485,13 @@ impl ResponseRouter {
         removed
     }
 
-    /// Retire a peer request on outer cancellation and report whether its
-    /// downstream write had started, requiring an exact `$/cancelRequest`.
+    /// Mark a peer request cancelled and report whether its downstream write
+    /// had started, which requires an exact `$/cancelRequest`.
+    ///
+    /// A request still queued is dropped here. One whose write started stays
+    /// pending as cancelled until the target answers or the cleanup task
+    /// expires it, so its response (or its wedged write) is still observed.
+    /// `None` means the entry had already settled.
     pub(crate) fn cancel_peer(&self, id: RequestId) -> Option<bool> {
         let mut state = self
             .state
@@ -494,7 +499,7 @@ impl ResponseRouter {
             .recover_poison("ResponseRouter::cancel_peer");
         let pending = state.pending.get_mut(&id)?;
         match pending.delivery {
-            RequestDelivery::Queued | RequestDelivery::CancelledQueued => {
+            RequestDelivery::Queued => {
                 state.pending.remove(&id);
                 state.failures.remove(&id);
                 Self::remove_cancel_mapping_inner(&mut state, id);
@@ -508,7 +513,12 @@ impl ResponseRouter {
                 pending.delivery = RequestDelivery::CancelledSent;
                 Some(true)
             }
-            RequestDelivery::CancelledWriting | RequestDelivery::CancelledSent => Some(false),
+            // Peer requests carry no upstream id, so the writer-discard state
+            // is unreachable here; treating it like an already cancelled
+            // entry keeps the match exhaustive without inventing a path.
+            RequestDelivery::CancelledQueued
+            | RequestDelivery::CancelledWriting
+            | RequestDelivery::CancelledSent => Some(false),
         }
     }
 
