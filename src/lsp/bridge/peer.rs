@@ -31,9 +31,16 @@ pub(in crate::lsp::bridge) struct Peer {
 /// Weak handles avoid a pool -> handle -> reader -> directory -> handle cycle.
 /// Re-inserting the same key on respawn replaces the old generation.
 pub(in crate::lsp::bridge) struct PeerDirectory {
-    handles: DashMap<ConnectionKey, Weak<ConnectionHandle>>,
+    handles: DashMap<ConnectionKey, PeerSlot>,
     document_tracker: Arc<DocumentTracker>,
     host_documents: Arc<HostDocuments>,
+}
+
+/// One registered connection slot. The wire id is a pure function of the
+/// key, so it is formatted once here rather than per discovery or lookup.
+struct PeerSlot {
+    id: String,
+    handle: Weak<ConnectionHandle>,
 }
 
 #[cfg(test)]
@@ -60,12 +67,18 @@ impl PeerDirectory {
 
     pub(in crate::lsp::bridge) fn register(&self, handle: &Arc<ConnectionHandle>) {
         self.prune_dead();
-        self.handles
-            .insert(handle.key().clone(), Arc::downgrade(handle));
+        self.handles.insert(
+            handle.key().clone(),
+            PeerSlot {
+                id: handle.key().peer_id(),
+                handle: Arc::downgrade(handle),
+            },
+        );
     }
 
     fn prune_dead(&self) {
-        self.handles.retain(|_, handle| handle.strong_count() != 0);
+        self.handles
+            .retain(|_, slot| slot.handle.strong_count() != 0);
     }
 
     pub(in crate::lsp::bridge) async fn list(
@@ -89,11 +102,17 @@ impl PeerDirectory {
                     .as_ref()
                     .is_none_or(|connections| connections.contains(entry.key()))
             })
-            .filter_map(|entry| entry.value().upgrade())
-            .filter(|handle| handle.state() == ConnectionState::Ready)
-            .map(|handle| Peer {
+            .filter_map(|entry| {
+                entry
+                    .value()
+                    .handle
+                    .upgrade()
+                    .map(|handle| (entry.value().id.clone(), handle))
+            })
+            .filter(|(_, handle)| handle.state() == ConnectionState::Ready)
+            .map(|(id, handle)| Peer {
                 name: handle.key().server().to_string(),
-                id: handle.key().peer_id(),
+                id,
                 workspace_folders: handle.workspace_folders().snapshot().unwrap_or_default(),
             })
             .collect::<Vec<_>>();
@@ -127,8 +146,8 @@ impl PeerDirectory {
         self.prune_dead();
         self.handles
             .iter()
-            .find(|entry| entry.key() != origin && entry.key().peer_id() == id)
-            .and_then(|entry| entry.value().upgrade())
+            .find(|entry| entry.key() != origin && entry.value().id == id)
+            .and_then(|entry| entry.value().handle.upgrade())
             .filter(|handle| handle.state() == ConnectionState::Ready)
     }
 }
