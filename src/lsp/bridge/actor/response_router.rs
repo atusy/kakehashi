@@ -1169,7 +1169,9 @@ mod tests {
         );
     }
 
-    const WRITE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+    /// The budget the peer cleanup passes in production, so these tests model
+    /// the real cap rather than a number that drifts from it.
+    const WRITE_BUDGET: std::time::Duration = crate::lsp::bridge::pool::REQUEST_TIMEOUT;
 
     #[tokio::test(start_paused = true)]
     async fn peer_write_expiry_distinguishes_connection_failure_victims() {
