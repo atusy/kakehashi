@@ -19,7 +19,6 @@
 //! been an eager one, not a request) — the same
 //! full-content sync the virt path uses for its `didChange` forwarding.
 
-use std::collections::hash_map::Entry;
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::sync::Arc;
@@ -200,34 +199,36 @@ pub(super) async fn sync_host_document<S: MessageSender>(
         )
     };
 
-    if let Entry::Vacant(uri_entry) = docs.entry(uri_string.clone()) {
+    // Steady-state resyncs find both levels present; look up by borrowed
+    // key and clone only on the miss path that inserts.
+    let Some(connections) = docs.get_mut(&uri_string) else {
         sender.send_notification(did_open()).await?;
-        uri_entry.insert(std::collections::HashMap::from([(
-            connection_key.clone(),
-            HostDocSyncState {
-                version: 1,
-                fingerprint: fp,
-                content_version,
-            },
-        )]));
+        docs.insert(
+            uri_string,
+            std::collections::HashMap::from([(
+                connection_key.clone(),
+                HostDocSyncState {
+                    version: 1,
+                    fingerprint: fp,
+                    content_version,
+                },
+            )]),
+        );
         return Ok(());
-    }
-
-    match docs
-        .get_mut(&uri_string)
-        .expect("host URI presence checked above")
-        .entry(connection_key.clone())
-    {
-        Entry::Vacant(entry) => {
+    };
+    match connections.get_mut(connection_key) {
+        None => {
             sender.send_notification(did_open()).await?;
-            entry.insert(HostDocSyncState {
-                version: 1,
-                fingerprint: fp,
-                content_version,
-            });
+            connections.insert(
+                connection_key.clone(),
+                HostDocSyncState {
+                    version: 1,
+                    fingerprint: fp,
+                    content_version,
+                },
+            );
         }
-        Entry::Occupied(mut entry) => {
-            let state = entry.get_mut();
+        Some(state) => {
             // Two requests of the same lifetime can reach this lock in the
             // reverse of the order their text was read in; syncing the older
             // text would roll the downstream back to it, and the request's
