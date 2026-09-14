@@ -185,8 +185,12 @@ fn completion_geometry_matches(
     live_protected_host_ranges: &[tower_lsp_server::ls_types::Range],
 ) -> bool {
     let produced_at = RegionOffset::from(&envelope.offset);
+    let protected_geometry_supported = !live_protected_host_ranges.is_empty()
+        && live_protected_host_ranges
+            .iter()
+            .all(|range| range.start.line == range.end.line);
     !envelope.region_id.is_empty()
-        && (contiguous || !live_protected_host_ranges.is_empty())
+        && (contiguous || protected_geometry_supported)
         && envelope.protected_host_ranges == live_protected_host_ranges
         // The start identifies the region; the per-line columns below it
         // grow with the region and are read live for translation.
@@ -275,6 +279,26 @@ mod tests {
             "lua",
             &[gap]
         ));
+        let multiline_gap = Range {
+            start: Position {
+                line: 3,
+                character: 5,
+            },
+            end: Position {
+                line: 4,
+                character: 1,
+            },
+        };
+        let mut multiline = envelope("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        multiline.protected_host_ranges = vec![multiline_gap];
+        assert!(!completion_geometry_matches(
+            &multiline,
+            &offset,
+            false,
+            "lua",
+            &[multiline_gap]
+        ));
+
         let shifted = Range {
             start: Position {
                 line: 3,
