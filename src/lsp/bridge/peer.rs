@@ -348,6 +348,52 @@ mod tests {
         assert_eq!(result[0]["name"], "oxfmt");
     }
 
+    /// The document filter also matches a peer that serves an injection of
+    /// the supplied host document, through the document tracker rather than
+    /// the host-document sync state.
+    #[tokio::test]
+    async fn peer_discovery_matches_a_peer_serving_an_injection_of_the_host() {
+        use crate::lsp::bridge::protocol::VirtualDocumentUri;
+        use crate::lsp::lsp_impl::url_to_uri;
+
+        let directory = PeerDirectory::default();
+        let origin_key = ConnectionKey::for_server("tsudoi");
+        let denols_key = ConnectionKey::for_server("denols");
+        let idle_key = ConnectionKey::for_server("oxfmt");
+        let origin = create_handle_with_key(ConnectionState::Ready, origin_key.clone()).await;
+        let denols = create_handle_with_key(ConnectionState::Ready, denols_key.clone()).await;
+        let idle = create_handle_with_key(ConnectionState::Ready, idle_key).await;
+        for handle in [&origin, &denols, &idle] {
+            directory.register(handle);
+        }
+        let host_uri = url::Url::parse("file:///repo/doc.md").unwrap();
+        let virtual_uri =
+            VirtualDocumentUri::new(&url_to_uri(&host_uri).unwrap(), "typescript", "ts-0");
+        directory
+            .document_tracker
+            .register_opened_document(&host_uri, &virtual_uri, &denols_key)
+            .await;
+
+        for uri in [host_uri.as_str(), &virtual_uri.to_uri_string()] {
+            let result = list_result(
+                &directory,
+                &origin_key,
+                &serde_json::json!({ "params": { "textDocument": { "uri": uri } } }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                result,
+                serde_json::json!([{
+                    "name": "denols",
+                    "id": denols_key.peer_id(),
+                    "workspaceFolders": []
+                }]),
+                "filtering by {uri} must find only the injection's server"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn peer_discovery_rejects_explicit_null_filters() {
         let directory = PeerDirectory::default();

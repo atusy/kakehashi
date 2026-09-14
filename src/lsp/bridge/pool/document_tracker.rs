@@ -459,7 +459,7 @@ impl DocumentTracker {
     /// `try_claim_for_open` already initialises both. They exist so test
     /// helpers can call this directly without going through the claim path.
     #[cfg(test)]
-    pub(super) async fn register_opened_document(
+    pub(in crate::lsp::bridge) async fn register_opened_document(
         &self,
         host_uri: &Url,
         virtual_uri: &VirtualDocumentUri,
