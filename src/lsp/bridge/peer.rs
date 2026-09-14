@@ -28,8 +28,11 @@ pub(in crate::lsp::bridge) struct Peer {
 
 /// Weak directory of pool connections shared with downstream reader tasks.
 ///
-/// Weak handles avoid a pool -> handle -> reader -> directory -> handle cycle.
-/// Re-inserting the same key on respawn replaces the old generation.
+/// Handles are held weakly so the directory can never resurrect a
+/// connection the pool has already dropped, and so a replaced generation
+/// leaves as soon as its last strong holder does instead of living until
+/// the next registration. Re-inserting the same key on respawn replaces the
+/// old generation.
 pub(in crate::lsp::bridge) struct PeerDirectory {
     handles: DashMap<ConnectionKey, PeerSlot>,
     document_tracker: Arc<DocumentTracker>,
