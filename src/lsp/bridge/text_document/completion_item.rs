@@ -424,7 +424,7 @@ impl LanguageServerPool {
                 }
                 let mut docs = self.host_documents().await;
                 if !docs
-                    .get(&document.host_uri.to_string())
+                    .get(document.host_uri.as_str())
                     .is_some_and(|connections| connections.contains_key(connection_key))
                 {
                     return Err(io::Error::other("completion document is no longer open"));
