@@ -174,6 +174,8 @@ pub(in crate::lsp::bridge) async fn handle(
 
     let connection_id = deps.progress_connection_id;
     let registry = deps.inbound_request_registry.clone();
+    // Register before the inner send: a $/cancelRequest arriving immediately
+    // after the outer request must not fall into a send/register gap.
     let Some((cancel, generation, permit)) = registry.try_register_peer(connection_id, id.clone())
     else {
         let response = jsonrpc::Response::from_error(
@@ -204,8 +206,6 @@ pub(in crate::lsp::bridge) async fn handle(
         }
     };
     let mut router_guard = RouterCleanupGuard::new(peer.router().clone(), downstream_id);
-    // Register before the inner send: a $/cancelRequest arriving immediately
-    // after the outer request must not fall into a send/register gap.
     let inner_params = match params.params {
         OptionalParams::Missing => None,
         OptionalParams::Present(value) => Some(value),
