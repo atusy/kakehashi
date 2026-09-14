@@ -35,6 +35,7 @@ mod selection_range;
 mod semantic_tokens;
 mod signature_help;
 mod type_definition;
+mod type_hierarchy;
 mod will_save;
 mod will_save_wait_until;
 

@@ -363,6 +363,7 @@ fn classify(req: &Request) -> Option<Role> {
         | "textDocument/documentColor"
         | "textDocument/colorPresentation"
         | "textDocument/prepareCallHierarchy"
+        | "textDocument/prepareTypeHierarchy"
         | "textDocument/diagnostic"
         | "kakehashi/captures/full"
         | "kakehashi/captures/full/delta"
