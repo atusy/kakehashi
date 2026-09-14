@@ -33,7 +33,11 @@ where
     }
 
     fn call(&mut self, request: Request) -> Self::Future {
-        let patch_type_hierarchy = request.method() == "textDocument/prepareTypeHierarchy";
+        let patch_type_hierarchy = matches!(
+            request.method(),
+            "textDocument/prepareTypeHierarchy" | "typeHierarchy/supertypes"
+        );
+        let request = scalarize_type_hierarchy_request_tags(request);
         let future = self.inner.call(request);
         Box::pin(async move {
             let response = future.await?;
@@ -43,6 +47,28 @@ where
             Ok(response.map(array_wrap_type_hierarchy_tags))
         })
     }
+}
+
+fn scalarize_type_hierarchy_request_tags(request: Request) -> Request {
+    if !matches!(request.method(), "typeHierarchy/supertypes") {
+        return request;
+    }
+    let (method, id, mut params) = request.into_parts();
+    if let Some(tags) = params
+        .as_mut()
+        .and_then(|params| params.pointer_mut("/item/tags"))
+        && let Some(values) = tags.as_array_mut()
+    {
+        *tags = values.first().cloned().unwrap_or(serde_json::Value::Null);
+    }
+    let mut builder = Request::build(method);
+    if let Some(params) = params {
+        builder = builder.params(params);
+    }
+    if let Some(id) = id {
+        builder = builder.id(id);
+    }
+    builder.finish()
 }
 
 fn array_wrap_type_hierarchy_tags(response: Response) -> Response {
@@ -105,5 +131,17 @@ mod tests {
             response.result().unwrap()[0]["tags"],
             serde_json::json!([1])
         );
+    }
+
+    #[test]
+    fn type_hierarchy_request_tags_are_scalarized_for_the_pinned_model() {
+        let request = Request::build("typeHierarchy/supertypes")
+            .id(1)
+            .params(serde_json::json!({ "item": { "tags": [1] } }))
+            .finish();
+
+        let request = scalarize_type_hierarchy_request_tags(request);
+
+        assert_eq!(request.params().unwrap()["item"]["tags"], 1);
     }
 }

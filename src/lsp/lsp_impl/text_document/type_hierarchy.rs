@@ -1,18 +1,22 @@
-//! Type-hierarchy preparation across virtual and host bridge layers.
+//! Type-hierarchy preparation and supertype expansion across virtual and host bridge layers.
 
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
-    NumberOrString, Position, TypeHierarchyItem, TypeHierarchyPrepareParams, Uri,
+    NumberOrString, Position, TypeHierarchyItem, TypeHierarchyPrepareParams,
+    TypeHierarchySupertypesParams, Uri,
 };
 
 use super::super::Kakehashi;
+use super::super::region_offset::resolve_region_offset_and_language;
 use crate::lsp::aggregation::server::{
     HostFanOutTask, dispatch_host_preferred, dispatch_preferred,
 };
 use crate::lsp::bridge::{
-    HostDocument, TypeHierarchyDocumentRevision, envelope_host_type_hierarchy_items,
+    HostDocument, TypeHierarchyDocumentRevision, TypeHierarchyEnvelope,
+    envelope_host_type_hierarchy_items, extract_type_hierarchy_envelope,
     parse_type_hierarchy_items,
 };
+use crate::lsp::current_upstream_id;
 
 const METHOD: &str = "textDocument/prepareTypeHierarchy";
 
@@ -37,6 +41,78 @@ impl Kakehashi {
             |items: &Vec<TypeHierarchyItem>| !items.is_empty(),
         )
         .await
+    }
+
+    pub(crate) async fn type_hierarchy_supertypes_impl(
+        &self,
+        params: TypeHierarchySupertypesParams,
+    ) -> Result<Option<Vec<TypeHierarchyItem>>> {
+        let Some(envelope) = extract_type_hierarchy_envelope(&params.item) else {
+            return Ok(None);
+        };
+        let pool = self.bridge.pool_arc();
+        if !self.type_hierarchy_envelope_is_fresh(&envelope, &pool) {
+            return Ok(None);
+        }
+        let settings = self.settings_manager.load_settings();
+        let upstream_id = current_upstream_id();
+        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
+        let sweep_id = upstream_id.clone();
+        let dispatch = pool.dispatch_type_hierarchy_supertypes(params, &settings, upstream_id);
+        let _sweep = crate::lsp::lsp_impl::bridge_context::UpstreamRegistrySweepGuard::new(
+            std::sync::Arc::clone(&pool),
+            sweep_id,
+        );
+        let items = match cancel_rx {
+            Some(rx) => tokio::select! {
+                biased;
+                _ = rx => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
+                items = dispatch => Ok(items),
+            },
+            None => Ok(dispatch.await),
+        }?;
+        if !self.type_hierarchy_envelope_is_fresh(&envelope, &pool) {
+            return Ok(None);
+        }
+        Ok(items)
+    }
+
+    fn type_hierarchy_envelope_is_fresh(
+        &self,
+        envelope: &TypeHierarchyEnvelope,
+        pool: &crate::lsp::bridge::LanguageServerPool,
+    ) -> bool {
+        let Ok(uri) = url::Url::parse(&envelope.host_uri) else {
+            return false;
+        };
+        let Some(expected_incarnation) = envelope.incarnation else {
+            return false;
+        };
+        let lineage_is_current = || {
+            self.documents.get(&uri).is_some_and(|document| {
+                document.content_version() == envelope.content_version
+                    && document.incarnation() == expected_incarnation
+            }) && pool.current_host_incarnation(&uri) == Some(expected_incarnation)
+        };
+        if !lineage_is_current() {
+            return false;
+        }
+        if envelope.is_host_layer() {
+            return true;
+        }
+        let geometry_is_current = resolve_region_offset_and_language(
+            &self.documents,
+            &self.language,
+            &self.bridge,
+            &uri,
+            &envelope.region_id,
+        )
+        .is_some_and(|(offset, _, contiguous, injection_language)| {
+            contiguous
+                && offset == crate::lsp::bridge::RegionOffset::from(&envelope.offset)
+                && injection_language == envelope.injection_language
+        });
+        geometry_is_current && lineage_is_current()
     }
 
     async fn type_hierarchy_prepare_host_layer(
