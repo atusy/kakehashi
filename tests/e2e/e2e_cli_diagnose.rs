@@ -319,6 +319,165 @@ fn e2e_diagnose_stdin_mode_prints_diagnostics() {
 }
 
 #[test]
+fn e2e_diagnose_collects_push_only_server_on_did_open() {
+    let ws = workspace_with(
+        &format!(
+            r#"autoInstall = false
+
+[languageServers.mock-push]
+cmd = ['{}', 'diagnostics-push-delayed']
+languages = ["lua"]
+"#,
+            env!("CARGO_BIN_EXE_mock-lsp-formatter")
+        ),
+        &[("doc.md", MARKDOWN)],
+    );
+
+    let output = run_diagnose(ws.path(), &["doc.md"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "the pushed severity-1 diagnostic must fail the run; stderr: {}",
+        stderr_of(&output)
+    );
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.starts_with("doc.md:4:1: error: mock-push-diag:"),
+        "push-only diagnostics must be translated to host coordinates; got: {stdout:?}"
+    );
+}
+
+#[test]
+fn e2e_diagnose_empty_push_settles_as_clean() {
+    let ws = workspace_with(
+        &format!(
+            r#"autoInstall = false
+
+[languageServers.mock-push-empty]
+cmd = ['{}', 'diagnostics-push-empty']
+languages = ["lua"]
+"#,
+            env!("CARGO_BIN_EXE_mock-lsp-formatter")
+        ),
+        &[("doc.md", MARKDOWN)],
+    );
+
+    let output = run_diagnose(ws.path(), &["doc.md"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "an explicit empty push is an authoritative clean result; stderr: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "an empty push must not manufacture diagnostics: {}",
+        stdout_of(&output)
+    );
+}
+
+#[test]
+fn e2e_diagnose_push_fallback_waits_outside_pull_priorities() {
+    let ws = workspace_with(
+        &format!(
+            r#"autoInstall = false
+
+[languages.markdown.bridge.lua.aggregation."textDocument/diagnostic"]
+priorities = ["mock-pull"]
+maxFanOut = 1
+
+[languageServers.mock-pull]
+cmd = ['{bin}', 'diagnostics']
+languages = ["lua"]
+
+[languageServers.mock-push]
+cmd = ['{bin}', 'diagnostics-push-delayed']
+languages = ["lua"]
+"#,
+            bin = env!("CARGO_BIN_EXE_mock-lsp-formatter")
+        ),
+        &[("doc.md", MARKDOWN)],
+    );
+
+    let output = run_diagnose(ws.path(), &["doc.md"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        stdout_of(&output).contains("mock-push-diag:"),
+        "pushFallback outside the live pull fan-out must still settle and fold: {}",
+        stdout_of(&output)
+    );
+}
+
+#[test]
+fn e2e_diagnose_push_burst_waits_for_latest_update() {
+    let ws = workspace_with(
+        &format!(
+            r#"autoInstall = false
+
+[languageServers.mock-push]
+cmd = ['{}', 'diagnostics-push-burst']
+languages = ["lua"]
+"#,
+            env!("CARGO_BIN_EXE_mock-lsp-formatter")
+        ),
+        &[("doc.md", MARKDOWN)],
+    );
+
+    let output = run_diagnose(ws.path(), &["doc.md"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr: {}",
+        stderr_of(&output)
+    );
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.contains("mock-push-burst:4"),
+        "diagnose must keep waiting while selected push diagnostics are still changing: {stdout:?}"
+    );
+    assert!(!stdout.contains("mock-push-burst:1"));
+}
+
+#[test]
+fn e2e_diagnose_silent_push_candidate_settles_as_clean() {
+    let ws = workspace_with(
+        &format!(
+            r#"autoInstall = false
+
+[languageServers.mock-idle]
+cmd = ['{}', 'idle-no-diagnostics']
+languages = ["lua"]
+"#,
+            env!("CARGO_BIN_EXE_mock-lsp-formatter")
+        ),
+        &[("doc.md", MARKDOWN)],
+    );
+
+    let output = run_diagnose(ws.path(), &["doc.md"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a non-pull server is not required to publish an empty result; stderr: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "a silent server must not manufacture diagnostics: {}",
+        stdout_of(&output)
+    );
+    assert!(
+        !stderr_of(&output).contains("did not publish diagnostics"),
+        "silence is not an operational failure; stderr: {}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
 fn e2e_diagnose_broken_downstream_server_exits_two() {
     // A configured-but-unstartable server must surface as exit 2, not a silent
     // "0 diagnostics" success.

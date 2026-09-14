@@ -7,14 +7,18 @@
 //! `documents` / `bridge` fields, so they live under `lsp_impl` rather than
 //! `crate::cli`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
 use tower_lsp_server::ls_types::{InitializeParams, InitializedParams, WorkspaceFolder};
 use url::Url;
 
+use crate::config::settings::LayerSource;
 use crate::language::InjectionResolver;
+use crate::lsp::diagnostic_cache::DiagnosticSource;
+
+use super::super::bridge_context::resolve_aggregation_config_from_settings;
 
 use super::super::{Kakehashi, url_to_uri};
 
@@ -138,7 +142,9 @@ impl Kakehashi {
     /// the caller reports that as a failure rather than issuing into the race.
     pub(crate) async fn wait_eager_open_finished(&self, uri: &Url, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
-        while !self.bridge.eager_open_tasks_finished(uri) {
+        while !(self.bridge.eager_open_tasks_finished(uri)
+            && self.bridge.host_eager_open_tasks_finished(uri))
+        {
             if tokio::time::Instant::now() >= deadline {
                 log::warn!(
                     target: "kakehashi::cli",
@@ -150,6 +156,152 @@ impl Kakehashi {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         true
+    }
+
+    /// Give push-driven diagnostic servers a bounded chance to settle after
+    /// their eager `didOpen` notifications.
+    ///
+    /// LSP advertises pull diagnostics but has no corresponding capability for
+    /// push diagnostics. A Ready server without `textDocument/diagnostic` may
+    /// publish diagnostics, may publish only when there is something to report,
+    /// or may never publish at all. Consequently, absence of a cache slot is
+    /// not an operational error and cannot be used as a completion signal.
+    ///
+    /// Instead, mirror the final `pushFallback` contributor set: for each
+    /// participating source whose fallback is enabled, every configured Ready
+    /// non-pull server is eligible even when priorities/maxFanOut omit it from
+    /// the live pull fan-out. Wait until those selected push slots have stayed
+    /// unchanged for one configured diagnostic debounce interval, capped by
+    /// `timeout`. Unrelated cache mutations do not restart the quiet window.
+    pub(crate) async fn settle_push_diagnostics(&self, uri: &Url, timeout: Duration) {
+        const METHOD: &str = "textDocument/diagnostic";
+
+        let Some(language_name) = self.document_language(uri) else {
+            return;
+        };
+        let settings = self.settings_manager.load_settings();
+        let layer_cfg = self.resolve_layer_config(&language_name, METHOD);
+        let mut candidate_sources: HashMap<DiagnosticSource, HashSet<String>> = HashMap::new();
+
+        // Virt sources: mirror the final pushFallback fold. That path applies
+        // the cross-layer and pushFallback gates but deliberately does not
+        // re-apply priorities/maxFanOut to push-driven cached contributors.
+        if layer_cfg.allows(LayerSource::Virt)
+            && let Some(injection_query) = self.language.injection_query(&language_name)
+            && let Some(snapshot) = self.documents.get(uri).and_then(|doc| doc.snapshot())
+        {
+            let regions = InjectionResolver::resolve_all(
+                &self.language,
+                self.bridge.node_tracker(),
+                uri,
+                snapshot.tree(),
+                snapshot.text(),
+                injection_query.as_ref(),
+                snapshot.incarnation(),
+            );
+            for resolved in regions {
+                let agg = resolve_aggregation_config_from_settings(
+                    &settings,
+                    &language_name,
+                    &resolved.injection_language,
+                    METHOD,
+                );
+                if !agg.push_fallback {
+                    continue;
+                }
+                let configs = self.bridge_configs_for_injection_language(
+                    &language_name,
+                    &resolved.injection_language,
+                );
+                candidate_sources
+                    .entry(DiagnosticSource::Region(resolved.region.region_id.clone()))
+                    .or_default()
+                    .extend(configs.into_iter().map(|config| config.server_name));
+            }
+        }
+
+        // Host source: mirror the final host pushFallback gate. `_self`
+        // opt-in/participation is enforced by resolve_host_bridge_context, but
+        // push-driven cached contributors are not re-truncated by fan-out rules.
+        if layer_cfg.allows(LayerSource::Host)
+            && let Ok(lsp_uri) = url_to_uri(uri)
+            && let Some(ctx) = self.resolve_host_bridge_context(&lsp_uri, METHOD)
+        {
+            let host_push_fallback = settings
+                .resolve_host_language_settings(&language_name)
+                .map(|language| language.resolve_host_aggregation(METHOD).push_fallback)
+                .unwrap_or(false);
+            if host_push_fallback {
+                let servers = candidate_sources.entry(DiagnosticSource::Host).or_default();
+                for config in ctx.configs {
+                    servers.insert(config.server_name);
+                }
+            }
+        }
+
+        if candidate_sources.is_empty() {
+            return;
+        }
+
+        // The pushFallback fold is independent of the live pull fan-out, so
+        // classify every configured contributor for an enabled source here too.
+        let candidate_names: HashSet<&str> = candidate_sources
+            .values()
+            .flat_map(|servers| servers.iter().map(String::as_str))
+            .collect();
+        let push_only = self
+            .bridge
+            .pool()
+            .servers_known_incapable(&candidate_names, METHOD)
+            .await;
+        if push_only.is_empty() {
+            return;
+        }
+        candidate_sources.retain(|_, servers| {
+            servers.retain(|server| push_only.contains(server));
+            !servers.is_empty()
+        });
+        if candidate_sources.is_empty() {
+            return;
+        }
+
+        let settle = Duration::from_millis(settings.diagnostics_debounce_ms).min(timeout);
+        if settle.is_zero() {
+            return;
+        }
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut observed_activity = self
+            .diagnostics
+            .selected_push_activity(uri, &candidate_sources);
+        let mut quiet_since = tokio::time::Instant::now();
+
+        loop {
+            let now = tokio::time::Instant::now();
+            if now.duration_since(quiet_since) >= settle || now >= deadline {
+                return;
+            }
+
+            // Read only a lightweight fingerprint for the eligible push slots:
+            // do not clone diagnostic payloads every poll, and do not let an
+            // unrelated server postpone a one-shot CLI result.
+            let remaining_quiet = settle.saturating_sub(now.duration_since(quiet_since));
+            let remaining_total = deadline.saturating_duration_since(now);
+            tokio::time::sleep(
+                remaining_quiet
+                    .min(remaining_total)
+                    .min(Duration::from_millis(10)),
+            )
+            .await;
+
+            let current_activity = self
+                .diagnostics
+                .selected_push_activity(uri, &candidate_sources);
+            if current_activity != observed_activity {
+                observed_activity = current_activity;
+                quiet_since = tokio::time::Instant::now();
+            }
+        }
     }
 
     /// Wait (up to `timeout` per server) until every downstream server

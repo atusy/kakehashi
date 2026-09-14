@@ -10,11 +10,12 @@
 //! downstream language-server pool verbatim, so CLI diagnostics can never
 //! drift from editor diagnostics.
 //!
-//! Only **pull** diagnostics (`textDocument/diagnostic`) are collected — the
-//! per-file lifecycle ends at `didClose`, so asynchronous **push** diagnostics
-//! (`textDocument/publishDiagnostics`) a downstream server might emit are never
-//! captured. A downstream server that only publishes diagnostics and does not
-//! answer a pull request therefore contributes nothing to this command.
+//! Pull diagnostics (`textDocument/diagnostic`) are authoritative when a
+//! downstream server advertises them. Push-only diagnostics
+//! (`textDocument/publishDiagnostics`) are also folded in through the normal
+//! `pushFallback` path after a bounded quiet period following `didOpen`. LSP has
+//! no push-completion capability, so a server that stays silent is treated as
+//! having contributed no push result rather than as an operational failure.
 //!
 //! Exit codes:
 //! - `0`: no failing diagnostics, and no operational error.

@@ -2030,6 +2030,13 @@ impl BridgeCoordinator {
             .is_none_or(|batch| batch.handles.iter().all(|h| h.is_finished()))
     }
 
+    /// Whether every host-layer eager-open task for `uri` has finished.
+    pub(crate) fn host_eager_open_tasks_finished(&self, uri: &Url) -> bool {
+        self.host_eager_open_tasks
+            .get(uri)
+            .is_none_or(|batch| batch.handles.iter().all(|h| h.is_finished()))
+    }
+
     /// Push an abort handle into an existing entry, or abort it if stale/removed.
     ///
     /// Called immediately after each `tokio::spawn`. The handle is aborted (not
@@ -2467,6 +2474,29 @@ mod tests {
         );
         assert_eq!(keys[1], &ConnectionKey::shared("shared"));
         drop(connections);
+    }
+
+    #[tokio::test]
+    async fn host_eager_open_finished_tracks_pending_batch() {
+        let coordinator = BridgeCoordinator::new();
+        let uri = Url::parse("file:///host_pending.lua").unwrap();
+        assert!(coordinator.host_eager_open_tasks_finished(&uri));
+
+        let task = tokio::spawn(std::future::pending::<()>());
+        coordinator.host_eager_open_tasks.insert(
+            uri.clone(),
+            EagerOpenBatch {
+                generation: 0,
+                handles: vec![task.abort_handle()],
+                cancel: CancellationToken::new(),
+            },
+        );
+        assert!(!coordinator.host_eager_open_tasks_finished(&uri));
+
+        task.abort();
+        let _ = task.await;
+        assert!(coordinator.host_eager_open_tasks_finished(&uri));
+        coordinator.cancel_host_eager_open(&uri);
     }
 
     /// Shutdown's `abort_all_eager_open` must drain the host-layer eager-open
