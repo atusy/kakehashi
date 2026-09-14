@@ -53,7 +53,7 @@ use crate::lsp::aggregation::server::{
 use crate::lsp::bridge::{
     ClientProgressAggregator, ClientProgressDeregisterGuard, RegionOffset, ResolvedServerConfig,
     UpstreamId, VirtualDocumentUri, range_intersects_protected, text_edit_safe_in_region,
-    translate_virtual_range_to_host,
+    translate_host_range_to_virtual, translate_virtual_range_to_host,
 };
 use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
 use crate::lsp::lsp_impl::text_document::{
@@ -1422,6 +1422,16 @@ fn project_protected_formatting_edits(
 
     let diff = TextDiff::from_chars(original, formatted);
     let mapper = crate::text::PositionMapper::new(original);
+    let mut protected_virtual_bytes = Vec::with_capacity(protected.len());
+    for host_range in protected {
+        let mut virtual_range = *host_range;
+        translate_host_range_to_virtual(&mut virtual_range, offset);
+        let start = mapper.position_to_byte_strict(virtual_range.start)?;
+        let end = mapper.position_to_byte_strict(virtual_range.end)?;
+        if start < end {
+            protected_virtual_bytes.push(start..end);
+        }
+    }
     let region_end = crate::lsp::bridge::region_host_end(original, offset);
     let mut edits = Vec::new();
     let mut current: Option<(usize, usize, String)> = None;
@@ -1432,6 +1442,24 @@ fn project_protected_formatting_edits(
             return Some(());
         };
         let old_text = &original[start..end];
+        if new_text.is_empty()
+            && !old_text.is_empty()
+            && protected_virtual_bytes.iter().any(|gap| {
+                let gap_text = &original[gap.clone()];
+                (gap.end == start
+                    && (gap_text.ends_with(old_text) || old_text.starts_with(gap_text)))
+                    || (end == gap.start
+                        && (gap_text.starts_with(old_text) || old_text.ends_with(gap_text)))
+            })
+        {
+            // Character diffs may place a deletion on an editable copy of the
+            // same text immediately beside a protected synthetic span. In that
+            // case either alignment is valid (for example `000` -> `00` with
+            // the middle `0` protected), so projecting the chosen alignment
+            // could mutate real host text for a synthetic-only formatter change.
+            // Drop the ambiguous deletion rather than guessing.
+            return Some(());
+        }
         let mut range = Range {
             start: mapper.byte_to_position(start)?,
             end: mapper.byte_to_position(end)?,
@@ -2988,6 +3016,16 @@ mod tests {
         assert!(
             project_protected_formatting_edits("aa 000 bb", "aa 0 bb", &offset, &[gap]).is_none()
         );
+    }
+
+    #[test]
+    fn protected_formatting_drops_ambiguous_repeated_character_change() {
+        let offset = RegionOffset::new(0, 0);
+        let gap = Range {
+            start: Position::new(0, 1),
+            end: Position::new(0, 2),
+        };
+        assert!(project_protected_formatting_edits("000", "00", &offset, &[gap]).is_none());
     }
 
     #[test]
