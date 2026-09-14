@@ -462,6 +462,27 @@ mod tests {
         );
     }
 
+    /// A respawn reuses the configured slot's key; the directory must hand
+    /// out the new generation, never the retired one it still remembers.
+    #[tokio::test]
+    async fn respawn_under_the_same_key_replaces_the_registered_generation() {
+        let directory = PeerDirectory::default();
+        let origin_key = ConnectionKey::for_server("tsudoi");
+        let key = ConnectionKey::for_server("denols");
+        let retired = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        directory.register(&retired);
+        retired.set_state(ConnectionState::Failed);
+        let replacement = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        directory.register(&replacement);
+
+        assert_eq!(directory.handles.len(), 1);
+        let resolved = directory
+            .resolve(&origin_key, &key.peer_id())
+            .expect("the replacement is a running peer");
+        assert!(Arc::ptr_eq(&resolved, &replacement));
+        assert_eq!(directory.list(&origin_key, None, None).await.len(), 1);
+    }
+
     #[tokio::test]
     async fn peer_lookup_prunes_connections_after_their_handles_drop() {
         let directory = PeerDirectory::default();
