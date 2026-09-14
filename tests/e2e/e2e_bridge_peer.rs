@@ -90,20 +90,23 @@ fn peer_command(client: &mut LspClient, target: &str, method: &str) -> Value {
 /// The target becomes discoverable only once it is running; retry until the
 /// caller reports it.
 fn peer_command_until_discovered(client: &mut LspClient, target: &str, method: &str) -> Value {
-    (0..300)
-        .find_map(|_| {
-            let report = peer_command(client, target, method);
-            let discovered = report["peers"]
-                .as_array()
-                .is_some_and(|peers| peers.iter().any(|peer| peer["name"] == target));
-            if discovered {
-                Some(report)
-            } else {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                None
-            }
-        })
-        .unwrap_or_else(|| panic!("{target} never became discoverable"))
+    let mut last = Value::Null;
+    for _ in 0..300 {
+        let report = peer_command(client, target, method);
+        assert!(
+            report.is_object(),
+            "the dispatch failed soft instead of reaching the caller: {report:?}"
+        );
+        let discovered = report["peers"]
+            .as_array()
+            .is_some_and(|peers| peers.iter().any(|peer| peer["name"] == target));
+        if discovered {
+            return report;
+        }
+        last = report;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("{target} never became discoverable; last report: {last:?}")
 }
 
 #[test]
