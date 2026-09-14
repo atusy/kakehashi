@@ -122,8 +122,12 @@ async fn cleanup_cancelled_peer(
     }
 }
 
-/// Start an arbitrary request against one discovered peer without blocking the
-/// originating connection's reader loop.
+/// Start an arbitrary request against one discovered peer.
+///
+/// Only the wait for the peer's answer is detached from the originating
+/// connection's reader loop; rejections are answered inline under the
+/// reader's normal response backpressure, so a flood of invalid requests
+/// cannot fan out into detached tasks.
 pub(in crate::lsp::bridge) async fn handle(
     message: &serde_json::Value,
     id: jsonrpc::Id,
