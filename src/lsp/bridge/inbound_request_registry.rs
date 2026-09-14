@@ -355,6 +355,18 @@ mod tests {
                 .is_none(),
             "reusing one outer id cannot bypass the generation limit"
         );
-        drop(registrations);
+
+        let replaced = registrations.remove(0);
+        assert!(
+            replaced.0.is_cancelled(),
+            "a generation displaced by id reuse was cancelled at replacement"
+        );
+        drop(replaced);
+        assert!(
+            registry
+                .try_register_peer(conn(1), jsonrpc::Id::Number(7))
+                .is_some(),
+            "a displaced generation's permit still returns its capacity"
+        );
     }
 }
