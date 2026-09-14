@@ -195,6 +195,13 @@ bound registered here):
   after its write started. An uncancelled peer request at the same point
   merely fails alone under the response cap; a cancelled one whose write
   completed is retired at the cap without touching the connection
+- **Why a separate bound**: Tier 2 resets on every decoded downstream
+  message, so a server that stops reading stdin while still emitting
+  progress or log notifications never trips it, and the parked write would
+  pin the writer task and the child indefinitely. The cancelled request is
+  the one case with no waiter left to time out, so kakehashi must decide the
+  connection's fate itself; an uncancelled request's response cap already
+  retires it alone
 - **On expiry**: the write has made no progress for a full cap, so the
   target is treated as wedged on stdin — `Ready` → `Failed`, request
   admission closed, every pending request on it answered (an internal
