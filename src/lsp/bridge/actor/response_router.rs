@@ -82,7 +82,8 @@ struct PendingRequest {
     /// When the FIFO writer claimed this request's bytes. A cancelled peer
     /// write is judged wedged by its age since this instant, not by the
     /// request's own deadline, because a frame can sit queued behind earlier
-    /// traffic for most of that deadline.
+    /// traffic for most of that deadline. Only whole-frame completion is
+    /// observable.
     write_claimed_at: Option<tokio::time::Instant>,
     /// The waiter distinguishes bridge transport failure from a genuine
     /// downstream JSON-RPC error via [`ResponseRouter::take_failure`].
@@ -550,7 +551,7 @@ impl ResponseRouter {
 
     /// Expire one cancelled peer request whose cleanup timer fired.
     ///
-    /// Only a write that has consumed a full `write_budget` since the writer
+    /// Only a write still incomplete a full `write_budget` after the writer
     /// claimed it counts as wedged: the request deadline this timer was armed
     /// with also covers time spent queued behind earlier frames, so a frame
     /// claimed late is given a fresh budget instead of faulting a healthy
@@ -558,8 +559,8 @@ impl ResponseRouter {
     /// entry is drained under one lock, so no waiter is lost and no new
     /// request slips in; the drained waiters are failed after the lock is
     /// released. A write that finishes in the same instant as the check is
-    /// still treated as wedged: after a full budget of no progress the
-    /// connection has already earned that verdict.
+    /// still treated as wedged: a frame that took a full budget has already
+    /// earned that verdict, whether it stalled or merely crawled.
     pub(crate) fn expire_peer_cancel(
         &self,
         id: RequestId,

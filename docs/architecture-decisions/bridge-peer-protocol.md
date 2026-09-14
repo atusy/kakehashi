@@ -130,9 +130,11 @@ with a failure of kakehashi to perform the forwarding.
   editor control surface, and planned editor-facing `bridge/client/*` methods
   are not thereby made callable from downstream connections.
 - A target connection may be faulted for a cancelled peer write only after
-  that write has made no progress for a full response cap since the writer
-  claimed it; time the frame spent queued behind earlier traffic never counts,
-  so a late-dequeued frame cannot fault a healthy connection.
+  that write has failed to complete within a full response cap of the writer
+  claiming it; time the frame spent queued behind earlier traffic never counts,
+  so a late-dequeued frame cannot fault a healthy connection. Only whole-frame
+  completion is observable, so a target that consumes a very large frame
+  slowly but steadily past the cap is faulted like a stalled one.
 
 ## Considered Options
 

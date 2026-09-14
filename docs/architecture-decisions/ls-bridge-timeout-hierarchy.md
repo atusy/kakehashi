@@ -202,8 +202,10 @@ bound registered here):
   the one case with no waiter left to time out, so kakehashi must decide the
   connection's fate itself; an uncancelled request's response cap already
   retires it alone
-- **On expiry**: the write has made no progress for a full cap, so the
-  target is treated as wedged on stdin — `Ready` → `Failed`, request
+- **On expiry**: the write has not completed within a full cap of its claim
+  (only whole-frame completion is observable, so slow steady consumption
+  past the cap counts the same), and the target is treated as wedged on
+  stdin — `Ready` → `Failed`, request
   admission closed, every pending request on it answered (an internal
   error, or `RequestCancelled` for one already cancelled while queued), the
   writer task aborted (which force-kills the child); the pool replaces the

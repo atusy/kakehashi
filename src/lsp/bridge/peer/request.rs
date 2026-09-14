@@ -84,9 +84,9 @@ fn validate_params(params: &PeerRequestParams) -> jsonrpc::Result<()> {
 }
 
 /// Retire a cancelled peer request once the target settles it, or judge its
-/// write wedged after it has consumed a full request budget since the writer
-/// claimed it. The first check runs at the request deadline; a frame claimed
-/// late in that window is re-checked when its own budget elapses.
+/// write wedged once it is still incomplete a full request budget after the
+/// writer claimed it. The first check runs at the request deadline; a frame
+/// claimed late in that window is re-checked when its own budget elapses.
 async fn cleanup_cancelled_peer(
     peer: Arc<ConnectionHandle>,
     downstream_id: RequestId,
