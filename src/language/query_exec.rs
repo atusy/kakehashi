@@ -101,6 +101,7 @@ pub(crate) fn execute_query(
             continue;
         }
 
+        let cardinalities = crate::language::query_directives::CaptureCardinalities::default();
         let captures: Vec<CapturedNode> = m
             .captures
             .iter()
@@ -108,9 +109,14 @@ pub(crate) fn execute_query(
                 let node = c.node;
                 let range =
                     crate::language::query_directives::capture_range(query, m, c.index, node, text);
-                let metadata =
-                    crate::language::query_directives::capture_metadata(query, m, c.index, text)
-                        .unwrap_or_else(|| metadata_for(Some(c.index as usize)));
+                let metadata = crate::language::query_directives::capture_metadata(
+                    query,
+                    m,
+                    c,
+                    text,
+                    &cardinalities,
+                )
+                .unwrap_or_else(|| metadata_for(Some(c.index as usize)));
                 CapturedNode {
                     name: capture_names[c.index as usize].to_string(),
                     start_byte: node.start_byte(),
@@ -216,6 +222,31 @@ mod tests {
                 vec![("role".into(), Some("title".into()))]
             );
         }
+    }
+
+    #[test]
+    fn gsub_resolves_singletons_after_quantified_captures() {
+        let src = "const A: i32 = 1; const B: i32 = 2; fn a() {} fn b() {} struct Tail;";
+        let (language, tree) = rust_tree(src);
+        let query = compile(
+            &language,
+            r#"((source_file
+                   (const_item) @prefix +
+                   (function_item name: (identifier) @name) +
+                   (struct_item name: (type_identifier) @tail))
+                 (#gsub! @name "^.*$" "unresolved")
+                 (#gsub! @tail "^.*$" "singleton"))"#,
+        );
+        let matches = execute_query(&query, &tree, src, None);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].captures.len(), 5);
+        for capture in &matches[0].captures[..4] {
+            assert!(capture.metadata.is_empty());
+        }
+        assert_eq!(
+            matches[0].captures[4].metadata,
+            vec![("text".into(), Some("singleton".into()))]
+        );
     }
 
     #[test]

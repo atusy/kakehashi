@@ -46,6 +46,7 @@ fn extract_static_language(query: &Query, match_: &QueryMatch) -> Option<String>
 
 /// Extracts language from @injection.language capture
 fn extract_dynamic_language(query: &Query, match_: &QueryMatch, text: &str) -> Option<String> {
+    let cardinalities = query_directives::CaptureCardinalities::default();
     for capture in match_.captures {
         if let Some(capture_name) = query.capture_names().get(capture.index as usize)
             && *capture_name == "injection.language"
@@ -55,7 +56,8 @@ fn extract_dynamic_language(query: &Query, match_: &QueryMatch, text: &str) -> O
             // the capture didn't resolve to real text — treat it as "no language"
             // rather than emitting an empty language id (which would create a
             // bogus injection region downstream), mirroring the info-string path.
-            let metadata = query_directives::capture_metadata(query, match_, capture.index, text)?;
+            let metadata =
+                query_directives::capture_metadata(query, match_, capture, text, &cardinalities)?;
             let lang_text = metadata
                 .iter()
                 .rev()
