@@ -408,11 +408,16 @@ fn assert_subtypes_discard_response_after_document_change(host_layer: bool) {
         wait_for_log_message(&mut client, "type-hierarchy-subtypes-started").is_some(),
         "downstream subtype request must reach the sent-state barrier"
     );
+    // Edit strictly inside the injected content. An edit covering the region's
+    // first byte invalidates its identity (START-priority), so the virtual layer
+    // would see didClose/didOpen instead of didChange: the mock never releases
+    // the delayed response, and only the 30s bridge timeout — racing this
+    // client's own 30s budget — would produce the null asserted below.
     client.send_notification(
         "textDocument/didChange",
         json!({
             "textDocument": { "uri": uri, "version": 2 },
-            "contentChanges": [{ "text": text.replace("MockChild", "Changed") }]
+            "contentChanges": [{ "text": text.replace("MockChild", "MockChanged") }]
         }),
     );
     let response = client.receive_response_for_id_public(request_id);
