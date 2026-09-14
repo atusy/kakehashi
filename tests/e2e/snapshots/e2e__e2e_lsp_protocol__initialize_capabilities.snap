@@ -67,6 +67,7 @@ expression: capabilities
       "changeNotifications": true
     }
   },
+  "callHierarchyProvider": true,
   "semanticTokensProvider": {
     "legend": {
       "tokenTypes": [

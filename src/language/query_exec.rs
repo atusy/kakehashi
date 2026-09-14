@@ -29,9 +29,8 @@ use crate::language::query_predicates::check_match_predicates;
 /// grammar's static data, matching the `(start, end, kind)` triple the node
 /// tracker keys on (lazy-node-identity-tracking).
 ///
-/// `metadata` holds the pattern's capture-scoped `#set!` directives —
-/// `(#set! @capture key value)` — for this capture, as `(key, value)` pairs
-/// in query-file order (treesitter-directive-set!).
+/// `metadata` holds capture-scoped properties and runtime `#gsub!` text as
+/// `(key, value)` pairs. Neither changes the raw node or capture geometry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CapturedNode {
     pub name: String,
@@ -91,13 +90,8 @@ pub(crate) fn execute_query(
         // `#set!` directives are parsed by tree-sitter into per-pattern
         // property settings; a capture argument scopes one to that capture,
         // its absence makes it match-level (treesitter-directive-set!).
-        let properties = query.property_settings(m.pattern_index);
-        let metadata_for = |capture_id: Option<usize>| -> Vec<(String, Option<String>)> {
-            properties
-                .iter()
-                .filter(|p| p.capture_id == capture_id)
-                .map(|p| (p.key.to_string(), p.value.as_ref().map(|v| v.to_string())))
-                .collect()
+        let metadata_for = |capture_id| {
+            crate::language::query_directives::property_metadata(query, m.pattern_index, capture_id)
         };
 
         // One failing general predicate discards the whole match — Neovim's
@@ -107,6 +101,7 @@ pub(crate) fn execute_query(
             continue;
         }
 
+        let cardinalities = crate::language::query_directives::CaptureCardinalities::default();
         let captures: Vec<CapturedNode> = m
             .captures
             .iter()
@@ -114,6 +109,14 @@ pub(crate) fn execute_query(
                 let node = c.node;
                 let range =
                     crate::language::query_directives::capture_range(query, m, c.index, node, text);
+                let metadata = crate::language::query_directives::capture_metadata(
+                    query,
+                    m,
+                    c,
+                    text,
+                    &cardinalities,
+                )
+                .unwrap_or_else(|| metadata_for(Some(c.index as usize)));
                 CapturedNode {
                     name: capture_names[c.index as usize].to_string(),
                     start_byte: node.start_byte(),
@@ -121,7 +124,7 @@ pub(crate) fn execute_query(
                     range_start_byte: range.start_byte,
                     range_end_byte: range.end_byte,
                     kind: node.kind(),
-                    metadata: metadata_for(Some(c.index as usize)),
+                    metadata,
                 }
             })
             .collect();
@@ -174,6 +177,76 @@ mod tests {
         QueryLoader::parse_query(language, query_str, false)
             .query
             .expect("query compiles")
+    }
+
+    #[test]
+    fn gsub_exposes_text_without_changing_capture_geometry() {
+        let src = "fn original() {}";
+        let (language, tree) = rust_tree(src);
+        let query = compile(
+            &language,
+            r#"((function_item name: (identifier) @name)
+                 (#set! @name role "title")
+                 (#gsub! @name "^.*$" "replacement"))"#,
+        );
+        let matches = execute_query(&query, &tree, src, None);
+        let capture = &matches[0].captures[0];
+        assert_eq!(
+            capture.metadata,
+            vec![
+                ("role".into(), Some("title".into())),
+                ("text".into(), Some("replacement".into())),
+            ]
+        );
+        assert_eq!(&src[capture.start_byte..capture.end_byte], "original");
+        assert_eq!((capture.range_start_byte, capture.range_end_byte), (3, 11));
+    }
+
+    #[test]
+    fn unresolved_gsub_keeps_capture_geometry_and_static_metadata() {
+        let src = "fn a() {} fn b() {}";
+        let (language, tree) = rust_tree(src);
+        let query = compile(
+            &language,
+            r#"((source_file
+                   (function_item name: (identifier) @name)
+                   (function_item name: (identifier) @name))
+                 (#set! @name role "title")
+                 (#gsub! @name "^.*$" "replacement"))"#,
+        );
+        let matches = execute_query(&query, &tree, src, None);
+        assert_eq!(matches[0].captures.len(), 2);
+        for capture in &matches[0].captures {
+            assert_eq!(
+                capture.metadata,
+                vec![("role".into(), Some("title".into()))]
+            );
+        }
+    }
+
+    #[test]
+    fn gsub_resolves_singletons_after_quantified_captures() {
+        let src = "const A: i32 = 1; const B: i32 = 2; fn a() {} fn b() {} struct Tail;";
+        let (language, tree) = rust_tree(src);
+        let query = compile(
+            &language,
+            r#"((source_file
+                   (const_item) @prefix +
+                   (function_item name: (identifier) @name) +
+                   (struct_item name: (type_identifier) @tail))
+                 (#gsub! @name "^.*$" "unresolved")
+                 (#gsub! @tail "^.*$" "singleton"))"#,
+        );
+        let matches = execute_query(&query, &tree, src, None);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].captures.len(), 5);
+        for capture in &matches[0].captures[..4] {
+            assert!(capture.metadata.is_empty());
+        }
+        assert_eq!(
+            matches[0].captures[4].metadata,
+            vec![("text".into(), Some("singleton".into()))]
+        );
     }
 
     #[test]

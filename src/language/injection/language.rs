@@ -46,6 +46,7 @@ fn extract_static_language(query: &Query, match_: &QueryMatch) -> Option<String>
 
 /// Extracts language from @injection.language capture
 fn extract_dynamic_language(query: &Query, match_: &QueryMatch, text: &str) -> Option<String> {
+    let cardinalities = query_directives::CaptureCardinalities::default();
     for capture in match_.captures {
         if let Some(capture_name) = query.capture_names().get(capture.index as usize)
             && *capture_name == "injection.language"
@@ -55,16 +56,23 @@ fn extract_dynamic_language(query: &Query, match_: &QueryMatch, text: &str) -> O
             // the capture didn't resolve to real text — treat it as "no language"
             // rather than emitting an empty language id (which would create a
             // bogus injection region downstream), mirroring the info-string path.
-            let transformed;
-            let lang_text =
-                if query_directives::has_text_directive(query, match_.pattern_index, capture.index)
-                {
-                    transformed =
-                        query_directives::capture_text(query, match_, capture.index, text)?;
-                    &transformed
-                } else {
-                    clamped_slice(text, capture.node.byte_range())
-                };
+            let metadata =
+                query_directives::capture_metadata(query, match_, capture, text, &cardinalities)?;
+            let lang_text = metadata
+                .iter()
+                .rev()
+                .find(|(key, _)| key == "text")
+                .and_then(|(_, value)| value.as_deref());
+            let lang_text = lang_text.unwrap_or_else(|| {
+                let range = query_directives::capture_range(
+                    query,
+                    match_,
+                    capture.index,
+                    capture.node,
+                    text,
+                );
+                clamped_slice(text, range.start_byte..range.end_byte)
+            });
             if lang_text.is_empty() {
                 return None;
             }
@@ -112,6 +120,31 @@ fn extract_language_from_info_string(
 mod tests {
     use super::*;
     use tree_sitter::{Parser, QueryCursor, StreamingIterator};
+
+    #[test]
+    fn dynamic_language_prefers_capture_text_metadata() {
+        let rust: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&rust).unwrap();
+        let text = "fn placeholder() {}";
+        let tree = parser.parse(text, None).unwrap();
+        for (replacement, expected) in [("lua", Some("lua")), ("", None)] {
+            let query = Query::new(
+                &rust,
+                &format!(
+                    r#"((function_item name: (identifier) @injection.language)
+                         (#set! @injection.language text "{replacement}"))"#
+                ),
+            )
+            .unwrap();
+            let mut cursor = QueryCursor::new();
+            let mut matches = cursor.matches(&query, tree.root_node(), text.as_bytes());
+            assert_eq!(
+                extract_injection_language(&query, matches.next().unwrap(), text).as_deref(),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn extract_dynamic_language_stale_capture_does_not_panic() {

@@ -10,7 +10,7 @@
 //! content merely moved hits, and the walk skips `execute_query` for it.
 //!
 //! What is cached is deliberately the ID-free, pre-JSON stage
-//! ([`MatchData`]: byte offsets + capture names + `#set!` metadata), stored
+//! ([`MatchData`]: byte offsets + capture names + static/runtime metadata), stored
 //! ANCHOR-RELATIVE. ULID minting, coordinate conversion, and wire shaping
 //! run per request in the walk exactly as on a fresh compute — the
 //! NodeTracker contract (currency-gated minting, post-walk reconciliation)

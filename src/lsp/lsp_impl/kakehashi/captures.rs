@@ -150,8 +150,8 @@ fn matches_delta_edit(previous: &[Value], current: &[Value]) -> Option<(usize, u
     Some((common_prefix, delete_count, data))
 }
 
-/// Shape `#set!` metadata pairs as a JSON object, or `None` when the pattern
-/// set none (so plain patterns carry no `metadata` field at all).
+/// Shape static properties and runtime text as a JSON metadata object, or
+/// `None` when neither produced any pairs.
 ///
 /// A valued key maps to its string; the bare flag form `(#set! key)` maps to
 /// `true` (a flag a client can test for, unlike Neovim's nil no-op). Duplicate
@@ -1638,8 +1638,8 @@ fn execute_captures_walk(
                     capture.insert("name".to_owned(), Value::String(c.name.clone()));
                     capture.insert("node".to_owned(), Value::Object(node));
                     capture.insert("range".to_owned(), Value::Object(range));
-                    // Capture-scoped `#set! @cap key value` metadata,
-                    // only when the capture was annotated.
+                    // Capture-scoped properties and runtime text, omitted
+                    // when neither produced metadata.
                     if let Some(meta) = metadata_object(&c.metadata) {
                         capture.insert("metadata".to_owned(), meta);
                     }
@@ -3652,8 +3652,8 @@ mod tests {
     }
 
     #[test]
-    fn metadata_object_is_none_when_no_directives() {
-        // Patterns without #set! must keep their pre-metadata wire shape —
+    fn metadata_object_is_none_when_no_metadata_pairs() {
+        // Captures without metadata must keep their existing wire shape —
         // an empty object would churn every delta lineage.
         assert_eq!(metadata_object(&[]), None);
     }
