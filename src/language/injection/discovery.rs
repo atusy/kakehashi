@@ -1642,6 +1642,12 @@ fn host_lsp_ranges(text: &str, ranges: &[Range<usize>]) -> Vec<tower_lsp_server:
 }
 
 fn token_padded_to_utf16_width(token: &str, width: usize) -> Option<String> {
+    if token
+        .chars()
+        .any(|character| matches!(character, '\r' | '\n'))
+    {
+        return None;
+    }
     let token_width = token.encode_utf16().count();
     (token_width <= width).then(|| {
         let mut rendered = String::from(token);
@@ -1686,11 +1692,11 @@ fn render_gap_segment(
     let multiline = clamped_slice(text, full_gap.clone()).contains('\n');
     let is_first = segment.start == full_gap.start;
     let is_last = segment.end == full_gap.end;
-    let token = if multiline && prefix.is_some() && suffix.is_some() {
+    let token = if multiline {
         if is_first {
-            prefix
+            prefix.or(placeholder)
         } else if is_last {
-            suffix
+            suffix.or(placeholder)
         } else {
             None
         }
@@ -3256,6 +3262,56 @@ mod tests {
                 tower_lsp_server::ls_types::Position::new(0, 4),
                 tower_lsp_server::ls_types::Position::new(2, 1),
             )]
+        );
+    }
+
+    #[test]
+    fn gap_tokens_must_preserve_line_count() {
+        assert_eq!(
+            token_padded_to_utf16_width("None", 6).as_deref(),
+            Some("None  ")
+        );
+        assert_eq!(token_padded_to_utf16_width("None\n", 6), None);
+        assert_eq!(token_padded_to_utf16_width("None\r", 6), None);
+    }
+
+    #[test]
+    fn multiline_gap_prefix_and_suffix_fall_back_independently() {
+        let text = "${\n  foo\n}";
+        let full_gap = 0..text.len();
+        let first_end = text.find('\n').unwrap() + 1;
+        let last_start = text.rfind('\n').unwrap() + 1;
+
+        assert_eq!(
+            render_gap_segment(text, &full_gap, 0..first_end, Some("0"), Some("(0"), None,),
+            "(0\n"
+        );
+        assert_eq!(
+            render_gap_segment(
+                text,
+                &full_gap,
+                last_start..text.len(),
+                Some("0"),
+                Some("(0"),
+                None,
+            ),
+            "0"
+        );
+
+        assert_eq!(
+            render_gap_segment(text, &full_gap, 0..first_end, Some("0"), None, Some(")"),),
+            "0 \n"
+        );
+        assert_eq!(
+            render_gap_segment(
+                text,
+                &full_gap,
+                last_start..text.len(),
+                Some("0"),
+                None,
+                Some(")"),
+            ),
+            ")"
         );
     }
 
