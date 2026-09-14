@@ -197,9 +197,10 @@ bound registered here):
   completed is retired at the cap without touching the connection
 - **On expiry**: the write has made no progress for a full cap, so the
   target is treated as wedged on stdin — `Ready` → `Failed`, request
-  admission closed, every pending request on it answered with an internal
-  error, the writer task aborted (which force-kills the child); the pool
-  replaces the slot on the next request as for any failed connection
+  admission closed, every pending request on it answered (an internal
+  error, or `RequestCancelled` for one already cancelled while queued), the
+  writer task aborted (which force-kills the child); the pool replaces the
+  slot on the next request as for any failed connection
 - **Precedence**: settlement of the entry (a late answer, or any drain)
   cancels the timer; a graceful shutdown that has already reclaimed the
   writer leaves nothing to abort and bounds the child by its own deadline;
