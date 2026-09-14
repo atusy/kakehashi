@@ -295,6 +295,60 @@ fn runtime_range_directives_adjust_wire_ranges() {
 }
 
 #[test]
+fn gsub_text_is_returned_and_updated_through_capture_deltas() {
+    let dir = context_query_dir();
+    std::fs::write(
+        dir.path().join("queries/markdown/context.scm"),
+        r#"((atx_heading (inline) @title)
+             (#gsub! @title "^.*$" "[%0]"))"#,
+    )
+    .unwrap();
+    let mut client = LspClient::new();
+    initialize(&mut client, dir.path());
+    let uri = "file:///captures_gsub.md";
+    open_markdown(&mut client, uri, "# Title\n");
+
+    let result = full(&mut client, uri, "context");
+    assert_eq!(
+        result.pointer("/matches/0/captures/0/metadata/text"),
+        Some(&json!("[Title]"))
+    );
+    assert_eq!(
+        result.pointer("/matches/0/captures/0/range"),
+        Some(&json!({
+            "start": { "line": 0, "character": 2 },
+            "end": { "line": 0, "character": 7 }
+        }))
+    );
+    let ranged = request(
+        &mut client,
+        "kakehashi/captures/range",
+        json!({
+            "textDocument": { "uri": uri }, "kind": "context",
+            "range": { "start": { "line": 0, "character": 0 },
+                       "end": { "line": 1, "character": 0 } }
+        }),
+    );
+    assert_eq!(ranged.get("matches"), result.get("matches"));
+    let unchanged = delta(&mut client, uri, "context", &result_id_of(&result));
+    assert_eq!(unchanged.get("edits"), Some(&json!([])));
+
+    // Equal-length text changes must invalidate metadata even when capture
+    // geometry is identical and the match cache has already been populated.
+    change_full_text(&mut client, uri, 2, "# Other\n");
+    let changed = delta_until(
+        &mut client,
+        uri,
+        "context",
+        &result_id_of(&unchanged),
+        |value| {
+            value.pointer("/edits/0/data/0/captures/0/metadata/text") == Some(&json!("[Other]"))
+        },
+    );
+    assert_eq!(changed.pointer("/edits/0/deleteCount"), Some(&json!(1)));
+}
+
+#[test]
 fn set_directive_yields_match_level_metadata() {
     // `(#set! key value)` (treesitter-directive-set!) sets match-level
     // metadata; patterns without `#set!` carry no metadata field at all.

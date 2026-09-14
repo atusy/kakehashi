@@ -5,6 +5,51 @@ use tree_sitter::{Query, QueryMatch, QueryPredicate};
 use crate::language::query_predicates::lua_gsub_bytes;
 use crate::text::clamped_slice;
 
+/// Static metadata in query-file order; duplicate keys are last-write-wins.
+pub(crate) fn property_metadata(
+    query: &Query,
+    pattern_index: usize,
+    capture_id: Option<usize>,
+) -> Vec<(String, Option<String>)> {
+    query
+        .property_settings(pattern_index)
+        .iter()
+        .filter(|property| property.capture_id == capture_id)
+        .map(|property| {
+            (
+                property.key.to_string(),
+                property.value.as_ref().map(|value| value.to_string()),
+            )
+        })
+        .collect()
+}
+
+/// Evaluate a capture's metadata, including materialized `#gsub!` text.
+///
+/// `None` means text could not be resolved (multiple captured nodes or invalid
+/// final UTF-8). Geometry-only consumers can still expose static metadata;
+/// text consumers must not silently use the untransformed language instead.
+/// `#set! text`/`#gsub!` source ordering remains unsupported by the Rust query
+/// API: as before, gsub starts from source text, independently of properties.
+pub(crate) fn capture_metadata(
+    query: &Query,
+    match_: &QueryMatch,
+    capture_id: u32,
+    source: &str,
+) -> Option<Vec<(String, Option<String>)>> {
+    let mut metadata = property_metadata(query, match_.pattern_index, Some(capture_id as usize));
+    let has_gsub = query.general_predicates(match_.pattern_index).iter().any(|directive| {
+        directive.operator.as_ref() == "gsub!"
+            && matches!(directive.args.first(), Some(tree_sitter::QueryPredicateArg::Capture(id)) if *id == capture_id)
+    });
+    if has_gsub {
+        let text = capture_text(query, match_, capture_id, source)?;
+        metadata.retain(|(key, _)| key != "text");
+        metadata.push(("text".into(), Some(text)));
+    }
+    Some(metadata)
+}
+
 /// A capture's directive-adjusted byte and point range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CaptureRange {
@@ -309,25 +354,11 @@ fn trim_range(
     })
 }
 
-/// Whether this pattern can change the text observed for `capture_id`.
-pub(crate) fn has_text_directive(query: &Query, pattern_index: usize, capture_id: u32) -> bool {
-    query
-        .general_predicates(pattern_index)
-        .iter()
-        .any(|directive| {
-            matches!(directive.operator.as_ref(), "gsub!" | "offset!" | "trim!")
-                && matches!(
-                    directive.args.first(),
-                    Some(tree_sitter::QueryPredicateArg::Capture(id)) if *id == capture_id
-                )
-        })
-}
-
 /// Return one capture's text after applying its runtime directives in query
 /// order. Once `#gsub!` materializes text, later range directives do not alter
 /// it, matching Neovim's `metadata.text` precedence. A quantified capture with
 /// `#gsub!` is left unresolved rather than panicking the server.
-pub(crate) fn capture_text(
+fn capture_text(
     query: &Query,
     match_: &QueryMatch,
     capture_id: u32,

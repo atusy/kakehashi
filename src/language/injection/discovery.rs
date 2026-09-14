@@ -2526,6 +2526,32 @@ mod tests {
     }
 
     #[test]
+    fn gsub_metadata_does_not_replace_bridge_source_content() {
+        let mut parser = create_rust_parser();
+        let text = "/*\n    original\n*/";
+        let tree = parse_rust_code(&mut parser, text);
+        let query = Query::new(
+            &tree_sitter_rust::LANGUAGE.into(),
+            r#"((block_comment) @injection.content
+                 (#set! injection.language "rust")
+                 (#offset! @injection.content 1 0 0 -2)
+                 (#gsub! @injection.content "^.*$" "replacement"))"#,
+        )
+        .unwrap();
+        let resolved = InjectionResolver::resolve_all(
+            &test_coordinator(),
+            &NodeTracker::new(),
+            &test_uri("gsub_content"),
+            &tree,
+            text,
+            &query,
+            0,
+        );
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].virtual_content, "    original\n");
+    }
+
+    #[test]
     fn resolve_all_combines_regions_marked_combined() {
         let mut parser = create_rust_parser();
         let text = r#"fn main() { let open = "<div>"; let close = "</div>"; }"#;

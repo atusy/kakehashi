@@ -556,7 +556,7 @@ type Match = {
     name: string;                    // capture name without the '@', e.g. "context"
     node: NodeInfo;                  // { id, kind } — trackable like any other node
     range: { start: Position, end: Position };  // LSP Position (UTF-16), inline
-    metadata?: Metadata;             // capture-level (#set! @cap key value); absent when none
+    metadata?: Metadata;             // capture-level properties and runtime gsub text; absent when none
   }[];
 };
 
@@ -617,8 +617,12 @@ type CapturesDelta = {
   `(#set! @cap key value)` rides on that capture as its `metadata[key]` —
   e.g. `((codeblock) @context (#set! kind "block"))` lets a client label
   matches without parsing capture names. Repeated keys are last-write-wins.
-- **`#gsub!` transforms dynamic injection-language captures** before language
-  normalization. `#offset!` and `#trim!` also adjust a dynamic language's text
+- **`#gsub!` returns transformed text for arbitrary captures** as
+  `capture.metadata.text`, without changing the capture range or node identity.
+  Dynamic `@injection.language` resolution uses the same metadata and prefers
+  its `text` property over source text; static `#set! @capture text` works too.
+  Injection parser/bridge content continues to use the original source ranges.
+  `#offset!` and `#trim!` also adjust the transformation's input text
   until `#gsub!` materializes it; later range directives leave that text intact.
   Multiple transformations run in query order using the same Lua-pattern
   subset as `#lua-match?`; unsupported `%b`, `%f`, position
@@ -626,8 +630,9 @@ type CapturesDelta = {
   the prior text unchanged.
   Composition with `#set! @capture text ...` is not supported because the Rust
   tree-sitter API does not retain its source order relative to general
-  directives. The captures protocol itself has no transformed-text field, so
-  `#gsub!` does not add capture metadata to these responses.
+  directives. In that combination, gsub uses source text and its resolved result
+  overrides static `text`. Multiple-node captures or invalid final UTF-8 leave
+  only static capture metadata; dynamic injection-language resolution fails.
 - **Tolerant compilation**: if some patterns reference symbols absent from the
   grammar, the valid patterns still run and the rest are reported in `skipped`.
 - **`null` means "nothing here"**: the document isn't open, or no involved

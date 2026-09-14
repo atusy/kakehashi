@@ -55,7 +55,7 @@ type Match = {
     name: string;              // capture name without '@', e.g. "context"
     node: NodeInfo;            // { id, kind } — trackable via kakehashi/node/*
     range: Range;              // LSP Range (UTF-16), inline to avoid N+1
-    metadata?: Metadata;       // capture-scoped `#set! @cap` directives
+    metadata?: Metadata;       // capture properties and runtime `#gsub!` text
   }[];
 };
 
@@ -86,9 +86,9 @@ the match's `metadata`, `(#set! @cap key value)` becomes that capture's —
 mirroring Neovim's `metadata[key]` vs. `metadata[capture_id][key]` split, with
 the capture *name* standing in for the capture id (the index is meaningless
 across the wire). The field is **omitted when a pattern sets nothing**, keeping
-pre-metadata wire shapes byte-identical; and because the directives are static
-per pattern, the positional delta diff is unaffected — equal JSON still means
-an identical match. Values stay the strings written in the query (clients
+pre-metadata wire shapes byte-identical. Runtime `#gsub!` adds a capture-level
+`text` string; text changes participate in the positional delta diff just
+like other metadata. Static values stay the strings written in the query (clients
 coerce, as Neovim consumers do); the bare flag form `(#set! key)` surfaces as
 `true` rather than Neovim's nil no-op, so a flag is actually observable.
 Repeated keys are last-write-wins, matching Neovim's in-order directive
@@ -96,11 +96,13 @@ application. Runtime range directives are evaluated separately:
 `#offset!` and `#trim!` adjust the capture's wire `range`, while the raw node
 span remains the source of node identity and cache tracking. As in
 `vim.treesitter.get_range()`, a valid trim range takes precedence over an
-offset. `#gsub!` is evaluated where transformed capture text has a consumer —
-currently dynamic `@injection.language` resolution — but this protocol does
-not expose Neovim's `metadata[capture_id].text` because its capture shape has
-no transformed-text field. Dynamic language resolution evaluates runtime
-directives in query order: range metadata affects text until `#gsub!`
+offset. [Capture text metadata](capture-text-metadata.md) extends this protocol:
+`#gsub!` is evaluated for arbitrary captures and its result is returned as
+`capture.metadata.text`. Dynamic `@injection.language` resolution consumes
+the same metadata, preferring `text` (including static `#set! @capture text`)
+over source text. Neither node identity nor injection parser/bridge source
+content is replaced. Runtime directives are evaluated in query order:
+range metadata affects text until `#gsub!`
 materializes it, after which Neovim's `metadata.text` precedence applies. The
 evaluator uses the same Lua-pattern translator
 as `#lua-match?`; unsupported Lua constructs (`%b`, `%f`, position captures
@@ -108,8 +110,11 @@ as `#lua-match?`; unsupported Lua constructs (`%b`, `%f`, position captures
 compose `#set! @capture text ...` with `#gsub!`: tree-sitter's Rust API exposes
 property settings separately from general directives without their relative
 source order, so reproducing Neovim's ordered metadata updates would require
-guessing. These limits do not affect the `#gsub!` forms currently shipped by
-nvim-treesitter.
+guessing. For this unsupported combination, gsub continues to transform source
+text and its resolved result takes precedence over the static `text` property.
+If gsub cannot resolve text (multiple nodes for its capture or invalid final
+UTF-8), captures retain their geometry and static properties; dynamic language
+resolution returns no language instead of routing the raw untransformed text.
 
 ### Kind resolution
 
