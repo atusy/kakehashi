@@ -2259,6 +2259,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn target_death_is_reported_as_connection_lost() {
+        let router = ResponseRouter::new();
+        let (deps, (mut response_rx, _upstream_rx, _window_rx)) =
+            dummy_server_request_deps_with_rx();
+        let peer = crate::lsp::bridge::pool::test_helpers::create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("oxfmt"),
+        )
+        .await;
+        deps.peer_directory.register(&peer);
+        forward_peer_request(&router, &deps, &peer, 43).await;
+
+        peer.router().fail_all("bridge: reader task exited");
+
+        let OutboundMessage::Untracked(response) = response_rx.recv().await.unwrap() else {
+            panic!("server-request responses are untracked")
+        };
+        assert_eq!(response["id"], 43);
+        assert_eq!(response["error"]["code"], -32803);
+        assert_eq!(response["error"]["data"]["reason"], "connectionLost");
+        assert!(
+            !deps
+                .inbound_request_registry
+                .is_registered(deps.progress_connection_id, &jsonrpc::Id::Number(43))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unanswered_peer_request_is_reported_as_request_timeout() {
+        let router = ResponseRouter::new();
+        let (deps, (mut response_rx, _upstream_rx, _window_rx)) =
+            dummy_server_request_deps_with_rx();
+        let peer = crate::lsp::bridge::pool::test_helpers::create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("oxfmt"),
+        )
+        .await;
+        deps.peer_directory.register(&peer);
+        handle_message(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 44,
+                "method": "kakehashi/bridge/peer/request",
+                "params": { "id": peer.key().peer_id(), "method": "custom/slow" }
+            }),
+            &router,
+            "[tsudoi] ",
+            &deps,
+        )
+        .await;
+
+        // The sink target never answers; paused time lets the managed
+        // deadline elapse without waiting for it.
+        let OutboundMessage::Untracked(response) = response_rx.recv().await.unwrap() else {
+            panic!("server-request responses are untracked")
+        };
+        assert_eq!(response["id"], 44);
+        assert_eq!(response["error"]["code"], -32803);
+        assert_eq!(response["error"]["data"]["reason"], "requestTimeout");
+        assert_eq!(
+            peer.router().pending_count(),
+            0,
+            "the timed-out entry is retired"
+        );
+    }
+
+    #[tokio::test]
     async fn handle_message_rejects_peer_request_when_origin_limit_is_full() {
         let router = ResponseRouter::new();
         let (deps, (mut response_rx, _upstream_rx, _window_rx)) =
