@@ -491,7 +491,7 @@ impl ResponseRouter {
         let mut state = self
             .state
             .lock()
-            .recover_poison("ResponseRouter::cancel_and_remove");
+            .recover_poison("ResponseRouter::cancel_peer");
         let pending = state.pending.get_mut(&id)?;
         match pending.delivery {
             RequestDelivery::Queued | RequestDelivery::CancelledQueued => {
@@ -838,7 +838,7 @@ mod tests {
     }
 
     #[test]
-    fn cancel_and_remove_notifies_only_after_downstream_write_starts() {
+    fn cancel_peer_notifies_only_after_downstream_write_starts() {
         let router = ResponseRouter::new();
         let queued = RequestId::new(1);
         let writing = RequestId::new(2);
