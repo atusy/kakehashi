@@ -99,6 +99,13 @@ async fn cleanup_cancelled_peer(
                     PeerCancelExpiry::Settled => return,
                     PeerCancelExpiry::WriteInProgress { until } => expiry = until,
                     PeerCancelExpiry::Wedged => {
+                        log::warn!(
+                            target: "kakehashi::bridge::peer",
+                            "{}: cancelled peer request {} stayed unwritten for a full request budget; \
+                             failing the connection and aborting its writer",
+                            peer.key(),
+                            downstream_id.as_i64()
+                        );
                         peer.fail_and_abort_writer();
                         return;
                     }
