@@ -1197,6 +1197,37 @@ mod tests {
         );
     }
 
+    /// A cancelled request whose write completed is merely awaiting an answer
+    /// the caller no longer wants; expiring it retires the entry and must
+    /// leave the connection and its other requests untouched.
+    #[tokio::test(start_paused = true)]
+    async fn expiring_a_sent_peer_cancel_keeps_the_connection() {
+        let router = ResponseRouter::new();
+        let peer_id = RequestId::new(1);
+        let (_peer_rx, _epoch, settled_rx) = router.register_peer(peer_id).unwrap();
+        let mut bystander_rx = router.register(RequestId::new(2)).unwrap();
+        assert!(router.claim_for_write(peer_id));
+        router.mark_sent(peer_id);
+        assert_eq!(router.cancel_peer(peer_id), Some(true));
+        tokio::time::advance(WRITE_BUDGET).await;
+
+        assert_eq!(
+            router.expire_peer_cancel(peer_id, WRITE_BUDGET),
+            PeerCancelExpiry::Settled
+        );
+        assert!(router.is_accepting());
+        assert_eq!(
+            router.pending_count(),
+            1,
+            "only the cancelled entry is retired"
+        );
+        assert!(
+            settled_rx.await.is_err(),
+            "retiring the entry settles its cleanup"
+        );
+        assert!(bystander_rx.try_recv().is_err(), "no bystander was failed");
+    }
+
     /// A frame can wait in the FIFO for most of its request deadline; the
     /// wedge verdict must count from the writer's claim, or a healthy
     /// connection that merely dequeued the frame late is killed.
