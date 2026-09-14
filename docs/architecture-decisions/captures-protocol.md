@@ -85,8 +85,9 @@ convention) follows its two scopes onto the wire: `(#set! key value)` becomes
 the match's `metadata`, `(#set! @cap key value)` becomes that capture's —
 mirroring Neovim's `metadata[key]` vs. `metadata[capture_id][key]` split, with
 the capture *name* standing in for the capture id (the index is meaningless
-across the wire). The field is **omitted when a pattern sets nothing**, keeping
-pre-metadata wire shapes byte-identical. Runtime `#gsub!` adds a capture-level
+across the wire). The field is **omitted when neither static properties nor
+runtime text produces metadata**, preserving the wire shape of such captures.
+Runtime `#gsub!` adds a capture-level
 `text` string; text changes participate in the positional delta diff just
 like other metadata. Static values stay the strings written in the query (clients
 coerce, as Neovim consumers do); the bare flag form `(#set! key)` surfaces as
