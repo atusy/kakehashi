@@ -377,20 +377,21 @@ languages = ["lua"]
 }
 
 #[test]
-fn e2e_diagnose_push_wait_respects_priorities_allowlist() {
+fn e2e_diagnose_push_fallback_waits_outside_pull_priorities() {
     let ws = workspace_with(
         &format!(
             r#"autoInstall = false
 
 [languages.markdown.bridge.lua.aggregation."textDocument/diagnostic"]
-priorities = ["mock-push"]
+priorities = ["mock-pull"]
+maxFanOut = 1
 
-[languageServers.mock-push]
-cmd = ['{bin}', 'diagnostics-push']
+[languageServers.mock-pull]
+cmd = ['{bin}', 'diagnostics']
 languages = ["lua"]
 
-[languageServers.mock-idle]
-cmd = ['{bin}', 'idle-no-diagnostics']
+[languageServers.mock-push]
+cmd = ['{bin}', 'diagnostics-push-delayed']
 languages = ["lua"]
 "#,
             bin = env!("CARGO_BIN_EXE_mock-lsp-formatter")
@@ -402,18 +403,44 @@ languages = ["lua"]
     assert_eq!(
         output.status.code(),
         Some(1),
-        "the selected push server should report normally; an excluded idle server must not time out; stderr: {}",
+        "stderr: {}",
         stderr_of(&output)
     );
     assert!(
         stdout_of(&output).contains("mock-push-diag:"),
-        "selected push diagnostics should still be reported"
+        "pushFallback outside the live pull fan-out must still settle and fold: {}",
+        stdout_of(&output)
     );
-    assert!(
-        !stderr_of(&output).contains("did not publish diagnostics"),
-        "an excluded server must not participate in the push wait; stderr: {}",
+}
+
+#[test]
+fn e2e_diagnose_push_burst_waits_for_latest_update() {
+    let ws = workspace_with(
+        &format!(
+            r#"autoInstall = false
+
+[languageServers.mock-push]
+cmd = ['{}', 'diagnostics-push-burst']
+languages = ["lua"]
+"#,
+            env!("CARGO_BIN_EXE_mock-lsp-formatter")
+        ),
+        &[("doc.md", MARKDOWN)],
+    );
+
+    let output = run_diagnose(ws.path(), &["doc.md"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr: {}",
         stderr_of(&output)
     );
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.contains("mock-push-burst:4"),
+        "diagnose must keep waiting while selected push diagnostics are still changing: {stdout:?}"
+    );
+    assert!(!stdout.contains("mock-push-burst:1"));
 }
 
 #[test]

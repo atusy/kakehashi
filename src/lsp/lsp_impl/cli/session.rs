@@ -7,7 +7,7 @@
 //! `documents` / `bridge` fields, so they live under `lsp_impl` rather than
 //! `crate::cli`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
@@ -16,8 +16,7 @@ use url::Url;
 
 use crate::config::settings::LayerSource;
 use crate::language::InjectionResolver;
-use crate::lsp::aggregation::server::priority::entry_names;
-use crate::lsp::aggregation::server::{expand_priorities, truncate_entries};
+use crate::lsp::diagnostic_cache::DiagnosticSource;
 
 use super::super::bridge_context::resolve_aggregation_config_from_settings;
 
@@ -143,7 +142,9 @@ impl Kakehashi {
     /// the caller reports that as a failure rather than issuing into the race.
     pub(crate) async fn wait_eager_open_finished(&self, uri: &Url, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
-        while !self.bridge.eager_open_tasks_finished(uri) {
+        while !(self.bridge.eager_open_tasks_finished(uri)
+            && self.bridge.host_eager_open_tasks_finished(uri))
+        {
             if tokio::time::Instant::now() >= deadline {
                 log::warn!(
                     target: "kakehashi::cli",
@@ -166,12 +167,12 @@ impl Kakehashi {
     /// or may never publish at all. Consequently, absence of a cache slot is
     /// not an operational error and cannot be used as a completion signal.
     ///
-    /// Instead, when the selected diagnostic fan-out contains at least one
-    /// non-pull server whose `pushFallback` is enabled, wait until the host's
-    /// diagnostic-cache revision has stayed unchanged for one configured
-    /// diagnostic debounce interval, capped by `timeout`. Any cache mutation
-    /// restarts the quiet window. The subsequent ordinary diagnostic pull then
-    /// consumes whatever push fallback data actually arrived.
+    /// Instead, mirror the final `pushFallback` contributor set: for each
+    /// participating source whose fallback is enabled, every configured Ready
+    /// non-pull server is eligible even when priorities/maxFanOut omit it from
+    /// the live pull fan-out. Wait until those selected push slots have stayed
+    /// unchanged for one configured diagnostic debounce interval, capped by
+    /// `timeout`. Unrelated cache mutations do not restart the quiet window.
     pub(crate) async fn settle_push_diagnostics(&self, uri: &Url, timeout: Duration) {
         const METHOD: &str = "textDocument/diagnostic";
 
@@ -180,11 +181,11 @@ impl Kakehashi {
         };
         let settings = self.settings_manager.load_settings();
         let layer_cfg = self.resolve_layer_config(&language_name, METHOD);
-        let mut candidate_names: HashSet<String> = HashSet::new();
+        let mut candidate_sources: HashMap<DiagnosticSource, HashSet<String>> = HashMap::new();
 
-        // Virt sources: mirror the pull path's cross-layer gate and its exact
-        // per-language priorities/maxFanOut selection. Servers excluded from
-        // the eventual diagnostic fan-out must not make the CLI wait.
+        // Virt sources: mirror the final pushFallback fold. That path applies
+        // the cross-layer and pushFallback gates but deliberately does not
+        // re-apply priorities/maxFanOut to push-driven cached contributors.
         if layer_cfg.allows(LayerSource::Virt)
             && let Some(injection_query) = self.language.injection_query(&language_name)
             && let Some(snapshot) = self.documents.get(uri).and_then(|doc| doc.snapshot())
@@ -212,17 +213,16 @@ impl Kakehashi {
                     &language_name,
                     &resolved.injection_language,
                 );
-                let selected = truncate_entries(
-                    expand_priorities(&agg.priorities, &configs),
-                    agg.max_fan_out,
-                );
-                candidate_names.extend(entry_names(&selected));
+                candidate_sources
+                    .entry(DiagnosticSource::Region(resolved.region.region_id.clone()))
+                    .or_default()
+                    .extend(configs.into_iter().map(|config| config.server_name));
             }
         }
 
-        // Host source: the same cross-layer gate plus the host aggregation's
-        // priorities/maxFanOut selection. `_self` opt-in is enforced by
-        // resolve_host_bridge_context.
+        // Host source: mirror the final host pushFallback gate. `_self`
+        // opt-in/participation is enforced by resolve_host_bridge_context, but
+        // push-driven cached contributors are not re-truncated by fan-out rules.
         if layer_cfg.allows(LayerSource::Host)
             && let Ok(lsp_uri) = url_to_uri(uri)
             && let Some(ctx) = self.resolve_host_bridge_context(&lsp_uri, METHOD)
@@ -232,30 +232,36 @@ impl Kakehashi {
                 .map(|language| language.resolve_host_aggregation(METHOD).push_fallback)
                 .unwrap_or(false);
             if host_push_fallback {
-                let selected = truncate_entries(
-                    expand_priorities(&ctx.priorities, &ctx.configs),
-                    ctx.max_fan_out,
-                );
-                candidate_names.extend(entry_names(&selected));
+                let servers = candidate_sources.entry(DiagnosticSource::Host).or_default();
+                for config in ctx.configs {
+                    servers.insert(config.server_name);
+                }
             }
         }
 
-        if candidate_names.is_empty() {
+        if candidate_sources.is_empty() {
             return;
         }
 
-        // There is no push capability bit. Match the normal pushFallback
-        // classification: once Ready, a server known not to support pull
-        // diagnostics is a possible push contributor. Servers that failed the
-        // preceding ready wait are absent here and are reported by that wait.
-        let candidates: HashSet<&str> = candidate_names.iter().map(String::as_str).collect();
-        if self
+        // The pushFallback fold is independent of the live pull fan-out, so
+        // classify every configured contributor for an enabled source here too.
+        let candidate_names: HashSet<&str> = candidate_sources
+            .values()
+            .flat_map(|servers| servers.iter().map(String::as_str))
+            .collect();
+        let push_only = self
             .bridge
             .pool()
-            .servers_known_incapable(&candidates, METHOD)
-            .await
-            .is_empty()
-        {
+            .servers_known_incapable(&candidate_names, METHOD)
+            .await;
+        if push_only.is_empty() {
+            return;
+        }
+        candidate_sources.retain(|_, servers| {
+            servers.retain(|server| push_only.contains(server));
+            !servers.is_empty()
+        });
+        if candidate_sources.is_empty() {
             return;
         }
 
@@ -265,7 +271,9 @@ impl Kakehashi {
         }
 
         let deadline = tokio::time::Instant::now() + timeout;
-        let (_, mut observed_revision) = self.diagnostics.snapshot_with_revision(uri);
+        let mut observed_activity = self
+            .diagnostics
+            .selected_push_activity(uri, &candidate_sources);
         let mut quiet_since = tokio::time::Instant::now();
 
         loop {
@@ -274,10 +282,9 @@ impl Kakehashi {
                 return;
             }
 
-            // Poll the revision rather than cache slots: push entries may be
-            // folded into PullLayer or compacted while preserving their final
-            // diagnostics, so slot shape is deliberately not a synchronization
-            // contract.
+            // Read only a lightweight fingerprint for the eligible push slots:
+            // do not clone diagnostic payloads every poll, and do not let an
+            // unrelated server postpone a one-shot CLI result.
             let remaining_quiet = settle.saturating_sub(now.duration_since(quiet_since));
             let remaining_total = deadline.saturating_duration_since(now);
             tokio::time::sleep(
@@ -287,9 +294,11 @@ impl Kakehashi {
             )
             .await;
 
-            let (_, current_revision) = self.diagnostics.snapshot_with_revision(uri);
-            if current_revision != observed_revision {
-                observed_revision = current_revision;
+            let current_activity = self
+                .diagnostics
+                .selected_push_activity(uri, &candidate_sources);
+            if current_activity != observed_activity {
+                observed_activity = current_activity;
                 quiet_since = tokio::time::Instant::now();
             }
         }

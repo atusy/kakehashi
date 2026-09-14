@@ -47,7 +47,7 @@
 //! version gate was evaluated and rejected (it converts a self-healing stale-overwrite
 //! into a reopen-resurrection hide); the stale-overwrite is left self-healing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -102,6 +102,10 @@ pub(crate) struct SlotEntry {
     /// ([`DiagnosticAggregator::evict_connection`]) drop only the dead connection's
     /// slots, never a live restart's (#469).
     pub(crate) connection_id: Option<ProgressConnectionId>,
+    /// Cache mutation revision that last changed this slot. Used by the CLI
+    /// diagnostic settle loop to observe only relevant push sources without
+    /// cloning diagnostic payloads.
+    pub(crate) revision: u64,
 }
 
 /// `server name → slot`. Several servers can attach to one source.
@@ -1047,19 +1051,29 @@ impl DiagnosticAggregator {
         } else {
             cache.entry(host.clone()).or_default()
         };
+        let previous_revision = source_slots
+            .get(&source)
+            .and_then(|servers| servers.get(&server))
+            .map_or(0, |slot| slot.revision);
         let changed = source_slots
             .get(&source)
             .and_then(|servers| servers.get(&server))
             .is_none_or(|slot| slot.diagnostics != diagnostics);
+        let slot_revision = if changed {
+            self.allocate_cache_revision()
+        } else {
+            previous_revision
+        };
         source_slots.entry(source).or_default().insert(
             server,
             SlotEntry {
                 diagnostics,
                 connection_id,
+                revision: slot_revision,
             },
         );
         if changed {
-            revisions.insert(host.clone(), self.allocate_cache_revision());
+            revisions.insert(host.clone(), slot_revision);
         }
     }
 
@@ -1099,6 +1113,43 @@ impl DiagnosticAggregator {
         let snapshot = cache.get(host).cloned().unwrap_or_default();
         let revision = revisions.get(host).copied().unwrap_or(0);
         (snapshot, revision)
+    }
+
+    /// Lightweight activity fingerprint for a selected set of push slots.
+    ///
+    /// Unlike `snapshot_with_revision`, this never clones diagnostics and ignores
+    /// mutations from unselected sources/servers. The fingerprint changes when a
+    /// selected slot is added, removed, or replaced with different diagnostics.
+    pub(crate) fn selected_push_activity(
+        &self,
+        host: &Url,
+        selected: &HashMap<DiagnosticSource, HashSet<String>>,
+    ) -> u64 {
+        use std::hash::{Hash, Hasher};
+
+        let cache = self.lock();
+        let Some(sources) = cache.get(host) else {
+            return 0;
+        };
+        let mut fingerprint = 0u64;
+        let mut count = 0u64;
+        for (source, servers) in sources {
+            let Some(selected_servers) = selected.get(source) else {
+                continue;
+            };
+            for (server, slot) in servers {
+                if !selected_servers.contains(server) {
+                    continue;
+                }
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                source.hash(&mut hasher);
+                server.hash(&mut hasher);
+                slot.revision.hash(&mut hasher);
+                fingerprint ^= hasher.finish();
+                count = count.wrapping_add(1);
+            }
+        }
+        fingerprint ^ count.wrapping_mul(0x9e37_79b9_7f4a_7c15)
     }
 
     /// Whether `host` has a cached `Region` push slot with **non-empty** diagnostics
@@ -1265,10 +1316,19 @@ impl DiagnosticAggregator {
         } else {
             cache.entry(host.clone()).or_default()
         };
+        let previous_revision = source_slots
+            .get(&DiagnosticSource::PullLayer)
+            .and_then(|servers| servers.get(PULL_LAYER_SERVER))
+            .map_or(0, |slot| slot.revision);
         let changed = source_slots
             .get(&DiagnosticSource::PullLayer)
             .and_then(|servers| servers.get(PULL_LAYER_SERVER))
             .is_none_or(|slot| slot.diagnostics != diagnostics);
+        let slot_revision = if changed {
+            self.allocate_cache_revision()
+        } else {
+            previous_revision
+        };
         source_slots
             .entry(DiagnosticSource::PullLayer)
             .or_default()
@@ -1277,10 +1337,11 @@ impl DiagnosticAggregator {
                 SlotEntry {
                     diagnostics,
                     connection_id: None,
+                    revision: slot_revision,
                 },
             );
         if changed {
-            revisions.insert(host.clone(), self.allocate_cache_revision());
+            revisions.insert(host.clone(), slot_revision);
             // Stamp only a REAL change (Qodo, PR #972): a no-op mutation owes
             // the editor nothing, and its stale mark would otherwise be
             // converted into a spurious lag by whatever unrelated Changed
@@ -3427,6 +3488,59 @@ mod tests {
             servers,
             std::collections::HashSet::from(["linter", "hostlint"]),
             "the synthetic pull-layer server is never reported as a pusher"
+        );
+    }
+
+    #[test]
+    fn selected_push_activity_ignores_unselected_servers() {
+        let agg = DiagnosticAggregator::new();
+        let host = host();
+        let source = DiagnosticSource::Region("r1".into());
+        let selected = HashMap::from([(source.clone(), HashSet::from(["selected".to_string()]))]);
+        let initial = agg.selected_push_activity(&host, &selected);
+
+        agg.record(
+            &host,
+            source.clone(),
+            "other".into(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![diag("other-1")],
+        );
+        assert_eq!(agg.selected_push_activity(&host, &selected), initial);
+
+        agg.record(
+            &host,
+            source.clone(),
+            "selected".into(),
+            Some(ProgressConnectionId::for_test(2)),
+            vec![diag("selected-1")],
+        );
+        let selected_revision = agg.selected_push_activity(&host, &selected);
+        assert_ne!(selected_revision, initial);
+
+        agg.record(
+            &host,
+            source.clone(),
+            "other".into(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![diag("other-2")],
+        );
+        assert_eq!(
+            agg.selected_push_activity(&host, &selected),
+            selected_revision,
+            "unselected activity must not restart the CLI settle window"
+        );
+
+        agg.record(
+            &host,
+            source,
+            "selected".into(),
+            Some(ProgressConnectionId::for_test(2)),
+            vec![diag("selected-2")],
+        );
+        assert_ne!(
+            agg.selected_push_activity(&host, &selected),
+            selected_revision
         );
     }
 
