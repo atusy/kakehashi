@@ -62,15 +62,11 @@ pub(crate) struct CacheCoordinator {
     /// that was already computing (it captured the pre-bump generation), which a
     /// bare clear could not prevent.
     semantic_token_generation: std::sync::atomic::AtomicU64,
-    /// The highest snapshot `parsed_version` whose semantic tokens were
-    /// actually SERVED to the client, per document. The parse loop consults
-    /// this to decide whether a fresh publish needs a
-    /// `workspace/semanticTokens/refresh`: the request is workspace-scoped and
-    /// clients (Neovim) already re-request per `didChange`, so a refresh is
-    /// warranted only when the document has settled and the client's last
-    /// served tokens predate the settled snapshot — one refresh per settle,
-    /// none during a typing burst, none for documents whose tokens no client
-    /// ever asked for.
+    /// Semantic-token interest since the latest accepted edit. A successful
+    /// response records its snapshot version; a settle timeout records zero.
+    /// Clearing on edit prevents a previous successful response from triggering
+    /// a workspace refresh that cancels the client's already-current request.
+    /// Same-version tree-less upgrades and timed-out requests still need healing.
     served_semantic_versions: dashmap::DashMap<Url, u64>,
 }
 
@@ -668,6 +664,12 @@ impl CacheCoordinator {
         }
     }
 
+    /// Begin a new edit's refresh-interest interval without discarding delta
+    /// baselines. The caller holds the document edit lock, as do token writers.
+    pub(crate) fn reset_semantic_refresh_interest(&self, uri: &Url) {
+        self.served_semantic_versions.remove(uri);
+    }
+
     /// Record that a semantic-token response computed from snapshot
     /// `parsed_version` was served for `uri` (monotonic max — a stale-serve
     /// racing a fresher one must not regress the mark).
@@ -685,7 +687,7 @@ impl CacheCoordinator {
     }
 
     /// The last snapshot version whose tokens were served for `uri`, or `None`
-    /// when no client ever consumed semantic tokens for it.
+    /// when no response or timeout has been recorded since the latest edit.
     pub(crate) fn served_semantic_version(&self, uri: &Url) -> Option<u64> {
         self.served_semantic_versions.get(uri).map(|v| *v)
     }

@@ -125,6 +125,81 @@ impl Kakehashi {
         current
     }
 
+    /// Register interest before re-reading a placeholder: publication can run
+    /// outside the edit lock. A tree published before this read is consumed now;
+    /// publication after it sees the interest and refreshes the empty response.
+    /// A concurrent upgrade can still queue a conservative recovery refresh.
+    /// Do not clear this shared mark after consuming a tree: another full/range
+    /// response may need it, and clearing cannot retract an already queued event.
+    async fn resolve_empty_token_snapshot(
+        &self,
+        uri: &Url,
+        snapshot: std::sync::Arc<crate::document::snapshot::ParseSnapshot>,
+        generation: u64,
+        request_id: Option<crate::lsp::cache::RequestId>,
+    ) -> Option<std::sync::Arc<crate::document::snapshot::ParseSnapshot>> {
+        if self.cache.semantic_token_generation() != generation {
+            return None;
+        }
+        if snapshot.tree.is_some() && snapshot.language.is_some() {
+            return Some(snapshot);
+        }
+        let edit_lock = self.documents.edit_lock(uri);
+        let _guard = edit_lock.lock().await;
+        if !self.semantic_snapshot_is_current(
+            uri,
+            snapshot.incarnation,
+            snapshot.parsed_version,
+            generation,
+            &edit_lock,
+        ) || request_id.is_some_and(|id| !self.cache.is_request_active(uri, id))
+        {
+            return None;
+        }
+        self.cache
+            .record_served_semantic_version(uri, snapshot.parsed_version);
+        self.documents.latest_snapshot(uri)?.slot.snapshot
+    }
+
+    /// Register a failed current-snapshot wait, then recheck publication. The
+    /// parse may have settled after the timeout but before this marker: in that
+    /// case serve it now instead of losing the only refresh wakeup.
+    /// An edit or reopen while acquiring the lock must not inherit this wait's
+    /// retry interest after clearing the previous interval's marker.
+    async fn token_snapshot_after_timeout(
+        &self,
+        uri: &Url,
+        expected_edit: Option<(u64, u64)>,
+        generation: u64,
+        supersede: &crate::cancel::CancelToken,
+    ) -> TokenSnapshot {
+        let edit_lock = self.documents.edit_lock(uri);
+        let _guard = edit_lock.lock().await;
+        // Reject work invalidated while awaiting this lock. Reloads do not take
+        // the edit lock, so a concurrent reload can still leave conservative
+        // recovery interest; this is not an atomic reload/refresh-dedup fence.
+        if supersede.is_cancelled() || self.cache.semantic_token_generation() != generation {
+            return TokenSnapshot::Superseded;
+        }
+        let Some(view) = self.documents.latest_snapshot(uri) else {
+            self.documents.remove_edit_lock_if_unshared(uri, &edit_lock);
+            return TokenSnapshot::Absent;
+        };
+        if expected_edit != Some((view.slot.current_incarnation, view.content_version)) {
+            return TokenSnapshot::Superseded;
+        }
+        self.cache.record_served_semantic_version(uri, 0);
+        let Some(view) = self.documents.latest_snapshot(uri) else {
+            return TokenSnapshot::Absent;
+        };
+        match view.slot.snapshot {
+            Some(snapshot) if snapshot.parsed_version == view.content_version => {
+                TokenSnapshot::Current(snapshot)
+            }
+            _ => TokenSnapshot::Stale,
+        }
+    }
+
     /// Latest-completed snapshot resolution (parse-snapshot ADR §3): returns
     /// the newest published snapshot, which may trail the input. The only
     /// wait is the bounded first-parse wait (no snapshot for this lifetime
@@ -194,38 +269,63 @@ impl Kakehashi {
         uri: &Url,
         cancel_rx: Option<&mut crate::lsp::request_id::CancelReceiver>,
         supersede: &crate::cancel::CancelToken,
+        generation: u64,
+        request_id: Option<crate::lsp::cache::RequestId>,
     ) -> TokenSnapshot {
         use crate::lsp::lsp_impl::snapshot_read::{SnapshotWait, TOKEN_SETTLE_BACKSTOP};
         let profile_start = log::log_enabled!(target: "kakehashi::profile", log::Level::Debug)
             .then(std::time::Instant::now);
         let result = async {
-            let wait = self.wait_for_current_snapshot(uri, TOKEN_SETTLE_BACKSTOP);
-            let outcome = match cancel_rx {
+            let wait = async {
+                // Only timeout interest belongs to this starting edit. A
+                // successful wait may still consume a newer current snapshot.
+                let expected_edit = self
+                    .documents
+                    .latest_snapshot(uri)
+                    .map(|view| (view.slot.current_incarnation, view.content_version));
+                let outcome = match self
+                    .wait_for_current_snapshot(uri, TOKEN_SETTLE_BACKSTOP)
+                    .await
+                {
+                    SnapshotWait::Current(snapshot) => TokenSnapshot::Current(snapshot),
+                    SnapshotWait::Stale => {
+                        self.token_snapshot_after_timeout(uri, expected_edit, generation, supersede)
+                            .await
+                    }
+                    SnapshotWait::Unparsed | SnapshotWait::Gone => TokenSnapshot::Absent,
+                };
+                match outcome {
+                    TokenSnapshot::Current(snapshot) => match self
+                        .resolve_empty_token_snapshot(uri, snapshot, generation, request_id)
+                        .await
+                    {
+                        Some(snapshot) => TokenSnapshot::Current(snapshot),
+                        None => TokenSnapshot::Superseded,
+                    },
+                    other => other,
+                }
+            };
+            match cancel_rx {
                 Some(rx) => {
                     tokio::select! {
                         biased;
                         // Fires on $/cancelRequest (and on forwarder teardown,
                         // which the compute-race arms below treat as cancel too).
-                        _ = rx => return TokenSnapshot::Cancelled,
+                        _ = rx => TokenSnapshot::Cancelled,
                         // Fires when a newer request for this document flips this
                         // request's tracker token — release the park (and its
                         // admission slot) instead of computing a discarded result.
-                        _ = supersede.cancelled() => return TokenSnapshot::Superseded,
+                        _ = supersede.cancelled() => TokenSnapshot::Superseded,
                         outcome = wait => outcome,
                     }
                 }
                 None => {
                     tokio::select! {
                         biased;
-                        _ = supersede.cancelled() => return TokenSnapshot::Superseded,
+                        _ = supersede.cancelled() => TokenSnapshot::Superseded,
                         outcome = wait => outcome,
                     }
                 }
-            };
-            match outcome {
-                SnapshotWait::Current(snapshot) => TokenSnapshot::Current(snapshot),
-                SnapshotWait::Stale => TokenSnapshot::Stale,
-                SnapshotWait::Unparsed | SnapshotWait::Gone => TokenSnapshot::Absent,
             }
         }
         .await;
@@ -297,7 +397,13 @@ impl Kakehashi {
         // the snapshot's own detected language — never a live re-detection
         // that could diverge from the tree's grammar.
         let snapshot = match self
-            .current_snapshot_for_tokens(&uri, cancel_rx.as_mut(), &cancel_token)
+            .current_snapshot_for_tokens(
+                &uri,
+                cancel_rx.as_mut(),
+                &cancel_token,
+                token_generation,
+                Some(request_id),
+            )
             .await
         {
             TokenSnapshot::Current(snapshot) => snapshot,
@@ -309,13 +415,6 @@ impl Kakehashi {
                 })));
             }
             TokenSnapshot::Stale => {
-                // Register token interest (version 0, monotonic max — a real
-                // serve overwrites) so the settle-refresh gate re-drives this
-                // client even when EVERY request so far rejected: without a
-                // served mark the gate reads "nobody highlights this
-                // document" and the client would stay dark until its next
-                // didChange-driven request.
-                self.cache.record_served_semantic_version(&uri, 0);
                 self.cache.finish_request(&uri, request_id);
                 return Err(crate::error::content_modified_error());
             }
@@ -343,12 +442,7 @@ impl Kakehashi {
         };
         let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
         else {
-            // No detectable language, or resolved-but-tree-less (see
-            // `ParseSnapshot` for the causes): nothing to tokenize. The empty set
-            // IS this snapshot's served state — record it so the parse loop
-            // doesn't keep refreshing a document that has no tokens.
-            self.cache
-                .record_served_semantic_version(&uri, snapshot.parsed_version);
+            // The placeholder was rechecked after registering refresh interest.
             self.cache.finish_request(&uri, request_id);
             return Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
                 result_id: None,
@@ -682,7 +776,13 @@ impl Kakehashi {
         // steady-state typing path where a stale answer corrupts the editor's
         // existing highlights AND poisons the client's delta baseline).
         let snapshot = match self
-            .current_snapshot_for_tokens(&uri, cancel_rx.as_mut(), &cancel_token)
+            .current_snapshot_for_tokens(
+                &uri,
+                cancel_rx.as_mut(),
+                &cancel_token,
+                token_generation,
+                Some(request_id),
+            )
             .await
         {
             TokenSnapshot::Current(snapshot) => snapshot,
@@ -696,13 +796,6 @@ impl Kakehashi {
                 )));
             }
             TokenSnapshot::Stale => {
-                // Register token interest (version 0, monotonic max — a real
-                // serve overwrites) so the settle-refresh gate re-drives this
-                // client even when EVERY request so far rejected: without a
-                // served mark the gate reads "nobody highlights this
-                // document" and the client would stay dark until its next
-                // didChange-driven request.
-                self.cache.record_served_semantic_version(&uri, 0);
                 self.cache.finish_request(&uri, request_id);
                 return Err(crate::error::content_modified_error());
             }
@@ -730,8 +823,6 @@ impl Kakehashi {
         };
         let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
         else {
-            self.cache
-                .record_served_semantic_version(&uri, snapshot.parsed_version);
             self.cache.finish_request(&uri, request_id);
             return Ok(Some(SemanticTokensFullDeltaResult::Tokens(
                 SemanticTokens {
@@ -1073,6 +1164,8 @@ impl Kakehashi {
         &self,
         params: SemanticTokensRangeParams,
     ) -> Result<Option<SemanticTokensRangeResult>> {
+        let upstream_id = current_upstream_id();
+        let (mut cancel_rx, _subscription_guard) = self.subscribe_cancel(upstream_id.as_ref());
         let lsp_uri = params.text_document.uri;
         let range = params.range;
 
@@ -1133,10 +1226,22 @@ impl Kakehashi {
             incarnation: snapshot.incarnation,
             generation,
         };
+        let resolve = self.resolve_empty_token_snapshot(&uri, snapshot, generation, None);
+        let resolved = match cancel_rx.as_mut() {
+            Some(rx) => {
+                tokio::select! {
+                    biased;
+                    _ = rx => return Err(Error::request_cancelled()),
+                    snapshot = resolve => snapshot,
+                }
+            }
+            None => resolve.await,
+        };
+        let Some(snapshot) = resolved else {
+            return Err(crate::error::content_modified_error());
+        };
         let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
         else {
-            self.cache
-                .record_served_semantic_version(&uri, snapshot.parsed_version);
             return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
                 result_id: None,
                 data: vec![],
@@ -1358,6 +1463,497 @@ mod tests {
             })
             .unwrap_or(false);
         assert!(landed, "test snapshot must land");
+    }
+
+    #[tokio::test]
+    async fn tree_less_token_response_cannot_restore_interest_after_an_edit() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///empty-response-race.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".into(),
+            Some("rust".into()),
+            None,
+        );
+        publish_treeless(server, &uri, "fn main() {}", 0);
+        let edit_lock = server.documents.edit_lock(&uri);
+        let guard = edit_lock.lock().await;
+        let mut request = std::pin::pin!(server.semantic_tokens_full_impl(full_params(&uri)));
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        server
+            .documents
+            .update_document(uri.clone(), "fn main() { }".into(), None);
+        server.cache.reset_semantic_refresh_interest(&uri);
+        drop(guard);
+        assert!(request.await.unwrap().is_none());
+        assert_eq!(server.cache.served_semantic_version(&uri), None);
+    }
+
+    #[tokio::test]
+    async fn timed_out_token_wait_rechecks_a_parse_that_already_settled() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///timeout-publish-race.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".into(),
+            Some("rust".into()),
+            None,
+        );
+        publish_treeless(server, &uri, "fn main() {}", 0);
+        server
+            .documents
+            .update_document(uri.clone(), "fn main() { }".into(), None);
+        publish_treeless(server, &uri, "fn main() { }", 1);
+        let outcome = server
+            .token_snapshot_after_timeout(
+                &uri,
+                server
+                    .documents
+                    .latest_snapshot(&uri)
+                    .map(|view| (view.slot.current_incarnation, view.content_version)),
+                server.cache.semantic_token_generation(),
+                &crate::cancel::CancelToken::default(),
+            )
+            .await;
+        assert!(
+            matches!(outcome, TokenSnapshot::Current(snapshot) if snapshot.parsed_version == 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_token_response_consumes_a_same_version_tree_upgrade() {
+        for kind in ["full", "delta", "range"] {
+            let (service, _socket) = LspService::new(Kakehashi::new);
+            let server = service.inner();
+            let uri = Url::parse("file:///placeholder-upgrade.rs").unwrap();
+            let text = "fn main() {}";
+            let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+            server
+                .language
+                .language_registry_for_parallel()
+                .register("rust".into(), language.clone());
+            server.language.query_store().insert_highlight_query(
+                "rust".into(),
+                std::sync::Arc::new(
+                    tree_sitter::Query::new(&language, "(identifier) @function").unwrap(),
+                ),
+            );
+            server
+                .documents
+                .insert(uri.clone(), "old".into(), Some("rust".into()), None);
+            server.cache.record_served_semantic_version(&uri, 0);
+            server
+                .documents
+                .update_document(uri.clone(), text.into(), None);
+            server.cache.reset_semantic_refresh_interest(&uri);
+            publish_treeless(server, &uri, text, 1);
+            let edit_lock = server.documents.edit_lock(&uri);
+            let guard = edit_lock.lock().await;
+            let mut request = std::pin::pin!(async {
+                match kind {
+                    "full" => {
+                        let Some(SemanticTokensResult::Tokens(tokens)) = server
+                            .semantic_tokens_full_impl(full_params(&uri))
+                            .await
+                            .unwrap()
+                        else {
+                            panic!("expected full tokens")
+                        };
+                        tokens.data
+                    }
+                    "delta" => {
+                        let params = SemanticTokensDeltaParams {
+                            text_document: full_params(&uri).text_document,
+                            previous_result_id: "missing-baseline".into(),
+                            work_done_progress_params: Default::default(),
+                            partial_result_params: Default::default(),
+                        };
+                        let Some(SemanticTokensFullDeltaResult::Tokens(tokens)) = server
+                            .semantic_tokens_full_delta_impl(params)
+                            .await
+                            .unwrap()
+                        else {
+                            panic!("expected delta full fallback")
+                        };
+                        tokens.data
+                    }
+                    "range" => {
+                        let params = range_params(
+                            &uri,
+                            Range::new(Position::new(0, 0), Position::new(0, text.len() as u32)),
+                        );
+                        let Some(SemanticTokensRangeResult::Tokens(tokens)) =
+                            server.semantic_tokens_range_impl(params).await.unwrap()
+                        else {
+                            panic!("expected range tokens")
+                        };
+                        tokens.data
+                    }
+                    _ => unreachable!(),
+                }
+            });
+            assert!(futures::poll!(request.as_mut()).is_pending());
+            let mut parser = tree_sitter::Parser::new();
+            parser.set_language(&language).unwrap();
+            let tree = parser.parse(text, None).unwrap();
+            let doc = server.documents.get(&uri).unwrap();
+            assert!(doc.publish_snapshot(&std::sync::Arc::new(
+                crate::document::snapshot::ParseSnapshot {
+                    text: std::sync::Arc::from(text),
+                    tree: Some(tree),
+                    language: Some("rust".into()),
+                    parsed_version: 1,
+                    incarnation: doc.incarnation(),
+                    injection_regions: None,
+                    regions: None,
+                    layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
+                }
+            )));
+            drop(doc);
+            assert_eq!(server.cache.served_semantic_version(&uri), None);
+            drop(guard);
+            let tokens = request.await;
+            assert!(
+                !tokens.is_empty(),
+                "{kind}: the published tree must replace the captured placeholder"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn token_timeout_lock_wait_remains_client_cancellable() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///timeout-cancel.rs").unwrap();
+        server
+            .documents
+            .insert(uri.clone(), "old".into(), None, None);
+        publish_treeless(server, &uri, "old", 0);
+        server
+            .documents
+            .update_document(uri.clone(), "new".into(), None);
+        let edit_lock = server.documents.edit_lock(&uri);
+        let _guard = edit_lock.lock().await;
+        let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel();
+        let supersede = crate::cancel::CancelToken::default();
+        let mut request = std::pin::pin!(server.current_snapshot_for_tokens(
+            &uri,
+            Some(&mut cancel_rx),
+            &supersede,
+            server.cache.semantic_token_generation(),
+            None,
+        ));
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        tokio::time::advance(crate::lsp::lsp_impl::snapshot_read::TOKEN_SETTLE_BACKSTOP).await;
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        cancel_tx.send(()).unwrap();
+        assert!(matches!(
+            futures::poll!(request.as_mut()),
+            std::task::Poll::Ready(TokenSnapshot::Cancelled)
+        ));
+        assert_eq!(server.cache.served_semantic_version(&uri), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_interest_cannot_cross_an_accepted_edit() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///timeout-edit.rs").unwrap();
+        server
+            .documents
+            .insert(uri.clone(), "old".into(), None, None);
+        publish_treeless(server, &uri, "old", 0);
+        server
+            .documents
+            .update_document(uri.clone(), "first".into(), None);
+        let supersede = crate::cancel::CancelToken::default();
+        let mut request = std::pin::pin!(server.current_snapshot_for_tokens(
+            &uri,
+            None,
+            &supersede,
+            server.cache.semantic_token_generation(),
+            None,
+        ));
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        let lock = server.documents.edit_lock(&uri);
+        let guard = lock.lock().await;
+        tokio::time::advance(crate::lsp::lsp_impl::snapshot_read::TOKEN_SETTLE_BACKSTOP).await;
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        // The accepted didChange critical section advances text and clears
+        // interest while timeout recovery is queued behind its edit lock.
+        server
+            .documents
+            .update_document(uri.clone(), "second".into(), None);
+        server.cache.reset_semantic_refresh_interest(&uri);
+        drop(guard);
+        assert!(matches!(request.await, TokenSnapshot::Superseded));
+        assert_eq!(server.cache.served_semantic_version(&uri), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_recovery_rejects_a_tree_from_an_obsolete_generation() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///timeout-generation.rs").unwrap();
+        let text = "fn main() {}";
+        server
+            .documents
+            .insert(uri.clone(), "old".into(), Some("rust".into()), None);
+        publish_treeless(server, &uri, "old", 0);
+        server
+            .documents
+            .update_document(uri.clone(), text.into(), None);
+        let generation = server.cache.semantic_token_generation();
+        let lock = server.documents.edit_lock(&uri);
+        let guard = lock.lock().await;
+        let supersede = crate::cancel::CancelToken::default();
+        let mut request = std::pin::pin!(
+            server.current_snapshot_for_tokens(&uri, None, &supersede, generation, None,)
+        );
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        tokio::time::advance(crate::lsp::lsp_impl::snapshot_read::TOKEN_SETTLE_BACKSTOP).await;
+        assert!(futures::poll!(request.as_mut()).is_pending());
+
+        server.cache.bump_semantic_token_generation();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(text, None).unwrap();
+        let doc = server.documents.get(&uri).unwrap();
+        assert!(doc.publish_snapshot(&std::sync::Arc::new(
+            crate::document::snapshot::ParseSnapshot {
+                text: std::sync::Arc::from(text),
+                tree: Some(tree),
+                language: Some("rust".into()),
+                parsed_version: 1,
+                incarnation: doc.incarnation(),
+                injection_regions: None,
+                regions: None,
+                layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
+            }
+        )));
+        drop(doc);
+        drop(guard);
+        assert!(matches!(request.await, TokenSnapshot::Superseded));
+        assert_eq!(server.cache.served_semantic_version(&uri), None);
+    }
+
+    #[tokio::test]
+    async fn successful_token_wait_can_follow_a_newer_edit() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///token-wait-newer-edit.rs").unwrap();
+        server
+            .documents
+            .insert(uri.clone(), "old".into(), None, None);
+        publish_treeless(server, &uri, "old", 0);
+        server
+            .documents
+            .update_document(uri.clone(), "first".into(), None);
+        let supersede = crate::cancel::CancelToken::default();
+        let mut request = std::pin::pin!(server.current_snapshot_for_tokens(
+            &uri,
+            None,
+            &supersede,
+            server.cache.semantic_token_generation(),
+            None,
+        ));
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        server
+            .documents
+            .update_document(uri.clone(), "second".into(), None);
+        publish_treeless(server, &uri, "second", 2);
+        assert!(matches!(
+            request.await,
+            TokenSnapshot::Current(snapshot) if snapshot.parsed_version == 2
+                && snapshot.text.as_ref() == "second"
+        ));
+    }
+
+    #[tokio::test]
+    async fn timeout_interest_cannot_cross_document_lifetimes() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///token-timeout-new-lifetime.rs").unwrap();
+        server
+            .documents
+            .insert(uri.clone(), "old".into(), None, None);
+        let expected_edit = server
+            .documents
+            .latest_snapshot(&uri)
+            .map(|view| (view.slot.current_incarnation, view.content_version));
+        server.documents.remove(&uri);
+        server
+            .documents
+            .insert(uri.clone(), "new".into(), None, None);
+        assert!(matches!(
+            server
+                .token_snapshot_after_timeout(
+                    &uri,
+                    expected_edit,
+                    server.cache.semantic_token_generation(),
+                    &crate::cancel::CancelToken::default(),
+                )
+                .await,
+            TokenSnapshot::Superseded
+        ));
+        assert_eq!(server.cache.served_semantic_version(&uri), None);
+    }
+
+    #[tokio::test]
+    async fn placeholder_lock_wait_remains_cancellable() {
+        for kind in ["full", "delta"] {
+            for cause in ["client", "supersede"] {
+                let (service, _socket) = LspService::new(Kakehashi::new);
+                let server = service.inner();
+                let uri = Url::parse("file:///placeholder-cancel.rs").unwrap();
+                server
+                    .documents
+                    .insert(uri.clone(), "old".into(), None, None);
+                publish_treeless(server, &uri, "old", 0);
+                let lock = server.documents.edit_lock(&uri);
+                let _guard = lock.lock().await;
+                let mut request = std::pin::pin!(crate::lsp::request_id::CURRENT_REQUEST_ID.scope(
+                    Some(tower_lsp_server::jsonrpc::Id::Number(42)),
+                    async {
+                        if kind == "full" {
+                            server
+                                .semantic_tokens_full_impl(full_params(&uri))
+                                .await
+                                .map(|result| result.is_some())
+                        } else {
+                            server
+                                .semantic_tokens_full_delta_impl(SemanticTokensDeltaParams {
+                                    text_document: full_params(&uri).text_document,
+                                    previous_result_id: "missing".into(),
+                                    work_done_progress_params: Default::default(),
+                                    partial_result_params: Default::default(),
+                                })
+                                .await
+                                .map(|result| result.is_some())
+                        }
+                    },
+                ));
+                assert!(futures::poll!(request.as_mut()).is_pending());
+                if cause == "client" {
+                    server
+                        .bridge
+                        .cancel_forwarder()
+                        .notify_cancel(&crate::lsp::bridge::UpstreamId::Number(42));
+                } else {
+                    server.cache.start_request(&uri);
+                }
+                let std::task::Poll::Ready(result) = futures::poll!(request.as_mut()) else {
+                    panic!("{kind}/{cause}: cancellation must release the placeholder wait")
+                };
+                if cause == "client" {
+                    assert_eq!(result.unwrap_err().code, Error::request_cancelled().code);
+                } else {
+                    assert!(!result.unwrap());
+                }
+                assert_eq!(server.cache.served_semantic_version(&uri), None);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn range_placeholder_lock_wait_is_cancellable_without_superseding_full() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///range-placeholder-cancel.rs").unwrap();
+        server
+            .documents
+            .insert(uri.clone(), "old".into(), None, None);
+        publish_treeless(server, &uri, "old", 0);
+        let (full_request_id, full_cancel) = server.cache.start_request(&uri);
+        let lock = server.documents.edit_lock(&uri);
+        let _guard = lock.lock().await;
+        let mut request = std::pin::pin!(crate::lsp::request_id::CURRENT_REQUEST_ID.scope(
+            Some(tower_lsp_server::jsonrpc::Id::Number(43)),
+            server.semantic_tokens_range_impl(range_params(
+                &uri,
+                Range::new(Position::new(0, 0), Position::new(0, 3)),
+            )),
+        ));
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        assert!(server.cache.is_request_active(&uri, full_request_id));
+        server
+            .bridge
+            .cancel_forwarder()
+            .notify_cancel(&crate::lsp::bridge::UpstreamId::Number(43));
+        let std::task::Poll::Ready(result) = futures::poll!(request.as_mut()) else {
+            panic!("cancellation must release the viewport's placeholder wait")
+        };
+        assert_eq!(result.unwrap_err().code, Error::request_cancelled().code);
+        assert_eq!(server.cache.served_semantic_version(&uri), None);
+        assert!(server.cache.is_request_active(&uri, full_request_id));
+        assert!(!full_cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cancelled_timeout_cannot_register_interest_for_a_reopened_document() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///timeout-reopen.rs").unwrap();
+        server
+            .documents
+            .insert(uri.clone(), "old".into(), None, None);
+        let (_, cancel) = server.cache.start_request(&uri);
+        server.cache.remove_document(&uri);
+        server.documents.remove(&uri);
+        server
+            .documents
+            .insert(uri.clone(), "new".into(), None, None);
+        assert!(matches!(
+            server
+                .token_snapshot_after_timeout(
+                    &uri,
+                    server
+                        .documents
+                        .latest_snapshot(&uri)
+                        .map(|view| { (view.slot.current_incarnation, view.content_version) }),
+                    server.cache.semantic_token_generation(),
+                    &cancel
+                )
+                .await,
+            TokenSnapshot::Superseded
+        ));
+        assert_eq!(server.cache.served_semantic_version(&uri), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn token_timeout_lock_wait_remains_supersedable() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///timeout-supersede.rs").unwrap();
+        server
+            .documents
+            .insert(uri.clone(), "old".into(), None, None);
+        publish_treeless(server, &uri, "old", 0);
+        server
+            .documents
+            .update_document(uri.clone(), "new".into(), None);
+        let edit_lock = server.documents.edit_lock(&uri);
+        let _guard = edit_lock.lock().await;
+        let supersede = crate::cancel::CancelToken::default();
+        let mut request = std::pin::pin!(server.current_snapshot_for_tokens(
+            &uri,
+            None,
+            &supersede,
+            server.cache.semantic_token_generation(),
+            None
+        ));
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        tokio::time::advance(crate::lsp::lsp_impl::snapshot_read::TOKEN_SETTLE_BACKSTOP).await;
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        supersede.cancel();
+        assert!(matches!(
+            futures::poll!(request.as_mut()),
+            std::task::Poll::Ready(TokenSnapshot::Superseded)
+        ));
+        assert_eq!(server.cache.served_semantic_version(&uri), None);
     }
 
     fn full_params(uri: &Url) -> SemanticTokensParams {
