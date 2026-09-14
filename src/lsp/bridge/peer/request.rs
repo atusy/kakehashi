@@ -85,7 +85,7 @@ fn validate_params(params: &PeerRequestParams) -> jsonrpc::Result<()> {
     // response may then legitimately be empty. Refuse rather than lose data.
     if matches!(
         &params.params,
-        OptionalParams::Present(value) if value.get("partialResultToken").is_some()
+        OptionalParams::Present(value) if carries_partial_result_token(value)
     ) {
         return Err(request_failed(
             "partialResultsUnsupported",
@@ -100,6 +100,18 @@ fn validate_params(params: &PeerRequestParams) -> jsonrpc::Result<()> {
 /// write wedged once it is still incomplete a full request budget after the
 /// writer claimed it. The first check runs at the request deadline; a frame
 /// claimed late in that window is re-checked when its own budget elapses.
+/// Whether the inner params request partial results, in either JSON-RPC
+/// shape: a by-name object, or by-position array whose elements are objects.
+fn carries_partial_result_token(params: &serde_json::Value) -> bool {
+    match params {
+        serde_json::Value::Object(members) => members.contains_key("partialResultToken"),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .any(|item| item.get("partialResultToken").is_some()),
+        _ => false,
+    }
+}
+
 async fn cleanup_cancelled_peer(
     peer: Arc<ConnectionHandle>,
     downstream_id: RequestId,
@@ -471,6 +483,18 @@ mod tests {
         assert_eq!(
             error.data,
             Some(serde_json::json!({ "reason": "partialResultsUnsupported" }))
+        );
+
+        let positional = PeerRequestParams::deserialize(&serde_json::json!({
+            "id": "peer",
+            "method": "workspace/symbol",
+            "params": [1, { "query": "x", "partialResultToken": "t" }]
+        }))
+        .unwrap();
+        assert_eq!(
+            validate_params(&positional).unwrap_err().data,
+            Some(serde_json::json!({ "reason": "partialResultsUnsupported" })),
+            "by-position params can carry the token too"
         );
 
         let work_done_only = PeerRequestParams::deserialize(&serde_json::json!({
