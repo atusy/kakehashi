@@ -102,7 +102,7 @@
               vimPlugins.mini-nvim # Test framework
               git
             ]
-            ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+            ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
               # macOS-specific dependencies
               pkgs.apple-sdk_15
               pkgs.libiconv
@@ -150,7 +150,7 @@
             [
               openssl
             ]
-            ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+            ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
               pkgs.apple-sdk_15
               pkgs.libiconv
             ];
