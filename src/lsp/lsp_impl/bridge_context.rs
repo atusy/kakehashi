@@ -801,6 +801,22 @@ pub(crate) fn format_concatenated_formatting_warning(pairs: &[(String, String)])
 }
 
 impl Kakehashi {
+    pub(crate) fn host_resolve_snapshot(
+        &self,
+        uri: &url::Url,
+    ) -> Option<crate::lsp::bridge::HostResolveSnapshot> {
+        let language_id = self.document_language(uri)?;
+        let document = self.documents.get(uri)?;
+        Some(crate::lsp::bridge::HostResolveSnapshot {
+            text: document.text_arc(),
+            language_id,
+            revision: crate::lsp::bridge::HostRevision {
+                incarnation: document.incarnation(),
+                content_version: document.content_version(),
+            },
+        })
+    }
+
     /// Subscribe to cancel notifications for an upstream request.
     ///
     /// Returns `(Some(receiver), Some(guard))` on success, or `(None, None)` if

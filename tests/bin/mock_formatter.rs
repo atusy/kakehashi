@@ -1679,7 +1679,8 @@ fn main() {
                             if mode == "code-lens-replacement" { "replacement" } else { "mock" },
                             data["mock"].as_str().unwrap_or("?")
                         ),
-                        "command": "mock.codelens"
+                        "command": "mock.codelens",
+                        "arguments": [documents.values().next()]
                     },
                     "data": data
                 });

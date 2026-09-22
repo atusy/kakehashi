@@ -44,6 +44,7 @@ use super::super::protocol::{
     translate_host_range_to_virtual, translate_virtual_range_to_host,
 };
 use super::completion::EnvelopeOffset;
+use super::host::{HostResolveContext, HostResolveReader};
 use crate::config::settings::{BridgeServerConfig, WorkspaceSettings};
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
 use crate::lsp::bridge::actor::RouterCleanupGuard;
@@ -293,6 +294,7 @@ impl LanguageServerPool {
         mut lens: CodeLens,
         settings: &WorkspaceSettings,
         upstream_id: Option<UpstreamId>,
+        read_host: HostResolveReader<'_>,
     ) -> CodeLens {
         let Some(envelope) = strip_code_lens_envelope(&mut lens) else {
             return lens;
@@ -315,7 +317,7 @@ impl LanguageServerPool {
             return lens;
         };
 
-        self.send_code_lens_resolve_request(&config, lens, envelope, upstream_id)
+        self.send_code_lens_resolve_request(&config, lens, envelope, upstream_id, read_host)
             .await
     }
 
@@ -331,6 +333,7 @@ impl LanguageServerPool {
         mut lens: CodeLens,
         envelope: CodeLensEnvelope,
         upstream_id: Option<UpstreamId>,
+        read_host: HostResolveReader<'_>,
     ) -> CodeLens {
         let server_name = &envelope.origin;
         // One function serves both layers; tag the host one like the
@@ -421,24 +424,10 @@ impl LanguageServerPool {
             return lens;
         }
 
-        let _host_lifecycle = if envelope.is_host_layer() {
-            let Some(expected_incarnation) = envelope.incarnation else {
-                re_envelope_lens(&mut lens, &envelope);
-                return lens;
-            };
-            match self
-                .request_host_lifecycle_for_incarnation(&host_uri, expected_incarnation)
-                .await
-            {
-                Ok(lifecycle) => Some(lifecycle),
-                Err(_) => {
-                    re_envelope_lens(&mut lens, &envelope);
-                    return lens;
-                }
-            }
-        } else {
-            None
-        };
+        if envelope.is_host_layer() && envelope.incarnation.is_none() {
+            re_envelope_lens(&mut lens, &envelope);
+            return lens;
+        }
 
         // Route per-connection cancel state by this handle's pool key (#382).
         let connection_key = handle.key();
@@ -476,7 +465,21 @@ impl LanguageServerPool {
 
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
 
-        let send_result = {
+        let send_result = if envelope.is_host_layer() {
+            self.enqueue_host_resolve(
+                &handle,
+                HostResolveContext {
+                    uri: &host_uri,
+                    incarnation: envelope.incarnation,
+                    content_version: None,
+                    connection_generation: envelope.connection_generation,
+                    read: read_host,
+                },
+                request,
+                request_id,
+            )
+            .await
+        } else {
             let connections = self.connections().await;
             let producer_is_live = connections.get(connection_key).is_some_and(|current| {
                 Arc::ptr_eq(current, &handle) && current.state() == ConnectionState::Ready
@@ -742,6 +745,7 @@ mod tests {
         pool.insert_connection(Arc::clone(&handle)).await;
         let host_uri = Url::parse("file:///test.lua").unwrap();
         pool.open_host_incarnation(&host_uri, 1).await;
+        super::super::test_helpers::open_resolve_host(&pool, &handle, &host_uri).await;
         let generation = pool.document_connection_generation(&key);
         let lens = CodeLens {
             range: Default::default(),
@@ -770,6 +774,7 @@ mod tests {
                     lens,
                     envelope,
                     Some(upstream_id),
+                    &super::super::test_helpers::resolve_host_snapshot,
                 )
                 .await
             })
@@ -1079,7 +1084,9 @@ mod tests {
         };
         envelope_lens_data(&mut lens, &ctx_with(&offset));
 
-        let result = pool.dispatch_code_lens_resolve(lens, &settings, None).await;
+        let result = pool
+            .dispatch_code_lens_resolve(lens, &settings, None, &|_| None)
+            .await;
 
         let envelope = extract_code_lens_envelope(&result).expect("envelope restored");
         assert_eq!(envelope.origin, "lua-ls");
@@ -1111,7 +1118,9 @@ mod tests {
         };
         envelope_lens_data(&mut lens, &ctx_with(&offset));
 
-        let result = pool.dispatch_code_lens_resolve(lens, &settings, None).await;
+        let result = pool
+            .dispatch_code_lens_resolve(lens, &settings, None, &|_| None)
+            .await;
 
         let envelope = extract_code_lens_envelope(&result).expect("envelope restored");
         assert_eq!(
@@ -1150,7 +1159,9 @@ mod tests {
         };
         envelope_lens_data(&mut lens, &ctx_with(&offset));
 
-        let result = pool.dispatch_code_lens_resolve(lens, &settings, None).await;
+        let result = pool
+            .dispatch_code_lens_resolve(lens, &settings, None, &|_| None)
+            .await;
 
         let envelope = extract_code_lens_envelope(&result).expect("envelope restored");
         assert_eq!(
@@ -1173,7 +1184,7 @@ mod tests {
         };
 
         let result = pool
-            .dispatch_code_lens_resolve(lens.clone(), &settings, None)
+            .dispatch_code_lens_resolve(lens.clone(), &settings, None, &|_| None)
             .await;
         assert_eq!(result.data, Some(json!({"custom": true})));
     }
@@ -1223,7 +1234,7 @@ mod tests {
                 );
 
                 let result = pool
-                    .dispatch_code_lens_resolve(lenses.remove(0), &settings, None)
+                    .dispatch_code_lens_resolve(lenses.remove(0), &settings, None, &|_| None)
                     .await;
                 let envelope = extract_code_lens_envelope(&result).expect("envelope restored");
                 assert_eq!(envelope.inner, Some(json!({"kind": "references"})));
@@ -1281,7 +1292,7 @@ mod tests {
                 );
 
                 let result = pool
-                    .dispatch_code_lens_resolve(lenses.remove(0), &settings, None)
+                    .dispatch_code_lens_resolve(lenses.remove(0), &settings, None, &|_| None)
                     .await;
                 let envelope = extract_code_lens_envelope(&result).expect("envelope restored");
                 assert_eq!(envelope.origin, "lua-ls");
@@ -1352,7 +1363,9 @@ mod tests {
                     },
                 );
 
-                let result = pool.dispatch_code_lens_resolve(lens, &settings, None).await;
+                let result = pool
+                    .dispatch_code_lens_resolve(lens, &settings, None, &|_| None)
+                    .await;
                 let envelope = extract_code_lens_envelope(&result).expect("envelope restored");
                 assert_eq!(envelope.inner, Some(json!({"kind": "references"})));
                 assert_eq!(envelope.connection_key, stamped_key);
