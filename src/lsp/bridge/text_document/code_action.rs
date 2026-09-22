@@ -43,6 +43,7 @@ use super::super::protocol::{
     workspace_edit_preserves_line_prefixes, workspace_edit_within_region,
 };
 use super::completion::EnvelopeOffset;
+use super::host::{HostResolveContext, HostResolveReader};
 
 /// Envelope stored in `CodeAction.data` for routing `codeAction/resolve`
 /// (#568 PR 4), mirroring [`CodeLensEnvelope`](super::code_lens::CodeLensEnvelope).
@@ -595,7 +596,7 @@ impl LanguageServerPool {
                 async move {
                     (
                         idx,
-                        self.send_code_action_resolve_on_handle(handle, action, upstream_id)
+                        self.send_code_action_resolve_on_handle(handle, action, upstream_id, None)
                             .await,
                     )
                 }
@@ -640,6 +641,7 @@ impl LanguageServerPool {
         upstream_caps: UpstreamCodeActionCaps,
         upstream_id: Option<UpstreamId>,
         region_end: Position,
+        read_host: HostResolveReader<'_>,
     ) -> CodeAction {
         let Some(envelope) = strip_code_action_envelope(&mut action) else {
             return action;
@@ -684,6 +686,7 @@ impl LanguageServerPool {
                     envelope,
                     upstream_caps,
                     upstream_id,
+                    read_host,
                 )
                 .await;
         }
@@ -713,6 +716,7 @@ impl LanguageServerPool {
         envelope: CodeActionEnvelope,
         upstream_caps: UpstreamCodeActionCaps,
         upstream_id: Option<UpstreamId>,
+        read_host: HostResolveReader<'_>,
     ) -> CodeAction {
         let server_name = &envelope.origin;
         // `host_uri` comes from client-supplied `data` (the resolve params echo
@@ -776,7 +780,18 @@ impl LanguageServerPool {
             std::mem::replace(&mut outgoing.title, envelope.original_title.clone());
 
         let Some(resolved) = self
-            .send_code_action_resolve_on_handle(&handle, outgoing, upstream_id)
+            .send_code_action_resolve_on_handle(
+                &handle,
+                outgoing,
+                upstream_id,
+                Some(HostResolveContext {
+                    uri: &host_url,
+                    incarnation: envelope.incarnation,
+                    content_version: envelope.content_version,
+                    connection_generation: None,
+                    read: read_host,
+                }),
+            )
             .await
         else {
             // Client-driven (one per user selection, so bounded): the resolve
@@ -882,7 +897,7 @@ impl LanguageServerPool {
         translate_action_ranges_host_to_virtual(&mut outgoing, &offset);
 
         let Some(resolved) = self
-            .send_code_action_resolve_on_handle(&handle, outgoing, upstream_id)
+            .send_code_action_resolve_on_handle(&handle, outgoing, upstream_id, None)
             .await
         else {
             // Per-selection warn (bounded: one per user-selected action) — the
@@ -1057,6 +1072,7 @@ impl LanguageServerPool {
         handle: &Arc<ConnectionHandle>,
         action: CodeAction,
         upstream_id: Option<UpstreamId>,
+        host_context: Option<HostResolveContext<'_>>,
     ) -> Option<CodeAction> {
         let connection_key = handle.key();
         if let Some(ref id) = upstream_id {
@@ -1089,7 +1105,18 @@ impl LanguageServerPool {
         // fetching the handle — earliest on the eager-resolve pass — and this
         // send would queue the resolve and its cancel bookkeeping on a dead
         // handle, losing cancel forwarding and waiting out the full timeout.
-        {
+        if let Some(context) = host_context {
+            if let Err(error) = self
+                .enqueue_host_resolve(handle, context, request, request_id)
+                .await
+            {
+                log::debug!(target: "kakehashi::bridge", "codeAction/resolve: host enqueue failed: {error}");
+                if let Some(ref id) = upstream_id {
+                    self.unregister_upstream_request(id, connection_key);
+                }
+                return None;
+            }
+        } else {
             let connections = self.connections().await;
             if !connections.get(connection_key).is_some_and(|current| {
                 Arc::ptr_eq(current, handle) && current.state() == ConnectionState::Ready
@@ -1711,6 +1738,7 @@ mod tests {
                         ..Default::default()
                     },
                     Some(upstream_id),
+                    None,
                 )
                 .await
             })
@@ -1749,6 +1777,69 @@ mod tests {
             request.await.unwrap().is_none(),
             "a response from a no-longer-Ready code-action producer must be discarded"
         );
+    }
+
+    #[tokio::test]
+    async fn host_code_action_resolve_syncs_before_enqueue() {
+        use crate::lsp::bridge::test_helpers::wait_for_sent_request;
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("ruff");
+        let handle = crate::lsp::bridge::test_helpers::create_handle_advertising_resolve_methods(
+            key.clone(),
+        )
+        .await;
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let host_uri = Url::parse("file:///test.lua").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
+        super::super::test_helpers::open_resolve_host(&pool, &handle, &host_uri).await;
+        let envelope = CodeActionEnvelope {
+            origin: "ruff".into(),
+            host_uri: host_uri.to_string(),
+            region_id: String::new(),
+            injection_language: String::new(),
+            incarnation: Some(1),
+            content_version: Some(2),
+            offset: EnvelopeOffset::from(&RegionOffset::new(0, 0)),
+            original_title: "old".into(),
+            inner: None,
+            host_layer: true,
+        };
+        let upstream_id = UpstreamId::Number(77);
+        let request = {
+            let pool = Arc::clone(&pool);
+            let upstream_id = upstream_id.clone();
+            tokio::spawn(async move {
+                pool.send_host_code_action_resolve(
+                    &BridgeServerConfig::default(),
+                    CodeAction {
+                        title: "old".into(),
+                        ..Default::default()
+                    },
+                    envelope,
+                    caps_resolve(),
+                    Some(upstream_id),
+                    &|uri| {
+                        let mut snapshot = super::super::test_helpers::resolve_host_snapshot(uri)?;
+                        snapshot.text = Arc::from("local x = 2");
+                        snapshot.revision.content_version = 2;
+                        Some(snapshot)
+                    },
+                )
+                .await
+            })
+        };
+        let downstream_id = wait_for_sent_request(&handle, &upstream_id).await;
+        let docs = pool.host_documents().await;
+        assert_eq!(
+            docs[host_uri.as_str()][&key].content_version,
+            Some(2),
+            "host action resolve must synchronize its snapshot before enqueue"
+        );
+        drop(docs);
+        let _ = handle.router().route(json!({
+            "jsonrpc": "2.0", "id": downstream_id.as_i64(), "result": {"title": "resolved"}
+        }));
+        assert!(request.await.unwrap().title.starts_with("resolved"));
     }
 
     fn range(start_line: u32, end_line: u32) -> Range {
@@ -3294,6 +3385,7 @@ mod tests {
                 caps_resolve(),
                 None,
                 Position::default(),
+                &|_| None,
             )
             .await;
         assert_eq!(result.data, Some(json!({ "custom": true })));
@@ -3318,6 +3410,7 @@ mod tests {
                 caps_resolve(),
                 None,
                 Position::default(),
+                &|_| None,
             )
             .await;
         let envelope = extract_code_action_envelope(&result).expect("envelope restored");
