@@ -18,6 +18,23 @@ use tower_lsp_server::Client;
 use super::ParseCoordinator;
 use super::parse::ParseCoordinatorDeps;
 
+fn query_dependency_paths(settings: &WorkspaceSettings, language: &str) -> Vec<std::path::PathBuf> {
+    // The loader returns after loading an explicit list (including an empty
+    // one), so runtime files for this root language are not dependency inputs.
+    if settings
+        .languages
+        .get(language)
+        .is_some_and(|config| config.queries.is_some())
+    {
+        return Vec::new();
+    }
+    settings
+        .search_paths
+        .iter()
+        .map(std::path::PathBuf::from)
+        .collect()
+}
+
 fn updated_settings_after_install(
     raw_settings: &crate::config::RawWorkspaceSettings,
     settings: &WorkspaceSettings,
@@ -218,13 +235,7 @@ impl InstallCoordinator {
                 };
             }
         }
-        let search_paths = self
-            .settings_manager
-            .load_settings()
-            .search_paths
-            .iter()
-            .map(std::path::PathBuf::from)
-            .collect();
+        let search_paths = query_dependency_paths(&self.settings_manager.load_settings(), language);
         let mut result = self.auto_install.try_install(language, search_paths).await;
 
         self.dispatch_install_events(language, &result.events).await;
@@ -467,6 +478,27 @@ mod tests {
     use std::path::Path;
     use std::task::Poll;
     use tower_lsp_server::LspService;
+
+    #[test]
+    fn explicit_queries_exclude_unused_runtime_dependency_paths() {
+        let mut settings = WorkspaceSettings {
+            search_paths: vec!["/runtime".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            query_dependency_paths(&settings, "lua"),
+            vec![std::path::PathBuf::from("/runtime")]
+        );
+        settings.languages.insert(
+            "lua".into(),
+            LanguageSettings {
+                queries: Some(Vec::new()),
+                ..Default::default()
+            },
+        );
+        assert!(query_dependency_paths(&settings, "lua").is_empty());
+        assert!(!query_dependency_paths(&settings, "rust").is_empty());
+    }
 
     #[test]
     fn reload_after_install_preserves_explicit_matching_override_in_raw_settings() {
