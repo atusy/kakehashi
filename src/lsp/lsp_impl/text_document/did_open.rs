@@ -180,7 +180,9 @@ impl Kakehashi {
                                 install_uri.clone(),
                                 false,
                                 Some(incarnation),
-                                true,
+                                crate::lsp::lsp_impl::coordinator::InstallRequest::new(
+                                    load_result.success,
+                                ),
                             )
                             .await;
                         if !completion.same_lifetime {

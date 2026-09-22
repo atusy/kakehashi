@@ -577,7 +577,7 @@ impl InjectionCoordinator {
                     uri.clone(),
                     true,
                     Some(expected_incarnation),
-                    true,
+                    super::InstallRequest::new(repair_queries),
                 )
                 .await;
         }

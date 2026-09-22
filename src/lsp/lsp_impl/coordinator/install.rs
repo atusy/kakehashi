@@ -113,6 +113,22 @@ pub(super) struct InstallCoordinatorDeps {
     pub(super) shutdown: tokio_util::sync::CancellationToken,
 }
 
+/// Preserve the caller's query-repair decision across publication races.
+#[derive(Clone, Copy)]
+pub(crate) struct InstallRequest {
+    repair_queries: bool,
+    allow_recovery: bool,
+}
+
+impl InstallRequest {
+    pub(crate) fn new(repair_queries: bool) -> Self {
+        Self {
+            repair_queries,
+            allow_recovery: true,
+        }
+    }
+}
+
 /// Installation/lifetime eligibility is distinct from ownership of a parse.
 /// A sibling may supply the tree while this install is waiting.
 #[derive(Default)]
@@ -275,15 +291,20 @@ impl InstallCoordinator {
         uri: Url,
         is_injection: bool,
         expected_incarnation: Option<u64>,
-        allow_recovery: bool,
+        request: InstallRequest,
     ) -> InstallCompletion {
         let mut parsed = None;
         if !self.same_document_incarnation(&uri, expected_incarnation) {
             return InstallCompletion::default();
         }
 
-        let query_repair = self.language.has_parser_available(language)
-            && self.needs_query_dependency_install(language);
+        let query_repair = request.repair_queries
+            || (self.language.has_parser_available(language)
+                && self.needs_query_dependency_install(language));
+        let request = InstallRequest {
+            repair_queries: query_repair,
+            ..request
+        };
         if self.language.has_parser_available(language) && !query_repair {
             if !is_injection && self.same_document_incarnation(&uri, expected_incarnation) {
                 parsed = self
@@ -398,13 +419,16 @@ impl InstallCoordinator {
                         queries_reloaded: query_repair,
                     };
                 }
-                if allow_recovery {
+                if request.allow_recovery {
                     return Box::pin(self.maybe_auto_install_language(
                         language,
                         uri,
                         is_injection,
                         expected_incarnation,
-                        false,
+                        InstallRequest {
+                            allow_recovery: false,
+                            ..request
+                        },
                     ))
                     .await;
                 }
@@ -412,14 +436,17 @@ impl InstallCoordinator {
             }
             if terminal == crate::lsp::auto_install::InstallOutcome::Abandoned
                 && self.same_document_incarnation(&uri, expected_incarnation)
-                && allow_recovery
+                && request.allow_recovery
             {
                 return Box::pin(self.maybe_auto_install_language(
                     language,
                     uri,
                     is_injection,
                     expected_incarnation,
-                    false,
+                    InstallRequest {
+                        allow_recovery: false,
+                        ..request
+                    },
                 ))
                 .await;
             }
@@ -566,6 +593,64 @@ mod tests {
     use std::path::Path;
     use std::task::Poll;
     use tower_lsp_server::LspService;
+
+    #[tokio::test]
+    async fn query_repair_request_survives_a_siblings_publication() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), tree_sitter_rust::LANGUAGE.into());
+        let uri = Url::parse("file:///query-waiter.rs").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "fn main() {}".into(),
+            Some("rust".into()),
+            None,
+        );
+        let original = server
+            .parse_coordinator()
+            .reparse_installed_document(uri.clone(), "rust", Some(incarnation))
+            .await
+            .expect("initial parse");
+        // This document requested repair before the sibling published. By the
+        // time its task runs, the current parser fastpath is otherwise usable.
+        let claim = server.auto_install.begin_test_claim(
+            "rust",
+            query_dependency_paths(&server.settings_manager.load_settings(), "rust"),
+        );
+        let install = server.install_coordinator();
+        let mut waiter = Box::pin(install.maybe_auto_install_language(
+            "rust",
+            uri.clone(),
+            false,
+            Some(incarnation),
+            InstallRequest::new(true),
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(
+                waiter.as_mut().poll(cx).is_pending(),
+                "repair intent must bypass the ordinary parser shortcut"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        // Artifact success is intentionally published without an owner reload.
+        claim.complete(crate::lsp::auto_install::InstallOutcome::Success {
+            data_dir: "/installed".into(),
+        });
+        let completion = waiter.await;
+        assert!(completion.same_lifetime);
+        assert!(
+            completion.parsed.is_none(),
+            "existing tree should be retained"
+        );
+        assert_eq!(
+            completion.downstream_lineage(&server.documents, &uri, incarnation),
+            Some(original)
+        );
+    }
 
     #[tokio::test]
     async fn query_reload_authorizes_retained_tree_downstream_only_for_current_lifetime() {
@@ -996,7 +1081,7 @@ mod tests {
             second.clone(),
             false,
             Some(second_incarnation),
-            true,
+            InstallRequest::new(false),
         ));
         std::future::poll_fn(|cx| {
             assert!(waiter.as_mut().poll(cx).is_pending());
@@ -1061,7 +1146,7 @@ mod tests {
             uri.clone(),
             false,
             Some(incarnation),
-            true,
+            InstallRequest::new(false),
         ));
         std::future::poll_fn(|cx| {
             assert!(waiter.as_mut().poll(cx).is_pending());
@@ -1223,7 +1308,13 @@ mod tests {
         );
         let install = server.install_coordinator();
         let first = install
-            .maybe_auto_install_language("rust", uri.clone(), false, Some(incarnation), true)
+            .maybe_auto_install_language(
+                "rust",
+                uri.clone(),
+                false,
+                Some(incarnation),
+                InstallRequest::new(false),
+            )
             .await;
         assert!(first.same_lifetime);
         let parsed = first.parsed.expect("this install published the parse");
@@ -1233,7 +1324,13 @@ mod tests {
             Some("rust")
         );
         let second = install
-            .maybe_auto_install_language("rust", uri.clone(), false, Some(incarnation), true)
+            .maybe_auto_install_language(
+                "rust",
+                uri.clone(),
+                false,
+                Some(incarnation),
+                InstallRequest::new(false),
+            )
             .await;
         assert!(
             second.same_lifetime,
@@ -1260,7 +1357,13 @@ mod tests {
                 .insert(uri.clone(), "fn old() {}".into(), Some("rust".into()), None);
         let completion = server
             .install_coordinator()
-            .maybe_auto_install_language("rust", uri.clone(), false, Some(incarnation), true)
+            .maybe_auto_install_language(
+                "rust",
+                uri.clone(),
+                false,
+                Some(incarnation),
+                InstallRequest::new(false),
+            )
             .await;
         let parsed = completion.parsed.expect("install's own parse");
         server
@@ -1326,7 +1429,7 @@ mod tests {
                 uri,
                 false,
                 Some(old_incarnation),
-                true,
+                InstallRequest::new(false),
             ),
         )
         .await
