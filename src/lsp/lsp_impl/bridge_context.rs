@@ -805,8 +805,15 @@ impl Kakehashi {
         &self,
         uri: &url::Url,
     ) -> Option<crate::lsp::bridge::HostResolveSnapshot> {
-        let language_id = self.document_language(uri)?;
+        // Keep detection and the stamped text under one store read: an edit
+        // can change a content-detected language between separate lookups.
         let document = self.documents.get(uri)?;
+        let language_id = self.language.detect_language(
+            uri.path(),
+            document.text(),
+            None,
+            document.language_id(),
+        )?;
         Some(crate::lsp::bridge::HostResolveSnapshot {
             text: document.text_arc(),
             language_id,
@@ -1842,6 +1849,58 @@ mod tests {
     use crate::config::settings::{
         AggregationConfig, AggregationStrategy, BridgeLanguageConfig, LanguageSettings,
     };
+
+    #[tokio::test]
+    async fn host_resolve_snapshot_keeps_language_and_text_together_during_edits() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let registry = server.language.language_registry_for_parallel();
+        registry.register("python".into(), tree_sitter_python::LANGUAGE.into());
+        registry.register("bash".into(), tree_sitter_bash::LANGUAGE.into());
+        let uri = url::Url::parse("file:///script").unwrap();
+        let texts = [
+            "#!/usr/bin/env python\nprint(1)\n",
+            "#!/usr/bin/env bash\necho 1\n",
+        ];
+        server
+            .documents
+            .insert(uri.clone(), texts[0].into(), Some("plaintext".into()), None);
+        let barrier = std::sync::Barrier::new(2);
+        let mut mismatches = 0;
+        // Coordinate each edit/read race without sleeps; either revision is
+        // valid, but language and text must always describe the same one.
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for index in 0..2000 {
+                    barrier.wait();
+                    server
+                        .documents
+                        .update_document(uri.clone(), texts[index % 2].into(), None);
+                    barrier.wait();
+                }
+            });
+            for _ in 0..2000 {
+                barrier.wait();
+                let snapshot = server.host_resolve_snapshot(&uri);
+                barrier.wait();
+                match snapshot {
+                    Some(snapshot) => {
+                        let expected = if snapshot.text.as_ref() == texts[0] {
+                            "python"
+                        } else {
+                            "bash"
+                        };
+                        mismatches += usize::from(snapshot.language_id != expected);
+                    }
+                    None => mismatches += 1,
+                }
+            }
+        });
+        assert_eq!(
+            mismatches, 0,
+            "language must be detected from the captured text"
+        );
+    }
 
     fn pos(line: u32, character: u32) -> Position {
         Position { line, character }
