@@ -1238,11 +1238,6 @@ fn write_content_to_output(
     force: bool,
     label: &str,
 ) -> Result<(), ExitCode> {
-    // Check for --force without --output (warn but continue)
-    if force && output.is_none() {
-        eprintln!("Warning: --force has no effect without --output");
-    }
-
     if let Some(path) = output.as_ref().filter(|p| p.as_os_str() != "-") {
         // A same-directory temp file plus an atomic no-clobber persist, not an
         // `exists()` check followed by a write: check-then-write has two holes
@@ -1285,6 +1280,9 @@ fn write_content_to_output(
             }
         }
     } else {
+        if force {
+            eprintln!("Warning: --force has no effect when writing to stdout");
+        }
         print!("{}", content);
     }
 

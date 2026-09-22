@@ -792,6 +792,46 @@ fn test_config_schema_output_dash_outputs_to_stdout() {
         serde_json::from_str(&stdout).expect("Stdout should contain valid JSON");
 }
 
+#[test]
+fn test_config_force_stdout_warns_without_changing_content() {
+    for subcommand in ["init", "schema"] {
+        let baseline = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+            .args(["config", subcommand])
+            .output()
+            .expect("Failed to execute command");
+        assert!(baseline.status.success());
+        assert!(baseline.stderr.is_empty());
+
+        for destination in [vec!["--output", "-"], vec![]] {
+            let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+                .args(["config", subcommand, "--force"])
+                .args(&destination)
+                .output()
+                .expect("Failed to execute command");
+            assert!(output.status.success(), "{subcommand} {destination:?}");
+            let stdout = std::str::from_utf8(&output.stdout).unwrap();
+            let baseline_stdout = std::str::from_utf8(&baseline.stdout).unwrap();
+            // Configuration tables can be emitted in a different order per process.
+            if subcommand == "init" {
+                assert_eq!(
+                    toml::from_str::<toml::Value>(stdout).unwrap(),
+                    toml::from_str::<toml::Value>(baseline_stdout).unwrap()
+                );
+            } else {
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(stdout).unwrap(),
+                    serde_json::from_str::<serde_json::Value>(baseline_stdout).unwrap()
+                );
+            }
+            assert_eq!(
+                String::from_utf8(output.stderr).unwrap(),
+                "Warning: --force has no effect when writing to stdout\n",
+                "{subcommand} {destination:?}"
+            );
+        }
+    }
+}
+
 /// Test that config schema output ends with a trailing newline
 #[test]
 fn test_config_schema_ends_with_trailing_newline() {
