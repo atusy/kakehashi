@@ -5,9 +5,10 @@
 //! captures nothing, depending on run order). Every bridge test that asserts
 //! on emitted warnings must therefore share this single logger via
 //! [`captured_warnings_for`]. Captures are serialized by an internal lock, so
-//! concurrent capture tests never observe each other's messages.
+//! concurrent capture tests never observe each other's messages. Only the
+//! calling thread is captured: unrelated tests can log without taking that lock.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::cell::Cell;
 use std::sync::{Mutex, Once};
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
@@ -17,7 +18,9 @@ static LOGGER: CapturingLogger = CapturingLogger {
 };
 static INIT_LOGGER: Once = Once::new();
 static CAPTURE_LOCK: Mutex<()> = Mutex::new(());
-static CAPTURING: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static CAPTURING: Cell<bool> = const { Cell::new(false) };
+}
 
 struct CapturingLogger {
     messages: Mutex<Vec<String>>,
@@ -27,13 +30,13 @@ struct CaptureGuard;
 
 impl Drop for CaptureGuard {
     fn drop(&mut self) {
-        CAPTURING.store(false, Ordering::Release);
+        CAPTURING.set(false);
     }
 }
 
 impl Log for CapturingLogger {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-        CAPTURING.load(Ordering::Acquire)
+        CAPTURING.get()
             && metadata.level() <= Level::Warn
             && metadata.target() == "kakehashi::bridge"
     }
@@ -55,6 +58,8 @@ impl Log for CapturingLogger {
 /// Run `f` and return every `kakehashi::bridge` warning (or error) it logged,
 /// formatted `LEVEL:target:message`. Serialized across the process: parallel
 /// callers block on an internal lock rather than interleave captures.
+/// Only logs on the calling thread are captured. `Runtime::block_on` keeps its
+/// root future on that thread; spawned tasks and worker threads are excluded.
 pub(crate) fn captured_warnings_for<F: FnOnce()>(f: F) -> Vec<String> {
     INIT_LOGGER.call_once(|| {
         log::set_logger(&LOGGER).expect("the shared test logger installs once per process");
@@ -66,7 +71,7 @@ pub(crate) fn captured_warnings_for<F: FnOnce()>(f: F) -> Vec<String> {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .clear();
-    CAPTURING.store(true, Ordering::Release);
+    CAPTURING.set(true);
     let guard = CaptureGuard;
     f();
     drop(guard);
@@ -81,4 +86,26 @@ pub(crate) fn captured_warnings_for<F: FnOnce()>(f: F) -> Vec<String> {
         .unwrap_or_else(|p| p.into_inner())
         .clear();
     captured
+}
+
+#[cfg(test)]
+mod tests {
+    use super::captured_warnings_for;
+
+    #[test]
+    fn capture_excludes_other_threads_warning_for_the_same_method() {
+        let warnings = captured_warnings_for(|| {
+            std::thread::spawn(|| {
+                log::warn!(target: "kakehashi::bridge", "codeLens/resolve: unrelated test");
+            })
+            .join()
+            .expect("other test thread finishes while capture is active");
+            log::warn!(target: "kakehashi::bridge", "codeLens/resolve: own warning");
+        });
+
+        assert_eq!(
+            warnings,
+            vec!["WARN:kakehashi::bridge:codeLens/resolve: own warning"]
+        );
+    }
 }
