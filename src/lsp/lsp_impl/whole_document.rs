@@ -104,6 +104,8 @@ impl Kakehashi {
                 return Ok(None);
             }
 
+            // Preferred may use another layer; concatenated deliberately
+            // rejects the request rather than present a partial set as complete.
             let all_regions = self
                 .whole_document_regions(&uri, &snapshot)
                 .ok_or_else(tower_lsp_server::jsonrpc::Error::content_modified)?;
@@ -448,6 +450,29 @@ mod tests {
         assert!(
             server.document_color_impl(params).await.unwrap().is_empty(),
             "a settled parser without injection queries really has no colors"
+        );
+    }
+
+    #[tokio::test]
+    async fn concatenated_results_reject_unavailable_virtual_regions_even_with_host_items() {
+        let (host_done, host_finished) = tokio::sync::oneshot::channel();
+        let result = crate::lsp::lsp_impl::bridge_context::race_layers_concatenated(
+            &[LayerSource::Host, LayerSource::Virt],
+            async {
+                host_finished.await.unwrap();
+                Err(tower_lsp_server::jsonrpc::Error::content_modified())
+            },
+            async {
+                host_done.send(()).unwrap();
+                Ok(Some(vec![1]))
+            },
+            async { Ok(None) },
+            concat_whole_document_items,
+        )
+        .await;
+        assert_eq!(
+            result.unwrap_err().code,
+            tower_lsp_server::jsonrpc::ErrorCode::ContentModified
         );
     }
 

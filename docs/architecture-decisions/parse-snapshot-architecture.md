@@ -186,9 +186,11 @@ Whole-document requests also check that the host parser is published and no
 query reload is in progress, then recheck the reload flag and settings generation
 after reading or resolving regions. This applies to cached regions too: a parse
 can publish old-query regions under a transitional generation. An unavailable
-read makes the one-shot virtual layer return `ContentModified` (other enabled
-layers may still answer); a settled language without an injection query returns
-an empty region set. Pull diagnostics retains degraded-answer debt instead of
+read makes the one-shot virtual layer return `ContentModified`. Under `preferred`,
+other enabled layers may still answer. Under `concatenated`, the existing
+all-layers-success rule rejects the request instead of presenting a partial set
+as complete. A settled language without an injection query returns an empty
+region set. Pull diagnostics retains degraded-answer debt instead of
 marking the document covered. Its immediate recovery check requires settled
 queries as well as a current tree. An unsettled recovery check also starts one
 bounded reload-completion waiter for the current document lifetime, because
