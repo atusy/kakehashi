@@ -148,21 +148,6 @@ impl Kakehashi {
         // (resolve_host_bridge_context returns None otherwise).
         let layer_cfg = self.resolve_layer_config(&language_name, "textDocument/diagnostic");
         let virt_enabled = layer_cfg.allows(LayerSource::Virt);
-        let host_ctx = if layer_cfg.allows(LayerSource::Host) {
-            self.resolve_host_bridge_context(&lsp_uri, "textDocument/diagnostic")
-        } else {
-            None
-        };
-        if !virt_enabled && host_ctx.is_none() {
-            log::debug!(
-                target: "kakehashi::diagnostic",
-                "no diagnostic layer enabled for {} (layers.aggregation priorities / bridge._self)",
-                language_name
-            );
-            self.mark_pull_covered(&uri, coverage_stamp, pull_view_lag_stamp, true);
-            return Ok(empty_diagnostic_report());
-        }
-
         // Snapshot for the VIRT layer ONLY, and ONLY ensure a fresh tree when virt
         // actually participates: `didChange` clears the tree and reparses
         // off-ingress, so the virt injection regions would otherwise be empty for
@@ -184,6 +169,36 @@ impl Kakehashi {
         } else {
             None
         };
+
+        // A parse may re-detect the host while we wait. Its regions and all
+        // routing decisions must use the same language, including persistent
+        // fallback snapshots whose stored document label intentionally differs.
+        let language_name = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.language.as_deref())
+            .unwrap_or(&language_name);
+        let layer_cfg = self.resolve_layer_config(language_name, "textDocument/diagnostic");
+        let virt_enabled = layer_cfg.allows(LayerSource::Virt);
+        let host_ctx = if layer_cfg.allows(LayerSource::Host) {
+            self.resolve_host_bridge_context_for_language(
+                &lsp_uri,
+                "textDocument/diagnostic",
+                language_name,
+            )
+        } else {
+            None
+        };
+        if !virt_enabled && host_ctx.is_none() {
+            log::debug!(
+                target: "kakehashi::diagnostic",
+                "no diagnostic layer enabled for {} (layers.aggregation priorities / bridge._self)",
+                language_name
+            );
+            self.mark_pull_covered(&uri, coverage_stamp, pull_view_lag_stamp, true);
+            return Ok(empty_diagnostic_report());
+        }
+
+        let snapshot = snapshot.as_ref().filter(|_| virt_enabled);
 
         // Tee the request-failure count through an internal sink: the caller's
         // sink (CLI diagnose) receives the total after the fan-out settles,
@@ -237,7 +252,7 @@ impl Kakehashi {
         // request; the resulting set is a cheap lookup inside the region loop.
         let incapable_servers = self
             .incapable_virt_servers(
-                &language_name,
+                language_name,
                 virt_regions.iter().map(|r| r.injection_language.as_str()),
                 "textDocument/diagnostic",
             )
@@ -250,7 +265,7 @@ impl Kakehashi {
             let mut outer_join_set: JoinSet<Vec<Diagnostic>> = JoinSet::new();
             for resolved in virt_regions.iter() {
                 let mut configs = self.bridge_configs_for_injection_language(
-                    &language_name,
+                    language_name,
                     &resolved.injection_language,
                 );
                 // Drop known-incapable servers before building the fan-out
@@ -265,7 +280,7 @@ impl Kakehashi {
                 // Resolve strategy per-region so different injection languages can use
                 // different strategies (e.g., Python=Preferred, Lua=All in the same host).
                 let agg = self.resolve_aggregation_config(
-                    &language_name,
+                    language_name,
                     &resolved.injection_language,
                     "textDocument/diagnostic",
                 );
@@ -353,7 +368,7 @@ impl Kakehashi {
         // cached pushes so they also answer the client pull.
         self.fold_push_fallback_diagnostics(
             &uri,
-            &language_name,
+            language_name,
             region_meta,
             host_ctx.is_some(),
             &mut virt_items,
@@ -1379,6 +1394,90 @@ mod tests {
         assert!(
             !server.diagnostics.take_degraded_pull(&uri),
             "recovery consumes the debt"
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostic_routes_with_language_changed_during_snapshot_wait() {
+        assert_snapshot_language_routing(crate::document::LanguageCheck::Record).await;
+    }
+
+    #[tokio::test]
+    async fn diagnostic_routes_with_persistent_fallback_snapshot_language() {
+        assert_snapshot_language_routing(crate::document::LanguageCheck::Expect(Some("rust")))
+            .await;
+    }
+
+    async fn assert_snapshot_language_routing(language_check: crate::document::LanguageCheck<'_>) {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let registry = server.language.language_registry_for_parallel();
+        registry.register("rust".into(), tree_sitter_rust::LANGUAGE.into());
+        let lua: tree_sitter::Language = tree_sitter_lua::LANGUAGE.into();
+        registry.register("lua".into(), lua.clone());
+        let mut settings = (*server.settings_manager.load_settings()).clone();
+        settings.languages.insert("lua".into(), serde_json::from_value(serde_json::json!({
+            "layers": { "aggregation": { "textDocument/diagnostic": { "priorities": ["native"] } } }
+        })).unwrap());
+        server.settings_manager.apply_settings(settings);
+        let uri = Url::parse("file:///redetected").unwrap();
+        let text = "return 1";
+        server
+            .documents
+            .insert(uri.clone(), text.into(), Some("rust".into()), None);
+        server.diagnostics.bump_current(&uri);
+        let params = DocumentDiagnosticParams {
+            text_document: tower_lsp_server::ls_types::TextDocumentIdentifier {
+                uri: uri.as_str().parse().unwrap(),
+            },
+            identifier: None,
+            previous_result_id: None,
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let mut request = Box::pin(server.diagnostic_impl(params.clone()));
+        // Stop at the snapshot wait, after routing selected the old language.
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(request.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&lua).unwrap();
+        let (incarnation, parsed_version) = {
+            let doc = server.documents.get(&uri).unwrap();
+            (doc.incarnation(), doc.content_version())
+        };
+        let installed = server.documents.install_parse(
+            &uri,
+            language_check,
+            Arc::new(crate::document::snapshot::ParseSnapshot {
+                text: Arc::from(text),
+                tree: Some(parser.parse(text, None).unwrap()),
+                language: Some("lua".into()),
+                parsed_version,
+                incarnation,
+                injection_regions: None,
+                regions: None,
+                layer_trees: Arc::new(std::sync::OnceLock::new()),
+            }),
+        );
+        assert!(installed.current);
+        // With Lua's virt layer disabled, reload must not create degraded debt.
+        // Using the entry Rust settings would instead skip unavailable regions
+        // and keep coverage dirty. Expect also leaves the stored label as Rust.
+        let _reload = crate::lsp::lsp_impl::ParserReloadGuard::begin(&server.parser_pool);
+        assert!(request.await.is_ok());
+        assert!(
+            !server.diagnostics.is_dirty(),
+            "the snapshot language disables virt"
+        );
+        assert!(!server.diagnostics.take_degraded_pull(&uri));
+        server.diagnostics.bump_current(&uri);
+        assert!(server.diagnostic_impl(params).await.is_ok());
+        assert!(
+            !server.diagnostics.is_dirty(),
+            "subsequent pulls remain answerable"
         );
     }
 
