@@ -23,6 +23,14 @@ dependency names. Parents declared by their `highlights.scm` and
 rules, including the exclusion of parenthesized parents when inherited.
 Downloads use the existing upstream query source and data-directory destination.
 Runtime paths do not provide download URLs or change the parser source.
+Languages with an explicit query list (including an empty list) do not use
+runtime paths as dependency inputs.
+
+Opening a document also checks an already-loaded managed parser's query chain.
+Query-only repair preserves parsing with that parser while installation runs.
+Injected languages are checked on initial lifecycle passes or fresh loads;
+cached edit passes do not rescan the dependency graph. A parser selected from
+outside the managed data directory is not a query-repair target.
 
 Each request captures its search paths. Concurrent requests for the same
 language share an outcome only when those inputs match; a request with different

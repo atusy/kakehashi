@@ -35,6 +35,37 @@ fn query_dependency_paths(settings: &WorkspaceSettings, language: &str) -> Vec<s
         .collect()
 }
 
+fn managed_queries_need_repair(
+    settings: &WorkspaceSettings,
+    language: &str,
+    data_dir: &std::path::Path,
+) -> bool {
+    if !settings.auto_install_for(language) {
+        return false;
+    }
+    let paths = query_dependency_paths(settings, language);
+    if paths.is_empty() {
+        return false;
+    }
+    let parser_config = settings
+        .languages
+        .get(language)
+        .and_then(|config| config.parser.as_deref());
+    let selected = crate::language::query_loader::QueryLoader::resolve_library_path(
+        parser_config,
+        language,
+        &paths,
+    );
+    let managed = crate::install::parser_file_exists(language, data_dir);
+    // A stale managed copy must not turn a custom parser into an install target.
+    let same_parser = selected
+        .and_then(|path| path.canonicalize().ok())
+        .zip(managed.and_then(|path| path.canonicalize().ok()))
+        .is_some_and(|(selected, managed)| selected == managed);
+    same_parser
+        && crate::install::queries::lock_complete_chain(data_dir, language, &paths).is_none()
+}
+
 fn updated_settings_after_install(
     raw_settings: &crate::config::RawWorkspaceSettings,
     settings: &WorkspaceSettings,
@@ -196,6 +227,15 @@ impl InstallCoordinator {
             .await;
     }
 
+    pub(crate) fn needs_query_dependency_install(&self, language: &str) -> bool {
+        if !self.settings_manager.is_auto_install_enabled(language) {
+            return false;
+        }
+        crate::install::default_data_dir().is_some_and(|data_dir| {
+            managed_queries_need_repair(&self.settings_manager.load_settings(), language, &data_dir)
+        })
+    }
+
     /// Try to auto-install a language if not already being installed.
     ///
     /// Delegates to `AutoInstallManager::try_install()`, dispatches its events, and
@@ -216,7 +256,9 @@ impl InstallCoordinator {
             return InstallCompletion::default();
         }
 
-        if self.language.has_parser_available(language) {
+        if self.language.has_parser_available(language)
+            && !self.needs_query_dependency_install(language)
+        {
             if !is_injection && self.same_document_incarnation(&uri, expected_incarnation) {
                 parsed = self
                     .parse_coordinator()
@@ -478,6 +520,66 @@ mod tests {
     use std::path::Path;
     use std::task::Poll;
     use tower_lsp_server::LspService;
+
+    #[test]
+    fn loaded_managed_parser_still_needs_missing_overlay_parent() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        std::fs::create_dir_all(data.join("parser")).unwrap();
+        std::fs::create_dir_all(data.join("queries/lua")).unwrap();
+        std::fs::create_dir_all(runtime.join("queries/lua")).unwrap();
+        let parser = data.join(format!("parser/lua.{}", std::env::consts::DLL_EXTENSION));
+        std::fs::write(&parser, "fixture").unwrap();
+        std::fs::write(data.join("queries/lua/highlights.scm"), "base").unwrap();
+        std::fs::write(
+            runtime.join("queries/lua/highlights.scm"),
+            ";; extends\n;; inherits: parent\n",
+        )
+        .unwrap();
+        let mut settings = WorkspaceSettings {
+            search_paths: vec![
+                runtime.to_string_lossy().into(),
+                data.to_string_lossy().into(),
+            ],
+            ..Default::default()
+        };
+        assert!(managed_queries_need_repair(&settings, "lua", &data));
+        settings.languages.insert(
+            "lua".into(),
+            LanguageSettings {
+                auto_install: Some(false),
+                ..Default::default()
+            },
+        );
+        assert!(!managed_queries_need_repair(&settings, "lua", &data));
+        settings.languages.insert(
+            "lua".into(),
+            LanguageSettings {
+                queries: Some(Vec::new()),
+                ..Default::default()
+            },
+        );
+        assert!(!managed_queries_need_repair(&settings, "lua", &data));
+        settings.languages.clear();
+        std::fs::create_dir_all(runtime.join("parser")).unwrap();
+        let custom = runtime.join("parser/lua.so");
+        std::fs::write(&custom, "custom").unwrap();
+        assert!(!managed_queries_need_repair(&settings, "lua", &data));
+        std::fs::remove_file(&custom).unwrap();
+        settings.languages.insert(
+            "lua".into(),
+            LanguageSettings {
+                parser: Some(custom.to_string_lossy().into()),
+                ..Default::default()
+            },
+        );
+        assert!(!managed_queries_need_repair(&settings, "lua", &data));
+        settings.languages.clear();
+        std::fs::create_dir_all(data.join("queries/parent")).unwrap();
+        std::fs::write(data.join("queries/parent/highlights.scm"), "parent").unwrap();
+        assert!(!managed_queries_need_repair(&settings, "lua", &data));
+    }
 
     #[test]
     fn explicit_queries_exclude_unused_runtime_dependency_paths() {

@@ -424,7 +424,13 @@ impl InjectionCoordinator {
             let uri = uri.clone();
             async move {
                 coordinator
-                    .check_injected_languages_auto_install(&uri, &languages, incarnation)
+                    .check_injected_languages_auto_install_after_incarnation_check(
+                        &uri,
+                        &languages,
+                        incarnation,
+                        !forward_did_change,
+                        std::future::ready(()),
+                    )
                     .await;
             }
         };
@@ -467,6 +473,7 @@ impl InjectionCoordinator {
             uri,
             languages,
             expected_incarnation,
+            true,
             std::future::ready(()),
         )
         .await;
@@ -477,6 +484,7 @@ impl InjectionCoordinator {
         uri: &Url,
         languages: &HashSet<String>,
         expected_incarnation: u64,
+        check_query_dependencies: bool,
         after_incarnation_check: F,
     ) where
         F: std::future::Future<Output = ()>,
@@ -533,9 +541,16 @@ impl InjectionCoordinator {
             if !self.same_document_incarnation(uri, expected_incarnation) {
                 return;
             }
+            // Initial lifecycle passes and fresh loads may repair queries even
+            // when the parser loaded. Cached didChange passes must not scan or
+            // lock the on-disk dependency graph on every edit.
+            let repair_queries = (check_query_dependencies || !load_result.events.is_empty())
+                && install.needs_query_dependency_install(&resolved_lang);
             if load_result.success {
                 load_events.extend(load_result.events);
-                continue;
+                if !repair_queries {
+                    continue;
+                }
             }
 
             // Resolved per language, not hoisted: `autoInstall` is now
@@ -1106,6 +1121,7 @@ mod tests {
                 &uri,
                 &HashSet::new(),
                 old_incarnation,
+                true,
                 async move {
                     observed.store(true, std::sync::atomic::Ordering::SeqCst);
                 },

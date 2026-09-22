@@ -124,7 +124,7 @@ impl Kakehashi {
 
         // Check if we need to auto-install
         let mut deferred_events = Vec::new();
-        let mut skip_parse = false; // Track if auto-install was triggered
+        let mut skip_parse = false; // Defer parsing only when the parser is unavailable
 
         if let Some(ref lang) = language_name {
             let load_result = self.language.ensure_language_loaded_async(lang).await;
@@ -145,19 +145,23 @@ impl Kakehashi {
                 }
             }
 
-            if !load_result.success {
+            if !load_result.success
+                || self
+                    .install_coordinator()
+                    .needs_query_dependency_install(lang)
+            {
                 if self.settings_manager.is_auto_install_enabled(lang) {
-                    // Language failed to load and auto-install is enabled.
+                    // A parser or its query dependency chain needs installation.
                     //
                     // Move auto-install OFF the ingress writer ticket (#480
                     // liveness): a slow or hung parser *compile* must not hold the
                     // didOpen ticket and wedge later same-URI readers/writers. The
                     // spawned task installs, reloads, and resurrection-safely
                     // reparses the latest store text; this handler returns
-                    // immediately. We skip the inline parse unconditionally — the
-                    // parser is not loaded yet, so an inline parse would yield no
-                    // tree anyway — and the skip-parse branch below advances the
-                    // watermark so a gated reader is not stranded.
+                    // immediately. Query-only repair preserves the inline parse:
+                    // a failed download must not discard a usable parser/tree.
+                    // When the parser is missing, the skip-parse branch advances
+                    // the watermark so a gated reader is not stranded.
                     let install = self.install_coordinator();
                     let injection = self.injection_coordinator();
                     let diagnostic_scheduler = self.diagnostic_scheduler();
@@ -209,7 +213,7 @@ impl Kakehashi {
                             }
                         }
                     });
-                    skip_parse = true;
+                    skip_parse = !load_result.success;
                 } else {
                     // Notify user that parser is missing and needs manual installation
                     let reason = self
