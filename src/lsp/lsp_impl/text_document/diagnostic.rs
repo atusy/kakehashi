@@ -402,7 +402,7 @@ impl Kakehashi {
             // The debt drives the post-parse recovery refresh (see
             // `DiagnosticAggregator::degraded_pulls`).
             self.diagnostics.record_degraded_pull(&uri, coverage_stamp);
-            self.recover_degraded_pull(&uri, snapshot.as_deref());
+            self.recover_degraded_pull(&uri);
         } else {
             // A failed/partial fan-out (`!pull_clean`) still advances the
             // coverage version but clears neither the pull-view lag nor the
@@ -426,13 +426,9 @@ impl Kakehashi {
     }
 
     /// Recover after a degraded answer has recorded its debt.
-    fn recover_degraded_pull(
-        &self,
-        uri: &Url,
-        snapshot: Option<&crate::document::snapshot::ParseSnapshot>,
-    ) {
-        // TOCTOU guard: `snapshot` was captured before the fan-out/fold
-        // awaits above, so the parse may have landed — and the post-parse
+    fn recover_degraded_pull(&self, uri: &Url) {
+        // The pull's snapshot was captured before the fan-out/fold awaits,
+        // so the parse may have landed — and the post-parse
         // debt consumer already run — in between, leaving this
         // freshly-recorded debt with no consumer until the next edit. If
         // geometry and queries are settled NOW, consume the debt here and fire the
@@ -441,28 +437,31 @@ impl Kakehashi {
         // received a non-covering answer, which the version-based gate
         // cannot see — an edit-race degradation leaves served == current
         // (no push-origin change), so a gated request would be suppressed
-        // while the client displays the region-less set. `take` on both
-        // consumers makes double-firing impossible; if the snapshot is
+        // while the client displays the region-less set. `take` in each
+        // consumer prevents duplicate recovery of the same debt; if the snapshot is
         // still absent, the parse that produces it has not run its
         // post-parse pass yet, so that pass will consume. Loop-bounded:
         // the refresh-induced re-pull sees the ready geometry, answers
         // covering, and clears everything.
-        let geometry_ready = self
-            .documents
-            .latest_snapshot(uri)
+        let current = self.documents.latest_snapshot(uri);
+        let geometry_ready = current
+            .as_ref()
             .and_then(|view| {
                 view.slot
                     .snapshot
+                    .as_ref()
                     .filter(|s| s.parsed_version == view.content_version)
             })
-            .and_then(|snapshot| self.whole_document_regions(uri, &snapshot))
+            .and_then(|snapshot| self.whole_document_regions(uri, snapshot))
             .is_some();
         if geometry_ready && self.diagnostics.take_degraded_pull(uri) {
             crate::lsp::lsp_impl::DiagnosticPublisher::new(self)
                 .request_pull_diagnostic_refresh(true);
-        } else if !geometry_ready && let Some(snapshot) = snapshot {
+        } else if !geometry_ready && let Some(current) = current {
+            // The initial read may have been tree-less even though its parse
+            // already finished. Bind recovery to the document that exists NOW.
             crate::lsp::lsp_impl::DiagnosticPublisher::new(self)
-                .retry_degraded_pull_after_reload(uri, snapshot.incarnation);
+                .retry_degraded_pull_after_reload(uri, current.slot.current_incarnation);
         }
     }
 
@@ -1306,6 +1305,77 @@ mod tests {
         })
         .await
         .expect("settling queries must refresh even without a parse or previous diagnostics");
+        assert!(
+            !server.diagnostics.take_degraded_pull(&uri),
+            "recovery consumes the debt"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initially_unparsed_pull_recovers_after_parse_and_reload() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        let uri = Url::parse("file:///test/degraded_pull.rs").unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse("fn main() {}", None).unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let initial_snapshot = server
+            .documents
+            .latest_snapshot(&uri)
+            .unwrap()
+            .slot
+            .snapshot;
+        assert!(initial_snapshot.is_none());
+        // The parse finishes and consumes any old debt while the pull is
+        // still awaiting its host fan-out. This pull has not recorded debt yet.
+        server
+            .documents
+            .update_document(uri.clone(), "fn main() {}".into(), Some(tree));
+        assert!(!server.diagnostics.take_degraded_pull(&uri));
+        server
+            .settings_manager
+            .set_capabilities(tower_lsp_server::ls_types::ClientCapabilities {
+                workspace: Some(tower_lsp_server::ls_types::WorkspaceClientCapabilities {
+                    diagnostics: Some(
+                        tower_lsp_server::ls_types::DiagnosticWorkspaceClientCapabilities {
+                            refresh_support: Some(true),
+                        },
+                    ),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        let reload_lock = crate::lsp::lsp_impl::lock_settings_reload().await;
+        let reload = crate::lsp::lsp_impl::ParserReloadGuard::begin(&server.parser_pool);
+        server.cache.bump_semantic_token_generation();
+        assert!(server.documents.get(&uri).unwrap().snapshot().is_some());
+        // Query reload starts after that parse. The earlier tree-less answer
+        // now records debt, so only the post-answer recovery can refresh it.
+        server.diagnostics.record_degraded_pull(&uri, None);
+        server.recover_degraded_pull(&uri);
+        tokio::task::yield_now().await;
+        assert_eq!(server.diagnostics.metrics_snapshot().refreshes_requested, 0);
+        drop(reload);
+        drop(reload_lock);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while server.diagnostics.metrics_snapshot().refreshes_requested == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("a parse that finished before debt registration must not strand recovery");
         assert!(
             !server.diagnostics.take_degraded_pull(&uri),
             "recovery consumes the debt"
