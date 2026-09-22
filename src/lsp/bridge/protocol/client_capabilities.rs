@@ -203,8 +203,8 @@ fn build_baseline_capabilities(advertise_configuration: bool) -> ClientCapabilit
 /// `window.showMessage` (the `messageActionItem` refinement) is a plain
 /// pass-through: `window/showMessageRequest` is a base-protocol request the
 /// bridge always relays.
-/// The bridge-owned `experimental.kakehashi` flags every downstream
-/// initialize carries, whatever the editor supplied. One list, so a flag
+/// The bridge-owned `experimental.kakehashi` flags before applying the process
+/// opt-in gate, whatever the editor supplied. One list, so a flag
 /// added here cannot be dropped by one of the merge branches below.
 const BRIDGE_EXPERIMENTAL_FLAGS: &[&str] = &["bridgeRouting", "bridgePeer"];
 
@@ -478,10 +478,33 @@ pub(super) fn build_bridge_client_capabilities(
     upstream: Option<&ClientCapabilities>,
     advertise_configuration: bool,
 ) -> ClientCapabilities {
-    merge_upstream_capabilities(
+    build_with_experimental(
+        upstream,
+        advertise_configuration,
+        crate::experimental::enabled(),
+    )
+}
+
+fn build_with_experimental(
+    upstream: Option<&ClientCapabilities>,
+    advertise_configuration: bool,
+    experimental_enabled: bool,
+) -> ClientCapabilities {
+    let mut capabilities = merge_upstream_capabilities(
         build_baseline_capabilities(advertise_configuration),
         upstream,
-    )
+    );
+    // Apply the gate after merging so an editor cannot advertise a disabled API.
+    if !experimental_enabled {
+        capabilities
+            .experimental
+            .as_mut()
+            .and_then(|value| value.get_mut("kakehashi"))
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("bridge flags always form an object")
+            .remove("bridgePeer");
+    }
+    capabilities
 }
 
 #[cfg(test)]
@@ -490,7 +513,7 @@ mod tests {
 
     #[test]
     fn downstream_initialize_advertises_bridge_peer_support() {
-        let capabilities = build_bridge_client_capabilities(None, false);
+        let capabilities = build_with_experimental(None, false, true);
         assert_eq!(
             capabilities.experimental,
             Some(serde_json::json!({
@@ -500,6 +523,33 @@ mod tests {
                 }
             }))
         );
+    }
+
+    #[test]
+    fn peer_advertisement_obeys_opt_in_after_every_upstream_merge() {
+        let upstreams = [
+            None,
+            Some(serde_json::json!({"kakehashi": {"bridgePeer": true}})),
+            Some(serde_json::json!({"kakehashi": {"bridgePeer": false}})),
+            Some(serde_json::json!({"editorFeature": true})),
+            Some(serde_json::json!({"kakehashi": "extension"})),
+            Some(serde_json::json!("extension")),
+        ];
+        for value in upstreams {
+            let upstream = value.map(|experimental| ClientCapabilities {
+                experimental: Some(experimental),
+                ..Default::default()
+            });
+            for enabled in [false, true] {
+                let capabilities = build_with_experimental(upstream.as_ref(), false, enabled);
+                let flags = &capabilities.experimental.as_ref().unwrap()["kakehashi"];
+                assert_eq!(
+                    flags.get("bridgePeer"),
+                    enabled.then_some(&serde_json::Value::Bool(true))
+                );
+                assert_eq!(flags["bridgeRouting"], true);
+            }
+        }
     }
 
     #[test]
@@ -1236,17 +1286,14 @@ mod tests {
                 "kakehashi": {
                     "other": "preserved",
                     "bridgeRouting": true,
-                    "bridgePeer": true,
                 },
             })),
         );
     }
 
-    /// Every merge branch must carry every bridge-owned flag: a downstream
-    /// negotiates the peer API from this advertisement, and an editor that
-    /// sends its own experimental extensions must not switch it off.
+    /// Routing remains available independently of the experimental opt-in.
     #[test]
-    fn every_merge_branch_advertises_every_bridge_flag() {
+    fn every_merge_branch_preserves_routing_without_experimental_opt_in() {
         let upstreams = [
             serde_json::json!({ "editorFeature": true }),
             serde_json::json!({ "kakehashi": { "other": "preserved" } }),
@@ -1261,13 +1308,11 @@ mod tests {
             let experimental = build_bridge_client_capabilities(Some(&upstream), false)
                 .experimental
                 .expect("experimental is always advertised");
-            for flag in BRIDGE_EXPERIMENTAL_FLAGS {
-                assert_eq!(
-                    experimental["kakehashi"][flag],
-                    serde_json::Value::Bool(true),
-                    "{flag} lost while merging {upstream_experimental}"
-                );
-            }
+            assert_eq!(
+                experimental["kakehashi"]["bridgeRouting"],
+                serde_json::Value::Bool(true),
+                "routing lost while merging {upstream_experimental}"
+            );
         }
     }
 
@@ -1281,7 +1326,7 @@ mod tests {
         assert_eq!(
             build_bridge_client_capabilities(Some(&upstream), false).experimental,
             Some(serde_json::json!({
-                "kakehashi": {"bridgeRouting": true, "bridgePeer": true},
+                "kakehashi": {"bridgeRouting": true},
                 "upstream": "editor-extension-payload",
             })),
         );

@@ -1273,7 +1273,8 @@ fn main() {
                         .as_array()
                         .and_then(|peers| peers.iter().find(|peer| peer["name"] == target_name))
                         .cloned();
-                    let forwarded = target.map(|peer| {
+                    let forwarded = {
+                        let peer = target.unwrap_or_else(|| json!({ "id": "unknown-peer" }));
                         request_with_params(
                             &mut writer,
                             json!(5001),
@@ -1285,13 +1286,14 @@ fn main() {
                             }),
                         );
                         read_response(&mut reader, &mut writer, 5001)
-                    });
+                    };
                     respond(
                         &mut writer,
                         id,
                         json!({
                             "bridgePeer": bridge_peer_advertised,
                             "peers": discovery["result"],
+                            "discovery": discovery,
                             "forwarded": forwarded,
                         }),
                     );

@@ -112,8 +112,7 @@ expression: capabilities
   },
   "experimental": {
     "kakehashi": {
-      "bridgeRouting": true,
-      "bridgePeer": true
+      "bridgeRouting": true
     }
   }
 }

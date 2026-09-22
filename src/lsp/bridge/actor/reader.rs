@@ -282,6 +282,8 @@ struct LivenessParams {
 /// connection was initialized with (the bridge advertises the
 /// `workspace.workspaceFolders` capability, so servers may query them).
 pub(crate) struct ServerRequestDeps {
+    /// Process opt-in copied at connection creation; explicit for isolated tests.
+    pub(crate) experimental_enabled: bool,
     pub(crate) server_name: Option<String>,
     /// The `(server, root)` key of this connection, carried on forwarded
     /// `workspace/applyEdit` requests so the translation can validate
@@ -592,6 +594,7 @@ pub(crate) fn spawn_reader_task_with_liveness(
         router,
         liveness_timeout,
         ServerRequestDeps {
+            experimental_enabled: true,
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
@@ -685,6 +688,7 @@ async fn reader_loop(
     let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
     let progress_connection_id = progress_registry.new_connection_id();
     let server_request_deps = ServerRequestDeps {
+        experimental_enabled: true,
         settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         server_name: None,
         connection_key: ConnectionKey::for_server("test"),
@@ -1040,7 +1044,7 @@ async fn handle_server_request(
             workspace::apply_edit::handle(&message, id, server_prefix, deps);
             return;
         }
-        "kakehashi/bridge/peer/request" => {
+        "kakehashi/bridge/peer/request" if deps.experimental_enabled => {
             peer::request::handle(&message, id, server_prefix, deps).await;
             return;
         }
@@ -1064,7 +1068,7 @@ async fn handle_server_request(
         "workspace/configuration" => {
             workspace::configuration::handle(&message, server_prefix, deps)
         }
-        "kakehashi/bridge/peer" => {
+        "kakehashi/bridge/peer" if deps.experimental_enabled => {
             peer::list_result(&deps.peer_directory, &deps.connection_key, &message).await
         }
         _ => {
@@ -1314,6 +1318,7 @@ mod tests {
         let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
         let progress_connection_id = progress_registry.new_connection_id();
         let deps = ServerRequestDeps {
+            experimental_enabled: true,
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: server_name.map(String::from),
             connection_key: ConnectionKey::for_server("test"),
@@ -1452,6 +1457,7 @@ mod tests {
         let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
         let progress_connection_id = progress_registry.new_connection_id();
         let deps = ServerRequestDeps {
+            experimental_enabled: true,
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: Some("mock-ls".to_string()),
             connection_key: ConnectionKey::for_server("test"),
@@ -1531,6 +1537,7 @@ mod tests {
             Arc::clone(&router),
             None,
             ServerRequestDeps {
+                experimental_enabled: true,
                 settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
                 server_name: None,
                 connection_key: ConnectionKey::for_server("test"),
@@ -1987,6 +1994,7 @@ mod tests {
         let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
         let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
+            experimental_enabled: true,
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
@@ -2503,6 +2511,7 @@ mod tests {
         assert!(dynamic_capabilities.has_registration("textDocument/diagnostic"));
 
         let deps = ServerRequestDeps {
+            experimental_enabled: true,
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
@@ -2567,6 +2576,7 @@ mod tests {
         let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
         let progress_connection_id = progress_registry.new_connection_id();
         let deps = ServerRequestDeps {
+            experimental_enabled: true,
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
@@ -2658,6 +2668,7 @@ mod tests {
         let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
         let progress_connection_id = progress_registry.new_connection_id();
         let deps = ServerRequestDeps {
+            experimental_enabled: true,
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
@@ -2720,6 +2731,7 @@ mod tests {
         let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
         let progress_connection_id = progress_registry.new_connection_id();
         let deps = ServerRequestDeps {
+            experimental_enabled: true,
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
@@ -2780,6 +2792,7 @@ mod tests {
         let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
         let progress_connection_id = progress_registry.new_connection_id();
         let deps = ServerRequestDeps {
+            experimental_enabled: true,
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
@@ -2841,6 +2854,7 @@ mod tests {
         let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
         let progress_connection_id = progress_registry.new_connection_id();
         let deps = ServerRequestDeps {
+            experimental_enabled: true,
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
@@ -2911,6 +2925,7 @@ mod tests {
         let progress_connection_id = progress_registry.new_connection_id();
         let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
+            experimental_enabled: true,
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
@@ -2999,6 +3014,7 @@ mod tests {
         let progress_connection_id = progress_registry.new_connection_id();
         let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
+            experimental_enabled: true,
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
@@ -3058,6 +3074,7 @@ mod tests {
         );
         let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
+            experimental_enabled: true,
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
@@ -3145,6 +3162,7 @@ mod tests {
         let progress_connection_id = progress_registry.new_connection_id();
         let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
+            experimental_enabled: true,
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
@@ -3187,6 +3205,7 @@ mod tests {
         let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
         let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
+            experimental_enabled: true,
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
@@ -3245,6 +3264,7 @@ mod tests {
             name: "repo".to_string(),
         }];
         let deps = ServerRequestDeps {
+            experimental_enabled: true,
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
@@ -3292,6 +3312,7 @@ mod tests {
         let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
         let (window_tx, _window_rx) = mpsc::channel(1);
         let deps = ServerRequestDeps {
+            experimental_enabled: true,
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
@@ -3339,6 +3360,7 @@ mod tests {
         let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
         let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
+            experimental_enabled: true,
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
@@ -3392,6 +3414,7 @@ mod tests {
         let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
         let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
+            experimental_enabled: true,
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: Some("luals".to_string()),
             connection_key: ConnectionKey::for_server("test"),
@@ -3453,6 +3476,7 @@ mod tests {
         let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
         let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
+            experimental_enabled: true,
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: Some("lua_ls".to_string()),
             connection_key: ConnectionKey::for_server("test"),
@@ -3507,6 +3531,7 @@ mod tests {
             let (upstream_tx, upstream_rx) = mpsc::unbounded_channel();
             let (window_tx, _window_rx) = mpsc::channel(16);
             let deps = ServerRequestDeps {
+                experimental_enabled: true,
                 settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
                 server_name: Some("luals".to_string()),
                 connection_key: ConnectionKey::for_server("test"),
@@ -3591,6 +3616,7 @@ mod tests {
         let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
         let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
+            experimental_enabled: true,
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
@@ -3634,6 +3660,7 @@ mod tests {
         let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
         let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
+            experimental_enabled: true,
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
@@ -3692,6 +3719,7 @@ mod tests {
         }]);
 
         let deps = ServerRequestDeps {
+            experimental_enabled: true,
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
@@ -3761,6 +3789,7 @@ mod tests {
 
         // Spawn handle_server_request in a separate task (it needs to await)
         let deps = ServerRequestDeps {
+            experimental_enabled: true,
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
@@ -3825,6 +3854,7 @@ mod tests {
         drop(response_rx);
 
         let deps = ServerRequestDeps {
+            experimental_enabled: true,
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
@@ -4300,6 +4330,7 @@ mod tests {
         let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
         let progress_connection_id = progress_registry.new_connection_id();
         let deps = ServerRequestDeps {
+            experimental_enabled: true,
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: Some("mock-ls".to_string()),
             connection_key: ConnectionKey::for_server("test"),
@@ -4753,6 +4784,7 @@ mod tests {
         let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
         let progress_connection_id = progress_registry.new_connection_id();
         let deps = ServerRequestDeps {
+            experimental_enabled: true,
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),

@@ -384,6 +384,10 @@ presentation itself survives.
 
 ## Downstream peer requests
 
+This experimental API requires starting kakehashi with
+`KAKEHASHI_EXPERIMENTAL=true` (exact value). Otherwise the methods return
+`MethodNotFound` and the `bridgePeer` capability is not advertised.
+
 Downstream language servers can feature-detect
 `initialize.params.capabilities.experimental.kakehashi.bridgePeer: true`, list
 other running downstream connections with `kakehashi/bridge/peer`, and proxy an

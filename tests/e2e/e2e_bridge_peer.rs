@@ -26,19 +26,29 @@ const MARKDOWN_URI: &str = "file:///test_bridge_peer.md";
 const CALLER_COMMAND: &str = "kakehashi|c|mock-caller||mock.peer";
 
 fn init_client() -> (LspClient, tempfile::TempDir) {
+    init_client_with_experimental(Some("true"))
+}
+
+fn init_client_with_experimental(value: Option<&str>) -> (LspClient, tempfile::TempDir) {
     let config_dir = tempfile::TempDir::new().expect("Failed to create config temp dir");
     let config_path = config_dir.path().join("bridge_peer.toml");
     std::fs::write(&config_path, "").expect("Failed to write config");
-    let mut client = LspClient::builder()
+    let builder = LspClient::builder()
         .arg("--config-file")
         .arg(config_path.to_str().expect("temp path should be UTF-8"))
-        .build();
+        .env_remove("KAKEHASHI_EXPERIMENTAL");
+    let mut client = match value {
+        Some(value) => builder.env("KAKEHASHI_EXPERIMENTAL", value),
+        None => builder,
+    }
+    .build();
     let _init = client.send_request(
         "initialize",
         json!({
             "processId": std::process::id(),
             "rootUri": null,
-            "capabilities": {},
+            // An editor cannot opt the process into the peer API.
+            "capabilities": {"experimental": {"kakehashi": {"bridgePeer": true}}},
             "workspaceFolders": null,
             "initializationOptions": {
                 "languageServers": {
@@ -210,4 +220,22 @@ fn lifecycle_methods_are_denied_over_the_wire() {
     );
 
     shutdown(&mut client);
+}
+
+#[test]
+fn peer_api_requires_exact_experimental_opt_in() {
+    for value in [None, Some("false"), Some("TRUE"), Some("1"), Some("")] {
+        let (mut client, _config_dir) = init_client_with_experimental(value);
+        let report = peer_command(&mut client, "mock-target", "custom/echo", Value::Null);
+        assert_eq!(report["bridgePeer"], false, "env={value:?}: {report}");
+        assert_eq!(
+            report["discovery"]["error"]["code"], -32601,
+            "env={value:?}: {report}"
+        );
+        assert_eq!(
+            report["forwarded"]["error"]["code"], -32601,
+            "env={value:?}: {report}"
+        );
+        shutdown(&mut client);
+    }
 }

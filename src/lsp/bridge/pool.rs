@@ -3404,6 +3404,7 @@ impl LanguageServerPool {
             Arc::clone(&router),
             Some(liveness_timeout.as_duration()),
             ServerRequestDeps {
+                experimental_enabled: crate::experimental::enabled(),
                 server_name: Some(server_name.to_string()),
                 // The applyEdit version validation scopes downstream-supplied
                 // versions to this connection's version space (PR-L).

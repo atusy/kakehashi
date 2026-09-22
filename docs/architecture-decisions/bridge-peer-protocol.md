@@ -31,7 +31,14 @@ Introduce two custom requests handled only on downstream connections:
 | `kakehashi/bridge/peer` | `{ textDocument?: TextDocumentIdentifier, name?: string }` | `Peer[]` |
 | `kakehashi/bridge/peer/request` | `{ id, method, params? }` | `ForwardResult` |
 
-kakehashi advertises the API to downstream servers as
+The API is experimental and is available only when the kakehashi process is
+started with `KAKEHASHI_EXPERIMENTAL=true`. Only the exact value `true` opts in;
+the process-wide setting is read once and cached. Without it, both methods
+return `MethodNotFound` and `bridgePeer` is omitted from downstream capabilities,
+even if the editor supplies that flag. This gate lets the peer protocol evolve
+before committing to a stable API. `bridgeRouting` remains independent.
+
+When enabled, kakehashi advertises the API to downstream servers as
 `initialize.params.capabilities.experimental.kakehashi.bridgePeer: true`.
 Neither method is registered on the editor-facing LSP service.
 

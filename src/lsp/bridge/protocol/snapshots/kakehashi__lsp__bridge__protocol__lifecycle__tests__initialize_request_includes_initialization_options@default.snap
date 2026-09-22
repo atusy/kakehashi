@@ -130,8 +130,7 @@ expression: request
       },
       "experimental": {
         "kakehashi": {
-          "bridgeRouting": true,
-          "bridgePeer": true
+          "bridgeRouting": true
         }
       }
     }
