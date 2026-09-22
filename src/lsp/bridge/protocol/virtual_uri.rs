@@ -127,22 +127,20 @@ impl VirtualDocumentUri {
         filename.starts_with(VIRTUAL_URI_PREFIX)
             && filename
                 .get(VIRTUAL_URI_PREFIX.len()..)
-                .and_then(|s| s.rsplit_once('.'))
+                .and_then(|s| s.split_once('.'))
                 .is_some_and(|(region_id, ext)| !region_id.is_empty() && !ext.is_empty())
     }
 
     /// Extract the `region_id` from a virtual-document URI string, or `None` if
     /// it isn't one. Parses the same `{prefix}{region_id}.{ext}` filename shape
     /// as [`Self::is_virtual_uri`]; `region_id`s are dot-free (a ULID in
-    /// production, also scratch/test ids), so the last `.` separates the id from
-    /// the extension. Used as a cheap pre-filter when scanning open virtual
-    /// documents (`DocumentTracker::resolve_virtual_uri`).
+    /// production, also scratch/test ids), so the first `.` separates the id from
+    /// the extension, which may itself contain dots. Used as a cheap pre-filter
+    /// when scanning open virtual documents (`DocumentTracker::resolve_virtual_uri`).
     pub(crate) fn region_id_of(uri: &str) -> Option<String> {
         let url = url::Url::parse(uri).ok()?;
         let filename = url.path_segments().and_then(|mut s| s.next_back())?;
-        let (region_id, ext) = filename
-            .strip_prefix(VIRTUAL_URI_PREFIX)?
-            .rsplit_once('.')?;
+        let (region_id, ext) = filename.strip_prefix(VIRTUAL_URI_PREFIX)?.split_once('.')?;
         // A real virtual URI always has a non-empty region_id and extension; an
         // empty region_id (`kakehashi-virtual-uri-.lua`) matches no open document.
         if region_id.is_empty() || ext.is_empty() {
