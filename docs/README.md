@@ -377,7 +377,9 @@ path. During an auto-install attempt, kakehashi also follows parents named by
 external overlays and overlays of inherited languages. These paths are trusted
 sources of dependency names: their modelines can trigger downloads from the
 existing nvim-treesitter query source. Downloads go into the data directory;
-files on the other search paths are not modified.
+files on the other search paths are not modified. Automatic repair targets the
+requested language's managed parser; `languages.<name>.base` aliases do not
+redirect installation to their base. Install or repair that base separately.
 
 The installer continues to collect dependencies per language across those two
 query kinds. It stages parents into the data directory even if a copy is

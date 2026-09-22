@@ -31,6 +31,11 @@ Query-only repair preserves parsing with that parser while installation runs.
 Injected languages are checked on initial lifecycle passes or fresh loads;
 cached edit passes do not rescan the dependency graph. A parser selected from
 outside the managed data directory is not a query-repair target.
+Repair uses the requested language's existing install target; it does not map
+`languages.<name>.base` aliases to another installation target. Base-language
+installation/repair must be requested under that base name. Resolving aliases
+would additionally need the loader's inheritance-only and custom-parser rules,
+and is outside this dependency-discovery change.
 
 Each request captures its search paths. Concurrent requests for the same
 language share an outcome only when those inputs match; a request with different
