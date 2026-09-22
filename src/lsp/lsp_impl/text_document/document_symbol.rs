@@ -15,7 +15,6 @@ use tower_lsp_server::ls_types::{
     SymbolInformation, Uri,
 };
 
-use crate::language::InjectionResolver;
 use crate::lsp::aggregation::server::{
     FanInResult, FanOutTask, dispatch_preferred, dispatch_preferred_with_tokens,
     mint_region_progress_source,
@@ -66,54 +65,24 @@ impl Kakehashi {
 
         log::debug!("documentSymbol called for {}", uri);
 
-        // Ensure a fresh tree before snapshotting: `didChange` clears the tree and
-        // reparses off-ingress, so without this the (tree-driven) virt layer drops
-        // injection-region symbols for the whole reparse window after every edit.
-        self.ensure_document_parsed(&uri).await;
-
-        // Get document snapshot (minimizes lock duration)
-        let snapshot = match self.documents.get(&uri) {
-            None => {
-                log::debug!("documentSymbol: No document found for {}", uri);
-                return Ok(None);
-            }
-            Some(doc) => match doc.snapshot() {
-                None => {
-                    log::debug!("documentSymbol: Document not fully initialized for {}", uri);
-                    return Ok(None);
-                }
-                Some(snapshot) => snapshot,
-            },
-            // doc automatically dropped here, lock released
-        };
-
-        // Get the language for this document
-        let Some(language_name) = self.document_language(&uri) else {
-            log::debug!(target: "kakehashi::document_symbol", "No language detected");
-            return Ok(None);
-        };
-
-        // Get injection query to detect injection regions
-        let Some(injection_query) = self.language.injection_query(&language_name) else {
-            return Ok(None);
-        };
-
-        // Collect all injection regions
-        let all_regions = match self
-            .documents
-            .current_resolved_regions(&uri, self.cache.semantic_token_generation())
+        // Keep tree, text, language, and cached regions on one current snapshot.
+        let snapshot = match self
+            .wait_for_current_snapshot(&uri, std::time::Duration::from_millis(200))
+            .await
         {
-            Some(regions) => regions,
-            None => std::sync::Arc::new(InjectionResolver::resolve_all(
-                &self.language,
-                self.bridge.node_tracker(),
-                &uri,
-                snapshot.tree(),
-                snapshot.text(),
-                injection_query.as_ref(),
-                snapshot.incarnation(),
-            )),
+            crate::lsp::lsp_impl::snapshot_read::SnapshotWait::Current(snapshot)
+                if snapshot.tree.is_some() =>
+            {
+                snapshot
+            }
+            _ => return Ok(None),
         };
+        let Some(language_name) = snapshot.language.as_deref() else {
+            return Ok(None);
+        };
+        let all_regions = self
+            .whole_document_regions(&uri, &snapshot)
+            .ok_or_else(tower_lsp_server::jsonrpc::Error::content_modified)?;
 
         if all_regions.is_empty() {
             return Ok(None);
@@ -149,7 +118,7 @@ impl Kakehashi {
         // (capability-prefilter-fanout). One pool query for the whole request.
         let incapable_servers = self
             .incapable_virt_servers(
-                &language_name,
+                language_name,
                 all_regions.iter().map(|r| r.injection_language.as_str()),
                 METHOD,
             )
@@ -157,10 +126,8 @@ impl Kakehashi {
 
         for (region_index, resolved) in all_regions.iter().enumerate() {
             // Get ALL bridge server configs for this injection language
-            let mut configs = self.bridge_configs_for_injection_language(
-                &language_name,
-                &resolved.injection_language,
-            );
+            let mut configs = self
+                .bridge_configs_for_injection_language(language_name, &resolved.injection_language);
             if !incapable_servers.is_empty() {
                 configs.retain(|c| !incapable_servers.contains(&c.server_name));
             }
@@ -169,7 +136,7 @@ impl Kakehashi {
             }
 
             let agg = self.resolve_aggregation_config(
-                &language_name,
+                language_name,
                 &resolved.injection_language,
                 METHOD,
             );
@@ -336,6 +303,49 @@ fn format_document_symbol_response(
 mod tests {
     use super::*;
     use tower_lsp_server::ls_types::{Position, Range, SymbolKind};
+
+    #[tokio::test]
+    async fn document_symbol_rejects_unsettled_queries_during_reload() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), language.clone());
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let text = "fn main() {}";
+        let uri = url::Url::parse("file:///reload.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            text.into(),
+            Some("rust".into()),
+            parser.parse(text, None),
+        );
+        let params = tower_lsp_server::ls_types::DocumentSymbolParams {
+            text_document: tower_lsp_server::ls_types::TextDocumentIdentifier {
+                uri: uri.as_str().parse().unwrap(),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let reload = crate::lsp::lsp_impl::ParserReloadGuard::begin(&server.parser_pool);
+        server.cache.bump_semantic_token_generation();
+        let error = server
+            .document_symbol_impl(params.clone())
+            .await
+            .expect_err("an unreadable query is not an empty result");
+        assert_eq!(
+            error.code,
+            tower_lsp_server::jsonrpc::ErrorCode::ContentModified
+        );
+        drop(reload);
+        assert!(
+            server.document_symbol_impl(params).await.unwrap().is_none(),
+            "a settled parser without injection queries really has no symbols"
+        );
+    }
 
     fn make_range(start_line: u32, start_char: u32, end_line: u32, end_char: u32) -> Range {
         Range {
