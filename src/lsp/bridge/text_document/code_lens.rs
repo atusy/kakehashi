@@ -1360,9 +1360,8 @@ mod tests {
                 assert!(result.command.is_none(), "lens stays unresolved");
             });
         });
-        // The capture is process-wide while it is armed, so another test's
-        // warning can land in it; only this resolve's own lines prove
-        // whether the gate fired before the handle was consulted.
+        // Capture is limited to this thread; method filtering excludes
+        // unrelated fixture warnings from the same thread.
         let own: Vec<&String> = warnings
             .iter()
             .filter(|w| w.contains("codeLens/resolve"))
