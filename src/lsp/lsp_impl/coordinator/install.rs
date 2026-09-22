@@ -119,6 +119,32 @@ pub(super) struct InstallCoordinatorDeps {
 pub(crate) struct InstallCompletion {
     pub(crate) same_lifetime: bool,
     pub(crate) parsed: Option<super::parse::ParseLineage>,
+    queries_reloaded: bool,
+}
+
+impl InstallCompletion {
+    /// Reloading queries authorizes a fresh downstream pass even when the
+    /// current tree was retained. A plain parser recovery still owns no pass.
+    pub(crate) fn downstream_lineage(
+        &self,
+        documents: &DocumentStore,
+        uri: &Url,
+        incarnation: u64,
+    ) -> Option<super::parse::ParseLineage> {
+        if let Some(parsed) = self.parsed {
+            return Some(parsed);
+        }
+        if !self.queries_reloaded {
+            return None;
+        }
+        let document = documents.get(uri)?;
+        (document.incarnation() == incarnation && document.has_current_tree()).then(|| {
+            super::parse::ParseLineage {
+                incarnation,
+                content_version: document.content_version(),
+            }
+        })
+    }
 }
 
 pub(crate) struct InstallCoordinator {
@@ -256,9 +282,9 @@ impl InstallCoordinator {
             return InstallCompletion::default();
         }
 
-        if self.language.has_parser_available(language)
-            && !self.needs_query_dependency_install(language)
-        {
+        let query_repair = self.language.has_parser_available(language)
+            && self.needs_query_dependency_install(language);
+        if self.language.has_parser_available(language) && !query_repair {
             if !is_injection && self.same_document_incarnation(&uri, expected_incarnation) {
                 parsed = self
                     .parse_coordinator()
@@ -274,6 +300,7 @@ impl InstallCoordinator {
                 return InstallCompletion {
                     same_lifetime: true,
                     parsed,
+                    queries_reloaded: false,
                 };
             }
         }
@@ -299,6 +326,7 @@ impl InstallCoordinator {
                 return InstallCompletion {
                     same_lifetime: true,
                     parsed,
+                    queries_reloaded: true,
                 };
             }
             drop(result);
@@ -336,7 +364,23 @@ impl InstallCoordinator {
             if terminal.data_dir().is_some()
                 && self.same_document_incarnation(&uri, expected_incarnation)
             {
-                if !is_injection {
+                if query_repair {
+                    // A cancelled owner may publish its successful install
+                    // outcome before reloading. Refresh explicitly rather than
+                    // treating a terminal artifact outcome as a query-store ack.
+                    parsed = self
+                        .reload_language_after_install(
+                            language,
+                            terminal
+                                .data_dir()
+                                .expect("successful terminal has data directory"),
+                            uri.clone(),
+                            is_injection,
+                            expected_incarnation,
+                            None,
+                        )
+                        .await;
+                } else if !is_injection {
                     parsed = self
                         .parse_coordinator()
                         .reparse_installed_document(uri.clone(), language, expected_incarnation)
@@ -351,6 +395,7 @@ impl InstallCoordinator {
                     return InstallCompletion {
                         same_lifetime: true,
                         parsed,
+                        queries_reloaded: query_repair,
                     };
                 }
                 if allow_recovery {
@@ -384,6 +429,7 @@ impl InstallCoordinator {
         InstallCompletion {
             same_lifetime: self.same_document_incarnation(&uri, expected_incarnation),
             parsed,
+            queries_reloaded: false,
         }
     }
 
@@ -520,6 +566,73 @@ mod tests {
     use std::path::Path;
     use std::task::Poll;
     use tower_lsp_server::LspService;
+
+    #[tokio::test]
+    async fn query_reload_authorizes_retained_tree_downstream_only_for_current_lifetime() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), tree_sitter_rust::LANGUAGE.into());
+        let uri = Url::parse("file:///query-repair.rs").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "fn main() {}".into(),
+            Some("rust".into()),
+            None,
+        );
+        let original = server
+            .parse_coordinator()
+            .reparse_installed_document(uri.clone(), "rust", Some(incarnation))
+            .await
+            .expect("initial parse");
+        let parsed = server
+            .install_coordinator()
+            .reload_language_after_install(
+                "rust",
+                Path::new("/installed"),
+                uri.clone(),
+                false,
+                Some(incarnation),
+                None,
+            )
+            .await;
+        assert!(parsed.is_none(), "reload retains the current tree");
+        let mut completion = InstallCompletion {
+            same_lifetime: true,
+            parsed,
+            queries_reloaded: true,
+        };
+        assert_eq!(
+            completion.downstream_lineage(&server.documents, &uri, incarnation),
+            Some(original)
+        );
+        completion.queries_reloaded = false;
+        assert_eq!(
+            completion.downstream_lineage(&server.documents, &uri, incarnation),
+            None,
+            "ordinary shared-parser recovery does not own downstream work"
+        );
+        completion.queries_reloaded = true;
+        server.documents.remove(&uri);
+        let reopened = server.documents.insert(
+            uri.clone(),
+            "fn next() {}".into(),
+            Some("rust".into()),
+            None,
+        );
+        server
+            .parse_coordinator()
+            .reparse_installed_document(uri.clone(), "rust", Some(reopened))
+            .await
+            .expect("reopened parse");
+        assert_eq!(
+            completion.downstream_lineage(&server.documents, &uri, incarnation),
+            None,
+            "a reload must not authorize work for a reopened lifetime"
+        );
+    }
 
     #[test]
     fn loaded_managed_parser_still_needs_missing_overlay_parent() {

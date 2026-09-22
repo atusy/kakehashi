@@ -186,21 +186,21 @@ impl Kakehashi {
                         if !completion.same_lifetime {
                             return;
                         }
-                        // Only a parse published by this install grants open
-                        // downstream work. A sibling's current tree does not.
-                        if let Some(lineage) = completion.parsed {
+                        // A new parse or a completed query reload grants this
+                        // pass. Query-only repair may retain the existing tree.
+                        if let Some(lineage) =
+                            completion.downstream_lineage(&documents, &install_uri, incarnation)
+                        {
                             if !injection
                                 .process_injections_for_parse(&install_uri, lineage)
                                 .await
                             {
                                 return;
                             }
-                            // Re-fire the proactive synthetic diagnostic now that a
-                            // tree exists: the handler's spawn (below) ran in the
-                            // skip-parse path with no tree, so its snapshot was None
-                            // and the pull-layer diagnostics were skipped on this
-                            // first open of a just-installed parser. Skipped in CLI
-                            // mode (#489), matching the handler's own gate.
+                            // Publish diagnostics with the installed queries.
+                            // The initial pass either had no tree yet or used
+                            // queries from before repair. Skip CLI mode (#489),
+                            // matching the handler's own gate.
                             if !is_cli_mode {
                                 spawn_synthetic_diagnostic_for_parse(
                                     &documents,
