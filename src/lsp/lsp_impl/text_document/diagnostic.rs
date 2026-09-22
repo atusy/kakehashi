@@ -1310,6 +1310,9 @@ mod tests {
             "unsettled queries yield a degraded empty answer"
         );
         tokio::task::yield_now().await;
+        // Recovery must survive reloads longer than the former 10-second budget.
+        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::task::yield_now().await;
         assert_eq!(server.diagnostics.metrics_snapshot().refreshes_requested, 0);
         drop(reload);
         drop(reload_lock);

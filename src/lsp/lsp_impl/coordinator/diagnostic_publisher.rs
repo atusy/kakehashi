@@ -1565,7 +1565,7 @@ impl DiagnosticPublisher {
 
     /// Recover a pull that read unsettled queries even when the reload does
     /// not reparse this host (notably another language's auto-install).
-    /// One bounded waiter per lifetime, sharing the reload's completion lock.
+    /// One waiter per lifetime, cancelled on close or shutdown.
     pub(crate) fn retry_degraded_pull_after_reload(&self, host: &Url, lifetime: u64) {
         let Some(claim) = self
             .settle_retry_waiters
@@ -1573,9 +1573,22 @@ impl DiagnosticPublisher {
         else {
             return;
         };
+        let Some(mut snapshots) = self.documents.subscribe_snapshots(host) else {
+            return;
+        };
         let this = self.clone();
         let host = host.clone();
         tokio::spawn(async move {
+            let lifetime_ended = async {
+                loop {
+                    if snapshots.borrow_and_update().current_incarnation != lifetime {
+                        return;
+                    }
+                    if snapshots.changed().await.is_err() {
+                        return;
+                    }
+                }
+            };
             let recovery = async {
                 let _reload = crate::lsp::lsp_impl::lock_settings_reload().await;
                 // Release the waiter before the reload lock: a new reload must
@@ -1588,7 +1601,10 @@ impl DiagnosticPublisher {
                     return; // A pending parse owns recovery instead.
                 };
                 // Auto-install reloads invalidate dynamically discovered parser
-                // registrations without reparsing other open hosts.
+                // registrations without reparsing other open hosts. Keep the
+                // reload lock through publication and geometry validation, as
+                // the install path does, so another reload cannot unpublish the
+                // parser between loading it and consuming recovery debt.
                 if !this.language.has_parser_available(&language) {
                     let _ = this.language.ensure_language_loaded_async(&language).await;
                 }
@@ -1601,7 +1617,9 @@ impl DiagnosticPublisher {
             };
             tokio::select! {
                 _ = this.shutdown.cancelled() => {}
-                _ = tokio::time::timeout(std::time::Duration::from_secs(10), recovery) => {}
+                _ = lifetime_ended => {}
+                // A timeout would strand debt after a slow non-reparsing reload.
+                _ = recovery => {}
             }
         });
     }
