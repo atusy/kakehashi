@@ -243,6 +243,74 @@ mod tests {
         assert!(landed, "test publish must land");
     }
 
+    #[tokio::test]
+    async fn whole_document_regions_distinguishes_unavailable_empty_and_cached() {
+        let uri = Url::parse("file:///regions.rs").unwrap();
+        let text = r#"fn main() { let html = "<div>"; }"#;
+        let (service, inc) = server_with_doc(&uri, text);
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let mut snapshot = ParseSnapshot {
+            text: Arc::from(text),
+            tree: Some(parser.parse(text, None).unwrap()),
+            language: Some("rust".into()),
+            parsed_version: 0,
+            incarnation: inc,
+            injection_regions: None,
+            regions: None,
+            layer_trees: Arc::new(std::sync::OnceLock::new()),
+        };
+        assert!(
+            server.whole_document_regions(&uri, &snapshot).is_none(),
+            "unpublished parser is not evidence"
+        );
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), language.clone());
+        assert!(
+            server
+                .whole_document_regions(&uri, &snapshot)
+                .unwrap()
+                .is_empty(),
+            "published parser without a query is definitive"
+        );
+        let query = tree_sitter::Query::new(&language, r#"((string_literal (string_content) @injection.content) (#set! injection.language "html"))"#).unwrap();
+        server
+            .language
+            .query_store()
+            .insert_injection_query("rust".into(), Arc::new(query));
+        let regions = server.whole_document_regions(&uri, &snapshot).unwrap();
+        assert_eq!(regions.len(), 1);
+        snapshot.regions = Some(crate::document::snapshot::ResolvedRegions {
+            generation: server.cache.semantic_token_generation(),
+            bridge: Arc::new(Vec::new()),
+            whole_document: Arc::clone(&regions),
+        });
+        assert!(
+            Arc::ptr_eq(
+                &regions,
+                &server.whole_document_regions(&uri, &snapshot).unwrap()
+            ),
+            "settled cache is reused"
+        );
+        let reload = super::super::ParserReloadGuard::begin(&server.parser_pool);
+        assert!(
+            server.whole_document_regions(&uri, &snapshot).is_none(),
+            "even matching-generation cache is unavailable during reload"
+        );
+        server.cache.bump_semantic_token_generation();
+        drop(reload);
+        let refreshed = server.whole_document_regions(&uri, &snapshot).unwrap();
+        assert_eq!(refreshed.len(), 1);
+        assert!(
+            !Arc::ptr_eq(&regions, &refreshed),
+            "generation mismatch resolves inline rather than using old regions"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn wait_returns_gone_for_unregistered_uri() {
         let (service, _socket) = LspService::new(Kakehashi::new);
