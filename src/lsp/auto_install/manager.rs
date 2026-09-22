@@ -212,7 +212,11 @@ impl AutoInstallManager {
     }
 
     #[cfg(test)]
-    pub(crate) fn begin_test_claim(&self, language: &str) -> TestInstallClaim {
+    pub(crate) fn begin_test_claim(
+        &self,
+        language: &str,
+        search_paths: Vec<PathBuf>,
+    ) -> TestInstallClaim {
         let mut claims = self
             .claims
             .lock()
@@ -222,7 +226,7 @@ impl AutoInstallManager {
         claims.insert(
             language.to_string(),
             ClaimState {
-                search_paths: Vec::new(),
+                search_paths,
                 completion: completion.clone(),
             },
         );
@@ -244,7 +248,7 @@ impl AutoInstallManager {
         language: &str,
         outcome: InstallOutcome,
     ) -> InstallResult {
-        let TestInstallClaim { guard } = self.begin_test_claim(language);
+        let TestInstallClaim { guard } = self.begin_test_claim(language, Vec::new());
         InstallResult::with_claim(
             outcome,
             Vec::new(),
@@ -841,7 +845,7 @@ mod tests {
     #[tokio::test]
     async fn cancelling_a_different_paths_waiter_preserves_the_owner_claim() {
         let manager = create_test_manager();
-        let owner = manager.begin_test_claim("different-paths");
+        let owner = manager.begin_test_claim("different-paths", Vec::new());
         let mut waiter = Box::pin(manager.try_install_with_support_check(
             "different-paths",
             vec![PathBuf::from("/new-runtime")],
@@ -880,7 +884,7 @@ mod tests {
             },
         ] {
             let manager = create_test_manager();
-            let owner = manager.begin_test_claim("different-paths");
+            let owner = manager.begin_test_claim("different-paths", Vec::new());
             let expected_paths = vec![PathBuf::from("/new-runtime")];
             let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let executor_calls = Arc::clone(&calls);

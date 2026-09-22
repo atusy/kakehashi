@@ -873,7 +873,10 @@ mod tests {
             Some("rust".to_string()),
             None,
         );
-        let claim = server.auto_install.begin_test_claim("rust");
+        let claim = server.auto_install.begin_test_claim(
+            "rust",
+            query_dependency_paths(&server.settings_manager.load_settings(), "rust"),
+        );
         let install = server.install_coordinator();
         let mut waiter = Box::pin(install.maybe_auto_install_language(
             "rust",
@@ -935,7 +938,10 @@ mod tests {
             Some("rust".to_string()),
             None,
         );
-        let claim = server.auto_install.begin_test_claim("rust");
+        let claim = server.auto_install.begin_test_claim(
+            "rust",
+            query_dependency_paths(&server.settings_manager.load_settings(), "rust"),
+        );
         let install = server.install_coordinator();
         let mut waiter = Box::pin(install.maybe_auto_install_language(
             "rust",
@@ -1178,7 +1184,10 @@ mod tests {
         // deterministic and network-free: without the claim the fall-through
         // reaches the metadata-backed support lookup, whose timing depends on
         // the cache and the network.
-        let _claim = server.auto_install.begin_test_claim(language);
+        let _claim = server.auto_install.begin_test_claim(
+            language,
+            query_dependency_paths(&server.settings_manager.load_settings(), language),
+        );
         let uri = Url::parse("file:///workspace/stale-install.txt").unwrap();
         let old_incarnation = server.documents.insert(
             uri.clone(),
