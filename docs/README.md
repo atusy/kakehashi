@@ -372,12 +372,23 @@ dangling symlink or an unreadable file in any search path fails the language's
 query, as it would as the only hit, rather than loading without it. And every
 parent actually followed must exist as the same kind of file:
 `child/context.scm` inheriting `foo` needs a `foo/context.scm` on some search
-path. Auto-install fetches the parents named by the `highlights.scm` and
-`injections.scm` it installs into the data directory — those two kinds only,
-and not parents named by an overlay elsewhere — so a parent that only your
-overlay names, or that a `bindings.scm` or a captures kind names, must be put
-on a search path by hand or the query fails to load with a message naming the
-file that named it.
+path. During an auto-install attempt, kakehashi also follows parents named by
+`highlights.scm` and `injections.scm` in the configured `searchPaths`, including
+external overlays and overlays of inherited languages. These paths are trusted
+sources of dependency names: their modelines can trigger downloads from the
+existing nvim-treesitter query source. Downloads go into the data directory;
+files on the other search paths are not modified.
+
+The installer continues to collect dependencies per language across those two
+query kinds. It stages parents into the data directory even if a copy is
+available on another search path; this can fetch more than a particular query
+needs. A parent named by `bindings.scm` or a captures kind must still be put on
+a search path by hand. Inline queries and explicit query-path lists do not
+participate in this dependency discovery. This does not add file watching or
+trigger installation when an already-loaded language's overlay is edited.
+External edits are not covered by install locks: changed dependencies are
+checked before publication, but an edit racing the final check can still
+require another install attempt.
 
 #### `languages`
 
@@ -1310,9 +1321,11 @@ Some languages inherit queries from base languages (see
 
 When you install a language with inheritance, the base queries its
 `highlights.scm` and `injections.scm` name are downloaded with it. Those are
-the only kinds the installer fetches: a parent named by `bindings.scm`, by a
-captures kind, or by an overlay on another search path must be put on a search
-path by hand (see [Query modelines](#query-modelines)).
+the only kinds the installer fetches. LSP auto-install also discovers their
+parents in configured runtime files, including overlays. The standalone
+`language install` command uses the data directory only. Parents needed by
+`bindings.scm` or a captures kind must be placed on a search path by hand
+(see [Query modelines](#query-modelines)).
 
 ## Logging
 
