@@ -24,6 +24,12 @@ rules, including the exclusion of parenthesized parents when inherited.
 Downloads use the existing upstream query source and data-directory destination.
 Runtime paths do not provide download URLs or change the parser source.
 
+Each request captures its search paths. Concurrent requests for the same
+language share an outcome only when those inputs match; a request with different
+paths waits, then evaluates its own dependencies. Installation remains serialized
+per language. This does not make an in-flight request track later settings
+changes automatically.
+
 Retain the language-level union and stage the discovered languages into the
 data directory, including parents already available elsewhere. The standalone
 CLI installation remains scoped to the data directory; this decision adds no
