@@ -49,10 +49,9 @@ pub enum QueryInstallError {
     IoError(std::io::Error),
     /// Queries already exist and --force not specified.
     AlreadyExists(PathBuf),
-    /// A language this install needed was removed after staging found it
-    /// already installed. Not an upstream problem — the remedy is to retry, not
-    /// to look for a language nvim-treesitter does not have.
-    DependencyRemoved(String),
+    /// A dependency disappeared or its query declarations changed after staging.
+    /// Not an upstream problem: retry using the new dependency graph.
+    DependencyChanged(String),
     /// Publishing moved the live queries aside and could not put anything back:
     /// the language has no queries, and the previous ones are in `backup`.
     PreviousQueriesStranded {
@@ -90,11 +89,11 @@ impl std::fmt::Display for QueryInstallError {
                     path.display()
                 )
             }
-            Self::DependencyRemoved(language) => {
+            Self::DependencyChanged(language) => {
                 write!(
                     f,
-                    "The queries installed for '{}' were removed or replaced while it was being \
-                     installed",
+                    "Query dependencies for '{}' changed or became unreadable while it was being \
+                     installed; retry the installation",
                     language
                 )
             }
@@ -238,9 +237,10 @@ fn required_parents(
 /// Hold every language in an inheritance chain still, and report whether all of
 /// them are installed.
 ///
-/// `Some(guards)` means the chain is complete and stays that way while the
-/// guards live — so a caller can read the rest of its state (a parser file, say)
-/// without the answer moving underneath it. `None` means a language in the chain
+/// `Some(guards)` means the managed chain is complete and protected from
+/// install/uninstall while the guards live, so a caller can also read its parser.
+/// External runtime files are observed but not locked; user edits may change
+/// their declarations after this check. `None` means a language in the chain
 /// is missing, or one of them is mid-publish and its queries can still be rolled
 /// back, or the name is not one that could be installed.
 ///
@@ -427,8 +427,8 @@ fn install_queries_with_dependencies_from_with_http_policy(
             format!("Query install for {language} was superseded by uninstall"),
         )));
     }
-    if let Some(unstable) = staged.unstable_skipped_dependency() {
-        return Err(QueryInstallError::DependencyRemoved(unstable.to_string()));
+    if let Some(unstable) = staged.unstable_dependency() {
+        return Err(QueryInstallError::DependencyChanged(unstable.to_string()));
     }
     let published = staged.publish().map_err(|failure| failure.error)?;
     match published.commit() {
@@ -539,24 +539,18 @@ impl StagedQueryInstall {
         &self.dependencies
     }
 
-    /// The first language staging skipped as already installed whose state has
-    /// moved since — its queries gone, unreadable, or now inheriting something
-    /// this install never discovered.
-    ///
-    /// Staging does not copy a language whose queries are already complete, so
-    /// there is no staged copy to publish and nothing in the publish that would
-    /// notice it changing. Without this, an uninstall or a forced reinstall
-    /// between staging and publication would leave this install reporting
-    /// success over a chain nobody was holding still. Callers check it once
-    /// they hold the locks that keep the answer true.
-    pub(crate) fn unstable_skipped_dependency(&self) -> Option<&str> {
+    /// The first dependency that disappeared, became unreadable, or now names
+    /// a parent outside the staged dependency set. Check after acquiring the
+    /// managed-language locks. External runtime files are not locked, so this
+    /// catches edits visible now but cannot serialize later user edits.
+    pub(crate) fn unstable_dependency(&self) -> Option<&str> {
         for language in &self.dependencies {
-            if self.entries.iter().any(|entry| &entry.language == language) {
-                // Staged by this install: its publish re-checks it under the
-                // lock, and what it publishes is what this install downloaded.
-                continue;
-            }
-            let queries_dir = self.queries_parent.join(language);
+            let queries_dir = self
+                .entries
+                .iter()
+                .find(|entry| &entry.language == language)
+                .map(|entry| entry.tmp.path.clone())
+                .unwrap_or_else(|| self.queries_parent.join(language));
             if !query_install_is_complete(&queries_dir) {
                 return Some(language);
             }
@@ -645,7 +639,7 @@ impl StagedQueryInstall {
                     if !chain_matches {
                         let residue = publish.rollback();
                         return Err(PublishFailure {
-                            error: QueryInstallError::DependencyRemoved(entry.language),
+                            error: QueryInstallError::DependencyChanged(entry.language),
                             residue,
                         });
                     }
@@ -656,7 +650,7 @@ impl StagedQueryInstall {
                 Ok(PublishQueryDirOutcome::Uninstalled) => {
                     let residue = publish.rollback();
                     return Err(PublishFailure {
-                        error: QueryInstallError::DependencyRemoved(entry.language),
+                        error: QueryInstallError::DependencyChanged(entry.language),
                         residue,
                     });
                 }
@@ -2445,10 +2439,10 @@ mod staging_tests {
             queries_parent: queries_parent.clone(),
         };
 
-        assert_eq!(staged.unstable_skipped_dependency(), None);
+        assert_eq!(staged.unstable_dependency(), None);
         fs::remove_dir_all(&queries_dir).unwrap();
         assert_eq!(
-            staged.unstable_skipped_dependency(),
+            staged.unstable_dependency(),
             Some("child"),
             "queries removed after staging must not pass as already installed"
         );
@@ -2482,7 +2476,7 @@ mod staging_tests {
             queries_parent: queries_parent.clone(),
         };
 
-        assert_eq!(staged.unstable_skipped_dependency(), None);
+        assert_eq!(staged.unstable_dependency(), None);
 
         // Someone force-reinstalls the parent, and its new queries inherit a
         // language this install never saw.
@@ -2493,7 +2487,7 @@ mod staging_tests {
         .unwrap();
 
         assert_eq!(
-            staged.unstable_skipped_dependency(),
+            staged.unstable_dependency(),
             Some("parent"),
             "a base language that gained a parent must stop the publish"
         );
@@ -2523,16 +2517,15 @@ mod staging_tests {
         };
 
         assert_eq!(
-            staged.unstable_skipped_dependency(),
+            staged.unstable_dependency(),
             Some("parent"),
             "a base language that is neither staged nor on disk must be caught"
         );
     }
 
-    /// A language this install staged for itself needs no such check — its
-    /// publish re-checks the directory under the lock.
+    /// A staged language is checked from its prepared copy, not a missing live directory.
     #[test]
-    fn a_staged_requested_language_needs_no_recheck() {
+    fn a_staged_requested_language_is_checked_from_its_prepared_copy() {
         let temp = TempDir::new().unwrap();
         let queries_parent = temp.path().join("queries");
         let staged = StagedQueryInstall {
@@ -2546,7 +2539,7 @@ mod staging_tests {
             queries_parent: queries_parent.clone(),
         };
 
-        assert_eq!(staged.unstable_skipped_dependency(), None);
+        assert_eq!(staged.unstable_dependency(), None);
     }
 
     /// Yielding to a copy that appeared while this install was busy is right
@@ -2585,7 +2578,7 @@ mod staging_tests {
             panic!("a winner that changed the chain must fail the publish");
         };
         assert!(
-            matches!(&failure.error, QueryInstallError::DependencyRemoved(language) if language == "parent")
+            matches!(&failure.error, QueryInstallError::DependencyChanged(language) if language == "parent")
         );
         assert!(
             !queries_parent.join("child").exists(),
@@ -2667,7 +2660,7 @@ mod staging_tests {
         let result = staged.publish();
 
         assert!(
-            matches!(&result, Err(failure) if matches!(&failure.error, QueryInstallError::DependencyRemoved(language) if language == "parent")),
+            matches!(&result, Err(failure) if matches!(&failure.error, QueryInstallError::DependencyChanged(language) if language == "parent")),
             "a tombstoned entry must abort the publish"
         );
         assert_eq!(
@@ -3280,6 +3273,167 @@ mod tests {
             !queries_dir.join("injections.scm").exists(),
             "repair should replace stale partial contents with the successful download"
         );
+    }
+
+    #[test]
+    fn external_overlay_changes_are_rechecked_before_publication() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        let overlay_dir = runtime.join("queries/child");
+        fs::create_dir_all(&overlay_dir).unwrap();
+        let overlay = overlay_dir.join("highlights.scm");
+        fs::write(&overlay, ";; extends\n").unwrap();
+        let base_url =
+            spawn_query_file_server(vec![("/child/highlights.scm", "(comment) @comment\n")]);
+        let staged = stage_queries_with_dependencies(
+            &base_url,
+            "child",
+            &data,
+            false,
+            QueryHttpPolicy::AllowHttpForTests,
+            &[runtime],
+        )
+        .unwrap();
+        assert_eq!(staged.unstable_dependency(), None);
+        fs::write(&overlay, ";; extends\n;; inherits: new_parent\n").unwrap();
+        assert_eq!(staged.unstable_dependency(), Some("child"));
+    }
+
+    #[test]
+    fn existing_queries_follow_transitive_overlays_but_skip_included_optional_parents() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        for (language, kind, content) in [
+            (
+                "child",
+                "injections.scm",
+                ";; extends\n;; inherits: (parent)\n",
+            ),
+            (
+                "parent",
+                "highlights.scm",
+                ";; extends\n;; inherits: grandparent,(unneeded)\n",
+            ),
+        ] {
+            let dir = runtime.join("queries").join(language);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(kind), content).unwrap();
+        }
+        let child = data.join("queries/child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(child.join("highlights.scm"), "existing child").unwrap();
+        let base_url = spawn_query_file_server(vec![
+            ("/parent/highlights.scm", "parent"),
+            ("/grandparent/highlights.scm", "grandparent"),
+        ]);
+        let staged = stage_queries_with_dependencies(
+            &base_url,
+            "child",
+            &data,
+            false,
+            QueryHttpPolicy::AllowHttpForTests,
+            std::slice::from_ref(&runtime),
+        )
+        .unwrap();
+        assert_eq!(staged.dependencies(), &["child", "grandparent", "parent"]);
+        staged
+            .publish()
+            .unwrap_or_else(|_| panic!("publish failed"))
+            .commit();
+        assert_eq!(
+            fs::read_to_string(child.join("highlights.scm")).unwrap(),
+            "existing child"
+        );
+        assert!(lock_complete_chain(&data, "child", &[runtime]).is_some());
+        assert!(!data.join("queries/unneeded").exists());
+    }
+
+    #[test]
+    fn a_missing_overlay_parent_leaves_existing_queries_untouched() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        let child = data.join("queries/child");
+        let overlay = runtime.join("queries/child");
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir_all(&overlay).unwrap();
+        fs::write(child.join("highlights.scm"), "existing child").unwrap();
+        fs::write(
+            overlay.join("highlights.scm"),
+            ";; extends\n;; inherits: missing\n",
+        )
+        .unwrap();
+        let base_url = spawn_query_file_server(vec![]);
+        let result = stage_queries_with_dependencies(
+            &base_url,
+            "child",
+            &data,
+            false,
+            QueryHttpPolicy::AllowHttpForTests,
+            &[runtime],
+        );
+        assert!(
+            matches!(result, Err(QueryInstallError::LanguageNotSupported(name)) if name == "missing")
+        );
+        assert_eq!(
+            fs::read_to_string(child.join("highlights.scm")).unwrap(),
+            "existing child"
+        );
+        assert!(!data.join("queries/missing").exists());
+    }
+
+    #[test]
+    fn forced_replacement_does_not_read_old_data_directory_modelines() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path();
+        let child = data.join("queries/child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(child.join("highlights.scm"), ";; inherits: obsolete\n").unwrap();
+        let base_url = spawn_query_file_server(vec![("/child/highlights.scm", "replacement")]);
+        let staged = stage_queries_with_dependencies(
+            &base_url,
+            "child",
+            data,
+            true,
+            QueryHttpPolicy::AllowHttpForTests,
+            &[data.to_path_buf()],
+        )
+        .unwrap();
+        assert_eq!(staged.dependencies(), &["child"]);
+        staged
+            .publish()
+            .unwrap_or_else(|_| panic!("publish failed"))
+            .commit();
+        assert_eq!(
+            fs::read_to_string(child.join("highlights.scm")).unwrap(),
+            "replacement"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_broken_overlay_is_not_a_complete_or_installable_chain() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        let child = data.join("queries/child");
+        let overlay = runtime.join("queries/child");
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir_all(&overlay).unwrap();
+        fs::write(child.join("highlights.scm"), "existing child").unwrap();
+        std::os::unix::fs::symlink("missing", overlay.join("injections.scm")).unwrap();
+        assert!(lock_complete_chain(&data, "child", std::slice::from_ref(&runtime)).is_none());
+        let result = stage_queries_with_dependencies(
+            "https://unused.invalid",
+            "child",
+            &data,
+            false,
+            QueryHttpPolicy::HttpsOnly,
+            &[runtime],
+        );
+        assert!(matches!(result, Err(QueryInstallError::IoError(_))));
     }
 
     #[test]

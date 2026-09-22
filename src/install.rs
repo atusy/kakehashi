@@ -416,15 +416,12 @@ fn install_language_with_query_stager(
         return result;
     }
 
-    // Queries that staging found already complete were never copied, so this is
-    // the only thing that would notice them being removed since. Checked under
-    // the locks, before anything is published, so there is nothing to undo.
-    if let Some(unstable) = staged_queries.unstable_skipped_dependency() {
-        result.queries_error = Some(format!(
-            "the queries installed for '{}' were removed or replaced while '{}' was being \
-             installed",
-            unstable, language
-        ));
+    // Recheck live queries skipped during staging and runtime declarations for
+    // staged copies. Managed files stay settled under the locks; user edits to
+    // external files are only observed, not serialized by those locks.
+    if let Some(unstable) = staged_queries.unstable_dependency() {
+        result.queries_error =
+            Some(queries::QueryInstallError::DependencyChanged(unstable.to_string()).to_string());
         return result;
     }
 
