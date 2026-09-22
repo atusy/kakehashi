@@ -1,6 +1,7 @@
 //! Query file downloading from nvim-treesitter repository.
 
 use crate::language::query_modeline::{InheritedLanguage, parse_modeline};
+use path_clean::PathClean;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -196,7 +197,7 @@ fn inherited_languages_with_search_paths(
 ) -> Option<Vec<InheritedLanguage>> {
     let mut parents = inherited_languages_on_disk(queries_dir)?;
     for base in search_paths {
-        let directory = base.join("queries").join(language);
+        let directory = base.join("queries").join(language).clean();
         if directory == queries_dir {
             continue;
         }
@@ -910,11 +911,11 @@ fn stage_queries_with_dependencies(
 ) -> Result<StagedQueryInstall, QueryInstallError> {
     // The staged copy replaces the data-directory view. Do not rediscover
     // dependencies from the old live copy during a forced replacement.
-    let data_identity = fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+    let data_identity = fs::canonicalize(data_dir.clean()).unwrap_or_else(|_| data_dir.clean());
     let search_paths: Vec<PathBuf> = search_paths
         .iter()
-        .filter(|path| fs::canonicalize(path).unwrap_or_else(|_| (*path).clone()) != data_identity)
-        .cloned()
+        .map(|path| path.clean())
+        .filter(|path| fs::canonicalize(path).unwrap_or_else(|_| path.clone()) != data_identity)
         .collect();
     let mut entries = Vec::new();
     // Every language the recursion visits, staged or already complete: the set
@@ -3273,6 +3274,38 @@ mod tests {
             !queries_dir.join("injections.scm").exists(),
             "repair should replace stale partial contents with the successful download"
         );
+    }
+
+    #[test]
+    fn runtime_dependency_paths_use_the_loaders_lexical_normalization() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        let child = data.join("queries/child");
+        let overlay = runtime.join("queries/child");
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir_all(&overlay).unwrap();
+        fs::write(child.join("highlights.scm"), "existing child").unwrap();
+        fs::write(
+            overlay.join("highlights.scm"),
+            ";; extends\n;; inherits: parent\n",
+        )
+        .unwrap();
+        // The loader folds this lexically, even though the intermediate path
+        // does not exist and the OS cannot traverse it.
+        let search_paths = [runtime.join("absent/..")];
+        assert!(lock_complete_chain(&data, "child", &search_paths).is_none());
+        let base_url = spawn_query_file_server(vec![("/parent/highlights.scm", "parent")]);
+        let staged = stage_queries_with_dependencies(
+            &base_url,
+            "child",
+            &data,
+            false,
+            QueryHttpPolicy::AllowHttpForTests,
+            &search_paths,
+        )
+        .unwrap();
+        assert_eq!(staged.dependencies(), &["child", "parent"]);
     }
 
     #[test]
