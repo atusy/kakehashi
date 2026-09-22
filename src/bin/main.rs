@@ -1391,6 +1391,7 @@ fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) -> Re
     let result = kakehashi::install::install_language(
         language,
         &kakehashi::install::LanguageInstallOptions {
+            search_paths: Vec::new(),
             data_dir,
             force,
             verbose,

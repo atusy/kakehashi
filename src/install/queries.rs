@@ -187,6 +187,30 @@ fn inherited_languages_on_disk(queries_dir: &Path) -> Option<Vec<InheritedLangua
     Some(parents)
 }
 
+/// Include configured runtime files as dependency declarations. The loader reads
+/// modelines from every hit (including shadowed plain files), so scan all hits.
+/// Download destinations remain under the data directory; these paths are read-only.
+fn inherited_languages_with_search_paths(
+    queries_dir: &Path,
+    language: &str,
+    search_paths: &[PathBuf],
+) -> Option<Vec<InheritedLanguage>> {
+    let mut parents = inherited_languages_on_disk(queries_dir)?;
+    for base in search_paths {
+        let directory = base.join("queries").join(language);
+        if directory == queries_dir {
+            continue;
+        }
+        for parent in inherited_languages_on_disk(&directory)? {
+            match parents.iter_mut().find(|known| known.name == parent.name) {
+                Some(known) => known.optional &= parent.optional,
+                None => parents.push(parent),
+            }
+        }
+    }
+    Some(parents)
+}
+
 /// The parents a language actually needs on disk, given how it is reached.
 ///
 /// The loader inherits an optional parent, `(cpp)`, only when the file is
@@ -289,6 +313,7 @@ pub(crate) fn stage_queries_with_dependencies_from(
     language: &str,
     data_dir: &Path,
     force: bool,
+    search_paths: &[PathBuf],
 ) -> Result<StagedQueryInstall, QueryInstallError> {
     stage_queries_with_dependencies(
         base_url,
@@ -296,6 +321,7 @@ pub(crate) fn stage_queries_with_dependencies_from(
         data_dir,
         force,
         QueryHttpPolicy::HttpsOnly,
+        search_paths,
     )
 }
 
@@ -307,6 +333,7 @@ pub(crate) fn stage_queries_with_dependencies_from_allowing_http_for_tests(
     language: &str,
     data_dir: &Path,
     force: bool,
+    search_paths: &[PathBuf],
 ) -> Result<StagedQueryInstall, QueryInstallError> {
     stage_queries_with_dependencies(
         base_url,
@@ -314,6 +341,7 @@ pub(crate) fn stage_queries_with_dependencies_from_allowing_http_for_tests(
         data_dir,
         force,
         QueryHttpPolicy::AllowHttpForTests,
+        search_paths,
     )
 }
 
@@ -370,7 +398,8 @@ fn install_queries_with_dependencies_from_with_http_policy(
     force: bool,
     http_policy: QueryHttpPolicy,
 ) -> Result<QueryInstallResult, QueryInstallError> {
-    let staged = stage_queries_with_dependencies(base_url, language, data_dir, force, http_policy)?;
+    let staged =
+        stage_queries_with_dependencies(base_url, language, data_dir, force, http_policy, &[])?;
     // One lock per language this install depends on, in the sorted order
     // `dependencies()` returns, so publishing a base language cannot interleave
     // with an install or uninstall of that language elsewhere.
@@ -448,6 +477,7 @@ pub(crate) struct StagedQueryInstall {
     dependencies: Vec<String>,
     /// Where those languages live, for the completeness re-check.
     queries_parent: PathBuf,
+    search_paths: Vec<PathBuf>,
 }
 
 /// A query directory that has been renamed into place, with the directory it
@@ -520,7 +550,9 @@ impl StagedQueryInstall {
             // it with queries that inherit something new — a language this
             // install never discovered, so never locked and never checked. The
             // chain it publishes would then be one nobody is holding still.
-            let Some(parents) = inherited_languages_on_disk(&queries_dir) else {
+            let Some(parents) =
+                inherited_languages_with_search_paths(&queries_dir, language, &self.search_paths)
+            else {
                 return Some(language);
             };
             // Only the requested language is loaded for itself; every other
@@ -547,6 +579,7 @@ impl StagedQueryInstall {
             entries,
             dependencies,
             queries_parent: _,
+            search_paths,
         } = self;
         let mut publish = PublishedQueryInstall {
             install_path,
@@ -586,11 +619,15 @@ impl StagedQueryInstall {
                 // language unlocked and unchecked, which is the dangling chain
                 // the whole dependency set exists to prevent.
                 Ok(PublishQueryDirOutcome::AlreadyComplete) => {
-                    let chain_matches = inherited_languages_on_disk(&entry.queries_dir)
-                        .is_some_and(|parents| {
-                            required_parents(parents, !requested)
-                                .all(|parent| dependencies.contains(&parent))
-                        });
+                    let chain_matches = inherited_languages_with_search_paths(
+                        &entry.queries_dir,
+                        &entry.language,
+                        &search_paths,
+                    )
+                    .is_some_and(|parents| {
+                        required_parents(parents, !requested)
+                            .all(|parent| dependencies.contains(&parent))
+                    });
                     if !chain_matches {
                         let residue = publish.rollback();
                         return Err(PublishFailure {
@@ -861,21 +898,34 @@ fn stage_queries_with_dependencies(
     data_dir: &Path,
     force: bool,
     http_policy: QueryHttpPolicy,
+    search_paths: &[PathBuf],
 ) -> Result<StagedQueryInstall, QueryInstallError> {
+    // The staged copy replaces the data-directory view. Do not rediscover
+    // dependencies from the old live copy during a forced replacement.
+    let data_identity = fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+    let search_paths: Vec<PathBuf> = search_paths
+        .iter()
+        .filter(|path| fs::canonicalize(path).unwrap_or_else(|_| (*path).clone()) != data_identity)
+        .cloned()
+        .collect();
     let mut entries = Vec::new();
     // Every language the recursion visits, staged or already complete: the set
     // this install needs to still be there when it publishes.
     let mut staged = std::collections::HashSet::new();
     // On any error the entries collected so far are dropped here, and with them
     // every staging directory: a failed install publishes nothing.
-    let outcome = stage_queries_recursive(
+    let source = QueryDependencySource {
         base_url,
+        data_dir,
+        http_policy,
+        search_paths: &search_paths,
+    };
+    let outcome = stage_queries_recursive(
+        &source,
         language,
         StageRole::Requested { force },
-        data_dir,
         &mut staged,
         &mut entries,
-        http_policy,
     )?;
     let (files_downloaded, requested_already_complete) = match outcome {
         StageOutcome::Staged { files_downloaded } => (files_downloaded, false),
@@ -891,6 +941,7 @@ fn stage_queries_with_dependencies(
         entries,
         dependencies,
         queries_parent: data_dir.join("queries"),
+        search_paths,
     })
 }
 
@@ -921,15 +972,26 @@ impl StageRole {
     }
 }
 
+struct QueryDependencySource<'a> {
+    base_url: &'a str,
+    data_dir: &'a Path,
+    http_policy: QueryHttpPolicy,
+    search_paths: &'a [PathBuf],
+}
+
 fn stage_queries_recursive(
-    base_url: &str,
+    source: &QueryDependencySource<'_>,
     language: &str,
     role: StageRole,
-    data_dir: &Path,
     staged: &mut std::collections::HashSet<String>,
     entries: &mut Vec<StagedQueryDir>,
-    http_policy: QueryHttpPolicy,
 ) -> Result<StageOutcome, QueryInstallError> {
+    let QueryDependencySource {
+        base_url,
+        data_dir,
+        http_policy,
+        search_paths,
+    } = *source;
     let is_included = role.is_included();
     let force = role.force();
     // The name becomes a path and URL segment below; reject anything that
@@ -966,22 +1028,15 @@ fn stage_queries_recursive(
         staged.insert(language.to_string());
 
         // Even if skipping, we need to check for inherited dependencies
-        let parents = inherited_languages_on_disk(&queries_dir).ok_or_else(|| {
+        let parents = inherited_languages_with_search_paths(&queries_dir, language, search_paths)
+            .ok_or_else(|| {
             QueryInstallError::IoError(std::io::Error::other(format!(
                 "cannot read the query files installed for '{language}' to find what it inherits"
             )))
         })?;
         for parent in required_parents(parents, is_included) {
             // Stage parent dependencies (don't force, just ensure they exist)
-            stage_queries_recursive(
-                base_url,
-                &parent,
-                StageRole::Parent,
-                data_dir,
-                staged,
-                entries,
-                http_policy,
-            )?;
+            stage_queries_recursive(source, &parent, StageRole::Parent, staged, entries)?;
         }
         return Ok(StageOutcome::NothingToDo);
     }
@@ -998,7 +1053,6 @@ fn stage_queries_recursive(
 
     let mut files_downloaded = Vec::new();
     let mut any_success = false;
-    let mut parents_to_install = Vec::new();
 
     // Download each query file
     for query_file in QUERY_FILES {
@@ -1006,22 +1060,6 @@ fn stage_queries_recursive(
 
         match download_file(&url, http_policy) {
             Ok(content) => {
-                // Every query kind resolves its own `; inherits:` chain at load
-                // time, so a parent named by injections.scm is as load-bearing
-                // as one named by highlights.scm. A file naming its own
-                // language is read as `extends`, not as a parent, and an
-                // optional parent is needed only when the language is loaded
-                // for itself (see `required_parents`).
-                for parent in parse_modeline(&content).inherits {
-                    if parent.optional && is_included {
-                        continue;
-                    }
-                    let parent = parent.name;
-                    if parent != language && !parents_to_install.contains(&parent) {
-                        parents_to_install.push(parent);
-                    }
-                }
-
                 let file_path = tmp_queries_dir.join(query_file);
                 write_query_file(&file_path, &content)?;
                 files_downloaded.push(query_file.to_string());
@@ -1063,17 +1101,15 @@ fn stage_queries_recursive(
     // whole install: propagating the error here drops every staging directory
     // collected so far, so a language is never published without the queries it
     // inherits.
-    for parent in parents_to_install {
+    let parents = inherited_languages_with_search_paths(&tmp_queries_dir, language, search_paths)
+        .ok_or_else(|| {
+        QueryInstallError::IoError(std::io::Error::other(format!(
+            "cannot read query dependencies for '{language}'"
+        )))
+    })?;
+    for parent in required_parents(parents, is_included) {
         eprintln!("Staging inherited queries: {}", parent);
-        stage_queries_recursive(
-            base_url,
-            &parent,
-            StageRole::Parent,
-            data_dir,
-            staged,
-            entries,
-            http_policy,
-        )?;
+        stage_queries_recursive(source, &parent, StageRole::Parent, staged, entries)?;
     }
     entries.push(staged_dir);
 
@@ -1992,6 +2028,7 @@ mod staging_tests {
         let temp = TempDir::new().unwrap();
         let queries_parent = temp.path().join("queries");
         let staged = StagedQueryInstall {
+            search_paths: Vec::new(),
             language: "child".to_string(),
             install_path: queries_parent.join("child"),
             files_downloaded: vec!["highlights.scm".to_string()],
@@ -2026,6 +2063,7 @@ mod staging_tests {
         fs::write(queries_dir.join("highlights.scm"), "previous").unwrap();
         write_install_marker(&queries_dir).unwrap();
         let staged = StagedQueryInstall {
+            search_paths: Vec::new(),
             language: "child".to_string(),
             install_path: queries_parent.join("child"),
             files_downloaded: vec!["highlights.scm".to_string()],
@@ -2068,6 +2106,7 @@ mod staging_tests {
         let temp = TempDir::new().unwrap();
         let queries_parent = temp.path().join("queries");
         let staged = StagedQueryInstall {
+            search_paths: Vec::new(),
             language: "child".to_string(),
             install_path: queries_parent.join("child"),
             files_downloaded: vec!["highlights.scm".to_string()],
@@ -2105,6 +2144,7 @@ mod staging_tests {
         fs::write(queries_dir.join("highlights.scm"), "previous").unwrap();
         write_install_marker(&queries_dir).unwrap();
         let staged = StagedQueryInstall {
+            search_paths: Vec::new(),
             language: "child".to_string(),
             install_path: queries_dir.clone(),
             files_downloaded: vec!["highlights.scm".to_string()],
@@ -2381,6 +2421,7 @@ mod staging_tests {
         fs::write(queries_dir.join("highlights.scm"), "complete").unwrap();
         write_install_marker(&queries_dir).unwrap();
         let staged = StagedQueryInstall {
+            search_paths: Vec::new(),
             language: "child".to_string(),
             install_path: queries_dir.clone(),
             files_downloaded: Vec::new(),
@@ -2412,6 +2453,7 @@ mod staging_tests {
         fs::write(parent_dir.join("highlights.scm"), "(comment) @comment\n").unwrap();
         write_install_marker(&parent_dir).unwrap();
         let staged = StagedQueryInstall {
+            search_paths: Vec::new(),
             language: "child".to_string(),
             install_path: queries_parent.join("child"),
             files_downloaded: vec!["highlights.scm".to_string()],
@@ -2451,6 +2493,7 @@ mod staging_tests {
         let temp = TempDir::new().unwrap();
         let queries_parent = temp.path().join("queries");
         let staged = StagedQueryInstall {
+            search_paths: Vec::new(),
             language: "child".to_string(),
             install_path: queries_parent.join("child"),
             files_downloaded: vec!["highlights.scm".to_string()],
@@ -2479,6 +2522,7 @@ mod staging_tests {
         let temp = TempDir::new().unwrap();
         let queries_parent = temp.path().join("queries");
         let staged = StagedQueryInstall {
+            search_paths: Vec::new(),
             language: "child".to_string(),
             install_path: queries_parent.join("child"),
             files_downloaded: vec!["highlights.scm".to_string()],
@@ -2500,6 +2544,7 @@ mod staging_tests {
         let temp = TempDir::new().unwrap();
         let queries_parent = temp.path().join("queries");
         let staged = StagedQueryInstall {
+            search_paths: Vec::new(),
             language: "child".to_string(),
             install_path: queries_parent.join("child"),
             files_downloaded: vec!["highlights.scm".to_string()],
@@ -2544,6 +2589,7 @@ mod staging_tests {
         let queries_parent = temp.path().join("queries");
         let parent_dir = queries_parent.join("parent");
         let staged = StagedQueryInstall {
+            search_paths: Vec::new(),
             language: "child".to_string(),
             install_path: queries_parent.join("child"),
             files_downloaded: vec!["highlights.scm".to_string()],
@@ -2590,6 +2636,7 @@ mod staging_tests {
         fs::write(queries_dir.join("highlights.scm"), "previous").unwrap();
         write_install_marker(&queries_dir).unwrap();
         let staged = StagedQueryInstall {
+            search_paths: Vec::new(),
             language: "child".to_string(),
             install_path: queries_dir.clone(),
             files_downloaded: vec!["highlights.scm".to_string()],
@@ -3219,6 +3266,39 @@ mod tests {
             !queries_dir.join("injections.scm").exists(),
             "repair should replace stale partial contents with the successful download"
         );
+    }
+
+    #[test]
+    fn staging_installs_parents_declared_by_external_overlays() {
+        let temp = TempDir::new().unwrap();
+        let data_dir = temp.path().join("data");
+        let overlay = temp.path().join("overlay");
+        let child = overlay.join("queries/child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(
+            child.join("highlights.scm"),
+            ";; extends\n;; inherits: parent\n",
+        )
+        .unwrap();
+        let base_url = spawn_query_file_server(vec![
+            ("/child/highlights.scm", "(identifier) @variable\n"),
+            ("/parent/highlights.scm", "(comment) @comment\n"),
+        ]);
+        let staged = stage_queries_with_dependencies(
+            &base_url,
+            "child",
+            &data_dir,
+            false,
+            QueryHttpPolicy::AllowHttpForTests,
+            &[overlay],
+        )
+        .unwrap();
+        assert!(staged.dependencies().iter().any(|name| name == "parent"));
+        staged
+            .publish()
+            .unwrap_or_else(|_| panic!("publish failed"))
+            .commit();
+        assert!(data_dir.join("queries/parent/highlights.scm").is_file());
     }
 
     /// Queries a language inherits are part of what makes it usable, so a

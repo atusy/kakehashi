@@ -142,6 +142,7 @@ pub mod test_support {
             return Ok(());
         }
         let options = super::LanguageInstallOptions {
+            search_paths: Vec::new(),
             data_dir: data_dir.to_path_buf(),
             force: false,
             verbose: false,
@@ -250,6 +251,8 @@ fn rollback_residue(outcome: queries::RollbackOutcome) -> Option<RollbackResidue
 pub struct LanguageInstallOptions {
     /// Base data directory the parser and queries are installed into.
     pub data_dir: PathBuf,
+    /// Trusted runtime paths whose query modelines may request dependencies.
+    pub search_paths: Vec<PathBuf>,
     /// Reinstall artifacts that are already present.
     pub force: bool,
     /// Print progress details to stderr.
@@ -295,6 +298,7 @@ fn install_language_blocking(
     install_language_with_query_stager(
         language,
         &LanguageInstallOptions {
+            search_paths: Vec::new(),
             data_dir: data_dir.to_path_buf(),
             force,
             verbose: false,
@@ -310,11 +314,12 @@ fn install_language_with_query_stager(
     language: &str,
     options: &LanguageInstallOptions,
     queries_base_url: &str,
-    stage_queries: fn(
+    stage_queries: impl Fn(
         &str,
         &str,
         &std::path::Path,
         bool,
+        &[PathBuf],
     ) -> Result<queries::StagedQueryInstall, queries::QueryInstallError>,
 ) -> InstallResult {
     let data_dir = options.data_dir.as_path();
@@ -356,7 +361,13 @@ fn install_language_with_query_stager(
     // compile that would then be thrown away. Following `; inherits:` here is
     // what makes languages like html (which keeps its @comment capture in
     // html_tags) highlight correctly.
-    let mut staged_queries = match stage_queries(queries_base_url, language, data_dir, force) {
+    let mut staged_queries = match stage_queries(
+        queries_base_url,
+        language,
+        data_dir,
+        force,
+        &options.search_paths,
+    ) {
         Ok(staged) => staged,
         Err(e) => {
             result.queries_error = Some(e.to_string());
@@ -516,6 +527,7 @@ pub(crate) async fn install_language_async(
         install_language(
             &language,
             &LanguageInstallOptions {
+                search_paths: Vec::new(),
                 data_dir,
                 force,
                 // Auto-install runs in the background: no progress chatter on
@@ -548,6 +560,7 @@ fn install_language_blocking_allowing_http_queries_for_tests(
     install_language_with_query_stager(
         language,
         &LanguageInstallOptions {
+            search_paths: Vec::new(),
             data_dir: data_dir.to_path_buf(),
             force,
             verbose: false,
