@@ -20,7 +20,6 @@ use tokio::task::JoinSet;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{NumberOrString, Uri};
 
-use crate::language::InjectionResolver;
 use crate::lsp::aggregation::server::{
     FanInResult, FanOutTask, dispatch_host_preferred, dispatch_preferred,
     dispatch_preferred_with_tokens, mint_region_progress_source,
@@ -100,36 +99,14 @@ impl Kakehashi {
                 log::debug!("{}: No language detected", method_name);
                 return Ok(None);
             };
-            let Some(snapshot_tree) = snapshot.tree.as_ref() else {
+            if snapshot.tree.is_none() {
                 log::debug!("{}: no tree (parser unavailable) for {}", method_name, uri);
                 return Ok(None);
-            };
+            }
 
-            // Get injection query to detect injection regions
-            let Some(injection_query) = self.language.injection_query(&language_name) else {
-                return Ok(None);
-            };
-
-            // Collect all injection regions — from THIS snapshot's own
-            // resolved_regions (generation-gated), never a store re-read: a
-            // parse publishing between the wait above and a store lookup
-            // could pair this snapshot's tree/text with a NEWER snapshot's
-            // regions. Snapshot immutability makes tree, text, and regions
-            // one value; absent/reload-stale falls back inline over the same
-            // tree.
-            let all_regions =
-                match snapshot.regions_for_generation(self.cache.semantic_token_generation()) {
-                    Some(regions) => std::sync::Arc::clone(&regions.whole_document),
-                    None => std::sync::Arc::new(InjectionResolver::resolve_all(
-                        &self.language,
-                        self.bridge.node_tracker(),
-                        &uri,
-                        snapshot_tree,
-                        &snapshot.text,
-                        injection_query.as_ref(),
-                        snapshot.incarnation,
-                    )),
-                };
+            let all_regions = self
+                .whole_document_regions(&uri, &snapshot)
+                .ok_or_else(tower_lsp_server::jsonrpc::Error::content_modified)?;
 
             if all_regions.is_empty() {
                 return Ok(None);
@@ -430,6 +407,49 @@ mod tests {
     use std::future::ready;
     use tower_lsp_server::LspService;
     use url::Url;
+
+    #[tokio::test]
+    async fn document_color_rejects_unsettled_queries_during_reload() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), language.clone());
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let text = "fn main() {}";
+        let uri = Url::parse("file:///reload.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            text.into(),
+            Some("rust".into()),
+            parser.parse(text, None),
+        );
+        let params = tower_lsp_server::ls_types::DocumentColorParams {
+            text_document: tower_lsp_server::ls_types::TextDocumentIdentifier {
+                uri: uri.as_str().parse().unwrap(),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let reload = crate::lsp::lsp_impl::ParserReloadGuard::begin(&server.parser_pool);
+        server.cache.bump_semantic_token_generation();
+        let error = server
+            .document_color_impl(params.clone())
+            .await
+            .expect_err("an unreadable query is not an empty result");
+        assert_eq!(
+            error.code,
+            tower_lsp_server::jsonrpc::ErrorCode::ContentModified
+        );
+        drop(reload);
+        assert!(
+            server.document_color_impl(params).await.unwrap().is_empty(),
+            "a settled parser without injection queries really has no colors"
+        );
+    }
 
     #[test]
     fn concatenates_whole_document_layer_items() {
