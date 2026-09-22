@@ -269,6 +269,22 @@ impl InstallCoordinator {
             .await;
     }
 
+    pub(crate) fn should_check_query_dependencies(
+        &self,
+        language: &str,
+        initial_pass: bool,
+    ) -> bool {
+        // Discovery may already have loaded the parser before this task runs.
+        // Track checks independently of load events; reload generations reset
+        // eligibility while steady-state edits do no dependency filesystem work.
+        // This records an attempted check: failed repairs are retried on open
+        // or a reload, not on every subsequent edit.
+        let first = self
+            .auto_install
+            .first_query_dependency_check(language, self.cache.semantic_token_generation());
+        initial_pass || first
+    }
+
     pub(crate) fn needs_query_dependency_install(&self, language: &str) -> bool {
         if !self.settings_manager.is_auto_install_enabled(language) {
             return false;
@@ -593,6 +609,44 @@ mod tests {
     use std::path::Path;
     use std::task::Poll;
     use tower_lsp_server::LspService;
+
+    #[tokio::test]
+    async fn parser_loaded_by_discovery_still_gets_a_first_dependency_check() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), tree_sitter_rust::LANGUAGE.into());
+        let loaded = server.language.ensure_language_loaded_async("rust").await;
+        assert!(loaded.success && loaded.events.is_empty());
+        assert!(
+            server
+                .install_coordinator()
+                .should_check_query_dependencies("rust", false)
+        );
+        assert!(
+            !server
+                .install_coordinator()
+                .should_check_query_dependencies("rust", false)
+        );
+        assert!(
+            server
+                .install_coordinator()
+                .should_check_query_dependencies("rust", true)
+        );
+        assert!(
+            !server
+                .install_coordinator()
+                .should_check_query_dependencies("rust", false)
+        );
+        server.cache.bump_semantic_token_generation();
+        assert!(
+            server
+                .install_coordinator()
+                .should_check_query_dependencies("rust", false)
+        );
+    }
 
     #[tokio::test]
     async fn query_repair_request_survives_a_siblings_publication() {

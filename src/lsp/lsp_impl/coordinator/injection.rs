@@ -541,10 +541,11 @@ impl InjectionCoordinator {
             if !self.same_document_incarnation(uri, expected_incarnation) {
                 return;
             }
-            // Initial lifecycle passes and fresh loads may repair queries even
-            // when the parser loaded. Cached didChange passes must not scan or
-            // lock the on-disk dependency graph on every edit.
-            let repair_queries = (check_query_dependencies || !load_result.events.is_empty())
+            // Parse-time discovery may have consumed the fresh load events.
+            // Check once per language/reload generation, and again on open;
+            // cached edits must not scan or lock the dependency graph.
+            let repair_queries = install
+                .should_check_query_dependencies(&resolved_lang, check_query_dependencies)
                 && install.needs_query_dependency_install(&resolved_lang);
             if load_result.success {
                 load_events.extend(load_result.events);

@@ -28,7 +28,8 @@ runtime paths as dependency inputs.
 
 Opening a document also checks an already-loaded managed parser's query chain.
 Query-only repair preserves parsing with that parser while installation runs.
-Injected languages are checked on initial lifecycle passes or fresh loads;
+Injected languages are checked on initial lifecycle passes and once per query
+reload generation, independently of which caller first loaded their parser;
 cached edit passes do not rescan the dependency graph. A parser selected from
 outside the managed data directory is not a query-repair target.
 Repair uses the requested language's existing install target; it does not map

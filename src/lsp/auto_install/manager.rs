@@ -8,7 +8,7 @@
 //! post-install coordination (settings update, language reload).
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
     io::Write,
     path::PathBuf,
@@ -144,6 +144,12 @@ pub(crate) enum InstallEvent {
     ProgressEnd { success: bool },
 }
 
+#[derive(Default)]
+struct QueryDependencyChecks {
+    generation: u64,
+    languages: HashSet<String>,
+}
+
 /// Isolated coordinator for parser auto-installation.
 ///
 /// Handles installation state and execution without depending on other
@@ -155,6 +161,7 @@ pub(crate) struct AutoInstallManager {
     /// Tracks languages currently being installed to prevent duplicates
     installing_languages: InstallingLanguages,
     claims: Arc<Mutex<HashMap<String, ClaimState>>>,
+    query_dependency_checks: Arc<Mutex<QueryDependencyChecks>>,
 }
 
 impl std::fmt::Debug for AutoInstallManager {
@@ -208,7 +215,27 @@ impl AutoInstallManager {
         Self {
             installing_languages,
             claims: Arc::new(Mutex::new(HashMap::new())),
+            query_dependency_checks: Arc::new(Mutex::new(QueryDependencyChecks::default())),
         }
+    }
+
+    pub(crate) fn first_query_dependency_check(&self, language: &str, generation: u64) -> bool {
+        let mut checked = self
+            .query_dependency_checks
+            .lock()
+            .recover_poison("AutoInstallManager::first_query_dependency_check");
+        if generation < checked.generation {
+            return false;
+        }
+        if generation > checked.generation {
+            checked.generation = generation;
+            checked.languages.clear();
+        }
+        if checked.languages.contains(language) {
+            return false;
+        }
+        checked.languages.insert(language.to_string());
+        true
     }
 
     #[cfg(test)]
@@ -840,6 +867,19 @@ mod tests {
             "marker must be released when the guard drops, even if try_install \
              is cancelled at its install await"
         );
+    }
+
+    #[test]
+    fn query_dependency_checks_follow_generation_not_parser_load_events() {
+        let manager = create_test_manager();
+        let sibling = manager.clone();
+        assert!(manager.first_query_dependency_check("lua", 10));
+        assert!(!sibling.first_query_dependency_check("lua", 10));
+        assert!(sibling.first_query_dependency_check("python", 10));
+        assert!(manager.first_query_dependency_check("lua", 11));
+        assert!(!sibling.first_query_dependency_check("lua", 10));
+        assert!(!manager.first_query_dependency_check("lua", 11));
+        assert!(manager.first_query_dependency_check("python", 11));
     }
 
     #[tokio::test]
