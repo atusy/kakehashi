@@ -402,39 +402,7 @@ impl Kakehashi {
             // The debt drives the post-parse recovery refresh (see
             // `DiagnosticAggregator::degraded_pulls`).
             self.diagnostics.record_degraded_pull(&uri, coverage_stamp);
-            // TOCTOU guard: `snapshot` was captured before the fan-out/fold
-            // awaits above, so the parse may have landed — and the post-parse
-            // debt consumer already run — in between, leaving this
-            // freshly-recorded debt with no consumer until the next edit. If
-            // geometry and queries are settled NOW, consume the debt here and fire the
-            // recovery refresh ourselves. FORCED past the coverage gate (still
-            // single-flighted): the debt itself proves the client just
-            // received a non-covering answer, which the version-based gate
-            // cannot see — an edit-race degradation leaves served == current
-            // (no push-origin change), so a gated request would be suppressed
-            // while the client displays the region-less set. `take` on both
-            // consumers makes double-firing impossible; if the snapshot is
-            // still absent, the parse that produces it has not run its
-            // post-parse pass yet, so that pass will consume. Loop-bounded:
-            // the refresh-induced re-pull sees the ready geometry, answers
-            // covering, and clears everything.
-            let geometry_ready = self
-                .documents
-                .latest_snapshot(&uri)
-                .and_then(|view| {
-                    view.slot
-                        .snapshot
-                        .filter(|s| s.parsed_version == view.content_version)
-                })
-                .and_then(|snapshot| self.whole_document_regions(&uri, &snapshot))
-                .is_some();
-            if geometry_ready && self.diagnostics.take_degraded_pull(&uri) {
-                crate::lsp::lsp_impl::DiagnosticPublisher::new(self)
-                    .request_pull_diagnostic_refresh(true);
-            } else if !geometry_ready && let Some(snapshot) = &snapshot {
-                crate::lsp::lsp_impl::DiagnosticPublisher::new(self)
-                    .retry_degraded_pull_after_reload(&uri, snapshot.incarnation);
-            }
+            self.recover_degraded_pull(&uri, snapshot.as_deref());
         } else {
             // A failed/partial fan-out (`!pull_clean`) still advances the
             // coverage version but clears neither the pull-view lag nor the
@@ -455,6 +423,47 @@ impl Kakehashi {
             return Ok(unchanged_diagnostic_report(result_id));
         }
         Ok(make_diagnostic_report(items, result_id))
+    }
+
+    /// Recover after a degraded answer has recorded its debt.
+    fn recover_degraded_pull(
+        &self,
+        uri: &Url,
+        snapshot: Option<&crate::document::snapshot::ParseSnapshot>,
+    ) {
+        // TOCTOU guard: `snapshot` was captured before the fan-out/fold
+        // awaits above, so the parse may have landed — and the post-parse
+        // debt consumer already run — in between, leaving this
+        // freshly-recorded debt with no consumer until the next edit. If
+        // geometry and queries are settled NOW, consume the debt here and fire the
+        // recovery refresh ourselves. FORCED past the coverage gate (still
+        // single-flighted): the debt itself proves the client just
+        // received a non-covering answer, which the version-based gate
+        // cannot see — an edit-race degradation leaves served == current
+        // (no push-origin change), so a gated request would be suppressed
+        // while the client displays the region-less set. `take` on both
+        // consumers makes double-firing impossible; if the snapshot is
+        // still absent, the parse that produces it has not run its
+        // post-parse pass yet, so that pass will consume. Loop-bounded:
+        // the refresh-induced re-pull sees the ready geometry, answers
+        // covering, and clears everything.
+        let geometry_ready = self
+            .documents
+            .latest_snapshot(uri)
+            .and_then(|view| {
+                view.slot
+                    .snapshot
+                    .filter(|s| s.parsed_version == view.content_version)
+            })
+            .and_then(|snapshot| self.whole_document_regions(uri, &snapshot))
+            .is_some();
+        if geometry_ready && self.diagnostics.take_degraded_pull(uri) {
+            crate::lsp::lsp_impl::DiagnosticPublisher::new(self)
+                .request_pull_diagnostic_refresh(true);
+        } else if !geometry_ready && let Some(snapshot) = snapshot {
+            crate::lsp::lsp_impl::DiagnosticPublisher::new(self)
+                .retry_degraded_pull_after_reload(uri, snapshot.incarnation);
+        }
     }
 
     /// A pull answered with a covering (non-degraded) report: advance the
