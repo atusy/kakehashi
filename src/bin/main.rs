@@ -184,7 +184,7 @@ enum ConfigAction {
         #[arg(long)]
         output: Option<PathBuf>,
 
-        /// Skip the refusal when the output path is already taken (only applies with --output)
+        /// Skip the refusal when the output path is already taken (only applies to file output)
         #[arg(long)]
         force: bool,
     },
@@ -197,7 +197,7 @@ enum ConfigAction {
         #[arg(long)]
         output: Option<PathBuf>,
 
-        /// Skip the refusal when the output path is already taken (only applies with --output)
+        /// Skip the refusal when the output path is already taken (only applies to file output)
         #[arg(long)]
         force: bool,
     },
