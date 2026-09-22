@@ -248,11 +248,16 @@ fn required_parents(
 /// the LSP's async path, and there "someone is publishing, look again later" is
 /// as useful as an answer as blocking for one. Because nothing waits, taking
 /// them in discovery order cannot deadlock.
-pub(crate) fn lock_complete_chain(data_dir: &Path, language: &str) -> Option<Vec<LanguageLock>> {
+pub(crate) fn lock_complete_chain(
+    data_dir: &Path,
+    language: &str,
+    search_paths: &[PathBuf],
+) -> Option<Vec<LanguageLock>> {
     fn walk(
         data_dir: &Path,
         language: &str,
         is_included: bool,
+        search_paths: &[PathBuf],
         seen: &mut Vec<String>,
         guards: &mut Vec<LanguageLock>,
     ) -> bool {
@@ -274,14 +279,23 @@ pub(crate) fn lock_complete_chain(data_dir: &Path, language: &str) -> Option<Vec
         }
         let queries_dir = data_dir.join("queries").join(language);
         query_install_is_complete(&queries_dir)
-            && inherited_languages_on_disk(&queries_dir).is_some_and(|parents| {
-                required_parents(parents, is_included)
-                    .all(|parent| walk(data_dir, &parent, true, seen, guards))
-            })
+            && inherited_languages_with_search_paths(&queries_dir, language, search_paths)
+                .is_some_and(|parents| {
+                    required_parents(parents, is_included)
+                        .all(|parent| walk(data_dir, &parent, true, search_paths, seen, guards))
+                })
     }
 
     let mut guards = Vec::new();
-    walk(data_dir, language, false, &mut Vec::new(), &mut guards).then_some(guards)
+    walk(
+        data_dir,
+        language,
+        false,
+        search_paths,
+        &mut Vec::new(),
+        &mut guards,
+    )
+    .then_some(guards)
 }
 
 /// Download and install query files for a language, including inherited dependencies.
@@ -2185,7 +2199,7 @@ mod staging_tests {
             "the language's own queries are complete"
         );
         assert!(
-            lock_complete_chain(temp.path(), "child").is_none(),
+            lock_complete_chain(temp.path(), "child", &[]).is_none(),
             "but the parent it inherits is missing"
         );
 
@@ -2194,7 +2208,7 @@ mod staging_tests {
         fs::write(parent_dir.join("highlights.scm"), "(comment) @comment\n").unwrap();
         write_install_marker(&parent_dir).unwrap();
 
-        assert!(lock_complete_chain(temp.path(), "child").is_some());
+        assert!(lock_complete_chain(temp.path(), "child", &[]).is_some());
     }
 
     /// A cycle among on-disk files is the loader's problem to report; treating
@@ -2215,7 +2229,7 @@ mod staging_tests {
         }
 
         assert!(
-            lock_complete_chain(temp.path(), "cyc_a").is_some(),
+            lock_complete_chain(temp.path(), "cyc_a", &[]).is_some(),
             "a cycle is the loader's problem to report, not a reason to reinstall forever"
         );
     }
@@ -2289,7 +2303,7 @@ mod staging_tests {
         fs::set_permissions(&injections, permissions).unwrap();
 
         let parents = inherited_languages_on_disk(&queries_dir);
-        let chained = lock_complete_chain(temp.path(), "child").is_some();
+        let chained = lock_complete_chain(temp.path(), "child", &[]).is_some();
 
         // Restore before asserting so a failure cannot leave the file locked.
         let mut permissions = fs::metadata(&injections).unwrap().permissions();
@@ -2320,7 +2334,7 @@ mod staging_tests {
             write_install_marker(&dir).unwrap();
         }
 
-        let held = lock_complete_chain(data_dir, "child").expect("a complete chain locks");
+        let held = lock_complete_chain(data_dir, "child", &[]).expect("a complete chain locks");
         assert_eq!(held.len(), 2, "both languages in the chain are held");
         assert!(
             matches!(
@@ -2333,16 +2347,16 @@ mod staging_tests {
 
         // A base language mid-publish makes the chain unusable...
         let publishing_parent = lock_language(data_dir, "parent").unwrap();
-        assert!(lock_complete_chain(data_dir, "child").is_none());
+        assert!(lock_complete_chain(data_dir, "child", &[]).is_none());
         drop(publishing_parent);
         assert!(
-            lock_complete_chain(data_dir, "child").is_some(),
+            lock_complete_chain(data_dir, "child", &[]).is_some(),
             "and usable again once it is done"
         );
 
         // ...as does one that is simply gone.
         fs::remove_dir_all(queries_parent.join("parent")).unwrap();
-        assert!(lock_complete_chain(data_dir, "child").is_none());
+        assert!(lock_complete_chain(data_dir, "child", &[]).is_none());
         assert!(
             matches!(
                 try_lock_language(data_dir, "child"),
@@ -3131,11 +3145,11 @@ mod tests {
         // No `cpp` on disk, and no network: reaching for it would fail.
 
         assert!(
-            lock_complete_chain(&data_dir, "cuda").is_some(),
+            lock_complete_chain(&data_dir, "cuda", &[]).is_some(),
             "cuda's chain stops at c, whose optional parent it never loads"
         );
         assert!(
-            lock_complete_chain(&data_dir, "c").is_none(),
+            lock_complete_chain(&data_dir, "c", &[]).is_none(),
             "c loaded for itself does need cpp"
         );
         let result = install_queries_with_dependencies("cuda", &data_dir, false);

@@ -518,6 +518,7 @@ fn install_language_with_query_stager(
 /// call from async contexts like the LSP server.
 pub(crate) async fn install_language_async(
     language: String,
+    search_paths: Vec<PathBuf>,
     data_dir: PathBuf,
     force: bool,
     compile: parser::ParserCompile,
@@ -527,7 +528,7 @@ pub(crate) async fn install_language_async(
         install_language(
             &language,
             &LanguageInstallOptions {
-                search_paths: Vec::new(),
+                search_paths,
                 data_dir,
                 force,
                 // Auto-install runs in the background: no progress chatter on

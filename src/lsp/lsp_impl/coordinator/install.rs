@@ -218,7 +218,14 @@ impl InstallCoordinator {
                 };
             }
         }
-        let mut result = self.auto_install.try_install(language).await;
+        let search_paths = self
+            .settings_manager
+            .load_settings()
+            .search_paths
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect();
+        let mut result = self.auto_install.try_install(language, search_paths).await;
 
         self.dispatch_install_events(language, &result.events).await;
 
@@ -674,7 +681,7 @@ mod tests {
                 data_dir: std::path::PathBuf::from("/installed"),
             },
         );
-        let duplicate = server.auto_install.try_install(language).await;
+        let duplicate = server.auto_install.try_install(language, Vec::new()).await;
         assert_eq!(
             duplicate.outcome,
             crate::lsp::auto_install::InstallOutcome::AlreadyInstalling

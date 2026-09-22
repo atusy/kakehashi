@@ -255,23 +255,28 @@ impl AutoInstallManager {
     /// it does NOT call `ClientNotifier` (returns events instead), access
     /// `SettingsManager` (Kakehashi checks settings first), or reload the
     /// language (Kakehashi handles post-install).
-    pub async fn try_install(&self, language: &str) -> InstallResult {
-        self.try_install_with_support_check(language, |language, default_data_dir| async move {
-            let fetch_options =
-                default_data_dir
-                    .as_ref()
-                    .map(|dir| crate::install::metadata::FetchOptions {
-                        data_dir: Some(dir.as_path()),
-                        use_cache: true,
-                    });
-            should_skip_unsupported_language_tracked(&language, fetch_options.as_ref()).await
-        })
+    pub async fn try_install(&self, language: &str, search_paths: Vec<PathBuf>) -> InstallResult {
+        self.try_install_with_support_check(
+            language,
+            search_paths,
+            |language, default_data_dir| async move {
+                let fetch_options =
+                    default_data_dir
+                        .as_ref()
+                        .map(|dir| crate::install::metadata::FetchOptions {
+                            data_dir: Some(dir.as_path()),
+                            use_cache: true,
+                        });
+                should_skip_unsupported_language_tracked(&language, fetch_options.as_ref()).await
+            },
+        )
         .await
     }
 
     async fn try_install_with_support_check<F, Fut>(
         &self,
         language: &str,
+        search_paths: Vec<PathBuf>,
         support_check: F,
     ) -> InstallResult
     where
@@ -280,10 +285,12 @@ impl AutoInstallManager {
     {
         self.try_install_with_support_check_and_executor(
             language,
+            search_paths,
             support_check,
-            |language, data_dir| async move {
+            |language, data_dir, search_paths| async move {
                 crate::install::install_language_async(
                     language,
+                    search_paths,
                     data_dir,
                     false,
                     crate::install::parser::ParserCompile::KillableSubprocess,
@@ -297,13 +304,14 @@ impl AutoInstallManager {
     async fn try_install_with_support_check_and_executor<F, Fut, I, IFut>(
         &self,
         language: &str,
+        search_paths: Vec<PathBuf>,
         support_check: F,
         install_executor: I,
     ) -> InstallResult
     where
         F: FnOnce(String, Option<PathBuf>) -> Fut + Send + 'static,
         Fut: Future<Output = TrackedSupportCheck> + Send + 'static,
-        I: FnOnce(String, PathBuf) -> IFut + Send + 'static,
+        I: FnOnce(String, PathBuf, Vec<PathBuf>) -> IFut + Send + 'static,
         IFut: Future<Output = crate::install::InstallResult> + Send + 'static,
     {
         let mut events = Vec::new();
@@ -497,7 +505,7 @@ impl AutoInstallManager {
         // arrived, and skipping on the parser meant that language could never
         // repair itself. Falling through costs a stat per half when everything
         // is there, since staging short-circuits on both.
-        if language_is_complete(language, &data_dir) {
+        if language_is_complete(language, &data_dir, &search_paths) {
             events.push(InstallEvent::Log {
                 level: MessageType::INFO,
                 message: format!(
@@ -531,8 +539,13 @@ impl AutoInstallManager {
             // Auto-install runs inside the LSP server, whose `current_exe()` is the
             // kakehashi binary — so the killable subprocess (re-exec
             // `__compile-parser`) is valid and bounds a hung `cc`.
-            let result = install_executor(task_lang.clone(), task_data_dir.clone()).await;
-            let complete = language_is_complete(&task_lang, &task_data_dir);
+            let result = install_executor(
+                task_lang.clone(),
+                task_data_dir.clone(),
+                search_paths.clone(),
+            )
+            .await;
+            let complete = language_is_complete(&task_lang, &task_data_dir, &search_paths);
             let terminal = classify_install_outcome(&result, complete, &task_data_dir);
             let mut install_marker = install_marker;
             // If the caller awaiting this task is cancelled, the task output is
@@ -618,7 +631,11 @@ impl AutoInstallManager {
 ///
 /// Read from disk rather than from an `InstallResult`, so it answers for
 /// whatever another process published while this install ran.
-fn language_is_complete(language: &str, data_dir: &std::path::Path) -> bool {
+fn language_is_complete(
+    language: &str,
+    data_dir: &std::path::Path,
+    search_paths: &[PathBuf],
+) -> bool {
     // An install that is mid-publish can still roll its queries back, so what is
     // on disk right now is not yet an answer. Hold the language's lock across
     // both reads — releasing it first would leave room for an entire publish and
@@ -633,7 +650,9 @@ fn language_is_complete(language: &str, data_dir: &std::path::Path) -> bool {
     // roll its queries back, and a base language can be uninstalled out from
     // under the walk. Non-blocking, so a busy language answers "not ready"
     // rather than stalling the async path.
-    let Some(chain) = crate::install::queries::lock_complete_chain(data_dir, language) else {
+    let Some(chain) =
+        crate::install::queries::lock_complete_chain(data_dir, language, search_paths)
+    else {
         return false;
     };
     let complete = crate::install::parser_file_exists(language, data_dir).is_some();
@@ -715,6 +734,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn external_overlay_parent_must_be_installed_before_language_is_complete() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        let queries = data.join("queries/child");
+        std::fs::create_dir_all(&queries).unwrap();
+        std::fs::write(queries.join("highlights.scm"), "(comment) @comment\n").unwrap();
+        crate::install::queries::write_install_marker_for_tests(&queries).unwrap();
+        std::fs::create_dir_all(data.join("parser")).unwrap();
+        std::fs::write(
+            data.join(format!("parser/child.{}", std::env::consts::DLL_EXTENSION)),
+            "parser fixture",
+        )
+        .unwrap();
+        let overlay = runtime.join("queries/child");
+        std::fs::create_dir_all(&overlay).unwrap();
+        std::fs::write(
+            overlay.join("highlights.scm"),
+            ";; extends\n;; inherits: parent\n",
+        )
+        .unwrap();
+        assert!(language_is_complete("child", &data, &[]));
+        assert!(!language_is_complete(
+            "child",
+            &data,
+            std::slice::from_ref(&runtime)
+        ));
+        let parent = data.join("queries/parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::write(parent.join("highlights.scm"), "(comment) @comment\n").unwrap();
+        crate::install::queries::write_install_marker_for_tests(&parent).unwrap();
+        assert!(language_is_complete("child", &data, &[runtime]));
+    }
+
     fn create_test_manager() -> AutoInstallManager {
         AutoInstallManager::new(InstallingLanguages::new())
     }
@@ -773,8 +827,9 @@ mod tests {
             owner_manager
                 .try_install_with_support_check_and_executor(
                     "controlled-detached-success",
+                    Vec::new(),
                     |_, _| async { TrackedSupportCheck::completed(false, None) },
-                    |_, _| async move {
+                    |_, _, _| async move {
                         let _ = started_tx.send(());
                         let _ = release_rx.await;
                         crate::install::InstallResult {
@@ -792,9 +847,11 @@ mod tests {
         started_rx.await.expect("install executor must start");
 
         let duplicate = manager
-            .try_install_with_support_check("controlled-detached-success", |_, _| async {
-                panic!("the exact waiter must not start another support check")
-            })
+            .try_install_with_support_check(
+                "controlled-detached-success",
+                Vec::new(),
+                |_, _| async { panic!("the exact waiter must not start another support check") },
+            )
             .await;
         assert_eq!(duplicate.outcome, InstallOutcome::AlreadyInstalling);
         let mut completion = duplicate
@@ -828,7 +885,7 @@ mod tests {
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let owner = tokio::spawn(async move {
             owner_manager
-                .try_install_with_support_check("panic-support", |_, _| async move {
+                .try_install_with_support_check("panic-support", Vec::new(), |_, _| async move {
                     let _ = started_tx.send(());
                     let _ = release_rx.await;
                     panic!("controlled support panic");
@@ -837,7 +894,7 @@ mod tests {
         });
         started_rx.await.unwrap();
         let duplicate = manager
-            .try_install_with_support_check("panic-support", |_, _| async {
+            .try_install_with_support_check("panic-support", Vec::new(), |_, _| async {
                 panic!("exact waiter must not run support check")
             })
             .await;
@@ -850,7 +907,7 @@ mod tests {
             InstallOutcome::Abandoned
         );
         let retry = manager
-            .try_install_with_support_check("panic-support", |_, _| async {
+            .try_install_with_support_check("panic-support", Vec::new(), |_, _| async {
                 TrackedSupportCheck::completed(true, None)
             })
             .await;
@@ -867,8 +924,9 @@ mod tests {
             owner_manager
                 .try_install_with_support_check_and_executor(
                     "panic-install",
+                    Vec::new(),
                     |_, _| async { TrackedSupportCheck::completed(false, None) },
-                    |_, _| async move {
+                    |_, _, _| async move {
                         let _ = started_tx.send(());
                         let _ = release_rx.await;
                         panic!("controlled install panic");
@@ -878,7 +936,7 @@ mod tests {
         });
         started_rx.await.unwrap();
         let duplicate = manager
-            .try_install_with_support_check("panic-install", |_, _| async {
+            .try_install_with_support_check("panic-install", Vec::new(), |_, _| async {
                 panic!("exact waiter must not run support check")
             })
             .await;
@@ -891,7 +949,7 @@ mod tests {
             InstallOutcome::Abandoned
         );
         let retry = manager
-            .try_install_with_support_check("panic-install", |_, _| async {
+            .try_install_with_support_check("panic-install", Vec::new(), |_, _| async {
                 TrackedSupportCheck::completed(true, None)
             })
             .await;
@@ -914,7 +972,7 @@ mod tests {
 
         let first = tokio::spawn(async move {
             first_manager
-                .try_install_with_support_check("lua", |_, _| async move {
+                .try_install_with_support_check("lua", Vec::new(), |_, _| async move {
                     first_lookup_count.fetch_add(1, Ordering::SeqCst);
                     let _ = started_tx.send(());
                     let _ = release_rx.await;
@@ -926,7 +984,7 @@ mod tests {
 
         let duplicate_lookup_count = Arc::clone(&lookup_count);
         let result = manager
-            .try_install_with_support_check("lua", move |_, _| {
+            .try_install_with_support_check("lua", Vec::new(), move |_, _| {
                 duplicate_lookup_count.fetch_add(1, Ordering::SeqCst);
                 async { TrackedSupportCheck::completed(false, None) }
             })
@@ -967,7 +1025,7 @@ mod tests {
         let (second_release_tx, second_release_rx) = tokio::sync::oneshot::channel();
         let second = tokio::spawn(async move {
             second_manager
-                .try_install_with_support_check("lua", |_, _| async move {
+                .try_install_with_support_check("lua", Vec::new(), |_, _| async move {
                     let _ = second_started_tx.send(());
                     let _ = second_release_rx.await;
                     TrackedSupportCheck::completed(true, None)
@@ -994,7 +1052,7 @@ mod tests {
         let manager = create_test_manager();
 
         let result = manager
-            .try_install_with_support_check("unsupported", |_, _| async {
+            .try_install_with_support_check("unsupported", Vec::new(), |_, _| async {
                 TrackedSupportCheck::completed(true, None)
             })
             .await;
@@ -1016,7 +1074,7 @@ mod tests {
         let manager = AutoInstallManager::new(installing.clone());
 
         let result = manager
-            .try_install_with_support_check("stale-marker", |_, _| async {
+            .try_install_with_support_check("stale-marker", Vec::new(), |_, _| async {
                 TrackedSupportCheck::completed(true, None)
             })
             .await;
@@ -1032,7 +1090,7 @@ mod tests {
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
 
         let result = manager
-            .try_install_with_support_check("lua", |_, _| async move {
+            .try_install_with_support_check("lua", Vec::new(), |_, _| async move {
                 TrackedSupportCheck {
                     should_skip: true,
                     reason: None,
@@ -1045,7 +1103,7 @@ mod tests {
         assert_eq!(result.outcome, InstallOutcome::Unsupported);
 
         let duplicate = manager
-            .try_install_with_support_check("lua", |_, _| async {
+            .try_install_with_support_check("lua", Vec::new(), |_, _| async {
                 TrackedSupportCheck::completed(false, None)
             })
             .await;
@@ -1082,7 +1140,7 @@ mod tests {
         let manager = create_test_manager();
 
         let result = manager
-            .try_install_with_support_check("lua", |_, _| async {
+            .try_install_with_support_check("lua", Vec::new(), |_, _| async {
                 TrackedSupportCheck {
                     should_skip: false,
                     reason: None,
@@ -1113,7 +1171,7 @@ mod tests {
 
         let task = tokio::spawn(async move {
             task_manager
-                .try_install_with_support_check("lua", |_, _| async move {
+                .try_install_with_support_check("lua", Vec::new(), |_, _| async move {
                     let _ = started_tx.send(());
                     let _ = release_rx.await;
                     TrackedSupportCheck::completed(true, None)
@@ -1127,7 +1185,7 @@ mod tests {
         let duplicate_lookups = Arc::new(AtomicUsize::new(0));
         let duplicate_count = Arc::clone(&duplicate_lookups);
         let duplicate = manager
-            .try_install_with_support_check("lua", move |_, _| {
+            .try_install_with_support_check("lua", Vec::new(), move |_, _| {
                 duplicate_count.fetch_add(1, Ordering::SeqCst);
                 async { TrackedSupportCheck::completed(false, None) }
             })
@@ -1172,7 +1230,7 @@ mod tests {
 
         let caller = tokio::spawn(async move {
             task_manager
-                .try_install_with_support_check("lua", |_, _| async move {
+                .try_install_with_support_check("lua", Vec::new(), |_, _| async move {
                     let _ = lookup_started_tx.send(());
                     let _ = timeout_rx.await;
                     let completion = tokio::spawn(async move {
