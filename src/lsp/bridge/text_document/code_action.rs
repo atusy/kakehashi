@@ -788,6 +788,8 @@ impl LanguageServerPool {
                     uri: &host_url,
                     incarnation: envelope.incarnation,
                     content_version: envelope.content_version,
+                    // CodeAction envelopes do not carry a producer generation;
+                    // preserve their existing current-connection routing policy.
                     connection_generation: None,
                     read: read_host,
                 }),
