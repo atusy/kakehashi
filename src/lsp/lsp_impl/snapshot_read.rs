@@ -80,6 +80,10 @@ impl Kakehashi {
         }
         let generation = self.cache.semantic_token_generation();
         let language = snapshot.language.as_deref()?;
+        // Request entry already requires a published parser through language
+        // detection. Recheck after the snapshot wait: a reload can invalidate
+        // that registration between entry and this read. Loading it here would
+        // not repair requests rejected by the earlier detection gate.
         if !self.language.has_parser_available(language) {
             return None;
         }
