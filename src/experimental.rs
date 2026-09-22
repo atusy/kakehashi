@@ -1,6 +1,6 @@
 //! Runtime opt-in for experimental features.
 //!
-//! Experimental features (currently the native lexical-resolution layer)
+//! Experimental features (the native lexical-resolution layer and downstream peer API)
 //! ship in every binary but
 //! stay dormant unless the server process is started with
 //! `KAKEHASHI_EXPERIMENTAL=true`. The variable is read once

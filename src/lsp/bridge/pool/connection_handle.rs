@@ -10,6 +10,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
+pub(in crate::lsp::bridge) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 use tokio::sync::mpsc;
 use tower_lsp_server::ls_types::{
     CodeActionOptions, CodeActionProviderCapability, ColorProviderCapability,
@@ -495,6 +497,33 @@ impl ConnectionHandle {
         parse_routing_response(&response)
     }
 
+    /// Queue an arbitrary JSON-RPC request for the downstream peer escape hatch.
+    ///
+    /// Unlike [`Self::send_request`], `method` is runtime data and `params` may
+    /// be omitted. The request is still tracked by the same response router and
+    /// single-writer queue as bridge-managed requests.
+    pub(crate) fn send_request_value(
+        &self,
+        method: String,
+        params: Option<serde_json::Value>,
+        request_id: RequestId,
+    ) -> Result<(), BridgeError> {
+        match self.tx.try_send(OutboundMessage::Tracked {
+            payload: build_request_value(method, params, request_id),
+            request_id,
+        }) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.router.remove(request_id);
+                Err(BridgeError::QueueFull)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.router.remove(request_id);
+                Err(BridgeError::ChannelClosed)
+            }
+        }
+    }
+
     /// Send a raw payload for echo-server tests.
     ///
     /// Echo-server tests need to send a message that, when echoed back, is
@@ -587,7 +616,7 @@ impl ConnectionHandle {
 
     /// Set the connection state, recovering from poisoned locks per project
     /// convention and notifying watchers via the watch channel.
-    pub(super) fn set_state(&self, new_state: ConnectionState) {
+    pub(in crate::lsp::bridge) fn set_state(&self, new_state: ConnectionState) {
         *self
             .state
             .write()
@@ -595,6 +624,32 @@ impl ConnectionHandle {
         // Notify watchers of state change. send_replace() is non-blocking and
         // always succeeds (it replaces the current value regardless of receivers).
         self.state_watch.send_replace(new_state);
+    }
+
+    /// Fail a wedged connection and abort its writer immediately.
+    ///
+    /// Dropping the writer task handle cancels a write parked on a full stdin
+    /// pipe; the writer then drops its owned process handle, which force-kills
+    /// the downstream child. This is required when graceful shutdown cannot
+    /// make progress because the writer itself is the failed resource. Once a
+    /// graceful shutdown has reclaimed the writer handle there is nothing left
+    /// to abort here, and the shutdown's own deadline bounds the child instead.
+    pub(in crate::lsp::bridge) fn fail_and_abort_writer(&self) {
+        let mut state = self
+            .state
+            .write()
+            .recover_poison("ConnectionHandle::fail_and_abort_writer");
+        if *state == ConnectionState::Ready {
+            *state = ConnectionState::Failed;
+            self.state_watch.send_replace(ConnectionState::Failed);
+        }
+        drop(state);
+        drop(
+            self.writer_handle
+                .lock()
+                .recover_poison("ConnectionHandle::fail_and_abort_writer")
+                .take(),
+        );
     }
 
     /// Complete initialization only while this handle still belongs to its
@@ -1137,6 +1192,26 @@ impl ConnectionHandle {
         self.register_request_with_upstream(None)
     }
 
+    pub(in crate::lsp::bridge) fn register_peer_request(
+        &self,
+    ) -> io::Result<(
+        RequestId,
+        tokio::sync::oneshot::Receiver<serde_json::Value>,
+        tokio::sync::oneshot::Receiver<()>,
+    )> {
+        let request_id = RequestId::new(self.next_request_id());
+        let (response_rx, liveness_epoch, settled_rx) = self
+            .router()
+            .register_peer(request_id)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        if let Some(epoch) = liveness_epoch
+            && self.state() == ConnectionState::Ready
+        {
+            self.reader_handle.notify_liveness_start(epoch);
+        }
+        Ok((request_id, response_rx, settled_rx))
+    }
+
     /// Like `register_request()`, but also records the upstream→downstream ID
     /// mapping in the router's cancel_map so `$/cancelRequest` can be translated
     /// and forwarded (`None` for internal requests).
@@ -1148,7 +1223,7 @@ impl ConnectionHandle {
         let (response_rx, liveness_epoch) = self
             .router()
             .register_with_upstream_liveness(request_id, upstream_id)
-            .ok_or_else(|| io::Error::other("bridge: duplicate request ID"))?;
+            .map_err(|error| io::Error::other(error.to_string()))?;
 
         // If pending went 0->1 and we're in Ready state, start liveness timer
         if let Some(epoch) = liveness_epoch
@@ -1168,12 +1243,65 @@ impl ConnectionHandle {
         request_id: RequestId,
         response_rx: tokio::sync::oneshot::Receiver<serde_json::Value>,
     ) -> io::Result<serde_json::Value> {
-        use tokio::time::timeout;
+        self.wait_for_response_until(
+            request_id,
+            response_rx,
+            tokio::time::Instant::now() + REQUEST_TIMEOUT,
+        )
+        .await
+    }
 
-        const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+    /// Wait for a managed request's answer until `deadline`. On timeout the
+    /// router entry is retired, except that a frame the writer is still
+    /// writing stays tracked as cancelled so a stalled writer remains visible
+    /// to the liveness timer.
+    pub(in crate::lsp::bridge) async fn wait_for_response_until(
+        &self,
+        request_id: RequestId,
+        response_rx: tokio::sync::oneshot::Receiver<serde_json::Value>,
+        deadline: tokio::time::Instant,
+    ) -> io::Result<serde_json::Value> {
+        self.wait_for_response_inner(request_id, response_rx, deadline, true)
+            .await
+    }
 
-        match timeout(REQUEST_TIMEOUT, response_rx).await {
+    /// Like [`Self::wait_for_response_until`], but a timeout leaves the router
+    /// entry untouched: the peer handler retires it itself so it can also
+    /// send the inner `$/cancelRequest` and watch a stalled write.
+    pub(in crate::lsp::bridge) async fn wait_for_peer_response_until(
+        &self,
+        request_id: RequestId,
+        response_rx: tokio::sync::oneshot::Receiver<serde_json::Value>,
+        deadline: tokio::time::Instant,
+    ) -> io::Result<serde_json::Value> {
+        self.wait_for_response_inner(request_id, response_rx, deadline, false)
+            .await
+    }
+
+    async fn wait_for_response_inner(
+        &self,
+        request_id: RequestId,
+        response_rx: tokio::sync::oneshot::Receiver<serde_json::Value>,
+        deadline: tokio::time::Instant,
+        retire_on_timeout: bool,
+    ) -> io::Result<serde_json::Value> {
+        use tokio::time::timeout_at;
+
+        match timeout_at(deadline, response_rx).await {
             Ok(Ok(response)) => {
+                if let Some(failure) = self.router.take_failure(request_id) {
+                    let (kind, message) = match failure {
+                        super::super::actor::BridgeFailure::ConnectionLost => (
+                            io::ErrorKind::BrokenPipe,
+                            "bridge: downstream connection lost",
+                        ),
+                        super::super::actor::BridgeFailure::RequestTimeout => (
+                            io::ErrorKind::TimedOut,
+                            "bridge: downstream request timed out",
+                        ),
+                    };
+                    return Err(io::Error::new(kind, message));
+                }
                 // Check if this was an error response from liveness timeout
                 // If so, transition to Failed state (ls-bridge-async-connection Phase 3)
                 if self.reader_handle.check_liveness_failed() {
@@ -1190,8 +1318,9 @@ impl ConnectionHandle {
                 Err(io::Error::other("bridge: response channel closed"))
             }
             Err(_) => {
-                // Timeout - clean up pending entry
-                self.router().remove(request_id);
+                if retire_on_timeout {
+                    self.router().retire_on_timeout(request_id);
+                }
                 Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "bridge: request timeout",
@@ -1199,6 +1328,24 @@ impl ConnectionHandle {
             }
         }
     }
+}
+
+fn build_request_value(
+    method: String,
+    params: Option<serde_json::Value>,
+    request_id: RequestId,
+) -> serde_json::Value {
+    let mut payload = serde_json::Map::with_capacity(4);
+    payload.insert(
+        "jsonrpc".to_string(),
+        serde_json::Value::String("2.0".to_string()),
+    );
+    payload.insert("id".to_string(), serde_json::json!(request_id.as_i64()));
+    payload.insert("method".to_string(), serde_json::Value::String(method));
+    if let Some(params) = params {
+        payload.insert("params".to_string(), params);
+    }
+    serde_json::Value::Object(payload)
 }
 
 #[cfg(test)]
@@ -1210,6 +1357,40 @@ mod tests {
     /// Create a default DynamicCapabilityRegistry for tests that don't need it.
     fn default_dynamic_caps() -> Arc<DynamicCapabilityRegistry> {
         Arc::new(DynamicCapabilityRegistry::new())
+    }
+
+    /// The generic timeout must not erase the one entry that proves the
+    /// writer is stalled on a frame.
+    #[tokio::test]
+    async fn timeout_keeps_a_frame_the_writer_is_still_writing() {
+        let handle = crate::lsp::bridge::pool::test_helpers::create_handle_with_state(
+            ConnectionState::Ready,
+        )
+        .await;
+        let (request_id, response_rx) = handle.register_request().unwrap();
+        assert!(handle.router().claim_for_write(request_id));
+
+        let error = handle
+            .wait_for_response_until(request_id, response_rx, tokio::time::Instant::now())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(handle.router().awaiting_downstream_count(), 1);
+    }
+
+    #[test]
+    fn arbitrary_request_preserves_omitted_params() {
+        let without = build_request_value("custom/noParams".to_string(), None, RequestId::new(7));
+        assert_eq!(without["id"], 7);
+        assert_eq!(without["method"], "custom/noParams");
+        assert!(without.get("params").is_none());
+
+        let with = build_request_value(
+            "custom/withParams".to_string(),
+            Some(serde_json::json!({ "value": 1 })),
+            RequestId::new(8),
+        );
+        assert_eq!(with["params"], serde_json::json!({ "value": 1 }));
     }
 
     /// The settings cell stored on the handle is the *same* `Arc` the reader's
@@ -1354,6 +1535,65 @@ mod tests {
         // Can access router
         let _router = handle.router();
         // Router is accessible (test passes if no panic)
+    }
+
+    /// A child that never reads stdin leaves the writer parked mid-frame on a
+    /// full pipe; aborting must unpark that write and kill the child, not
+    /// merely flip the state. Unix-only: spawns `sleep`, probes via `ps`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn aborting_a_wedged_writer_kills_its_downstream_process() {
+        use crate::lsp::bridge::pool::test_helpers::{
+            FULL_PIPE_PAYLOAD_BYTES, create_handle_with_command, process_stat,
+        };
+
+        let (handle, pid) = create_handle_with_command(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("wedged"),
+            vec!["sleep".to_string(), "30".to_string()],
+            None,
+        )
+        .await;
+        let huge = crate::lsp::bridge::protocol::JsonRpcNotification::new(
+            "blocked",
+            serde_json::json!({ "data": "x".repeat(FULL_PIPE_PAYLOAD_BYTES) }),
+        );
+        assert_eq!(
+            handle.send_notification(huge),
+            NotificationSendResult::Queued
+        );
+        // The child never reads, so once the writer has taken the frame off the
+        // queue the only place it can be is parked mid-write.
+        let dequeued = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while handle.tx.capacity() < handle.tx.max_capacity() {
+            assert!(
+                std::time::Instant::now() < dequeued,
+                "the writer never picked up the frame"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        handle.fail_and_abort_writer();
+        assert_eq!(handle.state(), ConnectionState::Failed);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match process_stat(pid) {
+                Err(error) => {
+                    eprintln!("Skipping child-liveness assertion: ps unavailable ({error})");
+                    return;
+                }
+                Ok(None) => break,
+                Ok(Some(stat)) if stat.starts_with('Z') => break,
+                Ok(Some(stat)) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "child {pid} survived writer abort while parked on a full pipe (stat {stat})"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+        }
     }
 
     /// Test that liveness timeout triggers Ready->Failed state transition (ls-bridge-async-connection Phase 3).

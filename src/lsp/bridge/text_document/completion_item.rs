@@ -423,7 +423,10 @@ impl LanguageServerPool {
                     return Err(io::Error::other("host completion routing changed"));
                 }
                 let mut docs = self.host_documents().await;
-                if !docs.contains_key(&(document.host_uri.to_string(), connection_key.clone())) {
+                if !docs
+                    .get(document.host_uri.as_str())
+                    .is_some_and(|connections| connections.contains_key(connection_key))
+                {
                     return Err(io::Error::other("completion document is no longer open"));
                 }
                 sync_host_document(

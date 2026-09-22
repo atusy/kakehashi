@@ -238,6 +238,10 @@ fn main() {
     let mut pending_call_hierarchy_outgoing: Option<(Option<Value>, Value)> = None;
     let mut pending_type_hierarchy_supertypes: Option<(Option<Value>, Value)> = None;
     let mut pending_type_hierarchy_subtypes: Option<(Option<Value>, Value)> = None;
+    // `peer-caller` mode: whether kakehashi's `initialize` advertised the
+    // downstream peer API, reported back through `mock.peer` so a test can
+    // prove feature detection works over the wire.
+    let mut bridge_peer_advertised = false;
 
     while let Some(message) = read_message(&mut reader) {
         let method = message
@@ -249,7 +253,19 @@ fn main() {
 
         match method {
             "initialize" => {
+                bridge_peer_advertised = message
+                    .pointer("/params/capabilities/experimental/kakehashi/bridgePeer")
+                    == Some(&json!(true));
                 let capabilities = match mode.as_str() {
+                    // `peer-caller`: executing `mock.peer` makes this server
+                    // discover its peers through kakehashi and proxy one
+                    // request to the peer named by the command's first
+                    // argument (bridge-peer-protocol); the second argument is
+                    // the inner method (default `custom/ping`).
+                    "peer-caller" => json!({
+                        "executeCommandProvider": { "commands": ["mock.peer"] },
+                        "textDocumentSync": 1
+                    }),
                     "range-upper" => json!({
                         "documentRangeFormattingProvider": true,
                         "textDocumentSync": 1
@@ -1229,6 +1245,60 @@ fn main() {
                     .pointer("/params/command")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
+                if command == "mock.peer" {
+                    // Ids 5000-5001 are this flow's server-initiated requests,
+                    // a block apart from applyEdit's 4000 like every other flow.
+                    let target_name = message
+                        .pointer("/params/arguments/0")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let inner_method = message
+                        .pointer("/params/arguments/1")
+                        .and_then(Value::as_str)
+                        .unwrap_or("custom/ping")
+                        .to_string();
+                    let inner_params = message
+                        .pointer("/params/arguments/2")
+                        .cloned()
+                        .unwrap_or_else(|| json!({ "probe": true }));
+                    request_with_params(
+                        &mut writer,
+                        json!(5000),
+                        "kakehashi/bridge/peer",
+                        json!({}),
+                    );
+                    let discovery = read_response(&mut reader, &mut writer, 5000);
+                    let target = discovery["result"]
+                        .as_array()
+                        .and_then(|peers| peers.iter().find(|peer| peer["name"] == target_name))
+                        .cloned();
+                    let forwarded = {
+                        let peer = target.unwrap_or_else(|| json!({ "id": "unknown-peer" }));
+                        request_with_params(
+                            &mut writer,
+                            json!(5001),
+                            "kakehashi/bridge/peer/request",
+                            json!({
+                                "id": peer["id"],
+                                "method": inner_method,
+                                "params": inner_params
+                            }),
+                        );
+                        read_response(&mut reader, &mut writer, 5001)
+                    };
+                    respond(
+                        &mut writer,
+                        id,
+                        json!({
+                            "bridgePeer": bridge_peer_advertised,
+                            "peers": discovery["result"],
+                            "discovery": discovery,
+                            "forwarded": forwarded,
+                        }),
+                    );
+                    continue;
+                }
                 if command == "mock.run" {
                     let target_uri = documents.keys().next().cloned().unwrap_or_default();
                     request_with_params(
@@ -2234,6 +2304,18 @@ fn main() {
                     .unwrap_or(Value::Null);
                 respond(&mut writer, id, result);
             }
+            // Echoes what arrived so a proxying test can prove the method
+            // and params reached this server unchanged, including whether
+            // `params` was present at all.
+            "custom/echo" => respond(
+                &mut writer,
+                id,
+                json!({
+                    "method": method,
+                    "hasParams": message.get("params").is_some(),
+                    "params": message.get("params"),
+                }),
+            ),
             _ => {
                 // Unknown REQUESTS get a null result so the client never
                 // hangs; notifications are ignored.
@@ -2306,6 +2388,22 @@ fn read_message<R: BufRead>(reader: &mut R) -> Option<Value> {
     let mut body = vec![0u8; content_length?];
     reader.read_exact(&mut body).ok()?;
     serde_json::from_slice(&body).ok()
+}
+
+/// Block until the response to this server's own request `expected_id`
+/// arrives, skipping notifications and answering any interleaved client
+/// request with `null` so the bridge never waits on us.
+fn read_response<R: BufRead, W: Write>(reader: &mut R, writer: &mut W, expected_id: i64) -> Value {
+    loop {
+        let message = read_message(reader)
+            .unwrap_or_else(|| panic!("stdin closed before the response to {expected_id}"));
+        let is_request = message.get("method").is_some();
+        match message.get("id") {
+            Some(id) if !is_request && id.as_i64() == Some(expected_id) => return message,
+            Some(id) if is_request => respond(writer, Some(id.clone()), Value::Null),
+            _ => {}
+        }
+    }
 }
 
 /// Send a JSON-RPC notification (server-initiated, no `id`).

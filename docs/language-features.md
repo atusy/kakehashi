@@ -382,6 +382,28 @@ presentation itself survives.
 
 ---
 
+## Downstream peer requests
+
+This experimental API requires starting kakehashi with
+`KAKEHASHI_EXPERIMENTAL=true` (exact value). Otherwise the methods return
+`MethodNotFound` and the `bridgePeer` capability is not advertised.
+
+Downstream language servers can feature-detect
+`initialize.params.capabilities.experimental.kakehashi.bridgePeer: true`, list
+other running downstream connections with `kakehashi/bridge/peer`, and proxy an
+arbitrary non-lifecycle JSON-RPC request with `kakehashi/bridge/peer/request`.
+Only the caller's own per-root connection is excluded; same-name peers at other
+roots remain visible. These methods are registered only on downstream
+connections, not directly on the editor-facing service.
+
+Every configured server can send any non-lifecycle request to every other
+running server through this API, with the same authority kakehashi itself has
+over those processes. Configure only servers you trust. See
+[bridge-peer-protocol](architecture-decisions/bridge-peer-protocol.md) for the
+complete wire and error contract.
+
+---
+
 ## `kakehashi/*` methods
 
 Beyond the standard LSP features, kakehashi exposes custom methods under the

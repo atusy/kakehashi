@@ -122,5 +122,6 @@ expression: capabilities
   "diagnosticProvider": {
     "interFileDependencies": false,
     "workspaceDiagnostics": false
-  }
+  },
+  "typeHierarchyProvider": true
 }

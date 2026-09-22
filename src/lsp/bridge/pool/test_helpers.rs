@@ -91,6 +91,11 @@ pub(in crate::lsp::bridge) fn devnull_config_for_language(language: &str) -> Bri
 /// assert a child process actually dies. `Err` means `ps` itself could not
 /// run (sandboxed runners) — callers should skip rather than fail.
 #[cfg(unix)]
+/// A payload far larger than any kernel pipe buffer (64 KiB on Linux, at
+/// most 1 MiB on macOS), so a write to a child that never reads parks
+/// mid-frame instead of completing into the buffer.
+pub(in crate::lsp::bridge) const FULL_PIPE_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+
 pub(in crate::lsp::bridge) fn process_stat(pid: u32) -> std::io::Result<Option<String>> {
     let output = std::process::Command::new("ps")
         .args(["-o", "stat=", "-p", &pid.to_string()])

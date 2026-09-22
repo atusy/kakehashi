@@ -169,6 +169,7 @@ fn build_baseline_capabilities(advertise_configuration: bool) -> ClientCapabilit
         experimental: Some(serde_json::json!({
             "kakehashi": {
                 "bridgeRouting": true,
+                "bridgePeer": true,
             },
         })),
         ..Default::default()
@@ -202,6 +203,17 @@ fn build_baseline_capabilities(advertise_configuration: bool) -> ClientCapabilit
 /// `window.showMessage` (the `messageActionItem` refinement) is a plain
 /// pass-through: `window/showMessageRequest` is a base-protocol request the
 /// bridge always relays.
+/// The bridge-owned `experimental.kakehashi` flags before applying the process
+/// opt-in gate, whatever the editor supplied. One list, so a flag
+/// added here cannot be dropped by one of the merge branches below.
+const BRIDGE_EXPERIMENTAL_FLAGS: &[&str] = &["bridgeRouting", "bridgePeer"];
+
+fn insert_bridge_flags(kakehashi: &mut serde_json::Map<String, serde_json::Value>) {
+    for flag in BRIDGE_EXPERIMENTAL_FLAGS {
+        kakehashi.insert((*flag).to_string(), serde_json::Value::Bool(true));
+    }
+}
+
 fn merge_upstream_capabilities(
     mut base: ClientCapabilities,
     upstream: Option<&ClientCapabilities>,
@@ -222,7 +234,7 @@ fn merge_upstream_capabilities(
                     .entry("kakehashi".to_string())
                     .or_insert_with(|| serde_json::json!({}));
                 if let serde_json::Value::Object(kakehashi) = kakehashi {
-                    kakehashi.insert("bridgeRouting".to_string(), serde_json::Value::Bool(true));
+                    insert_bridge_flags(kakehashi);
                     base.experimental = Some(serde_json::Value::Object(experimental));
                 } else {
                     let upstream_kakehashi = experimental
@@ -230,7 +242,7 @@ fn merge_upstream_capabilities(
                         .cloned()
                         .expect("kakehashi entry exists");
                     let mut kakehashi = serde_json::Map::new();
-                    kakehashi.insert("bridgeRouting".to_string(), serde_json::Value::Bool(true));
+                    insert_bridge_flags(&mut kakehashi);
                     kakehashi.insert("upstream".to_string(), upstream_kakehashi);
                     experimental.insert(
                         "kakehashi".to_string(),
@@ -240,8 +252,10 @@ fn merge_upstream_capabilities(
                 }
             }
             upstream_experimental => {
+                let mut kakehashi = serde_json::Map::new();
+                insert_bridge_flags(&mut kakehashi);
                 base.experimental = Some(serde_json::json!({
-                    "kakehashi": {"bridgeRouting": true},
+                    "kakehashi": kakehashi,
                     "upstream": upstream_experimental,
                 }));
             }
@@ -464,15 +478,79 @@ pub(super) fn build_bridge_client_capabilities(
     upstream: Option<&ClientCapabilities>,
     advertise_configuration: bool,
 ) -> ClientCapabilities {
-    merge_upstream_capabilities(
+    build_with_experimental(
+        upstream,
+        advertise_configuration,
+        crate::experimental::enabled(),
+    )
+}
+
+fn build_with_experimental(
+    upstream: Option<&ClientCapabilities>,
+    advertise_configuration: bool,
+    experimental_enabled: bool,
+) -> ClientCapabilities {
+    let mut capabilities = merge_upstream_capabilities(
         build_baseline_capabilities(advertise_configuration),
         upstream,
-    )
+    );
+    // Apply the gate after merging so an editor cannot advertise a disabled API.
+    if !experimental_enabled {
+        capabilities
+            .experimental
+            .as_mut()
+            .and_then(|value| value.get_mut("kakehashi"))
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("bridge flags always form an object")
+            .remove("bridgePeer");
+    }
+    capabilities
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn downstream_initialize_advertises_bridge_peer_support() {
+        let capabilities = build_with_experimental(None, false, true);
+        assert_eq!(
+            capabilities.experimental,
+            Some(serde_json::json!({
+                "kakehashi": {
+                    "bridgePeer": true,
+                    "bridgeRouting": true
+                }
+            }))
+        );
+    }
+
+    #[test]
+    fn peer_advertisement_obeys_opt_in_after_every_upstream_merge() {
+        let upstreams = [
+            None,
+            Some(serde_json::json!({"kakehashi": {"bridgePeer": true}})),
+            Some(serde_json::json!({"kakehashi": {"bridgePeer": false}})),
+            Some(serde_json::json!({"editorFeature": true})),
+            Some(serde_json::json!({"kakehashi": "extension"})),
+            Some(serde_json::json!("extension")),
+        ];
+        for value in upstreams {
+            let upstream = value.map(|experimental| ClientCapabilities {
+                experimental: Some(experimental),
+                ..Default::default()
+            });
+            for enabled in [false, true] {
+                let capabilities = build_with_experimental(upstream.as_ref(), false, enabled);
+                let flags = &capabilities.experimental.as_ref().unwrap()["kakehashi"];
+                assert_eq!(
+                    flags.get("bridgePeer"),
+                    enabled.then_some(&serde_json::Value::Bool(true))
+                );
+                assert_eq!(flags["bridgeRouting"], true);
+            }
+        }
+    }
 
     #[test]
     fn bridge_client_capabilities_snapshot() {
@@ -1211,6 +1289,31 @@ mod tests {
                 },
             })),
         );
+    }
+
+    /// Routing remains available independently of the experimental opt-in.
+    #[test]
+    fn every_merge_branch_preserves_routing_without_experimental_opt_in() {
+        let upstreams = [
+            serde_json::json!({ "editorFeature": true }),
+            serde_json::json!({ "kakehashi": { "other": "preserved" } }),
+            serde_json::json!({ "kakehashi": "not-an-object" }),
+            serde_json::json!("editor-extension-payload"),
+        ];
+        for upstream_experimental in upstreams {
+            let upstream = ClientCapabilities {
+                experimental: Some(upstream_experimental.clone()),
+                ..Default::default()
+            };
+            let experimental = build_bridge_client_capabilities(Some(&upstream), false)
+                .experimental
+                .expect("experimental is always advertised");
+            assert_eq!(
+                experimental["kakehashi"]["bridgeRouting"],
+                serde_json::Value::Bool(true),
+                "routing lost while merging {upstream_experimental}"
+            );
+        }
     }
 
     #[test]
