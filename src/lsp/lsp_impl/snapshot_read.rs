@@ -60,6 +60,50 @@ pub(crate) const FIRST_PARSE_BACKSTOP: std::time::Duration = std::time::Duration
 pub(crate) const TOKEN_SETTLE_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl Kakehashi {
+    /// Resolve one snapshot's whole-document regions. `None` means the
+    /// parser/query pair could not be read consistently; `Some(empty)` means
+    /// the settled language has no injection query or no matching regions.
+    pub(super) fn whole_document_regions(
+        &self,
+        uri: &Url,
+        snapshot: &ParseSnapshot,
+    ) -> Option<Arc<Vec<crate::language::injection::ResolvedInjection>>> {
+        use crate::error::LockResultExt;
+        let reloading = || {
+            self.parser_pool
+                .lock()
+                .recover_poison("Kakehashi::whole_document_regions")
+                .reload_in_progress()
+        };
+        if reloading() {
+            return None;
+        }
+        let generation = self.cache.semantic_token_generation();
+        let language = snapshot.language.as_deref()?;
+        if !self.language.has_parser_available(language) {
+            return None;
+        }
+        let tree = snapshot.tree.as_ref()?;
+        let regions = if let Some(regions) = snapshot.regions_for_generation(generation) {
+            Arc::clone(&regions.whole_document)
+        } else if let Some(query) = self.language.injection_query(language) {
+            Arc::new(crate::language::InjectionResolver::resolve_all(
+                &self.language,
+                self.bridge.node_tracker(),
+                uri,
+                tree,
+                &snapshot.text,
+                &query,
+                snapshot.incarnation,
+            ))
+        } else {
+            Arc::new(Vec::new())
+        };
+        // A reload may have started or completed during any of the reads,
+        // including a snapshot-cache hit. Neither result is then evidence.
+        (!reloading() && self.cache.semantic_token_generation() == generation).then_some(regions)
+    }
+
     /// Wait (bounded) until `uri`'s latest snapshot is current, re-resolving
     /// the cell per wakeup (per-request re-resolution + incarnation validation
     /// happen inside `latest_snapshot`). This is the ADR's explicit-action

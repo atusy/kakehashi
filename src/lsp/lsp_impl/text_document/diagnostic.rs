@@ -22,7 +22,6 @@ use url::Url;
 
 use super::super::{Kakehashi, uri_to_url};
 use crate::config::settings::{AggregationStrategy, LayerSource, ResolvedLayerConfig};
-use crate::language::InjectionResolver;
 use crate::lsp::aggregation::server::{
     FanInResult, FanOutTask, HostFanOutTask, dispatch_concatenated, dispatch_host_concatenated,
     dispatch_host_preferred, dispatch_preferred,
@@ -171,8 +170,17 @@ impl Kakehashi {
         // host-only document must not pay the freshness wait. A still-missing tree
         // (parse pending/failed) yields `None` — host still pulls, virt skips.
         let snapshot = if virt_enabled {
-            self.ensure_document_parsed(&uri).await;
-            self.documents.get(&uri).and_then(|doc| doc.snapshot())
+            match self
+                .wait_for_current_snapshot(&uri, Duration::from_millis(200))
+                .await
+            {
+                crate::lsp::lsp_impl::snapshot_read::SnapshotWait::Current(snapshot)
+                    if snapshot.tree.is_some() =>
+                {
+                    Some(snapshot)
+                }
+                _ => None,
+            }
         } else {
             None
         };
@@ -198,33 +206,11 @@ impl Kakehashi {
 
         // Resolve injection regions once: the live virt pull below and the
         // pushFallback fold (#425) after the join share them.
-        let virt_regions = match (virt_enabled, snapshot.as_ref()) {
-            (true, Some(snapshot)) => self
-                .language
-                .injection_query(&language_name)
-                .map(|injection_query| {
-                    match self
-                        .documents
-                        .current_resolved_regions(&uri, self.cache.semantic_token_generation())
-                    {
-                        Some(regions) => regions,
-                        None => std::sync::Arc::new(InjectionResolver::resolve_all(
-                            &self.language,
-                            self.bridge.node_tracker(),
-                            &uri,
-                            snapshot.tree(),
-                            snapshot.text(),
-                            injection_query.as_ref(),
-                            snapshot.incarnation(),
-                        )),
-                    }
-                })
-                .unwrap_or_default(),
-            // Virt gated off, or no tree yet (the host layer still pulls). The
-            // wait+on-demand above already tried, so a missing tree here is the
-            // rare parse-failure case, self-healing on the next pull.
-            _ => std::sync::Arc::new(Vec::new()),
-        };
+        let resolved_regions = snapshot
+            .as_ref()
+            .and_then(|snapshot| self.whole_document_regions(&uri, snapshot));
+        let regions_unavailable = resolved_regions.is_none();
+        let virt_regions = resolved_regions.unwrap_or_default();
         // Lightweight per-region metadata `(region_id, injection_language,
         // current offset)` for the pushFallback fold; the live pull below moves
         // the regions themselves.
@@ -387,7 +373,7 @@ impl Kakehashi {
 
         // Degraded-answer guard (the pull-side sibling of `republish`'s
         // geometry-unknown deferral): the bounded parse wait above can lapse
-        // under load, leaving `snapshot` `None` for an open document while the
+        // under load, or a reload can make the query/regions unavailable while the
         // aggregator holds live region pushes — the fold above then silently
         // skipped every cached `Region` slot, so this answer is missing whole
         // servers' diagnostics. A pull must respond (there is no "defer" for a
@@ -396,16 +382,16 @@ impl Kakehashi {
         // TOCTOU guard below) consumes it and requests the recovery refresh
         // (single-flighted, forced past the coverage gate) that brings the
         // client back to a full view, instead of the gap being masked until
-        // the next edit. The predicate mirrors `republish`'s `needs_geometry`
-        // (non-empty region slots only).
-        // Missing-virt evidence for a tree-less answer: cached Region push
+        // the next edit.
+        // Missing-virt evidence: an unreadable query with a tree, cached Region push
         // slots (mirrors `republish`'s `needs_geometry`) OR a non-empty
         // cached PullLayer — a pull-only injected server's diagnostics live
         // only there, and this answer's virt layer silently skipped them
         // just the same.
         let degraded_virt = virt_enabled
-            && snapshot.is_none()
-            && (self.diagnostics.has_region_slots(&uri)
+            && regions_unavailable
+            && (snapshot.is_some()
+                || self.diagnostics.has_region_slots(&uri)
                 || self.diagnostics.has_nonempty_pull_layer(&uri));
 
         // The editor is about to receive the current merged set: advance `served` to
@@ -420,7 +406,7 @@ impl Kakehashi {
             // awaits above, so the parse may have landed — and the post-parse
             // debt consumer already run — in between, leaving this
             // freshly-recorded debt with no consumer until the next edit. If
-            // geometry is available NOW, consume the debt here and fire the
+            // geometry and queries are settled NOW, consume the debt here and fire the
             // recovery refresh ourselves. FORCED past the coverage gate (still
             // single-flighted): the debt itself proves the client just
             // received a non-covering answer, which the version-based gate
@@ -434,8 +420,13 @@ impl Kakehashi {
             // covering, and clears everything.
             let geometry_ready = self
                 .documents
-                .get(&uri)
-                .and_then(|doc| doc.snapshot())
+                .latest_snapshot(&uri)
+                .and_then(|view| {
+                    view.slot
+                        .snapshot
+                        .filter(|s| s.parsed_version == view.content_version)
+                })
+                .and_then(|snapshot| self.whole_document_regions(&uri, &snapshot))
                 .is_some();
             if geometry_ready && self.diagnostics.take_degraded_pull(&uri) {
                 crate::lsp::lsp_impl::DiagnosticPublisher::new(self)
@@ -1123,6 +1114,73 @@ mod tests {
             Some("rust".to_string()),
             None, // tree pending: snapshot() is None
         );
+        server.diagnostics.record(
+            &uri,
+            crate::lsp::diagnostic_cache::DiagnosticSource::Region("region-1".to_string()),
+            "lua_ls".to_string(),
+            Some(crate::lsp::bridge::ProgressConnectionId::for_test(1)),
+            vec![diag("boom")],
+        );
+        server.diagnostics.bump_current(&uri);
+        assert!(
+            server.diagnostics.is_dirty(),
+            "the push made the host dirty"
+        );
+
+        let params = DocumentDiagnosticParams {
+            text_document: tower_lsp_server::ls_types::TextDocumentIdentifier {
+                uri: "file:///test/degraded_pull.rs".parse().expect("uri"),
+            },
+            identifier: None,
+            previous_result_id: None,
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let report = server
+            .diagnostic_impl(params)
+            .await
+            .expect("a degraded pull still answers");
+        let DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(full)) = report
+        else {
+            panic!("degraded answer is a full report");
+        };
+        assert!(
+            full.full_document_diagnostic_report.items.is_empty(),
+            "the region push cannot be folded without geometry (that's the degradation)"
+        );
+        assert!(
+            server.diagnostics.is_dirty(),
+            "a degraded answer must not advance `served` — the gap would be masked"
+        );
+        assert!(
+            server.diagnostics.take_degraded_pull(&uri),
+            "the degraded answer records the per-host debt that keys the post-parse recovery refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_pull_does_not_mark_the_change_served() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        let uri = Url::parse("file:///test/degraded_pull.rs").unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse("fn main() {}", None).unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            Some(tree),
+        );
+        let _reload = crate::lsp::lsp_impl::ParserReloadGuard::begin(&server.parser_pool);
+        server.cache.bump_semantic_token_generation();
+        assert!(server.documents.get(&uri).unwrap().snapshot().is_some());
         server.diagnostics.record(
             &uri,
             crate::lsp::diagnostic_cache::DiagnosticSource::Region("region-1".to_string()),
