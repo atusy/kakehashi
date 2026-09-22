@@ -190,8 +190,11 @@ read makes the one-shot virtual layer return `ContentModified` (other enabled
 layers may still answer); a settled language without an injection query returns
 an empty region set. Pull diagnostics retains degraded-answer debt instead of
 marking the document covered. Its immediate recovery check requires settled
-queries as well as a current tree; otherwise the post-parse pass requests the
-recovery refresh.
+queries as well as a current tree. A tree-bearing but unsettled read also starts
+one bounded reload-completion waiter per document lifetime, because auto-install
+reloads do not reparse other hosts. The waiter reloads a missing host parser and
+requests recovery once geometry is readable. Tree-less reads retain the
+post-parse recovery path.
 
 - **Incarnation-scoped, strict monotonicity.** The `>` is strict — equal-version
   double-publishes (e.g. a racing open-parse and reparse both at version 0) must

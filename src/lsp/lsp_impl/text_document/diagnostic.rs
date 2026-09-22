@@ -431,6 +431,9 @@ impl Kakehashi {
             if geometry_ready && self.diagnostics.take_degraded_pull(&uri) {
                 crate::lsp::lsp_impl::DiagnosticPublisher::new(self)
                     .request_pull_diagnostic_refresh(true);
+            } else if !geometry_ready && let Some(snapshot) = &snapshot {
+                crate::lsp::lsp_impl::DiagnosticPublisher::new(self)
+                    .retry_degraded_pull_after_reload(&uri, snapshot.incarnation);
             }
         } else {
             // A failed/partial fan-out (`!pull_clean`) still advances the
@@ -1222,6 +1225,81 @@ mod tests {
         assert!(
             server.diagnostics.take_degraded_pull(&uri),
             "the degraded answer records the per-host debt that keys the post-parse recovery refresh"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reload_pull_refreshes_without_a_reparse() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        let uri = Url::parse("file:///test/degraded_pull.rs").unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse("fn main() {}", None).unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            Some(tree),
+        );
+        server
+            .settings_manager
+            .set_capabilities(tower_lsp_server::ls_types::ClientCapabilities {
+                workspace: Some(tower_lsp_server::ls_types::WorkspaceClientCapabilities {
+                    diagnostics: Some(
+                        tower_lsp_server::ls_types::DiagnosticWorkspaceClientCapabilities {
+                            refresh_support: Some(true),
+                        },
+                    ),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        let reload_lock = crate::lsp::lsp_impl::lock_settings_reload().await;
+        let reload = crate::lsp::lsp_impl::ParserReloadGuard::begin(&server.parser_pool);
+        server.cache.bump_semantic_token_generation();
+        assert!(server.documents.get(&uri).unwrap().snapshot().is_some());
+        let params = DocumentDiagnosticParams {
+            text_document: tower_lsp_server::ls_types::TextDocumentIdentifier {
+                uri: "file:///test/degraded_pull.rs".parse().expect("uri"),
+            },
+            identifier: None,
+            previous_result_id: None,
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let report = server
+            .diagnostic_impl(params)
+            .await
+            .expect("a degraded pull still answers");
+        let DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(full)) = report
+        else {
+            panic!("degraded answer is a full report");
+        };
+        assert!(
+            full.full_document_diagnostic_report.items.is_empty(),
+            "unsettled queries yield a degraded empty answer"
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(server.diagnostics.metrics_snapshot().refreshes_requested, 0);
+        drop(reload);
+        drop(reload_lock);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while server.diagnostics.metrics_snapshot().refreshes_requested == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("settling queries must refresh even without a parse or previous diagnostics");
+        assert!(
+            !server.diagnostics.take_degraded_pull(&uri),
+            "recovery consumes the debt"
         );
     }
 
