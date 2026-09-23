@@ -320,10 +320,11 @@ mod tests {
     /// Drive `initialize` through the real service — a client may only be
     /// sent requests once it is initialized — with one workspace folder and a
     /// client that can answer `workspace/configuration`. Every server→client
-    /// request is answered (`[null]` for a configuration pull, so nothing is
-    /// applied) and the `workspace/configuration` params are recorded.
+    /// request is answered — a configuration pull with `[answer]` — and the
+    /// `workspace/configuration` params are recorded.
     async fn initialized_pull_capable_server(
         first: &std::path::Path,
+        answer: serde_json::Value,
     ) -> (
         LspService<Kakehashi>,
         Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
@@ -346,7 +347,7 @@ mod tests {
                         .lock()
                         .unwrap()
                         .push(request.params().cloned().unwrap_or_default());
-                    serde_json::json!([null])
+                    serde_json::json!([answer])
                 } else {
                     serde_json::Value::Null
                 };
@@ -380,6 +381,10 @@ mod tests {
 
     /// A pull-capable client is asked again once the selected configuration
     /// root moves: the settings in effect were read for the old workspace.
+    ///
+    /// The answer is a real layer rather than `null`, so it is applied — which
+    /// takes the reload lock the folder change held, and anchors its relative
+    /// path to the root now in effect.
     #[tokio::test]
     #[serial(xdg_env)]
     async fn a_root_change_pulls_the_client_configuration_again() {
@@ -388,7 +393,11 @@ mod tests {
         let first = tempfile::tempdir().expect("failed to create first workspace dir");
         let second = tempfile::tempdir().expect("failed to create second workspace dir");
 
-        let (service, pulls) = initialized_pull_capable_server(first.path()).await;
+        let (service, pulls) = initialized_pull_capable_server(
+            first.path(),
+            serde_json::json!({ "searchPaths": ["./pulled"] }),
+        )
+        .await;
         let server = service.inner();
 
         tokio::time::timeout(
@@ -408,6 +417,16 @@ mod tests {
             1,
             "a root change must ask the client for its configuration again"
         );
+        let pulled = second.path().join("pulled");
+        assert!(
+            server
+                .settings_manager
+                .load_settings()
+                .search_paths
+                .iter()
+                .any(|path| std::path::Path::new(path) == pulled),
+            "the answer must be applied, anchored to the new root"
+        );
     }
 
     /// Adding a folder behind the first one leaves the selected root where it
@@ -420,7 +439,8 @@ mod tests {
         let first = tempfile::tempdir().expect("failed to create first workspace dir");
         let second = tempfile::tempdir().expect("failed to create second workspace dir");
 
-        let (service, pulls) = initialized_pull_capable_server(first.path()).await;
+        let (service, pulls) =
+            initialized_pull_capable_server(first.path(), serde_json::Value::Null).await;
         let server = service.inner();
 
         tokio::time::timeout(
