@@ -1249,12 +1249,16 @@ mod properties {
     }
 
     /// Document-controlled language names: arbitrary Unicode (controls
-    /// included) and ASCII biased toward URI delimiters.
+    /// included), printable ASCII, and only URI delimiters and controls.
     fn language() -> impl Strategy<Value = String> {
-        prop_oneof![any::<String>(), "[ -~\t\n\\\\|^\\[\\]%?#/.]{1,12}",]
-            .prop_filter("language must be non-empty", |language| {
-                !language.is_empty()
-            })
+        prop_oneof![
+            any::<String>(),
+            "[ -~\t\n]{1,12}",
+            "[\\\\|^\\[\\]%?#/.:@!$&'()*+,;= \t\n]{1,12}",
+        ]
+        .prop_filter("language must be non-empty", |language| {
+            !language.is_empty()
+        })
     }
 
     /// Dot-free region ids, as `VirtualDocumentUri::new` requires.
