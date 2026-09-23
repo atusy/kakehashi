@@ -231,9 +231,9 @@ pushed `settings.kakehashi`: it is one more layer on top of the ones already in
 effect, and keys it omits keep their current values. An answer of `null`, an
 error response, or no answer within 10 seconds leaves the settings in effect
 unchanged, and so does an answer to a request made before the workspace root
-moved — the root change asks again. Unlike a push, an answer containing keys kakehashi does not know
-(editors keep settings such as `trace.server` in the same section) is not
-rejected: those keys are ignored and the rest applies.
+moved — the root change asks again. Unlike a push, an answer containing keys
+kakehashi does not know (editors keep settings such as `trace.server` in the
+same section) is not rejected: those keys are ignored and the rest applies.
 
 A field answered with an empty container (`{}` or `[]`) means what the same
 spelling means in a config file — for most settings, it clears the value below
