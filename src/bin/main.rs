@@ -1285,7 +1285,7 @@ fn write_new_output_with(
     path: &std::path::Path,
     write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    let mut temp = output_temporary_file(path)?;
+    let mut temp = output_temporary_file(path, None)?;
     write(temp.as_file_mut())?;
     temp.as_file().sync_all()?;
     temp.persist_noclobber(path)
@@ -1293,17 +1293,26 @@ fn write_new_output_with(
         .map_err(|e| e.error)
 }
 
-fn output_temporary_file(path: &std::path::Path) -> std::io::Result<tempfile::NamedTempFile> {
+fn output_temporary_file(
+    path: &std::path::Path,
+    permissions: Option<&std::fs::Permissions>,
+) -> std::io::Result<tempfile::NamedTempFile> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("."));
     #[cfg_attr(not(unix), allow(unused_mut))] // only the cfg(unix) block mutates
     let mut builder = tempfile::Builder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        builder.permissions(std::fs::Permissions::from_mode(0o666));
+    if let Some(permissions) = permissions {
+        // Restrict the initial open itself: chmod after creation cannot revoke
+        // a descriptor opened while the staging file was more permissive.
+        builder.permissions(permissions.clone());
+    } else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            builder.permissions(std::fs::Permissions::from_mode(0o666));
+        }
     }
     builder.tempfile_in(parent)
 }
@@ -1320,8 +1329,10 @@ fn write_forced_output_with(
     write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     let permissions = forced_output_permissions(path)?;
-    let mut temp = output_temporary_file(path)?;
+    let mut temp = output_temporary_file(path, permissions.as_ref())?;
     if let Some(permissions) = permissions {
+        // Creation applies umask; restore the exact previous mode only after
+        // the file has been created with no broader access.
         temp.as_file().set_permissions(permissions)?;
     }
     write(temp.as_file_mut())?;
@@ -1989,6 +2000,25 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(std::fs::read_to_string(output).unwrap(), "existing");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_temporary_file_starts_with_restricted_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let output = directory.path().join("private.toml");
+        let permissions = std::fs::Permissions::from_mode(0o600);
+
+        let staged = output_temporary_file(&output, Some(&permissions)).unwrap();
+
+        let mode = staged.as_file().metadata().unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "staging must never grant group or other access"
+        );
     }
 
     #[test]
