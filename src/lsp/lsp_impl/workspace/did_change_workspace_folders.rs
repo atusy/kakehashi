@@ -657,4 +657,129 @@ mod tests {
         assert_eq!(pulls.len(), 1);
         assert_eq!(scope_of(&pulls[0]), None);
     }
+
+    fn language_server(name: &str) -> serde_json::Value {
+        serde_json::json!({ "languageServers": { name: { "cmd": [name], "languages": ["zz"] } } })
+    }
+
+    fn has_language_server(server: &Kakehashi, name: &str) -> bool {
+        server
+            .settings_manager
+            .load_settings()
+            .language_servers
+            .contains_key(name)
+    }
+
+    /// A pull answer is the client's whole configuration for the scope, not a
+    /// delta: a newer answer takes the older one's place rather than
+    /// accumulating over it, so a server the client stopped configuring goes.
+    #[tokio::test]
+    #[serial(xdg_env)]
+    async fn a_newer_pull_answer_replaces_the_previous_one() {
+        let xdg_scratch = tempfile::tempdir().expect("failed to create scratch XDG_CONFIG_HOME");
+        let _xdg_guard = XdgConfigHomeGuard::set(xdg_scratch.path());
+        let first = tempfile::tempdir().expect("failed to create workspace dir");
+
+        let (service, _pulls) = initialized_server_answering(
+            serde_json::json!([folder(first.path(), "first")]),
+            vec![language_server("old-server"), language_server("new-server")],
+        )
+        .await;
+        let server = service.inner();
+
+        pull_now(server).await;
+        assert!(has_language_server(server, "old-server"), "precondition");
+        pull_now(server).await;
+
+        assert!(has_language_server(server, "new-server"));
+        assert!(
+            !has_language_server(server, "old-server"),
+            "the older answer must not survive beneath the newer one"
+        );
+    }
+
+    /// An answer that holds nothing for kakehashi — only keys the editor keeps
+    /// in the same section — says the client configures nothing here now, so
+    /// it withdraws what the previous answer configured.
+    #[tokio::test]
+    #[serial(xdg_env)]
+    async fn an_answer_with_nothing_for_kakehashi_withdraws_the_previous_one() {
+        let xdg_scratch = tempfile::tempdir().expect("failed to create scratch XDG_CONFIG_HOME");
+        let _xdg_guard = XdgConfigHomeGuard::set(xdg_scratch.path());
+        let first = tempfile::tempdir().expect("failed to create workspace dir");
+
+        let (service, _pulls) = initialized_server_answering(
+            serde_json::json!([folder(first.path(), "first")]),
+            vec![
+                language_server("old-server"),
+                serde_json::json!({ "trace": { "server": "off" } }),
+            ],
+        )
+        .await;
+        let server = service.inner();
+
+        pull_now(server).await;
+        assert!(has_language_server(server, "old-server"), "precondition");
+        pull_now(server).await;
+
+        assert!(!has_language_server(server, "old-server"));
+    }
+
+    /// `null` is the client saying it cannot answer, not that it configures
+    /// nothing: the previous answer stays in effect.
+    #[tokio::test]
+    #[serial(xdg_env)]
+    async fn a_null_answer_keeps_the_previous_one() {
+        let xdg_scratch = tempfile::tempdir().expect("failed to create scratch XDG_CONFIG_HOME");
+        let _xdg_guard = XdgConfigHomeGuard::set(xdg_scratch.path());
+        let first = tempfile::tempdir().expect("failed to create workspace dir");
+
+        let (service, _pulls) = initialized_server_answering(
+            serde_json::json!([folder(first.path(), "first")]),
+            vec![language_server("old-server"), serde_json::Value::Null],
+        )
+        .await;
+        let server = service.inner();
+
+        pull_now(server).await;
+        pull_now(server).await;
+
+        assert!(has_language_server(server, "old-server"));
+    }
+
+    /// The newest answer is the newest statement of the client's
+    /// configuration, so it lands above pushes that arrived before it rather
+    /// than back where the previous answer sat.
+    #[tokio::test]
+    #[serial(xdg_env)]
+    async fn a_pull_answer_lands_above_older_pushes() {
+        let xdg_scratch = tempfile::tempdir().expect("failed to create scratch XDG_CONFIG_HOME");
+        let _xdg_guard = XdgConfigHomeGuard::set(xdg_scratch.path());
+        let first = tempfile::tempdir().expect("failed to create workspace dir");
+
+        let (service, _pulls) = initialized_server_answering(
+            serde_json::json!([folder(first.path(), "first")]),
+            vec![
+                serde_json::json!({ "searchPaths": ["/pulled-first"] }),
+                serde_json::json!({ "searchPaths": ["/pulled-second"] }),
+            ],
+        )
+        .await;
+        let server = service.inner();
+
+        pull_now(server).await;
+        server
+            .did_change_configuration_impl(
+                tower_lsp_server::ls_types::DidChangeConfigurationParams {
+                    settings: serde_json::json!({ "kakehashi": { "searchPaths": ["/pushed"] } }),
+                },
+            )
+            .await;
+        pull_now(server).await;
+
+        assert_eq!(
+            server.settings_manager.load_settings().search_paths,
+            vec!["/pulled-second".to_string()]
+        );
+    }
 }
