@@ -398,7 +398,7 @@ impl InstallCoordinator {
                     break crate::lsp::auto_install::InstallOutcome::Failed;
                 }
             };
-            if terminal.data_dir().is_some()
+            if let Some(data_dir) = terminal.data_dir()
                 && self.same_document_incarnation(&uri, expected_incarnation)
             {
                 if query_repair {
@@ -408,9 +408,7 @@ impl InstallCoordinator {
                     parsed = self
                         .reload_language_after_install(
                             language,
-                            terminal
-                                .data_dir()
-                                .expect("successful terminal has data directory"),
+                            data_dir,
                             uri.clone(),
                             is_injection,
                             expected_incarnation,
