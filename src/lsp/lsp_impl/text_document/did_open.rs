@@ -124,7 +124,7 @@ impl Kakehashi {
 
         // Check if we need to auto-install
         let mut deferred_events = Vec::new();
-        let mut skip_parse = false; // Track if auto-install was triggered
+        let mut skip_parse = false; // Defer parsing only when the parser is unavailable
 
         if let Some(ref lang) = language_name {
             let load_result = self.language.ensure_language_loaded_async(lang).await;
@@ -145,19 +145,24 @@ impl Kakehashi {
                 }
             }
 
-            if !load_result.success {
-                if self.settings_manager.is_auto_install_enabled(lang) {
-                    // Language failed to load and auto-install is enabled.
+            let auto_install = self.settings_manager.is_auto_install_enabled(lang);
+            if !load_result.success || auto_install {
+                if auto_install {
+                    // A parser, or possibly its query dependency chain, needs
+                    // installation. Whether a loaded parser's chain does is
+                    // decided in the spawned task: the probe reads modelines
+                    // across every search path and takes the data directory's
+                    // lock files.
                     //
                     // Move auto-install OFF the ingress writer ticket (#480
                     // liveness): a slow or hung parser *compile* must not hold the
                     // didOpen ticket and wedge later same-URI readers/writers. The
                     // spawned task installs, reloads, and resurrection-safely
                     // reparses the latest store text; this handler returns
-                    // immediately. We skip the inline parse unconditionally — the
-                    // parser is not loaded yet, so an inline parse would yield no
-                    // tree anyway — and the skip-parse branch below advances the
-                    // watermark so a gated reader is not stranded.
+                    // immediately. Query-only repair preserves the inline parse:
+                    // a failed download must not discard a usable parser/tree.
+                    // When the parser is missing, the skip-parse branch advances
+                    // the watermark so a gated reader is not stranded.
                     let install = self.install_coordinator();
                     let injection = self.injection_coordinator();
                     let diagnostic_scheduler = self.diagnostic_scheduler();
@@ -170,33 +175,38 @@ impl Kakehashi {
                     // spawn is pure wasted work and races the bridge-state sweep.
                     let is_cli_mode = self.is_cli_mode();
                     tokio::spawn(async move {
+                        if load_result.success && !install.query_repair_needed(&lang, true).await {
+                            return;
+                        }
                         let completion = install
                             .maybe_auto_install_language(
                                 &lang,
                                 install_uri.clone(),
                                 false,
                                 Some(incarnation),
-                                true,
+                                crate::lsp::lsp_impl::coordinator::InstallRequest::new(
+                                    load_result.success,
+                                ),
                             )
                             .await;
                         if !completion.same_lifetime {
                             return;
                         }
-                        // Only a parse published by this install grants open
-                        // downstream work. A sibling's current tree does not.
-                        if let Some(lineage) = completion.parsed {
+                        // A new parse or a completed query reload grants this
+                        // pass. Query-only repair may retain the existing tree.
+                        if let Some(lineage) =
+                            completion.downstream_lineage(&documents, &install_uri, incarnation)
+                        {
                             if !injection
                                 .process_injections_for_parse(&install_uri, lineage)
                                 .await
                             {
                                 return;
                             }
-                            // Re-fire the proactive synthetic diagnostic now that a
-                            // tree exists: the handler's spawn (below) ran in the
-                            // skip-parse path with no tree, so its snapshot was None
-                            // and the pull-layer diagnostics were skipped on this
-                            // first open of a just-installed parser. Skipped in CLI
-                            // mode (#489), matching the handler's own gate.
+                            // Publish diagnostics with the installed queries.
+                            // The initial pass either had no tree yet or used
+                            // queries from before repair. Skip CLI mode (#489),
+                            // matching the handler's own gate.
                             if !is_cli_mode {
                                 spawn_synthetic_diagnostic_for_parse(
                                     &documents,
@@ -209,7 +219,7 @@ impl Kakehashi {
                             }
                         }
                     });
-                    skip_parse = true;
+                    skip_parse = !load_result.success;
                 } else {
                     // Notify user that parser is missing and needs manual installation
                     let reason = self
@@ -634,6 +644,62 @@ mod tests {
             Some("rust"),
             "plaintext should fall back to a path-derived candidate"
         );
+    }
+
+    /// With auto-install on and the parser loaded, a query-chain repair may run
+    /// in the background, but the open still parses inline: a repair that
+    /// fails (here, scripted) must not leave the document without a tree.
+    #[tokio::test]
+    async fn loaded_parser_parses_inline_while_auto_install_is_on() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        server.settings_manager.apply_settings(WorkspaceSettings {
+            auto_install: true,
+            search_paths: vec![
+                crate::install::default_data_dir()
+                    .expect("test data directory")
+                    .to_string_lossy()
+                    .into_owned(),
+            ],
+            ..Default::default()
+        });
+        assert!(server.settings_manager.is_auto_install_enabled("rust"));
+        // Whatever the probe decides, no real install may run.
+        server
+            .auto_install
+            .script_next_install("rust", crate::lsp::auto_install::InstallOutcome::Failed);
+        let uri = Url::parse("file:///test/inline-with-auto-install.rs").unwrap();
+        let lsp_uri = crate::lsp::lsp_impl::url_to_uri(&uri).unwrap();
+        server
+            .did_open_impl(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: lsp_uri,
+                    language_id: "rust".to_string(),
+                    version: 1,
+                    text: "fn main() {}".to_string(),
+                },
+            })
+            .await;
+        let mut snapshots = server.documents.subscribe_snapshots(&uri).unwrap();
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if snapshots
+                    .borrow_and_update()
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.tree.is_some())
+                {
+                    break;
+                }
+                snapshots.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("the open parses inline instead of deferring to install");
     }
 
     /// A parse publishes twice per version: the tree with its discovery as

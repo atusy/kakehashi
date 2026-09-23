@@ -424,7 +424,13 @@ impl InjectionCoordinator {
             let uri = uri.clone();
             async move {
                 coordinator
-                    .check_injected_languages_auto_install(&uri, &languages, incarnation)
+                    .check_injected_languages_auto_install_after_incarnation_check(
+                        &uri,
+                        &languages,
+                        incarnation,
+                        !forward_did_change,
+                        std::future::ready(()),
+                    )
                     .await;
             }
         };
@@ -467,6 +473,7 @@ impl InjectionCoordinator {
             uri,
             languages,
             expected_incarnation,
+            true,
             std::future::ready(()),
         )
         .await;
@@ -477,6 +484,7 @@ impl InjectionCoordinator {
         uri: &Url,
         languages: &HashSet<String>,
         expected_incarnation: u64,
+        check_query_dependencies: bool,
         after_incarnation_check: F,
     ) where
         F: std::future::Future<Output = ()>,
@@ -533,9 +541,20 @@ impl InjectionCoordinator {
             if !self.same_document_incarnation(uri, expected_incarnation) {
                 return;
             }
+            // Parse-time discovery may have consumed the fresh load events.
+            // Check once per language/reload generation, and again on every
+            // initial (non-didChange) pass unless a repair already failed this
+            // generation; cached edits must not scan or lock the dependency
+            // graph.
+            let repair_queries = load_result.success
+                && install
+                    .query_repair_needed(&resolved_lang, check_query_dependencies)
+                    .await;
             if load_result.success {
                 load_events.extend(load_result.events);
-                continue;
+                if !repair_queries {
+                    continue;
+                }
             }
 
             // Resolved per language, not hoisted: `autoInstall` is now
@@ -562,7 +581,7 @@ impl InjectionCoordinator {
                     uri.clone(),
                     true,
                     Some(expected_incarnation),
-                    true,
+                    super::InstallRequest::new(repair_queries),
                 )
                 .await;
         }
@@ -1106,6 +1125,7 @@ mod tests {
                 &uri,
                 &HashSet::new(),
                 old_incarnation,
+                true,
                 async move {
                     observed.store(true, std::sync::atomic::Ordering::SeqCst);
                 },

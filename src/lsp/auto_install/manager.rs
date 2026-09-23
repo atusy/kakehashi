@@ -8,11 +8,14 @@
 //! post-install coordination (settings update, language reload).
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
     io::Write,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tower_lsp_server::ls_types::MessageType;
 
@@ -37,10 +40,23 @@ pub(crate) struct InstallResult {
 #[derive(Clone)]
 pub(crate) struct InstallCompletion {
     pub(crate) receiver: tokio::sync::watch::Receiver<Option<InstallOutcome>>,
+    settled: Arc<AtomicBool>,
+}
+
+impl InstallCompletion {
+    /// Whether the owner completed the claim itself, which it does only after
+    /// the post-install reload it owes. A cancelled owner's outcome is
+    /// published without that reload. Meaningful once a terminal is observed.
+    pub(crate) fn owner_settled(&self) -> bool {
+        self.settled.load(Ordering::Acquire)
+    }
 }
 
 struct ClaimState {
+    /// Immutable inputs: only callers with the same paths can reuse the outcome.
+    search_paths: Vec<PathBuf>,
     completion: tokio::sync::watch::Sender<Option<InstallOutcome>>,
+    settled: Arc<AtomicBool>,
 }
 
 #[cfg(test)]
@@ -55,6 +71,13 @@ impl TestInstallClaim {
             .take()
             .expect("test claim is present")
             .complete(outcome);
+    }
+
+    /// End the claim the way a cancelled owner does: its outcome is published,
+    /// but the post-install reload it owed never ran.
+    pub(crate) fn publish_without_reload(mut self, outcome: InstallOutcome) {
+        let mut guard = self.guard.take().expect("test claim is present");
+        guard.preserve_terminal(outcome);
     }
 }
 
@@ -120,6 +143,12 @@ pub(crate) enum InstallOutcome {
 }
 
 impl InstallOutcome {
+    /// Whether this attempt ended without the language being installable.
+    /// `AlreadyInstalling` and `Abandoned` say nothing about the language.
+    pub(crate) fn is_failure(&self) -> bool {
+        matches!(self, Self::Unsupported | Self::Failed | Self::NoDataDir)
+    }
+
     /// Get the data directory if installation was successful.
     pub(crate) fn data_dir(&self) -> Option<&PathBuf> {
         match self {
@@ -142,6 +171,29 @@ pub(crate) enum InstallEvent {
     ProgressEnd { success: bool },
 }
 
+#[derive(Default)]
+struct QueryDependencyChecks {
+    generation: u64,
+    languages: HashSet<String>,
+    /// Languages whose query repair failed in `generation`.
+    failed: HashSet<String>,
+}
+
+impl QueryDependencyChecks {
+    /// Move to `generation` if it is newer; false when it is already stale.
+    fn observe(&mut self, generation: u64) -> bool {
+        if generation < self.generation {
+            return false;
+        }
+        if generation > self.generation {
+            self.generation = generation;
+            self.languages.clear();
+            self.failed.clear();
+        }
+        true
+    }
+}
+
 /// Isolated coordinator for parser auto-installation.
 ///
 /// Handles installation state and execution without depending on other
@@ -153,6 +205,10 @@ pub(crate) struct AutoInstallManager {
     /// Tracks languages currently being installed to prevent duplicates
     installing_languages: InstallingLanguages,
     claims: Arc<Mutex<HashMap<String, ClaimState>>>,
+    query_dependency_checks: Arc<Mutex<QueryDependencyChecks>>,
+    /// Outcome the next `try_install` of a language owns without installing.
+    #[cfg(test)]
+    scripted_outcomes: Arc<Mutex<HashMap<String, InstallOutcome>>>,
 }
 
 impl std::fmt::Debug for AutoInstallManager {
@@ -174,6 +230,8 @@ struct InstallMarkerGuard {
     installing: InstallingLanguages,
     claims: Arc<Mutex<HashMap<String, ClaimState>>>,
     completion: tokio::sync::watch::Sender<Option<InstallOutcome>>,
+    /// Set by an explicit [`Self::complete`], before the terminal is sent.
+    settled: Arc<AtomicBool>,
     language: String,
     terminal: Option<InstallOutcome>,
 }
@@ -185,6 +243,8 @@ impl InstallMarkerGuard {
 
     fn complete(mut self, outcome: InstallOutcome) {
         self.terminal = Some(outcome);
+        // Published by the watch send in Drop, which follows.
+        self.settled.store(true, Ordering::Release);
     }
 }
 
@@ -206,21 +266,100 @@ impl AutoInstallManager {
         Self {
             installing_languages,
             claims: Arc::new(Mutex::new(HashMap::new())),
+            query_dependency_checks: Arc::new(Mutex::new(QueryDependencyChecks::default())),
+            #[cfg(test)]
+            scripted_outcomes: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Make the next `try_install` of `language` claim it and own `outcome`,
+    /// so the coordinator's owner path runs without support checks or I/O.
+    #[cfg(test)]
+    pub(crate) fn script_next_install(&self, language: &str, outcome: InstallOutcome) {
+        self.scripted_outcomes
+            .lock()
+            .recover_poison("AutoInstallManager::script_next_install")
+            .insert(language.to_string(), outcome);
+    }
+
+    /// Remember that repairing `language`'s queries failed in `generation`.
+    pub(crate) fn record_query_repair_failure(&self, language: &str, generation: u64) {
+        let mut checked = self
+            .query_dependency_checks
+            .lock()
+            .recover_poison("AutoInstallManager::record_query_repair_failure");
+        if checked.observe(generation) {
+            checked.failed.insert(language.to_string());
+        }
+    }
+
+    /// Whether a query dependency check of `language` is due in `generation`,
+    /// recording it when it is. A repair that already failed in this
+    /// generation declines even an initial pass; otherwise an initial pass
+    /// always checks and a later one only first in the generation. One lock
+    /// covers both, so a failure recorded meanwhile cannot slip between them.
+    pub(crate) fn begin_query_dependency_check(
+        &self,
+        language: &str,
+        generation: u64,
+        initial_pass: bool,
+    ) -> bool {
+        let mut checked = self
+            .query_dependency_checks
+            .lock()
+            .recover_poison("AutoInstallManager::begin_query_dependency_check");
+        let current = checked.observe(generation);
+        if current && checked.failed.contains(language) {
+            return false;
+        }
+        // Edit passes land here on every keystroke: allocate only on a miss.
+        let first = current
+            && !checked.languages.contains(language)
+            && checked.languages.insert(language.to_string());
+        initial_pass || first
+    }
+
+    /// Whether a repair of `language` already failed in `generation`, for a
+    /// probe admitting its answer after other repairs may have finished.
+    pub(crate) fn query_repair_failed(&self, language: &str, generation: u64) -> bool {
+        let checked = self
+            .query_dependency_checks
+            .lock()
+            .recover_poison("AutoInstallManager::query_repair_failed");
+        generation == checked.generation && checked.failed.contains(language)
+    }
+
+    /// Undo [`Self::begin_query_dependency_check`]'s mark for a check that could not
+    /// reach an answer, so a later pass in the same generation checks again.
+    pub(crate) fn forget_query_dependency_check(&self, language: &str, generation: u64) {
+        let mut checked = self
+            .query_dependency_checks
+            .lock()
+            .recover_poison("AutoInstallManager::forget_query_dependency_check");
+        if generation == checked.generation {
+            checked.languages.remove(language);
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn begin_test_claim(&self, language: &str) -> TestInstallClaim {
+    pub(crate) fn begin_test_claim(
+        &self,
+        language: &str,
+        search_paths: Vec<PathBuf>,
+    ) -> TestInstallClaim {
         let mut claims = self
             .claims
             .lock()
             .recover_poison("AutoInstallManager::begin_test_claim");
         assert!(!claims.contains_key(language));
         let (completion, _) = tokio::sync::watch::channel(None);
+        let settled = Arc::new(AtomicBool::new(false));
         claims.insert(
             language.to_string(),
             ClaimState {
+                search_paths,
                 completion: completion.clone(),
+                settled: Arc::clone(&settled),
             },
         );
         assert!(self.installing_languages.try_start_install(language));
@@ -229,6 +368,7 @@ impl AutoInstallManager {
                 installing: self.installing_languages.clone(),
                 claims: Arc::clone(&self.claims),
                 completion,
+                settled,
                 language: language.to_string(),
                 terminal: None,
             }),
@@ -241,7 +381,7 @@ impl AutoInstallManager {
         language: &str,
         outcome: InstallOutcome,
     ) -> InstallResult {
-        let TestInstallClaim { guard } = self.begin_test_claim(language);
+        let TestInstallClaim { guard } = self.begin_test_claim(language, Vec::new());
         InstallResult::with_claim(
             outcome,
             Vec::new(),
@@ -255,23 +395,37 @@ impl AutoInstallManager {
     /// it does NOT call `ClientNotifier` (returns events instead), access
     /// `SettingsManager` (Kakehashi checks settings first), or reload the
     /// language (Kakehashi handles post-install).
-    pub async fn try_install(&self, language: &str) -> InstallResult {
-        self.try_install_with_support_check(language, |language, default_data_dir| async move {
-            let fetch_options =
-                default_data_dir
-                    .as_ref()
-                    .map(|dir| crate::install::metadata::FetchOptions {
-                        data_dir: Some(dir.as_path()),
-                        use_cache: true,
-                    });
-            should_skip_unsupported_language_tracked(&language, fetch_options.as_ref()).await
-        })
+    pub async fn try_install(&self, language: &str, search_paths: Vec<PathBuf>) -> InstallResult {
+        #[cfg(test)]
+        if let Some(outcome) = self
+            .scripted_outcomes
+            .lock()
+            .recover_poison("AutoInstallManager::try_install")
+            .remove(language)
+        {
+            return self.begin_test_result(language, outcome);
+        }
+        self.try_install_with_support_check(
+            language,
+            search_paths,
+            |language, default_data_dir| async move {
+                let fetch_options =
+                    default_data_dir
+                        .as_ref()
+                        .map(|dir| crate::install::metadata::FetchOptions {
+                            data_dir: Some(dir.as_path()),
+                            use_cache: true,
+                        });
+                should_skip_unsupported_language_tracked(&language, fetch_options.as_ref()).await
+            },
+        )
         .await
     }
 
     async fn try_install_with_support_check<F, Fut>(
         &self,
         language: &str,
+        search_paths: Vec<PathBuf>,
         support_check: F,
     ) -> InstallResult
     where
@@ -280,10 +434,12 @@ impl AutoInstallManager {
     {
         self.try_install_with_support_check_and_executor(
             language,
+            search_paths,
             support_check,
-            |language, data_dir| async move {
+            |language, data_dir, search_paths| async move {
                 crate::install::install_language_async(
                     language,
+                    search_paths,
                     data_dir,
                     false,
                     crate::install::parser::ParserCompile::KillableSubprocess,
@@ -297,13 +453,14 @@ impl AutoInstallManager {
     async fn try_install_with_support_check_and_executor<F, Fut, I, IFut>(
         &self,
         language: &str,
+        search_paths: Vec<PathBuf>,
         support_check: F,
         install_executor: I,
     ) -> InstallResult
     where
         F: FnOnce(String, Option<PathBuf>) -> Fut + Send + 'static,
         Fut: Future<Output = TrackedSupportCheck> + Send + 'static,
-        I: FnOnce(String, PathBuf) -> IFut + Send + 'static,
+        I: FnOnce(String, PathBuf, Vec<PathBuf>) -> IFut + Send + 'static,
         IFut: Future<Output = crate::install::InstallResult> + Send + 'static,
     {
         let mut events = Vec::new();
@@ -312,65 +469,86 @@ impl AutoInstallManager {
         // for the same language do not all fetch metadata. Ordinary early
         // returns release the RAII claim; a timeout transfers it to a detached
         // keeper until the still-running blocking lookup exits.
-        let install_marker = {
-            let mut claims = self
-                .claims
-                .lock()
-                .recover_poison("AutoInstallManager::claim_install");
-            if let Some(claim) = claims.get(language) {
-                events.push(InstallEvent::Log {
-                    level: MessageType::INFO,
-                    message: format!(
-                        "Language '{}' support is already being checked or installed",
-                        language
-                    ),
-                });
-                return InstallResult {
-                    outcome: InstallOutcome::AlreadyInstalling,
-                    events,
-                    completion: Some(InstallCompletion {
-                        receiver: claim.completion.subscribe(),
-                    }),
-                    claim: None,
-                };
-            }
-            let (completion, _) = tokio::sync::watch::channel(None);
-            claims.insert(
-                language.to_string(),
-                ClaimState {
-                    completion: completion.clone(),
-                },
-            );
-            if !self.installing_languages.try_start_install(language) {
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "Auto-install state mismatch for '{}': repairing a stale installing marker",
-                    language
-                );
-                events.push(InstallEvent::Log {
-                    level: MessageType::WARNING,
-                    message: format!(
-                        "Auto-install state for '{}' was inconsistent; retrying with repaired state",
-                        language
-                    ),
-                });
-                self.installing_languages.finish_install(language);
-                if !self.installing_languages.try_start_install(language) {
-                    claims.remove(language);
-                    return InstallResult {
-                        outcome: InstallOutcome::Failed,
-                        events,
-                        completion: None,
-                        claim: None,
+        let install_marker = loop {
+            let mut previous_completion = {
+                let mut claims = self
+                    .claims
+                    .lock()
+                    .recover_poison("AutoInstallManager::claim_install");
+                if let Some(claim) = claims.get(language) {
+                    if claim.search_paths == search_paths {
+                        events.push(InstallEvent::Log {
+                            level: MessageType::INFO,
+                            message: format!(
+                                "Language '{}' support is already being checked or installed",
+                                language
+                            ),
+                        });
+                        return InstallResult {
+                            outcome: InstallOutcome::AlreadyInstalling,
+                            events,
+                            completion: Some(InstallCompletion {
+                                receiver: claim.completion.subscribe(),
+                                settled: Arc::clone(&claim.settled),
+                            }),
+                            claim: None,
+                        };
+                    }
+                    // Different configuration inputs cannot reuse this outcome.
+                    // Subscribe before releasing the lock to avoid missing release.
+                    claim.completion.subscribe()
+                } else {
+                    let (completion, _) = tokio::sync::watch::channel(None);
+                    let settled = Arc::new(AtomicBool::new(false));
+                    claims.insert(
+                        language.to_string(),
+                        ClaimState {
+                            search_paths: search_paths.clone(),
+                            completion: completion.clone(),
+                            settled: Arc::clone(&settled),
+                        },
+                    );
+                    if !self.installing_languages.try_start_install(language) {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "Auto-install state mismatch for '{}': repairing a stale installing marker",
+                            language
+                        );
+                        events.push(InstallEvent::Log {
+                            level: MessageType::WARNING,
+                            message: format!(
+                                "Auto-install state for '{}' was inconsistent; retrying with repaired state",
+                                language
+                            ),
+                        });
+                        self.installing_languages.finish_install(language);
+                        if !self.installing_languages.try_start_install(language) {
+                            claims.remove(language);
+                            return InstallResult {
+                                outcome: InstallOutcome::Failed,
+                                events,
+                                completion: None,
+                                claim: None,
+                            };
+                        }
+                    }
+                    break InstallMarkerGuard {
+                        installing: self.installing_languages.clone(),
+                        claims: Arc::clone(&self.claims),
+                        completion,
+                        settled,
+                        language: language.to_string(),
+                        terminal: None,
                     };
                 }
-            }
-            InstallMarkerGuard {
-                installing: self.installing_languages.clone(),
-                claims: Arc::clone(&self.claims),
-                completion,
-                language: language.to_string(),
-                terminal: None,
+            };
+            // Await admission, not an install retry: our support check and
+            // executor have not run. Cancellation here owns no claim. Another
+            // caller may win admission first, so recheck under the lock.
+            while previous_completion.borrow().is_none() {
+                if previous_completion.changed().await.is_err() {
+                    break;
+                }
             }
         };
 
@@ -497,7 +675,7 @@ impl AutoInstallManager {
         // arrived, and skipping on the parser meant that language could never
         // repair itself. Falling through costs a stat per half when everything
         // is there, since staging short-circuits on both.
-        if language_is_complete(language, &data_dir) {
+        if language_is_complete_off_worker(language, &data_dir, &search_paths).await {
             events.push(InstallEvent::Log {
                 level: MessageType::INFO,
                 message: format!(
@@ -531,8 +709,14 @@ impl AutoInstallManager {
             // Auto-install runs inside the LSP server, whose `current_exe()` is the
             // kakehashi binary — so the killable subprocess (re-exec
             // `__compile-parser`) is valid and bounds a hung `cc`.
-            let result = install_executor(task_lang.clone(), task_data_dir.clone()).await;
-            let complete = language_is_complete(&task_lang, &task_data_dir);
+            let result = install_executor(
+                task_lang.clone(),
+                task_data_dir.clone(),
+                search_paths.clone(),
+            )
+            .await;
+            let complete =
+                language_is_complete_off_worker(&task_lang, &task_data_dir, &search_paths).await;
             let terminal = classify_install_outcome(&result, complete, &task_data_dir);
             let mut install_marker = install_marker;
             // If the caller awaiting this task is cancelled, the task output is
@@ -614,11 +798,32 @@ impl AutoInstallManager {
     }
 }
 
+/// [`language_is_complete`] on the blocking pool: the chain walk canonicalizes
+/// and reads query files on every configured search path, which may sit on a
+/// slow filesystem, and must not stall a Tokio worker serving other requests.
+/// A walk that cannot finish answers "not complete", the side that installs.
+async fn language_is_complete_off_worker(
+    language: &str,
+    data_dir: &std::path::Path,
+    search_paths: &[PathBuf],
+) -> bool {
+    let language = language.to_string();
+    let data_dir = data_dir.to_path_buf();
+    let search_paths = search_paths.to_vec();
+    tokio::task::spawn_blocking(move || language_is_complete(&language, &data_dir, &search_paths))
+        .await
+        .unwrap_or(false)
+}
+
 /// Whether both halves of a language are on disk and usable.
 ///
 /// Read from disk rather than from an `InstallResult`, so it answers for
 /// whatever another process published while this install ran.
-fn language_is_complete(language: &str, data_dir: &std::path::Path) -> bool {
+fn language_is_complete(
+    language: &str,
+    data_dir: &std::path::Path,
+    search_paths: &[PathBuf],
+) -> bool {
     // An install that is mid-publish can still roll its queries back, so what is
     // on disk right now is not yet an answer. Hold the language's lock across
     // both reads — releasing it first would leave room for an entire publish and
@@ -628,12 +833,14 @@ fn language_is_complete(language: &str, data_dir: &std::path::Path) -> bool {
     // files — is settled by definition, and must still be readable.
     // The whole chain, not just this language's own queries: a missing inherited
     // parent makes the query load fail outright, and skipping the install over
-    // it is what leaves such a language unrepairable. Every language in the
-    // chain is held still while this decides — an install mid-publish can still
+    // it is what leaves such a language unrepairable. Every managed language in
+    // the chain is held still while this decides — an install mid-publish can still
     // roll its queries back, and a base language can be uninstalled out from
     // under the walk. Non-blocking, so a busy language answers "not ready"
-    // rather than stalling the async path.
-    let Some(chain) = crate::install::queries::lock_complete_chain(data_dir, language) else {
+    // rather than waiting for the install that holds it.
+    let Some(chain) =
+        crate::install::queries::lock_complete_chain(data_dir, language, search_paths)
+    else {
         return false;
     };
     let complete = crate::install::parser_file_exists(language, data_dir).is_some();
@@ -715,6 +922,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn external_overlay_parent_must_be_installed_before_language_is_complete() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        let queries = data.join("queries/child");
+        std::fs::create_dir_all(&queries).unwrap();
+        std::fs::write(queries.join("highlights.scm"), "(comment) @comment\n").unwrap();
+        crate::install::queries::write_install_marker_for_tests(&queries).unwrap();
+        std::fs::create_dir_all(data.join("parser")).unwrap();
+        std::fs::write(
+            data.join(format!("parser/child.{}", std::env::consts::DLL_EXTENSION)),
+            "parser fixture",
+        )
+        .unwrap();
+        let overlay = runtime.join("queries/child");
+        std::fs::create_dir_all(&overlay).unwrap();
+        std::fs::write(
+            overlay.join("highlights.scm"),
+            ";; extends\n;; inherits: parent\n",
+        )
+        .unwrap();
+        assert!(language_is_complete("child", &data, &[]));
+        assert!(!language_is_complete(
+            "child",
+            &data,
+            std::slice::from_ref(&runtime)
+        ));
+        let parent = data.join("queries/parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::write(parent.join("highlights.scm"), "(comment) @comment\n").unwrap();
+        crate::install::queries::write_install_marker_for_tests(&parent).unwrap();
+        assert!(language_is_complete("child", &data, &[runtime]));
+    }
+
     fn create_test_manager() -> AutoInstallManager {
         AutoInstallManager::new(InstallingLanguages::new())
     }
@@ -743,7 +985,9 @@ mod tests {
         claims.lock().unwrap().insert(
             "lua".to_string(),
             ClaimState {
+                search_paths: Vec::new(),
                 completion: completion.clone(),
+                settled: Arc::new(AtomicBool::new(false)),
             },
         );
 
@@ -751,6 +995,7 @@ mod tests {
             installing: installing.clone(),
             claims,
             completion,
+            settled: Arc::new(AtomicBool::new(false)),
             language: "lua".to_string(),
             terminal: None,
         };
@@ -763,6 +1008,106 @@ mod tests {
         );
     }
 
+    #[test]
+    fn query_dependency_checks_follow_generation_not_parser_load_events() {
+        let manager = create_test_manager();
+        let sibling = manager.clone();
+        assert!(manager.begin_query_dependency_check("lua", 10, false));
+        assert!(!sibling.begin_query_dependency_check("lua", 10, false));
+        assert!(sibling.begin_query_dependency_check("python", 10, false));
+        // An initial pass checks even after the generation's mark is used.
+        assert!(sibling.begin_query_dependency_check("lua", 10, true));
+        assert!(manager.begin_query_dependency_check("lua", 11, false));
+        // A stale generation neither marks nor sees the newer marks...
+        assert!(!sibling.begin_query_dependency_check("lua", 10, false));
+        // ...but its initial pass still checks.
+        assert!(sibling.begin_query_dependency_check("lua", 10, true));
+        assert!(!manager.begin_query_dependency_check("lua", 11, false));
+        assert!(manager.begin_query_dependency_check("python", 11, false));
+        // A failed repair declines even an initial pass, until a new generation.
+        manager.record_query_repair_failure("python", 11);
+        assert!(!manager.begin_query_dependency_check("python", 11, true));
+        assert!(manager.begin_query_dependency_check("python", 12, true));
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_different_paths_waiter_preserves_the_owner_claim() {
+        let manager = create_test_manager();
+        let owner = manager.begin_test_claim("different-paths", Vec::new());
+        let mut waiter = Box::pin(manager.try_install_with_support_check(
+            "different-paths",
+            vec![PathBuf::from("/new-runtime")],
+            |_, _| async { panic!("waiting must not start a support check") },
+        ));
+        assert!(futures::poll!(waiter.as_mut()).is_pending());
+        drop(waiter);
+        assert!(
+            manager
+                .claims
+                .lock()
+                .unwrap()
+                .contains_key("different-paths")
+        );
+        owner.complete(InstallOutcome::Failed);
+        assert!(
+            !manager
+                .claims
+                .lock()
+                .unwrap()
+                .contains_key("different-paths")
+        );
+        assert!(
+            manager
+                .installing_languages
+                .try_start_install("different-paths")
+        );
+    }
+
+    #[tokio::test]
+    async fn different_runtime_paths_wait_then_run_their_own_install_attempt() {
+        for terminal in [
+            InstallOutcome::Failed,
+            InstallOutcome::Success {
+                data_dir: PathBuf::from("/old-install"),
+            },
+        ] {
+            let manager = create_test_manager();
+            let owner = manager.begin_test_claim("different-paths", Vec::new());
+            let expected_paths = vec![PathBuf::from("/new-runtime")];
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let executor_calls = Arc::clone(&calls);
+            let mut waiter = Box::pin(manager.try_install_with_support_check_and_executor(
+                "different-paths",
+                expected_paths.clone(),
+                |_, _| async { TrackedSupportCheck::completed(false, None) },
+                move |_, _, paths| async move {
+                    assert_eq!(paths, expected_paths);
+                    executor_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    crate::install::InstallResult {
+                        parser_path: Some(PathBuf::from("/new-install/parser")),
+                        queries_path: Some(PathBuf::from("/new-install/queries")),
+                        parser_error: None,
+                        queries_error: None,
+                        rollback_residue: None,
+                        files_downloaded: Vec::new(),
+                    }
+                },
+            ));
+            assert!(
+                futures::poll!(waiter.as_mut()).is_pending(),
+                "different paths must wait for the owner, not reuse its outcome"
+            );
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            owner.complete(terminal);
+            let mut result = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+                .await
+                .expect("new-path attempt must run after owner finishes");
+            assert!(matches!(result.outcome, InstallOutcome::Success { .. }));
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            result.complete_claim();
+        }
+    }
+
     #[tokio::test]
     async fn cancelled_owner_preserves_detached_install_success_for_exact_waiter() {
         let manager = create_test_manager();
@@ -773,8 +1118,9 @@ mod tests {
             owner_manager
                 .try_install_with_support_check_and_executor(
                     "controlled-detached-success",
+                    Vec::new(),
                     |_, _| async { TrackedSupportCheck::completed(false, None) },
-                    |_, _| async move {
+                    |_, _, _| async move {
                         let _ = started_tx.send(());
                         let _ = release_rx.await;
                         crate::install::InstallResult {
@@ -792,9 +1138,11 @@ mod tests {
         started_rx.await.expect("install executor must start");
 
         let duplicate = manager
-            .try_install_with_support_check("controlled-detached-success", |_, _| async {
-                panic!("the exact waiter must not start another support check")
-            })
+            .try_install_with_support_check(
+                "controlled-detached-success",
+                Vec::new(),
+                |_, _| async { panic!("the exact waiter must not start another support check") },
+            )
             .await;
         assert_eq!(duplicate.outcome, InstallOutcome::AlreadyInstalling);
         let mut completion = duplicate
@@ -828,7 +1176,7 @@ mod tests {
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let owner = tokio::spawn(async move {
             owner_manager
-                .try_install_with_support_check("panic-support", |_, _| async move {
+                .try_install_with_support_check("panic-support", Vec::new(), |_, _| async move {
                     let _ = started_tx.send(());
                     let _ = release_rx.await;
                     panic!("controlled support panic");
@@ -837,7 +1185,7 @@ mod tests {
         });
         started_rx.await.unwrap();
         let duplicate = manager
-            .try_install_with_support_check("panic-support", |_, _| async {
+            .try_install_with_support_check("panic-support", Vec::new(), |_, _| async {
                 panic!("exact waiter must not run support check")
             })
             .await;
@@ -850,7 +1198,7 @@ mod tests {
             InstallOutcome::Abandoned
         );
         let retry = manager
-            .try_install_with_support_check("panic-support", |_, _| async {
+            .try_install_with_support_check("panic-support", Vec::new(), |_, _| async {
                 TrackedSupportCheck::completed(true, None)
             })
             .await;
@@ -867,8 +1215,9 @@ mod tests {
             owner_manager
                 .try_install_with_support_check_and_executor(
                     "panic-install",
+                    Vec::new(),
                     |_, _| async { TrackedSupportCheck::completed(false, None) },
-                    |_, _| async move {
+                    |_, _, _| async move {
                         let _ = started_tx.send(());
                         let _ = release_rx.await;
                         panic!("controlled install panic");
@@ -878,7 +1227,7 @@ mod tests {
         });
         started_rx.await.unwrap();
         let duplicate = manager
-            .try_install_with_support_check("panic-install", |_, _| async {
+            .try_install_with_support_check("panic-install", Vec::new(), |_, _| async {
                 panic!("exact waiter must not run support check")
             })
             .await;
@@ -891,7 +1240,7 @@ mod tests {
             InstallOutcome::Abandoned
         );
         let retry = manager
-            .try_install_with_support_check("panic-install", |_, _| async {
+            .try_install_with_support_check("panic-install", Vec::new(), |_, _| async {
                 TrackedSupportCheck::completed(true, None)
             })
             .await;
@@ -914,7 +1263,7 @@ mod tests {
 
         let first = tokio::spawn(async move {
             first_manager
-                .try_install_with_support_check("lua", |_, _| async move {
+                .try_install_with_support_check("lua", Vec::new(), |_, _| async move {
                     first_lookup_count.fetch_add(1, Ordering::SeqCst);
                     let _ = started_tx.send(());
                     let _ = release_rx.await;
@@ -926,7 +1275,7 @@ mod tests {
 
         let duplicate_lookup_count = Arc::clone(&lookup_count);
         let result = manager
-            .try_install_with_support_check("lua", move |_, _| {
+            .try_install_with_support_check("lua", Vec::new(), move |_, _| {
                 duplicate_lookup_count.fetch_add(1, Ordering::SeqCst);
                 async { TrackedSupportCheck::completed(false, None) }
             })
@@ -967,7 +1316,7 @@ mod tests {
         let (second_release_tx, second_release_rx) = tokio::sync::oneshot::channel();
         let second = tokio::spawn(async move {
             second_manager
-                .try_install_with_support_check("lua", |_, _| async move {
+                .try_install_with_support_check("lua", Vec::new(), |_, _| async move {
                     let _ = second_started_tx.send(());
                     let _ = second_release_rx.await;
                     TrackedSupportCheck::completed(true, None)
@@ -994,7 +1343,7 @@ mod tests {
         let manager = create_test_manager();
 
         let result = manager
-            .try_install_with_support_check("unsupported", |_, _| async {
+            .try_install_with_support_check("unsupported", Vec::new(), |_, _| async {
                 TrackedSupportCheck::completed(true, None)
             })
             .await;
@@ -1016,7 +1365,7 @@ mod tests {
         let manager = AutoInstallManager::new(installing.clone());
 
         let result = manager
-            .try_install_with_support_check("stale-marker", |_, _| async {
+            .try_install_with_support_check("stale-marker", Vec::new(), |_, _| async {
                 TrackedSupportCheck::completed(true, None)
             })
             .await;
@@ -1032,7 +1381,7 @@ mod tests {
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
 
         let result = manager
-            .try_install_with_support_check("lua", |_, _| async move {
+            .try_install_with_support_check("lua", Vec::new(), |_, _| async move {
                 TrackedSupportCheck {
                     should_skip: true,
                     reason: None,
@@ -1045,7 +1394,7 @@ mod tests {
         assert_eq!(result.outcome, InstallOutcome::Unsupported);
 
         let duplicate = manager
-            .try_install_with_support_check("lua", |_, _| async {
+            .try_install_with_support_check("lua", Vec::new(), |_, _| async {
                 TrackedSupportCheck::completed(false, None)
             })
             .await;
@@ -1082,7 +1431,7 @@ mod tests {
         let manager = create_test_manager();
 
         let result = manager
-            .try_install_with_support_check("lua", |_, _| async {
+            .try_install_with_support_check("lua", Vec::new(), |_, _| async {
                 TrackedSupportCheck {
                     should_skip: false,
                     reason: None,
@@ -1113,7 +1462,7 @@ mod tests {
 
         let task = tokio::spawn(async move {
             task_manager
-                .try_install_with_support_check("lua", |_, _| async move {
+                .try_install_with_support_check("lua", Vec::new(), |_, _| async move {
                     let _ = started_tx.send(());
                     let _ = release_rx.await;
                     TrackedSupportCheck::completed(true, None)
@@ -1127,7 +1476,7 @@ mod tests {
         let duplicate_lookups = Arc::new(AtomicUsize::new(0));
         let duplicate_count = Arc::clone(&duplicate_lookups);
         let duplicate = manager
-            .try_install_with_support_check("lua", move |_, _| {
+            .try_install_with_support_check("lua", Vec::new(), move |_, _| {
                 duplicate_count.fetch_add(1, Ordering::SeqCst);
                 async { TrackedSupportCheck::completed(false, None) }
             })
@@ -1172,7 +1521,7 @@ mod tests {
 
         let caller = tokio::spawn(async move {
             task_manager
-                .try_install_with_support_check("lua", |_, _| async move {
+                .try_install_with_support_check("lua", Vec::new(), |_, _| async move {
                     let _ = lookup_started_tx.send(());
                     let _ = timeout_rx.await;
                     let completion = tokio::spawn(async move {

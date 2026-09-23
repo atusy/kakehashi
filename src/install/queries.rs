@@ -1,6 +1,7 @@
 //! Query file downloading from nvim-treesitter repository.
 
 use crate::language::query_modeline::{InheritedLanguage, parse_modeline};
+use path_clean::PathClean;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -49,10 +50,9 @@ pub enum QueryInstallError {
     IoError(std::io::Error),
     /// Queries already exist and --force not specified.
     AlreadyExists(PathBuf),
-    /// A language this install needed was removed after staging found it
-    /// already installed. Not an upstream problem — the remedy is to retry, not
-    /// to look for a language nvim-treesitter does not have.
-    DependencyRemoved(String),
+    /// A dependency disappeared or its query declarations changed after staging.
+    /// Not an upstream problem: retry using the new dependency graph.
+    DependencyChanged(String),
     /// Publishing moved the live queries aside and could not put anything back:
     /// the language has no queries, and the previous ones are in `backup`.
     PreviousQueriesStranded {
@@ -90,11 +90,11 @@ impl std::fmt::Display for QueryInstallError {
                     path.display()
                 )
             }
-            Self::DependencyRemoved(language) => {
+            Self::DependencyChanged(language) => {
                 write!(
                     f,
-                    "The queries installed for '{}' were removed or replaced while it was being \
-                     installed",
+                    "Query dependencies for '{}' changed or became unreadable while it was being \
+                     installed; retry the installation",
                     language
                 )
             }
@@ -149,15 +149,48 @@ fn validate_safe_language_name(language: &str) -> Result<(), QueryInstallError> 
 /// installer manages (`QUERY_FILES`).
 ///
 /// Each kind resolves its own `; inherits:` chain when it loads, and a parent it
-/// names but that is not installed makes that load fail outright — so
+/// names that no search path has makes that load fail outright — so
 /// injections.scm's parents matter exactly as much as highlights.scm's. A
 /// kind the installer does not fetch (bindings, captures kinds) resolves its
 /// parents the same way, but only from files the user placed on a search
 /// path; nothing here can install those.
 fn inherited_languages_on_disk(queries_dir: &Path) -> Option<Vec<InheritedLanguage>> {
+    inherited_languages_in(queries_dir, UnreadableQuery::Undetermined, None)
+}
+
+/// Whether `file` resolves into `managed_root`, the canonical managed
+/// directory of the language being read: through any link, it is then that
+/// language's managed copy, never a runtime source. A link to another
+/// language's managed file is left alone; the loader reads it as this
+/// language's query.
+fn resolves_into(file: &Path, managed_root: Option<&Path>) -> bool {
+    managed_root.is_some_and(|root| fs::canonicalize(file).is_ok_and(|file| file.starts_with(root)))
+}
+
+/// What an unreadable query file means for the dependency set.
+#[derive(Clone, Copy)]
+enum UnreadableQuery {
+    /// A managed copy: the chain cannot be determined, so it is not complete.
+    Undetermined,
+    /// A user's runtime file: the loader fails only that kind, and no install
+    /// repairs it, so it declares nothing here.
+    Skipped,
+}
+
+/// `managed_root`, the language's canonical managed directory, is given when
+/// reading a runtime directory: files resolving into it are skipped as
+/// managed copies.
+fn inherited_languages_in(
+    queries_dir: &Path,
+    unreadable: UnreadableQuery,
+    managed_root: Option<&Path>,
+) -> Option<Vec<InheritedLanguage>> {
     let mut parents: Vec<InheritedLanguage> = Vec::new();
     for query_file in QUERY_FILES {
         let path = queries_dir.join(query_file);
+        if resolves_into(&path, managed_root) {
+            continue;
+        }
         let content = match fs::read_to_string(&path) {
             Ok(content) => content,
             // A kind this language does not have — but only when there is no
@@ -171,10 +204,20 @@ fn inherited_languages_on_disk(queries_dir: &Path) -> Option<Vec<InheritedLangua
             {
                 continue;
             }
-            // A kind it has but that cannot be read. Answering "no parents"
-            // would let a caller call the chain complete on a file it never
-            // saw, so say the chain cannot be determined instead.
-            Err(_) => return None,
+            // A kind it has but that cannot be read. For a managed copy,
+            // answering "no parents" would let a caller call the chain complete
+            // on a file it never saw, so say the chain cannot be determined.
+            Err(_) if matches!(unreadable, UnreadableQuery::Undetermined) => return None,
+            // Debug, not warn: the probe runs on every open, and the loader
+            // already reports the kind this file breaks.
+            Err(e) => {
+                log::debug!(
+                    target: "kakehashi::install",
+                    "Ignoring unreadable runtime query {:?} while collecting dependencies: {e}",
+                    path
+                );
+                continue;
+            }
         };
         for parent in parse_modeline(&content).inherits {
             match parents.iter_mut().find(|p| p.name == parent.name) {
@@ -185,6 +228,116 @@ fn inherited_languages_on_disk(queries_dir: &Path) -> Option<Vec<InheritedLangua
         }
     }
     Some(parents)
+}
+
+/// Include configured runtime files as dependency declarations. The loader reads
+/// modelines from every hit (including shadowed plain files), so scan all hits.
+/// Download destinations remain under the data directory; these paths are read-only.
+/// Only the managed copy must be readable: an unreadable runtime file is skipped.
+fn inherited_languages_with_search_paths(
+    queries_dir: &Path,
+    language: &str,
+    search_paths: &[PathBuf],
+) -> Option<Vec<InheritedLanguage>> {
+    inherited_languages_replacing(queries_dir, queries_dir, language, search_paths)
+}
+
+/// [`inherited_languages_with_search_paths`] for `queries_dir` standing in for
+/// the live copy at `managed`, as a staged replacement does. A runtime path
+/// reaching the live copy, directly or through a link, would otherwise feed
+/// the replacement the declarations it is replacing.
+fn inherited_languages_replacing(
+    queries_dir: &Path,
+    managed: &Path,
+    language: &str,
+    search_paths: &[PathBuf],
+) -> Option<Vec<InheritedLanguage>> {
+    let mut parents = inherited_languages_on_disk(queries_dir)?;
+    let managed_root = fs::canonicalize(managed).ok();
+    for base in search_paths {
+        let directory = base.join("queries").join(language).clean();
+        if same_directory(&directory, queries_dir) || same_directory(&directory, managed) {
+            continue;
+        }
+        for parent in inherited_languages_in(
+            &directory,
+            UnreadableQuery::Skipped,
+            managed_root.as_deref(),
+        )? {
+            match parents.iter_mut().find(|known| known.name == parent.name) {
+                Some(known) => known.optional &= parent.optional,
+                None => parents.push(parent),
+            }
+        }
+    }
+    Some(parents)
+}
+
+/// The configured search paths as dependency sources: normalized the way the
+/// loader folds them, and without any that resolve to the data directory,
+/// whose copies are read as managed ones rather than as runtime files.
+fn runtime_search_paths(data_dir: &Path, search_paths: &[PathBuf]) -> Vec<PathBuf> {
+    let data_dir = data_dir.clean();
+    let managed_queries = data_dir.join("queries");
+    search_paths
+        .iter()
+        .map(|path| path.clean())
+        // A root aliasing the data directory, or one whose `queries` does.
+        .filter(|path| {
+            !same_directory(path, &data_dir)
+                && !same_directory(&path.join("queries"), &managed_queries)
+        })
+        .collect()
+}
+
+/// Whether two paths name the same directory, through symlinks too.
+fn same_directory(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (fs::canonicalize(a), fs::canonicalize(b)),
+            (Ok(a), Ok(b)) if a == b
+        )
+}
+
+/// Whether a search path outside the data directory supplies `language` as an
+/// inherited parent: a readable base (not `extends`) `highlights.scm` there is
+/// what the loader resolves the parent from, so no managed copy is needed.
+///
+/// An overlay alone does not count: the loader would load it without the base
+/// the child expects, so the base still has to be installed. `highlights.scm`
+/// stands for the language as it does in [`query_install_is_complete`]; the
+/// installer's per-language union does not resolve each kind separately.
+fn provided_outside_data_dir(
+    queries_parent: &Path,
+    language: &str,
+    search_paths: &[PathBuf],
+) -> bool {
+    let managed = queries_parent.join(language).clean();
+    // A managed base of any kind, even an empty leftover, is what the loader
+    // takes first when the data directory precedes the runtime path; only
+    // with none at all is the runtime base the one it reads.
+    if fs::symlink_metadata(managed.join("highlights.scm")).is_ok() {
+        return false;
+    }
+    let managed_root = fs::canonicalize(&managed).ok();
+    search_paths.iter().any(|base| {
+        let directory = base.join("queries").join(language).clean();
+        let highlights = directory.join("highlights.scm");
+        // Compared by identity: a link to the managed copy, of the directory
+        // or of the file, is not another source.
+        !same_directory(&directory, &managed)
+            && !resolves_into(&highlights, managed_root.as_deref())
+            && fs::read_to_string(&highlights).is_ok_and(|content| {
+                let modeline = parse_modeline(&content);
+                // Reached as a parent, so an optional self-name is skipped as
+                // the loader skips it, and does not mark an overlay.
+                !modeline.extends
+                    && !modeline
+                        .inherits
+                        .iter()
+                        .any(|parent| !parent.optional && parent.name == language)
+            })
+    })
 }
 
 /// The parents a language actually needs on disk, given how it is reached.
@@ -211,26 +364,59 @@ fn required_parents(
         .map(|parent| parent.name)
 }
 
-/// Hold every language in an inheritance chain still, and report whether all of
-/// them are installed.
+/// Hold every language in an inheritance chain still, and report
+/// whether the chain is complete: every language installed, or, for an
+/// inherited parent with no complete managed copy, provided as a base query by
+/// a search path outside the data directory.
 ///
-/// `Some(guards)` means the chain is complete and stays that way while the
-/// guards live — so a caller can read the rest of its state (a parser file, say)
-/// without the answer moving underneath it. `None` means a language in the chain
-/// is missing, or one of them is mid-publish and its queries can still be rolled
-/// back, or the name is not one that could be installed.
+/// `Some(guards)` means the managed chain is complete and protected from
+/// install/uninstall while the guards live, so a caller can also read its parser.
+/// External runtime files are observed but not locked; user edits may change
+/// their declarations after this check. `None` means a language in the chain
+/// is missing, or one of them is held by an install (staging or publishing, so
+/// its queries can still change or be rolled back) or an uninstall, or the
+/// name is not one that could be installed.
 ///
 /// Locks are taken with [`try_lock_language`], so this never waits: it runs on
 /// the LSP's async path, and there "someone is publishing, look again later" is
 /// as useful as an answer as blocking for one. Because nothing waits, taking
 /// them in discovery order cannot deadlock.
-pub(crate) fn lock_complete_chain(data_dir: &Path, language: &str) -> Option<Vec<LanguageLock>> {
+pub(crate) fn lock_complete_chain(
+    data_dir: &Path,
+    language: &str,
+    search_paths: &[PathBuf],
+) -> Option<Vec<LanguageLock>> {
+    match probe_chain(data_dir, language, search_paths) {
+        ChainProbe::Complete(guards) => Some(guards),
+        ChainProbe::Incomplete | ChainProbe::Busy => None,
+    }
+}
+
+/// What [`probe_chain`] found for an inheritance chain.
+pub(crate) enum ChainProbe {
+    /// Every language is installed or provided by a search path; the guards
+    /// keep installs from replacing any of them while they live.
+    Complete(Vec<LanguageLock>),
+    /// A language is missing, unreadable, or not installable by name.
+    Incomplete,
+    /// A language's lock is held exclusively by an install (staging or
+    /// publishing it) or an uninstall, so the chain cannot be judged right
+    /// now. Other probes never cause this.
+    Busy,
+}
+
+/// [`lock_complete_chain`], telling a held lock apart from a missing language.
+/// The walk stops at the first language that fails, so a chain reported busy
+/// may also turn out incomplete once the lock is released.
+pub(crate) fn probe_chain(data_dir: &Path, language: &str, search_paths: &[PathBuf]) -> ChainProbe {
     fn walk(
         data_dir: &Path,
         language: &str,
         is_included: bool,
+        search_paths: &[PathBuf],
         seen: &mut Vec<String>,
         guards: &mut Vec<LanguageLock>,
+        busy: &mut bool,
     ) -> bool {
         // A language already on the path — a file naming its own language
         // (read as `extends`), or an A↔B cycle for the loader to report — is
@@ -239,25 +425,62 @@ pub(crate) fn lock_complete_chain(data_dir: &Path, language: &str) -> Option<Vec
             return true;
         }
         seen.push(language.to_string());
+        let queries_dir = data_dir.join("queries").join(language);
+        // Locked before anything is read, a provided parent included: a
+        // forced install of it removes its managed copy between two renames,
+        // and that transient absence must read as busy, not as "provided".
         match try_lock_language(data_dir, language) {
             LanguageLockProbe::Idle(guard) => guards.push(guard),
             // Nothing can publish into a data directory nothing can write, so
             // what is there is settled without a guard to prove it.
             LanguageLockProbe::Unlockable => {}
-            LanguageLockProbe::Busy
-            | LanguageLockProbe::UnusableName
-            | LanguageLockProbe::Unavailable => return false,
+            LanguageLockProbe::Busy => {
+                *busy = true;
+                return false;
+            }
+            LanguageLockProbe::UnusableName | LanguageLockProbe::Unavailable => return false,
         }
-        let queries_dir = data_dir.join("queries").join(language);
+        // A parent the loader resolves from a search path needs no managed
+        // copy; its own declarations are still part of the chain.
+        if is_included
+            && !query_install_is_complete(&queries_dir)
+            && provided_outside_data_dir(&data_dir.join("queries"), language, search_paths)
+        {
+            return inherited_languages_with_search_paths(&queries_dir, language, search_paths)
+                .is_some_and(|parents| {
+                    required_parents(parents, true).all(|parent| {
+                        walk(data_dir, &parent, true, search_paths, seen, guards, busy)
+                    })
+                });
+        }
         query_install_is_complete(&queries_dir)
-            && inherited_languages_on_disk(&queries_dir).is_some_and(|parents| {
-                required_parents(parents, is_included)
-                    .all(|parent| walk(data_dir, &parent, true, seen, guards))
-            })
+            && inherited_languages_with_search_paths(&queries_dir, language, search_paths)
+                .is_some_and(|parents| {
+                    required_parents(parents, is_included).all(|parent| {
+                        walk(data_dir, &parent, true, search_paths, seen, guards, busy)
+                    })
+                })
     }
 
+    // The same view staging uses: the managed copy is judged as the data
+    // directory, never again through an alias as if another path provided it.
+    let search_paths = runtime_search_paths(data_dir, search_paths);
     let mut guards = Vec::new();
-    walk(data_dir, language, false, &mut Vec::new(), &mut guards).then_some(guards)
+    let mut busy = false;
+    let complete = walk(
+        data_dir,
+        language,
+        false,
+        &search_paths,
+        &mut Vec::new(),
+        &mut guards,
+        &mut busy,
+    );
+    match (complete, busy) {
+        (true, _) => ChainProbe::Complete(guards),
+        (false, true) => ChainProbe::Busy,
+        (false, false) => ChainProbe::Incomplete,
+    }
 }
 
 /// Download and install query files for a language, including inherited dependencies.
@@ -289,6 +512,7 @@ pub(crate) fn stage_queries_with_dependencies_from(
     language: &str,
     data_dir: &Path,
     force: bool,
+    search_paths: &[PathBuf],
 ) -> Result<StagedQueryInstall, QueryInstallError> {
     stage_queries_with_dependencies(
         base_url,
@@ -296,6 +520,7 @@ pub(crate) fn stage_queries_with_dependencies_from(
         data_dir,
         force,
         QueryHttpPolicy::HttpsOnly,
+        search_paths,
     )
 }
 
@@ -307,6 +532,7 @@ pub(crate) fn stage_queries_with_dependencies_from_allowing_http_for_tests(
     language: &str,
     data_dir: &Path,
     force: bool,
+    search_paths: &[PathBuf],
 ) -> Result<StagedQueryInstall, QueryInstallError> {
     stage_queries_with_dependencies(
         base_url,
@@ -314,6 +540,7 @@ pub(crate) fn stage_queries_with_dependencies_from_allowing_http_for_tests(
         data_dir,
         force,
         QueryHttpPolicy::AllowHttpForTests,
+        search_paths,
     )
 }
 
@@ -370,7 +597,8 @@ fn install_queries_with_dependencies_from_with_http_policy(
     force: bool,
     http_policy: QueryHttpPolicy,
 ) -> Result<QueryInstallResult, QueryInstallError> {
-    let staged = stage_queries_with_dependencies(base_url, language, data_dir, force, http_policy)?;
+    let staged =
+        stage_queries_with_dependencies(base_url, language, data_dir, force, http_policy, &[])?;
     // One lock per language this install depends on, in the sorted order
     // `dependencies()` returns, so publishing a base language cannot interleave
     // with an install or uninstall of that language elsewhere.
@@ -384,8 +612,8 @@ fn install_queries_with_dependencies_from_with_http_policy(
             format!("Query install for {language} was superseded by uninstall"),
         )));
     }
-    if let Some(unstable) = staged.unstable_skipped_dependency() {
-        return Err(QueryInstallError::DependencyRemoved(unstable.to_string()));
+    if let Some(unstable) = staged.unstable_dependency() {
+        return Err(QueryInstallError::DependencyChanged(unstable.to_string()));
     }
     let published = staged.publish().map_err(|failure| failure.error)?;
     match published.commit() {
@@ -442,12 +670,18 @@ pub(crate) struct StagedQueryInstall {
     requested_already_complete: bool,
     entries: Vec<StagedQueryDir>,
     /// Every language this install needs on disk — the requested one and its
-    /// whole `; inherits:` chain, whether staged or found already complete.
+    /// `; inherits:` chain, whether staged or found already complete, except
+    /// the parents in `external`.
     /// Sorted, so locking them in this order cannot deadlock against another
     /// install locking an overlapping set.
     dependencies: Vec<String>,
+    /// Inherited parents a search path outside the data directory provides
+    /// (see [`provided_outside_data_dir`]): part of the chain, but neither
+    /// staged nor locked, so they are re-checked before publication instead.
+    external: Vec<String>,
     /// Where those languages live, for the completeness re-check.
     queries_parent: PathBuf,
+    search_paths: Vec<PathBuf>,
 }
 
 /// A query directory that has been renamed into place, with the directory it
@@ -490,29 +724,24 @@ impl StagedQueryInstall {
     }
 
     /// Languages this install needs to lock before publishing: the requested
-    /// one and every language it reaches through `; inherits:`, sorted.
+    /// one and every language it reaches through `; inherits:` other than
+    /// those a search path provides, sorted.
     pub(crate) fn dependencies(&self) -> &[String] {
         &self.dependencies
     }
 
-    /// The first language staging skipped as already installed whose state has
-    /// moved since — its queries gone, unreadable, or now inheriting something
-    /// this install never discovered.
-    ///
-    /// Staging does not copy a language whose queries are already complete, so
-    /// there is no staged copy to publish and nothing in the publish that would
-    /// notice it changing. Without this, an uninstall or a forced reinstall
-    /// between staging and publication would leave this install reporting
-    /// success over a chain nobody was holding still. Callers check it once
-    /// they hold the locks that keep the answer true.
-    pub(crate) fn unstable_skipped_dependency(&self) -> Option<&str> {
+    /// The first dependency that disappeared, became unreadable, or now names
+    /// a parent outside the staged dependency set. Check after acquiring the
+    /// managed-language locks. External runtime files are not locked, so this
+    /// catches edits visible now but cannot serialize later user edits.
+    pub(crate) fn unstable_dependency(&self) -> Option<&str> {
         for language in &self.dependencies {
-            if self.entries.iter().any(|entry| &entry.language == language) {
-                // Staged by this install: its publish re-checks it under the
-                // lock, and what it publishes is what this install downloaded.
-                continue;
-            }
-            let queries_dir = self.queries_parent.join(language);
+            let queries_dir = self
+                .entries
+                .iter()
+                .find(|entry| &entry.language == language)
+                .map(|entry| entry.tmp.path.clone())
+                .unwrap_or_else(|| self.queries_parent.join(language));
             if !query_install_is_complete(&queries_dir) {
                 return Some(language);
             }
@@ -520,20 +749,49 @@ impl StagedQueryInstall {
             // it with queries that inherit something new — a language this
             // install never discovered, so never locked and never checked. The
             // chain it publishes would then be one nobody is holding still.
-            let Some(parents) = inherited_languages_on_disk(&queries_dir) else {
+            let Some(parents) = inherited_languages_replacing(
+                &queries_dir,
+                &self.queries_parent.join(language),
+                language,
+                &self.search_paths,
+            ) else {
                 return Some(language);
             };
             // Only the requested language is loaded for itself; every other
             // dependency is reached as a parent, where its optional parents
             // are not needed.
             let is_included = language != &self.language;
-            if required_parents(parents, is_included)
-                .any(|parent| !self.dependencies.contains(&parent))
+            if required_parents(parents, is_included).any(|parent| !self.covers(&parent)) {
+                return Some(language);
+            }
+        }
+        // A provided parent is a user's file: it may since have been removed,
+        // turned into an overlay, or made to inherit something new.
+        for language in &self.external {
+            // A managed copy another install completed meanwhile serves too.
+            if !query_install_is_complete(&self.queries_parent.join(language))
+                && !provided_outside_data_dir(&self.queries_parent, language, &self.search_paths)
             {
+                return Some(language);
+            }
+            let Some(parents) = inherited_languages_with_search_paths(
+                &self.queries_parent.join(language),
+                language,
+                &self.search_paths,
+            ) else {
+                return Some(language);
+            };
+            if required_parents(parents, true).any(|parent| !self.covers(&parent)) {
                 return Some(language);
             }
         }
         None
+    }
+
+    /// Whether this install accounts for `language` as part of its chain.
+    fn covers(&self, language: &str) -> bool {
+        self.dependencies.iter().any(|known| known == language)
+            || self.external.iter().any(|known| known == language)
     }
 
     /// Rename every staged directory into place, keeping the displaced
@@ -546,7 +804,9 @@ impl StagedQueryInstall {
             requested_already_complete,
             entries,
             dependencies,
+            external,
             queries_parent: _,
+            search_paths,
         } = self;
         let mut publish = PublishedQueryInstall {
             install_path,
@@ -586,15 +846,20 @@ impl StagedQueryInstall {
                 // language unlocked and unchecked, which is the dangling chain
                 // the whole dependency set exists to prevent.
                 Ok(PublishQueryDirOutcome::AlreadyComplete) => {
-                    let chain_matches = inherited_languages_on_disk(&entry.queries_dir)
-                        .is_some_and(|parents| {
-                            required_parents(parents, !requested)
-                                .all(|parent| dependencies.contains(&parent))
-                        });
+                    let chain_matches = inherited_languages_with_search_paths(
+                        &entry.queries_dir,
+                        &entry.language,
+                        &search_paths,
+                    )
+                    .is_some_and(|parents| {
+                        required_parents(parents, !requested).all(|parent| {
+                            dependencies.contains(&parent) || external.contains(&parent)
+                        })
+                    });
                     if !chain_matches {
                         let residue = publish.rollback();
                         return Err(PublishFailure {
-                            error: QueryInstallError::DependencyRemoved(entry.language),
+                            error: QueryInstallError::DependencyChanged(entry.language),
                             residue,
                         });
                     }
@@ -605,7 +870,7 @@ impl StagedQueryInstall {
                 Ok(PublishQueryDirOutcome::Uninstalled) => {
                     let residue = publish.rollback();
                     return Err(PublishFailure {
-                        error: QueryInstallError::DependencyRemoved(entry.language),
+                        error: QueryInstallError::DependencyChanged(entry.language),
                         residue,
                     });
                 }
@@ -861,21 +1126,34 @@ fn stage_queries_with_dependencies(
     data_dir: &Path,
     force: bool,
     http_policy: QueryHttpPolicy,
+    search_paths: &[PathBuf],
 ) -> Result<StagedQueryInstall, QueryInstallError> {
+    // The staged copy replaces the data-directory view. Do not rediscover
+    // dependencies from the old live copy during a forced replacement.
+    let search_paths = runtime_search_paths(data_dir, search_paths);
     let mut entries = Vec::new();
-    // Every language the recursion visits, staged or already complete: the set
-    // this install needs to still be there when it publishes.
+    // Every language the recursion visits, staged or already complete, other
+    // than those a search path provides: the set this install needs to still
+    // be there when it publishes.
     let mut staged = std::collections::HashSet::new();
+    let mut external = std::collections::HashSet::new();
     // On any error the entries collected so far are dropped here, and with them
     // every staging directory: a failed install publishes nothing.
-    let outcome = stage_queries_recursive(
+    let source = QueryDependencySource {
         base_url,
+        data_dir,
+        http_policy,
+        search_paths: &search_paths,
+    };
+    let outcome = stage_queries_recursive(
+        &source,
         language,
         StageRole::Requested { force },
-        data_dir,
-        &mut staged,
+        &mut StageVisits {
+            staged: &mut staged,
+            external: &mut external,
+        },
         &mut entries,
-        http_policy,
     )?;
     let (files_downloaded, requested_already_complete) = match outcome {
         StageOutcome::Staged { files_downloaded } => (files_downloaded, false),
@@ -883,6 +1161,8 @@ fn stage_queries_with_dependencies(
     };
     let mut dependencies: Vec<String> = staged.into_iter().collect();
     dependencies.sort();
+    let mut external: Vec<String> = external.into_iter().collect();
+    external.sort();
     Ok(StagedQueryInstall {
         language: language.to_string(),
         install_path: data_dir.join("queries").join(language),
@@ -890,16 +1170,12 @@ fn stage_queries_with_dependencies(
         requested_already_complete,
         entries,
         dependencies,
+        external,
         queries_parent: data_dir.join("queries"),
+        search_paths,
     })
 }
 
-/// Internal recursive helper for staging queries with dependencies.
-///
-/// Appends a language's staging directory to `entries` *after* recursing into
-/// the languages it inherits, so `entries` comes out in dependency order and
-/// publishing it forward puts every base language in place before the language
-/// that needs it.
 /// How a language is reached while staging an install.
 ///
 /// Only the requested language is loaded for itself, and only it may be
@@ -921,15 +1197,40 @@ impl StageRole {
     }
 }
 
+/// Languages a staging walk has visited: `staged` ones (downloaded or found
+/// complete in the data directory) are locked, and published when downloaded;
+/// `external` ones are provided by a search path and only re-checked.
+struct StageVisits<'a> {
+    staged: &'a mut std::collections::HashSet<String>,
+    external: &'a mut std::collections::HashSet<String>,
+}
+
+struct QueryDependencySource<'a> {
+    base_url: &'a str,
+    data_dir: &'a Path,
+    http_policy: QueryHttpPolicy,
+    search_paths: &'a [PathBuf],
+}
+
+/// Internal recursive helper for staging queries with dependencies.
+///
+/// Appends a language's staging directory to `entries` *after* recursing into
+/// the languages it inherits, so `entries` comes out in dependency order and
+/// publishing it forward puts every base language in place before the language
+/// that needs it.
 fn stage_queries_recursive(
-    base_url: &str,
+    source: &QueryDependencySource<'_>,
     language: &str,
     role: StageRole,
-    data_dir: &Path,
-    staged: &mut std::collections::HashSet<String>,
+    visits: &mut StageVisits<'_>,
     entries: &mut Vec<StagedQueryDir>,
-    http_policy: QueryHttpPolicy,
 ) -> Result<StageOutcome, QueryInstallError> {
+    let QueryDependencySource {
+        base_url,
+        data_dir,
+        http_policy,
+        search_paths,
+    } = *source;
     let is_included = role.is_included();
     let force = role.force();
     // The name becomes a path and URL segment below; reject anything that
@@ -938,10 +1239,13 @@ fn stage_queries_recursive(
     // the CLI, so control characters must not reach the terminal.
     validate_safe_language_name(language)?;
 
-    // Skip if already staged (or found complete) in this session
-    if staged.contains(language) {
+    // Skip if already staged (or found complete or provided) in this session
+    if visits.staged.contains(language) || visits.external.contains(language) {
         return Ok(StageOutcome::NothingToDo);
     }
+
+    let queries_dir = data_dir.join("queries").join(language);
+    let queries_parent = data_dir.join("queries");
 
     // Clear any uninstall tombstone here rather than at the call sites, so a
     // language the graph reaches twice — a cycle, or two languages sharing a
@@ -950,8 +1254,6 @@ fn stage_queries_recursive(
     // transaction would then republish what that uninstall had removed.
     clear_uninstall_tombstone_for_dependency(data_dir, language)?;
 
-    let queries_dir = data_dir.join("queries").join(language);
-    let queries_parent = data_dir.join("queries");
     fs::create_dir_all(&queries_parent)?;
     recover_interrupted_query_install(&queries_parent, language)?;
 
@@ -963,25 +1265,18 @@ fn stage_queries_recursive(
         // cycle among on-disk query files (a file naming its own language,
         // A↔B) would otherwise recurse forever and overflow the stack. The
         // download branch below already inserts before its parent loop.
-        staged.insert(language.to_string());
+        visits.staged.insert(language.to_string());
 
         // Even if skipping, we need to check for inherited dependencies
-        let parents = inherited_languages_on_disk(&queries_dir).ok_or_else(|| {
+        let parents = inherited_languages_with_search_paths(&queries_dir, language, search_paths)
+            .ok_or_else(|| {
             QueryInstallError::IoError(std::io::Error::other(format!(
                 "cannot read the query files installed for '{language}' to find what it inherits"
             )))
         })?;
         for parent in required_parents(parents, is_included) {
             // Stage parent dependencies (don't force, just ensure they exist)
-            stage_queries_recursive(
-                base_url,
-                &parent,
-                StageRole::Parent,
-                data_dir,
-                staged,
-                entries,
-                http_policy,
-            )?;
+            stage_queries_recursive(source, &parent, StageRole::Parent, visits, entries)?;
         }
         return Ok(StageOutcome::NothingToDo);
     }
@@ -998,7 +1293,6 @@ fn stage_queries_recursive(
 
     let mut files_downloaded = Vec::new();
     let mut any_success = false;
-    let mut parents_to_install = Vec::new();
 
     // Download each query file
     for query_file in QUERY_FILES {
@@ -1006,22 +1300,6 @@ fn stage_queries_recursive(
 
         match download_file(&url, http_policy) {
             Ok(content) => {
-                // Every query kind resolves its own `; inherits:` chain at load
-                // time, so a parent named by injections.scm is as load-bearing
-                // as one named by highlights.scm. A file naming its own
-                // language is read as `extends`, not as a parent, and an
-                // optional parent is needed only when the language is loaded
-                // for itself (see `required_parents`).
-                for parent in parse_modeline(&content).inherits {
-                    if parent.optional && is_included {
-                        continue;
-                    }
-                    let parent = parent.name;
-                    if parent != language && !parents_to_install.contains(&parent) {
-                        parents_to_install.push(parent);
-                    }
-                }
-
                 let file_path = tmp_queries_dir.join(query_file);
                 write_query_file(&file_path, &content)?;
                 files_downloaded.push(query_file.to_string());
@@ -1031,6 +1309,23 @@ fn stage_queries_recursive(
                 // highlights.scm is required, others are optional
                 if *query_file == "highlights.scm" {
                     return match e {
+                        // A parent upstream does not publish, such as a
+                        // user's own language, is left to the search path
+                        // that provides it. Only when upstream lacks it: the
+                        // loader resolves each kind separately, and a
+                        // provided highlights base says nothing about the
+                        // other kinds an upstream copy would supply.
+                        QueryInstallError::HttpStatus { code: 404, .. }
+                            if role.is_included()
+                                && provided_outside_data_dir(
+                                    &queries_parent,
+                                    language,
+                                    search_paths,
+                                ) =>
+                        {
+                            drop(staged_dir);
+                            stage_provided_parent(source, language, visits, entries)
+                        }
                         QueryInstallError::HttpStatus { code: 404, .. } => Err(
                             QueryInstallError::LanguageNotSupported(language.to_string()),
                         ),
@@ -1057,27 +1352,63 @@ fn stage_queries_recursive(
     // Marked as staged before recursing, so an inheritance cycle terminates;
     // the entry itself is appended after, so `entries` comes out in dependency
     // order and can be published base-language-first.
-    staged.insert(language.to_string());
+    visits.staged.insert(language.to_string());
 
     // Stage parent dependencies. A parent that cannot be downloaded fails the
     // whole install: propagating the error here drops every staging directory
     // collected so far, so a language is never published without the queries it
     // inherits.
-    for parent in parents_to_install {
+    let parents = inherited_languages_replacing(
+        &tmp_queries_dir,
+        &staged_dir.queries_dir,
+        language,
+        search_paths,
+    )
+    .ok_or_else(|| {
+        QueryInstallError::IoError(std::io::Error::other(format!(
+            "cannot read query dependencies for '{language}'"
+        )))
+    })?;
+    for parent in required_parents(parents, is_included) {
         eprintln!("Staging inherited queries: {}", parent);
-        stage_queries_recursive(
-            base_url,
-            &parent,
-            StageRole::Parent,
-            data_dir,
-            staged,
-            entries,
-            http_policy,
-        )?;
+        stage_queries_recursive(source, &parent, StageRole::Parent, visits, entries)?;
     }
     entries.push(staged_dir);
 
     Ok(StageOutcome::Staged { files_downloaded })
+}
+
+/// Record a parent a search path provides and walk the parents it declares.
+///
+/// Nothing is published for it, so it is neither staged, published, nor held
+/// in the publish transaction. Only the tombstone clear before its fetch took
+/// its lock, briefly; the tombstone was an old uninstall's leftover, and
+/// nothing here republishes the language.
+fn stage_provided_parent(
+    source: &QueryDependencySource<'_>,
+    language: &str,
+    visits: &mut StageVisits<'_>,
+    entries: &mut Vec<StagedQueryDir>,
+) -> Result<StageOutcome, QueryInstallError> {
+    visits.external.insert(language.to_string());
+    let queries_dir = source.data_dir.join("queries").join(language);
+    let parents = inherited_languages_with_search_paths(
+        &queries_dir,
+        language,
+        source.search_paths,
+    )
+    // Runtime files are read leniently, so only the data directory's
+    // leftover copy can be unreadable here.
+    .ok_or_else(|| {
+        QueryInstallError::IoError(std::io::Error::other(format!(
+            "cannot read the query files left in {:?} for '{language}' to find what it inherits",
+            queries_dir
+        )))
+    })?;
+    for parent in required_parents(parents, true) {
+        stage_queries_recursive(source, &parent, StageRole::Parent, visits, entries)?;
+    }
+    Ok(StageOutcome::NothingToDo)
 }
 
 pub fn query_install_is_complete(queries_dir: &Path) -> bool {
@@ -1551,7 +1882,7 @@ pub fn lock_language(data_dir: &Path, language: &str) -> Result<LanguageLock, Qu
     })
 }
 
-/// [`lock_language`] without the wait.
+/// A shared [`lock_language`] without the wait.
 ///
 /// For callers that must not block — the LSP's async path — and that only need
 /// to know whether the language is settled. The guard is returned rather than
@@ -1581,13 +1912,16 @@ fn try_lock_language(data_dir: &Path, language: &str) -> LanguageLockProbe {
         // whether an install is in flight, so do not pretend it does.
         Err(_) => return LanguageLockProbe::Unavailable,
     };
-    match file.try_lock() {
+    // Shared: probes only read, so they must not see each other as busy.
+    // Installs and uninstalls lock exclusively and still exclude them.
+    match file.try_lock_shared() {
         Ok(()) => LanguageLockProbe::Idle(LanguageLock {
             _file: file,
             queries_parent,
             language: language.to_string(),
         }),
-        // Only contention means an install is in flight. A filesystem that
+        // Only contention means an install or uninstall holds the language:
+        // probes share the lock, so they never contend. A filesystem that
         // cannot do advisory locks at all — some NFS and FUSE mounts — errors
         // here too, and calling that busy would make every language on such a
         // mount read as unusable while the repair it triggers fails for the
@@ -1599,9 +1933,11 @@ fn try_lock_language(data_dir: &Path, language: &str) -> LanguageLockProbe {
 
 /// What [`try_lock_language`] found.
 enum LanguageLockProbe {
-    /// Nobody holds the lock, and nobody can take it while the guard lives.
+    /// No install holds the lock, and none can take it while this shared
+    /// guard lives; other probes may hold it too.
     Idle(LanguageLock),
-    /// An install is mid-publish: what is on disk can still be rolled back.
+    /// An install (staging or publishing) or uninstall holds the language
+    /// exclusively: what is on disk can still change or be rolled back.
     Busy,
     /// The lock cannot be taken at all, so nothing can be publishing either.
     /// Whatever is on disk is as settled as it will ever be.
@@ -1637,7 +1973,7 @@ fn open_language_lock_file(
 /// Take [`lock_language`] for every language an install depends on.
 ///
 /// `languages` must be sorted: two installs whose dependency sets overlap
-/// acquire the shared locks in the same order, so they queue instead of
+/// acquire the same exclusive locks in the same order, so they queue instead of
 /// deadlocking. Holding the parents' locks too is what stops an install of one
 /// language from publishing over — or uninstalling — a base language another
 /// install has already decided to rely on.
@@ -1992,6 +2328,8 @@ mod staging_tests {
         let temp = TempDir::new().unwrap();
         let queries_parent = temp.path().join("queries");
         let staged = StagedQueryInstall {
+            search_paths: Vec::new(),
+            external: Vec::new(),
             language: "child".to_string(),
             install_path: queries_parent.join("child"),
             files_downloaded: vec!["highlights.scm".to_string()],
@@ -2026,6 +2364,8 @@ mod staging_tests {
         fs::write(queries_dir.join("highlights.scm"), "previous").unwrap();
         write_install_marker(&queries_dir).unwrap();
         let staged = StagedQueryInstall {
+            search_paths: Vec::new(),
+            external: Vec::new(),
             language: "child".to_string(),
             install_path: queries_parent.join("child"),
             files_downloaded: vec!["highlights.scm".to_string()],
@@ -2068,6 +2408,8 @@ mod staging_tests {
         let temp = TempDir::new().unwrap();
         let queries_parent = temp.path().join("queries");
         let staged = StagedQueryInstall {
+            search_paths: Vec::new(),
+            external: Vec::new(),
             language: "child".to_string(),
             install_path: queries_parent.join("child"),
             files_downloaded: vec!["highlights.scm".to_string()],
@@ -2105,6 +2447,8 @@ mod staging_tests {
         fs::write(queries_dir.join("highlights.scm"), "previous").unwrap();
         write_install_marker(&queries_dir).unwrap();
         let staged = StagedQueryInstall {
+            search_paths: Vec::new(),
+            external: Vec::new(),
             language: "child".to_string(),
             install_path: queries_dir.clone(),
             files_downloaded: vec!["highlights.scm".to_string()],
@@ -2145,7 +2489,7 @@ mod staging_tests {
             "the language's own queries are complete"
         );
         assert!(
-            lock_complete_chain(temp.path(), "child").is_none(),
+            lock_complete_chain(temp.path(), "child", &[]).is_none(),
             "but the parent it inherits is missing"
         );
 
@@ -2154,7 +2498,7 @@ mod staging_tests {
         fs::write(parent_dir.join("highlights.scm"), "(comment) @comment\n").unwrap();
         write_install_marker(&parent_dir).unwrap();
 
-        assert!(lock_complete_chain(temp.path(), "child").is_some());
+        assert!(lock_complete_chain(temp.path(), "child", &[]).is_some());
     }
 
     /// A cycle among on-disk files is the loader's problem to report; treating
@@ -2175,7 +2519,7 @@ mod staging_tests {
         }
 
         assert!(
-            lock_complete_chain(temp.path(), "cyc_a").is_some(),
+            lock_complete_chain(temp.path(), "cyc_a", &[]).is_some(),
             "a cycle is the loader's problem to report, not a reason to reinstall forever"
         );
     }
@@ -2249,7 +2593,7 @@ mod staging_tests {
         fs::set_permissions(&injections, permissions).unwrap();
 
         let parents = inherited_languages_on_disk(&queries_dir);
-        let chained = lock_complete_chain(temp.path(), "child").is_some();
+        let chained = lock_complete_chain(temp.path(), "child", &[]).is_some();
 
         // Restore before asserting so a failure cannot leave the file locked.
         let mut permissions = fs::metadata(&injections).unwrap().permissions();
@@ -2280,29 +2624,33 @@ mod staging_tests {
             write_install_marker(&dir).unwrap();
         }
 
-        let held = lock_complete_chain(data_dir, "child").expect("a complete chain locks");
+        let held = lock_complete_chain(data_dir, "child", &[]).expect("a complete chain locks");
         assert_eq!(held.len(), 2, "both languages in the chain are held");
+        let (publisher, _) = open_language_lock_file(data_dir, "parent").unwrap();
         assert!(
-            matches!(
-                try_lock_language(data_dir, "parent"),
-                LanguageLockProbe::Busy
-            ),
-            "including the base language, which is the point"
+            matches!(publisher.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+            "an install cannot publish the base language, which is the point"
+        );
+        // Probes only read: a concurrent open of another language sharing
+        // the base must not read this probe as an install in flight.
+        assert!(
+            lock_complete_chain(data_dir, "child", &[]).is_some(),
+            "a second probe still judges the chain"
         );
         drop(held);
 
         // A base language mid-publish makes the chain unusable...
         let publishing_parent = lock_language(data_dir, "parent").unwrap();
-        assert!(lock_complete_chain(data_dir, "child").is_none());
+        assert!(lock_complete_chain(data_dir, "child", &[]).is_none());
         drop(publishing_parent);
         assert!(
-            lock_complete_chain(data_dir, "child").is_some(),
+            lock_complete_chain(data_dir, "child", &[]).is_some(),
             "and usable again once it is done"
         );
 
         // ...as does one that is simply gone.
         fs::remove_dir_all(queries_parent.join("parent")).unwrap();
-        assert!(lock_complete_chain(data_dir, "child").is_none());
+        assert!(lock_complete_chain(data_dir, "child", &[]).is_none());
         assert!(
             matches!(
                 try_lock_language(data_dir, "child"),
@@ -2381,6 +2729,8 @@ mod staging_tests {
         fs::write(queries_dir.join("highlights.scm"), "complete").unwrap();
         write_install_marker(&queries_dir).unwrap();
         let staged = StagedQueryInstall {
+            search_paths: Vec::new(),
+            external: Vec::new(),
             language: "child".to_string(),
             install_path: queries_dir.clone(),
             files_downloaded: Vec::new(),
@@ -2390,10 +2740,10 @@ mod staging_tests {
             queries_parent: queries_parent.clone(),
         };
 
-        assert_eq!(staged.unstable_skipped_dependency(), None);
+        assert_eq!(staged.unstable_dependency(), None);
         fs::remove_dir_all(&queries_dir).unwrap();
         assert_eq!(
-            staged.unstable_skipped_dependency(),
+            staged.unstable_dependency(),
             Some("child"),
             "queries removed after staging must not pass as already installed"
         );
@@ -2412,6 +2762,8 @@ mod staging_tests {
         fs::write(parent_dir.join("highlights.scm"), "(comment) @comment\n").unwrap();
         write_install_marker(&parent_dir).unwrap();
         let staged = StagedQueryInstall {
+            search_paths: Vec::new(),
+            external: Vec::new(),
             language: "child".to_string(),
             install_path: queries_parent.join("child"),
             files_downloaded: vec!["highlights.scm".to_string()],
@@ -2426,7 +2778,7 @@ mod staging_tests {
             queries_parent: queries_parent.clone(),
         };
 
-        assert_eq!(staged.unstable_skipped_dependency(), None);
+        assert_eq!(staged.unstable_dependency(), None);
 
         // Someone force-reinstalls the parent, and its new queries inherit a
         // language this install never saw.
@@ -2437,7 +2789,7 @@ mod staging_tests {
         .unwrap();
 
         assert_eq!(
-            staged.unstable_skipped_dependency(),
+            staged.unstable_dependency(),
             Some("parent"),
             "a base language that gained a parent must stop the publish"
         );
@@ -2451,6 +2803,8 @@ mod staging_tests {
         let temp = TempDir::new().unwrap();
         let queries_parent = temp.path().join("queries");
         let staged = StagedQueryInstall {
+            search_paths: Vec::new(),
+            external: Vec::new(),
             language: "child".to_string(),
             install_path: queries_parent.join("child"),
             files_downloaded: vec!["highlights.scm".to_string()],
@@ -2466,19 +2820,20 @@ mod staging_tests {
         };
 
         assert_eq!(
-            staged.unstable_skipped_dependency(),
+            staged.unstable_dependency(),
             Some("parent"),
             "a base language that is neither staged nor on disk must be caught"
         );
     }
 
-    /// A language this install staged for itself needs no such check — its
-    /// publish re-checks the directory under the lock.
+    /// A staged language is checked from its prepared copy, not a missing live directory.
     #[test]
-    fn a_staged_requested_language_needs_no_recheck() {
+    fn a_staged_requested_language_is_checked_from_its_prepared_copy() {
         let temp = TempDir::new().unwrap();
         let queries_parent = temp.path().join("queries");
         let staged = StagedQueryInstall {
+            search_paths: Vec::new(),
+            external: Vec::new(),
             language: "child".to_string(),
             install_path: queries_parent.join("child"),
             files_downloaded: vec!["highlights.scm".to_string()],
@@ -2488,7 +2843,7 @@ mod staging_tests {
             queries_parent: queries_parent.clone(),
         };
 
-        assert_eq!(staged.unstable_skipped_dependency(), None);
+        assert_eq!(staged.unstable_dependency(), None);
     }
 
     /// Yielding to a copy that appeared while this install was busy is right
@@ -2500,6 +2855,8 @@ mod staging_tests {
         let temp = TempDir::new().unwrap();
         let queries_parent = temp.path().join("queries");
         let staged = StagedQueryInstall {
+            search_paths: Vec::new(),
+            external: Vec::new(),
             language: "child".to_string(),
             install_path: queries_parent.join("child"),
             files_downloaded: vec!["highlights.scm".to_string()],
@@ -2526,7 +2883,7 @@ mod staging_tests {
             panic!("a winner that changed the chain must fail the publish");
         };
         assert!(
-            matches!(&failure.error, QueryInstallError::DependencyRemoved(language) if language == "parent")
+            matches!(&failure.error, QueryInstallError::DependencyChanged(language) if language == "parent")
         );
         assert!(
             !queries_parent.join("child").exists(),
@@ -2544,6 +2901,8 @@ mod staging_tests {
         let queries_parent = temp.path().join("queries");
         let parent_dir = queries_parent.join("parent");
         let staged = StagedQueryInstall {
+            search_paths: Vec::new(),
+            external: Vec::new(),
             language: "child".to_string(),
             install_path: queries_parent.join("child"),
             files_downloaded: vec!["highlights.scm".to_string()],
@@ -2590,6 +2949,8 @@ mod staging_tests {
         fs::write(queries_dir.join("highlights.scm"), "previous").unwrap();
         write_install_marker(&queries_dir).unwrap();
         let staged = StagedQueryInstall {
+            search_paths: Vec::new(),
+            external: Vec::new(),
             language: "child".to_string(),
             install_path: queries_dir.clone(),
             files_downloaded: vec!["highlights.scm".to_string()],
@@ -2606,7 +2967,7 @@ mod staging_tests {
         let result = staged.publish();
 
         assert!(
-            matches!(&result, Err(failure) if matches!(&failure.error, QueryInstallError::DependencyRemoved(language) if language == "parent")),
+            matches!(&result, Err(failure) if matches!(&failure.error, QueryInstallError::DependencyChanged(language) if language == "parent")),
             "a tombstoned entry must abort the publish"
         );
         assert_eq!(
@@ -3084,11 +3445,11 @@ mod tests {
         // No `cpp` on disk, and no network: reaching for it would fail.
 
         assert!(
-            lock_complete_chain(&data_dir, "cuda").is_some(),
+            lock_complete_chain(&data_dir, "cuda", &[]).is_some(),
             "cuda's chain stops at c, whose optional parent it never loads"
         );
         assert!(
-            lock_complete_chain(&data_dir, "c").is_none(),
+            lock_complete_chain(&data_dir, "c", &[]).is_none(),
             "c loaded for itself does need cpp"
         );
         let result = install_queries_with_dependencies("cuda", &data_dir, false);
@@ -3219,6 +3580,593 @@ mod tests {
             !queries_dir.join("injections.scm").exists(),
             "repair should replace stale partial contents with the successful download"
         );
+    }
+
+    #[test]
+    fn runtime_dependency_paths_use_the_loaders_lexical_normalization() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        let child = data.join("queries/child");
+        let overlay = runtime.join("queries/child");
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir_all(&overlay).unwrap();
+        fs::write(child.join("highlights.scm"), "existing child").unwrap();
+        fs::write(
+            overlay.join("highlights.scm"),
+            ";; extends\n;; inherits: parent\n",
+        )
+        .unwrap();
+        // The loader folds this lexically, even though the intermediate path
+        // does not exist and the OS cannot traverse it.
+        let search_paths = [runtime.join("absent/..")];
+        assert!(lock_complete_chain(&data, "child", &search_paths).is_none());
+        let base_url = spawn_query_file_server(vec![("/parent/highlights.scm", "parent")]);
+        let staged = stage_queries_with_dependencies(
+            &base_url,
+            "child",
+            &data,
+            false,
+            QueryHttpPolicy::AllowHttpForTests,
+            &search_paths,
+        )
+        .unwrap();
+        assert_eq!(staged.dependencies(), &["child", "parent"]);
+    }
+
+    #[test]
+    fn external_overlay_changes_are_rechecked_before_publication() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        let overlay_dir = runtime.join("queries/child");
+        fs::create_dir_all(&overlay_dir).unwrap();
+        let overlay = overlay_dir.join("highlights.scm");
+        fs::write(&overlay, ";; extends\n").unwrap();
+        let base_url =
+            spawn_query_file_server(vec![("/child/highlights.scm", "(comment) @comment\n")]);
+        let staged = stage_queries_with_dependencies(
+            &base_url,
+            "child",
+            &data,
+            false,
+            QueryHttpPolicy::AllowHttpForTests,
+            &[runtime],
+        )
+        .unwrap();
+        assert_eq!(staged.unstable_dependency(), None);
+        fs::write(&overlay, ";; extends\n;; inherits: new_parent\n").unwrap();
+        assert_eq!(staged.unstable_dependency(), Some("child"));
+    }
+
+    #[test]
+    fn existing_queries_follow_transitive_overlays_but_skip_included_optional_parents() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        for (language, kind, content) in [
+            (
+                "child",
+                "injections.scm",
+                ";; extends\n;; inherits: (parent)\n",
+            ),
+            (
+                "parent",
+                "highlights.scm",
+                ";; extends\n;; inherits: grandparent,(unneeded)\n",
+            ),
+        ] {
+            let dir = runtime.join("queries").join(language);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(kind), content).unwrap();
+        }
+        let child = data.join("queries/child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(child.join("highlights.scm"), "existing child").unwrap();
+        let base_url = spawn_query_file_server(vec![
+            ("/parent/highlights.scm", "parent"),
+            ("/grandparent/highlights.scm", "grandparent"),
+        ]);
+        let staged = stage_queries_with_dependencies(
+            &base_url,
+            "child",
+            &data,
+            false,
+            QueryHttpPolicy::AllowHttpForTests,
+            std::slice::from_ref(&runtime),
+        )
+        .unwrap();
+        assert_eq!(staged.dependencies(), &["child", "grandparent", "parent"]);
+        staged
+            .publish()
+            .unwrap_or_else(|_| panic!("publish failed"))
+            .commit();
+        assert_eq!(
+            fs::read_to_string(child.join("highlights.scm")).unwrap(),
+            "existing child"
+        );
+        assert!(lock_complete_chain(&data, "child", &[runtime]).is_some());
+        assert!(!data.join("queries/unneeded").exists());
+    }
+
+    #[test]
+    fn a_missing_overlay_parent_leaves_existing_queries_untouched() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        let child = data.join("queries/child");
+        let overlay = runtime.join("queries/child");
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir_all(&overlay).unwrap();
+        fs::write(child.join("highlights.scm"), "existing child").unwrap();
+        fs::write(
+            overlay.join("highlights.scm"),
+            ";; extends\n;; inherits: missing\n",
+        )
+        .unwrap();
+        let base_url = spawn_query_file_server(vec![]);
+        let result = stage_queries_with_dependencies(
+            &base_url,
+            "child",
+            &data,
+            false,
+            QueryHttpPolicy::AllowHttpForTests,
+            &[runtime],
+        );
+        assert!(
+            matches!(result, Err(QueryInstallError::LanguageNotSupported(name)) if name == "missing")
+        );
+        assert_eq!(
+            fs::read_to_string(child.join("highlights.scm")).unwrap(),
+            "existing child"
+        );
+        assert!(!data.join("queries/missing").exists());
+    }
+
+    #[test]
+    fn forced_replacement_does_not_read_old_data_directory_modelines() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path();
+        let child = data.join("queries/child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(child.join("highlights.scm"), ";; inherits: obsolete\n").unwrap();
+        let base_url = spawn_query_file_server(vec![("/child/highlights.scm", "replacement")]);
+        let staged = stage_queries_with_dependencies(
+            &base_url,
+            "child",
+            data,
+            true,
+            QueryHttpPolicy::AllowHttpForTests,
+            &[data.to_path_buf()],
+        )
+        .unwrap();
+        assert_eq!(staged.dependencies(), &["child"]);
+        staged
+            .publish()
+            .unwrap_or_else(|_| panic!("publish failed"))
+            .commit();
+        assert_eq!(
+            fs::read_to_string(child.join("highlights.scm")).unwrap(),
+            "replacement"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forced_replacement_ignores_a_link_to_the_managed_language() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        let child = data.join("queries/child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(child.join("highlights.scm"), ";; inherits: obsolete\n").unwrap();
+        fs::create_dir_all(runtime.join("queries")).unwrap();
+        std::os::unix::fs::symlink(&child, runtime.join("queries/child")).unwrap();
+        let base_url = spawn_query_file_server(vec![("/child/highlights.scm", "replacement")]);
+        let staged = stage_queries_with_dependencies(
+            &base_url,
+            "child",
+            &data,
+            true,
+            QueryHttpPolicy::AllowHttpForTests,
+            &[runtime],
+        )
+        .unwrap_or_else(|e| panic!("the old copy's parents leaked into staging: {e}"));
+        assert_eq!(staged.dependencies(), &["child"]);
+        assert_eq!(staged.unstable_dependency(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_managed_query_files_are_not_runtime_sources() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        // An incomplete managed parent, its file linked from a runtime path.
+        let parent = data.join("queries/parent");
+        fs::create_dir_all(&parent).unwrap();
+        fs::write(parent.join("highlights.scm"), "").unwrap();
+        fs::create_dir_all(runtime.join("queries/parent")).unwrap();
+        std::os::unix::fs::symlink(
+            parent.join("highlights.scm"),
+            runtime.join("queries/parent/highlights.scm"),
+        )
+        .unwrap();
+        let child = data.join("queries/child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(child.join("highlights.scm"), "; inherits: parent\n").unwrap();
+        write_install_marker(&child).unwrap();
+        assert!(
+            lock_complete_chain(&data, "child", std::slice::from_ref(&runtime)).is_none(),
+            "a link to the managed file does not provide the parent"
+        );
+        // Replacing the child must not read its old declarations through a
+        // file link either.
+        fs::write(child.join("injections.scm"), "; inherits: obsolete\n").unwrap();
+        fs::create_dir_all(runtime.join("queries/child")).unwrap();
+        std::os::unix::fs::symlink(
+            child.join("injections.scm"),
+            runtime.join("queries/child/injections.scm"),
+        )
+        .unwrap();
+        let base_url = spawn_query_file_server(vec![
+            ("/child/highlights.scm", "replacement"),
+            ("/parent/highlights.scm", "(comment) @comment\n"),
+        ]);
+        stage_queries_with_dependencies(
+            &base_url,
+            "child",
+            &data,
+            true,
+            QueryHttpPolicy::AllowHttpForTests,
+            &[runtime],
+        )
+        .unwrap_or_else(|e| panic!("the old copy's parents leaked into staging: {e}"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_another_languages_query_still_declares_its_parents() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        let child = data.join("queries/child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(child.join("highlights.scm"), "existing child").unwrap();
+        let other = data.join("queries/other");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("injections.scm"), "; inherits: parent\n").unwrap();
+        // The loader reads this as child's injections, parent and all.
+        fs::create_dir_all(runtime.join("queries/child")).unwrap();
+        std::os::unix::fs::symlink(
+            other.join("injections.scm"),
+            runtime.join("queries/child/injections.scm"),
+        )
+        .unwrap();
+        assert!(lock_complete_chain(&data, "child", &[runtime]).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_broken_runtime_file_neither_blocks_nor_hides_the_chain() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        let child = data.join("queries/child");
+        let overlay = runtime.join("queries/child");
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir_all(&overlay).unwrap();
+        fs::write(child.join("highlights.scm"), "existing child").unwrap();
+        // The loader fails only this kind; nothing an install fetches fixes it.
+        std::os::unix::fs::symlink("missing", overlay.join("injections.scm")).unwrap();
+        assert!(lock_complete_chain(&data, "child", std::slice::from_ref(&runtime)).is_some());
+        let staged = stage_queries_with_dependencies(
+            "https://unused.invalid",
+            "child",
+            &data,
+            false,
+            QueryHttpPolicy::HttpsOnly,
+            std::slice::from_ref(&runtime),
+        )
+        .unwrap_or_else(|e| panic!("staging failed: {e}"));
+        assert_eq!(staged.unstable_dependency(), None);
+        // A readable sibling in the same directory still declares its parents.
+        fs::write(
+            overlay.join("highlights.scm"),
+            ";; extends\n;; inherits: missing_parent\n",
+        )
+        .unwrap();
+        assert!(lock_complete_chain(&data, "child", std::slice::from_ref(&runtime)).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_broken_managed_file_still_leaves_the_chain_incomplete() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let child = data.join("queries/child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(child.join("highlights.scm"), "existing child").unwrap();
+        std::os::unix::fs::symlink("missing", child.join("injections.scm")).unwrap();
+        assert!(lock_complete_chain(&data, "child", &[]).is_none());
+    }
+
+    fn write_runtime_query(runtime: &Path, language: &str, content: &str) {
+        let dir = runtime.join("queries").join(language);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("highlights.scm"), content).unwrap();
+    }
+
+    #[test]
+    fn a_base_query_on_a_search_path_completes_the_chain_without_a_managed_copy() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        let child = data.join("queries/child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(child.join("highlights.scm"), "existing child").unwrap();
+        write_runtime_query(&runtime, "child", ";; extends\n;; inherits: custom\n");
+        write_runtime_query(&runtime, "custom", "(comment) @comment\n");
+        assert!(
+            lock_complete_chain(&data, "child", std::slice::from_ref(&runtime)).is_some(),
+            "the loader resolves custom from the search path"
+        );
+        // The provided parent's own declarations still count.
+        write_runtime_query(
+            &runtime,
+            "custom",
+            ";; inherits: grand\n(comment) @comment\n",
+        );
+        assert!(lock_complete_chain(&data, "child", std::slice::from_ref(&runtime)).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_alias_of_the_data_directory_does_not_provide_a_parent() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let alias = temp.path().join("alias");
+        let child = data.join("queries/child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(child.join("highlights.scm"), "; inherits: parent\n").unwrap();
+        write_install_marker(&child).unwrap();
+        // An interrupted install left the parent incomplete in the data
+        // directory; seen through the alias it must not count as provided.
+        let parent = data.join("queries/parent");
+        fs::create_dir_all(&parent).unwrap();
+        fs::write(parent.join("highlights.scm"), "").unwrap();
+        std::os::unix::fs::symlink(&data, &alias).unwrap();
+        assert!(lock_complete_chain(&data, "child", &[alias]).is_none());
+    }
+
+    #[test]
+    fn a_provided_parent_being_replaced_is_busy_not_complete() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        let child = data.join("queries/child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(child.join("highlights.scm"), "; inherits: custom\n").unwrap();
+        write_install_marker(&child).unwrap();
+        write_runtime_query(&runtime, "custom", "(comment) @comment\n");
+        // A forced install of the parent holds its lock while its managed
+        // copy is between renames, so the copy looks absent.
+        let publishing = lock_language(&data, "custom").unwrap();
+        assert!(matches!(
+            probe_chain(&data, "child", std::slice::from_ref(&runtime)),
+            ChainProbe::Busy
+        ));
+        drop(publishing);
+        assert!(matches!(
+            probe_chain(&data, "child", std::slice::from_ref(&runtime)),
+            ChainProbe::Complete(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_alias_of_the_managed_queries_does_not_provide_a_parent() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        let child = data.join("queries/child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(child.join("highlights.scm"), "; inherits: parent\n").unwrap();
+        write_install_marker(&child).unwrap();
+        let parent = data.join("queries/parent");
+        fs::create_dir_all(&parent).unwrap();
+        fs::write(parent.join("highlights.scm"), "").unwrap();
+        // The runtime root is its own directory; only its queries alias the
+        // managed ones.
+        fs::create_dir_all(&runtime).unwrap();
+        std::os::unix::fs::symlink(data.join("queries"), runtime.join("queries")).unwrap();
+        assert!(lock_complete_chain(&data, "child", &[runtime]).is_none());
+    }
+
+    #[test]
+    fn a_leftover_managed_base_shadows_a_provided_parent() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        let child = data.join("queries/child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(child.join("highlights.scm"), "; inherits: custom\n").unwrap();
+        write_install_marker(&child).unwrap();
+        write_runtime_query(&runtime, "custom", "(comment) @comment\n");
+        // An interrupted install left an empty, unmarked managed base, which
+        // the loader picks when the data directory is searched first.
+        let leftover = data.join("queries/custom");
+        fs::create_dir_all(&leftover).unwrap();
+        fs::write(leftover.join("highlights.scm"), "").unwrap();
+        let search_paths = [data.clone(), runtime.clone()];
+        assert!(lock_complete_chain(&data, "child", &search_paths).is_none());
+        // Staging cannot fall back to the runtime copy either: it would leave
+        // the shadowing leftover in place and the chain still incomplete.
+        let result = stage_queries_with_dependencies(
+            &spawn_query_file_server(vec![("/child/highlights.scm", "; inherits: custom\n")]),
+            "child",
+            &data,
+            true,
+            QueryHttpPolicy::AllowHttpForTests,
+            &search_paths,
+        );
+        assert!(
+            matches!(result, Err(QueryInstallError::LanguageNotSupported(ref name)) if name == "custom")
+        );
+    }
+
+    #[test]
+    fn an_overlay_alone_does_not_provide_a_parent() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        let child = data.join("queries/child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(child.join("highlights.scm"), "existing child").unwrap();
+        write_runtime_query(&runtime, "child", ";; extends\n;; inherits: parent\n");
+        write_runtime_query(&runtime, "parent", ";; extends\n(comment) @spell\n");
+        assert!(lock_complete_chain(&data, "child", std::slice::from_ref(&runtime)).is_none());
+        let base_url =
+            spawn_query_file_server(vec![("/parent/highlights.scm", "(comment) @comment\n")]);
+        let staged = stage_queries_with_dependencies(
+            &base_url,
+            "child",
+            &data,
+            false,
+            QueryHttpPolicy::AllowHttpForTests,
+            &[runtime],
+        )
+        .unwrap();
+        staged
+            .publish()
+            .unwrap_or_else(|_| panic!("publish failed"))
+            .commit();
+        assert!(
+            data.join("queries/parent/highlights.scm").is_file(),
+            "an overlay-only parent still needs the upstream base"
+        );
+    }
+
+    #[test]
+    fn an_upstream_parent_is_installed_even_when_a_search_path_overrides_it() {
+        // A Neovim-style plain override of the parent's highlights does not
+        // give the loader the parent's injections, which the child's
+        // upstream injections.scm inherits.
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        write_runtime_query(&runtime, "parent", "(comment) @comment\n");
+        let base_url = spawn_query_file_server(vec![
+            ("/child/highlights.scm", "(identifier) @variable\n"),
+            ("/child/injections.scm", "; inherits: parent\n"),
+            ("/parent/highlights.scm", "(comment) @comment\n"),
+            ("/parent/injections.scm", "(comment) @injection.content\n"),
+        ]);
+        let staged = stage_queries_with_dependencies(
+            &base_url,
+            "child",
+            &data,
+            false,
+            QueryHttpPolicy::AllowHttpForTests,
+            &[runtime],
+        )
+        .unwrap();
+        staged
+            .publish()
+            .unwrap_or_else(|_| panic!("publish failed"))
+            .commit();
+        assert!(data.join("queries/parent/injections.scm").is_file());
+    }
+
+    #[test]
+    fn a_search_path_parent_is_rechecked_before_publication() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        write_runtime_query(&runtime, "child", ";; extends\n;; inherits: custom\n");
+        write_runtime_query(&runtime, "custom", "(comment) @comment\n");
+        let base_url =
+            spawn_query_file_server(vec![("/child/highlights.scm", "(identifier) @variable\n")]);
+        let staged = stage_queries_with_dependencies(
+            &base_url,
+            "child",
+            &data,
+            false,
+            QueryHttpPolicy::AllowHttpForTests,
+            std::slice::from_ref(&runtime),
+        )
+        .unwrap();
+        assert_eq!(staged.unstable_dependency(), None);
+        write_runtime_query(
+            &runtime,
+            "custom",
+            ";; inherits: grand\n(comment) @comment\n",
+        );
+        assert_eq!(staged.unstable_dependency(), Some("custom"));
+        fs::remove_file(runtime.join("queries/custom/highlights.scm")).unwrap();
+        assert_eq!(staged.unstable_dependency(), Some("custom"));
+    }
+
+    #[test]
+    fn a_concurrent_winner_may_inherit_a_search_path_parent() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        write_runtime_query(&runtime, "child", ";; extends\n;; inherits: custom\n");
+        write_runtime_query(&runtime, "custom", "(comment) @comment\n");
+        let base_url =
+            spawn_query_file_server(vec![("/child/highlights.scm", "(identifier) @variable\n")]);
+        let staged = stage_queries_with_dependencies(
+            &base_url,
+            "child",
+            &data,
+            false,
+            QueryHttpPolicy::AllowHttpForTests,
+            std::slice::from_ref(&runtime),
+        )
+        .unwrap();
+        // Another install completes the child while this one was staging.
+        let winner = data.join("queries/child");
+        fs::create_dir_all(&winner).unwrap();
+        fs::write(winner.join("highlights.scm"), "(identifier) @variable\n").unwrap();
+        write_install_marker(&winner).unwrap();
+        let published = staged
+            .publish()
+            .unwrap_or_else(|failure| panic!("publish failed: {}", failure.error));
+        published.commit();
+    }
+
+    #[test]
+    fn staging_installs_parents_declared_by_external_overlays() {
+        let temp = TempDir::new().unwrap();
+        let data_dir = temp.path().join("data");
+        let overlay = temp.path().join("overlay");
+        let child = overlay.join("queries/child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(
+            child.join("highlights.scm"),
+            ";; extends\n;; inherits: parent\n",
+        )
+        .unwrap();
+        let base_url = spawn_query_file_server(vec![
+            ("/child/highlights.scm", "(identifier) @variable\n"),
+            ("/parent/highlights.scm", "(comment) @comment\n"),
+        ]);
+        let staged = stage_queries_with_dependencies(
+            &base_url,
+            "child",
+            &data_dir,
+            false,
+            QueryHttpPolicy::AllowHttpForTests,
+            &[overlay],
+        )
+        .unwrap();
+        assert!(staged.dependencies().iter().any(|name| name == "parent"));
+        staged
+            .publish()
+            .unwrap_or_else(|_| panic!("publish failed"))
+            .commit();
+        assert!(data_dir.join("queries/parent/highlights.scm").is_file());
     }
 
     /// Queries a language inherits are part of what makes it usable, so a

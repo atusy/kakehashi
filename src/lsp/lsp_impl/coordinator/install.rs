@@ -18,6 +18,71 @@ use tower_lsp_server::Client;
 use super::ParseCoordinator;
 use super::parse::ParseCoordinatorDeps;
 
+fn query_dependency_paths(settings: &WorkspaceSettings, language: &str) -> Vec<std::path::PathBuf> {
+    // The loader returns after loading an explicit list (including an empty
+    // one), so runtime files for this root language are not dependency inputs.
+    if settings
+        .languages
+        .get(language)
+        .is_some_and(|config| config.queries.is_some())
+    {
+        return Vec::new();
+    }
+    settings
+        .search_paths
+        .iter()
+        .map(std::path::PathBuf::from)
+        .collect()
+}
+
+/// What a lifecycle probe found for a managed language's query chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueryChainState {
+    /// Complete, or not a query-repair target at all.
+    Settled,
+    /// The managed parser's query chain is missing a language.
+    NeedsRepair,
+    /// A language in the chain is locked, so the chain cannot be judged now.
+    Busy,
+}
+
+fn managed_query_chain_state(
+    settings: &WorkspaceSettings,
+    language: &str,
+    data_dir: &std::path::Path,
+) -> QueryChainState {
+    if !settings.auto_install_for(language) {
+        return QueryChainState::Settled;
+    }
+    let paths = query_dependency_paths(settings, language);
+    if paths.is_empty() {
+        return QueryChainState::Settled;
+    }
+    let parser_config = settings
+        .languages
+        .get(language)
+        .and_then(|config| config.parser.as_deref());
+    let selected = crate::language::query_loader::QueryLoader::resolve_library_path(
+        parser_config,
+        language,
+        &paths,
+    );
+    let managed = crate::install::parser_file_exists(language, data_dir);
+    // A stale managed copy must not turn a custom parser into an install target.
+    let same_parser = selected
+        .and_then(|path| path.canonicalize().ok())
+        .zip(managed.and_then(|path| path.canonicalize().ok()))
+        .is_some_and(|(selected, managed)| selected == managed);
+    if !same_parser {
+        return QueryChainState::Settled;
+    }
+    match crate::install::queries::probe_chain(data_dir, language, &paths) {
+        crate::install::queries::ChainProbe::Complete(_) => QueryChainState::Settled,
+        crate::install::queries::ChainProbe::Incomplete => QueryChainState::NeedsRepair,
+        crate::install::queries::ChainProbe::Busy => QueryChainState::Busy,
+    }
+}
+
 fn updated_settings_after_install(
     raw_settings: &crate::config::RawWorkspaceSettings,
     settings: &WorkspaceSettings,
@@ -65,12 +130,58 @@ pub(super) struct InstallCoordinatorDeps {
     pub(super) shutdown: tokio_util::sync::CancellationToken,
 }
 
+/// Preserve the caller's query-repair decision across publication races.
+#[derive(Clone, Copy)]
+pub(crate) struct InstallRequest {
+    repair_queries: bool,
+    /// The requester already had a usable parser, so its own parse (or the
+    /// host's existing tree) publishes this document's first snapshot.
+    parser_loaded: bool,
+    allow_recovery: bool,
+}
+
+impl InstallRequest {
+    pub(crate) fn new(repair_queries: bool) -> Self {
+        Self {
+            repair_queries,
+            parser_loaded: repair_queries,
+            allow_recovery: true,
+        }
+    }
+}
+
 /// Installation/lifetime eligibility is distinct from ownership of a parse.
 /// A sibling may supply the tree while this install is waiting.
 #[derive(Default)]
 pub(crate) struct InstallCompletion {
     pub(crate) same_lifetime: bool,
     pub(crate) parsed: Option<super::parse::ParseLineage>,
+    queries_reloaded: bool,
+}
+
+impl InstallCompletion {
+    /// Reloading queries authorizes a fresh downstream pass even when the
+    /// current tree was retained. A plain parser recovery still owns no pass.
+    pub(crate) fn downstream_lineage(
+        &self,
+        documents: &DocumentStore,
+        uri: &Url,
+        incarnation: u64,
+    ) -> Option<super::parse::ParseLineage> {
+        if let Some(parsed) = self.parsed {
+            return Some(parsed);
+        }
+        if !self.queries_reloaded {
+            return None;
+        }
+        let document = documents.get(uri)?;
+        (document.incarnation() == incarnation && document.has_current_tree()).then(|| {
+            super::parse::ParseLineage {
+                incarnation,
+                content_version: document.content_version(),
+            }
+        })
+    }
 }
 
 pub(crate) struct InstallCoordinator {
@@ -179,6 +290,105 @@ impl InstallCoordinator {
             .await;
     }
 
+    /// Whether an already-loaded managed parser's query chain should be
+    /// repaired now. `initial_pass` marks lifecycle passes (open, install
+    /// completion) that check regardless of this generation's earlier checks.
+    ///
+    /// The probe resolves the parser path, canonicalizes, takes lock files and
+    /// reads modelines across every search path, so it runs on the blocking
+    /// pool rather than on an async worker.
+    pub(crate) async fn query_repair_needed(&self, language: &str, initial_pass: bool) -> bool {
+        let Some(generation) = self.begin_query_repair_check(language, initial_pass) else {
+            return false;
+        };
+        let settings = self.settings_manager.load_settings();
+        let probe_language = language.to_string();
+        let state = tokio::task::spawn_blocking(move || {
+            crate::install::default_data_dir().map_or(QueryChainState::Settled, |data_dir| {
+                managed_query_chain_state(&settings, &probe_language, &data_dir)
+            })
+        })
+        .await
+        .unwrap_or_else(|error| {
+            // A probe that panics would panic again on the next pass; reading
+            // it as busy would re-arm the check and respawn it every edit.
+            log::warn!(
+                target: "kakehashi::install",
+                "Query dependency check for {language:?} did not finish: {error}"
+            );
+            QueryChainState::Settled
+        });
+        self.finish_query_repair_check(language, generation, state)
+    }
+
+    #[cfg(test)]
+    fn decide_query_repair(
+        &self,
+        language: &str,
+        initial_pass: bool,
+        probe: impl FnOnce() -> QueryChainState,
+    ) -> bool {
+        self.begin_query_repair_check(language, initial_pass)
+            .is_some_and(|generation| self.finish_query_repair_check(language, generation, probe()))
+    }
+
+    /// The generation to probe in, or `None` when no probe is due.
+    fn begin_query_repair_check(&self, language: &str, initial_pass: bool) -> Option<u64> {
+        // Discovery may already have loaded the parser before this task runs.
+        // Track checks independently of load events; reload generations reset
+        // eligibility while steady-state edits do no dependency filesystem
+        // work. Opening another file does not change why the last repair
+        // failed; a reload (settings change or any successful install) retries
+        // it. The generation returned is the one the check was recorded in, so
+        // a busy answer undoes this very mark even when a reload lands between.
+        //
+        // The memo goes first: on an edit pass it answers without the settings
+        // and data-directory work the auto-install check does. A mark taken
+        // while auto-install is off is harmless; enabling it is a settings
+        // change, which starts a new generation.
+        let generation = self.cache.semantic_token_generation();
+        (self
+            .auto_install
+            .begin_query_dependency_check(language, generation, initial_pass)
+            && self.settings_manager.is_auto_install_enabled(language))
+        .then_some(generation)
+    }
+
+    /// A repair a pass decided on but dropped before installing, because its
+    /// document's lifetime ended, answered nothing for the language: let a
+    /// later pass of another document check it again this generation.
+    fn release_dropped_repair(&self, language: &str, generation: u64) {
+        self.auto_install
+            .forget_query_dependency_check(language, generation);
+    }
+
+    fn finish_query_repair_check(
+        &self,
+        language: &str,
+        generation: u64,
+        state: QueryChainState,
+    ) -> bool {
+        match state {
+            // Probes run concurrently; a repair that failed while this one
+            // read the chain has already answered. Judged in the current
+            // generation: a reload during the probe retires failures from the
+            // probe's own, and a failure after it is the one that counts.
+            QueryChainState::NeedsRepair => !self
+                .auto_install
+                .query_repair_failed(language, self.cache.semantic_token_generation()),
+            QueryChainState::Settled => false,
+            // A lock held exclusively by an install (staging or publishing)
+            // or an uninstall is not evidence of a missing language. Leave the answer
+            // to a later pass instead of spawning an install that would find
+            // nothing to do and still reload every document's queries.
+            QueryChainState::Busy => {
+                self.auto_install
+                    .forget_query_dependency_check(language, generation);
+                false
+            }
+        }
+    }
+
     /// Try to auto-install a language if not already being installed.
     ///
     /// Delegates to `AutoInstallManager::try_install()`, dispatches its events, and
@@ -192,14 +402,31 @@ impl InstallCoordinator {
         uri: Url,
         is_injection: bool,
         expected_incarnation: Option<u64>,
-        allow_recovery: bool,
+        request: InstallRequest,
     ) -> InstallCompletion {
         let mut parsed = None;
+        // A failure is remembered for the generation it was attempted in, so
+        // a reload that lands meanwhile already counts as the retry trigger.
+        let generation = self.cache.semantic_token_generation();
         if !self.same_document_incarnation(&uri, expected_incarnation) {
+            if request.repair_queries {
+                self.release_dropped_repair(language, generation);
+            }
             return InstallCompletion::default();
         }
 
-        if self.language.has_parser_available(language) {
+        let parser_available = self.language.has_parser_available(language);
+        let query_repair = request.repair_queries
+            || (parser_available && self.query_repair_needed(language, true).await);
+        let request = InstallRequest {
+            repair_queries: query_repair,
+            ..request
+        };
+        // A usable parser parses now. A repair requested with a loaded parser
+        // leaves that to the caller's own parse; one that started as a parser
+        // install had its caller skip parsing, and a failed repair must not
+        // leave the document tree-less.
+        if parser_available && (!query_repair || !request.parser_loaded) {
             if !is_injection && self.same_document_incarnation(&uri, expected_incarnation) {
                 parsed = self
                     .parse_coordinator()
@@ -207,18 +434,25 @@ impl InstallCoordinator {
                     .await;
             }
             if !self.same_document_incarnation(&uri, expected_incarnation) {
+                if query_repair {
+                    self.release_dropped_repair(language, generation);
+                }
                 return InstallCompletion::default();
             }
+        }
+        if parser_available && !query_repair {
             let recovered =
                 self.install_reparse_recovered(language, &uri, is_injection, expected_incarnation);
             if recovered {
                 return InstallCompletion {
                     same_lifetime: true,
                     parsed,
+                    queries_reloaded: false,
                 };
             }
         }
-        let mut result = self.auto_install.try_install(language).await;
+        let search_paths = query_dependency_paths(&self.settings_manager.load_settings(), language);
+        let mut result = self.auto_install.try_install(language, search_paths).await;
 
         self.dispatch_install_events(language, &result.events).await;
 
@@ -239,6 +473,7 @@ impl InstallCoordinator {
                 return InstallCompletion {
                     same_lifetime: true,
                     parsed,
+                    queries_reloaded: true,
                 };
             }
             drop(result);
@@ -255,7 +490,14 @@ impl InstallCoordinator {
         // burn the full first-parse backstop. Harmless for AlreadyInstalling:
         // its eventual reload-reparse lands the same-version tree through the
         // snapshot cell's tree-upgrade clause.
-        if let Some(expected_incarnation) = expected_incarnation {
+        // A repair requested with a usable parser is the exception: the
+        // caller's own parse publishes the tree, and a give-up landing first
+        // would hand its parked readers a tree-less snapshot. A parser install
+        // that became a repair still owns the release: its caller skipped
+        // the inline parse.
+        if let Some(expected_incarnation) = expected_incarnation
+            && !request.parser_loaded
+        {
             self.documents
                 .publish_giveup_snapshot(&uri, expected_incarnation);
         }
@@ -273,10 +515,26 @@ impl InstallCoordinator {
                     break crate::lsp::auto_install::InstallOutcome::Failed;
                 }
             };
-            if terminal.data_dir().is_some()
+            if let Some(data_dir) = terminal.data_dir()
                 && self.same_document_incarnation(&uri, expected_incarnation)
             {
-                if !is_injection {
+                if query_repair && !completion_token.owner_settled() {
+                    // A cancelled owner may publish its successful install
+                    // outcome before reloading. Refresh explicitly rather than
+                    // treating a terminal artifact outcome as a query-store ack.
+                    // An owner that completed the claim itself already
+                    // reloaded; repeating it would refresh every document again.
+                    parsed = self
+                        .reload_language_after_install(
+                            language,
+                            data_dir,
+                            uri.clone(),
+                            is_injection,
+                            expected_incarnation,
+                            None,
+                        )
+                        .await;
+                } else if !is_injection {
                     parsed = self
                         .parse_coordinator()
                         .reparse_installed_document(uri.clone(), language, expected_incarnation)
@@ -291,39 +549,66 @@ impl InstallCoordinator {
                     return InstallCompletion {
                         same_lifetime: true,
                         parsed,
+                        queries_reloaded: query_repair,
                     };
                 }
-                if allow_recovery {
-                    return Box::pin(self.maybe_auto_install_language(
+                if request.allow_recovery {
+                    // The queries were reloaded (by the owner or above); the
+                    // retry only needs a tree. Letting it re-decide keeps a
+                    // repair request from owning another install and a second
+                    // workspace-wide reload. The reload it would skip already
+                    // happened, so its completion still authorizes downstream
+                    // work for the repaired queries.
+                    let mut retried = Box::pin(self.maybe_auto_install_language(
                         language,
                         uri,
                         is_injection,
                         expected_incarnation,
-                        false,
+                        InstallRequest {
+                            repair_queries: false,
+                            allow_recovery: false,
+                            ..request
+                        },
                     ))
                     .await;
+                    retried.queries_reloaded |= query_repair;
+                    return retried;
                 }
                 return InstallCompletion::default();
             }
+            // A shared failure is the owner's to record, in the generation
+            // its attempt started in: a waiter joining after a reload must
+            // not spend that reload's retry on an attempt from before it.
             if terminal == crate::lsp::auto_install::InstallOutcome::Abandoned
                 && self.same_document_incarnation(&uri, expected_incarnation)
-                && allow_recovery
+                && request.allow_recovery
             {
                 return Box::pin(self.maybe_auto_install_language(
                     language,
                     uri,
                     is_injection,
                     expected_incarnation,
-                    false,
+                    InstallRequest {
+                        allow_recovery: false,
+                        ..request
+                    },
                 ))
                 .await;
             }
         } else {
+            // Recorded for any owned failure, not only a repair's: waiters
+            // repairing through this claim rely on it, and the memo only
+            // gates query-repair decisions.
+            if result.outcome.is_failure() {
+                self.auto_install
+                    .record_query_repair_failure(language, generation);
+            }
             result.complete_claim();
         }
         InstallCompletion {
             same_lifetime: self.same_document_incarnation(&uri, expected_incarnation),
             parsed,
+            queries_reloaded: false,
         }
     }
 
@@ -460,6 +745,576 @@ mod tests {
     use std::path::Path;
     use std::task::Poll;
     use tower_lsp_server::LspService;
+
+    #[tokio::test]
+    async fn parser_loaded_by_discovery_still_gets_a_first_dependency_check() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .apply_settings(auto_install_settings());
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), tree_sitter_rust::LANGUAGE.into());
+        let loaded = server.language.ensure_language_loaded_async("rust").await;
+        assert!(loaded.success && loaded.events.is_empty());
+        let install = server.install_coordinator();
+        let due = |initial_pass| {
+            install.decide_query_repair("rust", initial_pass, || QueryChainState::NeedsRepair)
+        };
+        assert!(due(false), "no load event, yet the first pass checks");
+        assert!(!due(false), "an edit pass checks once per generation");
+        assert!(due(true), "an initial pass always checks");
+        assert!(!due(false));
+        server.cache.bump_semantic_token_generation();
+        assert!(due(false), "a reload re-arms the check");
+    }
+
+    fn auto_install_settings() -> WorkspaceSettings {
+        WorkspaceSettings {
+            auto_install: true,
+            search_paths: vec![
+                crate::install::default_data_dir()
+                    .expect("test data directory")
+                    .to_string_lossy()
+                    .into_owned(),
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_busy_chain_is_not_repaired_and_stays_eligible_for_a_recheck() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .apply_settings(auto_install_settings());
+        let install = server.install_coordinator();
+        assert!(server.settings_manager.is_auto_install_enabled("rust"));
+        assert!(
+            !install.decide_query_repair("rust", false, || QueryChainState::Busy),
+            "a held lock is an install at work, not a missing language"
+        );
+        assert!(
+            install.decide_query_repair("rust", false, || QueryChainState::NeedsRepair),
+            "a busy answer must not consume this generation's check"
+        );
+        assert!(
+            !install.decide_query_repair("rust", false, || QueryChainState::NeedsRepair),
+            "a definitive answer does consume it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_waiter_leaves_a_shared_failure_to_the_owners_generation() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .apply_settings(auto_install_settings());
+        let uri = Url::parse("file:///failed-repair.rs").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "fn main() {}".into(),
+            Some("rust".into()),
+            None,
+        );
+        // An attempt started before a reload is still running afterwards...
+        let claim = server.auto_install.begin_test_claim(
+            "rust",
+            query_dependency_paths(&server.settings_manager.load_settings(), "rust"),
+        );
+        server.cache.bump_semantic_token_generation();
+        // ...and a repair requested after the reload joins it.
+        let install = server.install_coordinator();
+        let mut repair = Box::pin(install.maybe_auto_install_language(
+            "rust",
+            uri.clone(),
+            false,
+            Some(incarnation),
+            InstallRequest::new(true),
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(repair.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        claim.complete(crate::lsp::auto_install::InstallOutcome::Failed);
+        repair.await;
+
+        assert!(
+            install.decide_query_repair("rust", true, || QueryChainState::NeedsRepair),
+            "the reload's retry must not be spent on an attempt from before it"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_owned_failed_query_repair_is_not_retried_until_the_next_reload() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .apply_settings(auto_install_settings());
+        let uri = Url::parse("file:///owned-failed-repair.rs").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "fn main() {}".into(),
+            Some("rust".into()),
+            None,
+        );
+        server
+            .auto_install
+            .script_next_install("rust", crate::lsp::auto_install::InstallOutcome::Failed);
+        let install = server.install_coordinator();
+        install
+            .maybe_auto_install_language(
+                "rust",
+                uri.clone(),
+                false,
+                Some(incarnation),
+                InstallRequest::new(true),
+            )
+            .await;
+        assert!(
+            !install.decide_query_repair("rust", true, || QueryChainState::NeedsRepair),
+            "reopening must not repeat a repair that just failed"
+        );
+        server.cache.bump_semantic_token_generation();
+        assert!(
+            install.decide_query_repair("rust", true, || QueryChainState::NeedsRepair),
+            "a reload (settings change or a successful install) retries it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_parser_install_turned_repair_still_parses_with_the_loaded_parser() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), tree_sitter_rust::LANGUAGE.into());
+        // didOpen found no parser and skipped its inline parse; by the time
+        // its task runs the parser is back and the chain needs repair.
+        let uri = Url::parse("file:///turned-repair.rs").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "fn main() {}".into(),
+            Some("rust".into()),
+            None,
+        );
+        server
+            .auto_install
+            .script_next_install("rust", crate::lsp::auto_install::InstallOutcome::Failed);
+        server
+            .install_coordinator()
+            .maybe_auto_install_language(
+                "rust",
+                uri.clone(),
+                false,
+                Some(incarnation),
+                InstallRequest {
+                    repair_queries: true,
+                    parser_loaded: false,
+                    allow_recovery: true,
+                },
+            )
+            .await;
+        assert!(
+            server.documents.get(&uri).unwrap().tree().is_some(),
+            "a failed repair must not leave a document tree-less under a usable parser"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repair_dropped_for_a_closed_document_rearms_the_check() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .apply_settings(auto_install_settings());
+        let install = server.install_coordinator();
+        // An edit pass found the chain in need of repair...
+        assert!(install.decide_query_repair("rust", false, || QueryChainState::NeedsRepair));
+        // ...but its document closed before the install could start.
+        let closed = Url::parse("file:///closed-before-repair.rs").unwrap();
+        install
+            .maybe_auto_install_language("rust", closed, true, Some(1), InstallRequest::new(true))
+            .await;
+        assert!(
+            install.decide_query_repair("rust", false, || QueryChainState::NeedsRepair),
+            "another document's edit pass must still be able to repair"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failure_recorded_during_a_probe_declines_its_repair() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .apply_settings(auto_install_settings());
+        let install = server.install_coordinator();
+        let generation = server.cache.semantic_token_generation();
+        // A concurrent open's repair fails while this probe is still reading.
+        assert!(!install.decide_query_repair("rust", true, || {
+            server
+                .auto_install
+                .record_query_repair_failure("rust", generation);
+            QueryChainState::NeedsRepair
+        }));
+    }
+
+    #[tokio::test]
+    async fn a_probe_outlived_by_a_reload_sees_the_newer_failure() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .apply_settings(auto_install_settings());
+        let install = server.install_coordinator();
+        // A reload lands while the probe reads, and a repair then fails in
+        // the new generation.
+        assert!(!install.decide_query_repair("rust", true, || {
+            server.cache.bump_semantic_token_generation();
+            server
+                .auto_install
+                .record_query_repair_failure("rust", server.cache.semantic_token_generation());
+            QueryChainState::NeedsRepair
+        }));
+    }
+
+    #[tokio::test]
+    async fn query_repair_leaves_the_first_snapshot_to_the_inline_parse() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), tree_sitter_rust::LANGUAGE.into());
+        // didOpen spawns the repair beside the inline parse, which has not
+        // published yet.
+        let uri = Url::parse("file:///repair-before-parse.rs").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "fn main() {}".into(),
+            Some("rust".into()),
+            None,
+        );
+        let claim = server.auto_install.begin_test_claim(
+            "rust",
+            query_dependency_paths(&server.settings_manager.load_settings(), "rust"),
+        );
+        let install = server.install_coordinator();
+        let mut repair = Box::pin(install.maybe_auto_install_language(
+            "rust",
+            uri.clone(),
+            false,
+            Some(incarnation),
+            InstallRequest::new(true),
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(repair.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        claim.complete(crate::lsp::auto_install::InstallOutcome::Failed);
+        repair.await;
+        assert!(
+            server
+                .documents
+                .latest_snapshot(&uri)
+                .and_then(|view| view.slot.snapshot)
+                .is_none(),
+            "a tree-less give-up would wake first-parse readers before the tree lands"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reloaded_owner_spares_query_repair_waiters_a_second_reload() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), tree_sitter_rust::LANGUAGE.into());
+        let uri = Url::parse("file:///settled-owner.rs").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "fn main() {}".into(),
+            Some("rust".into()),
+            None,
+        );
+        let original = server
+            .parse_coordinator()
+            .reparse_installed_document(uri.clone(), "rust", Some(incarnation))
+            .await
+            .expect("initial parse");
+        let claim = server.auto_install.begin_test_claim(
+            "rust",
+            query_dependency_paths(&server.settings_manager.load_settings(), "rust"),
+        );
+        let install = server.install_coordinator();
+        let mut waiter = Box::pin(install.maybe_auto_install_language(
+            "rust",
+            uri.clone(),
+            false,
+            Some(incarnation),
+            InstallRequest::new(true),
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(waiter.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        let generation = server.cache.semantic_token_generation();
+        // An owner completes its claim only after its own reload.
+        claim.complete(crate::lsp::auto_install::InstallOutcome::Success {
+            data_dir: "/installed".into(),
+        });
+        let completion = waiter.await;
+        assert_eq!(
+            server.cache.semantic_token_generation(),
+            generation,
+            "the owner already reloaded every document's queries"
+        );
+        assert_eq!(
+            completion.downstream_lineage(&server.documents, &uri, incarnation),
+            Some(original),
+            "the waiter still refreshes its own document's downstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_repair_request_survives_a_siblings_publication() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), tree_sitter_rust::LANGUAGE.into());
+        let uri = Url::parse("file:///query-waiter.rs").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "fn main() {}".into(),
+            Some("rust".into()),
+            None,
+        );
+        let original = server
+            .parse_coordinator()
+            .reparse_installed_document(uri.clone(), "rust", Some(incarnation))
+            .await
+            .expect("initial parse");
+        // This document requested repair before the sibling published. By the
+        // time its task runs, the current parser fastpath is otherwise usable.
+        let claim = server.auto_install.begin_test_claim(
+            "rust",
+            query_dependency_paths(&server.settings_manager.load_settings(), "rust"),
+        );
+        let install = server.install_coordinator();
+        let mut waiter = Box::pin(install.maybe_auto_install_language(
+            "rust",
+            uri.clone(),
+            false,
+            Some(incarnation),
+            InstallRequest::new(true),
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(
+                waiter.as_mut().poll(cx).is_pending(),
+                "repair intent must bypass the ordinary parser shortcut"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        // Artifact success is intentionally published without an owner reload.
+        let generation = server.cache.semantic_token_generation();
+        claim.publish_without_reload(crate::lsp::auto_install::InstallOutcome::Success {
+            data_dir: "/installed".into(),
+        });
+        let completion = waiter.await;
+        assert!(
+            server.cache.semantic_token_generation() > generation,
+            "a cancelled owner's reload falls to the waiter"
+        );
+        assert!(completion.same_lifetime);
+        assert!(
+            completion.parsed.is_none(),
+            "existing tree should be retained"
+        );
+        assert_eq!(
+            completion.downstream_lineage(&server.documents, &uri, incarnation),
+            Some(original)
+        );
+    }
+
+    #[tokio::test]
+    async fn query_reload_authorizes_retained_tree_downstream_only_for_current_lifetime() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), tree_sitter_rust::LANGUAGE.into());
+        let uri = Url::parse("file:///query-repair.rs").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "fn main() {}".into(),
+            Some("rust".into()),
+            None,
+        );
+        let original = server
+            .parse_coordinator()
+            .reparse_installed_document(uri.clone(), "rust", Some(incarnation))
+            .await
+            .expect("initial parse");
+        let parsed = server
+            .install_coordinator()
+            .reload_language_after_install(
+                "rust",
+                Path::new("/installed"),
+                uri.clone(),
+                false,
+                Some(incarnation),
+                None,
+            )
+            .await;
+        assert!(parsed.is_none(), "reload retains the current tree");
+        let mut completion = InstallCompletion {
+            same_lifetime: true,
+            parsed,
+            queries_reloaded: true,
+        };
+        assert_eq!(
+            completion.downstream_lineage(&server.documents, &uri, incarnation),
+            Some(original)
+        );
+        completion.queries_reloaded = false;
+        assert_eq!(
+            completion.downstream_lineage(&server.documents, &uri, incarnation),
+            None,
+            "ordinary shared-parser recovery does not own downstream work"
+        );
+        completion.queries_reloaded = true;
+        server.documents.remove(&uri);
+        let reopened = server.documents.insert(
+            uri.clone(),
+            "fn next() {}".into(),
+            Some("rust".into()),
+            None,
+        );
+        server
+            .parse_coordinator()
+            .reparse_installed_document(uri.clone(), "rust", Some(reopened))
+            .await
+            .expect("reopened parse");
+        assert_eq!(
+            completion.downstream_lineage(&server.documents, &uri, incarnation),
+            None,
+            "a reload must not authorize work for a reopened lifetime"
+        );
+    }
+
+    #[test]
+    fn loaded_managed_parser_still_needs_missing_overlay_parent() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        std::fs::create_dir_all(data.join("parser")).unwrap();
+        std::fs::create_dir_all(data.join("queries/lua")).unwrap();
+        std::fs::create_dir_all(runtime.join("queries/lua")).unwrap();
+        let parser = data.join(format!("parser/lua.{}", std::env::consts::DLL_EXTENSION));
+        std::fs::write(&parser, "fixture").unwrap();
+        std::fs::write(data.join("queries/lua/highlights.scm"), "base").unwrap();
+        std::fs::write(
+            runtime.join("queries/lua/highlights.scm"),
+            ";; extends\n;; inherits: parent\n",
+        )
+        .unwrap();
+        let mut settings = WorkspaceSettings {
+            search_paths: vec![
+                runtime.to_string_lossy().into(),
+                data.to_string_lossy().into(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            managed_query_chain_state(&settings, "lua", &data),
+            QueryChainState::NeedsRepair
+        );
+        settings.languages.insert(
+            "lua".into(),
+            LanguageSettings {
+                auto_install: Some(false),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            managed_query_chain_state(&settings, "lua", &data),
+            QueryChainState::Settled
+        );
+        settings.languages.insert(
+            "lua".into(),
+            LanguageSettings {
+                queries: Some(Vec::new()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            managed_query_chain_state(&settings, "lua", &data),
+            QueryChainState::Settled
+        );
+        settings.languages.clear();
+        std::fs::create_dir_all(runtime.join("parser")).unwrap();
+        let custom = runtime.join("parser/lua.so");
+        std::fs::write(&custom, "custom").unwrap();
+        assert_eq!(
+            managed_query_chain_state(&settings, "lua", &data),
+            QueryChainState::Settled
+        );
+        std::fs::remove_file(&custom).unwrap();
+        settings.languages.insert(
+            "lua".into(),
+            LanguageSettings {
+                parser: Some(custom.to_string_lossy().into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            managed_query_chain_state(&settings, "lua", &data),
+            QueryChainState::Settled
+        );
+        settings.languages.clear();
+        std::fs::create_dir_all(data.join("queries/parent")).unwrap();
+        std::fs::write(data.join("queries/parent/highlights.scm"), "parent").unwrap();
+        assert_eq!(
+            managed_query_chain_state(&settings, "lua", &data),
+            QueryChainState::Settled
+        );
+    }
+
+    #[test]
+    fn explicit_queries_exclude_unused_runtime_dependency_paths() {
+        let mut settings = WorkspaceSettings {
+            search_paths: vec!["/runtime".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            query_dependency_paths(&settings, "lua"),
+            vec![std::path::PathBuf::from("/runtime")]
+        );
+        settings.languages.insert(
+            "lua".into(),
+            LanguageSettings {
+                queries: Some(Vec::new()),
+                ..Default::default()
+            },
+        );
+        assert!(query_dependency_paths(&settings, "lua").is_empty());
+        assert!(!query_dependency_paths(&settings, "rust").is_empty());
+    }
 
     #[test]
     fn reload_after_install_preserves_explicit_matching_override_in_raw_settings() {
@@ -674,7 +1529,7 @@ mod tests {
                 data_dir: std::path::PathBuf::from("/installed"),
             },
         );
-        let duplicate = server.auto_install.try_install(language).await;
+        let duplicate = server.auto_install.try_install(language, Vec::new()).await;
         assert_eq!(
             duplicate.outcome,
             crate::lsp::auto_install::InstallOutcome::AlreadyInstalling
@@ -732,14 +1587,17 @@ mod tests {
             Some("rust".to_string()),
             None,
         );
-        let claim = server.auto_install.begin_test_claim("rust");
+        let claim = server.auto_install.begin_test_claim(
+            "rust",
+            query_dependency_paths(&server.settings_manager.load_settings(), "rust"),
+        );
         let install = server.install_coordinator();
         let mut waiter = Box::pin(install.maybe_auto_install_language(
             "rust",
             second.clone(),
             false,
             Some(second_incarnation),
-            true,
+            InstallRequest::new(false),
         ));
         std::future::poll_fn(|cx| {
             assert!(waiter.as_mut().poll(cx).is_pending());
@@ -794,14 +1652,17 @@ mod tests {
             Some("rust".to_string()),
             None,
         );
-        let claim = server.auto_install.begin_test_claim("rust");
+        let claim = server.auto_install.begin_test_claim(
+            "rust",
+            query_dependency_paths(&server.settings_manager.load_settings(), "rust"),
+        );
         let install = server.install_coordinator();
         let mut waiter = Box::pin(install.maybe_auto_install_language(
             "rust",
             uri.clone(),
             false,
             Some(incarnation),
-            true,
+            InstallRequest::new(false),
         ));
         std::future::poll_fn(|cx| {
             assert!(waiter.as_mut().poll(cx).is_pending());
@@ -963,7 +1824,13 @@ mod tests {
         );
         let install = server.install_coordinator();
         let first = install
-            .maybe_auto_install_language("rust", uri.clone(), false, Some(incarnation), true)
+            .maybe_auto_install_language(
+                "rust",
+                uri.clone(),
+                false,
+                Some(incarnation),
+                InstallRequest::new(false),
+            )
             .await;
         assert!(first.same_lifetime);
         let parsed = first.parsed.expect("this install published the parse");
@@ -973,7 +1840,13 @@ mod tests {
             Some("rust")
         );
         let second = install
-            .maybe_auto_install_language("rust", uri.clone(), false, Some(incarnation), true)
+            .maybe_auto_install_language(
+                "rust",
+                uri.clone(),
+                false,
+                Some(incarnation),
+                InstallRequest::new(false),
+            )
             .await;
         assert!(
             second.same_lifetime,
@@ -1000,7 +1873,13 @@ mod tests {
                 .insert(uri.clone(), "fn old() {}".into(), Some("rust".into()), None);
         let completion = server
             .install_coordinator()
-            .maybe_auto_install_language("rust", uri.clone(), false, Some(incarnation), true)
+            .maybe_auto_install_language(
+                "rust",
+                uri.clone(),
+                false,
+                Some(incarnation),
+                InstallRequest::new(false),
+            )
             .await;
         let parsed = completion.parsed.expect("install's own parse");
         server
@@ -1037,7 +1916,10 @@ mod tests {
         // deterministic and network-free: without the claim the fall-through
         // reaches the metadata-backed support lookup, whose timing depends on
         // the cache and the network.
-        let _claim = server.auto_install.begin_test_claim(language);
+        let _claim = server.auto_install.begin_test_claim(
+            language,
+            query_dependency_paths(&server.settings_manager.load_settings(), language),
+        );
         let uri = Url::parse("file:///workspace/stale-install.txt").unwrap();
         let old_incarnation = server.documents.insert(
             uri.clone(),
@@ -1063,7 +1945,7 @@ mod tests {
                 uri,
                 false,
                 Some(old_incarnation),
-                true,
+                InstallRequest::new(false),
             ),
         )
         .await

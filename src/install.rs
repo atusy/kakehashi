@@ -142,6 +142,7 @@ pub mod test_support {
             return Ok(());
         }
         let options = super::LanguageInstallOptions {
+            search_paths: Vec::new(),
             data_dir: data_dir.to_path_buf(),
             force: false,
             verbose: false,
@@ -250,6 +251,8 @@ fn rollback_residue(outcome: queries::RollbackOutcome) -> Option<RollbackResidue
 pub struct LanguageInstallOptions {
     /// Base data directory the parser and queries are installed into.
     pub data_dir: PathBuf,
+    /// Trusted runtime paths whose query modelines may request dependencies.
+    pub search_paths: Vec<PathBuf>,
     /// Reinstall artifacts that are already present.
     pub force: bool,
     /// Print progress details to stderr.
@@ -295,6 +298,7 @@ fn install_language_blocking(
     install_language_with_query_stager(
         language,
         &LanguageInstallOptions {
+            search_paths: Vec::new(),
             data_dir: data_dir.to_path_buf(),
             force,
             verbose: false,
@@ -310,11 +314,12 @@ fn install_language_with_query_stager(
     language: &str,
     options: &LanguageInstallOptions,
     queries_base_url: &str,
-    stage_queries: fn(
+    stage_queries: impl Fn(
         &str,
         &str,
         &std::path::Path,
         bool,
+        &[PathBuf],
     ) -> Result<queries::StagedQueryInstall, queries::QueryInstallError>,
 ) -> InstallResult {
     let data_dir = options.data_dir.as_path();
@@ -356,7 +361,13 @@ fn install_language_with_query_stager(
     // compile that would then be thrown away. Following `; inherits:` here is
     // what makes languages like html (which keeps its @comment capture in
     // html_tags) highlight correctly.
-    let mut staged_queries = match stage_queries(queries_base_url, language, data_dir, force) {
+    let mut staged_queries = match stage_queries(
+        queries_base_url,
+        language,
+        data_dir,
+        force,
+        &options.search_paths,
+    ) {
         Ok(staged) => staged,
         Err(e) => {
             result.queries_error = Some(e.to_string());
@@ -405,15 +416,12 @@ fn install_language_with_query_stager(
         return result;
     }
 
-    // Queries that staging found already complete were never copied, so this is
-    // the only thing that would notice them being removed since. Checked under
-    // the locks, before anything is published, so there is nothing to undo.
-    if let Some(unstable) = staged_queries.unstable_skipped_dependency() {
-        result.queries_error = Some(format!(
-            "the queries installed for '{}' were removed or replaced while '{}' was being \
-             installed",
-            unstable, language
-        ));
+    // Recheck live queries skipped during staging and runtime declarations for
+    // staged copies. Managed files stay settled under the locks; user edits to
+    // external files are only observed, not serialized by those locks.
+    if let Some(unstable) = staged_queries.unstable_dependency() {
+        result.queries_error =
+            Some(queries::QueryInstallError::DependencyChanged(unstable.to_string()).to_string());
         return result;
     }
 
@@ -507,6 +515,7 @@ fn install_language_with_query_stager(
 /// call from async contexts like the LSP server.
 pub(crate) async fn install_language_async(
     language: String,
+    search_paths: Vec<PathBuf>,
     data_dir: PathBuf,
     force: bool,
     compile: parser::ParserCompile,
@@ -516,6 +525,7 @@ pub(crate) async fn install_language_async(
         install_language(
             &language,
             &LanguageInstallOptions {
+                search_paths,
                 data_dir,
                 force,
                 // Auto-install runs in the background: no progress chatter on
@@ -545,9 +555,29 @@ fn install_language_blocking_allowing_http_queries_for_tests(
     queries_base_url: &str,
     compile: parser::ParserCompile,
 ) -> InstallResult {
+    install_language_with_search_paths_allowing_http_queries_for_tests(
+        language,
+        data_dir,
+        Vec::new(),
+        force,
+        queries_base_url,
+        compile,
+    )
+}
+
+#[cfg(test)]
+fn install_language_with_search_paths_allowing_http_queries_for_tests(
+    language: &str,
+    data_dir: &std::path::Path,
+    search_paths: Vec<PathBuf>,
+    force: bool,
+    queries_base_url: &str,
+    compile: parser::ParserCompile,
+) -> InstallResult {
     install_language_with_query_stager(
         language,
         &LanguageInstallOptions {
+            search_paths,
             data_dir: data_dir.to_path_buf(),
             force,
             verbose: false,
@@ -1001,6 +1031,61 @@ mod tests {
         assert!(
             !data_dir.join("queries").join("orphan_child").exists(),
             "the child's queries must not be published without the parent it inherits"
+        );
+    }
+
+    /// A parent that a search path outside the data directory already
+    /// provides as a base query is what the loader resolves; it must not
+    /// block the requested language's install because upstream lacks it.
+    #[test]
+    fn a_parent_provided_only_by_a_search_path_does_not_block_the_install() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let data_dir = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        let parser_dir = data_dir.join("parser");
+        std::fs::create_dir_all(&parser_dir).unwrap();
+        std::fs::write(
+            parser_dir.join(format!("child_lang.{}", std::env::consts::DLL_EXTENSION)),
+            "",
+        )
+        .unwrap();
+        std::fs::create_dir_all(runtime.join("queries/child_lang")).unwrap();
+        std::fs::create_dir_all(runtime.join("queries/custom_lang")).unwrap();
+        std::fs::write(
+            runtime.join("queries/child_lang/highlights.scm"),
+            ";; extends\n;; inherits: custom_lang\n",
+        )
+        .unwrap();
+        std::fs::write(
+            runtime.join("queries/custom_lang/highlights.scm"),
+            "(comment) @comment\n",
+        )
+        .unwrap();
+        // Upstream has the child only: fetching custom_lang would 404.
+        let base_url = spawn_query_file_server(vec![(
+            "/child_lang/highlights.scm",
+            "(identifier) @variable\n",
+        )]);
+
+        let result = install_language_with_search_paths_allowing_http_queries_for_tests(
+            "child_lang",
+            &data_dir,
+            vec![runtime],
+            false,
+            &base_url,
+            parser::ParserCompile::InProcess,
+        );
+
+        assert!(
+            result.is_success(),
+            "a search-path parent must not fail the install: {:?} / {:?}",
+            result.parser_error,
+            result.queries_error
+        );
+        assert!(data_dir.join("queries/child_lang/highlights.scm").is_file());
+        assert!(
+            !data_dir.join("queries/custom_lang").exists(),
+            "a parent provided outside the data directory is not copied into it"
         );
     }
 }
