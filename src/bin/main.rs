@@ -1992,6 +1992,158 @@ mod tests {
     }
 
     #[test]
+    fn forced_output_creates_and_replaces_regular_files() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("config.toml");
+
+        write_forced_output(&output, "first complete configuration").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            "first complete configuration"
+        );
+        write_forced_output(&output, "replacement").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), "replacement");
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn failed_forced_creation_leaves_no_partial_output() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("config.toml");
+
+        let result = write_forced_output_with(&output, |file| {
+            use std::io::Write as _;
+            file.write_all(b"partial")?;
+            Err(std::io::Error::other("injected write failure"))
+        });
+
+        assert!(result.is_err());
+        assert!(!output.exists());
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn forced_output_refuses_directory_before_writing() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("config.toml");
+        std::fs::create_dir(&output).unwrap();
+        let marker = output.join("keep");
+        std::fs::write(&marker, "unchanged").unwrap();
+
+        let error = write_forced_output_with(&output, |_| {
+            panic!("a non-regular destination must be refused before writing")
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "unchanged");
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forced_output_preserves_permissions_without_mutating_hardlinks() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("config.toml");
+        let sibling = temp.path().join("other.toml");
+        std::fs::write(&output, "previous configuration").unwrap();
+        std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::fs::hard_link(&output, &sibling).unwrap();
+
+        write_forced_output(&output, "replacement").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), "replacement");
+        assert_eq!(
+            output.metadata().unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(
+            std::fs::read_to_string(sibling).unwrap(),
+            "previous configuration"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forced_output_refuses_read_only_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("config.toml");
+        std::fs::write(&output, "previous configuration").unwrap();
+        std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o400)).unwrap();
+
+        let error = write_forced_output(&output, "replacement").unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            std::fs::read_to_string(output).unwrap(),
+            "previous configuration"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forced_output_refuses_symlink_introduced_during_staging() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("config.toml");
+        let victim = temp.path().join("keep.toml");
+        std::fs::write(&output, "old output").unwrap();
+        std::fs::write(&victim, "unrelated content").unwrap();
+
+        let error = write_forced_output_with(&output, |file| {
+            use std::io::Write as _;
+            file.write_all(b"replacement")?;
+            std::fs::remove_file(&output)?;
+            std::os::unix::fs::symlink(&victim, &output)
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(output.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(victim).unwrap(),
+            "unrelated content"
+        );
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forced_output_refuses_socket_without_replacing_it() {
+        use std::os::unix::fs::FileTypeExt as _;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("socket");
+        let _listener = std::os::unix::net::UnixListener::bind(&output).unwrap();
+
+        let error = write_forced_output(&output, "replacement").unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(output.symlink_metadata().unwrap().file_type().is_socket());
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forced_output_refuses_dangling_symlink() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("config.toml");
+        let missing = temp.path().join("absent.toml");
+        std::os::unix::fs::symlink(&missing, &output).unwrap();
+
+        let error = write_forced_output(&output, "replacement").unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(output.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(!missing.exists());
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
     fn failed_forced_write_preserves_previous_output() {
         let temp = tempfile::TempDir::new().unwrap();
         let output = temp.path().join("config.toml");
