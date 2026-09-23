@@ -743,7 +743,10 @@ fn download_and_extract_archive(
     extract_parser_archive(decoder, &expected_prefix, dest)
 }
 
-/// Extract a parser archive while stripping its expected repository root.
+/// Extract regular files and directories while stripping the repository root.
+///
+/// Production callers supply a fresh source directory inside a private TempDir.
+/// Archives with links or special entries fall back to the git-clone fetch path.
 fn extract_parser_archive(
     reader: impl std::io::Read,
     expected_prefix: &str,
@@ -775,6 +778,17 @@ fn extract_parser_archive(
             continue;
         }
 
+        // Entry::unpack does not confine link targets. Reject links before any
+        // entry can create an alias that a later file or directory follows.
+        // A parser source archive needs only regular files and directories;
+        // devices and FIFOs must not be materialized either.
+        let entry_type = entry.header().entry_type();
+        if !entry_type.is_file() && !entry_type.is_dir() {
+            return Err(ParserInstallError::ArchiveError(format!(
+                "Unsupported entry type {entry_type:?} in parser archive at {relative:?}"
+            )));
+        }
+
         // Prevent path traversal attacks (zip slip)
         if relative
             .components()
@@ -788,7 +802,7 @@ fn extract_parser_archive(
 
         let target = dest.join(&relative);
 
-        if entry.header().entry_type().is_dir() {
+        if entry_type.is_dir() {
             fs::create_dir_all(&target)?;
         } else {
             if let Some(parent) = target.parent() {
@@ -2098,6 +2112,37 @@ mod tests {
             archive_root_dir_name("tree-sitter-json", "0.24.8"),
             "tree-sitter-json-0.24.8"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn parser_archive_cannot_write_through_an_archived_symlink() {
+        let temp = tempdir().unwrap();
+        let victim_dir = temp.path().join("outside");
+        fs::create_dir(&victim_dir).unwrap();
+        let victim = victim_dir.join("payload");
+        fs::write(&victim, b"original").unwrap();
+
+        let mut archive = tar::Builder::new(Vec::new());
+        let mut link = tar::Header::new_gnu();
+        link.set_entry_type(tar::EntryType::Symlink);
+        link.set_mode(0o777);
+        link.set_size(0);
+        link.set_link_name(&victim_dir).unwrap();
+        archive
+            .append_data(&mut link, "repo-rev/escape", std::io::empty())
+            .unwrap();
+        let mut file = tar::Header::new_gnu();
+        file.set_mode(0o644);
+        file.set_size(9);
+        archive
+            .append_data(&mut file, "repo-rev/escape/payload", &b"malicious"[..])
+            .unwrap();
+        let bytes = archive.into_inner().unwrap();
+
+        let result = extract_parser_archive(&bytes[..], "repo-rev", &temp.path().join("source"));
+        assert_eq!(fs::read(&victim).unwrap(), b"original");
+        assert!(result.is_err(), "archive links must be refused");
     }
 
     /// Test that download_and_extract_archive downloads and extracts a GitHub archive.
