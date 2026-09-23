@@ -1287,12 +1287,28 @@ fn write_new_output_with(
     path: &std::path::Path,
     write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
+    #[cfg(windows)]
+    let normalized_path = native_output_path(path)?;
+    #[cfg(windows)]
+    let path = normalized_path.as_path();
     let mut temp = output_temporary_file(path, None)?;
     write(temp.as_file_mut())?;
     temp.as_file().sync_all()?;
     temp.persist_noclobber(path).map_err(|e| e.error)?;
     sync_output_parent(path);
     Ok(())
+}
+
+#[cfg(windows)]
+fn native_output_path(path: &std::path::Path) -> std::io::Result<PathBuf> {
+    // Rust's filesystem wrappers support extended-length paths, but tempfile's
+    // native publication and our security APIs need the prefix explicitly.
+    // Canonicalize only the existing parent: the output leaf may be absent and
+    // must still be inspected without following a symlink/reparse point.
+    match path.file_name() {
+        Some(name) => Ok(output_parent(path).canonicalize()?.join(name)),
+        None => Ok(path.to_owned()),
+    }
 }
 
 fn output_parent(path: &std::path::Path) -> &std::path::Path {
@@ -1341,6 +1357,10 @@ fn write_forced_output_with(
     path: &std::path::Path,
     write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
+    #[cfg(windows)]
+    let normalized_path = native_output_path(path)?;
+    #[cfg(windows)]
+    let path = normalized_path.as_path();
     let metadata = forced_output_metadata(path)?;
     // Until ownership is restored, the staging inode may belong to a different
     // Unix group. Do not expose its content through that inherited group.
@@ -2330,6 +2350,31 @@ mod tests {
             std::fs::read_to_string(&output).unwrap(),
             "previous configuration"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn output_publication_supports_windows_long_paths() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut parent = temp.path().to_path_buf();
+        for _ in 0..6 {
+            parent.push("a-long-directory-component-for-output-publication");
+        }
+        std::fs::create_dir_all(&parent).unwrap();
+        let output = parent.join("config.toml");
+        assert!(output.as_os_str().len() > 260);
+
+        write_new_output_with(&output, |file| {
+            use std::io::Write as _;
+            file.write_all(b"initial")
+        })
+        .unwrap();
+        write_forced_output(&output, "replacement").unwrap();
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), "replacement");
+
+        let fresh = parent.join("schema.json");
+        write_forced_output(&fresh, "fresh").unwrap();
+        assert_eq!(std::fs::read_to_string(&fresh).unwrap(), "fresh");
     }
 
     #[cfg(windows)]
