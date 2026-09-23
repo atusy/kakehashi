@@ -1131,24 +1131,47 @@ fn e2e_downstream_refresh_skips_pull_fallback_disabled_contexts() {
     );
     open_host(&mut client);
 
-    // Discrimination math for the window: the mock sleeps 1000 ms before
-    // answering any pull, so a wrongly-dispatched pull delays the refresh to
-    // ≥ 1000 ms + mock startup (~350 ms baseline observed); the skip path
-    // delivers at startup cost alone (~340-500 ms, jittering to ~900 ms under
-    // ambient load). 900 ms keeps a clean margin on both sides where the old
-    // 600 ms window flaked against the startup jitter.
     let (refresh_id, _) = client
-        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_millis(900))
-        .expect("pullFallback=false must not delay the editor refresh with a downstream pull");
+        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(15))
+        .expect("pullFallback=false must still forward the editor refresh");
     client.send_response(refresh_id, json!(null));
+
+    // Refresh follows completion of the prefetch pass. The mock handles hover
+    // on the same FIFO as diagnostic requests, so its count proves the pass
+    // skipped this context regardless of process startup or machine load.
+    let response = client.send_request(
+        "textDocument/hover",
+        json!({
+            "textDocument": { "uri": MD_URI },
+            "position": { "line": HOST_LINE, "character": 0 }
+        }),
+    );
+    assert_eq!(
+        response.pointer("/result/contents"),
+        Some(&json!("diagnostic-requests:0")),
+        "pullFallback=false must not pull a diagnostic set to prefetch: {response}"
+    );
+
+    // Calibrate the observation: explicit editor pulls still reach this server
+    // despite pullFallback=false, and must increment the reported count.
+    let pulled = client.send_request(
+        "textDocument/diagnostic",
+        json!({ "textDocument": { "uri": MD_URI } }),
+    );
     assert!(
-        client
-            .wait_for_notification(
-                "textDocument/publishDiagnostics",
-                Duration::from_millis(400),
-            )
-            .is_none(),
-        "pullFallback=false must not publish a prefetched diagnostic set"
+        pulled.get("error").is_none(),
+        "editor pull failed: {pulled}"
+    );
+    let response = client.send_request(
+        "textDocument/hover",
+        json!({
+            "textDocument": { "uri": MD_URI },
+            "position": { "line": HOST_LINE, "character": 0 }
+        }),
+    );
+    assert_eq!(
+        response.pointer("/result/contents"),
+        Some(&json!("diagnostic-requests:1"))
     );
 
     client.send_request("shutdown", json!(null));
