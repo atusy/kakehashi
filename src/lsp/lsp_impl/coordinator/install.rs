@@ -837,6 +837,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_owned_failed_query_repair_is_not_retried_until_the_next_reload() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .apply_settings(auto_install_settings());
+        let uri = Url::parse("file:///owned-failed-repair.rs").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "fn main() {}".into(),
+            Some("rust".into()),
+            None,
+        );
+        server
+            .auto_install
+            .script_next_install("rust", crate::lsp::auto_install::InstallOutcome::Failed);
+        let install = server.install_coordinator();
+        install
+            .maybe_auto_install_language(
+                "rust",
+                uri.clone(),
+                false,
+                Some(incarnation),
+                InstallRequest::new(true),
+            )
+            .await;
+        assert!(
+            !install.decide_query_repair("rust", true, || QueryChainState::NeedsRepair),
+            "the repair's own failure must be remembered, not only a shared one"
+        );
+    }
+
+    #[tokio::test]
     async fn query_repair_leaves_the_first_snapshot_to_the_inline_parse() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();

@@ -206,6 +206,9 @@ pub(crate) struct AutoInstallManager {
     installing_languages: InstallingLanguages,
     claims: Arc<Mutex<HashMap<String, ClaimState>>>,
     query_dependency_checks: Arc<Mutex<QueryDependencyChecks>>,
+    /// Outcome the next `try_install` of a language owns without installing.
+    #[cfg(test)]
+    scripted_outcomes: Arc<Mutex<HashMap<String, InstallOutcome>>>,
 }
 
 impl std::fmt::Debug for AutoInstallManager {
@@ -264,7 +267,19 @@ impl AutoInstallManager {
             installing_languages,
             claims: Arc::new(Mutex::new(HashMap::new())),
             query_dependency_checks: Arc::new(Mutex::new(QueryDependencyChecks::default())),
+            #[cfg(test)]
+            scripted_outcomes: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Make the next `try_install` of `language` claim it and own `outcome`,
+    /// so the coordinator's owner path runs without support checks or I/O.
+    #[cfg(test)]
+    pub(crate) fn script_next_install(&self, language: &str, outcome: InstallOutcome) {
+        self.scripted_outcomes
+            .lock()
+            .recover_poison("AutoInstallManager::script_next_install")
+            .insert(language.to_string(), outcome);
     }
 
     #[cfg(test)]
@@ -384,6 +399,15 @@ impl AutoInstallManager {
     /// `SettingsManager` (Kakehashi checks settings first), or reload the
     /// language (Kakehashi handles post-install).
     pub async fn try_install(&self, language: &str, search_paths: Vec<PathBuf>) -> InstallResult {
+        #[cfg(test)]
+        if let Some(outcome) = self
+            .scripted_outcomes
+            .lock()
+            .recover_poison("AutoInstallManager::try_install")
+            .remove(language)
+        {
+            return self.begin_test_result(language, outcome);
+        }
         self.try_install_with_support_check(
             language,
             search_paths,
