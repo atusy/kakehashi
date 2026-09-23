@@ -1201,16 +1201,12 @@ fn safe_query_entry_name(path: &Path) -> Option<String> {
     Some(name.to_string())
 }
 
-/// What to tell someone whose `--output` path is already taken. A regular
-/// file is the only entry `--force` overwrites — in place, truncating that
-/// inode rather than replacing the directory entry, so any hard link to it
-/// sees the new content too. Everything else it cannot overwrite at all:
-/// `--force` refuses a symlink or reparse point rather than following it (see
-/// `write_forced_output`), cannot write to a directory, would write *into* a
-/// FIFO or device node (blocking until a reader appears, in the FIFO case),
-/// and cannot open a socket path as a file at all. So the advice is offered
-/// only where `--force` acts on the entry named — not as a promise that the
-/// write then succeeds, which permissions still decide.
+/// What to tell someone whose `--output` path is already taken. `--force`
+/// replaces regular file entries atomically; it does not update other hard
+/// links to the old file. Symlinks, reparse points and special files are
+/// refused rather than followed or replaced. The advice is not a promise
+/// that publication succeeds: directory permissions and open handles may
+/// still prevent replacement.
 ///
 /// The entry is inspected only to word the message — the refusal itself was
 /// already decided atomically by `create_new`, so a path that changes between
@@ -1261,11 +1257,7 @@ fn write_content_to_output(
             Ok(()) => {
                 eprintln!("Created {label} file: {}", path.display());
             }
-            // `AlreadyExists` under `--force` cannot happen today — a truncating
-            // write never reports it — so testing `!force` is redundant. It
-            // stays deliberately: without it, a future force-path error of
-            // that kind would tell someone who already passed `--force` to
-            // pass `--force`.
+            // Do not advise someone who already passed --force to pass it again.
             Err(e) if !force && e.kind() == std::io::ErrorKind::AlreadyExists => {
                 eprintln!(
                     "Error: An entry already exists at '{}'. {}",
@@ -1293,6 +1285,15 @@ fn write_new_output_with(
     path: &std::path::Path,
     write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
+    let mut temp = output_temporary_file(path)?;
+    write(temp.as_file_mut())?;
+    temp.as_file().sync_all()?;
+    temp.persist_noclobber(path)
+        .map(|_| ())
+        .map_err(|e| e.error)
+}
+
+fn output_temporary_file(path: &std::path::Path) -> std::io::Result<tempfile::NamedTempFile> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -1304,12 +1305,7 @@ fn write_new_output_with(
         use std::os::unix::fs::PermissionsExt as _;
         builder.permissions(std::fs::Permissions::from_mode(0o666));
     }
-    let mut temp = builder.tempfile_in(parent)?;
-    write(temp.as_file_mut())?;
-    temp.as_file().sync_all()?;
-    temp.persist_noclobber(path)
-        .map(|_| ())
-        .map_err(|e| e.error)
+    builder.tempfile_in(parent)
 }
 
 fn write_forced_output(path: &std::path::Path, content: &str) -> std::io::Result<()> {
@@ -1323,43 +1319,63 @@ fn write_forced_output_with(
     path: &std::path::Path,
     write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+    let permissions = forced_output_permissions(path)?;
+    let mut temp = output_temporary_file(path)?;
+    if let Some(permissions) = permissions {
+        temp.as_file().set_permissions(permissions)?;
+    }
+    write(temp.as_file_mut())?;
+    temp.as_file().sync_all()?;
+
+    // Refuse a link or special entry introduced while preparing the output.
+    // Persist replaces the directory entry, so even a later leaf swap cannot
+    // redirect the write into a symlink target.
+    forced_output_permissions(path)?;
+    temp.persist(path).map(|_| ()).map_err(|e| e.error)
+}
+
+fn forced_output_permissions(
+    path: &std::path::Path,
+) -> std::io::Result<Option<std::fs::Permissions>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let is_link = metadata.file_type().is_symlink();
+    #[cfg(windows)]
+    let is_link = {
+        use std::os::windows::fs::MetadataExt as _;
+        // Win32 FILE_ATTRIBUTE_REPARSE_POINT, returned by file_attributes().
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        is_link || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    };
+    if is_link {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("refusing to follow output symlink '{}'", path.display()),
+            format!(
+                "refusing to follow output symlink or reparse point '{}'",
+                path.display()
+            ),
         ));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .custom_flags(nix::libc::O_NOFOLLOW)
-            .open(path)?;
-        write(&mut file)
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to replace non-regular output '{}'",
+                path.display()
+            ),
+        ));
     }
-    #[cfg(not(unix))]
-    {
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt as _;
-            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-                .open(path)?;
-            write(&mut file)
-        }
-        #[cfg(not(windows))]
-        {
-            let mut file = std::fs::File::create(path)?;
-            write(&mut file)
-        }
+    let permissions = metadata.permissions();
+    if permissions.readonly() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("refusing to replace read-only output '{}'", path.display()),
+        ));
     }
+    Ok(Some(permissions))
 }
 
 /// Run the config init command
@@ -1954,9 +1970,7 @@ mod tests {
         std::os::unix::fs::symlink(temp.path().join("nowhere.toml"), &link).unwrap();
         assert!(overwrite_advice(&link).contains("symbolic link"));
 
-        // A socket stands in for the whole special-file family (FIFOs, device
-        // nodes). Only the classification is pinned here: what --force does to
-        // each kind differs, and none of it is a replacement.
+        // A socket stands in for the special-file family that --force refuses.
         let socket = temp.path().join("sock");
         let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         assert!(overwrite_advice(&socket).contains("not a regular file"));
@@ -1975,6 +1989,26 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(std::fs::read_to_string(output).unwrap(), "existing");
+    }
+
+    #[test]
+    fn failed_forced_write_preserves_previous_output() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("config.toml");
+        std::fs::write(&output, "previous valid configuration").unwrap();
+
+        let result = write_forced_output_with(&output, |file| {
+            use std::io::Write as _;
+            file.write_all(b"partial")?;
+            Err(std::io::Error::other("injected write failure"))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            "previous valid configuration"
+        );
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
     }
 
     #[test]
