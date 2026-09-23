@@ -2747,16 +2747,27 @@ impl LanguageServerPool {
                         .as_ref()
                         .map(|(root, _folder)| root.as_str().to_owned()),
                 );
-                return self
+                let diverted = self
                     .acquire_resolved_wait_ready(
                         server_name,
                         server_config,
                         per_root_key,
-                        marker,
+                        marker.clone(),
                         remaining,
                         false,
                     )
                     .await;
+                // A dynamically registering server makes this divert race its
+                // own registration: the per-root spawn above is usually still
+                // handshaking when the shared instance registers, and the
+                // consolidation that follows retires it mid-wait. Its failure
+                // then means "no longer needed", not "unavailable" — take the
+                // shared instance that just became able to serve this root.
+                if diverted.is_err() && handle.supports_workspace_folder_changes() {
+                    self.announce_shared_root(&handle, &marker).await?;
+                    return Ok(handle);
+                }
+                return diverted;
             }
         }
 
@@ -5172,6 +5183,45 @@ mod tests {
             Arc::ptr_eq(&result, &per_root),
             "a root the incapable shared connection does not serve must divert to its per-root connection"
         );
+    }
+
+    /// A dynamically registering server makes the post-Ready divert race its
+    /// own registration: the per-root spawn is still handshaking when the
+    /// shared instance registers, and consolidation retires it mid-wait. That
+    /// failure means the divert is no longer needed, so the acquisition takes
+    /// the now-capable shared instance instead of failing (#968).
+    #[tokio::test]
+    async fn wait_ready_takes_the_shared_instance_when_consolidation_retires_its_divert() {
+        let (_tmp, doc) = marker_rooted_doc();
+        let pool = Arc::new(LanguageServerPool::new());
+        let config = shared_config();
+
+        let per_root_key = pool.connection_key("lua", &config, Some(&doc));
+        let per_root = create_handle_with_key(ConnectionState::Initializing, per_root_key).await;
+        pool.insert_connection(Arc::clone(&per_root)).await;
+        let shared =
+            create_handle_with_key(ConnectionState::Initializing, ConnectionKey::shared("lua"))
+                .await;
+        pool.insert_connection(Arc::clone(&shared)).await;
+        let (shared_clone, pool_clone) = (Arc::clone(&shared), Arc::clone(&pool));
+        tokio::spawn(async move {
+            // Ready but not yet registered: the waiter diverts...
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            shared_clone
+                .set_server_capabilities(tower_lsp_server::ls_types::ServerCapabilities::default());
+            shared_clone.set_state(ConnectionState::Ready);
+            // ...then the registration arrives while the divert still waits.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            register_folder_changes(&shared_clone);
+            pool_clone.consolidate_shared_instance("lua").await;
+        });
+
+        let result = pool
+            .get_or_create_connection_wait_ready("lua", &config, Some(&doc), Duration::from_secs(2))
+            .await
+            .expect("a divert retired by consolidation must fall back to the shared instance");
+        assert!(Arc::ptr_eq(&result, &shared));
+        assert!(!Arc::ptr_eq(&result, &per_root));
     }
 
     /// The incapable-shared divert proves served-ness against the SPAWN root,
