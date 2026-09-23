@@ -124,6 +124,24 @@ pub(crate) fn truncate_entries(
     result
 }
 
+/// Whether a `priorities` allowlist admits `server`, given that `server` is
+/// one of the configured candidates — the membership [`expand_priorities`]
+/// yields, without expanding: a candidate is admitted iff the list names it
+/// or holds a `"*"` (which stands for every candidate not named elsewhere).
+///
+/// For gating what a server *pushes* unsolicited (#916), where there is no
+/// walk to order — only "is this server allowed to contribute here".
+/// `maxFanOut` is deliberately not applied: it is a dispatch budget taken
+/// after the capability prefilter drops incapable servers, so the servers
+/// inside the cap depend on each request's candidates — a push-only server
+/// is never inside it for a pull — and it has no stable meaning as
+/// membership.
+pub(crate) fn priorities_admit(priorities: &[String], server: &str) -> bool {
+    priorities
+        .iter()
+        .any(|entry| entry == server || entry == PRIORITIES_WILDCARD)
+}
+
 /// Flatten entries to server names in walk order.
 ///
 /// This is the fan-out membership and spawn order, and the result ordering
@@ -194,6 +212,27 @@ mod tests {
                 PriorityEntry::Server("alpha".into()),
             ]
         );
+    }
+
+    #[test]
+    fn priorities_admit_matches_expanded_membership() {
+        let servers = configs(&["alpha", "beta", "gamma"]);
+        for list in [
+            prios(&["*"]),
+            prios(&["gamma", "unconfigured"]),
+            prios(&["beta", "*"]),
+            prios(&["*", "alpha", "*"]),
+            prios(&[]),
+        ] {
+            let expanded = entry_names(&expand_priorities(&list, &servers));
+            for server in ["alpha", "beta", "gamma"] {
+                assert_eq!(
+                    priorities_admit(&list, server),
+                    expanded.iter().any(|name| name == server),
+                    "{server} under {list:?}"
+                );
+            }
+        }
     }
 
     #[test]

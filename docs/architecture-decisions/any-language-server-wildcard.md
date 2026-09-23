@@ -129,17 +129,25 @@ priorities = ["pyright", "ruff"]
 The default (absent `priorities` ≡ `["*"]`) includes it everywhere, so this
 only bites configs that have already opted into explicit priority lists.
 
-**This exclusion covers requests kakehashi dispatches, not unsolicited pushes.**
-A server excluded by `priorities` is still a *candidate* — `handles_language`
-put it in the set — so the eager open still opens the region on it, and
-`record_region_push` accepts what it publishes after checking only that the
-server is still spawnable. A push-driven server therefore keeps reaching the
-editor for a language whose `priorities` omit it. That gate predates this
-decision (it bites an excluded pyright/ruff pair the same way), but the
-wildcard makes it far easier to hit, since a `"*"` server is a candidate for
-every language by construction. Tracked as #916; the reliable exclusion for a
-push-driven server today is `enabled = false`, which the selection sites check
-first.
+**The exclusion also covers what an excluded server pushes (#916).** A server
+excluded by `priorities` is still a *candidate* — `handles_language` put it in
+the set — so the eager open still opens the region on it and the recorder
+still caches what it publishes. Its pushes are dropped where each diagnostic
+surface merges the cache instead, against current settings: the proactive
+`publishDiagnostics` admits only the servers the
+`textDocument/publishDiagnostics` `priorities` names, the client-pull fold only
+those `textDocument/diagnostic` names. The two surfaces keep separate keys, so
+excluding a push-driven server from a language on both takes both keys (or the
+`"_"` method wildcard):
+
+```toml
+[languages.markdown.bridge.python.aggregation."_"]
+priorities = ["pyright"]   # harper-ls ("*") neither dispatches nor pushes here
+```
+
+The server still receives the region and may spend work on it; skipping the
+eager open would have to prove the server excluded for *every* method it could
+serve, which per-method `priorities` cannot answer cheaply.
 
 ### Scope: Turning a Language Off at Runtime Does Not Retract It
 
@@ -151,7 +159,10 @@ document when its region changes language, not when its server stops being a
 candidate, and a host-filter edit does not touch any server's launch config, so
 nothing recycles the connection either — a `same_launch_config` mismatch would.
 The server keeps receiving `didChange` for those regions, and keeps publishing,
-until the host document closes or the connection restarts.
+until the host document closes or the connection restarts — though what it
+publishes no longer reaches the editor: with no candidates left for the
+language, the push gates (#916) drop its cached pushes from both diagnostic
+surfaces.
 
 Also pre-existing, also amplified for the same reason: with `"*"` there is
 always a server holding the region. Changing the server's own `languages` *does*

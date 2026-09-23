@@ -605,6 +605,15 @@ impl Kakehashi {
         .await
         .into_iter()
         .for_each(|uri| self.schedule_reparse(uri, None));
+        // The new settings can change what a client pull returns with no
+        // publish to show it — e.g. a server newly excluded by
+        // `textDocument/diagnostic` `priorities` (#916), whose folded pushes
+        // the pull drops at once. A pull client re-pulls only when told to,
+        // so ask it to. Forced past the coverage gate: no coverage version
+        // moved, the configuration did. Refresh-capability-gated and
+        // single-flighted like every other nudge; the re-pull waits for the
+        // reparse scheduled above.
+        DiagnosticPublisher::new(self).request_pull_diagnostic_refresh(true);
     }
 
     async fn apply_initial_settings(

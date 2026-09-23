@@ -272,13 +272,15 @@ actions) — when multiple servers are configured for a block, all of their
 diagnostics are shown. The strategy is resolved per language, so different
 embedded languages can behave differently. Spontaneous pushes a server sends
 on its own bypass the strategy machinery when proactively republished: they
-are cached and concatenated across servers — except that whenever the pull
+are cached and concatenated across the servers the block's
+`textDocument/publishDiagnostics` `priorities` admits — except that whenever the pull
 layer is active for the document, cached push slots from pull-capable
 servers are suppressed in favor of pull results (no double-counting; in
 mixed configurations this can suppress a push whose server was not itself
 pulled). When those cached pushes later answer a client PULL
-(`pushFallback`), only push-driven servers' slots fold in, under the
-cross-layer priorities/strategy only — server-level `priorities`/
+(`pushFallback`), only push-driven servers' slots fold in, and only from
+the servers the block's `textDocument/diagnostic` `priorities` admits,
+under the cross-layer priorities/strategy — the server-level order and
 `maxFanOut` are not reapplied.
 
 ### Code actions

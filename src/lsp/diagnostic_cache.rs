@@ -195,6 +195,30 @@ pub(crate) fn push_slot_servers(snapshot: &SourceSlots) -> std::collections::Has
     servers
 }
 
+/// Whether `slots` holds any `Region` source at all (empty slots included).
+pub(crate) fn has_region_sources(slots: &SourceSlots) -> bool {
+    slots
+        .keys()
+        .any(|source| matches!(source, DiagnosticSource::Region(_)))
+}
+
+/// Keep only the `Region` push slots `keep(region_id, server)` accepts,
+/// dropping any `Region` source left empty. `Host` and `PullLayer` sources are
+/// untouched. Filters a publish/pull snapshot clone; the cache keeps the slots,
+/// so a later config change that re-admits a server restores them.
+pub(crate) fn retain_region_push_slots(
+    snapshot: &mut SourceSlots,
+    mut keep: impl FnMut(&str, &str) -> bool,
+) {
+    snapshot.retain(|source, servers| {
+        let DiagnosticSource::Region(region_id) = source else {
+            return true;
+        };
+        servers.retain(|server, _| keep(region_id, server));
+        !servers.is_empty()
+    });
+}
+
 /// Cached **push** diagnostics from `snapshot`, partitioned by layer, for every
 /// `(source, server)` the `include` predicate accepts — Path B's `pushFallback`
 /// fold (#425). `Region` slots are transformed to host coordinates via
@@ -1027,6 +1051,8 @@ impl DiagnosticAggregator {
     /// it (`None` for the synthetic pull-layer), so a later crash can evict only
     /// that connection's slots (#469). A restart re-pushes with a new id, replacing
     /// and re-tagging the slot.
+    ///
+    /// Returns whether the slot's diagnostics changed.
     pub(crate) fn record(
         &self,
         host: &Url,
@@ -1034,7 +1060,7 @@ impl DiagnosticAggregator {
         server: String,
         connection_id: Option<ProgressConnectionId>,
         diagnostics: Vec<Diagnostic>,
-    ) {
+    ) -> bool {
         let mut revisions = self
             .cache_revisions
             .lock()
@@ -1061,6 +1087,7 @@ impl DiagnosticAggregator {
         if changed {
             revisions.insert(host.clone(), self.allocate_cache_revision());
         }
+        changed
     }
 
     /// Replace the cached host-event pull blob for a host
@@ -2190,6 +2217,28 @@ impl DiagnosticAggregator {
             .recover_poison("DiagnosticAggregator::republish_locks")
             .get(host)
             .map_or(0, Arc::strong_count)
+    }
+
+    /// Every non-empty push slot `connection_id` produced, as `(host, source,
+    /// server)` — what [`Self::evict_connection`] would remove visibly. Read
+    /// before an eviction so the caller can tell which servers' diagnostics
+    /// vanish (only on a connection exit, never on a hot path).
+    pub(crate) fn connection_push_slots(
+        &self,
+        connection_id: ProgressConnectionId,
+    ) -> Vec<(Url, DiagnosticSource, String)> {
+        let cache = self.lock();
+        let mut slots = Vec::new();
+        for (host, sources) in cache.iter() {
+            for (source, servers) in sources {
+                for (server, slot) in servers {
+                    if slot.connection_id == Some(connection_id) && !slot.diagnostics.is_empty() {
+                        slots.push((host.clone(), source.clone(), server.clone()));
+                    }
+                }
+            }
+        }
+        slots
     }
 
     /// Drop every push slot produced by `connection_id` — a downstream connection
@@ -4020,6 +4069,38 @@ mod tests {
             vec![diag("r")],
         );
         assert!(agg.has_region_slots(&host()));
+    }
+
+    #[test]
+    fn retain_region_push_slots_filters_region_servers_only() {
+        let agg = DiagnosticAggregator::new();
+        let conn = Some(ProgressConnectionId::for_test(1));
+        for (source, server) in [
+            (DiagnosticSource::Region("r1".into()), "kept"),
+            (DiagnosticSource::Region("r1".into()), "dropped"),
+            (DiagnosticSource::Region("r2".into()), "dropped"),
+            (DiagnosticSource::Host, "dropped"),
+        ] {
+            agg.record(&host(), source, server.into(), conn, vec![diag(server)]);
+        }
+        let mut snapshot = agg.snapshot(&host());
+
+        retain_region_push_slots(&mut snapshot, |_, server| server != "dropped");
+
+        let r1 = &snapshot[&DiagnosticSource::Region("r1".into())];
+        assert!(r1.contains_key("kept") && !r1.contains_key("dropped"));
+        assert!(
+            !snapshot.contains_key(&DiagnosticSource::Region("r2".into())),
+            "a region source left empty is removed"
+        );
+        assert!(
+            snapshot[&DiagnosticSource::Host].contains_key("dropped"),
+            "host push slots are not region slots and stay untouched"
+        );
+        assert!(
+            agg.has_region_slots(&host()),
+            "only the snapshot clone is filtered; the cache keeps every slot"
+        );
     }
 
     #[test]

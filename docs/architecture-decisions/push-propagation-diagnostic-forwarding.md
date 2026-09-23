@@ -651,6 +651,23 @@ because the #380 benefit now outweighs it:
   from the publish whenever a `PullLayer` blob is present, so each server has one
   native source while its slot stays cached (a spontaneous push from a
   pull-driven server still publishes when no `PullLayer` exists).
+- Server-level `priorities` membership over cached pushes (#916). Each path
+  admits only the push slots whose server its own key's `priorities` allowlist
+  names for the slot's (host, injection language) — `publishDiagnostics` for
+  Path A's merge, `diagnostic` for Path B's fold; `_self` host slots likewise
+  under `bridge._self.aggregation`. Filtered on the snapshot clone at merge time
+  against current settings, never at record time, so one cache serves both keys
+  and a config change that excludes a server retracts its pushes at the next
+  republish: the settings reload reparses open documents, whose post-parse pass
+  republishes a host holding region slots at once and any host that can still
+  contribute after the debounce; pull clients are sent one forced
+  `workspace/diagnostic/refresh` per settings reload, since the fold applies
+  the new allowlist at their next pull. Membership only: the walk's order and
+  `maxFanOut` stay with the deferred per-source fan-in below. Because the keys
+  can diverge, a changed push slot hidden from the publish but admitted by the
+  fold leaves the published set unchanged while changing the next pull; the
+  push-origin callers (push batch, crash eviction) check exactly those slots
+  after an unchanged republish and still send the refresh nudge.
 
 **Deferred** (staged follow-ups; the code documents each at its site):
 
