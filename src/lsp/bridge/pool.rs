@@ -916,6 +916,12 @@ impl LanguageServerPool {
         stale_handles
     }
 
+    /// Retire `server_name`'s per-root connections once its shared instance
+    /// can take new roots (#968). Not implemented yet.
+    pub(crate) async fn consolidate_shared_instance(&self, server_name: &str) {
+        let _ = server_name;
+    }
+
     /// Set the upstream client capabilities.
     ///
     /// Called once during upstream initialize to forward capabilities to downstream servers.
@@ -4644,6 +4650,83 @@ mod tests {
 
         assert!(pool.connections.lock().await.contains_key(&key));
         assert_eq!(handle.workspace_folders().snapshot(), None);
+    }
+
+    fn register_folder_changes(handle: &ConnectionHandle) {
+        handle
+            .dynamic_capabilities()
+            .register(vec![tower_lsp_server::ls_types::Registration {
+                id: "folders".to_string(),
+                method: "workspace/didChangeWorkspaceFolders".to_string(),
+                register_options: None,
+            }]);
+    }
+
+    /// Roots diverted to per-root processes while the shared instance looked
+    /// incapable — deterministic in the window between `initialized` and a
+    /// dynamic registration — are consolidated once it registers (#968):
+    /// their connections are retired through the ordinary invalidate path, so
+    /// their documents move to the shared instance on their next acquisition
+    /// instead of a redundant process serving them for the rest of the
+    /// session.
+    #[tokio::test]
+    async fn consolidating_a_capable_shared_instance_retires_its_diverted_roots() {
+        let pool = LanguageServerPool::new();
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("srv")).await;
+        shared.set_server_capabilities(Default::default());
+        register_folder_changes(&shared);
+        let diverted_key = ConnectionKey::new("srv", Some("file:///repo/b".to_string()));
+        let diverted = create_handle_with_key(ConnectionState::Ready, diverted_key.clone()).await;
+        let fallback_key = ConnectionKey::for_server("srv");
+        let fallback = create_handle_with_key(ConnectionState::Ready, fallback_key.clone()).await;
+        let other_key = ConnectionKey::new("other", Some("file:///repo/b".to_string()));
+        let other = create_handle_with_key(ConnectionState::Ready, other_key.clone()).await;
+        for handle in [&shared, &diverted, &fallback, &other] {
+            pool.insert_connection(Arc::clone(handle)).await;
+        }
+
+        pool.consolidate_shared_instance("srv").await;
+
+        let connections = pool.connections.lock().await;
+        assert!(
+            !connections.contains_key(&diverted_key),
+            "a diverted root must be retired once the shared instance can take it"
+        );
+        assert!(connections.contains_key(shared.key()));
+        assert!(
+            connections.contains_key(&fallback_key),
+            "only marker roots are diverts; a client-root connection is not one"
+        );
+        assert!(
+            connections.contains_key(&other_key),
+            "another server's per-root connection is not this shared instance's"
+        );
+        drop(connections);
+        assert!(
+            pool.pending_reopen.claim(&diverted_key).is_some(),
+            "the retirement goes through the invalidate path, which arms a re-open"
+        );
+    }
+
+    /// A consolidation request that finds the shared instance incapable — its
+    /// registration withdrawn again, or the connection replaced by one that
+    /// never registered — retires nothing: those roots still need their own
+    /// processes.
+    #[tokio::test]
+    async fn consolidating_an_incapable_shared_instance_keeps_diverted_roots() {
+        let pool = LanguageServerPool::new();
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("srv")).await;
+        shared.set_server_capabilities(Default::default());
+        let diverted_key = ConnectionKey::new("srv", Some("file:///repo/b".to_string()));
+        let diverted = create_handle_with_key(ConnectionState::Ready, diverted_key.clone()).await;
+        pool.insert_connection(Arc::clone(&shared)).await;
+        pool.insert_connection(diverted).await;
+
+        pool.consolidate_shared_instance("srv").await;
+
+        assert!(pool.connections.lock().await.contains_key(&diverted_key));
     }
 
     #[tokio::test]

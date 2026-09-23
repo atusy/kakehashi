@@ -188,6 +188,9 @@
 //!   `workspace/didChangeWorkspaceFolders` via `client/registerCapability` on
 //!   `initialized` (Pyright-style, #968). Its hover also reports the process id
 //!   so a test can tell a forwarded folder change from a restart.
+//! - `workspace-folders-dynamic-late` — like `workspace-folders-dynamic`, but
+//!   registers on the first `textDocument/hover` this process receives, so a
+//!   test can let other roots divert before the capability appears.
 //!
 //! Only built for E2E runs (`required-features = ["e2e"]` in Cargo.toml).
 
@@ -209,6 +212,9 @@ fn main() {
     // `workspace-folders` mode: every folder URI this server has been told
     // about, via `initialize` params and `workspace/didChangeWorkspaceFolders`.
     let mut workspace_folders: Vec<String> = Vec::new();
+    // `workspace-folders-dynamic-late`: whether the one-shot registration on
+    // the first hover has been sent.
+    let mut registered_folder_changes = false;
     // `will-save` mode: counts + last-seen URI for the willSave/didSave
     // notifications, reported back via hover so the test can prove they arrived
     // and carried the right document URI (the virtual URI for a virt server,
@@ -489,7 +495,7 @@ fn main() {
                     // Declares `supported` but NOT `changeNotifications`:
                     // folder-change support arrives later, via a dynamic
                     // registration sent on `initialized` (#968).
-                    "workspace-folders-dynamic" => json!({
+                    "workspace-folders-dynamic" | "workspace-folders-dynamic-late" => json!({
                         "hoverProvider": true,
                         "textDocumentSync": 1,
                         "workspace": {
@@ -803,6 +809,24 @@ fn main() {
                 }
             }
             "textDocument/hover" => {
+                if mode == "workspace-folders-dynamic-late" && !registered_folder_changes {
+                    // Register only once this process is first asked for
+                    // something, so a test decides WHEN the capability appears.
+                    // Sent before the hover answer: the bridge records it
+                    // before routing that answer.
+                    registered_folder_changes = true;
+                    request_with_params(
+                        &mut writer,
+                        json!("register-workspace-folders"),
+                        "client/registerCapability",
+                        json!({
+                            "registrations": [{
+                                "id": "workspace-folders",
+                                "method": "workspace/didChangeWorkspaceFolders"
+                            }]
+                        }),
+                    );
+                }
                 let result = if mode == "inlay-hint-marker-resolve" {
                     let observation = json!({
                         "uri": message.pointer("/params/textDocument/uri"),

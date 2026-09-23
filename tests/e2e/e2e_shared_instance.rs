@@ -59,14 +59,16 @@ fn two_roots() -> TwoRoots {
 /// `prefer_shared` and the mock running in `mock_mode` (`"workspace-folders"`
 /// advertises the capability; `"workspace-folders-incapable"` does not).
 fn init_client_mode(prefer_shared: bool, mock_mode: &str) -> (LspClient, tempfile::TempDir) {
-    init_client_with_folders(prefer_shared, mock_mode, Value::Null)
+    init_client_with_folders(prefer_shared, mock_mode, Value::Null, None)
 }
 
-/// [`init_client_mode`] with the client's `workspaceFolders` at `initialize`.
+/// [`init_client_mode`] with the client's `workspaceFolders` at `initialize`,
+/// and optionally the mock's cross-process wire log (`MOCK_LSP_WIRE_LOG`).
 fn init_client_with_folders(
     prefer_shared: bool,
     mock_mode: &str,
     workspace_folders: Value,
+    wire_log: Option<&std::path::Path>,
 ) -> (LspClient, tempfile::TempDir) {
     let config_dir = tempfile::TempDir::new().expect("config tempdir");
     let config_path = config_dir.path().join("shared.toml");
@@ -77,10 +79,13 @@ fn init_client_with_folders(
     )
     .expect("write config");
 
-    let mut client = LspClient::builder()
+    let mut builder = LspClient::builder()
         .arg("--config-file")
-        .arg(config_path.to_str().expect("utf-8 path"))
-        .build();
+        .arg(config_path.to_str().expect("utf-8 path"));
+    if let Some(path) = wire_log {
+        builder = builder.env("MOCK_LSP_WIRE_LOG", path.to_string_lossy());
+    }
+    let mut client = builder.build();
 
     client.send_request(
         "initialize",
@@ -295,6 +300,7 @@ fn e2e_client_folder_change_is_forwarded_to_a_dynamically_registering_server() {
         false,
         "workspace-folders-dynamic",
         json!([{ "uri": root_a, "name": "a" }]),
+        None,
     );
     open(&mut client, &doc, "# A\n");
     let before = poll_hover(&mut client, &doc, |f| f.contains(&root_a));
@@ -317,4 +323,69 @@ fn e2e_client_folder_change_is_forwarded_to_a_dynamically_registering_server() {
         hover_pid(&before),
         "the folder change must be forwarded, not answered with a restart"
     );
+}
+
+/// A root diverted to its own process while the shared instance had not yet
+/// registered folder-change support is consolidated once it does (#968): the
+/// diverted process is shut down rather than left serving a root the shared
+/// instance now takes. Routing alone would already send root B's NEXT request
+/// to the shared instance (the capability is read live), so the discriminating
+/// observation is the diverted process's `shutdown`.
+#[test]
+fn e2e_late_registration_consolidates_diverted_roots() {
+    let roots = two_roots();
+    let log_dir = tempfile::TempDir::new().expect("wire log dir");
+    let wire_log = log_dir.path().join("wire.log");
+    let (mut client, _cfg) = init_client_with_folders(
+        true,
+        "workspace-folders-dynamic-late",
+        Value::Null,
+        Some(&wire_log),
+    );
+
+    // Bring the shared instance up for root A WITHOUT asking it anything, so
+    // it stays unregistered (the mock registers on its first hover).
+    open(&mut client, &roots.doc_a, "# A\n");
+    open(&mut client, &roots.doc_b, "# B\n");
+    // Root B lands on a diverted per-root process: the shared one is Ready
+    // and still incapable.
+    let root_b = roots.root_b.clone();
+    let diverted = poll_hover(&mut client, &roots.doc_b, |f| f.contains(&root_b));
+    assert!(
+        diverted.contains(&roots.root_b) && !diverted.contains(&roots.root_a),
+        "before registration root B must be served by its own process; got {diverted:?}"
+    );
+    let shutdowns = |log: &std::path::Path| {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.starts_with("shutdown\t"))
+            .count()
+    };
+    assert_eq!(shutdowns(&wire_log), 0, "nothing has been retired yet");
+
+    // The shared instance's first hover makes it register.
+    let root_a = roots.root_a.clone();
+    let shared = poll_hover(&mut client, &roots.doc_a, |f| f.contains(&root_a));
+    assert!(shared.contains(&roots.root_a), "got {shared:?}");
+
+    let mut retired = 0;
+    for _ in 0..200 {
+        retired = shutdowns(&wire_log);
+        if retired > 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(
+        retired, 1,
+        "the diverted root's process must be retired once the shared instance registers"
+    );
+
+    let consolidated = poll_hover(&mut client, &roots.doc_b, |f| f.contains(&roots.root_a));
+    assert!(
+        consolidated.contains(&roots.root_a) && consolidated.contains(&roots.root_b),
+        "root B must now be served by the shared instance; got {consolidated:?}"
+    );
+    assert_eq!(hover_pid(&consolidated), hover_pid(&shared));
 }
