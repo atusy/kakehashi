@@ -2427,7 +2427,9 @@ fn spawn_crash_recovery(
             );
             return;
         }
-        let Some(mut delay) = recovery_delay(&key, pool.schedule_crash_recovery(&crashed)) else {
+        let Some((mut delay, mut reservation)) =
+            recovery_delay(&key, pool.schedule_crash_recovery(&crashed))
+        else {
             return;
         };
         let mut after_own_failure = false;
@@ -2438,6 +2440,7 @@ fn spawn_crash_recovery(
                 &bridge,
                 &settings_manager,
                 &key,
+                reservation,
                 after_own_failure,
             )
             .await
@@ -2452,7 +2455,10 @@ fn spawn_crash_recovery(
                 }
             };
             match recovery_delay(&key, next) {
-                Some(next) => delay = next,
+                Some((next, next_reservation)) => {
+                    delay = next;
+                    reservation = next_reservation;
+                }
                 None => return,
             }
         }
@@ -2472,19 +2478,24 @@ enum RecoveryAttempt {
     },
 }
 
-/// The delay before the next attempt `decision` allows, logging a give-up.
+/// The delay (and schedule reservation) of the next attempt `decision`
+/// allows, logging a give-up.
 fn recovery_delay(
     key: &crate::lsp::bridge::ConnectionKey,
     decision: crate::lsp::bridge::RecoveryDecision,
-) -> Option<std::time::Duration> {
+) -> Option<(std::time::Duration, crate::lsp::bridge::Reservation)> {
     use crate::lsp::bridge::RecoveryDecision;
     match decision {
-        RecoveryDecision::Retry { attempt, delay } => {
+        RecoveryDecision::Retry {
+            attempt,
+            delay,
+            reservation,
+        } => {
             log::debug!(
                 target: "kakehashi::bridge",
                 "Downstream {key} is down; considering a respawn in {delay:?} (attempt {attempt})"
             );
-            Some(delay)
+            Some((delay, reservation))
         }
         RecoveryDecision::AlreadyScheduled | RecoveryDecision::Exhausted => None,
         RecoveryDecision::GiveUp { attempts } => {
@@ -2504,12 +2515,13 @@ async fn attempt_crash_recovery(
     bridge: &Arc<crate::lsp::bridge::BridgeCoordinator>,
     settings_manager: &crate::lsp::settings_manager::SettingsManager,
     key: &crate::lsp::bridge::ConnectionKey,
+    reservation: crate::lsp::bridge::Reservation,
     after_own_failure: bool,
 ) -> RecoveryAttempt {
     let pool = bridge.pool();
     // Standing down gives the attempt back, and hands on any crash this
     // recovery absorbed while it was scheduled.
-    let stand_down = || match pool.stand_down_crash_recovery(key) {
+    let stand_down = || match pool.stand_down_crash_recovery(key, reservation) {
         Some(decision) => RecoveryAttempt::Again {
             decision,
             after_own_failure: false,
@@ -2545,18 +2557,18 @@ async fn attempt_crash_recovery(
         // server the new settings do not describe.
         let generation = snapshot.generation;
         let admit = || settings_manager.settings_generation() == generation;
-        pool.commit_crash_recovery_attempt(key);
+        pool.commit_crash_recovery_attempt(key, reservation);
         let error = match pool.revive_crashed_connection(key, &config, &admit).await {
-            Ok(true) => {
+            // Whether this call spawned the replacement or an edit's respawn
+            // got there first, the key was restarted during this crash
+            // streak, and the streak's budget counts restarts.
+            Ok(_) => {
                 log::info!(
                     target: "kakehashi::bridge",
-                    "Respawned crashed downstream {key}"
+                    "Crashed downstream {key} is back up"
                 );
                 return RecoveryAttempt::Done;
             }
-            // An edit or request replaced it first; this attempt spawned
-            // nothing and does not count.
-            Ok(false) => return stand_down(),
             Err(error) => error,
         };
         if error.kind() == std::io::ErrorKind::Interrupted

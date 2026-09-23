@@ -68,13 +68,13 @@ pub use pool::LanguageServerPool;
 /// The re-open budget, shared so the server-side handler bounds its work by the
 /// same value requests wait on (execute-command-routing-token).
 pub(crate) use pool::REOPEN_WAIT;
-pub(crate) use pool::RecoveryDecision;
 pub(crate) use pool::UpstreamId;
 /// Re-exported for the capability-prefilter regression test in `lsp_impl`, which
 /// seeds a `Ready` downstream to exercise `collect_push_diagnostics`' filter.
 #[cfg(test)]
 pub(crate) use pool::test_helpers;
 pub(crate) use pool::{ConnectionHandle, ConnectionKey};
+pub(crate) use pool::{RecoveryDecision, Reservation};
 pub(crate) use progress_registry::{ProgressConnectionId, ProgressRegistry};
 pub(crate) use protocol::RegionOffset;
 pub(crate) use protocol::RequestId;

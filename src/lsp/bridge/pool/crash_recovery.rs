@@ -57,8 +57,13 @@ const _: () =
 /// What to do about a connection that just crashed.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RecoveryDecision {
-    /// Attempt recovery after `delay`; `attempt` counts from 1.
-    Retry { attempt: u32, delay: Duration },
+    /// Attempt recovery after `delay`; `attempt` counts from 1. The caller
+    /// owns `reservation` until it commits to the respawn or stands down.
+    Retry {
+        attempt: u32,
+        delay: Duration,
+        reservation: Reservation,
+    },
     /// A recovery for this key is already waiting out its delay.
     AlreadyScheduled,
     /// This crash exhausted the consecutive attempts. Returned once per
@@ -68,10 +73,19 @@ pub(crate) enum RecoveryDecision {
     Exhausted,
 }
 
+/// One scheduled recovery's claim on its key, so that only the recovery that
+/// scheduled can release the schedule: an older recovery finishing late must
+/// not release a newer one's, or a third could be scheduled beside it and
+/// skip the backoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Reservation(u64);
+
 #[derive(Default)]
 struct KeyState {
     attempts: u32,
-    scheduled: bool,
+    /// The reservation of the recovery currently waiting out its delay.
+    scheduled: Option<Reservation>,
+    next_reservation: u64,
     gave_up: bool,
     /// A crash reported while a recovery was already scheduled: that recovery
     /// owes it, and must hand it on if it stands down instead of respawning.
@@ -92,12 +106,14 @@ impl CrashRecoveryRegistry {
             .lock()
             .recover_poison("CrashRecoveryRegistry::schedule");
         let state = keys.entry(key.clone()).or_default();
-        if state.scheduled {
+        if state.scheduled.is_some() {
             state.missed = true;
             return RecoveryDecision::AlreadyScheduled;
         }
         if uptime >= HEALTHY_PERIOD {
-            *state = KeyState::default();
+            state.attempts = 0;
+            state.gave_up = false;
+            state.missed = false;
         }
         if state.attempts >= MAX_CONSECUTIVE_ATTEMPTS {
             if state.gave_up {
@@ -109,10 +125,13 @@ impl CrashRecoveryRegistry {
             };
         }
         state.attempts += 1;
-        state.scheduled = true;
+        state.next_reservation += 1;
+        let reservation = Reservation(state.next_reservation);
+        state.scheduled = Some(reservation);
         RecoveryDecision::Retry {
             attempt: state.attempts,
             delay: FIRST_RETRY_DELAY * 2u32.pow(state.attempts - 1),
+            reservation,
         }
     }
 
@@ -124,14 +143,17 @@ impl CrashRecoveryRegistry {
     /// crashes during its own handshake reports that crash while the attempt is
     /// still awaiting the handshake, and that crash must schedule the next
     /// attempt rather than read as already scheduled.
-    pub(super) fn begin_attempt(&self, key: &ConnectionKey) {
+    pub(super) fn begin_attempt(&self, key: &ConnectionKey, reservation: Reservation) {
         let mut keys = self
             .keys
             .lock()
             .recover_poison("CrashRecoveryRegistry::begin_attempt");
-        let state = keys.entry(key.clone()).or_default();
-        state.scheduled = false;
-        state.missed = false;
+        if let Some(state) = keys.get_mut(key)
+            && state.scheduled == Some(reservation)
+        {
+            state.scheduled = None;
+            state.missed = false;
+        }
     }
 
     /// Give back the attempt a recovery took, because it respawned nothing
@@ -143,16 +165,27 @@ impl CrashRecoveryRegistry {
     /// Returns the decision for a crash this recovery was holding on to, which
     /// would otherwise go unrecovered: one reported while it was scheduled
     /// (absorbed as already scheduled), or one that found the budget exhausted
-    /// only because this attempt had not been given back yet.
-    pub(super) fn stand_down(&self, key: &ConnectionKey) -> Option<RecoveryDecision> {
+    /// only because this attempt had not been given back yet. Nothing is
+    /// owed while another recovery holds the schedule: that one serves them.
+    pub(super) fn stand_down(
+        &self,
+        key: &ConnectionKey,
+        reservation: Reservation,
+    ) -> Option<RecoveryDecision> {
         let mut keys = self
             .keys
             .lock()
             .recover_poison("CrashRecoveryRegistry::stand_down");
         let state = keys.get_mut(key)?;
-        state.scheduled = false;
         state.attempts = state.attempts.saturating_sub(1);
-        let owed = std::mem::take(&mut state.missed) || std::mem::take(&mut state.gave_up);
+        let owed = if state.scheduled == Some(reservation) {
+            state.scheduled = None;
+            std::mem::take(&mut state.missed) | std::mem::take(&mut state.gave_up)
+        } else if state.scheduled.is_none() {
+            std::mem::take(&mut state.gave_up)
+        } else {
+            false
+        };
         drop(keys);
         owed.then(|| self.schedule(key, Duration::ZERO))
     }
@@ -169,16 +202,23 @@ mod tests {
     /// A replacement that died shortly after starting.
     const SHORT_RUN: Duration = Duration::from_millis(100);
 
+    /// `(attempt, delay, reservation)` of a `Retry`, panicking otherwise.
+    fn retry(decision: RecoveryDecision) -> (u32, Duration, Reservation) {
+        match decision {
+            RecoveryDecision::Retry {
+                attempt,
+                delay,
+                reservation,
+            } => (attempt, delay, reservation),
+            other => panic!("expected a retry, got {other:?}"),
+        }
+    }
+
     #[test]
     fn first_crash_retries_after_the_first_delay() {
         let registry = CrashRecoveryRegistry::default();
-        assert_eq!(
-            registry.schedule(&key(), SHORT_RUN),
-            RecoveryDecision::Retry {
-                attempt: 1,
-                delay: FIRST_RETRY_DELAY
-            }
-        );
+        let (attempt, delay, _) = retry(registry.schedule(&key(), SHORT_RUN));
+        assert_eq!((attempt, delay), (1, FIRST_RETRY_DELAY));
     }
 
     #[test]
@@ -194,15 +234,13 @@ mod tests {
     #[test]
     fn consecutive_crashes_back_off_then_give_up_once() {
         let registry = CrashRecoveryRegistry::default();
-        for attempt in 1..=MAX_CONSECUTIVE_ATTEMPTS {
+        for expected in 1..=MAX_CONSECUTIVE_ATTEMPTS {
+            let (attempt, delay, reservation) = retry(registry.schedule(&key(), SHORT_RUN));
             assert_eq!(
-                registry.schedule(&key(), SHORT_RUN),
-                RecoveryDecision::Retry {
-                    attempt,
-                    delay: FIRST_RETRY_DELAY * 2u32.pow(attempt - 1)
-                }
+                (attempt, delay),
+                (expected, FIRST_RETRY_DELAY * 2u32.pow(expected - 1))
             );
-            registry.begin_attempt(&key());
+            registry.begin_attempt(&key(), reservation);
         }
         assert_eq!(
             registry.schedule(&key(), SHORT_RUN),
@@ -219,32 +257,28 @@ mod tests {
     #[test]
     fn a_crash_during_the_attempt_schedules_the_next_one() {
         let registry = CrashRecoveryRegistry::default();
-        let _ = registry.schedule(&key(), SHORT_RUN);
-        registry.begin_attempt(&key());
-        assert!(matches!(
-            registry.schedule(&key(), SHORT_RUN),
-            RecoveryDecision::Retry { attempt: 2, .. }
-        ));
+        let (_, _, reservation) = retry(registry.schedule(&key(), SHORT_RUN));
+        registry.begin_attempt(&key(), reservation);
+        assert_eq!(retry(registry.schedule(&key(), SHORT_RUN)).0, 2);
+    }
+
+    fn exhaust(registry: &CrashRecoveryRegistry) {
+        for _ in 0..MAX_CONSECUTIVE_ATTEMPTS {
+            let (_, _, reservation) = retry(registry.schedule(&key(), SHORT_RUN));
+            registry.begin_attempt(&key(), reservation);
+        }
     }
 
     #[test]
     fn a_crash_ending_a_healthy_run_starts_over_even_after_giving_up() {
         let registry = CrashRecoveryRegistry::default();
-        for _ in 0..MAX_CONSECUTIVE_ATTEMPTS {
-            let _ = registry.schedule(&key(), SHORT_RUN);
-            registry.begin_attempt(&key());
-        }
+        exhaust(&registry);
         assert!(matches!(
             registry.schedule(&key(), SHORT_RUN),
             RecoveryDecision::GiveUp { .. }
         ));
-        assert_eq!(
-            registry.schedule(&key(), HEALTHY_PERIOD),
-            RecoveryDecision::Retry {
-                attempt: 1,
-                delay: FIRST_RETRY_DELAY
-            }
-        );
+        let (attempt, delay, _) = retry(registry.schedule(&key(), HEALTHY_PERIOD));
+        assert_eq!((attempt, delay), (1, FIRST_RETRY_DELAY));
     }
 
     /// Time alone does not heal: after giving up, a server an edit restarts
@@ -252,10 +286,7 @@ mod tests {
     #[test]
     fn a_short_run_after_giving_up_stays_exhausted() {
         let registry = CrashRecoveryRegistry::default();
-        for _ in 0..MAX_CONSECUTIVE_ATTEMPTS {
-            let _ = registry.schedule(&key(), SHORT_RUN);
-            registry.begin_attempt(&key());
-        }
+        exhaust(&registry);
         let _ = registry.schedule(&key(), SHORT_RUN);
         assert_eq!(
             registry.schedule(&key(), SHORT_RUN),
@@ -266,39 +297,37 @@ mod tests {
     #[test]
     fn keys_back_off_independently() {
         let registry = CrashRecoveryRegistry::default();
+        let (_, _, reservation) = retry(registry.schedule(&key(), SHORT_RUN));
+        registry.begin_attempt(&key(), reservation);
         let _ = registry.schedule(&key(), SHORT_RUN);
-        registry.begin_attempt(&key());
-        let _ = registry.schedule(&key(), SHORT_RUN);
-        assert!(matches!(
-            registry.schedule(&ConnectionKey::for_server("other"), SHORT_RUN),
-            RecoveryDecision::Retry { attempt: 1, .. }
-        ));
+        assert_eq!(
+            retry(registry.schedule(&ConnectionKey::for_server("other"), SHORT_RUN)).0,
+            1
+        );
     }
 
     #[test]
     fn a_recovery_that_stands_down_spends_no_attempt() {
         let registry = CrashRecoveryRegistry::default();
         for _ in 0..MAX_CONSECUTIVE_ATTEMPTS + 1 {
-            assert!(matches!(
-                registry.schedule(&key(), SHORT_RUN),
-                RecoveryDecision::Retry { attempt: 1, .. }
-            ));
-            registry.begin_attempt(&key());
-            assert_eq!(registry.stand_down(&key()), None);
+            let (attempt, _, reservation) = retry(registry.schedule(&key(), SHORT_RUN));
+            assert_eq!(attempt, 1);
+            assert_eq!(registry.stand_down(&key(), reservation), None);
         }
     }
 
     #[test]
     fn a_crash_absorbed_while_scheduled_is_handed_on_by_a_stand_down() {
         let registry = CrashRecoveryRegistry::default();
-        let _ = registry.schedule(&key(), SHORT_RUN);
+        let (_, _, reservation) = retry(registry.schedule(&key(), SHORT_RUN));
         // A replacement crashed while the recovery waited.
         assert_eq!(
             registry.schedule(&key(), SHORT_RUN),
             RecoveryDecision::AlreadyScheduled
         );
+        let handed_on = registry.stand_down(&key(), reservation);
         assert!(matches!(
-            registry.stand_down(&key()),
+            handed_on,
             Some(RecoveryDecision::Retry { attempt: 1, .. })
         ));
     }
@@ -306,9 +335,11 @@ mod tests {
     #[test]
     fn a_crash_that_found_the_budget_spent_is_handed_on_by_a_stand_down() {
         let registry = CrashRecoveryRegistry::default();
+        let mut last = None;
         for _ in 0..MAX_CONSECUTIVE_ATTEMPTS {
-            let _ = registry.schedule(&key(), SHORT_RUN);
-            registry.begin_attempt(&key());
+            let (_, _, reservation) = retry(registry.schedule(&key(), SHORT_RUN));
+            registry.begin_attempt(&key(), reservation);
+            last = Some(reservation);
         }
         // The last attempt is still in flight when another crash arrives.
         assert!(matches!(
@@ -317,8 +348,24 @@ mod tests {
         ));
         // It then respawns nothing, so that crash was not really out of budget.
         assert!(matches!(
-            registry.stand_down(&key()),
+            registry.stand_down(&key(), last.unwrap()),
             Some(RecoveryDecision::Retry { .. })
         ));
+    }
+
+    /// A recovery that committed and then stood down must not release the
+    /// schedule of a newer recovery, or a third crash could be scheduled
+    /// beside it and skip the backoff.
+    #[test]
+    fn a_late_stand_down_leaves_a_newer_recovery_scheduled() {
+        let registry = CrashRecoveryRegistry::default();
+        let (_, _, older) = retry(registry.schedule(&key(), SHORT_RUN));
+        registry.begin_attempt(&key(), older);
+        let _newer = retry(registry.schedule(&key(), SHORT_RUN));
+        assert_eq!(registry.stand_down(&key(), older), None);
+        assert_eq!(
+            registry.schedule(&key(), SHORT_RUN),
+            RecoveryDecision::AlreadyScheduled
+        );
     }
 }
