@@ -206,11 +206,14 @@ Partially implemented:
     drops the virtual `didSave` instead of running a save hook on stale or later
     unsaved fragment text. At ingress, `didSave` is a per-document writer fence,
     so a later wire-order `didChange` cannot overtake save-time version capture.
-    Synthetic diagnostic collection registers an abortable background waiter
-    for that exact saved incarnation/version and snapshots only after its tree
-    is ready; parse or parser-install latency therefore neither blocks the
-    writer nor silently loses the save trigger. Snapshot preparation repeats
-    that lineage check atomically with the snapshot read. A later `didChange`
+    Synthetic diagnostic collection registers an abortable background task
+    for that exact saved incarnation/version. It pulls the host layer from live
+    text immediately; if virtual geometry is pending, the same task waits for
+    the saved tree and then recollects both layers. Pending virtual results stay
+    cached separately from the advancing host results, including contributions
+    hidden by a preferred layer. Parse latency therefore neither blocks host
+    diagnostics nor silently loses the virtual save trigger. Snapshot
+    preparation repeats the lineage check atomically with the input read. A later `didChange`
     aborts the saved pull before mutating the document, and the completed pull
     revalidates and publishes under the same edit lock, so neither the
     wait-to-snapshot window nor an in-flight downstream request can commit

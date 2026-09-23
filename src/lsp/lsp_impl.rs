@@ -823,14 +823,8 @@ impl Kakehashi {
                     publisher.request_pull_diagnostic_refresh(true);
                 }
 
-                // Schedule the debounced diagnostic HERE, after the reparse published
-                // a current tree — NOT in the did_change handler, where the tree has
-                // just gone stale. `prepare_diagnostic_snapshot` returns `None` without
-                // a tree (`Document::snapshot()` requires one), and a `None` snapshot
-                // makes the debounce a no-op — skipping the on-edit host re-sync
-                // (#431) that keeps a push-only `_self` host server's diagnostics
-                // following edits. Running it post-parse captures a snapshot with the
-                // fresh tree; the debounce coalesces across loop iterations.
+                // Follow up the text-only host collection with current virtual
+                // geometry. The debounce coalesces across parse iterations.
                 diagnostic_scheduler.schedule_debounced_diagnostic(uri.clone());
 
                 if !scheduler.finish(&uri) {

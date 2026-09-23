@@ -293,6 +293,10 @@ impl Kakehashi {
                 .process_injections(&uri, false)
                 .await;
         } else {
+            // Host diagnostics need only live text. The parse callback below
+            // follows up with virtual diagnostics once geometry is current.
+            self.diagnostic_scheduler()
+                .spawn_synthetic_diagnostic_task(uri.clone());
             // #6 off-ingress open flip (interactive LSP). The owned coordinators /
             // Arcs are captured into the spawned task; the handler returns without
             // awaiting the parse.
@@ -2414,17 +2418,91 @@ print("hello")
         );
     }
 
-    /// Regression (parse-actor flip): the debounced diagnostic — which drives the
-    /// on-edit host re-sync (#431) that keeps a push host's diagnostics following
-    /// edits — must be scheduled AFTER the off-ingress reparse, not in the
-    /// `did_change` handler. The handler makes the tree stale, and
-    /// `prepare_diagnostic_snapshot` returns `None` without a tree, so scheduling
-    /// the debounce there would capture a `None` snapshot and silently skip the
-    /// re-sync (the diagnostics-don't-follow-edits bug). This pins the mechanism:
-    /// the snapshot is `None` with the tree cleared and valid again once the
-    /// reparse restores it.
+    #[cfg(unix)]
     #[tokio::test]
-    async fn diagnostic_snapshot_needs_the_reparsed_tree_not_the_cleared_one() {
+    async fn saved_host_diagnostics_run_before_parse_and_again_after_parse() {
+        use crate::lsp::diagnostic_cache::{DiagnosticSource, PULL_LAYER_SERVER};
+        use serde_json::json;
+        use std::time::Duration;
+
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+        let handle = server
+            .bridge
+            .insert_diagnostic_test_connection("rust_ls")
+            .await;
+        let uri = Url::parse("file:///test/saved-unparsed.rs").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        server.bridge.open_host_incarnation(&uri, incarnation).await;
+        assert!(server.documents.get(&uri).unwrap().tree().is_none());
+        server
+            .diagnostic_scheduler()
+            .spawn_synthetic_diagnostic_task_when_current(uri.clone(), incarnation, 0);
+
+        for message in ["before parse", "after parse"] {
+            let request_id = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Some(id) = handle
+                        .router()
+                        .pending_ids()
+                        .into_iter()
+                        .find(|id| handle.router().is_sent(*id))
+                    {
+                        break id;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("saved host pull must not wait for a tree, and must follow up once it lands");
+            let _ = handle.router().route(json!({
+                "jsonrpc": "2.0", "id": request_id.as_i64(),
+                "result": { "kind": "full", "items": [{
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+                    "message": message
+                }] }
+            }));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let snapshot = server.diagnostics.snapshot(&uri);
+                    if snapshot
+                        .get(&DiagnosticSource::PullLayer)
+                        .and_then(|slots| slots.get(PULL_LAYER_SERVER))
+                        .is_some_and(|slot| {
+                            slot.diagnostics.iter().any(|diag| diag.message == message)
+                        })
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("saved host result should reach the proactive cache");
+            if message == "before parse" {
+                assert!(server.documents.get(&uri).unwrap().tree().is_none());
+                let lineage = server
+                    .parse_coordinator()
+                    .parse_document(uri.clone(), Some("rust"), None, Some(incarnation))
+                    .await
+                    .unwrap();
+                // A late Open callback cannot take ownership from the Save.
+                server
+                    .diagnostic_scheduler()
+                    .spawn_synthetic_diagnostic_task_for_parse(uri.clone(), lineage);
+            }
+        }
+    }
+
+    /// Live host text remains available while virtual geometry awaits reparse.
+    #[tokio::test]
+    async fn diagnostic_snapshot_keeps_host_text_while_virtual_geometry_is_pending() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
         configure_rust_self_host(server);
@@ -2452,17 +2530,16 @@ print("hello")
         server
             .documents
             .update_document(uri.clone(), "fn changed() {}".to_string(), None);
-        assert!(
-            server
-                .diagnostic_scheduler()
-                .prepare_diagnostic_snapshot(&uri)
-                .is_none(),
-            "with the tree cleared, the snapshot is None — scheduling the debounce \
-             here (as the handler used to) would skip the on-edit host re-sync"
-        );
+        let snapshot = server
+            .diagnostic_scheduler()
+            .prepare_diagnostic_snapshot(&uri)
+            .expect("host diagnostics remain available without a current tree");
+        assert_eq!(&*snapshot.host.unwrap().text, "fn changed() {}");
+        assert!(snapshot.virtual_geometry_pending);
+        assert!(snapshot.narrower_than_editor_pull);
+        assert!(snapshot.virt_contexts.is_empty());
 
-        // The off-ingress reparse restores the tree → the snapshot is valid again,
-        // which is exactly why the debounce is scheduled from the reparse loop.
+        // The off-ingress reparse makes virtual geometry available again.
         server
             .parse_coordinator()
             .reparse_latest(&uri, Some(1))
