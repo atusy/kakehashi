@@ -797,4 +797,52 @@ mod tests {
             "the client-named root must be asked for, though its path is unchanged"
         );
     }
+
+    /// A pull rebuilds the settings to take the previous answer out, but the
+    /// configuration files were read when the root was selected and are not
+    /// read again for it: a project file saved half-edited in between must not
+    /// silently drop out of effect because the editor's settings changed.
+    #[tokio::test]
+    #[serial(xdg_env)]
+    async fn a_pull_does_not_reread_the_configuration_files() {
+        let xdg_scratch = tempfile::tempdir().expect("failed to create scratch XDG_CONFIG_HOME");
+        let _xdg_guard = XdgConfigHomeGuard::set(xdg_scratch.path());
+        let workspace = tempfile::tempdir().expect("failed to create workspace dir");
+        let project_file = workspace.path().join("kakehashi.toml");
+        std::fs::write(&project_file, "searchPaths = [\"/from-project\"]\n")
+            .expect("failed to write the project config");
+
+        let (service, _pulls) = initialized_server_answering(
+            serde_json::json!([folder(workspace.path(), "workspace")]),
+            vec![language_server("old-server"), language_server("new-server")],
+        )
+        .await;
+        let server = service.inner();
+        let from_project = |server: &Kakehashi| {
+            server
+                .settings_manager
+                .load_settings()
+                .search_paths
+                .iter()
+                .any(|path| path == "/from-project")
+        };
+
+        pull_now(server).await;
+        assert!(
+            from_project(server),
+            "precondition: the project file applies"
+        );
+
+        std::fs::write(&project_file, "searchPaths = [\n").expect("failed to break the config");
+        pull_now(server).await;
+
+        assert!(
+            has_language_server(server, "new-server"),
+            "the answer applies"
+        );
+        assert!(
+            from_project(server),
+            "the project file read at the root change must stay in effect"
+        );
+    }
 }
