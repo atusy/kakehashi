@@ -877,6 +877,7 @@ pub(in crate::lsp::lsp_impl::kakehashi) fn walk_document_layers(
         1,
         byte_filter,
         cancel,
+        &mut std::collections::HashSet::new(),
         visit,
     )
 }
@@ -891,6 +892,7 @@ fn walk_child_layers(
     depth: usize,
     byte_filter: Option<&std::ops::Range<usize>>,
     cancel: Option<&crate::cancel::CancelToken>,
+    visited: &mut std::collections::HashSet<crate::language::node_tracker::NodeTreeScope>,
     visit: &mut dyn FnMut(&str, &tree_sitter::Tree, usize),
 ) -> bool {
     // Match cursor selection and scope resolution's injected depth bound.
@@ -927,6 +929,19 @@ fn walk_child_layers(
             complete = false;
             continue;
         };
+        let scope = crate::language::node_tracker::NodeTreeScope {
+            language: resolved_lang.as_str().into(),
+            depth,
+            ranges: absolute_ranges
+                .iter()
+                .map(|range| (range.start_byte, range.end_byte))
+                .collect(),
+        };
+        // Equal parse inputs produce the same tree and descendants. Deduplicate
+        // before parsing so recursive duplicate patterns cannot multiply work.
+        if !visited.insert(scope) {
+            continue;
+        }
         let Some(language) = coordinator
             .language_registry_for_parallel()
             .get(&resolved_lang)
@@ -948,6 +963,7 @@ fn walk_child_layers(
             depth + 1,
             byte_filter,
             cancel,
+            visited,
             visit,
         );
     }
@@ -1002,6 +1018,13 @@ mod tests {
             parses,
             MAX_INJECTION_DEPTH - 1,
             "identical recursive candidates must not multiply full-region parsing"
+        );
+        let collected = collect_document_layer_trees(&coordinator, "rust", text, &tree);
+        assert!(collected.complete);
+        assert_eq!(
+            collected.layers.len(),
+            MAX_INJECTION_DEPTH,
+            "reconciliation must collect each distinct recursive tree only once"
         );
     }
 
