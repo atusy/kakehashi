@@ -1178,8 +1178,8 @@ mod tests {
     #[test]
     fn validated_rendering_prefers_the_kakehashi_form_over_an_invalid_candidate() {
         let host: Uri = "file:///p/doc.md".parse().unwrap();
-        let fallback =
-            "kakehashi:///virtual/file%3A%2F%2F%2Fp%2Fdoc.md/kakehashi-virtual-uri-R.lua";
+        // Any valid URI stands in for the closure's output.
+        let fallback = "kakehashi:///virtual/host/kakehashi-virtual-uri-R.lua";
 
         let (rendered, uri) =
             validated_rendering(Some("file:///p/a|b".to_string()), || fallback.into(), &host);
