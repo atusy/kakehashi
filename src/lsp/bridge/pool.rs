@@ -3495,6 +3495,7 @@ impl LanguageServerPool {
         let diverted = server_config.prefers_shared_instance()
             && !connection_key.is_shared()
             && !connection_key.is_client_fallback();
+        let start = std::time::Instant::now();
         let acquired = self
             .get_or_create_connection_resolved(
                 server_name,
@@ -3518,7 +3519,8 @@ impl LanguageServerPool {
                     server_config,
                     ConnectionKey::shared(server_name),
                     marker,
-                    timeout,
+                    // One budget for the acquisition, not one per attempt.
+                    timeout.saturating_sub(start.elapsed()),
                     false,
                     admit,
                 )
