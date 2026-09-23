@@ -33,17 +33,74 @@ fn normalize(result: io::Result<Option<Vec<u8>>>) -> io::Result<Vec<u8>> {
 
 pub fn from_path(path: &std::path::Path) -> io::Result<Vec<u8>> {
     // xattr::get inspects the leaf itself, without following symlinks.
-    reject_native_acls(|name| xattr::get(path, name))?;
-    normalize(xattr::get(path, ACCESS_ACL))
+    snapshot(|name| xattr::get(path, name))
 }
 
 pub fn from_file(file: &std::fs::File) -> io::Result<Vec<u8>> {
-    reject_native_acls(|name| file.get_xattr(name))?;
-    normalize(file.get_xattr(ACCESS_ACL))
+    snapshot(|name| file.get_xattr(name))
+}
+
+fn snapshot(mut get: impl FnMut(&str) -> io::Result<Option<Vec<u8>>>) -> io::Result<Vec<u8>> {
+    reject_native_acls(&mut get)?;
+    let mut protection = vec![normalize(get(ACCESS_ACL))?];
+    // Linux mandatory-access labels are independent of POSIX ACLs and may
+    // differ from a new inode's inherited defaults. Compare, never copy them.
+    for name in [
+        "security.selinux",
+        "security.SMACK64",
+        "security.SMACK64EXEC",
+        "security.SMACK64MMAP",
+        "security.SMACK64TRANSMUTE",
+    ] {
+        let value = match get(name) {
+            Ok(value) => value.unwrap_or_default(),
+            // An inactive LSM has no handler for its security attribute. This
+            // does not relax the mandatory POSIX/native ACL checks above.
+            Err(error) if error.raw_os_error() == Some(nix::libc::EOPNOTSUPP) => Vec::new(),
+            Err(error) => return Err(error),
+        };
+        protection.push(value);
+    }
+    // Preserve field boundaries: concatenating labels could hide a change.
+    serde_json::to_vec(&protection).map_err(io::Error::other)
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mandatory_labels_participate_in_protection_comparison() {
+        for label in [
+            "security.selinux",
+            "security.SMACK64",
+            "security.SMACK64EXEC",
+            "security.SMACK64MMAP",
+            "security.SMACK64TRANSMUTE",
+        ] {
+            let read = |value: &'static [u8]| {
+                super::snapshot(|name| {
+                    Ok(if name == label {
+                        Some(value.to_vec())
+                    } else {
+                        None
+                    })
+                })
+                .unwrap()
+            };
+            assert_ne!(read(b"restricted"), read(b"inherited"));
+            assert_eq!(read(b"restricted"), read(b"restricted"));
+        }
+        assert!(
+            super::snapshot(|name| {
+                if name == "security.selinux" {
+                    Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                } else {
+                    Ok(None)
+                }
+            })
+            .is_err()
+        );
+    }
+
     #[test]
     fn native_acls_are_not_mistaken_for_absent_posix_acls() {
         for native_name in ["system.nfs4_acl", "system.cifs_acl", "system.smb3_acl"] {
