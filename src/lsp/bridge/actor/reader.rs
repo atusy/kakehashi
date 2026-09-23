@@ -715,8 +715,8 @@ async fn reader_loop(
 /// each framed and JSON-decoded downstream message — not by raw stdout activity,
 /// so a server dribbling out a partial frame is still caught (see
 /// `LivenessTimerState`).
-async fn reader_loop_with_liveness(
-    mut reader: BridgeReader,
+async fn reader_loop_with_liveness<R: tokio::io::AsyncRead + Unpin>(
+    mut reader: BridgeReader<R>,
     router: Arc<ResponseRouter>,
     cancel_token: CancellationToken,
     liveness_params: LivenessParams,
@@ -3933,67 +3933,115 @@ mod tests {
         );
     }
 
-    /// Test that liveness timer resets on message activity.
-    ///
-    /// ls-bridge-async-connection: the timer resets on each framed and
-    /// JSON-decoded downstream message — not on raw stdout activity, since a
-    /// partial frame must not keep a stalled server alive.
-    /// This verifies that receiving a message resets the timer to full duration.
-    ///
-    /// Uses paused time for deterministic testing - avoids CI flakiness from
-    /// timing variations under system load.
+    // Poll the real reader loop directly so every read and timer check completes
+    // before advancing paused time. There is no child-process I/O or idle-runtime
+    // auto-advance between supplying bytes and observing the reader's state.
+    fn controlled_liveness_reader(
+        reader: tokio::io::DuplexStream,
+        router: Arc<ResponseRouter>,
+    ) -> (
+        tokio_test::task::Spawn<impl std::future::Future<Output = ()>>,
+        oneshot::Receiver<()>,
+    ) {
+        let (start_tx, start_rx) = mpsc::channel(1);
+        start_tx.try_send(router.liveness_epoch()).unwrap();
+        let (_stop_tx, stop_rx) = mpsc::channel(1);
+        let (failed_tx, failed_rx) = oneshot::channel();
+        let (deps, _window_rx, _keep) = server_request_deps_for(Some("mock-ls"));
+        let task = tokio_test::task::spawn(reader_loop_with_liveness(
+            BridgeReader::new(reader),
+            router,
+            CancellationToken::new(),
+            LivenessParams {
+                timeout: Some(Duration::from_millis(150)),
+                start_rx,
+                stop_rx,
+                failed_tx,
+            },
+            deps,
+        ));
+        (task, failed_rx)
+    }
+
     #[tokio::test(start_paused = true)]
     async fn liveness_timer_resets_on_message_activity() {
         use crate::lsp::bridge::protocol::RequestId;
-        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
 
-        // Create a server that echoes messages
-        let mut conn = create_echo_connection().await;
-
-        // Register request before splitting
+        let (mut writer, reader) = tokio::io::duplex(4096);
         let router = Arc::new(ResponseRouter::new());
-        let _rx1 = router.register(RequestId::new(1)).unwrap();
-        let _rx2 = router.register(RequestId::new(2)).unwrap();
+        let mut rx1 = router.register(RequestId::new(1)).unwrap();
+        let mut rx2 = router.register(RequestId::new(2)).unwrap();
+        let (mut task, mut failed_rx) = controlled_liveness_reader(reader, router.clone());
+        tokio_test::assert_pending!(task.poll()); // Arm at t=0.
 
-        // Write response before splitting - it will be buffered in the pipe
-        // When reader starts, it reads the response and resets the timer
-        let response1 = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": null
-        });
-        conn.write_message(&response1).await.unwrap();
-
-        let (writer, reader) = conn.split();
-
-        // Spawn reader with liveness timeout (150ms)
-        let handle = spawn_reader_task_with_liveness(
-            reader,
-            Arc::clone(&router),
-            Some(Duration::from_millis(150)),
+        tokio::time::advance(Duration::from_millis(100)).await;
+        let body = json!({"jsonrpc": "2.0", "id": 1, "result": null}).to_string();
+        writer
+            .write_all(format!("Content-Length: {}\r\n\r\n{body}", body.len()).as_bytes())
+            .await
+            .unwrap();
+        tokio_test::assert_pending!(task.poll()); // Reset at t=100.
+        assert_eq!(
+            rx1.try_recv().unwrap(),
+            json!({"jsonrpc": "2.0", "id": 1, "result": null})
         );
 
-        // Notify the reader to start the timer
-        handle.notify_liveness_start(1);
+        tokio::time::advance(Duration::from_millis(60)).await;
+        tokio_test::assert_pending!(task.poll()); // Original deadline was t=150.
+        assert_eq!(router.pending_count(), 1);
+        assert_eq!(
+            failed_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        );
+        assert_eq!(rx2.try_recv(), Err(oneshot::error::TryRecvError::Empty));
 
-        // Yield to let reader task process the buffered response
-        // This resets the timer deadline
-        tokio::task::yield_now().await;
-
-        // Advance time past the original timeout (150ms) but before the reset deadline
-        // If timer reset worked: deadline is now ~150ms from when response was processed
-        // If timer didn't reset: it would fire at 150ms
-        tokio::time::advance(Duration::from_millis(160)).await;
-        tokio::task::yield_now().await;
-
-        // After first response, pending should be 1 (one request remaining)
-        // Timer should have been reset, not fired
+        tokio::time::advance(Duration::from_millis(100)).await;
+        tokio_test::assert_ready!(task.poll()); // Reset deadline was t=250.
+        assert_eq!(failed_rx.try_recv(), Ok(()));
+        assert_eq!(router.pending_count(), 0);
         assert!(
-            router.pending_count() <= 1,
-            "Timer should reset on message activity, not fire prematurely"
+            rx2.try_recv().unwrap()["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("liveness timeout")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn liveness_timer_does_not_reset_on_partial_frame() {
+        use crate::lsp::bridge::protocol::RequestId;
+        use tokio::io::AsyncWriteExt;
+
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let router = Arc::new(ResponseRouter::new());
+        let mut rx = router.register(RequestId::new(1)).unwrap();
+        let (mut task, mut failed_rx) = controlled_liveness_reader(reader, router.clone());
+        tokio_test::assert_pending!(task.poll());
+
+        tokio::time::advance(Duration::from_millis(100)).await;
+        // A valid header and incomplete body have arrived, but no decoded message.
+        writer
+            .write_all(b"Content-Length: 100\r\n\r\n{\"jsonrpc\":")
+            .await
+            .unwrap();
+        tokio_test::assert_pending!(task.poll());
+        assert_eq!(router.pending_count(), 1);
+        assert_eq!(
+            failed_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
         );
 
-        drop(writer);
+        tokio::time::advance(Duration::from_millis(60)).await;
+        tokio_test::assert_ready!(task.poll());
+        assert_eq!(failed_rx.try_recv(), Ok(()));
+        assert_eq!(router.pending_count(), 0);
+        assert!(
+            rx.try_recv().unwrap()["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("liveness timeout")
+        );
     }
 
     /// Test that liveness timer stops when pending count returns to 0.
