@@ -1333,7 +1333,7 @@ impl LanguageServerPool {
 
     /// Take the host's opened documents that `should_take` selects; see
     /// `DocumentTracker::take_host_virtual_docs_where`.
-    pub(crate) async fn take_host_virtual_docs_where(
+    pub(super) async fn take_host_virtual_docs_where(
         &self,
         host_uri: &Url,
         should_take: impl FnMut(&OpenedVirtualDoc) -> bool,
@@ -1716,7 +1716,7 @@ impl LanguageServerPool {
     /// document, keeping every other server's decision for the same URI.
     /// Exact-key removals, unlike the whole-URI scans of
     /// [`Self::clear_host_document_routing`].
-    pub(crate) fn clear_virtual_routing_for_connection(
+    pub(super) fn clear_virtual_routing_for_connection(
         &self,
         virtual_uri: &Url,
         connection_key: &ConnectionKey,
