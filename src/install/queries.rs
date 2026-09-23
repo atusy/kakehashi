@@ -243,12 +243,26 @@ fn inherited_languages_with_search_paths(
 /// loader folds them, and without any that resolve to the data directory,
 /// whose copies are read as managed ones rather than as runtime files.
 fn runtime_search_paths(data_dir: &Path, search_paths: &[PathBuf]) -> Vec<PathBuf> {
-    let data_identity = fs::canonicalize(data_dir.clean()).unwrap_or_else(|_| data_dir.clean());
+    let data_dir = data_dir.clean();
+    let managed_queries = data_dir.join("queries");
     search_paths
         .iter()
         .map(|path| path.clean())
-        .filter(|path| fs::canonicalize(path).unwrap_or_else(|_| path.clone()) != data_identity)
+        // A root aliasing the data directory, or one whose `queries` does.
+        .filter(|path| {
+            !same_directory(path, &data_dir)
+                && !same_directory(&path.join("queries"), &managed_queries)
+        })
         .collect()
+}
+
+/// Whether two paths name the same directory, through symlinks too.
+fn same_directory(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (fs::canonicalize(a), fs::canonicalize(b)),
+            (Ok(a), Ok(b)) if a == b
+        )
 }
 
 /// Whether a search path outside the data directory supplies `language` as an
@@ -267,7 +281,8 @@ fn provided_outside_data_dir(
     let managed = queries_parent.join(language).clean();
     search_paths.iter().any(|base| {
         let directory = base.join("queries").join(language).clean();
-        directory != managed
+        // Compared by identity: a link to the managed copy is not another source.
+        !same_directory(&directory, &managed)
             && fs::read_to_string(directory.join("highlights.scm")).is_ok_and(|content| {
                 let modeline = parse_modeline(&content);
                 // Reached as a parent, so an optional self-name is skipped as
