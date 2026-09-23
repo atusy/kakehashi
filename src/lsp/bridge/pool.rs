@@ -949,12 +949,14 @@ impl LanguageServerPool {
         // handshake flips the state, so a server registering in its
         // `initialized` handler can be heard while still Initializing — and
         // acquisitions already route to an Initializing shared instance.
-        if !connections.get(&shared_key).is_some_and(|shared| {
-            matches!(
-                shared.state(),
-                ConnectionState::Initializing | ConnectionState::Ready
-            ) && shared.supports_workspace_folder_changes()
-        }) {
+        let Some(shared) = connections.get(&shared_key).map(Arc::clone) else {
+            return;
+        };
+        if !(matches!(
+            shared.state(),
+            ConnectionState::Initializing | ConnectionState::Ready
+        ) && shared.supports_workspace_folder_changes())
+        {
             return;
         }
         // A marker-rooted connection launched WITHOUT the preference is a
@@ -1003,7 +1005,20 @@ impl LanguageServerPool {
         // that is already open there is a no-op. The retired keys stay armed
         // too, but nothing routes to them any more, so no replacement claims
         // that debt.
+        //
+        // A shared instance still handshaking must settle the debt itself:
+        // its handshake claims just before flipping Ready and sends the
+        // re-open after, whereas a sweep sent now would find no Ready
+        // connection to open on and spend the debt (the respawn's own
+        // included) on nothing. Arm only, then claim only if it has already
+        // turned Ready — a claim the handshake beat returns `None`. What is
+        // left is the handshake claiming in the instant between our arm and
+        // its flip; the debt then waits for the next spawn under the key, and
+        // the documents move at their next acquisition instead.
         self.pending_reopen.arm(&shared_key);
+        if shared.state() != ConnectionState::Ready {
+            return;
+        }
         if let Some(done) = self.pending_reopen.claim(&shared_key)
             && let Err(e) = self
                 .upstream_request_tx
@@ -4920,6 +4935,34 @@ mod tests {
                 other.is_ok()
             ),
         }
+    }
+
+    /// A shared instance still handshaking settles the re-open itself: its
+    /// handshake claims the debt right before turning Ready. Sending the sweep
+    /// now would find no Ready connection, open nothing, and spend the debt.
+    #[tokio::test]
+    async fn consolidating_leaves_an_initializing_shared_instances_reopen_to_its_handshake() {
+        let pool = LanguageServerPool::new();
+        let mut upstream_requests = pool.take_upstream_request_rx().expect("receiver");
+        let shared =
+            create_handle_with_key(ConnectionState::Initializing, ConnectionKey::shared("srv"))
+                .await;
+        register_folder_changes(&shared);
+        let diverted_key = ConnectionKey::new("srv", Some("file:///repo/b".to_string()));
+        pool.insert_connection(Arc::clone(&shared)).await;
+        pool.insert_connection(create_handle_with_key(ConnectionState::Ready, diverted_key).await)
+            .await;
+
+        pool.consolidate_shared_instance("srv").await;
+
+        assert!(
+            upstream_requests.try_recv().is_err(),
+            "no sweep before Ready"
+        );
+        assert!(
+            pool.pending_reopen.claim(shared.key()).is_some(),
+            "the debt stays armed for the handshake to claim"
+        );
     }
 
     /// Nothing was retired, so nothing moved: no repair is asked for.
