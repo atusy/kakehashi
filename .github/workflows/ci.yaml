@@ -30,6 +30,15 @@ jobs:
       - run: "cargo test --features e2e --test e2e e2e_type_hierarchy::"
       - run: "cargo test --features e2e --test e2e e2e_bridge_peer::"
 
+  windows-parser:
+    name: Windows parser tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Keep parser installation and replacement covered on Windows before
+      # release; Unix-only process-group tests remain gated by cfg(unix).
+      - run: cargo test --lib install::parser::tests
+
   resolve-e2e:
     name: Resolve E2E
     runs-on: ubuntu-latest
