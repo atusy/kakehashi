@@ -2325,7 +2325,7 @@ impl LanguageServerPool {
     pub(crate) async fn crashed_connection(
         &self,
         connection_id: super::ProgressConnectionId,
-    ) -> Option<Arc<ConnectionHandle>> {
+    ) -> Option<ConnectionKey> {
         if self.shutting_down.load(Ordering::Relaxed) {
             return None;
         }
@@ -2334,7 +2334,7 @@ impl LanguageServerPool {
             .values()
             .find(|handle| handle.connection_id() == Some(connection_id))
             .filter(|handle| handle.state() == ConnectionState::Failed)
-            .map(Arc::clone)
+            .map(|handle| handle.key().clone())
     }
 
     /// Decide when to recover `key`'s crashed connection (see
@@ -2344,27 +2344,30 @@ impl LanguageServerPool {
             .schedule(key, tokio::time::Instant::now())
     }
 
-    /// Start a scheduled recovery of `crashed`: whether it is still the crashed
-    /// connection the pool holds for its key. Anything else — shutdown began,
-    /// settings evicted it, or an edit or request already replaced it — leaves
-    /// nothing for recovery to do.
-    pub(crate) async fn begin_crash_recovery_attempt(
-        &self,
-        crashed: &Arc<ConnectionHandle>,
-    ) -> bool {
+    /// Start a scheduled recovery of `key`: whether the connection the pool
+    /// holds for it is still a failed one. Shutdown, a settings eviction, or an
+    /// edit or request that already brought up a live replacement leave nothing
+    /// for recovery to do.
+    ///
+    /// Asked of the KEY, not of the handle that crashed: when a replacement
+    /// spawned during the delay has crashed too, its own crash report found this
+    /// recovery already scheduled and stood down, so this recovery must now
+    /// serve it. Nor is the crashed handle held across the delay — holding it
+    /// would keep a hung (liveness-failed but running) process alive until the
+    /// attempt ends, next to its replacement.
+    pub(crate) async fn begin_crash_recovery_attempt(&self, key: &ConnectionKey) -> bool {
         self.crash_recovery
-            .begin_attempt(crashed.key(), tokio::time::Instant::now());
+            .begin_attempt(key, tokio::time::Instant::now());
         if self.shutting_down.load(Ordering::Relaxed) {
             return false;
         }
         let connections = self.connections.lock().await;
         connections
-            .get(crashed.key())
-            .is_some_and(|mapped| Arc::ptr_eq(mapped, crashed))
-            && crashed.state() == ConnectionState::Failed
+            .get(key)
+            .is_some_and(|mapped| mapped.state() == ConnectionState::Failed)
     }
 
-    /// Respawn `crashed`'s connection under its own key. The replacement's
+    /// Respawn the crashed connection under `key`. The replacement's
     /// handshake claims the re-open its purge armed, so the documents it should
     /// hold are derived and opened the ordinary way
     /// (respawn-reopen-derives-its-targets).
@@ -2374,11 +2377,10 @@ impl LanguageServerPool {
     /// it — the next document acquisition revives it with its roots intact.
     pub(crate) async fn revive_crashed_connection(
         &self,
-        crashed: &ConnectionHandle,
+        key: &ConnectionKey,
         config: &crate::config::settings::BridgeServerConfig,
         admit: &(dyn Fn() -> bool + Sync),
     ) -> io::Result<Arc<ConnectionHandle>> {
-        let key = crashed.key();
         if key.is_shared() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -11383,8 +11385,7 @@ mod tests {
         );
 
         handle.set_state(ConnectionState::Failed);
-        let crashed = pool.crashed_connection(id).await;
-        assert!(crashed.is_some_and(|crashed| Arc::ptr_eq(&crashed, &handle)));
+        assert_eq!(pool.crashed_connection(id).await, Some(key.clone()));
         let other = pool.progress_registry.new_connection_id();
         assert!(
             pool.crashed_connection(other).await.is_none(),
@@ -11402,24 +11403,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn crash_recovery_stands_down_once_the_connection_is_replaced() {
+    async fn crash_recovery_stands_down_once_a_live_replacement_exists() {
         let pool = LanguageServerPool::new();
         let key = ConnectionKey::for_server("crashy");
-        let (crashed, _) = insert_spawned_connection(&pool, &key, ConnectionState::Failed).await;
-        assert!(pool.begin_crash_recovery_attempt(&crashed).await);
+        insert_spawned_connection(&pool, &key, ConnectionState::Failed).await;
+        assert!(pool.begin_crash_recovery_attempt(&key).await);
 
         // An edit respawned it before the recovery got there.
         insert_spawned_connection(&pool, &key, ConnectionState::Ready).await;
-        assert!(!pool.begin_crash_recovery_attempt(&crashed).await);
+        assert!(!pool.begin_crash_recovery_attempt(&key).await);
+    }
+
+    #[tokio::test]
+    async fn crash_recovery_serves_a_replacement_that_crashed_during_the_delay() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("crashy");
+        insert_spawned_connection(&pool, &key, ConnectionState::Failed).await;
+        // A lazy respawn replaced it, and the replacement died too; its own
+        // crash report found this recovery already scheduled.
+        insert_spawned_connection(&pool, &key, ConnectionState::Failed).await;
+        assert!(pool.begin_crash_recovery_attempt(&key).await);
     }
 
     #[tokio::test]
     async fn crash_recovery_stands_down_during_shutdown() {
         let pool = LanguageServerPool::new();
         let key = ConnectionKey::for_server("crashy");
-        let (crashed, id) = insert_spawned_connection(&pool, &key, ConnectionState::Failed).await;
+        let (_, id) = insert_spawned_connection(&pool, &key, ConnectionState::Failed).await;
         pool.shutting_down.store(true, Ordering::Relaxed);
         assert!(pool.crashed_connection(id).await.is_none());
-        assert!(!pool.begin_crash_recovery_attempt(&crashed).await);
+        assert!(!pool.begin_crash_recovery_attempt(&key).await);
     }
 }

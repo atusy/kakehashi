@@ -2417,10 +2417,9 @@ fn spawn_crash_recovery(
     tokio::spawn(async move {
         let bridge = Arc::clone(injection.bridge());
         let pool = bridge.pool();
-        let Some(crashed) = pool.crashed_connection(connection_id).await else {
+        let Some(key) = pool.crashed_connection(connection_id).await else {
             return;
         };
-        let key = crashed.key().clone();
         if key.is_shared() {
             // Nothing here can re-root a dead shared instance: the marker roots
             // it served died with its folder set. The next document that routes
@@ -2452,7 +2451,7 @@ fn spawn_crash_recovery(
         // Anchored now, so the delay does not stretch by however long this
         // task waited to be polled.
         tokio::time::sleep_until(tokio::time::Instant::now() + delay).await;
-        if !pool.begin_crash_recovery_attempt(&crashed).await {
+        if !pool.begin_crash_recovery_attempt(&key).await {
             return;
         }
         let snapshot = settings_manager.load_settings_pair();
@@ -2477,10 +2476,7 @@ fn spawn_crash_recovery(
         // server the new settings do not describe.
         let generation = snapshot.generation;
         let admit = || settings_manager.settings_generation() == generation;
-        match pool
-            .revive_crashed_connection(&crashed, &config, &admit)
-            .await
-        {
+        match pool.revive_crashed_connection(&key, &config, &admit).await {
             Ok(_) => log::info!(
                 target: "kakehashi::bridge",
                 "Respawned crashed downstream {key}"
