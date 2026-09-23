@@ -1227,7 +1227,7 @@ impl Kakehashi {
                     // parser landed. On mismatch walk fresh, uncached — the
                     // pre-cache per-request cost — until the next snapshot.
                     if cached.0 == generation {
-                        Some(cached.1.as_slice())
+                        Some(cached.1.as_ref())
                     } else {
                         fresh_layers =
                             crate::lsp::lsp_impl::kakehashi::node::injection_stack::collect_document_layer_trees(
@@ -1236,7 +1236,7 @@ impl Kakehashi {
                                 &text,
                                 &tree,
                             );
-                        Some(fresh_layers.as_slice())
+                        Some(&fresh_layers)
                     }
                 } else {
                     None
@@ -1251,7 +1251,7 @@ impl Kakehashi {
                     &language_id,
                     &text,
                     &tree,
-                    layers,
+                    layers.map(|set| set.layers.as_slice()),
                     &language,
                     &tracker,
                     &documents,
@@ -1270,7 +1270,11 @@ impl Kakehashi {
                     walk_start.elapsed().as_millis(),
                     walked.as_ref().map_or(0, |(m, _)| m.len()),
                 );
-                walked
+                let scopes = layers.filter(|set| set.complete && lsp_range.is_none() && mint_into_tracker && !inner_cancel.is_cancelled())
+                    .map(|set| set.layers.iter().map(|layer|
+                        crate::language::node_tracker::NodeTreeScope::new(
+                            &layer.language, layer.depth, &layer.tree)).collect::<HashSet<_>>());
+                (walked, scopes)
             });
         let walked = if let Some(cancel_rx) = cancel_rx {
             tokio::pin!(cancel_rx);
@@ -1300,7 +1304,7 @@ impl Kakehashi {
                 walked = walk_future => walked,
             }
         };
-        let Some(walked) = walked else {
+        let Some((walked, scopes)) = walked else {
             // A pool-skip of an already-cancelled unit (or a work-unit panic).
             return Ok(None);
         };
@@ -1331,6 +1335,25 @@ impl Kakehashi {
             );
             if !current {
                 return Ok(None);
+            }
+            if let Some(scopes) = scopes {
+                // Keep reload publication out of the final generation check
+                // and retirement, just as the edit guard excludes didChange.
+                let pool = self
+                    .parser_pool
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if !walk_cancel.is_cancelled()
+                    && !pool.reload_in_progress()
+                    && self.cache.semantic_token_generation() == generation
+                {
+                    self.bridge.node_tracker().retain_tree_scopes(
+                        &uri,
+                        entry_mint_epoch,
+                        incarnation,
+                        &scopes,
+                    );
+                }
             }
             self.captures_walk_cache.insert(
                 key,
@@ -1854,6 +1877,114 @@ mod tests {
             "skipped": [],
         });
         assert_eq!(serde_json::to_value(&response).unwrap(), expected);
+    }
+
+    #[rstest::rstest]
+    #[case::complete_full(true, false, true, true)]
+    #[case::range(true, true, true, false)]
+    #[case::host_only(false, false, true, false)]
+    #[case::missing_grammar(true, false, false, false)]
+    #[tokio::test]
+    async fn only_complete_full_geometry_retires_absent_scopes(
+        #[case] injection: bool,
+        #[case] ranged: bool,
+        #[case] grammar_available: bool,
+        #[case] retires: bool,
+    ) {
+        use tower_lsp_server::ls_types::Position;
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), language.clone());
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("scope_inner".into(), language.clone());
+        let query = tree_sitter::Query::new(
+            &language,
+            r#"((block) @injection.content
+            (#set! injection.language "scope_inner") (#set! injection.include-children))"#,
+        )
+        .unwrap();
+        server
+            .language
+            .query_store()
+            .insert_injection_query("rust".into(), Arc::new(query));
+        let uri = Url::parse("file:///scope-retention.rs").unwrap();
+        let text = "fn main() { let name = 1; }";
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(text, None).unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            text.into(),
+            Some("rust".into()),
+            Some(tree.clone()),
+        );
+        let layers = super::super::node::injection_stack::collect_document_layer_trees(
+            &server.language,
+            "rust",
+            text,
+            &tree,
+        );
+        assert!(layers.complete);
+        assert_eq!(layers.layers.len(), 1);
+        let layer = &layers.layers[0];
+        let current = crate::language::node_tracker::NodeTreeScope::new(
+            &layer.language,
+            layer.depth,
+            &layer.tree,
+        );
+        let mut obsolete = current.clone();
+        obsolete.ranges[0].1 -= 1;
+        let tracker = server.bridge.node_tracker();
+        let start = text.find("name").unwrap();
+        let mint = |scope: &crate::language::node_tracker::NodeTreeScope| {
+            tracker
+                .mint_tree_batch(
+                    &uri,
+                    tracker.mint_epoch(&uri),
+                    incarnation,
+                    Some(scope),
+                    [(start, start + 4, "identifier")],
+                )
+                .unwrap()[0]
+        };
+        let current_id = mint(&current);
+        let obsolete_id = mint(&obsolete);
+        if !grammar_available {
+            // Resolve a now-unavailable language with the same layer geometry.
+            let query = tree_sitter::Query::new(
+                &language,
+                r#"((block) @injection.content
+                (#set! injection.language "scope_missing") (#set! injection.include-children))"#,
+            )
+            .unwrap();
+            server
+                .language
+                .query_store()
+                .insert_injection_query("rust".into(), Arc::new(query));
+        }
+        let range = ranged.then_some(Range::new(Position::new(0, 0), Position::new(0, 1)));
+        // This kind has no query file: geometry retention must not depend on
+        // whether this particular captures request can produce any matches.
+        let _ = server
+            .compute_captures(
+                &crate::lsp::lsp_impl::url_to_uri(&uri).unwrap(),
+                "scope-retention-no-query",
+                range,
+                injection,
+            )
+            .await
+            .unwrap();
+        assert!(
+            tracker.lookup_node(&uri, &current_id).is_some(),
+            "a current tree without a kind query keeps its IDs"
+        );
+        assert_eq!(tracker.lookup_node(&uri, &obsolete_id).is_none(), retires);
     }
 
     /// Serve-current (ADR §3, revised): a captures request arriving while the

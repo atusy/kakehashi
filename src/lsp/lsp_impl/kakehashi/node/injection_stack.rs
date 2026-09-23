@@ -802,15 +802,16 @@ fn ranges_intersect(
 /// snapshot calls this lazily and the result rides the `ParseSnapshot`, so
 /// subsequent per-keystroke walks iterate pre-parsed layers instead of
 /// re-running the walk. Byte-identical to the inline walk by construction —
-/// it IS the inline walk, with a collecting visitor.
+/// it IS the inline walk, with a collecting visitor. The completeness flag
+/// distinguishes absent regions from branches skipped for unavailable parsers.
 pub(crate) fn collect_document_layer_trees(
     coordinator: &LanguageCoordinator,
     host_language: &str,
     host_text: &str,
     host_tree: &tree_sitter::Tree,
-) -> Vec<crate::document::SnapshotLayerTree> {
+) -> crate::document::SnapshotLayerTrees {
     let mut layers = Vec::new();
-    walk_document_layers(
+    let complete = walk_document_layers(
         coordinator,
         host_language,
         host_text,
@@ -836,7 +837,7 @@ pub(crate) fn collect_document_layer_trees(
             });
         },
     );
-    layers
+    crate::document::SnapshotLayerTrees { layers, complete }
 }
 
 /// Visit every injection layer of the document in **document-order DFS**: the
@@ -865,7 +866,7 @@ pub(in crate::lsp::lsp_impl::kakehashi) fn walk_document_layers(
     byte_filter: Option<&std::ops::Range<usize>>,
     cancel: Option<&crate::cancel::CancelToken>,
     visit: &mut dyn FnMut(&str, &tree_sitter::Tree, usize),
-) {
+) -> bool {
     visit(host_language, host_tree, 0);
     walk_child_layers(
         coordinator,
@@ -877,7 +878,7 @@ pub(in crate::lsp::lsp_impl::kakehashi) fn walk_document_layers(
         byte_filter,
         cancel,
         visit,
-    );
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -891,17 +892,18 @@ fn walk_child_layers(
     byte_filter: Option<&std::ops::Range<usize>>,
     cancel: Option<&crate::cancel::CancelToken>,
     visit: &mut dyn FnMut(&str, &tree_sitter::Tree, usize),
-) {
+) -> bool {
     // Match cursor selection and scope resolution's injected depth bound.
     // All three paths must agree on which parse scopes are reachable.
     if depth > MAX_INJECTION_DEPTH {
-        return;
+        return true;
     }
     // Cancellation checkpoint before the per-depth injection query and the
     // per-region resolve+parse below — the walk's expensive units.
     if crate::cancel::is_cancelled(cancel) {
-        return;
+        return false;
     }
+    let mut complete = true;
     for (region, absolute_ranges) in effective_child_regions(
         coordinator,
         parent_language,
@@ -916,25 +918,28 @@ fn walk_child_layers(
         // for the remaining siblings before the per-depth check above sees
         // it on the next recursion.
         if crate::cancel::is_cancelled(cancel) {
-            return;
+            return false;
         }
         let content = &host_text[effective_content_range(&region, host_text)];
         let Some((resolved_lang, _)) =
             coordinator.resolve_injection_language(&region.language, content)
         else {
+            complete = false;
             continue;
         };
         let Some(language) = coordinator
             .language_registry_for_parallel()
             .get(&resolved_lang)
         else {
+            complete = false;
             continue;
         };
         let Some(tree) = parse_with_absolute_ranges(&language, host_text, &absolute_ranges) else {
+            complete = false;
             continue;
         };
         visit(&resolved_lang, &tree, depth);
-        walk_child_layers(
+        complete &= walk_child_layers(
             coordinator,
             &resolved_lang,
             &tree,
@@ -946,6 +951,7 @@ fn walk_child_layers(
             visit,
         );
     }
+    complete
 }
 
 #[cfg(test)]
@@ -1020,7 +1026,7 @@ mod tests {
             .set_language(&tree_sitter_rust::LANGUAGE.into())
             .unwrap();
         let host = parser.parse(text, None).unwrap();
-        let layers = collect_document_layer_trees(&coordinator, "rust", text, &host);
+        let layers = collect_document_layer_trees(&coordinator, "rust", text, &host).layers;
         assert_eq!(
             layers.len(),
             2,
@@ -1153,7 +1159,7 @@ mod tests {
             "sanity: the document has injected layers"
         );
 
-        let stored = collect_document_layer_trees(&coordinator, "markdown", text, &tree);
+        let stored = collect_document_layer_trees(&coordinator, "markdown", text, &tree).layers;
         let stored_shape: Vec<LayerShape> = stored
             .iter()
             .map(|l| {

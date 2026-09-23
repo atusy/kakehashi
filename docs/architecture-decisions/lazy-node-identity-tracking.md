@@ -159,7 +159,13 @@ URI lifetime, so a delayed navigation cannot mint into a different scope after
 its old one is retired. If an edit makes two scopes equal, both existing tokens
 remain resolvable and new mints choose one surviving token. Scopes without live
 nodes are reclaimed during edit processing; closing the document releases the
-URI registry. The cost is one scope record per distinct retained parse scope
+URI registry. A complete, current full-injection captures walk also retires
+scopes absent from its full tree geometry together with their node IDs. This
+keeps repeated boundary changes from accumulating obsolete scopes whose interior
+nodes survive ordinary edit adjustment. Geometry includes trees without the
+requested kind query; range-only, cancelled, stale, and incomplete walks cannot
+prune scopes. Edit, incarnation, query-generation, and reload checks protect the
+retirement. The cost is one scope record per distinct retained parse scope
 and range adjustment alongside node adjustment.
 
 **Invalidation with composite keys**: node START-priority invalidation remains

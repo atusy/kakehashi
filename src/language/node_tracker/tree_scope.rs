@@ -106,6 +106,21 @@ impl TreeScopes {
         self.reindex();
     }
 
+    pub(super) fn retire_absent(&mut self, current: &HashSet<NodeTreeScope>) -> HashSet<usize> {
+        let mut retired = HashSet::new();
+        self.by_token.retain(|token, scope| {
+            let keep = current.contains(scope.as_ref());
+            if !keep {
+                retired.insert(*token);
+            }
+            keep
+        });
+        if !retired.is_empty() {
+            self.reindex();
+        }
+        retired
+    }
+
     fn reindex(&mut self) {
         self.by_scope.clear();
         for (&token, scope) in &self.by_token {

@@ -146,3 +146,10 @@ pub(crate) struct SnapshotLayerTree {
     /// the layer's query yield nothing for the clipped range).
     pub span: std::ops::Range<usize>,
 }
+
+/// The parsed injection layers and whether discovery reached every branch.
+/// Incomplete geometry can serve available captures but cannot retire scopes.
+pub(crate) struct SnapshotLayerTrees {
+    pub layers: Vec<SnapshotLayerTree>,
+    pub complete: bool,
+}

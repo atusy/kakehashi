@@ -1031,6 +1031,45 @@ impl NodeTracker {
         invalidated
     }
 
+    /// Retire scopes absent from a complete, current injection-tree walk.
+    /// The caller also serializes document/query currency with reconciliation;
+    /// this latch keeps edits and close/reopen from pruning a newer index.
+    pub(crate) fn retain_tree_scopes(
+        &self,
+        uri: &Url,
+        expected: (u64, u64),
+        incarnation: u64,
+        current: &std::collections::HashSet<NodeTreeScope>,
+    ) {
+        let Some(mut entry) = self.entries.get_mut(uri) else {
+            return;
+        };
+        if !self.admits_incarnation(uri, incarnation)
+            || (
+                entry.shift_gen,
+                self.cleanup_epoch
+                    .load(std::sync::atomic::Ordering::Acquire),
+            ) != expected
+        {
+            return;
+        }
+        let retired = entry.tree_scopes.retire_absent(current);
+        if retired.is_empty() {
+            return;
+        }
+        let mut retired_ids = Vec::new();
+        entry.forward.retain(|key, tracked| {
+            let keep = !retired.contains(&key.layer);
+            if !keep {
+                retired_ids.push(tracked.ulid);
+            }
+            keep
+        });
+        for id in retired_ids {
+            entry.reverse.remove(&id);
+        }
+    }
+
     /// Remove tracked nodes minted by the closing document lifetime.
     ///
     /// Each bidirectional entry carries the document incarnation that minted
@@ -1326,6 +1365,68 @@ mod tests {
             depth: 1,
             ranges: ranges.to_vec(),
         }
+    }
+
+    #[test]
+    fn appending_and_recapturing_does_not_retain_obsolete_scopes() {
+        let tracker = NodeTracker::new();
+        let uri = test_uri("append_scope");
+        let mut previous = None;
+        for end in 20..36 {
+            let current = scope(&[(0, end)]);
+            let id = tracker
+                .mint_tree_batch(
+                    &uri,
+                    tracker.mint_epoch(&uri),
+                    0,
+                    Some(&current),
+                    [(5, 8, "identifier")],
+                )
+                .unwrap()[0];
+            tracker.retain_tree_scopes(
+                &uri,
+                tracker.mint_epoch(&uri),
+                0,
+                &std::collections::HashSet::from([current]),
+            );
+            if let Some(old) = previous {
+                assert!(
+                    tracker.lookup_node(&uri, &old).is_none(),
+                    "a scope absent from the current full walk must retire its IDs"
+                );
+            }
+            assert_eq!(tracker.entries.get(&uri).unwrap().len(), 1);
+            previous = Some(id);
+            tracker.apply_input_edits(&uri, &[EditInfo::new(end, end, end + 1)]);
+        }
+    }
+
+    #[test]
+    fn scope_retirement_rejects_stale_edits_and_closed_lifetimes() {
+        let tracker = NodeTracker::new();
+        let uri = test_uri("stale_scope_retirement");
+        tracker.open_incarnation(&uri, 1);
+        let current = scope(&[(10, 20)]);
+        let old_epoch = tracker.mint_epoch(&uri);
+        let id = tracker
+            .mint_tree_batch(&uri, old_epoch, 1, Some(&current), [(12, 15, "identifier")])
+            .unwrap()[0];
+        tracker.apply_input_edits(&uri, &[EditInfo::new(0, 0, 1)]);
+        tracker.retain_tree_scopes(&uri, old_epoch, 1, &Default::default());
+        assert!(tracker.lookup_node(&uri, &id).is_some());
+        tracker.cleanup(&uri, 1);
+        tracker.open_incarnation(&uri, 2);
+        let newer = tracker
+            .mint_tree_batch(
+                &uri,
+                tracker.mint_epoch(&uri),
+                2,
+                Some(&current),
+                [(12, 15, "identifier")],
+            )
+            .unwrap()[0];
+        tracker.retain_tree_scopes(&uri, tracker.mint_epoch(&uri), 1, &Default::default());
+        assert!(tracker.lookup_node(&uri, &newer).is_some());
     }
 
     #[test]
