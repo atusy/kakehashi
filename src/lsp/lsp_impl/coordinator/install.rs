@@ -541,12 +541,17 @@ impl InstallCoordinator {
                     };
                 }
                 if request.allow_recovery {
+                    // The queries were reloaded (by the owner or above); the
+                    // retry only needs a tree. Letting it re-decide keeps a
+                    // repair request from owning another install and a second
+                    // workspace-wide reload.
                     return Box::pin(self.maybe_auto_install_language(
                         language,
                         uri,
                         is_injection,
                         expected_incarnation,
                         InstallRequest {
+                            repair_queries: false,
                             allow_recovery: false,
                             ..request
                         },
