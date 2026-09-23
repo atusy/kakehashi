@@ -3826,6 +3826,35 @@ mod tests {
     }
 
     #[test]
+    fn a_concurrent_winner_may_inherit_a_search_path_parent() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        write_runtime_query(&runtime, "child", ";; extends\n;; inherits: custom\n");
+        write_runtime_query(&runtime, "custom", "(comment) @comment\n");
+        let base_url =
+            spawn_query_file_server(vec![("/child/highlights.scm", "(identifier) @variable\n")]);
+        let staged = stage_queries_with_dependencies(
+            &base_url,
+            "child",
+            &data,
+            false,
+            QueryHttpPolicy::AllowHttpForTests,
+            std::slice::from_ref(&runtime),
+        )
+        .unwrap();
+        // Another install completes the child while this one was staging.
+        let winner = data.join("queries/child");
+        fs::create_dir_all(&winner).unwrap();
+        fs::write(winner.join("highlights.scm"), "(identifier) @variable\n").unwrap();
+        write_install_marker(&winner).unwrap();
+        let published = staged
+            .publish()
+            .unwrap_or_else(|failure| panic!("publish failed: {}", failure.error));
+        published.commit();
+    }
+
+    #[test]
     fn staging_installs_parents_declared_by_external_overlays() {
         let temp = TempDir::new().unwrap();
         let data_dir = temp.path().join("data");
