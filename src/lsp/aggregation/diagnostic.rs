@@ -20,6 +20,10 @@ pub(crate) enum PullContribution {
 impl PullContribution {
     fn retain_pending(self, previous: Option<&Self>) -> Self {
         match self {
+            // Retain source ownership along with the cached items. Coverage
+            // describes the retained pull source, not current-version freshness;
+            // exposing push alongside these items could duplicate or contradict
+            // them before the next virtual pull replaces the retained result.
             Self::Pending => previous.cloned().unwrap_or(Self::NotPulled),
             collected => collected,
         }
