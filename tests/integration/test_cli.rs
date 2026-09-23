@@ -3173,7 +3173,7 @@ fn test_language_uninstall_cancel() {
 /// creation**, leaving no window at all — this is what CI runs on, and the
 /// residual window is exactly where the flake kept recurring. Platforms
 /// without `pipe2` (macOS) set the flags in a second syscall and keep a few
-/// instructions of exposure.
+/// instructions of exposure; [`BROKEN_PIPE_ATTEMPTS`] absorbs that.
 #[cfg(any(
     target_os = "linux",
     target_os = "android",
@@ -3223,6 +3223,52 @@ fn cloexec_pipe() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
 /// spawn/write race.
 #[cfg(unix)]
 fn run_with_broken_stdout_pipe(args: &[&str]) -> std::process::Output {
+    use std::os::unix::process::ExitStatusExt;
+
+    // A leaked read end only makes a run exit without a signal, so retry just
+    // that outcome. A real regression (SIGPIPE left ignored) exits the same
+    // way on every attempt and still fails the caller's assertion.
+    let mut output = run_with_broken_stdout_pipe_once(args);
+    for _ in 1..BROKEN_PIPE_ATTEMPTS {
+        if output.status.signal().is_some() {
+            break;
+        }
+        output = run_with_broken_stdout_pipe_once(args);
+    }
+    output
+}
+
+/// Runs per [`run_with_broken_stdout_pipe`] call. One where `pipe2` makes the
+/// fds CLOEXEC atomically; a few elsewhere, where a sibling test's child can
+/// still inherit the read end during the `pipe()`→`fcntl` window.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "illumos",
+    target_os = "solaris",
+))]
+const BROKEN_PIPE_ATTEMPTS: usize = 1;
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "illumos",
+        target_os = "solaris",
+    ))
+))]
+const BROKEN_PIPE_ATTEMPTS: usize = 5;
+
+#[cfg(unix)]
+fn run_with_broken_stdout_pipe_once(args: &[&str]) -> std::process::Output {
     use std::process::Stdio;
 
     let (read_fd, write_fd) = cloexec_pipe();
