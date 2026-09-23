@@ -83,6 +83,12 @@ pub(crate) struct CodeActionEnvelope {
     /// Host open incarnation that produced this action. Missing for legacy data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) incarnation: Option<u64>,
+    /// Exact producing connection, absent in legacy envelopes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) connection_key: Option<ConnectionKey>,
+    /// Process generation observed before the action request was sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) connection_generation: Option<u64>,
     /// Host-layer action (`bridge._self`): its edit/data are already in host
     /// coordinates, so resolve routes to the host server VERBATIM — no virtual
     /// URI, region, or offset translation. `region_id`/`injection_language`/
@@ -117,6 +123,8 @@ pub(crate) struct CodeActionEnvelopeContext<'a> {
     offset: &'a RegionOffset,
     incarnation: Option<u64>,
     content_version: Option<u64>,
+    connection_key: Option<&'a ConnectionKey>,
+    connection_generation: Option<u64>,
 }
 
 /// Wrap `action.data` in a Kakehashi envelope for origin tracking, capturing
@@ -138,6 +146,8 @@ fn envelope_action_data(action: &mut CodeAction, ctx: &CodeActionEnvelopeContext
         inner: None,
         content_version: ctx.content_version,
         incarnation: ctx.incarnation,
+        connection_key: ctx.connection_key.cloned(),
+        connection_generation: ctx.connection_generation,
         host_layer: false,
     };
     action.data = Some(wrap_envelope(&envelope, inner));
@@ -153,6 +163,8 @@ fn envelope_host_action(
     server_name: &str,
     host_uri: &str,
     revision: Option<HostRevision>,
+    connection_key: &ConnectionKey,
+    connection_generation: u64,
 ) {
     let inner = action.data.take();
     let envelope = CodeActionEnvelope {
@@ -170,6 +182,8 @@ fn envelope_host_action(
         inner: None,
         content_version: revision.map(|r| r.content_version),
         incarnation: revision.map(|r| r.incarnation),
+        connection_key: Some(connection_key.clone()),
+        connection_generation: Some(connection_generation),
         host_layer: true,
     };
     action.data = Some(wrap_envelope(&envelope, inner));
@@ -214,6 +228,8 @@ fn re_envelope_action(action: &mut CodeAction, envelope: &CodeActionEnvelope) {
             inner: None,
             content_version: envelope.content_version,
             incarnation: envelope.incarnation,
+            connection_key: envelope.connection_key.clone(),
+            connection_generation: envelope.connection_generation,
             host_layer: envelope.host_layer,
         },
         inner,
@@ -466,6 +482,11 @@ impl LanguageServerPool {
             return Ok(None);
         }
 
+        // Read before sending, while the request path still verifies this
+        // handle under the connections lock. Never stamp an old reply with
+        // a replacement process's generation.
+        let connection_generation = self.document_connection_generation(handle.key());
+
         // Phase 1: send the request and parse the raw actions (still in virtual
         // coordinates, no policy applied) — the bridge policy is deferred to
         // phase 3 so phase 2 can eager-resolve lazy actions asynchronously.
@@ -543,6 +564,7 @@ impl LanguageServerPool {
             handle.has_capability("codeAction/resolve"),
             Some(&virt),
             None,
+            connection_generation,
         )))
     }
 
@@ -1340,7 +1362,11 @@ pub(crate) struct VirtLayerContext<'a> {
 }
 
 impl VirtLayerContext<'_> {
-    fn envelope_ctx(&self) -> CodeActionEnvelopeContext<'_> {
+    fn envelope_ctx<'a>(
+        &'a self,
+        connection_key: &'a ConnectionKey,
+        connection_generation: u64,
+    ) -> CodeActionEnvelopeContext<'a> {
         CodeActionEnvelopeContext {
             server_name: self.server_name,
             host_uri: self.host_uri_string,
@@ -1349,6 +1375,8 @@ impl VirtLayerContext<'_> {
             offset: self.offset,
             incarnation: self.incarnation,
             content_version: self.content_version,
+            connection_key: Some(connection_key),
+            connection_generation: Some(connection_generation),
         }
     }
 }
@@ -1386,6 +1414,7 @@ impl UpstreamCodeActionCaps {
 /// `codeAction/resolve`: it decides whether a no-edit/no-command action with
 /// no `data` is a resolvable lazy action (LSP 3.18 allows a title-only lazy
 /// action) or a no-op to drop.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn bridge_code_actions(
     actions: Vec<CodeActionOrCommand>,
     connection_key: &ConnectionKey,
@@ -1394,6 +1423,7 @@ pub(crate) fn bridge_code_actions(
     server_resolves: bool,
     virt: Option<&VirtLayerContext<'_>>,
     host_revision: Option<HostRevision>,
+    connection_generation: u64,
 ) -> Vec<CodeActionOrCommand> {
     actions
         .into_iter()
@@ -1406,6 +1436,7 @@ pub(crate) fn bridge_code_actions(
                 server_resolves,
                 virt,
                 host_revision,
+                connection_generation,
             )
         })
         .collect()
@@ -1417,6 +1448,7 @@ const REASON_PREFIXED_REGION: &str = "the edit would break the host document's s
      around the injected region (its line prefixes, e.g. a blockquote's, or the \
      closing fence)";
 
+#[allow(clippy::too_many_arguments)]
 fn bridge_code_action(
     item: CodeActionOrCommand,
     connection_key: &ConnectionKey,
@@ -1425,6 +1457,7 @@ fn bridge_code_action(
     server_resolves: bool,
     virt: Option<&VirtLayerContext<'_>>,
     host_revision: Option<HostRevision>,
+    connection_generation: u64,
 ) -> Option<CodeActionOrCommand> {
     // The key's server IS the config server name the envelope and titles use;
     // deriving it here keeps one source of truth for the origin.
@@ -1552,7 +1585,10 @@ fn bridge_code_action(
                 // later `codeAction/resolve` routes back to the origin (an
                 // eager-resolve pass already ran for non-envelope clients).
                 if let Some(virt) = virt.filter(|_| upstream_caps.can_envelope()) {
-                    envelope_action_data(&mut action, &virt.envelope_ctx());
+                    envelope_action_data(
+                        &mut action,
+                        &virt.envelope_ctx(connection_key, connection_generation),
+                    );
                     action.title = suffix_title(action.title, server_name);
                     return Some(CodeActionOrCommand::CodeAction(action));
                 }
@@ -1561,7 +1597,14 @@ fn bridge_code_action(
                 // (host coordinates, no translation — #627). Otherwise it can
                 // never be completed here, so disable it.
                 if virt.is_none() && server_resolves && upstream_caps.can_envelope() {
-                    envelope_host_action(&mut action, server_name, host_uri, host_revision);
+                    envelope_host_action(
+                        &mut action,
+                        server_name,
+                        host_uri,
+                        host_revision,
+                        connection_key,
+                        connection_generation,
+                    );
                     action.title = suffix_title(action.title, server_name);
                     return Some(CodeActionOrCommand::CodeAction(action));
                 }
@@ -1796,6 +1839,8 @@ mod tests {
         super::super::test_helpers::open_resolve_host(&pool, &handle, &host_uri).await;
         let envelope = CodeActionEnvelope {
             origin: "ruff".into(),
+            connection_key: Some(key.clone()),
+            connection_generation: Some(pool.document_connection_generation(&key)),
             host_uri: host_uri.to_string(),
             region_id: String::new(),
             injection_language: String::new(),
@@ -2151,6 +2196,7 @@ mod tests {
             server_resolves,
             Some(&virt),
             None,
+            0,
         ))
     }
 
@@ -2551,6 +2597,7 @@ mod tests {
             false,
             None,
             None,
+            0,
         );
         assert_eq!(bridged.len(), 2);
         let CodeActionOrCommand::CodeAction(action) = &bridged[0] else {
@@ -2590,6 +2637,7 @@ mod tests {
                 incarnation: 1,
                 content_version: 0,
             }),
+            0,
         );
         assert_eq!(bridged.len(), 1);
         let CodeActionOrCommand::CodeAction(action) = &bridged[0] else {
@@ -2630,6 +2678,7 @@ mod tests {
             false, // host server does NOT advertise resolve
             None,
             None,
+            0,
         );
         let CodeActionOrCommand::CodeAction(action) = &bridged[0] else {
             panic!("Expected CodeAction");
@@ -2670,6 +2719,7 @@ mod tests {
             true,
             None,
             None,
+            0,
         );
         assert_eq!(bridged.len(), 1);
         let CodeActionOrCommand::CodeAction(action) = &bridged[0] else {
@@ -2696,6 +2746,7 @@ mod tests {
             false,
             None,
             None,
+            0,
         );
         assert!(
             bridged.is_empty(),
@@ -2917,6 +2968,32 @@ mod tests {
             offset,
             incarnation: Some(1),
             content_version: None,
+            connection_key: None,
+            connection_generation: None,
+        }
+    }
+
+    #[test]
+    fn repeated_resolve_preserves_code_action_producer_identity() {
+        let key = ConnectionKey::for_server("ruff");
+        let mut action = CodeAction {
+            title: "Fix".into(),
+            ..Default::default()
+        };
+        envelope_action_data(
+            &mut action,
+            &envelope_ctx_for_test(&RegionOffset::new(0, 0)),
+        );
+        let mut value =
+            serde_json::to_value(strip_code_action_envelope(&mut action).unwrap()).unwrap();
+        value["connection_key"] = serde_json::to_value(&key).unwrap();
+        value["connection_generation"] = json!(7);
+        for _ in 0..2 {
+            let envelope: CodeActionEnvelope = serde_json::from_value(value).unwrap();
+            re_envelope_action(&mut action, &envelope);
+            value = serde_json::to_value(strip_code_action_envelope(&mut action).unwrap()).unwrap();
+            assert_eq!(value["connection_key"], serde_json::to_value(&key).unwrap());
+            assert_eq!(value["connection_generation"], json!(7));
         }
     }
 
@@ -3031,6 +3108,7 @@ mod tests {
             false,
             None,
             None,
+            0,
         );
         let CodeActionOrCommand::CodeAction(action) = &bridged[0] else {
             panic!("Expected CodeAction");
@@ -3220,6 +3298,7 @@ mod tests {
             true,
             None,
             None,
+            0,
         );
         let CodeActionOrCommand::CodeAction(action) = &bridged[0] else {
             panic!("Expected CodeAction");

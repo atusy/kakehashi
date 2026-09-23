@@ -636,6 +636,7 @@ impl Kakehashi {
                     server_resolves,
                     None,
                     Some(host_revision),
+                    raw.connection_generation,
                 )))
             }
         };
