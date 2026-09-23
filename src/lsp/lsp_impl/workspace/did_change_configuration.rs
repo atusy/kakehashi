@@ -602,6 +602,22 @@ impl Kakehashi {
                     .client_layers
                     .write()
                     .recover_poison("client_layers pull") = layers;
+                // A pull-model editor asks on every settings change, most of
+                // them not kakehashi's, so most answers rebuild exactly the
+                // settings in effect. Publishing those would reparse every open
+                // document and refresh semantic tokens for nothing. Compared
+                // serialized: the raw settings carry no `PartialEq`, and the
+                // cost is small next to the reload it saves.
+                let unchanged = matches!(
+                    (
+                        serde_json::to_value(&raw),
+                        serde_json::to_value(&*self.settings_manager.load_raw_settings()),
+                    ),
+                    (Ok(rebuilt), Ok(in_effect)) if rebuilt == in_effect
+                );
+                if unchanged {
+                    return;
+                }
                 let warnings = Self::misconfigured_settings_warnings(&settings);
                 self.apply_raw_settings_locked(&reload, raw, settings).await;
                 drop(reload);
