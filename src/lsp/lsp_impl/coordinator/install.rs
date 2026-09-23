@@ -576,10 +576,9 @@ impl InstallCoordinator {
                 }
                 return InstallCompletion::default();
             }
-            if query_repair && terminal.is_failure() {
-                self.auto_install
-                    .record_query_repair_failure(language, generation);
-            }
+            // A shared failure is the owner's to record, in the generation
+            // its attempt started in: a waiter joining after a reload must
+            // not spend that reload's retry on an attempt from before it.
             if terminal == crate::lsp::auto_install::InstallOutcome::Abandoned
                 && self.same_document_incarnation(&uri, expected_incarnation)
                 && request.allow_recovery
@@ -597,7 +596,10 @@ impl InstallCoordinator {
                 .await;
             }
         } else {
-            if query_repair && result.outcome.is_failure() {
+            // Recorded for any owned failure, not only a repair's: waiters
+            // repairing through this claim rely on it, and the memo only
+            // gates query-repair decisions.
+            if result.outcome.is_failure() {
                 self.auto_install
                     .record_query_repair_failure(language, generation);
             }
