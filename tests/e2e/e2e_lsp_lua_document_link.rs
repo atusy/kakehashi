@@ -675,13 +675,12 @@ fn e2e_host_document_link_resolve_cancel_targets_downstream_request() {
     let link = document_links_with_retry(&mut client, uri).remove(0);
 
     let request_id = client.send_request_async("documentLink/resolve", link);
-    let started =
-        client.wait_for_notification("window/logMessage", std::time::Duration::from_secs(10));
     assert!(
-        started.as_ref().is_some_and(|params| params["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("document-link-resolve-started"))),
-        "resolve must reach the downstream sent-state barrier: {started:?}"
+        client.wait_for_log_message(
+            "document-link-resolve-started",
+            std::time::Duration::from_secs(10)
+        ),
+        "resolve must reach the downstream sent-state barrier"
     );
     assert!(
         request_file.exists(),

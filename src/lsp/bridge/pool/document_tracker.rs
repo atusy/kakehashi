@@ -2424,6 +2424,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_virtual_uri_recovers_dotted_language() {
+        for host in ["file:///project/doc.md", "untitled:Untitled-1"] {
+            let tracker = DocumentTracker::new();
+            let host_uri = Url::parse(host).unwrap();
+            let virtual_uri =
+                VirtualDocumentUri::new(&url_to_uri(&host_uri), "foo.bar", "region-0");
+            tracker
+                .register_opened_document(
+                    &host_uri,
+                    &virtual_uri,
+                    &ConnectionKey::for_server("custom"),
+                )
+                .await;
+            assert_eq!(
+                tracker
+                    .resolve_virtual_uri(&virtual_uri.to_uri_string())
+                    .await,
+                Some((host_uri, "region-0".to_string())),
+                "dotted language for {host}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn virtual_uri_observer_retains_uri_closed_during_request() {
         let tracker = DocumentTracker::new();
         let host_uri = Url::parse("file:///project/doc.md").unwrap();

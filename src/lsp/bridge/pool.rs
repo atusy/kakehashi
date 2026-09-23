@@ -2484,12 +2484,12 @@ impl LanguageServerPool {
         injection_language: &str,
         region_id: &str,
     ) -> io::Result<Arc<ConnectionHandle>> {
-        // Legacy or client-modified resolve envelopes may not carry the
-        // virtual identity. Do not feed an empty component to
-        // `VirtualDocumentUri::new` (debug builds assert, and release builds
-        // would select an unrelated `.txt` route); preserve the pre-routing
-        // host-URI fallback instead.
-        if injection_language.is_empty() || region_id.is_empty() {
+        // Legacy or client-modified resolve envelopes may not carry a valid
+        // virtual identity. Do not feed an empty component or a dotted
+        // region_id to `VirtualDocumentUri::new` (debug builds assert, and
+        // release builds would select a route no minted document uses);
+        // preserve the pre-routing host-URI fallback instead.
+        if injection_language.is_empty() || region_id.is_empty() || region_id.contains('.') {
             return self
                 .get_or_create_connection(server_name, server_config, Some(host_uri))
                 .await;
@@ -6637,6 +6637,29 @@ mod tests {
 
         done.send(true).expect("the waiter holds the receiver");
         waiter.await.expect("the request proceeds once re-opened");
+    }
+
+    /// Resolve envelopes round-trip through the client, so their `region_id`
+    /// is untrusted. A dotted one names no virtual document kakehashi minted;
+    /// it takes the host-URI route like a missing identity.
+    #[tokio::test]
+    async fn a_dotted_envelope_region_id_takes_the_host_route() {
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///test/dotted-region.md").unwrap();
+        let config = devnull_config();
+        let (_marker, key) = pool.resolve_acquire("lua", &config, Some(&host_uri)).await;
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        handle.record_launch_config(&config);
+        pool.connections
+            .lock()
+            .await
+            .insert(key, Arc::clone(&handle));
+
+        let acquired = pool
+            .get_or_create_virtual_connection("lua", &config, &host_uri, "lua", "region.part")
+            .await
+            .expect("a dotted region_id must fall back to the host route");
+        assert!(Arc::ptr_eq(&acquired, &handle));
     }
 
     /// Interactive virtual requests must not acquire a marker connection while
