@@ -162,6 +162,10 @@ pub fn compile_parser_inprocess(
             ),
         ))
     })?;
+    // `parser_source_dir` canonicalizes for its confinement check, which on
+    // Windows yields a verbatim `\\?\C:\...` path; MSVC's cl.exe cannot open
+    // sources under it (#1113). Hand the compiler the plain form.
+    let grammar_path = dunce::simplified(grammar_path);
     let loader = Loader::with_parser_lib_path(parent_dir.to_path_buf());
     loader
         .compile_parser_at_path(grammar_path, output_path.to_path_buf(), &[])
@@ -2340,7 +2344,12 @@ mod tests {
         // `__compile-parser` subcommand, which is not present in the unit-test
         // harness binary. End-to-end subprocess wiring is covered by
         // `tests/test_compile_parser_subprocess.rs`.
-        compile_parser_inprocess(&clone_dir, &output_path).expect("compile should succeed");
+        //
+        // Resolve the source through `parser_source_dir` as install does: on
+        // Windows it canonicalizes to a verbatim `\\?\` path, which the C
+        // compiler cannot open (#1113).
+        let source_dir = parser_source_dir(&clone_dir, None).expect("source dir");
+        compile_parser_inprocess(&source_dir, &output_path).expect("compile should succeed");
 
         assert!(
             output_path.exists(),
