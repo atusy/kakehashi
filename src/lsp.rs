@@ -28,7 +28,7 @@ pub use protocol_response_patch::ProtocolResponsePatch;
 pub(crate) use request_id::current_upstream_id;
 pub use request_id::{CancelForwarder, RequestIdCapture};
 pub(crate) use settings::{
-    SettingsEvent, SettingsEventKind, SettingsSource, load_settings,
+    SettingsEvent, SettingsEventKind, SettingsSource, load_settings, load_settings_over_base,
     load_settings_with_client_layers,
 };
 pub use wire_repair::repair_inbound_frames;
