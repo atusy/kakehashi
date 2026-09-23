@@ -4556,13 +4556,7 @@ mod tests {
         let key = ConnectionKey::for_server("dynamic");
         let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
         handle.set_server_capabilities(Default::default());
-        handle
-            .dynamic_capabilities()
-            .register(vec![tower_lsp_server::ls_types::Registration {
-                id: "folders".to_string(),
-                method: "workspace/didChangeWorkspaceFolders".to_string(),
-                register_options: None,
-            }]);
+        register_folder_changes(&handle);
         pool.insert_connection(Arc::clone(&handle)).await;
         let added = tower_lsp_server::ls_types::WorkspaceFolder {
             uri: "file:///added".parse().unwrap(),
@@ -4578,6 +4572,39 @@ mod tests {
         );
         assert_eq!(handle.workspace_folders().snapshot(), Some(vec![added]));
         assert!(pool.pending_reopen.claim(&key).is_none());
+    }
+
+    /// The dynamic capability is read live, not latched: a server that
+    /// unregisters the notification is no longer sent it. Nothing reacts to
+    /// the unregistration itself — the next upstream folder change finds the
+    /// connection incapable and recycles it like any other, so the respawn
+    /// handshakes with the current folders (#968).
+    #[tokio::test]
+    async fn workspace_folder_change_recycles_a_fallback_that_unregistered() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("dynamic");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        handle.set_server_capabilities(Default::default());
+        register_folder_changes(&handle);
+        handle.dynamic_capabilities().unregister(vec![
+            tower_lsp_server::ls_types::Unregistration {
+                id: "folders".to_string(),
+                method: "workspace/didChangeWorkspaceFolders".to_string(),
+            },
+        ]);
+        pool.insert_connection(handle).await;
+
+        pool.apply_workspace_folder_change(
+            vec![tower_lsp_server::ls_types::WorkspaceFolder {
+                uri: "file:///added".parse().unwrap(),
+                name: "added".to_string(),
+            }],
+            &[],
+        )
+        .await;
+
+        assert!(!pool.connections.lock().await.contains_key(&key));
+        assert!(pool.pending_reopen.claim(&key).is_some());
     }
 
     #[tokio::test]
