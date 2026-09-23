@@ -3377,6 +3377,20 @@ impl LanguageServerPool {
             }
         };
         if !handle.supports_workspace_folder_changes() {
+            // Routing chose this connection while it was capable and an
+            // unregistration landed since (#968's rare reverse transition).
+            // A marker root it does not serve must not be opened here
+            // unannounced: fail this acquisition so the next one re-resolves
+            // and diverts.
+            if let Some((root, _folder)) = marker
+                && !incapable_shared_serves(handle, root)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "bridge: shared instance withdrew folder-change support before \
+                     this root was announced",
+                ));
+            }
             return Ok(());
         }
         // The closure runs under the folder-set lock and reports its send
@@ -6234,6 +6248,31 @@ mod tests {
         let (_marker, key) = pool.resolve_acquire("lua", &config, Some(&doc)).await;
 
         assert_eq!(key, ConnectionKey::shared("lua"));
+    }
+
+    /// Routing picked the shared instance while it was capable; an
+    /// unregistration before the announce must not let the root's document
+    /// open there unannounced — the acquisition fails and the next one
+    /// re-resolves (#968).
+    #[tokio::test]
+    async fn announce_refuses_an_unserved_root_after_the_server_unregisters() {
+        let (_tmp, doc) = marker_rooted_doc();
+        let pool = LanguageServerPool::new();
+        let config = shared_config();
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
+        shared.set_server_capabilities(Default::default());
+        register_folder_changes(&shared);
+        unregister_folder_changes(&shared);
+        pool.insert_connection(Arc::clone(&shared)).await;
+        let (marker, _) = pool.resolve_marker_and_key("lua", &config, Some(&doc));
+
+        let error = pool
+            .announce_shared_root(&shared, &marker)
+            .await
+            .expect_err("an unserved root must not be opened unannounced");
+
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
     }
 
     /// A Ready shared connection whose server never advertised the
