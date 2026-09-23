@@ -267,6 +267,7 @@ impl AutoInstallManager {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn first_query_dependency_check(&self, language: &str, generation: u64) -> bool {
         let mut checked = self
             .query_dependency_checks
@@ -293,13 +294,27 @@ impl AutoInstallManager {
         }
     }
 
-    /// Whether a repair of `language` already failed in `generation`.
-    pub(crate) fn query_repair_failed(&self, language: &str, generation: u64) -> bool {
-        let checked = self
+    /// Whether a query dependency check of `language` is due in `generation`,
+    /// recording it when it is. A repair that already failed in this
+    /// generation declines even an initial pass; otherwise an initial pass
+    /// always checks and a later one only first in the generation. One lock
+    /// covers both, so a failure recorded meanwhile cannot slip between them.
+    pub(crate) fn begin_query_dependency_check(
+        &self,
+        language: &str,
+        generation: u64,
+        initial_pass: bool,
+    ) -> bool {
+        let mut checked = self
             .query_dependency_checks
             .lock()
-            .recover_poison("AutoInstallManager::query_repair_failed");
-        generation == checked.generation && checked.failed.contains(language)
+            .recover_poison("AutoInstallManager::begin_query_dependency_check");
+        let current = checked.observe(generation);
+        if current && checked.failed.contains(language) {
+            return false;
+        }
+        let first = current && checked.languages.insert(language.to_string());
+        initial_pass || first
     }
 
     /// Undo [`Self::first_query_dependency_check`] for a check that could not

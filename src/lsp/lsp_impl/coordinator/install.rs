@@ -296,27 +296,9 @@ impl InstallCoordinator {
         language: &str,
         initial_pass: bool,
     ) -> bool {
-        self.should_check_query_dependencies_at(
-            language,
-            initial_pass,
-            self.cache.semantic_token_generation(),
-        )
-    }
-
-    fn should_check_query_dependencies_at(
-        &self,
-        language: &str,
-        initial_pass: bool,
-        generation: u64,
-    ) -> bool {
-        // Discovery may already have loaded the parser before this task runs.
-        // Track checks independently of load events; reload generations reset
-        // eligibility while steady-state edits do no dependency filesystem work.
-        // This records an attempted check; a failed repair is remembered
-        // separately and waits for the next reload, even on open.
         let first = self
             .auto_install
-            .first_query_dependency_check(language, generation);
+            .first_query_dependency_check(language, self.cache.semantic_token_generation());
         initial_pass || first
     }
 
@@ -367,16 +349,16 @@ impl InstallCoordinator {
         if !self.settings_manager.is_auto_install_enabled(language) {
             return None;
         }
+        // Discovery may already have loaded the parser before this task runs.
+        // Track checks independently of load events; reload generations reset
+        // eligibility while steady-state edits do no dependency filesystem
+        // work. Opening another file does not change why the last repair
+        // failed; a reload (settings change or any successful install) retries
+        // it. The generation returned is the one the check was recorded in, so
+        // a busy answer undoes this very mark even when a reload lands between.
         let generation = self.cache.semantic_token_generation();
-        // Opening another file does not change why the last repair failed;
-        // a reload (settings change or any successful install) retries it.
-        if self.auto_install.query_repair_failed(language, generation) {
-            return None;
-        }
-        // The same generation as the failure check above and the forget in
-        // `finish_query_repair_check`: a busy answer must undo this very mark,
-        // even when a reload lands in between.
-        self.should_check_query_dependencies_at(language, initial_pass, generation)
+        self.auto_install
+            .begin_query_dependency_check(language, generation, initial_pass)
             .then_some(generation)
     }
 
