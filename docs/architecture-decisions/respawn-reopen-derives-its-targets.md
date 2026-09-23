@@ -298,14 +298,23 @@ anyway, incorrectly, since it cannot include documents opened since the purge.
   per open, so this is not a new kind of work, but it is work the
   captured-list design skipped.
 
+### Empty resolutions retain their input revision
+
+The sweep captures the document's incarnation and content version before
+resolving injections. An empty result is confirmed against that exact revision
+in one snapshot lookup, which distinguishes a closed document, an unchanged
+current parse, and a changed document. A closed document is no longer owed a
+repair. A newer current parse or a reopened lifetime cannot confirm the old
+empty result; the sweep reports incomplete instead. The snapshot language is
+also checked before cached regions or a missing injection query can establish
+that the host has no injections.
+
 ### Known limits of `done`
 
-Tracked as issue #929. Four ways the sweep's report can be wrong — mostly by claiming success for a
-connection that is not caught up, and in the last case by claiming failure for a
-document nobody is owed. All are narrow, all degrade to the pre-existing lazy
-heal (the next parse's eager open), and none is introduced here — but the
-barrier's contract is stated in terms of `done`, so they belong written down
-rather than implied.
+Tracked as issue #929. The remaining cases affect the report for tree-less
+documents and the content sent by a required open. The next parse's eager open
+can repair the connection, but `done` must not imply that this has already
+happened.
 
 **An invalidation placeholder reads as a current parse.** `invalidate_parse`
 publishes a tree-less snapshot whose `parsed_version` equals the content
@@ -319,13 +328,6 @@ cost is that one command, also for a document that stays tree-less (no parser
 will ever come), which has no regions to route anyway. Same root cause as the
 reload-placeholder issue (#923).
 
-**An empty resolution can be confirmed against a NEWER version.** If a
-`didChange` clears the tree and its reparse publishes before the currency
-re-check runs, the check passes on version N+1 while the emptiness came from N.
-The new version's own `process_injections` opens the documents, so the
-connection is repaired — just not by this sweep, and possibly after the barrier
-released.
-
 **A `didOpen` can carry superseded content.** `ensure_document_opened` re-reads
 the latest virtual content immediately before enqueue, but that cache is
 refreshed when a `didChange` is FORWARDED, which happens after the reparse the
@@ -334,13 +336,6 @@ content and enqueues it. The open claim does order the eventual
 `didChange` after this `didOpen`, so the downstream converges — but it does not
 order either of them against the command the barrier is about to release, so a
 command can arrive between them.
-
-**The incarnation checks are not atomic with what they guard.** A close landing
-between the liveness check and the currency re-check still reports failure, and
-a close+reopen can validate an empty result from one lifetime against a snapshot
-from the next. Same shape as the version case above: a two-step check over a
-value that can move between the steps. Closing it properly needs one lookup
-returning gone / exactly-current / changed rather than two booleans.
 
 ### Neutral
 

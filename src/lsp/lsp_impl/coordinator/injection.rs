@@ -68,6 +68,13 @@ pub(crate) enum ParseWait {
     Unsettled,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ReopenSnapshotState {
+    Gone,
+    Current,
+    Changed,
+}
+
 impl InjectionCoordinator {
     pub(crate) fn new(server: &Kakehashi) -> Self {
         Self {
@@ -948,6 +955,40 @@ impl InjectionCoordinator {
             .map(|document| document.incarnation())
     }
 
+    pub(crate) fn document_revision(&self, uri: &Url) -> Option<crate::lsp::bridge::HostRevision> {
+        self.documents
+            .get(uri)
+            .map(|document| crate::lsp::bridge::HostRevision {
+                incarnation: document.incarnation(),
+                content_version: document.content_version(),
+            })
+    }
+
+    pub(crate) fn reopen_snapshot_state(
+        &self,
+        uri: &Url,
+        expected: crate::lsp::bridge::HostRevision,
+    ) -> ReopenSnapshotState {
+        // One store read distinguishes a closed document from an unchanged
+        // resolution and from a newer parse/lifetime. Independent liveness and
+        // currency reads can accidentally confirm a different snapshot.
+        let Some(view) = self.documents.latest_snapshot(uri) else {
+            return ReopenSnapshotState::Gone;
+        };
+        if view.slot.current_incarnation == expected.incarnation
+            && view.content_version == expected.content_version
+            && view
+                .slot
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.parsed_version == expected.content_version)
+        {
+            ReopenSnapshotState::Current
+        } else {
+            ReopenSnapshotState::Changed
+        }
+    }
+
     /// The host language and resolved bridge injections for `uri`, or `None`
     /// when the document has no detectable language. Lets a caller re-derive the
     /// injected regions on demand (the respawn re-open), mirroring the
@@ -1711,6 +1752,75 @@ mod tests {
             assert_eq!(a.region_id, b.region_id, "region id must match");
             assert_eq!(a.content, b.content, "clean content must match");
         }
+    }
+
+    #[rstest::rstest]
+    #[case::edited(false)]
+    #[case::reopened(true)]
+    #[tokio::test]
+    async fn reopen_empty_result_cannot_be_confirmed_by_a_newer_snapshot(#[case] reopen: bool) {
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), language.clone());
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let uri = Url::parse("file:///reopen-revision.rs").unwrap();
+        let text = "fn main() {}";
+        server.documents.insert(
+            uri.clone(),
+            text.into(),
+            Some("rust".into()),
+            parser.parse(text, None),
+        );
+        let injection = server.injection_coordinator();
+        let revision = injection.document_revision(&uri).unwrap();
+        assert!(
+            injection
+                .bridge_injections(&uri)
+                .unwrap()
+                .1
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            injection.reopen_snapshot_state(&uri, revision),
+            super::ReopenSnapshotState::Current
+        );
+
+        if reopen {
+            server.documents.remove(&uri);
+            server.documents.insert(
+                uri.clone(),
+                text.into(),
+                Some("rust".into()),
+                parser.parse(text, None),
+            );
+        } else {
+            let edited = "fn newer() {}";
+            server
+                .documents
+                .update_document(uri.clone(), edited.into(), None);
+            publish_test_snapshot(
+                server,
+                &uri,
+                edited,
+                parser.parse(edited, None).unwrap(),
+                "rust",
+            );
+        }
+        assert!(
+            injection.snapshot_is_current(&uri),
+            "precondition: the replacement parse is already current"
+        );
+        assert_eq!(
+            injection.reopen_snapshot_state(&uri, revision),
+            super::ReopenSnapshotState::Changed,
+            "the replacement snapshot cannot confirm the old empty resolution"
+        );
     }
 
     #[rstest::rstest]

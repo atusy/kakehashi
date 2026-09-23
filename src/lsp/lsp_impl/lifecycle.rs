@@ -1814,13 +1814,10 @@ fn spawn_upstream_request(
                                 continue;
                             }
                         }
-                        // Incarnation BEFORE injections, matching the ordering the
-                        // inline heal used: a close+reopen landing between the two
-                        // reads then pairs a stale incarnation with fresh
-                        // injections, which the downstream sync rejects. The
-                        // reverse pairs stale injections with a fresh incarnation,
-                        // which reads as current.
-                        let Some(incarnation) = injection.document_incarnation(&host) else {
+                        // Capture the revision BEFORE resolving injections. An
+                        // edit or reopen during resolution must not let a new
+                        // snapshot validate an empty result from the old one.
+                        let Some(revision) = injection.document_revision(&host) else {
                             continue;
                         };
                         let Some((host_language, injections)) = injection.bridge_injections(&host)
@@ -1848,21 +1845,12 @@ fn spawn_upstream_request(
                             continue;
                         };
                         if injections.is_empty() {
-                            // Empty means one of two very different things: this
-                            // host genuinely has no region for this server, or
-                            // an edit cleared the tree between the currency
-                            // check above and this resolution — `didChange`
-                            // clears it WITHOUT bumping the incarnation, so
-                            // neither guard above catches that. Re-check rather
-                            // than assume the benign reading, because the benign
-                            // reading is the one that releases commands.
-                            // ...unless the host is simply gone. A buffer
-                            // closed mid-sweep is not a repair this connection
-                            // is owed, and `document_language` falls back to the
-                            // URI extension, so a closed document can reach here
-                            // and would otherwise wedge the barrier shut.
-                            if injection.document_incarnation(&host).is_some()
-                                && !injection.snapshot_is_current(&host)
+                            // Confirm exactly the revision used for resolution,
+                            // even if a newer parse is already current. A closed
+                            // document is no longer owed a repair; distinguish
+                            // that case in the same store read.
+                            if injection.reopen_snapshot_state(&host, revision)
+                                == super::coordinator::ReopenSnapshotState::Changed
                             {
                                 repaired = false;
                             }
@@ -1885,7 +1873,7 @@ fn spawn_upstream_request(
                                 &host_language,
                                 &host,
                                 crate::lsp::bridge::OpenExpectation {
-                                    incarnation,
+                                    incarnation: revision.incarnation,
                                     // Both the filter and the target: only hosts
                                     // that route here are opened, and they are
                                     // opened HERE.

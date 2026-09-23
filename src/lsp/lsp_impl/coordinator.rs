@@ -6,6 +6,6 @@ mod parse;
 
 pub(crate) use diagnostic::DiagnosticScheduler;
 pub(crate) use diagnostic_publisher::{DiagnosticPublisher, DiagnosticPush};
-pub(crate) use injection::{InjectionCoordinator, ParseWait};
+pub(crate) use injection::{InjectionCoordinator, ParseWait, ReopenSnapshotState};
 pub(crate) use install::{InstallCoordinator, InstallRequest};
 pub(crate) use parse::{ParseCoordinator, ParseLineage};
