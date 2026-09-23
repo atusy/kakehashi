@@ -27,6 +27,16 @@ fn init_mock_inlay_hint_client(
     host: bool,
     cancel_dir: Option<&std::path::Path>,
 ) -> (LspClient, tempfile::TempDir) {
+    init_mock_inlay_hint_client_with_capabilities(mode, language, host, cancel_dir, json!({}))
+}
+
+fn init_mock_inlay_hint_client_with_capabilities(
+    mode: &str,
+    language: &str,
+    host: bool,
+    cancel_dir: Option<&std::path::Path>,
+    capabilities: Value,
+) -> (LspClient, tempfile::TempDir) {
     let config_dir = tempfile::TempDir::new().expect("config temp dir");
     let config_path = config_dir.path().join("inlay_hint_resolve.toml");
     std::fs::write(&config_path, "").expect("write config");
@@ -54,7 +64,7 @@ fn init_mock_inlay_hint_client(
         json!({
             "processId": std::process::id(),
             "rootUri": null,
-            "capabilities": {},
+            "capabilities": capabilities,
             "workspaceFolders": null,
             "initializationOptions": initialization_options
         }),
@@ -62,6 +72,10 @@ fn init_mock_inlay_hint_client(
     assert_eq!(
         init["result"]["capabilities"]["inlayHintProvider"]["resolveProvider"],
         json!(true)
+    );
+    assert_eq!(
+        init["result"]["capabilities"]["executeCommandProvider"]["commands"],
+        json!([])
     );
     client.send_notification("initialized", json!({}));
     (client, config_dir)
@@ -208,6 +222,72 @@ fn wait_for_injected_node(client: &mut LspClient, uri: &str, line: u64) {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     panic!("timed out waiting for current injected parse");
+}
+
+#[test]
+fn inlay_hint_commands_are_registered_without_code_action_support() {
+    for host in [false, true] {
+        let (mut client, _config_dir) = init_mock_inlay_hint_client_with_capabilities(
+            "inlay-hint-resolve",
+            "lua",
+            host,
+            None,
+            json!({"workspace": {"executeCommand": {"dynamicRegistration": true}}}),
+        );
+        let (uri, language, text, start, end) = if host {
+            ("file:///registered-hint.lua", "lua", "local x = 1\n", 0, 1)
+        } else {
+            (
+                "file:///registered-hint.md",
+                "markdown",
+                "# Test\n\n```lua\nlocal x = 1\n```\n",
+                3,
+                5,
+            )
+        };
+        client.send_notification(
+            "textDocument/didOpen",
+            json!({"textDocument": {
+                "uri": uri, "languageId": language, "version": 1, "text": text,
+            }}),
+        );
+        let (registration_id, params) = client
+            .wait_for_server_request(
+                "client/registerCapability",
+                std::time::Duration::from_secs(5),
+            )
+            .expect("hint producer must register its command names");
+        let commands: Vec<&str> = params["registrations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["method"] == "workspace/executeCommand")
+            .flat_map(|entry| entry["registerOptions"]["commands"].as_array().unwrap())
+            .filter_map(Value::as_str)
+            .collect();
+        client.send_response(registration_id, json!(null));
+        let hint = inlay_hints_with_retry(&mut client, uri, start, end).remove(0);
+        let resolved = client.send_request("inlayHint/resolve", hint.clone());
+        assert!(resolved.get("error").is_none(), "{resolved}");
+        for (item, expected) in [(&hint, "mock.hint"), (&resolved["result"], "mock.resolved")] {
+            let command = &item["label"][0]["command"];
+            let name = command["command"].as_str().expect("hint command name");
+            assert!(
+                commands.contains(&name),
+                "surfaced command must be registered: {name}"
+            );
+            let response = client.send_request(
+                "workspace/executeCommand",
+                json!({
+                    "command": name,
+                    "arguments": command["arguments"].as_array().cloned().unwrap_or_default(),
+                }),
+            );
+            assert!(response.get("error").is_none(), "{response}");
+            assert_eq!(response["result"]["executed"], expected);
+        }
+        shutdown_client(&mut client);
+    }
 }
 
 /// E2E test: inlay hint request is handled without error

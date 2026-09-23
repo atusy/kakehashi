@@ -1548,7 +1548,7 @@ fn downstream_command_names_are_registered_upstream_for_the_palette() {
         }},
         "workspace": { "executeCommand": { "dynamicRegistration": true } }
     });
-    let (mut client, init_response, _config_dir) = init_client(caps);
+    let (mut client, init_response, _config_dir) = init_client(with_apply_edit(caps));
     assert_advertised(&init_response);
     // Opening the doc eager-spawns mock-codeaction (the lua fence's bridge
     // server); its handshake advertises `executeCommandProvider.commands`.
@@ -1560,18 +1560,42 @@ fn downstream_command_names_are_registered_upstream_for_the_palette() {
     let registrations = reg_params["registrations"]
         .as_array()
         .expect("registrations array");
-    let exec = registrations
+    let commands: Vec<&str> = registrations
         .iter()
-        .find(|r| r["method"] == "workspace/executeCommand")
-        .expect("a workspace/executeCommand registration");
-    let commands = exec["registerOptions"]["commands"]
-        .as_array()
-        .expect("registerOptions.commands");
+        .filter(|r| r["method"] == "workspace/executeCommand")
+        .flat_map(|r| {
+            r["registerOptions"]["commands"]
+                .as_array()
+                .expect("commands")
+        })
+        .filter_map(Value::as_str)
+        .collect();
     assert!(
-        commands.iter().any(|c| c == "mock.run"),
-        "the mock's advertised command must be registered, got: {commands:?}"
+        commands.contains(&"mock.run"),
+        "raw command must be registered"
     );
     client.send_response(reg_id, json!(null));
+
+    let actions = code_action_with_retry(&mut client);
+    let routed = actions
+        .iter()
+        .find_map(|action| action["command"].as_str())
+        .expect("a command action");
+    assert!(
+        commands.contains(&routed),
+        "the actual action command must be registered: {routed}"
+    );
+    let execution = client.send_request_async(
+        "workspace/executeCommand",
+        json!({"command": routed, "arguments": []}),
+    );
+    let (apply_id, _) = client
+        .wait_for_server_request("workspace/applyEdit", Duration::from_secs(5))
+        .expect("registered action command must reach its producer");
+    client.send_response(apply_id, json!({"applied": true}));
+    let response = client.receive_response_for_id_public(execution);
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["result"]["executed"], "mock.run");
 
     shutdown(&mut client);
 }

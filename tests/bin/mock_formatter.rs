@@ -356,6 +356,7 @@ fn main() {
                     | "inlay-hint-escaping-resolve"
                     | "inlay-hint-slow-resolve" => json!({
                         "inlayHintProvider": { "resolveProvider": true },
+                        "executeCommandProvider": { "commands": ["mock.hint", "mock.resolved"] },
                         "textDocumentSync": 1
                     }),
                     "inlay-hint-marker-resolve" => json!({
