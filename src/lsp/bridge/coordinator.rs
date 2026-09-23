@@ -2553,6 +2553,59 @@ mod tests {
         assert!(coordinator.pool().connections().await.is_empty());
     }
 
+    /// Crash recovery (#977) brings back only a server current settings would
+    /// still start: one they deleted, disabled — directly or through the
+    /// wildcard — or left without a command stays down.
+    #[tokio::test]
+    async fn crash_recovery_respawns_only_a_server_settings_still_start() {
+        let coordinator = BridgeCoordinator::new();
+        let mut settings = force_start_settings(&[
+            ("live", idle_server(false, vec![])),
+            (
+                "disabled",
+                BridgeServerConfig {
+                    enabled: Some(false),
+                    ..idle_server(false, vec![])
+                },
+            ),
+            (
+                "no-cmd",
+                BridgeServerConfig {
+                    cmd: None,
+                    ..idle_server(false, vec![])
+                },
+            ),
+        ]);
+
+        assert!(
+            coordinator
+                .respawnable_server_config(&settings, "live")
+                .is_some()
+        );
+        for server in ["disabled", "no-cmd", "deleted"] {
+            assert!(
+                coordinator
+                    .respawnable_server_config(&settings, server)
+                    .is_none(),
+                "{server} must not be respawned"
+            );
+        }
+
+        settings.language_servers.insert(
+            crate::config::WILDCARD_KEY.to_string(),
+            BridgeServerConfig {
+                enabled: Some(false),
+                ..Default::default()
+            },
+        );
+        assert!(
+            coordinator
+                .respawnable_server_config(&settings, "live")
+                .is_none(),
+            "a wildcard disable reaches a server that does not opt back in"
+        );
+    }
+
     /// The wildcard supplies the flag like any other field, and — as with
     /// `preferSharedInstance` — a concrete server can opt out of a blanket
     /// opt-in. The wildcard entry itself is a template, never a server.
