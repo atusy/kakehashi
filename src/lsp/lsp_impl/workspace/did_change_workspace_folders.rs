@@ -2,9 +2,7 @@
 
 use tower_lsp_server::ls_types::DidChangeWorkspaceFoldersParams;
 
-use crate::config::WorkspaceSettings;
 use crate::error::LockResultExt;
-use crate::lsp::load_settings_with_client_layers;
 
 use super::super::{Kakehashi, lifecycle::config_root_after_folder_change, lock_settings_reload};
 
@@ -81,47 +79,16 @@ impl Kakehashi {
         // in effect. Publishing it earlier would leave a rejected reload with
         // the new root over the old snapshot, so the next pushed layer would
         // anchor to a workspace the settings in effect know nothing about.
-        let client_overrides = self
+        let client_layers = self
             .client_layers
             .read()
             .recover_poison("client_layers replay")
             .to_fold_order();
-        let outcome = load_settings_with_client_layers(
-            root_path.as_deref(),
-            client_overrides,
-            self.home_dir.as_deref(),
-            |var| std::env::var(var).ok(),
-            // Explicit files are never re-read. Initialize retained their
-            // already-parsed, already-anchored layers specifically for this
-            // replay; only client-relative layers move with the workspace.
-            self.explicit_config.get().cloned().flatten(),
-        );
-        self.notifier().log_settings_events(&outcome.events).await;
-        if outcome.deprecated_keys.capture_mappings
-            && self
-                .settings_manager
-                .claim_capture_mappings_deprecation_warning()
+        match self
+            .recompose_settings(root_path.as_deref(), client_layers)
+            .await
         {
-            self.notifier()
-                .show_warning(crate::config::deprecation::CAPTURE_MAPPINGS_DEPRECATION_NOTICE)
-                .await;
-        }
-        if let Some(notice) = outcome.empty_container_notice.as_deref()
-            && self
-                .settings_manager
-                .claim_empty_container_migration_warning()
-        {
-            self.notifier().show_warning(notice).await;
-        }
-        let raw = outcome
-            .raw_settings
-            .unwrap_or_else(crate::config::defaults::default_settings);
-        match WorkspaceSettings::try_from_settings(
-            &raw,
-            self.home_dir.as_deref(),
-            crate::config::expand::with_kakehashi_defaults(|var| std::env::var(var).ok()),
-        ) {
-            Ok(settings) => {
+            Ok((raw, settings)) => {
                 let warnings = Self::misconfigured_settings_warnings(&settings);
                 let root_changed = *self.settings_manager.root_path() != root_path;
                 self.settings_manager.set_root(root_path, root_scope);
