@@ -1330,12 +1330,12 @@ fn write_forced_output_with(
 ) -> std::io::Result<()> {
     let permissions = forced_output_permissions(path)?;
     let mut temp = output_temporary_file(path, permissions.as_ref())?;
+    write(temp.as_file_mut())?;
     if let Some(permissions) = permissions {
-        // Creation applies umask; restore the exact previous mode only after
-        // the file has been created with no broader access.
+        // Creation applies umask, and writing may clear Unix set-ID bits.
+        // Restore the exact mode after writing, before syncing and publication.
         temp.as_file().set_permissions(permissions)?;
     }
-    write(temp.as_file_mut())?;
     temp.as_file().sync_all()?;
 
     // Refuse a link or special entry introduced while preparing the output.
@@ -2093,6 +2093,36 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(sibling).unwrap(),
             "previous configuration"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forced_output_restores_mode_bits_after_writing() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("config.toml");
+        std::fs::write(&output, "previous configuration").unwrap();
+        std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o2640)).unwrap();
+        assert_eq!(
+            output.metadata().unwrap().permissions().mode() & 0o7777,
+            0o2640
+        );
+
+        write_forced_output_with(&output, |file| {
+            use std::io::Write as _;
+            file.write_all(b"replacement")?;
+            // Unix can clear set-ID bits when writing. Emulate this explicitly
+            // so the ordering check does not depend on runner privileges.
+            file.set_permissions(std::fs::Permissions::from_mode(0o640))
+        })
+        .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), "replacement");
+        assert_eq!(
+            output.metadata().unwrap().permissions().mode() & 0o7777,
+            0o2640
         );
     }
 
