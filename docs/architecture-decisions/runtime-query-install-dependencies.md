@@ -30,7 +30,9 @@ Opening a document also checks an already-loaded managed parser's query chain.
 Query-only repair preserves parsing with that parser while installation runs.
 Injected languages are checked on initial lifecycle passes and once per query
 reload generation, independently of which caller first loaded their parser;
-cached edit passes do not rescan the dependency graph. A parser selected from
+cached edit passes do not rescan the dependency graph. A repair that fails is
+not retried, even on open, until the next reload generation (a settings change
+or any install). A parser selected from
 outside the managed data directory is not a query-repair target. A chain
 whose managed lock is held (an install mid-publish, or a concurrent probe) is
 not treated as missing: the check is left to a later pass.

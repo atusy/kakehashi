@@ -122,6 +122,12 @@ pub(crate) enum InstallOutcome {
 }
 
 impl InstallOutcome {
+    /// Whether this attempt ended without the language being installable.
+    /// `AlreadyInstalling` and `Abandoned` say nothing about the language.
+    pub(crate) fn is_failure(&self) -> bool {
+        matches!(self, Self::Unsupported | Self::Failed | Self::NoDataDir)
+    }
+
     /// Get the data directory if installation was successful.
     pub(crate) fn data_dir(&self) -> Option<&PathBuf> {
         match self {
@@ -148,6 +154,23 @@ pub(crate) enum InstallEvent {
 struct QueryDependencyChecks {
     generation: u64,
     languages: HashSet<String>,
+    /// Languages whose query repair failed in `generation`.
+    failed: HashSet<String>,
+}
+
+impl QueryDependencyChecks {
+    /// Move to `generation` if it is newer; false when it is already stale.
+    fn observe(&mut self, generation: u64) -> bool {
+        if generation < self.generation {
+            return false;
+        }
+        if generation > self.generation {
+            self.generation = generation;
+            self.languages.clear();
+            self.failed.clear();
+        }
+        true
+    }
 }
 
 /// Isolated coordinator for parser auto-installation.
@@ -224,18 +247,34 @@ impl AutoInstallManager {
             .query_dependency_checks
             .lock()
             .recover_poison("AutoInstallManager::first_query_dependency_check");
-        if generation < checked.generation {
+        if !checked.observe(generation) {
             return false;
-        }
-        if generation > checked.generation {
-            checked.generation = generation;
-            checked.languages.clear();
         }
         if checked.languages.contains(language) {
             return false;
         }
         checked.languages.insert(language.to_string());
         true
+    }
+
+    /// Remember that repairing `language`'s queries failed in `generation`.
+    pub(crate) fn record_query_repair_failure(&self, language: &str, generation: u64) {
+        let mut checked = self
+            .query_dependency_checks
+            .lock()
+            .recover_poison("AutoInstallManager::record_query_repair_failure");
+        if checked.observe(generation) {
+            checked.failed.insert(language.to_string());
+        }
+    }
+
+    /// Whether a repair of `language` already failed in `generation`.
+    pub(crate) fn query_repair_failed(&self, language: &str, generation: u64) -> bool {
+        let checked = self
+            .query_dependency_checks
+            .lock()
+            .recover_poison("AutoInstallManager::query_repair_failed");
+        generation == checked.generation && checked.failed.contains(language)
     }
 
     /// Undo [`Self::first_query_dependency_check`] for a check that could not

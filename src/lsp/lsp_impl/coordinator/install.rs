@@ -294,8 +294,8 @@ impl InstallCoordinator {
         // Discovery may already have loaded the parser before this task runs.
         // Track checks independently of load events; reload generations reset
         // eligibility while steady-state edits do no dependency filesystem work.
-        // This records an attempted check: failed repairs are retried on open
-        // or a reload, not on every subsequent edit.
+        // This records an attempted check; a failed repair is remembered
+        // separately and waits for the next reload, even on open.
         let first = self
             .auto_install
             .first_query_dependency_check(language, self.cache.semantic_token_generation());
@@ -327,6 +327,11 @@ impl InstallCoordinator {
             return false;
         }
         let generation = self.cache.semantic_token_generation();
+        // Opening another file does not change why the last repair failed;
+        // a reload (settings change or any install) is what retries it.
+        if self.auto_install.query_repair_failed(language, generation) {
+            return false;
+        }
         if !self.should_check_query_dependencies(language, initial_pass) {
             return false;
         }
@@ -361,6 +366,9 @@ impl InstallCoordinator {
         request: InstallRequest,
     ) -> InstallCompletion {
         let mut parsed = None;
+        // A failure is remembered for the generation it was attempted in, so
+        // a reload that lands meanwhile already counts as the retry trigger.
+        let generation = self.cache.semantic_token_generation();
         if !self.same_document_incarnation(&uri, expected_incarnation) {
             return InstallCompletion::default();
         }
@@ -499,6 +507,10 @@ impl InstallCoordinator {
                 }
                 return InstallCompletion::default();
             }
+            if query_repair && terminal.is_failure() {
+                self.auto_install
+                    .record_query_repair_failure(language, generation);
+            }
             if terminal == crate::lsp::auto_install::InstallOutcome::Abandoned
                 && self.same_document_incarnation(&uri, expected_incarnation)
                 && request.allow_recovery
@@ -516,6 +528,10 @@ impl InstallCoordinator {
                 .await;
             }
         } else {
+            if query_repair && result.outcome.is_failure() {
+                self.auto_install
+                    .record_query_repair_failure(language, generation);
+            }
             result.complete_claim();
         }
         InstallCompletion {
