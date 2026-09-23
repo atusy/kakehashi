@@ -928,8 +928,14 @@ mod tests {
         }
     }
 
+    #[rstest::rstest]
+    #[case::current(1, OpenOutcome::Opened)]
+    #[case::superseded(2, OpenOutcome::NotOpened)]
     #[tokio::test]
-    async fn repair_rejects_content_superseded_before_open() {
+    async fn repair_checks_content_revision_under_the_edit_lock(
+        #[case] current_version: u64,
+        #[case] expected: OpenOutcome,
+    ) {
         let pool = LanguageServerPool::new();
         let key = crate::lsp::bridge::ConnectionKey::for_server("test-server");
         let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
@@ -939,9 +945,13 @@ mod tests {
         pool.open_host_incarnation(&host_uri, 1).await;
         let edit_lock = tokio::sync::Mutex::new(());
         let read = || {
+            assert!(
+                edit_lock.try_lock().is_err(),
+                "revision must be checked while edits are serialized"
+            );
             Some(crate::lsp::bridge::HostRevision {
                 incarnation: 1,
-                content_version: 2,
+                content_version: current_version,
             })
         };
         let outcome = pool
@@ -967,15 +977,18 @@ mod tests {
                 }],
             )
             .await;
+        assert_eq!(outcome, expected);
         assert_eq!(
-            outcome,
-            OpenOutcome::NotOpened,
-            "an edit superseded the resolved content"
+            pool.is_document_opened_on_connection(
+                &VirtualDocumentUri::new(&uri, "lua", TEST_ULID_LUA_0),
+                &key,
+            ),
+            expected == OpenOutcome::Opened
         );
-        assert!(!pool.is_document_opened_on_connection(
-            &VirtualDocumentUri::new(&uri, "lua", TEST_ULID_LUA_0),
-            &key,
-        ));
+        assert!(
+            edit_lock.try_lock().is_ok(),
+            "repair must release the edit lock"
+        );
     }
 
     /// Test that eager_open_virtual_documents marks virtual documents as opened.

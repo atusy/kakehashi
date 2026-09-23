@@ -5754,17 +5754,73 @@ mod reopen_order_tests {
         );
     }
 
-    /// Exercise the actual producer, not a test that supplies `done=true` by
-    /// hand. A false or missing completion must fail even though E2E command
-    /// retries can eventually pass a retired failed barrier.
+    /// Exercise the actual producer for both success and incomplete results.
+    /// E2E retries alone cannot distinguish them because commands can later
+    /// pass a retired failed barrier.
+    #[rstest::rstest]
+    #[case::no_documents(false, true)]
+    #[case::invalidation_placeholder(true, false)]
     #[tokio::test]
-    async fn completed_reopen_reports_success() {
+    async fn reopen_reports_whether_documents_could_be_resolved(
+        #[case] invalidated: bool,
+        #[case] expected: bool,
+    ) {
         use super::*;
         use crate::lsp::bridge::{ConnectionKey, UpstreamRequest};
         use tower_lsp_server::LspService;
 
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
+        // Let injections reach the retired server. Otherwise configuration
+        // alone proves the placeholder irrelevant, and the sweep correctly
+        // skips it before the tree-less snapshot is examined.
+        server
+            .settings_manager
+            .apply_settings(crate::config::WorkspaceSettings {
+                auto_install: false,
+                language_servers: std::collections::HashMap::from([(
+                    "retired-server".into(),
+                    crate::config::settings::BridgeServerConfig {
+                        cmd: Some(vec!["retired-server".into()]),
+                        languages: Some(vec!["html".into()]),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            });
+        if invalidated {
+            let uri = Url::parse("file:///reopen-placeholder.rs").unwrap();
+            let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+            // A published parser keeps the language settled, so only the
+            // missing tree can make the result incomplete.
+            server
+                .language
+                .language_registry_for_parallel()
+                .register("rust".into(), language.clone());
+            let mut parser = tree_sitter::Parser::new();
+            parser.set_language(&language).unwrap();
+            let text = "fn main() {}";
+            server.documents.insert(
+                uri.clone(),
+                text.into(),
+                Some("rust".into()),
+                parser.parse(text, None),
+            );
+            server.documents.invalidate_all_parses();
+            assert!(server.injection_coordinator().snapshot_is_current(&uri));
+            assert!(
+                server
+                    .documents
+                    .latest_snapshot(&uri)
+                    .unwrap()
+                    .slot
+                    .snapshot
+                    .as_ref()
+                    .unwrap()
+                    .tree
+                    .is_none()
+            );
+        }
         let context = Arc::new(UpstreamDeliveryContext {
             diagnostic_publisher: Arc::new(
                 crate::lsp::lsp_impl::coordinator::DiagnosticPublisher::new(server),
@@ -5784,16 +5840,14 @@ mod reopen_order_tests {
             false,
             Some(context),
         );
-        // No documents need repair. Await the producer's own completion signal,
-        // with a generous deadlock guard rather than a latency assertion.
+        // Await the producer's own signal, including the false result for a
+        // version-current placeholder. No test-supplied completion can mask a
+        // sweep that accidentally treats the missing tree as zero regions.
         tokio::time::timeout(std::time::Duration::from_secs(15), completion.changed())
             .await
             .expect("reopen task must finish")
             .expect("reopen task must report its result before dropping the sender");
-        assert!(
-            *completion.borrow(),
-            "a completed repair must report success"
-        );
+        assert_eq!(*completion.borrow(), expected);
     }
 
     #[cfg(unix)]

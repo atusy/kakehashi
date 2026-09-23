@@ -309,23 +309,22 @@ empty result; the sweep reports incomplete instead. The snapshot language is
 also checked before cached regions or a missing injection query can establish
 that the host has no injections.
 
-### Known limits of `done`
+### Undeterminable parses fail soft
 
-The remaining limitation tracked in #929 concerns tree-less documents. The
-next parse's eager open can repair the connection, but `done` must not imply
-that this has already happened.
+`invalidate_parse` publishes a tree-less snapshot whose `parsed_version`
+equals the content version, so the parse wait alone can classify it as settled.
+The sweep does not use that currency as proof of an empty injection set:
+`bridge_injections` reports an undeterminable result for the placeholder, and
+`done` reports incomplete. This already prevented the false-success placeholder
+case described in #929 before the revision and content checks above were added.
 
-**An invalidation placeholder reads as a current parse.** `invalidate_parse`
-publishes a tree-less snapshot whose `parsed_version` equals the content
-version, so both the parse wait and the currency re-check classify it as
-settled. The injection resolution answers "could not look" for a tree-less
-document (and for a language whose parser is not published, or a reload in
-progress), so the sweep reports the connection incomplete rather than
-repaired: the command that waits on it fails soft once, the reparse that
-follows re-opens eagerly. Reporting incomplete is the fail-soft direction; the
-cost is that one command, also for a document that stays tree-less (no parser
-will ever come), which has no regions to route anyway. Same root cause as the
-reload-placeholder issue (#923).
+Commands observing this incomplete result fail soft. Once the sender drops,
+the registry retires that completed barrier when a waiter observes it; a
+permanently tree-less document therefore does not leave that barrier blocking
+all later commands. A subsequent parse re-opens its regions eagerly. A tree-less
+snapshot still cannot distinguish a pending parse from a document that will
+never produce a tree, so the conservative failure remains an availability
+trade-off. It is not evidence that the downstream already holds its documents.
 
 ### Required opens use revision-validated content
 
