@@ -3744,6 +3744,54 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn linked_managed_query_files_are_not_runtime_sources() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        // An incomplete managed parent, its file linked from a runtime path.
+        let parent = data.join("queries/parent");
+        fs::create_dir_all(&parent).unwrap();
+        fs::write(parent.join("highlights.scm"), "").unwrap();
+        fs::create_dir_all(runtime.join("queries/parent")).unwrap();
+        std::os::unix::fs::symlink(
+            parent.join("highlights.scm"),
+            runtime.join("queries/parent/highlights.scm"),
+        )
+        .unwrap();
+        let child = data.join("queries/child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(child.join("highlights.scm"), "; inherits: parent\n").unwrap();
+        write_install_marker(&child).unwrap();
+        assert!(
+            lock_complete_chain(&data, "child", std::slice::from_ref(&runtime)).is_none(),
+            "a link to the managed file does not provide the parent"
+        );
+        // Replacing the child must not read its old declarations through a
+        // file link either.
+        fs::write(child.join("injections.scm"), "; inherits: obsolete\n").unwrap();
+        fs::create_dir_all(runtime.join("queries/child")).unwrap();
+        std::os::unix::fs::symlink(
+            child.join("injections.scm"),
+            runtime.join("queries/child/injections.scm"),
+        )
+        .unwrap();
+        let base_url = spawn_query_file_server(vec![
+            ("/child/highlights.scm", "replacement"),
+            ("/parent/highlights.scm", "(comment) @comment\n"),
+        ]);
+        stage_queries_with_dependencies(
+            &base_url,
+            "child",
+            &data,
+            true,
+            QueryHttpPolicy::AllowHttpForTests,
+            &[runtime],
+        )
+        .unwrap_or_else(|e| panic!("the old copy's parents leaked into staging: {e}"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_broken_runtime_file_neither_blocks_nor_hides_the_chain() {
         let temp = TempDir::new().unwrap();
         let data = temp.path().join("data");
