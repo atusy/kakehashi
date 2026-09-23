@@ -870,6 +870,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_parser_install_turned_repair_still_parses_with_the_loaded_parser() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), tree_sitter_rust::LANGUAGE.into());
+        // didOpen found no parser and skipped its inline parse; by the time
+        // its task runs the parser is back and the chain needs repair.
+        let uri = Url::parse("file:///turned-repair.rs").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "fn main() {}".into(),
+            Some("rust".into()),
+            None,
+        );
+        server
+            .auto_install
+            .script_next_install("rust", crate::lsp::auto_install::InstallOutcome::Failed);
+        server
+            .install_coordinator()
+            .maybe_auto_install_language(
+                "rust",
+                uri.clone(),
+                false,
+                Some(incarnation),
+                InstallRequest {
+                    repair_queries: true,
+                    parser_loaded: false,
+                    allow_recovery: true,
+                },
+            )
+            .await;
+        assert!(
+            server.documents.get(&uri).unwrap().tree().is_some(),
+            "a failed repair must not leave a document tree-less under a usable parser"
+        );
+    }
+
+    #[tokio::test]
     async fn query_repair_leaves_the_first_snapshot_to_the_inline_parse() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
