@@ -406,14 +406,18 @@ impl InstallCoordinator {
             return InstallCompletion::default();
         }
 
+        let parser_available = self.language.has_parser_available(language);
         let query_repair = request.repair_queries
-            || (self.language.has_parser_available(language)
-                && self.query_repair_needed(language, true).await);
+            || (parser_available && self.query_repair_needed(language, true).await);
         let request = InstallRequest {
             repair_queries: query_repair,
             ..request
         };
-        if self.language.has_parser_available(language) && !query_repair {
+        // A usable parser parses now. A repair requested with a loaded parser
+        // leaves that to the caller's own parse; one that started as a parser
+        // install had its caller skip parsing, and a failed repair must not
+        // leave the document tree-less.
+        if parser_available && (!query_repair || !request.parser_loaded) {
             if !is_injection && self.same_document_incarnation(&uri, expected_incarnation) {
                 parsed = self
                     .parse_coordinator()
@@ -423,6 +427,8 @@ impl InstallCoordinator {
             if !self.same_document_incarnation(&uri, expected_incarnation) {
                 return InstallCompletion::default();
             }
+        }
+        if parser_available && !query_repair {
             let recovered =
                 self.install_reparse_recovered(language, &uri, is_injection, expected_incarnation);
             if recovered {
