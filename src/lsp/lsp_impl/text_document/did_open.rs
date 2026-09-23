@@ -145,11 +145,7 @@ impl Kakehashi {
                 }
             }
 
-            if !load_result.success
-                || self
-                    .install_coordinator()
-                    .needs_query_dependency_install(lang)
-            {
+            if !load_result.success || self.install_coordinator().query_repair_needed(lang, true) {
                 if self.settings_manager.is_auto_install_enabled(lang) {
                     // A parser or its query dependency chain needs installation.
                     //

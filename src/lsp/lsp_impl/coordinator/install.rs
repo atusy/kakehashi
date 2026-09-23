@@ -35,17 +35,28 @@ fn query_dependency_paths(settings: &WorkspaceSettings, language: &str) -> Vec<s
         .collect()
 }
 
-fn managed_queries_need_repair(
+/// What a lifecycle probe found for a managed language's query chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueryChainState {
+    /// Complete, or not a query-repair target at all.
+    Settled,
+    /// The managed parser's query chain is missing a language.
+    NeedsRepair,
+    /// A language in the chain is locked, so the chain cannot be judged now.
+    Busy,
+}
+
+fn managed_query_chain_state(
     settings: &WorkspaceSettings,
     language: &str,
     data_dir: &std::path::Path,
-) -> bool {
+) -> QueryChainState {
     if !settings.auto_install_for(language) {
-        return false;
+        return QueryChainState::Settled;
     }
     let paths = query_dependency_paths(settings, language);
     if paths.is_empty() {
-        return false;
+        return QueryChainState::Settled;
     }
     let parser_config = settings
         .languages
@@ -62,8 +73,14 @@ fn managed_queries_need_repair(
         .and_then(|path| path.canonicalize().ok())
         .zip(managed.and_then(|path| path.canonicalize().ok()))
         .is_some_and(|(selected, managed)| selected == managed);
-    same_parser
-        && crate::install::queries::lock_complete_chain(data_dir, language, &paths).is_none()
+    if !same_parser {
+        return QueryChainState::Settled;
+    }
+    match crate::install::queries::probe_chain(data_dir, language, &paths) {
+        crate::install::queries::ChainProbe::Complete(_) => QueryChainState::Settled,
+        crate::install::queries::ChainProbe::Incomplete => QueryChainState::NeedsRepair,
+        crate::install::queries::ChainProbe::Busy => QueryChainState::Busy,
+    }
 }
 
 fn updated_settings_after_install(
@@ -285,13 +302,37 @@ impl InstallCoordinator {
         initial_pass || first
     }
 
-    pub(crate) fn needs_query_dependency_install(&self, language: &str) -> bool {
+    /// Whether an already-loaded managed parser's query chain should be
+    /// repaired now. `initial_pass` marks lifecycle passes (open, install
+    /// completion) that check regardless of this generation's earlier checks.
+    pub(crate) fn query_repair_needed(&self, language: &str, initial_pass: bool) -> bool {
+        self.decide_query_repair(language, initial_pass, || {
+            crate::install::default_data_dir().map_or(QueryChainState::Settled, |data_dir| {
+                managed_query_chain_state(
+                    &self.settings_manager.load_settings(),
+                    language,
+                    &data_dir,
+                )
+            })
+        })
+    }
+
+    fn decide_query_repair(
+        &self,
+        language: &str,
+        initial_pass: bool,
+        probe: impl FnOnce() -> QueryChainState,
+    ) -> bool {
         if !self.settings_manager.is_auto_install_enabled(language) {
             return false;
         }
-        crate::install::default_data_dir().is_some_and(|data_dir| {
-            managed_queries_need_repair(&self.settings_manager.load_settings(), language, &data_dir)
-        })
+        if !self.should_check_query_dependencies(language, initial_pass) {
+            return false;
+        }
+        matches!(
+            probe(),
+            QueryChainState::NeedsRepair | QueryChainState::Busy
+        )
     }
 
     /// Try to auto-install a language if not already being installed.
@@ -316,7 +357,7 @@ impl InstallCoordinator {
 
         let query_repair = request.repair_queries
             || (self.language.has_parser_available(language)
-                && self.needs_query_dependency_install(language));
+                && self.query_repair_needed(language, true));
         let request = InstallRequest {
             repair_queries: query_repair,
             ..request
@@ -794,7 +835,10 @@ mod tests {
             ],
             ..Default::default()
         };
-        assert!(managed_queries_need_repair(&settings, "lua", &data));
+        assert_eq!(
+            managed_query_chain_state(&settings, "lua", &data),
+            QueryChainState::NeedsRepair
+        );
         settings.languages.insert(
             "lua".into(),
             LanguageSettings {
@@ -802,7 +846,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(!managed_queries_need_repair(&settings, "lua", &data));
+        assert_eq!(
+            managed_query_chain_state(&settings, "lua", &data),
+            QueryChainState::Settled
+        );
         settings.languages.insert(
             "lua".into(),
             LanguageSettings {
@@ -810,12 +857,18 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(!managed_queries_need_repair(&settings, "lua", &data));
+        assert_eq!(
+            managed_query_chain_state(&settings, "lua", &data),
+            QueryChainState::Settled
+        );
         settings.languages.clear();
         std::fs::create_dir_all(runtime.join("parser")).unwrap();
         let custom = runtime.join("parser/lua.so");
         std::fs::write(&custom, "custom").unwrap();
-        assert!(!managed_queries_need_repair(&settings, "lua", &data));
+        assert_eq!(
+            managed_query_chain_state(&settings, "lua", &data),
+            QueryChainState::Settled
+        );
         std::fs::remove_file(&custom).unwrap();
         settings.languages.insert(
             "lua".into(),
@@ -824,11 +877,17 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(!managed_queries_need_repair(&settings, "lua", &data));
+        assert_eq!(
+            managed_query_chain_state(&settings, "lua", &data),
+            QueryChainState::Settled
+        );
         settings.languages.clear();
         std::fs::create_dir_all(data.join("queries/parent")).unwrap();
         std::fs::write(data.join("queries/parent/highlights.scm"), "parent").unwrap();
-        assert!(!managed_queries_need_repair(&settings, "lua", &data));
+        assert_eq!(
+            managed_query_chain_state(&settings, "lua", &data),
+            QueryChainState::Settled
+        );
     }
 
     #[test]

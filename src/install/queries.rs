@@ -310,6 +310,27 @@ pub(crate) fn lock_complete_chain(
     language: &str,
     search_paths: &[PathBuf],
 ) -> Option<Vec<LanguageLock>> {
+    match probe_chain(data_dir, language, search_paths) {
+        ChainProbe::Complete(guards) => Some(guards),
+        ChainProbe::Incomplete | ChainProbe::Busy => None,
+    }
+}
+
+/// What [`probe_chain`] found for an inheritance chain.
+pub(crate) enum ChainProbe {
+    /// Every language is installed; the guards hold them still.
+    Complete(Vec<LanguageLock>),
+    /// A language is missing, unreadable, or not installable by name.
+    Incomplete,
+    /// A language's lock is held (an install or uninstall is mid-publish, or
+    /// another probe is reading it), so the chain cannot be judged right now.
+    Busy,
+}
+
+/// [`lock_complete_chain`], telling a held lock apart from a missing language.
+/// The walk stops at the first language that fails, so a chain reported busy
+/// may also turn out incomplete once the lock is released.
+pub(crate) fn probe_chain(data_dir: &Path, language: &str, search_paths: &[PathBuf]) -> ChainProbe {
     fn walk(
         data_dir: &Path,
         language: &str,
@@ -317,6 +338,7 @@ pub(crate) fn lock_complete_chain(
         search_paths: &[PathBuf],
         seen: &mut Vec<String>,
         guards: &mut Vec<LanguageLock>,
+        busy: &mut bool,
     ) -> bool {
         // A language already on the path — a file naming its own language
         // (read as `extends`), or an A↔B cycle for the loader to report — is
@@ -336,8 +358,9 @@ pub(crate) fn lock_complete_chain(
         {
             return inherited_languages_with_search_paths(&queries_dir, language, search_paths)
                 .is_some_and(|parents| {
-                    required_parents(parents, true)
-                        .all(|parent| walk(data_dir, &parent, true, search_paths, seen, guards))
+                    required_parents(parents, true).all(|parent| {
+                        walk(data_dir, &parent, true, search_paths, seen, guards, busy)
+                    })
                 });
         }
         match try_lock_language(data_dir, language) {
@@ -345,28 +368,37 @@ pub(crate) fn lock_complete_chain(
             // Nothing can publish into a data directory nothing can write, so
             // what is there is settled without a guard to prove it.
             LanguageLockProbe::Unlockable => {}
-            LanguageLockProbe::Busy
-            | LanguageLockProbe::UnusableName
-            | LanguageLockProbe::Unavailable => return false,
+            LanguageLockProbe::Busy => {
+                *busy = true;
+                return false;
+            }
+            LanguageLockProbe::UnusableName | LanguageLockProbe::Unavailable => return false,
         }
         query_install_is_complete(&queries_dir)
             && inherited_languages_with_search_paths(&queries_dir, language, search_paths)
                 .is_some_and(|parents| {
-                    required_parents(parents, is_included)
-                        .all(|parent| walk(data_dir, &parent, true, search_paths, seen, guards))
+                    required_parents(parents, is_included).all(|parent| {
+                        walk(data_dir, &parent, true, search_paths, seen, guards, busy)
+                    })
                 })
     }
 
     let mut guards = Vec::new();
-    walk(
+    let mut busy = false;
+    let complete = walk(
         data_dir,
         language,
         false,
         search_paths,
         &mut Vec::new(),
         &mut guards,
-    )
-    .then_some(guards)
+        &mut busy,
+    );
+    match (complete, busy) {
+        (true, _) => ChainProbe::Complete(guards),
+        (false, true) => ChainProbe::Busy,
+        (false, false) => ChainProbe::Incomplete,
+    }
 }
 
 /// Download and install query files for a language, including inherited dependencies.
