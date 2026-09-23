@@ -1282,66 +1282,62 @@ impl DiagnosticAggregator {
     /// the exact revision carrying this data, so a republish can only settle
     /// it once its validated snapshot INCLUDES the mutation.
     pub(crate) fn set_pull_layer_nudgeless(&self, host: &Url, diagnostics: Vec<Diagnostic>) {
-        let mut revisions = self
-            .cache_revisions
-            .lock()
-            .recover_poison("DiagnosticAggregator::cache_revisions");
-        let mut cache = self.lock();
-        let source_slots = if let Some(source_slots) = cache.get_mut(host) {
-            source_slots
-        } else {
-            cache.entry(host.clone()).or_default()
-        };
-        let changed = source_slots
-            .get(&DiagnosticSource::PullLayer)
-            .and_then(|servers| servers.get(PULL_LAYER_SERVER))
-            .is_none_or(|slot| slot.diagnostics != diagnostics);
-        source_slots
-            .entry(DiagnosticSource::PullLayer)
-            .or_default()
-            .insert(
-                PULL_LAYER_SERVER.to_string(),
-                SlotEntry {
-                    diagnostics,
-                    connection_id: None,
-                },
-            );
-        if changed {
-            revisions.insert(host.clone(), self.allocate_cache_revision());
-            // Stamp only a REAL change (Qodo, PR #972): a no-op mutation owes
-            // the editor nothing, and its stale mark would otherwise be
-            // converted into a spurious lag by whatever unrelated Changed
-            // republish settles next.
-            let revision = revisions.get(host).copied().unwrap_or(0);
-            self.pull_view_lag_pending
-                .lock()
-                .recover_poison("DiagnosticAggregator::pull_view_lag_pending")
-                .insert(host.clone(), revision);
-        }
+        self.update_pull_layer_nudgeless(host, |_| {
+            Some(SlotEntry {
+                diagnostics,
+                connection_id: None,
+            })
+        });
     }
 
     /// Evict the pull-layer blob AND stamp the pending mark, like
     /// [`Self::set_pull_layer_nudgeless`] — the nudge-less variant of
     /// `evict_source(host, PullLayer)`.
     pub(crate) fn evict_pull_layer_nudgeless(&self, host: &Url) {
+        self.update_pull_layer_nudgeless(host, |_| None);
+    }
+
+    /// Read, transform, and replace the synthetic pull slot under the same
+    /// revision/cache guards. A partial collection can therefore retain a
+    /// previous contribution without racing another cache writer.
+    fn update_pull_layer_nudgeless(
+        &self,
+        host: &Url,
+        update: impl FnOnce(Option<&SlotEntry>) -> Option<SlotEntry>,
+    ) {
         let mut revisions = self
             .cache_revisions
             .lock()
             .recover_poison("DiagnosticAggregator::cache_revisions");
         let mut cache = self.lock();
-        let removed = if let Some(slots) = cache.get_mut(host) {
-            let removed = slots.remove(&DiagnosticSource::PullLayer).is_some();
-            if slots.is_empty() {
+        let previous = cache
+            .get(host)
+            .and_then(|sources| sources.get(&DiagnosticSource::PullLayer))
+            .and_then(|servers| servers.get(PULL_LAYER_SERVER));
+        let next = update(previous);
+        let changed =
+            previous.map(|slot| &slot.diagnostics) != next.as_ref().map(|slot| &slot.diagnostics);
+        if let Some(slot) = next {
+            let sources = if let Some(sources) = cache.get_mut(host) {
+                sources
+            } else {
+                cache.entry(host.clone()).or_default()
+            };
+            sources
+                .entry(DiagnosticSource::PullLayer)
+                .or_default()
+                .insert(PULL_LAYER_SERVER.to_string(), slot);
+        } else if let Some(sources) = cache.get_mut(host) {
+            sources.remove(&DiagnosticSource::PullLayer);
+            if sources.is_empty() {
                 cache.remove(host);
             }
-            removed
-        } else {
-            false
-        };
-        if removed {
-            revisions.insert(host.clone(), self.allocate_cache_revision());
-            // Same real-change gate as `set_pull_layer_nudgeless`.
-            let revision = revisions.get(host).copied().unwrap_or(0);
+        }
+        if changed {
+            let revision = self.allocate_cache_revision();
+            revisions.insert(host.clone(), revision);
+            // A no-op mutation owes the editor nothing. Stamp only a real
+            // change, atomically with the revision carrying the new data.
             self.pull_view_lag_pending
                 .lock()
                 .recover_poison("DiagnosticAggregator::pull_view_lag_pending")
