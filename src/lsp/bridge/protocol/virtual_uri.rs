@@ -886,6 +886,12 @@ mod tests {
         "file:///project/kakehashi-virtual-uri-region%2Fsubregion.lua",
         true
     )]
+    // Region ids are dot-free, so the first dot starts the extension
+    #[case::dotted_extension_ending_in_dot("file:///project/kakehashi-virtual-uri-R.foo.", true)]
+    #[case::empty_region_before_dotted_extension(
+        "file:///project/kakehashi-virtual-uri-.foo.bar",
+        false
+    )]
     // Rejects real URIs and malformed input
     #[case::real_lua_file("file:///home/user/project/main.lua", false)]
     #[case::real_py_file("file:///C:/Users/dev/code.py", false)]
