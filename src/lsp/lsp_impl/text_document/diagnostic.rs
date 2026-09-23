@@ -615,7 +615,8 @@ impl Kakehashi {
         });
 
         // Host `pushFallback` gate: the host layer participates AND pushFallback
-        // is on for the host's diagnostic method.
+        // is on for the host's diagnostic method. Then the same `priorities`
+        // allowlist as the region fold above, over the host servers (#916).
         let host_push_enabled = host_layer_participates
             && settings
                 .resolve_host_language_settings(language_name)
@@ -624,6 +625,16 @@ impl Kakehashi {
                         .push_fallback
                 })
                 .unwrap_or(false);
+        let host_admitted = if host_push_enabled {
+            crate::lsp::lsp_impl::bridge_context::admitted_host_push_servers(
+                &self.bridge,
+                &settings,
+                language_name,
+                "textDocument/diagnostic",
+            )
+        } else {
+            std::collections::HashSet::new()
+        };
 
         let include = |source: &DiagnosticSource, server: &str| {
             // Pull-driven servers are excluded unconditionally: their native
@@ -642,7 +653,7 @@ impl Kakehashi {
                 // has its offset, i.e. its `pushFallback` is on — so the gate is
                 // already applied; nothing more to check beyond `pull_driven`.
                 DiagnosticSource::Region(_) => true,
-                DiagnosticSource::Host => host_push_enabled,
+                DiagnosticSource::Host => host_admitted.contains(server),
                 DiagnosticSource::PullLayer => false,
             }
         };

@@ -745,9 +745,10 @@ impl DiagnosticPublisher {
     }
 
     /// Remove `Host` push slots from `snapshot` whose server is no longer a
-    /// configured `_self` host server for `host`'s current language, so stale host
-    /// diagnostics are filtered out of the publish after a config change. Operates
-    /// on the snapshot clone only; the cache is untouched.
+    /// configured `_self` host server for `host`'s current language, or is one
+    /// its `textDocument/publishDiagnostics` `priorities` allowlist omits (#916),
+    /// so stale host diagnostics are filtered out of the publish after a config
+    /// change. Operates on the snapshot clone only; the cache is untouched.
     fn filter_stale_host_slots(
         &self,
         host: &Url,
@@ -765,20 +766,21 @@ impl DiagnosticPublisher {
             return;
         };
         let settings = self.settings_manager.load_settings();
-        let configs = self
-            .bridge
-            .get_host_configs_for_language(&settings, &language_name);
-        if configs.is_empty() {
-            // No host servers for this language (or `_self` disabled) — every host
-            // slot is stale. Drop the whole source without scanning the slots.
+        let admitted = crate::lsp::lsp_impl::bridge_context::admitted_host_push_servers(
+            &self.bridge,
+            &settings,
+            &language_name,
+            "textDocument/publishDiagnostics",
+        );
+        if admitted.is_empty() {
+            // No admitted host server for this language (`_self` disabled, none
+            // configured, or `priorities` admits none) — every host slot is
+            // stale. Drop the whole source without scanning the slots.
             entry.remove();
             return;
         }
         let slots = entry.get_mut();
-        // A language has only a handful of host servers (usually 1–2), so a linear
-        // scan over `configs` is cheaper than allocating a lookup set on every
-        // republish (no `server_name` clones either).
-        slots.retain(|server, _| configs.iter().any(|c| &c.server_name == server));
+        slots.retain(|server, _| admitted.contains(server));
         if slots.is_empty() {
             entry.remove();
         }

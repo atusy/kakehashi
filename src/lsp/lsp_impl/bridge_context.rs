@@ -624,6 +624,31 @@ impl<'a> RegionPushAllowlist<'a> {
     }
 }
 
+/// The `_self` host servers whose **pushed** diagnostics `host_language`
+/// admits under `method`'s host-layer `priorities` allowlist — the host-layer
+/// sibling of [`RegionPushAllowlist`] (#916). Empty when `_self` is off or has
+/// no configured server for the language.
+pub(crate) fn admitted_host_push_servers(
+    bridge: &crate::lsp::bridge::BridgeCoordinator,
+    settings: &WorkspaceSettings,
+    host_language: &str,
+    method: &str,
+) -> std::collections::HashSet<String> {
+    let configs = bridge.get_host_configs_for_language(settings, host_language);
+    if configs.is_empty() {
+        return std::collections::HashSet::new();
+    }
+    settings
+        .resolve_host_language_settings(host_language)
+        .map(|lang| {
+            crate::lsp::aggregation::server::admitted_server_names(
+                &lang.resolve_host_aggregation(method).priorities,
+                &configs,
+            )
+        })
+        .unwrap_or_default()
+}
+
 /// Find every (host_language, injection_language) pair whose configured
 /// aggregation for `textDocument/formatting` is the **misconfigured**
 /// `Concatenated`-without-explicit-`priorities` combination.
