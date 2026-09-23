@@ -3,6 +3,8 @@ use kakehashi::install::{default_data_dir, metadata, parser, queries};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+mod output_security;
+
 /// A Language Server Protocol (LSP) server using Tree-sitter for parsing
 #[derive(Parser)]
 #[command(name = "kakehashi")]
@@ -1352,9 +1354,13 @@ fn write_forced_output_with(
     #[cfg(not(unix))]
     let staging_permissions = metadata.as_ref().map(|m| m.permissions.clone());
     let mut temp = output_temporary_file(path, staging_permissions.as_ref())?;
+    if let Some(metadata) = &metadata {
+        check_output_security(temp.as_file(), metadata)?;
+    }
     write(temp.as_file_mut())?;
     if let Some(metadata) = &metadata {
         restore_forced_output_metadata(temp.as_file(), metadata)?;
+        check_output_security(temp.as_file(), metadata)?;
     }
     temp.as_file().sync_all()?;
 
@@ -1364,7 +1370,7 @@ fn write_forced_output_with(
     // cannot redirect the write into a symlink target (#800).
     if forced_output_metadata(path)? != metadata {
         return Err(std::io::Error::other(
-            "output permissions or ownership changed while preparing replacement; retry",
+            "output permissions, ownership or ACLs changed while preparing replacement; retry",
         ));
     }
     temp.persist(path).map_err(|e| e.error)?;
@@ -1375,10 +1381,24 @@ fn write_forced_output_with(
 #[derive(PartialEq, Eq)]
 struct ForcedOutputMetadata {
     permissions: std::fs::Permissions,
+    security: Vec<u8>,
     #[cfg(unix)]
     uid: u32,
     #[cfg(unix)]
     gid: u32,
+}
+
+fn check_output_security(
+    file: &std::fs::File,
+    metadata: &ForcedOutputMetadata,
+) -> std::io::Result<()> {
+    if output_security::from_file(file)? != metadata.security {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "cannot retain output ACLs in atomic replacement; use a new output path",
+        ));
+    }
+    Ok(())
 }
 
 fn restore_forced_output_metadata(
@@ -1443,6 +1463,7 @@ fn forced_output_metadata(path: &std::path::Path) -> std::io::Result<Option<Forc
     use std::os::unix::fs::MetadataExt as _;
     Ok(Some(ForcedOutputMetadata {
         permissions,
+        security: output_security::from_path(path)?,
         #[cfg(unix)]
         uid: metadata.uid(),
         #[cfg(unix)]
@@ -2153,6 +2174,213 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(sibling).unwrap(),
+            "previous configuration"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn forced_output_preserves_macos_access_control_list() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("config.toml");
+        std::fs::write(&output, "previous configuration").unwrap();
+        let status = std::process::Command::new("/bin/chmod")
+            .args(["+a", "everyone deny read"])
+            .arg(&output)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let acl_lines = |path: &std::path::Path| {
+            let output = std::process::Command::new("/bin/ls")
+                .arg("-le")
+                .arg(path)
+                .env("LC_ALL", "C")
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .filter(|line| line.trim_start().starts_with("0:"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let previous_acl = acl_lines(&output);
+        assert!(!previous_acl.is_empty());
+
+        let error = write_forced_output(&output, "replacement").unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(acl_lines(&output), previous_acl);
+        let status = std::process::Command::new("/bin/chmod")
+            .arg("-N")
+            .arg(&output)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            "previous configuration"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn forced_output_refuses_acl_added_during_staging() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("config.toml");
+        std::fs::write(&output, "previous configuration").unwrap();
+        let error = write_forced_output_with(&output, |_| {
+            let status = std::process::Command::new("/bin/chmod")
+                .args(["+a", "everyone deny write"])
+                .arg(&output)
+                .status()?;
+            assert!(status.success());
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("changed"));
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            "previous configuration"
+        );
+        assert!(!output_security::from_path(&output).unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn forced_output_checks_inherited_acl_before_writing() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("config.toml");
+        std::fs::write(&output, "previous configuration").unwrap();
+        // Existing output predates this inheritable grant. A 0600 staging file
+        // would still grant this principal access through its inherited ACL.
+        let status = std::process::Command::new("/bin/chmod")
+            .args(["+a", "everyone allow read,file_inherit"])
+            .arg(temp.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let error = write_forced_output_with(&output, |_| {
+            panic!("must reject inherited ACL before writing secret content")
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            "previous configuration"
+        );
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn add_linux_access_acl(path: &std::path::Path) {
+        // Linux POSIX ACL xattr ABI: version 2, then tag/permissions/id entries.
+        let mut bytes = 2u32.to_le_bytes().to_vec();
+        for (tag, permissions, id) in [
+            (1u16, 6u16, u32::MAX), // owner: rw
+            (2, 4, 12345),          // named user: r
+            (4, 0, u32::MAX),       // group: none
+            (16, 4, u32::MAX),      // mask: r
+            (32, 0, u32::MAX),      // other: none
+        ] {
+            bytes.extend(tag.to_le_bytes());
+            bytes.extend(permissions.to_le_bytes());
+            bytes.extend(id.to_le_bytes());
+        }
+        xattr::set(path, "system.posix_acl_access", &bytes).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn forced_output_preserves_linux_acl_and_original_content() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("config.toml");
+        std::fs::write(&output, "previous configuration").unwrap();
+        add_linux_access_acl(&output);
+        let security = output_security::from_path(&output).unwrap();
+        let error = write_forced_output_with(&output, |_| {
+            panic!("must reject incompatible ACL before writing")
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(output_security::from_path(&output).unwrap(), security);
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            "previous configuration"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn forced_output_refuses_linux_acl_added_during_staging() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("config.toml");
+        std::fs::write(&output, "previous configuration").unwrap();
+        // Keep mode stable so this exercises ACL-only revalidation.
+        std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let error = write_forced_output_with(&output, |_| {
+            add_linux_access_acl(&output);
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("changed"));
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            "previous configuration"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn forced_output_preserves_windows_dacl_and_original_content() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("config.toml");
+        std::fs::write(&output, "previous configuration").unwrap();
+        let status = std::process::Command::new("icacls")
+            .arg(&output)
+            .args(["/deny", "*S-1-1-0:(R)"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let security = output_security::from_path(&output).unwrap();
+        let error = write_forced_output_with(&output, |_| {
+            panic!("must reject incompatible DACL before writing")
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(output_security::from_path(&output).unwrap(), security);
+        let status = std::process::Command::new("icacls")
+            .arg(&output)
+            .args(["/remove:d", "*S-1-1-0"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            "previous configuration"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn forced_output_refuses_windows_acl_added_during_staging() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("config.toml");
+        std::fs::write(&output, "previous configuration").unwrap();
+        let error = write_forced_output_with(&output, |_| {
+            let status = std::process::Command::new("icacls")
+                .arg(&output)
+                .args(["/grant", "*S-1-1-0:(R)"])
+                .status()?;
+            assert!(status.success());
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("changed"));
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
             "previous configuration"
         );
     }

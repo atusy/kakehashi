@@ -121,6 +121,12 @@ futures = "0.3.31"
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["signal", "process", "fs"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+xattr = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Authorization"] }
+
 [features]
 e2e = []
 
