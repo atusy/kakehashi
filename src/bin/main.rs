@@ -1209,9 +1209,9 @@ fn safe_query_entry_name(path: &Path) -> Option<String> {
 /// still prevent replacement.
 ///
 /// The entry is inspected only to word the message — the refusal itself was
-/// already decided atomically by `create_new`, so a path that changes between
-/// the two costs at worst a misleading sentence, never a wrong action. A
-/// failed inspection falls back to the plain advice for the same reason.
+/// already decided atomically by `persist_noclobber`, so a path that changes
+/// between the two costs at worst a misleading sentence, never a wrong action.
+/// A failed inspection falls back to the plain advice for the same reason.
 fn overwrite_advice(path: &Path) -> &'static str {
     let Ok(metadata) = path.symlink_metadata() else {
         return "Use --force to overwrite.";
