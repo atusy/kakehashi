@@ -225,7 +225,7 @@ The following are **deferred** and intentionally out of scope:
   that moves the selected configuration root. The last is a decision, not a
   protocol requirement. Even unscoped, the answer may depend on the open
   workspace — VS Code folds workspace settings into it, while Neovim answers
-  from settings that do not — so an answer read in the old workspace may not
+  from one per-client table — so an answer read in the old workspace may not
   describe the new one, and its relative paths anchor to whichever root is in
   effect when it is applied. It asks only once the reload has put the new
   root in effect, so the answer anchors to it. A folder change that keeps the
@@ -235,10 +235,9 @@ The following are **deferred** and intentionally out of scope:
   so the reload's reparse of open documents and semantic-token refresh
   happen a second time, and one more layer is retained for later replays.
   Accepted, because a root change is rare next to an edit. The answer is
-  applied as a configuration layer,
-  identically to a push of the same section (see the accumulate contract in
-  configuration-merging-strategy), so nothing about the merge is special-cased
-  for having been pulled.
+  applied as a configuration layer, identically to a push of the same section
+  (see the accumulate contract in configuration-merging-strategy), so nothing
+  about the merge is special-cased for having been pulled.
 
   One consequence worth stating for anyone writing an editor integration: a
   field the client answers with an empty container **clears** the layer below,
