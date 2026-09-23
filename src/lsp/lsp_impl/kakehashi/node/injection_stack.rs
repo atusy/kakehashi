@@ -8,12 +8,11 @@
 //! Trees within each layer are parsed against the **full host text** with
 //! tree-sitter's `set_included_ranges`, which means every node's
 //! `start_byte` / `end_byte` is already in original-document coordinates.
-//! That property is load-bearing: the entry-point handler issues ULIDs via
-//! `NodeTracker::get_or_create_in_layer(uri, start_byte, end_byte, kind, layer)`,
-//! and the tracker keys must stay in the host's byte space so subsequent
-//! `parent` / `children` / `text` calls and `didChange` adjustments line
-//! up across layers. The `layer` index distinguishes a host node from an
-//! injected node sharing the same span and kind (lazy-node-identity-tracking).
+//! NodeTracker coordinates must stay in the host's byte space so navigation
+//! and didChange adjustments agree across layers. The stack index selects a
+//! layer for a cursor request; mint_tree_batch records that layer's full tree
+//! scope and assigns its identity token. Overlapping siblings at one depth
+//! therefore remain distinguishable during later node resolution.
 
 use crate::analysis::offset_calculator::{ByteRange, calculate_effective_range};
 use crate::language::LanguageCoordinator;
