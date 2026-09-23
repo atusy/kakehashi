@@ -17,7 +17,24 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+      - name: Prepare fs-verity fixture
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fsverity
+          mkdir -p "$RUNNER_TEMP/kakehashi-verity"
+          truncate -s 64M "$RUNNER_TEMP/kakehashi-verity.img"
+          mkfs.ext4 -q -O verity "$RUNNER_TEMP/kakehashi-verity.img"
+          sudo mount -o loop "$RUNNER_TEMP/kakehashi-verity.img" "$RUNNER_TEMP/kakehashi-verity"
+          sudo chown "$(id -u):$(id -g)" "$RUNNER_TEMP/kakehashi-verity"
+          echo "KAKEHASHI_TEST_VERITY_ROOT=$RUNNER_TEMP/kakehashi-verity" >> "$GITHUB_ENV"
       - run: cargo test --bin kakehashi
+      - name: Unmount fs-verity fixture
+        if: always() && runner.os == 'Linux'
+        run: |
+          if mountpoint -q "$RUNNER_TEMP/kakehashi-verity"; then
+            sudo umount "$RUNNER_TEMP/kakehashi-verity"
+          fi
 
   check:
     name: Check

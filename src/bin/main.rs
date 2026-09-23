@@ -2352,6 +2352,63 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn forced_output_accepts_write_only_files() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("config.toml");
+        std::fs::write(&output, "previous").unwrap();
+        std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o200)).unwrap();
+        write_forced_output(&output, "replacement").unwrap();
+        assert_eq!(
+            output.metadata().unwrap().permissions().mode() & 0o777,
+            0o200
+        );
+        std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), "replacement");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn forced_output_preserves_linux_fs_verity() {
+        let Some(root) = std::env::var_os("KAKEHASHI_TEST_VERITY_ROOT") else {
+            eprintln!(
+                "fs-verity fixture needs KAKEHASHI_TEST_VERITY_ROOT (provided by Linux CLI CI)"
+            );
+            return;
+        };
+        let temp = tempfile::TempDir::new_in(root).unwrap();
+        let output = temp.path().join("config.toml");
+        std::fs::write(&output, "previous configuration").unwrap();
+        assert!(
+            std::process::Command::new("fsverity")
+                .arg("enable")
+                .arg(&output)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let error = write_forced_output_with(&output, |_| {
+            panic!("must refuse integrity-protected output before staging content")
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            "previous configuration"
+        );
+        assert!(
+            std::process::Command::new("fsverity")
+                .arg("measure")
+                .arg(&output)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn forced_output_preserves_linux_acl_and_original_content() {
         let temp = tempfile::TempDir::new().unwrap();
         let output = temp.path().join("config.toml");
