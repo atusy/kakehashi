@@ -97,6 +97,11 @@ Partially implemented:
   non-contiguous combined injections fail soft before dispatch because a lazy
   edit could otherwise cross a masked host-only gap. Safe resolves apply the
   same all-or-nothing edit guard as initial hint retrieval.
+  `codeAction/resolve` also records the exact producing connection key and
+  generation on both layers. A legacy unstamped action or an unavailable
+  producer returns unresolved without acquiring a replacement. Client-driven
+  and eager resolves recheck the producer generation before enqueue and after
+  the reply; the host enqueue check shares the synchronization lock protocol.
   `codeAction/resolve` carries and checks the same revision stamp before
   dispatch and after the reply, and the incarnation after the reply as well.
   `completionItem/resolve` binds both layers to the producing connection key

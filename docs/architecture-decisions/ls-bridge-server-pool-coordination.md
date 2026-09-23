@@ -53,26 +53,21 @@ The `ConnectionKey` is stored on each connection handle, so the request,
 no `textDocument`, so the originating host URI is stashed in their routing
 envelopes (`KakehashiEnvelope` / `CodeActionEnvelope` / `CodeLensEnvelope` /
 `DocumentLinkEnvelope` / `InlayHintEnvelope` / `CallHierarchyEnvelope`)
-and used to re-resolve the same `(server, root)` connection that produced the
-item. (A legacy **completion** envelope without that field falls back to
-the client-root connection — the pre-#382 rule, and still the shipped
-behavior today, via the field's serde default; the code-action, code-lens,
-document-link, inlay-hint, and call-hierarchy envelopes *require* the field. A
-stamp-less resolve item fails to deserialize and is returned unresolved;
-stamp-less call-hierarchy expansion returns `null` because no producer can expand it. The fail-soft rule
-below is target state that lands with bridge-routing-protocol's
-implementation.) Amended with
-bridge-routing-protocol:
-this re-resolution — like every site that derives a connection from the host
-URI — consults the active route binding first, matched by the envelope's
-stamp of the decided document's URI (virtual for virt items) and its
-open incarnation; a missing, evicted, or mismatched **binding stamp**
-fails soft under that target-state rule (distinct from the *legacy
-envelope* above — an envelope missing the host-URI field entirely,
-whose shipped client-root fallback predates bindings altogether) rather
-than falling back to marker or
-client-root resolution, which under a root override would reach the
-config-root process instead of the one that produced the item.
+for document lifetime and coordinate checks. These envelopes also retain the
+producing `ConnectionKey` and connection generation. Resolve and hierarchy
+expansion look up that exact live producer, checking its generation under
+the connections lock, rather than acquiring a new connection from the host
+URI. Missing producer stamps or a retired producer fail soft: resolve returns
+the original item unresolved, and call-hierarchy expansion returns `null`.
+A legacy completion envelope may deserialize with an empty host URI, but it
+no longer falls back to the client-root connection.
+
+Amended with bridge-routing-protocol: its target-state binding stamps add
+another freshness check, matched by the decided document's URI (virtual for
+virt items) and open incarnation. A missing, evicted, or mismatched binding
+stamp fails soft rather than falling back to marker or client-root routing.
+The existing producer identity check remains necessary: a route binding
+cannot make process-owned opaque data usable by a replacement process.
 
 **Shared-instance opt-in** (#391): a per-server `preferSharedInstance` boolean
 (default `false`) routes a server's documents to one shared connection

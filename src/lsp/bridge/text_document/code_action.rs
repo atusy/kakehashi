@@ -522,8 +522,13 @@ impl LanguageServerPool {
         // envelope, so resolve those actions downstream now (bounded: only the
         // lazy ones). Failures fall through to the phase-3 REASON_RESOLVE path.
         if !upstream_caps.can_envelope() {
-            self.eager_resolve_lazy_actions(&handle, &mut actions, upstream_request_id)
-                .await;
+            self.eager_resolve_lazy_actions(
+                &handle,
+                &mut actions,
+                upstream_request_id,
+                connection_generation,
+            )
+            .await;
         }
 
         // Phase 3: apply the bridge policy (coordinate translation, title
@@ -578,6 +583,7 @@ impl LanguageServerPool {
         handle: &Arc<ConnectionHandle>,
         actions: &mut [CodeActionOrCommand],
         upstream_id: Option<UpstreamId>,
+        connection_generation: u64,
     ) {
         if !handle.has_capability("codeAction/resolve") {
             return;
@@ -618,8 +624,14 @@ impl LanguageServerPool {
                 async move {
                     (
                         idx,
-                        self.send_code_action_resolve_on_handle(handle, action, upstream_id, None)
-                            .await,
+                        self.send_code_action_resolve_on_handle(
+                            handle,
+                            action,
+                            upstream_id,
+                            None,
+                            connection_generation,
+                        )
+                        .await,
                     )
                 }
             }))
@@ -724,6 +736,22 @@ impl LanguageServerPool {
         .await
     }
 
+    async fn code_action_producer(
+        &self,
+        envelope: &CodeActionEnvelope,
+        config: &BridgeServerConfig,
+    ) -> Option<(Arc<ConnectionHandle>, u64)> {
+        let key = envelope
+            .connection_key
+            .as_ref()
+            .filter(|key| key.server() == envelope.origin)?;
+        let generation = envelope.connection_generation?;
+        let handle = self
+            .ready_producer_by_key(key, Some(config), generation)
+            .await?;
+        Some((handle, generation))
+    }
+
     /// Route a HOST-layer `codeAction/resolve` back to its host server VERBATIM:
     /// the action is already in host coordinates, so nothing is translated. Same
     /// policy as [`Self::send_code_action_resolve_request`] (restore title →
@@ -741,13 +769,7 @@ impl LanguageServerPool {
         read_host: HostResolveReader<'_>,
     ) -> CodeAction {
         let server_name = &envelope.origin;
-        // `host_uri` comes from client-supplied `data` (the resolve params echo
-        // the action's envelope), so a malformed value must fail soft, NOT fall
-        // through to `get_or_create_connection(.., None)` — a `None` document
-        // hint routes to a rootless client-fallback / shared key that could run
-        // the resolve against the wrong workspace. The bridge only ever mints a
-        // valid `Url::as_str()` here, so a parse failure means a corrupt/foreign
-        // envelope.
+        // Validate the echoed host URI before any document synchronization.
         let Ok(host_url) = Url::parse(&envelope.host_uri) else {
             warn!(
                 target: "kakehashi::bridge",
@@ -764,24 +786,16 @@ impl LanguageServerPool {
             re_envelope_action(&mut action, &envelope);
             return action;
         }
-        let handle = match self
-            .get_or_create_connection(server_name, server_config, Some(&host_url))
-            .await
-        {
-            Ok(h) => h,
-            Err(e) => {
-                warn!(
-                    target: "kakehashi::bridge",
-                    "codeAction/resolve (host): failed to connect to {server_name}: {e}"
-                );
-                re_envelope_action(&mut action, &envelope);
-                return action;
-            }
+        let Some((handle, generation)) = self.code_action_producer(&envelope, server_config).await
+        else {
+            warn!(target: "kakehashi::bridge", "codeAction/resolve: producing connection for {server_name:?} is unavailable; returning unresolved");
+            re_envelope_action(&mut action, &envelope);
+            return action;
         };
         if !handle.has_capability("codeAction/resolve") {
             // Anomalous: the envelope was only minted because the origin
-            // advertised resolve, so reaching here means a respawn changed
-            // capabilities under the action. (Unlike the other resolve kinds,
+            // advertised resolve, so reaching here means the producing
+            // connection no longer offers it. (Unlike the other resolve kinds,
             // `has_capability` reads no `textDocument/codeAction`
             // registration-options `resolveProvider`, so a standard dynamic
             // unregister cannot flip it.)
@@ -810,11 +824,10 @@ impl LanguageServerPool {
                     uri: &host_url,
                     incarnation: envelope.incarnation,
                     content_version: envelope.content_version,
-                    // CodeAction envelopes do not carry a producer generation;
-                    // preserve their existing current-connection routing policy.
-                    connection_generation: None,
+                    connection_generation: Some(generation),
                     read: read_host,
                 }),
+                generation,
             )
             .await
         else {
@@ -839,7 +852,7 @@ impl LanguageServerPool {
         )
     }
 
-    /// Reconnect to the origin `(server, root)`, restore the original title,
+    /// Find the stamped producer, restore the original title,
     /// translate coordinates back to virtual, forward `codeAction/resolve`,
     /// then translate the resolved edit/diagnostics host-ward, re-suffix, and
     /// re-envelope. Every failure path returns the action unresolved.
@@ -853,10 +866,7 @@ impl LanguageServerPool {
         region_end: Position,
     ) -> CodeAction {
         let server_name = &envelope.origin;
-        // Client-supplied `host_uri` (see the host path): a malformed value must
-        // fail soft, not connect with a `None` document hint that routes to a
-        // rootless client-fallback / shared key. The bridge only mints valid
-        // URLs here, so a parse failure means a corrupt/foreign envelope.
+        // Validate the echoed host URI before coordinate translation.
         let Ok(host_url) = Url::parse(&envelope.host_uri) else {
             warn!(
                 target: "kakehashi::bridge",
@@ -873,30 +883,16 @@ impl LanguageServerPool {
             re_envelope_action(&mut action, &envelope);
             return action;
         }
-        let handle = match self
-            .get_or_create_virtual_connection(
-                server_name,
-                server_config,
-                &host_url,
-                &envelope.injection_language,
-                &envelope.region_id,
-            )
-            .await
-        {
-            Ok(h) => h,
-            Err(e) => {
-                warn!(
-                    target: "kakehashi::bridge",
-                    "codeAction/resolve: failed to connect to {server_name}: {e}"
-                );
-                re_envelope_action(&mut action, &envelope);
-                return action;
-            }
+        let Some((handle, generation)) = self.code_action_producer(&envelope, server_config).await
+        else {
+            warn!(target: "kakehashi::bridge", "codeAction/resolve: producing connection for {server_name:?} is unavailable; returning unresolved");
+            re_envelope_action(&mut action, &envelope);
+            return action;
         };
         if !handle.has_capability("codeAction/resolve") {
             // Anomalous: the envelope was only minted because the origin
-            // advertised resolve, so reaching here means a respawn changed
-            // capabilities under the action. (Unlike the other resolve kinds,
+            // advertised resolve, so reaching here means the producing
+            // connection no longer offers it. (Unlike the other resolve kinds,
             // `has_capability` reads no `textDocument/codeAction`
             // registration-options `resolveProvider`, so a standard dynamic
             // unregister cannot flip it.)
@@ -921,7 +917,7 @@ impl LanguageServerPool {
         translate_action_ranges_host_to_virtual(&mut outgoing, &offset);
 
         let Some(resolved) = self
-            .send_code_action_resolve_on_handle(&handle, outgoing, upstream_id, None)
+            .send_code_action_resolve_on_handle(&handle, outgoing, upstream_id, None, generation)
             .await
         else {
             // Per-selection warn (bounded: one per user-selected action) — the
@@ -1097,6 +1093,7 @@ impl LanguageServerPool {
         action: CodeAction,
         upstream_id: Option<UpstreamId>,
         host_context: Option<HostResolveContext<'_>>,
+        expected_generation: u64,
     ) -> Option<CodeAction> {
         let connection_key = handle.key();
         if let Some(ref id) = upstream_id {
@@ -1142,9 +1139,11 @@ impl LanguageServerPool {
             }
         } else {
             let connections = self.connections().await;
-            if !connections.get(connection_key).is_some_and(|current| {
-                Arc::ptr_eq(current, handle) && current.state() == ConnectionState::Ready
-            }) {
+            if self.document_connection_generation(connection_key) != expected_generation
+                || !connections.get(connection_key).is_some_and(|current| {
+                    Arc::ptr_eq(current, handle) && current.state() == ConnectionState::Ready
+                })
+            {
                 drop(connections);
                 warn!(
                     target: "kakehashi::bridge",
@@ -1190,9 +1189,10 @@ impl LanguageServerPool {
         };
         let producer_is_still_live = {
             let connections = self.connections().await;
-            connections.get(connection_key).is_some_and(|current| {
-                Arc::ptr_eq(current, handle) && current.state() == ConnectionState::Ready
-            })
+            self.document_connection_generation(connection_key) == expected_generation
+                && connections.get(connection_key).is_some_and(|current| {
+                    Arc::ptr_eq(current, handle) && current.state() == ConnectionState::Ready
+                })
         };
         if !producer_is_still_live {
             return None;
@@ -1784,6 +1784,7 @@ mod tests {
                     },
                     Some(upstream_id),
                     None,
+                    0,
                 )
                 .await
             })
@@ -1822,6 +1823,79 @@ mod tests {
             request.await.unwrap().is_none(),
             "a response from a no-longer-Ready code-action producer must be discarded"
         );
+    }
+
+    #[cfg(unix)]
+    #[rstest::rstest]
+    #[case::host(true)]
+    #[case::virtual_layer(false)]
+    #[tokio::test]
+    async fn code_action_resolve_never_sends_old_data_to_a_replacement(#[case] host_layer: bool) {
+        use crate::lsp::bridge::test_helpers::{
+            create_handle_advertising_resolve_methods, wait_for_sent_request,
+        };
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("ruff");
+        let old = create_handle_advertising_resolve_methods(key.clone()).await;
+        pool.insert_connection(Arc::clone(&old)).await;
+        let offset = RegionOffset::new(0, 0);
+        let mut action = CodeAction {
+            title: "old".into(),
+            data: Some(json!({"process_local_id": 7})),
+            ..Default::default()
+        };
+        envelope_action_data(
+            &mut action,
+            &CodeActionEnvelopeContext {
+                connection_key: Some(&key),
+                connection_generation: Some(pool.document_connection_generation(&key)),
+                content_version: Some(1),
+                ..envelope_ctx_for_test(&offset)
+            },
+        );
+        let mut envelope = strip_code_action_envelope(&mut action).unwrap();
+        envelope.host_layer = host_layer;
+        if host_layer {
+            envelope.region_id.clear();
+        }
+        re_envelope_action(&mut action, &envelope);
+        assert!(
+            pool.invalidate_connection_after_didclose_failure(&key, &old)
+                .await
+        );
+        let replacement = create_handle_advertising_resolve_methods(key.clone()).await;
+        assert!(replacement.has_capability("codeAction/resolve"));
+        pool.insert_connection(Arc::clone(&replacement)).await;
+        let uri = Url::parse(&envelope.host_uri).unwrap();
+        pool.open_host_incarnation(&uri, 1).await;
+        super::super::test_helpers::open_resolve_host(&pool, &replacement, &uri).await;
+        assert_ne!(
+            envelope.connection_generation,
+            Some(pool.document_connection_generation(&key))
+        );
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "ruff".into(),
+            BridgeServerConfig {
+                cmd: Some(vec!["unused".into()]),
+                ..Default::default()
+            },
+        );
+        let upstream_id = UpstreamId::Number(123);
+        let resolve = pool.dispatch_code_action_resolve(
+            action.clone(),
+            &settings,
+            caps_resolve(),
+            Some(upstream_id.clone()),
+            Position::new(10, 0),
+            &super::super::test_helpers::resolve_host_snapshot,
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::select! {
+                result = resolve => assert_eq!(result, action, "the old action must stay unresolved"),
+                _ = wait_for_sent_request(&replacement, &upstream_id) => panic!("old process data reached its replacement"),
+            }
+        }).await.expect("rejecting a stale producer must finish promptly");
     }
 
     #[tokio::test]
