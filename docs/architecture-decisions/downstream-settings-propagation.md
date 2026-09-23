@@ -229,9 +229,10 @@ The following are **deferred** and intentionally out of scope:
   that keeps the root does not ask, and neither does a reload rejected as
   invalid: that keeps the old root, so an answer would anchor to a workspace
   the editor has left. Asking has a price: an answer that changes the
-  retained layers rebuilds the settings, so the reload's reparse of open
-  documents and semantic-token refresh happen a second time. Accepted,
-  because a root change is rare next to an edit.
+  settings in effect is published again, so the reload's reparse of open
+  documents and semantic-token refresh happen a second time (an answer that
+  rebuilds to the same settings is not republished). Accepted, because a
+  root change is rare next to an edit.
 
   Until that answer arrives, the previous answer stays in effect — it was
   read for the old root, and the reload replays it anchored to the new one.
