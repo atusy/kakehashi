@@ -1136,7 +1136,8 @@ mod tests {
     #[test]
     fn normal_path_encodes_characters_ls_types_rejects() {
         // `PathSegmentsMut::push` left these literal, so `to_lsp_uri` fell back
-        // to the host URI and the region aliased its host document downstream.
+        // to the host URI and the region aliased its host document downstream;
+        // it also dropped tabs and newlines, which could empty the extension.
         // Full strings: the kakehashi: form would also end with the filename.
         for (host, language, expected) in [
             (
@@ -1153,6 +1154,11 @@ mod tests {
                 "git:/p/doc.md",
                 "a\\b",
                 "git:/p/kakehashi-virtual-uri-R.a%5Cb",
+            ),
+            (
+                "file:///doc.md",
+                "\t",
+                "file:///kakehashi-virtual-uri-R.%09",
             ),
         ] {
             let host_uri: Uri = host.parse().unwrap();
