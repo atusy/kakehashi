@@ -1331,18 +1331,23 @@ fn write_forced_output_with(
     let metadata = forced_output_metadata(path)?;
     let mut temp = output_temporary_file(path, metadata.as_ref().map(|m| &m.permissions))?;
     write(temp.as_file_mut())?;
-    if let Some(metadata) = metadata {
-        restore_forced_output_metadata(temp.as_file(), &metadata)?;
+    if let Some(metadata) = &metadata {
+        restore_forced_output_metadata(temp.as_file(), metadata)?;
     }
     temp.as_file().sync_all()?;
 
     // Refuse a link or special entry introduced while preparing the output.
     // Persist replaces the directory entry, so even a later leaf swap cannot
     // redirect the write into a symlink target.
-    forced_output_metadata(path)?;
+    if forced_output_metadata(path)? != metadata {
+        return Err(std::io::Error::other(
+            "output permissions or ownership changed while preparing replacement; retry",
+        ));
+    }
     temp.persist(path).map(|_| ()).map_err(|e| e.error)
 }
 
+#[derive(PartialEq, Eq)]
 struct ForcedOutputMetadata {
     permissions: std::fs::Permissions,
     #[cfg(unix)]
@@ -2156,6 +2161,64 @@ mod tests {
         assert_eq!(replaced.uid(), original.uid());
         assert_eq!(replaced.gid(), group);
         assert_eq!(std::fs::read_to_string(output).unwrap(), "replacement");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forced_output_preserves_private_destination_created_during_staging() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("config.toml");
+
+        let result = write_forced_output_with(&output, |file| {
+            use std::io::Write as _;
+            file.write_all(b"replacement")?;
+            std::fs::write(&output, "concurrent configuration")?;
+            std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o600))
+        });
+
+        assert!(
+            result.is_err(),
+            "newly observed protection metadata must not be ignored"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            "concurrent configuration"
+        );
+        assert_eq!(
+            output.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forced_output_refuses_permissions_changed_during_staging() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("config.toml");
+        std::fs::write(&output, "previous configuration").unwrap();
+        std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let result = write_forced_output_with(&output, |file| {
+            use std::io::Write as _;
+            file.write_all(b"replacement")?;
+            std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o600))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            "previous configuration"
+        );
+        assert_eq!(
+            output.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
     }
 
     #[cfg(unix)]
