@@ -940,8 +940,9 @@ impl LanguageServerPool {
     /// replacement that never registered) retires nothing. A divert racing
     /// this sweep can still land after it; `resolve_acquire` retires such a
     /// straggler at the next acquisition of its root, and a divert the sweep
-    /// retires mid-handshake falls back to the shared instance
-    /// (`get_or_create_connection_wait_ready`).
+    /// retires mid-handshake falls back to the shared instance (both
+    /// `get_or_create_connection_wait_ready` and the fast-fail
+    /// `get_or_create_connection_with_timeout`).
     pub(crate) async fn consolidate_shared_instance(&self, server_name: &str) {
         let shared_key = ConnectionKey::shared(server_name);
         let mut connections = self.connections.lock().await;
@@ -1012,9 +1013,10 @@ impl LanguageServerPool {
         // connection to open on and spend the debt (the respawn's own
         // included) on nothing. Arm only, then claim only if it has already
         // turned Ready — a claim the handshake beat returns `None`. What is
-        // left is the handshake claiming in the instant between our arm and
-        // its flip; the debt then waits for the next spawn under the key, and
-        // the documents move at their next acquisition instead.
+        // left is a handshake that claimed (finding nothing armed) just
+        // before our arm and flips Ready just after our state check; the debt
+        // then waits for the next spawn under the key, and the documents move
+        // at their next acquisition instead.
         self.pending_reopen.arm(&shared_key);
         if shared.state() != ConnectionState::Ready {
             return;
