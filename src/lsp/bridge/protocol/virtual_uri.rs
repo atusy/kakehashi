@@ -60,7 +60,8 @@ struct HostBase {
 }
 
 impl HostBase {
-    /// `None` for a host `url` cannot parse, that has no directory, or whose
+    /// `None` for a host `url` cannot parse, that is cannot-be-a-base (an
+    /// opaque path such as `untitled:x`), or whose
     /// `url` serialization `ls_types::Uri` rejects (`url` decodes some
     /// escapes, e.g. `%7B` in an authority). Deciding here keeps such hosts
     /// on the `kakehashi:` form once per host instead of failing validation
