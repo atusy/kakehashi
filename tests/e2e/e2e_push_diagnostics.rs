@@ -1599,11 +1599,11 @@ fn e2e_downstream_refresh_gated_off_for_refresh_incapable_client() {
 const MIXED_LUA_LINE: i64 = 3;
 /// Host line of the python fence content in [`MD_MIXED_TEXT`].
 const MIXED_PYTHON_LINE: i64 = 7;
-/// [`MD_MIXED_TEXT`] with only the python fence's content edited, so the
-/// python virtual document gets a `didChange` (and the mock re-pushes empty
-/// for it) while the lua region is untouched.
-const MD_MIXED_TEXT_PYTHON_EDITED: &str =
-    "# Test\n\n```lua\nlocal x = 1\n```\n\n```python\nprint('y')\n```\n";
+/// [`MD_MIXED_TEXT`] shifted down one line by a blank first line: no region's
+/// content changes (no downstream re-push), but every cached region
+/// diagnostic re-anchors one line lower, so the host is republished.
+const MD_MIXED_TEXT_SHIFTED: &str =
+    "\n# Test\n\n```lua\nlocal x = 1\n```\n\n```python\nprint('x')\n```\n";
 
 /// Start kakehashi with one push-only `mock-push` serving lua AND python, and
 /// the given `languages.markdown.bridge` table.
@@ -1689,13 +1689,15 @@ fn e2e_publish_priorities_exclude_a_pushing_server_from_the_region_publish() {
             && has_mock_push_on_line(items, MIXED_PYTHON_LINE)
     });
 
-    // Force a publish after both slots are cached: editing the python fence
-    // makes the mock clear its python push.
+    // Force a publish after both slots are cached: shifting every region one
+    // line down re-anchors the cached pushes, so the next publish is computed
+    // from both slots — and must carry python's push (the positive control)
+    // without lua's.
     client.send_notification(
         "textDocument/didChange",
         json!({
             "textDocument": { "uri": MD_URI, "version": 2 },
-            "contentChanges": [{ "text": MD_MIXED_TEXT_PYTHON_EDITED }]
+            "contentChanges": [{ "text": MD_MIXED_TEXT_SHIFTED }]
         }),
     );
     let (_, published) = client
@@ -1706,13 +1708,13 @@ fn e2e_publish_priorities_exclude_a_pushing_server_from_the_region_publish() {
                 params["uri"] == json!(MD_URI)
                     && params["diagnostics"]
                         .as_array()
-                        .is_some_and(|ds| !has_mock_push_on_line(ds, MIXED_PYTHON_LINE))
+                        .is_some_and(|ds| has_mock_push_on_line(ds, MIXED_PYTHON_LINE + 1))
             },
         )
-        .expect("clearing the python push must republish the host");
+        .expect("the re-anchored python push must be published");
     let diagnostics = published["diagnostics"].as_array().unwrap();
     assert!(
-        !has_mock_push_on_line(diagnostics, MIXED_LUA_LINE),
+        !has_mock_push_on_line(diagnostics, MIXED_LUA_LINE + 1),
         "a server outside lua's publishDiagnostics priorities must not publish there: \
          {diagnostics:?}"
     );
