@@ -158,9 +158,11 @@ fn inherited_languages_on_disk(queries_dir: &Path) -> Option<Vec<InheritedLangua
     inherited_languages_in(queries_dir, UnreadableQuery::Undetermined, None)
 }
 
-/// Whether `file` resolves into the managed query tree rooted at the
-/// canonical `managed_root`: through any link, it is then a managed copy,
-/// never a runtime source.
+/// Whether `file` resolves into `managed_root`, the canonical managed
+/// directory of the language being read: through any link, it is then that
+/// language's managed copy, never a runtime source. A link to another
+/// language's managed file is left alone; the loader reads it as this
+/// language's query.
 fn resolves_into(file: &Path, managed_root: Option<&Path>) -> bool {
     managed_root.is_some_and(|root| fs::canonicalize(file).is_ok_and(|file| file.starts_with(root)))
 }
@@ -175,8 +177,9 @@ enum UnreadableQuery {
     Skipped,
 }
 
-/// `managed_root`, the canonical managed query tree, is given when reading a
-/// runtime directory: files resolving into it are skipped as managed copies.
+/// `managed_root`, the language's canonical managed directory, is given when
+/// reading a runtime directory: files resolving into it are skipped as
+/// managed copies.
 fn inherited_languages_in(
     queries_dir: &Path,
     unreadable: UnreadableQuery,
@@ -250,9 +253,7 @@ fn inherited_languages_replacing(
     search_paths: &[PathBuf],
 ) -> Option<Vec<InheritedLanguage>> {
     let mut parents = inherited_languages_on_disk(queries_dir)?;
-    let managed_root = managed
-        .parent()
-        .and_then(|root| fs::canonicalize(root).ok());
+    let managed_root = fs::canonicalize(managed).ok();
     for base in search_paths {
         let directory = base.join("queries").join(language).clean();
         if same_directory(&directory, queries_dir) || same_directory(&directory, managed) {
@@ -312,7 +313,7 @@ fn provided_outside_data_dir(
     search_paths: &[PathBuf],
 ) -> bool {
     let managed = queries_parent.join(language).clean();
-    let managed_root = fs::canonicalize(queries_parent).ok();
+    let managed_root = fs::canonicalize(&managed).ok();
     search_paths.iter().any(|base| {
         let directory = base.join("queries").join(language).clean();
         let highlights = directory.join("highlights.scm");
