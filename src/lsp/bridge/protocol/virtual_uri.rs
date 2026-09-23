@@ -393,8 +393,9 @@ impl VirtualDocumentUri {
         rendered
     }
 
-    /// The `kakehashi:` form for hosts without a [`HostBase`]: every component
-    /// is percent-encoded, keeping the host URI for traceability.
+    /// The `kakehashi:` form, for hosts without a [`HostBase`] or a rejected
+    /// host-relative form: every component is percent-encoded, keeping the
+    /// host URI for traceability.
     fn render_fallback(&self, filename: &EncodedFilename<'_>) -> String {
         let encoded_host = percent_encoding::utf8_percent_encode(
             self.host_uri.as_str(),
