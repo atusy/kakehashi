@@ -129,8 +129,9 @@
 //! - `diagnostics-push-crash-once` — pushes a diagnostic on `didOpen`; the FIRST
 //!   process (per `MOCK_LSP_WIRE_LOG`, via its `.died` marker) exits ~300 ms after
 //!   that push with no client input, and every later process tags its push
-//!   `:replacement`. Used to prove the bridge respawns a crashed server and its
-//!   diagnostics come back without any editor action (#977).
+//!   `:replacement` and leaves a `.replacement` marker. Used to prove the bridge
+//!   respawns a crashed server and its diagnostics come back without any editor
+//!   action — and that it does not when nothing open needs the server (#977).
 //! - `diagnostics-refresh` — sends a `workspace/diagnostic/refresh` server→client
 //!   request on `didOpen`. The bridge forwards it upstream to the editor; used to
 //!   prove that forward is capability-gated (#521).
@@ -239,6 +240,10 @@ fn main() {
     let crash_once_replacement = mode == "diagnostics-push-crash-once"
         && std::env::var("MOCK_LSP_WIRE_LOG")
             .is_ok_and(|path| Path::new(&format!("{path}.died")).exists());
+    // ...and records that it started, so a test can tell no replacement came.
+    if crash_once_replacement && let Ok(path) = std::env::var("MOCK_LSP_WIRE_LOG") {
+        let _ = std::fs::write(format!("{path}.replacement"), b"");
+    }
     // `diagnostics-refresh-prefetch-unchanged`: once ANY unchanged report was
     // answered, the baseline demonstrably exists — a later baseline-less full
     // request means a pull LOST it and is re-fetching.
