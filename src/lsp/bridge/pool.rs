@@ -3094,9 +3094,9 @@ impl LanguageServerPool {
         // Clone the shared handle out under the lock, then probe its capability
         // and folder set without nesting the folder-set lock under `connections`.
         // Also note whether this root still has a per-root connection of its
-        // own: one diverted after consolidation already swept (a divert racing
-        // the registration), or revived by a command's routing token. Probed
-        // under the same guard, so it costs one lookup, not another lock.
+        // own — one diverted after consolidation already swept, a divert that
+        // raced the registration. Probed under the same guard, so it costs one
+        // lookup, not another lock.
         let (shared_handle, per_root_live) = {
             let connections = self.connections.lock().await;
             (
@@ -5751,9 +5751,9 @@ mod tests {
     }
 
     /// A per-root connection that outlived consolidation — a divert that
-    /// raced the registration, or one a command's routing token revived — is
-    /// retired by the next acquisition of its root, before that root's
-    /// documents open on the shared instance beside it (#968).
+    /// raced the registration — is retired by the next acquisition of its
+    /// root, before that root's documents open on the shared instance beside
+    /// it (#968).
     #[tokio::test]
     async fn resolve_acquire_retires_a_straggling_divert_of_a_capable_shared() {
         let (_tmp, doc) = marker_rooted_doc();
