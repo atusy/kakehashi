@@ -351,8 +351,23 @@ fn e2e_late_registration_consolidates_diverted_roots() {
     );
 
     // Bring the shared instance up for root A WITHOUT asking it anything, so
-    // it stays unregistered (the mock registers on its first hover).
+    // it stays unregistered (the mock registers on its first hover). Wait for
+    // A's didOpen before opening B: the two eager opens race, and whichever
+    // lands first spawns the shared instance under its root.
     open(&mut client, &roots.doc_a, "# A\n");
+    let opened_a = format!("textDocument/didOpen\t{}", roots.doc_a);
+    let mut a_is_open = false;
+    for _ in 0..200 {
+        a_is_open = std::fs::read_to_string(&wire_log)
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line == opened_a);
+        if a_is_open {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(a_is_open, "the shared instance must come up under root A");
     open(&mut client, &roots.doc_b, "# B\n");
     // Root B lands on a diverted per-root process: the shared one is Ready
     // and still incapable.
