@@ -981,10 +981,10 @@ impl DocumentTracker {
         .await
     }
 
-    /// Take the host's opened documents that `should_take` selects, removing
-    /// them from `host_to_virtual` and the reverse index in one lock
-    /// acquisition, so a concurrent didOpen cannot interleave between the
-    /// decision and the removal.
+    /// Take the host's opened documents that `should_take` selects. The
+    /// decision and the `host_to_virtual` removal share one lock acquisition,
+    /// so a concurrent registration cannot slip between them; the reverse
+    /// index is cleared right after the lock is released.
     pub(super) async fn take_host_virtual_docs_where(
         &self,
         host_uri: &Url,
