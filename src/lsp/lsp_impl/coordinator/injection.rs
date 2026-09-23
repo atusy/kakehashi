@@ -124,18 +124,19 @@ impl InjectionCoordinator {
     /// Close the virtual documents current settings no longer route to their
     /// server, and take their pushed diagnostics out of the editor (#917).
     ///
-    /// Runs in every injection pass, so a settings publication reaches open
-    /// documents through the reparse it schedules — no edit needed — and a
-    /// re-enabled language is reopened by the same pass's eager open. It sits
-    /// after `cancel_eager_open` for the same reason the replaced-language
-    /// close does: an older pass's eager task must not reopen what this closes.
+    /// Runs in every pass that resolves injections, so a settings publication
+    /// reaches open documents through the reparse it schedules — no edit
+    /// needed — and a re-enabled language is reopened by the same pass's
+    /// eager open. It sits after `cancel_eager_open` for the same reason the
+    /// replaced-language close does: an older pass's eager task must not
+    /// reopen what this closes.
     ///
-    /// The slots are evicted after the tracker removal, so a push racing the
-    /// close can no longer resolve the closed URI and re-record them (unless a
-    /// still-selected server holds the same URI; see #916 for gating pushes by
-    /// selection). The republish is
-    /// detached: this pass holds the document's lifecycle lock, and an editor
-    /// publish must not stall the next pass.
+    /// The slots are evicted after the tracker removal, so a push that
+    /// resolves its URI after the close can no longer re-record them. A push
+    /// that resolved it just before still can, as can one for a URI a
+    /// still-selected server holds; #916 gates pushes by selection. The
+    /// publish is detached: this pass holds the document's lifecycle lock, and
+    /// an editor publish must not stall the next pass.
     async fn retract_deselected_docs(&self, uri: &Url, host_language: &str) {
         let settings = self.settings_manager.load_settings();
         let deselected = self
