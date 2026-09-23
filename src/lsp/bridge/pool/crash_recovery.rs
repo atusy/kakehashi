@@ -44,7 +44,15 @@ const _: () = assert!(MAX_CONSECUTIVE_ATTEMPTS <= 16);
 
 /// How long a connection must have run for its crash to start the backoff
 /// over.
-pub(super) const HEALTHY_PERIOD: Duration = Duration::from_secs(60);
+///
+/// Well above the liveness timeout: a server that hangs on some document is
+/// failed by the liveness timer only after at least that long, so a period at
+/// or below it would count every hang as the end of a healthy run and respawn
+/// such a server forever while the document stays open.
+pub(super) const HEALTHY_PERIOD: Duration = Duration::from_secs(300);
+
+const _: () =
+    assert!(HEALTHY_PERIOD.as_secs() >= 2 * super::liveness_timeout::LivenessTimeout::DEFAULT_SECS);
 
 /// What to do about a connection that just crashed.
 #[derive(Debug, PartialEq, Eq)]
