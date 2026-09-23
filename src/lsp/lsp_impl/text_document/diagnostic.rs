@@ -1012,6 +1012,106 @@ mod tests {
         }
     }
 
+    /// Rust settings with a `_self` host server `rust_ls` whose `priorities`
+    /// under `method` admit only another server.
+    fn rust_host_settings_excluding_under(
+        method: &str,
+    ) -> crate::config::settings::WorkspaceSettings {
+        use crate::config::settings::{
+            AggregationConfig, BridgeLanguageConfig, BridgeServerConfig, HOST_BRIDGE_KEY,
+            LanguageSettings, WorkspaceSettings,
+        };
+        let server = BridgeServerConfig {
+            cmd: Some(vec!["true".to_string()]),
+            languages: Some(vec!["rust".to_string()]),
+            initialization_options: None,
+            workspace_markers: None,
+            on_type_formatting_triggers: None,
+            prefer_shared_instance: None,
+            force_start: None,
+            enabled: None,
+            settings: None,
+        };
+        let self_bridge = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(HashMap::from([(
+                method.to_string(),
+                AggregationConfig {
+                    priorities: Some(vec!["other_ls".to_string()]),
+                    ..Default::default()
+                },
+            )])),
+        };
+        WorkspaceSettings {
+            auto_install: false,
+            language_servers: HashMap::from([("rust_ls".to_string(), server)]),
+            languages: HashMap::from([(
+                "rust".to_string(),
+                LanguageSettings {
+                    bridge: Some(HashMap::from([(HOST_BRIDGE_KEY.to_string(), self_bridge)])),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn host_fold_admits_only_servers_the_pull_priorities_name() {
+        // #916, host layer of the client-pull fold: a push-driven `_self`
+        // server the `textDocument/diagnostic` priorities omit is not folded,
+        // while an exclusion under the publish key leaves the fold alone.
+        for (excluded_under, folded) in [
+            ("textDocument/diagnostic", false),
+            ("textDocument/publishDiagnostics", true),
+        ] {
+            let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+            let server = service.inner();
+            server
+                .settings_manager
+                .apply_settings(rust_host_settings_excluding_under(excluded_under));
+            let uri = Url::parse("file:///test/fold.rs").unwrap();
+            server.documents.insert(
+                uri.clone(),
+                "fn main() {}".to_string(),
+                Some("rust".to_string()),
+                None,
+            );
+            server.diagnostics.record(
+                &uri,
+                DiagnosticSource::Host,
+                "rust_ls".to_string(),
+                Some(crate::lsp::bridge::ProgressConnectionId::for_test(1)),
+                vec![diag("host push")],
+            );
+            let lsp_uri = crate::lsp::lsp_impl::url_to_uri(&uri).unwrap();
+            let ctx = server
+                .resolve_host_bridge_context_for_language(
+                    &lsp_uri,
+                    "textDocument/diagnostic",
+                    "rust",
+                )
+                .expect("the host layer participates");
+
+            let (mut virt, mut host) = (Vec::new(), Vec::new());
+            server
+                .fold_push_fallback_diagnostics(
+                    &uri,
+                    "rust",
+                    Vec::new(),
+                    Some(&ctx),
+                    &mut virt,
+                    &mut host,
+                )
+                .await;
+            assert_eq!(
+                !host.is_empty(),
+                folded,
+                "host push with rust_ls excluded under {excluded_under}: {host:?}"
+            );
+        }
+    }
+
     #[test]
     fn combine_concatenated_merges_in_priority_order() {
         let cfg = layer_cfg(
