@@ -2324,13 +2324,18 @@ impl LanguageServerPool {
         (key, Some(marker))
     }
 
-    /// The connection whose reader exited under `connection_id`, when that exit
-    /// was a crash the pool still holds (#977).
+    /// The connection whose reader exited under `connection_id`, when the pool
+    /// did not initiate that exit and still holds the connection (#977).
     ///
-    /// A reader also exits on a deliberate shutdown, a settings eviction or a
-    /// replacement; none of those leaves the exited handle both mapped and
-    /// `Failed` — shutdown moves it to `Closing`/`Closed`, and eviction or
-    /// replacement unmaps it — so that one check tells a crash from the rest.
+    /// That covers a crash, a framing error, a liveness timeout on a hung
+    /// server, a process that died during its handshake, and a writer wedge
+    /// the pool aborted (`fail_and_abort_writer`, which kills the process but
+    /// leaves the handle mapped) — every exit after which the connection is
+    /// down but still owed. A reader also exits on a deliberate shutdown, a
+    /// settings eviction or a replacement; none of those leaves the exited
+    /// handle both mapped and `Failed` — shutdown moves it to
+    /// `Closing`/`Closed`, and eviction or replacement unmaps it — so that one
+    /// check tells them apart.
     pub(crate) async fn crashed_connection(
         &self,
         connection_id: super::ProgressConnectionId,
