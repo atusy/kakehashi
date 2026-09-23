@@ -2382,9 +2382,17 @@ impl LanguageServerPool {
             .is_some_and(|mapped| mapped.state() == ConnectionState::Failed)
     }
 
-    /// Whether the pool holds any connection under `key`, in any state.
-    pub(crate) async fn holds_connection(&self, key: &ConnectionKey) -> bool {
-        self.connections.lock().await.contains_key(key)
+    /// Whether the connection the pool holds under `key` has lost its reader,
+    /// so that reader's exit reports (or already reported) a crash. `false`
+    /// when nothing is mapped, or when the mapped connection failed with its
+    /// reader still running — a handshake refused or timed out on a live
+    /// process — which reports nothing.
+    pub(crate) async fn reports_crash_for(&self, key: &ConnectionKey) -> bool {
+        self.connections
+            .lock()
+            .await
+            .get(key)
+            .is_some_and(|handle| !handle.router().is_accepting())
     }
 
     /// Respawn the crashed connection under `key`. The replacement's
@@ -11471,5 +11479,19 @@ mod tests {
             io::ErrorKind::Unsupported
         );
         assert!(pool.connections().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn only_a_lost_reader_reports_a_crash() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("crashy");
+        assert!(!pool.reports_crash_for(&key).await, "nothing is mapped");
+
+        // A refused handshake fails the connection while its reader runs on.
+        let (handle, _) = insert_spawned_connection(&pool, &key, ConnectionState::Failed).await;
+        assert!(!pool.reports_crash_for(&key).await);
+
+        handle.router().fail_all("bridge: reader error: EOF");
+        assert!(pool.reports_crash_for(&key).await);
     }
 }

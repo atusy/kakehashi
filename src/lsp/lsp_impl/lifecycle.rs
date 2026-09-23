@@ -2492,7 +2492,7 @@ fn spawn_crash_recovery(
                 // this cannot spin on its own.
                 continue;
             }
-            if error.kind() == std::io::ErrorKind::Interrupted || pool.holds_connection(&key).await
+            if error.kind() == std::io::ErrorKind::Interrupted || pool.reports_crash_for(&key).await
             {
                 // Shutdown, or a process that started and died again: its
                 // reader reports that crash, which schedules the next attempt.
@@ -2501,8 +2501,10 @@ fn spawn_crash_recovery(
                     "Respawning crashed downstream {key} did not complete: {error}"
                 );
             } else {
-                // Not even a process to report a crash (the command failed to
-                // start, or the key is refused): proactive recovery ends here.
+                // No reader exit is coming to schedule another attempt: the
+                // command failed to start, the handshake was refused or timed
+                // out on a process that is still running, or the key is
+                // disabled. Proactive recovery ends here.
                 log::warn!(
                     target: "kakehashi::bridge",
                     "Could not respawn crashed downstream {key}: {error}; the next edit \
