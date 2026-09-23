@@ -188,6 +188,11 @@ pub(crate) struct ConnectionHandle {
     /// beyond the rootUri promise nothing for a server that advertises no
     /// workspaceFolders support).
     spawn_root: OnceLock<Option<String>>,
+    /// The id this connection's reader reports when it exits (it scopes the
+    /// connection's progress tokens and diagnostic slots). Recorded once at
+    /// spawn so an exit notice, which carries only the id, can be matched back
+    /// to the exact handle — a replacement under the same key has a new id.
+    connection_id: OnceLock<crate::lsp::bridge::ProgressConnectionId>,
 }
 
 impl ConnectionHandle {
@@ -276,6 +281,7 @@ impl ConnectionHandle {
             settings,
             launch_config: OnceLock::new(),
             spawn_root: OnceLock::new(),
+            connection_id: OnceLock::new(),
         }
     }
 
@@ -310,6 +316,18 @@ impl ConnectionHandle {
     /// The root this connection's `initialize` was rooted at, when recorded.
     pub(super) fn spawn_root(&self) -> Option<&str> {
         self.spawn_root.get().and_then(|root| root.as_deref())
+    }
+
+    /// Record the id this connection's reader reports on exit. Set once at
+    /// spawn.
+    pub(super) fn record_connection_id(&self, id: crate::lsp::bridge::ProgressConnectionId) {
+        let _ = self.connection_id.set(id);
+    }
+
+    /// The id recorded by [`Self::record_connection_id`]; `None` for handles
+    /// built without a spawn (tests).
+    pub(super) fn connection_id(&self) -> Option<crate::lsp::bridge::ProgressConnectionId> {
+        self.connection_id.get().copied()
     }
 
     pub(super) fn launch_config(&self) -> Option<&crate::config::settings::BridgeServerConfig> {

@@ -14,6 +14,7 @@ mod connection_action;
 mod connection_handle;
 mod connection_key;
 mod connection_state;
+mod crash_recovery;
 mod document_tracker;
 mod dynamic_capability_registry;
 mod execute;
@@ -36,6 +37,8 @@ pub(in crate::lsp::bridge) use connection_handle::REQUEST_TIMEOUT;
 pub(crate) use connection_handle::{ConnectionHandle, NotificationSendResult};
 pub(crate) use connection_key::ConnectionKey;
 pub(crate) use connection_state::ConnectionState;
+use crash_recovery::CrashRecoveryRegistry;
+pub(crate) use crash_recovery::RecoveryDecision;
 pub(in crate::lsp::bridge) use document_tracker::DocumentTracker;
 pub(crate) use document_tracker::{OpenedVirtualDoc, VirtualUriObserver};
 pub(crate) use dynamic_capability_registry::DynamicCapabilityRegistry;
@@ -461,6 +464,8 @@ pub struct LanguageServerPool {
     /// the barrier requests wait on (respawn-reopen-derives-its-targets).
     /// `Arc` because the claim runs inside the spawned handshake task.
     pending_reopen: Arc<PendingReopenRegistry>,
+    /// Backoff state for proactively recovering crashed connections (#977).
+    crash_recovery: CrashRecoveryRegistry,
     /// Last full downstream pull report per exact connection/document. Region
     /// diagnostics stay virtual-local and are re-anchored with the request's
     /// current offset when a server answers `unchanged`.
@@ -610,6 +615,7 @@ impl LanguageServerPool {
             host_routing_pending: DashMap::new(),
             virtual_routing_pending: DashMap::new(),
             pending_reopen: Arc::new(PendingReopenRegistry::default()),
+            crash_recovery: CrashRecoveryRegistry::default(),
             diagnostic_pull_baselines: DashMap::new(),
             diagnostic_document_generations: DashMap::new(),
             diagnostic_pull_generations: DashMap::new(),
@@ -2309,6 +2315,96 @@ impl LanguageServerPool {
         (key, Some(marker))
     }
 
+    /// The connection whose reader exited under `connection_id`, when that exit
+    /// was a crash the pool still holds (#977).
+    ///
+    /// A reader also exits on a deliberate shutdown, a settings eviction or a
+    /// replacement; none of those leaves the exited handle both mapped and
+    /// `Failed` — shutdown moves it to `Closing`/`Closed`, and eviction or
+    /// replacement unmaps it — so that one check tells a crash from the rest.
+    pub(crate) async fn crashed_connection(
+        &self,
+        connection_id: super::ProgressConnectionId,
+    ) -> Option<Arc<ConnectionHandle>> {
+        if self.shutting_down.load(Ordering::Relaxed) {
+            return None;
+        }
+        let connections = self.connections.lock().await;
+        connections
+            .values()
+            .find(|handle| handle.connection_id() == Some(connection_id))
+            .filter(|handle| handle.state() == ConnectionState::Failed)
+            .map(Arc::clone)
+    }
+
+    /// Decide when to recover `key`'s crashed connection (see
+    /// [`CrashRecoveryRegistry::schedule`]).
+    pub(crate) fn schedule_crash_recovery(&self, key: &ConnectionKey) -> RecoveryDecision {
+        self.crash_recovery
+            .schedule(key, tokio::time::Instant::now())
+    }
+
+    /// Start a scheduled recovery of `crashed`: whether it is still the crashed
+    /// connection the pool holds for its key. Anything else — shutdown began,
+    /// settings evicted it, or an edit or request already replaced it — leaves
+    /// nothing for recovery to do.
+    pub(crate) async fn begin_crash_recovery_attempt(
+        &self,
+        crashed: &Arc<ConnectionHandle>,
+    ) -> bool {
+        self.crash_recovery
+            .begin_attempt(crashed.key(), tokio::time::Instant::now());
+        if self.shutting_down.load(Ordering::Relaxed) {
+            return false;
+        }
+        let connections = self.connections.lock().await;
+        connections
+            .get(crashed.key())
+            .is_some_and(|mapped| Arc::ptr_eq(mapped, crashed))
+            && crashed.state() == ConnectionState::Failed
+    }
+
+    /// Respawn `crashed`'s connection under its own key. The replacement's
+    /// handshake claims the re-open its purge armed, so the documents it should
+    /// hold are derived and opened the ordinary way
+    /// (respawn-reopen-derives-its-targets).
+    ///
+    /// Refused for a shared-instance key: the marker roots a dead shared
+    /// instance served died with its folder set, and nothing here can re-root
+    /// it — the next document acquisition revives it with its roots intact.
+    pub(crate) async fn revive_crashed_connection(
+        &self,
+        crashed: &ConnectionHandle,
+        config: &crate::config::settings::BridgeServerConfig,
+        admit: &(dyn Fn() -> bool + Sync),
+    ) -> io::Result<Arc<ConnectionHandle>> {
+        let key = crashed.key();
+        if key.is_shared() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "bridge: shared-instance connection {key} cannot be re-rooted without a document"
+                ),
+            ));
+        }
+        let marker = marker_for_key(key).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("bridge: root of {key} is not a usable workspace URI"),
+            )
+        })?;
+        self.acquire_resolved_wait_ready(
+            key.server(),
+            config,
+            key.clone(),
+            marker,
+            Duration::from_secs(INIT_TIMEOUT_SECS),
+            false,
+            Some(admit),
+        )
+        .await
+    }
+
     /// Resolve the exact `(server, root)` connection a document currently
     /// routes to, including shared-instance capability fallback.
     pub(super) async fn resolved_connection_key(
@@ -3938,6 +4034,7 @@ impl LanguageServerPool {
         ));
 
         let liveness_timeout = liveness_timeout::LivenessTimeout::default();
+        let progress_connection_id = self.progress_registry.new_connection_id();
         let reader_handle = spawn_reader_task_for_server(
             reader,
             Arc::clone(&router),
@@ -3960,7 +4057,7 @@ impl LanguageServerPool {
                 workspace_folders: workspace_folders.clone(),
                 progress_registry: Arc::clone(&self.progress_registry),
                 client_progress_registry: Arc::clone(&self.client_progress_registry),
-                progress_connection_id: self.progress_registry.new_connection_id(),
+                progress_connection_id,
                 settings: Arc::clone(&settings_cell),
             },
         );
@@ -3981,6 +4078,7 @@ impl LanguageServerPool {
             settings_cell,
         ));
         handle.record_launch_config(server_config);
+        handle.record_connection_id(progress_connection_id);
         // The incapable-shared divert's baseline proof: the spawn root always
         // counts as served, whatever the server declared about workspace
         // folders. Initialize-listed folders widen the proof only for servers
@@ -11255,5 +11353,73 @@ mod tests {
             ConnectionState::Closing | ConnectionState::Closed
         ));
         assert_eq!(unchanged.state(), ConnectionState::Ready);
+    }
+
+    /// Seed `key`'s connection as a spawned one: its reader reports exits
+    /// under the returned id.
+    async fn insert_spawned_connection(
+        pool: &LanguageServerPool,
+        key: &ConnectionKey,
+        state: ConnectionState,
+    ) -> (
+        Arc<ConnectionHandle>,
+        crate::lsp::bridge::ProgressConnectionId,
+    ) {
+        let handle = create_handle_with_key(state, key.clone()).await;
+        let id = pool.progress_registry.new_connection_id();
+        handle.record_connection_id(id);
+        pool.insert_connection(Arc::clone(&handle)).await;
+        (handle, id)
+    }
+
+    #[tokio::test]
+    async fn crashed_connection_is_the_mapped_failed_handle_its_reader_reported() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("crashy");
+        let (handle, id) = insert_spawned_connection(&pool, &key, ConnectionState::Ready).await;
+        assert!(
+            pool.crashed_connection(id).await.is_none(),
+            "a live connection has not crashed"
+        );
+
+        handle.set_state(ConnectionState::Failed);
+        let crashed = pool.crashed_connection(id).await;
+        assert!(crashed.is_some_and(|crashed| Arc::ptr_eq(&crashed, &handle)));
+        let other = pool.progress_registry.new_connection_id();
+        assert!(
+            pool.crashed_connection(other).await.is_none(),
+            "an exit reported under another id is not this connection's"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connection_shut_down_on_purpose_is_not_a_crash() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("crashy");
+        let (handle, id) = insert_spawned_connection(&pool, &key, ConnectionState::Ready).await;
+        handle.begin_shutdown();
+        assert!(pool.crashed_connection(id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn crash_recovery_stands_down_once_the_connection_is_replaced() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("crashy");
+        let (crashed, _) = insert_spawned_connection(&pool, &key, ConnectionState::Failed).await;
+        assert!(pool.begin_crash_recovery_attempt(&crashed).await);
+
+        // An edit respawned it before the recovery got there.
+        insert_spawned_connection(&pool, &key, ConnectionState::Ready).await;
+        assert!(!pool.begin_crash_recovery_attempt(&crashed).await);
+    }
+
+    #[tokio::test]
+    async fn crash_recovery_stands_down_during_shutdown() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("crashy");
+        let (crashed, id) = insert_spawned_connection(&pool, &key, ConnectionState::Failed).await;
+        pool.shutting_down.store(true, Ordering::Relaxed);
+        assert!(pool.crashed_connection(id).await.is_none());
+        assert!(!pool.begin_crash_recovery_attempt(&crashed).await);
     }
 }

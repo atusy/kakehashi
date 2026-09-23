@@ -2334,13 +2334,121 @@ async fn deliver_upstream_notification(
             // diagnostic slots it produced and republish the affected hosts so a
             // dead server's diagnostics don't linger until didClose (#469). A
             // `None` publisher (test loop) has no cache to evict.
-            if let Some(publisher) =
-                delivery_context.map(|context| context.diagnostic_publisher.as_ref())
-            {
-                publisher.evict_connection_diagnostics(connection_id).await;
+            if let Some(context) = delivery_context {
+                context
+                    .diagnostic_publisher
+                    .evict_connection_diagnostics(connection_id)
+                    .await;
+                // The eviction cleared what the dead server said; bring it back
+                // so it can say it again (#977).
+                spawn_crash_recovery(context, connection_id);
             }
         }
     }
+}
+
+/// Proactively respawn a downstream connection whose reader just exited, when
+/// that exit was a crash (#977).
+///
+/// Without this, nothing respawned a crashed server until an edit or request
+/// happened to acquire it again, so on a document nobody touched its evicted
+/// diagnostics stayed gone. The respawn is an ordinary acquire by key: its
+/// purge arms a re-open that the replacement's handshake claims, the re-open
+/// derives and opens the documents the connection should hold, and the
+/// server's pushes for them flow back through the usual publish and refresh
+/// paths. A pull-driven server needs nothing more — its pull layer is not
+/// connection-scoped, so the crash evicted none of it.
+///
+/// Detached: the backoff delay and the handshake must not stall the forwarding
+/// loop, which carries every server's diagnostics and progress. The pool's
+/// backoff bounds a server that dies on every start.
+fn spawn_crash_recovery(
+    context: &UpstreamDeliveryContext,
+    connection_id: crate::lsp::bridge::ProgressConnectionId,
+) {
+    use crate::lsp::bridge::RecoveryDecision;
+    let settings_manager = Arc::clone(&context.settings_manager);
+    let injection = context.injection.clone();
+    tokio::spawn(async move {
+        let bridge = Arc::clone(injection.bridge());
+        let pool = bridge.pool();
+        let Some(crashed) = pool.crashed_connection(connection_id).await else {
+            return;
+        };
+        let key = crashed.key().clone();
+        let delay = match pool.schedule_crash_recovery(&key) {
+            RecoveryDecision::Retry { attempt, delay } => {
+                log::info!(
+                    target: "kakehashi::bridge",
+                    "Downstream {key} crashed; respawning in {delay:?} (attempt {attempt})"
+                );
+                delay
+            }
+            RecoveryDecision::AlreadyScheduled | RecoveryDecision::Exhausted => return,
+            RecoveryDecision::GiveUp { attempts } => {
+                log::warn!(
+                    target: "kakehashi::bridge",
+                    "Downstream {key} kept crashing ({attempts} respawns); not respawning it \
+                     again until the next edit or request needs it"
+                );
+                return;
+            }
+        };
+        // Anchored now, so the delay does not stretch by however long this
+        // task waited to be polled.
+        tokio::time::sleep_until(tokio::time::Instant::now() + delay).await;
+        if !pool.begin_crash_recovery_attempt(&crashed).await {
+            return;
+        }
+        let snapshot = settings_manager.load_settings_pair();
+        let settings = &snapshot.settings;
+        let server = key.server();
+        let Some(config) = bridge.respawnable_server_config(settings, server) else {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "Not respawning {key}: settings no longer start {server:?}"
+            );
+            return;
+        };
+        // A server only earns its process back while some open document could
+        // use it. The same cheap configuration screen the re-open sweep runs
+        // first; a document it wrongly rejects is still healed the ordinary
+        // way, by its next edit.
+        let wanted = injection.open_host_uris().iter().any(|host| {
+            injection
+                .screen_language(host)
+                .is_some_and(|(language, _)| {
+                    bridge.host_language_can_reach_server(settings, &language, server)
+                })
+        });
+        if !wanted {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "Not respawning {key}: no open document bridges to {server:?}"
+            );
+            return;
+        }
+        // Stand down if settings change before the spawn commits: the config
+        // in hand would then be history, and spawning from it would start a
+        // server the new settings do not describe.
+        let generation = snapshot.generation;
+        let admit = || settings_manager.settings_generation() == generation;
+        match pool
+            .revive_crashed_connection(&crashed, &config, &admit)
+            .await
+        {
+            Ok(_) => log::info!(
+                target: "kakehashi::bridge",
+                "Respawned crashed downstream {key}"
+            ),
+            // A replacement that dies again reports its own crash, which
+            // schedules the next attempt; nothing to do here.
+            Err(e) => log::debug!(
+                target: "kakehashi::bridge",
+                "Respawning crashed downstream {key} did not complete: {e}"
+            ),
+        }
+    });
 }
 
 /// Cancellable upstream forwarding loop without a Client (for testing).

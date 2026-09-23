@@ -391,6 +391,19 @@ impl BridgeCoordinator {
         Arc::clone(&self.pool)
     }
 
+    /// `server_name`'s resolved config under `settings`, when that server could
+    /// still be started: configured, enabled, with a command. A crashed server
+    /// that settings no longer name — or name but disable — must not be
+    /// brought back by crash recovery (#977).
+    pub(crate) fn respawnable_server_config(
+        &self,
+        settings: &WorkspaceSettings,
+        server_name: &str,
+    ) -> Option<BridgeServerConfig> {
+        resolve_reload_server_config(settings, server_name)
+            .filter(|config| config.is_spawnable_with_wildcard(None))
+    }
+
     /// Apply merged server-config changes to live downstream connections.
     /// Runtime `settings` changes are pushed in place; removed servers and
     /// spawn-time config changes evict and shut down their connections so the
