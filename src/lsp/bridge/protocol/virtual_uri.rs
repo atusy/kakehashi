@@ -53,10 +53,16 @@ struct HostBase {
 }
 
 impl HostBase {
-    /// `None` for a host `url` cannot parse or that has no directory.
+    /// `None` for a host `url` cannot parse, that has no directory, or whose
+    /// `url` serialization `ls_types::Uri` rejects (`url` decodes some
+    /// escapes, e.g. `%7B` in an authority). Deciding here keeps such hosts
+    /// on the `kakehashi:` form once per host instead of failing validation
+    /// on every render.
     fn parse(host: &str) -> Option<Self> {
         let url = url::Url::parse(host).ok()?;
-        if url.cannot_be_a_base() {
+        if url.cannot_be_a_base()
+            || tower_lsp_server::ls_types::Uri::from_str(url.as_str()).is_err()
+        {
             return None;
         }
         let serialized = url.as_str();
@@ -1134,6 +1140,18 @@ mod tests {
     }
 
     #[test]
+    fn host_base_rejects_hosts_url_reserializes_invalidly() {
+        // `url` decodes `%7B` in the authority to `{`, which `ls_types::Uri`
+        // rejects: such a host has no usable host-relative form.
+        let host: Uri = "file://h%7B/p/doc.md".parse().unwrap();
+        assert!(url::Url::parse(host.as_str()).is_ok());
+        assert!(HostBase::parse(host.as_str()).is_none());
+
+        let rendered = VirtualDocumentUri::new(&host, "lua", "R").to_uri_string();
+        assert!(rendered.starts_with("kakehashi:///virtual/"), "{rendered}");
+    }
+
+    #[test]
     fn validated_rendering_prefers_the_kakehashi_form_over_an_invalid_candidate() {
         let host: Uri = "file:///p/doc.md".parse().unwrap();
         let fallback =
@@ -1205,6 +1223,7 @@ mod properties {
         "file:///C:/x/doc.md",
         "file:///a//doc.md",
         "file:///a%2Fb/doc.md",
+        "file://h%7B/p/doc.md",
         "https://u:p@h:8080/p/doc.md?q=1",
         "http://[::1]/p/doc.md",
         "git:/x/doc.md",
@@ -1271,7 +1290,8 @@ mod properties {
             let rendered_url = url::Url::parse(&rendered).unwrap();
             let host_url = url::Url::parse(host.as_str())
                 .ok()
-                .filter(|url| !url.cannot_be_a_base());
+                .filter(|url| !url.cannot_be_a_base())
+                .filter(|url| Uri::from_str(url.as_str()).is_ok());
             match &host_url {
                 // Same scheme, authority and directory, byte for byte.
                 Some(host_url) => {
