@@ -223,10 +223,23 @@ fn inherited_languages_with_search_paths(
     language: &str,
     search_paths: &[PathBuf],
 ) -> Option<Vec<InheritedLanguage>> {
+    inherited_languages_replacing(queries_dir, queries_dir, language, search_paths)
+}
+
+/// [`inherited_languages_with_search_paths`] for `queries_dir` standing in for
+/// the live copy at `managed`, as a staged replacement does. A runtime path
+/// reaching the live copy, directly or through a link, would otherwise feed
+/// the replacement the declarations it is replacing.
+fn inherited_languages_replacing(
+    queries_dir: &Path,
+    managed: &Path,
+    language: &str,
+    search_paths: &[PathBuf],
+) -> Option<Vec<InheritedLanguage>> {
     let mut parents = inherited_languages_on_disk(queries_dir)?;
     for base in search_paths {
         let directory = base.join("queries").join(language).clean();
-        if directory == queries_dir {
+        if same_directory(&directory, queries_dir) || same_directory(&directory, managed) {
             continue;
         }
         for parent in inherited_languages_in(&directory, UnreadableQuery::Skipped)? {
@@ -705,9 +718,12 @@ impl StagedQueryInstall {
             // it with queries that inherit something new — a language this
             // install never discovered, so never locked and never checked. The
             // chain it publishes would then be one nobody is holding still.
-            let Some(parents) =
-                inherited_languages_with_search_paths(&queries_dir, language, &self.search_paths)
-            else {
+            let Some(parents) = inherited_languages_replacing(
+                &queries_dir,
+                &self.queries_parent.join(language),
+                language,
+                &self.search_paths,
+            ) else {
                 return Some(language);
             };
             // Only the requested language is loaded for itself; every other
@@ -1308,8 +1324,13 @@ fn stage_queries_recursive(
     // whole install: propagating the error here drops every staging directory
     // collected so far, so a language is never published without the queries it
     // inherits.
-    let parents = inherited_languages_with_search_paths(&tmp_queries_dir, language, search_paths)
-        .ok_or_else(|| {
+    let parents = inherited_languages_replacing(
+        &tmp_queries_dir,
+        &staged_dir.queries_dir,
+        language,
+        search_paths,
+    )
+    .ok_or_else(|| {
         QueryInstallError::IoError(std::io::Error::other(format!(
             "cannot read query dependencies for '{language}'"
         )))
