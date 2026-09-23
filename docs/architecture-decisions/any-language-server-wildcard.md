@@ -159,7 +159,10 @@ document when its region changes language, not when its server stops being a
 candidate, and a host-filter edit does not touch any server's launch config, so
 nothing recycles the connection either — a `same_launch_config` mismatch would.
 The server keeps receiving `didChange` for those regions, and keeps publishing,
-until the host document closes or the connection restarts.
+until the host document closes or the connection restarts — though what it
+publishes no longer reaches the editor: with no candidates left for the
+language, the push gates (#916) drop its cached pushes from both diagnostic
+surfaces.
 
 Also pre-existing, also amplified for the same reason: with `"*"` there is
 always a server holding the region. Changing the server's own `languages` *does*
