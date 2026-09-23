@@ -56,8 +56,11 @@ envelopes (`KakehashiEnvelope` / `CodeActionEnvelope` / `CodeLensEnvelope` /
 for document lifetime and coordinate checks. These envelopes also retain the
 producing `ConnectionKey` and connection generation. Resolve and hierarchy
 expansion use that key rather than acquiring a new connection from the host
-URI. Before enqueueing, they check the producer handle and generation together
-under the connections lock. Missing producer stamps or a retired producer fail
+URI. Before queuing a request, they check the producer handle and generation
+together under the connections lock. Completion and code-action resolves also
+recheck the producer after receiving a reply: if it retired while the request
+was in flight, they discard the reply and return the item unresolved.
+Missing producer stamps or a retired producer fail
 soft: resolve returns the original item unresolved, and call-hierarchy expansion
 returns `null`.
 A legacy completion envelope may deserialize with an empty host URI, but it
