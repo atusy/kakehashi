@@ -1,7 +1,30 @@
+use nix::sys::statfs::{FsType, NFS_SUPER_MAGIC, SMB_SUPER_MAGIC, fstatfs, statfs};
 use std::io;
 use xattr::FileExt as _;
 
 const ACCESS_ACL: &str = "system.posix_acl_access";
+// Linux UAPI linux/magic.h; nix does not export the CIFS/SMB2 constants.
+const CIFS_SUPER_MAGIC: FsType = FsType(0xff53_4d42u32 as _);
+const SMB2_SUPER_MAGIC: FsType = FsType(0xfe53_4d42u32 as _);
+
+fn check_filesystem(kind: FsType) -> io::Result<()> {
+    // Server/mount/kernel options can hide native ACL queries on these models.
+    // Refuse them even if every xattr probe reports absent or unsupported.
+    if [
+        NFS_SUPER_MAGIC,
+        SMB_SUPER_MAGIC,
+        CIFS_SUPER_MAGIC,
+        SMB2_SUPER_MAGIC,
+    ]
+    .contains(&kind)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cannot verify network filesystem access rules for atomic replacement; use a new output path",
+        ));
+    }
+    Ok(())
+}
 
 fn reject_native_acls(mut get: impl FnMut(&str) -> io::Result<Option<Vec<u8>>>) -> io::Result<()> {
     // Older NFSv4 kernels can report ENODATA for POSIX ACLs even though the
@@ -32,11 +55,13 @@ fn normalize(result: io::Result<Option<Vec<u8>>>) -> io::Result<Vec<u8>> {
 }
 
 pub fn from_path(path: &std::path::Path) -> io::Result<Vec<u8>> {
+    check_filesystem(statfs(path)?.filesystem_type())?;
     // xattr::get inspects the leaf itself, without following symlinks.
     snapshot(|name| xattr::get(path, name))
 }
 
 pub fn from_file(file: &std::fs::File) -> io::Result<Vec<u8>> {
+    check_filesystem(fstatfs(file)?.filesystem_type())?;
     snapshot(|name| file.get_xattr(name))
 }
 
@@ -67,6 +92,23 @@ fn snapshot(mut get: impl FnMut(&str) -> io::Result<Option<Vec<u8>>>) -> io::Res
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn network_acl_models_are_refused_even_without_visible_attributes() {
+        for kind in [
+            super::NFS_SUPER_MAGIC,
+            super::SMB_SUPER_MAGIC,
+            super::CIFS_SUPER_MAGIC,
+            super::SMB2_SUPER_MAGIC,
+        ] {
+            assert_eq!(
+                super::check_filesystem(kind).unwrap_err().kind(),
+                std::io::ErrorKind::Unsupported
+            );
+        }
+        super::check_filesystem(nix::sys::statfs::EXT4_SUPER_MAGIC).unwrap();
+        super::check_filesystem(nix::sys::statfs::TMPFS_MAGIC).unwrap();
+    }
+
     #[test]
     fn mandatory_labels_participate_in_protection_comparison() {
         for label in [
