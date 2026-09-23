@@ -640,6 +640,148 @@ fn full_with_injection_collects_all_layers() {
 }
 
 #[test]
+fn overlapping_injection_ids_preserve_navigation_and_edit_identity() {
+    let dir = context_query_dir();
+    std::fs::write(
+        dir.path().join("queries/markdown/injections.scm"),
+        r#"
+        ((fenced_code_block (code_fence_content) @injection.content)
+          (#set! injection.language "python") (#set! injection.include-children))
+        ((fenced_code_block (code_fence_content) @injection.content)
+          (#set! injection.language "python") (#set! injection.include-children)
+          (#offset! @injection.content 1 0 0 0))
+    "#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("queries/python/context.scm"),
+        "(identifier) @context\n",
+    )
+    .unwrap();
+    let mut client = LspClient::new();
+    initialize(&mut client, dir.path());
+    let uri = "file:///captures_overlapping.md";
+    open_markdown(
+        &mut client,
+        uri,
+        "```python\ndef outer():\n    name = 1\n```\n",
+    );
+    let ids_at = |result: &Value, line: u64| -> Vec<String> {
+        result["matches"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|m| m["language"] == "python")
+            .flat_map(|m| m["captures"].as_array().unwrap())
+            .filter(|c| {
+                c["range"]["start"]["line"].as_u64() == Some(line)
+                    && c["range"]["start"]["character"] == 4
+            })
+            .map(|c| c["node"]["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let captures = full_with_injection(&mut client, uri, "context");
+    let ids = ids_at(&captures, 2);
+    assert_eq!(
+        ids.len(),
+        2,
+        "both overlapping Python trees capture name: {captures}"
+    );
+    assert_ne!(
+        ids[0], ids[1],
+        "same-span nodes from distinct trees need distinct IDs"
+    );
+    let mut roots = Vec::new();
+    let mut function_ancestors = Vec::new();
+    for id in &ids {
+        let mut current = id.clone();
+        let mut has_function = false;
+        for depth in 0..16 {
+            let parent = request(
+                &mut client,
+                "kakehashi/node/parent",
+                json!({ "textDocument": { "uri": uri }, "id": current }),
+            );
+            if parent.is_null() {
+                break;
+            }
+            assert!(
+                depth < 15,
+                "parent traversal must terminate at its injected root"
+            );
+            has_function |= parent["kind"] == "function_definition";
+            current = parent["id"].as_str().unwrap().to_owned();
+        }
+        let children = request(
+            &mut client,
+            "kakehashi/node/children",
+            json!({ "textDocument": { "uri": uri }, "id": current }),
+        );
+        assert!(!children.as_array().unwrap().is_empty());
+        let child = request(
+            &mut client,
+            "kakehashi/node/childWithDescendant",
+            json!({ "textDocument": { "uri": uri }, "id": current, "descendantId": id }),
+        );
+        assert!(!child.is_null());
+        roots.push(current);
+        function_ancestors.push(has_function);
+    }
+    assert_eq!(
+        function_ancestors,
+        [true, false],
+        "larger sibling retains the function ancestor"
+    );
+    assert!(
+        request(
+            &mut client,
+            "kakehashi/node/childWithDescendant",
+            json!({ "textDocument": { "uri": uri }, "id": roots[0], "descendantId": ids[1] })
+        )
+        .is_null()
+    );
+    let selected = request(
+        &mut client,
+        "kakehashi/node",
+        json!({ "textDocument": { "uri": uri }, "position": { "line": 2, "character": 4 }, "injection": true }),
+    );
+    assert_eq!(
+        selected["id"], ids[1],
+        "cursor selection and captures agree on the narrower tree identity"
+    );
+
+    client.send_notification("textDocument/didChange", json!({
+        "textDocument": { "uri": uri, "version": 2 },
+        "contentChanges": [{ "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } }, "text": "# title\n\n" }]
+    }));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let next = full_with_injection(&mut client, uri, "context");
+        let shifted = ids_at(&next, 4);
+        if shifted.len() == 2 {
+            assert_eq!(
+                shifted, ids,
+                "an edit before both scopes must preserve their IDs"
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "shifted captures did not settle: {next}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    for id in ids {
+        let kind = request(
+            &mut client,
+            "kakehashi/node/kind",
+            json!({ "textDocument": { "uri": uri }, "id": id }),
+        );
+        assert_eq!(kind["kind"], "identifier");
+    }
+}
+
+#[test]
 fn full_without_injection_stays_host_only_with_language() {
     let dir = context_query_dir();
     let mut client = LspClient::new();
