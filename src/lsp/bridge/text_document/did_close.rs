@@ -1,6 +1,7 @@
 //! didClose notification handling for bridge connections.
 //!
-//! Cleans up when host documents are closed or regions are invalidated.
+//! Cleans up when host documents are closed, when regions are invalidated or
+//! change language, and when settings stop selecting a server for a region.
 //! Notifications are queued via the channel-based writer task (ls-bridge-message-ordering) for
 //! FIFO ordering.
 
@@ -299,9 +300,12 @@ impl LanguageServerPool {
     /// longer selected for them, returning what was closed.
     ///
     /// Selection is a settings question, so nothing about the region itself
-    /// changes: the region stays live and its latest contents stay recorded
-    /// (other servers may still hold it, and a later re-selection reopens from
-    /// them).
+    /// changes: the region stays live and its latest contents stay recorded,
+    /// since other servers may still hold it and a later re-selection reopens
+    /// from those recorded contents. A formatting scratch document is taken
+    /// too when its server is deselected mid-request; that step's request then
+    /// fails against the closed document, and the pipeline's own cleanup finds
+    /// it already closed.
     pub(crate) async fn close_deselected_docs(
         &self,
         host_uri: &Url,
