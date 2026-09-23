@@ -34,8 +34,9 @@ cached edit passes do not rescan the dependency graph. A repair that fails is
 not retried, even on open, until the next reload generation (a settings change
 or any successful install). A parser selected from
 outside the managed data directory is not a query-repair target. A chain
-whose managed lock is held by an install mid-publish is not treated as
-missing (probes share the lock, so they never block each other): the check is left to a later pass.
+whose managed lock is held exclusively by an install or uninstall is not
+treated as missing (probes share the lock, so they never block each other): the
+check is left to a later pass.
 Repair uses the requested language's existing install target; it does not map
 `languages.<name>.base` aliases to another installation target. Base-language
 installation/repair must be requested under that base name. Resolving aliases
@@ -54,9 +55,10 @@ resolves each query kind separately, so a runtime highlights base does not
 supply the other kinds an upstream copy would. Only a parent upstream does not
 publish (a 404 for its highlights query) is left to a search path outside the
 data directory that has a readable base (non-`extends`) `highlights.scm` for
-it; it is then neither copied nor locked, and the parents it declares remain
-part of the chain. Completeness and the pre-publication checks accept such a
-provided parent when the data directory has no complete copy, so a
+it; it is then neither staged, published, nor held in the publish transaction,
+and the parents it declares remain part of the chain. Completeness accepts such
+a provided parent when the data directory has no complete copy, and the
+pre-publication checks recheck the parents staging recorded as provided, so a
 user-provided parent absent upstream no longer fails the install or requests
 repair. An overlay alone does not provide a parent. An unreadable runtime file declares nothing:
 the loader fails only that query kind and no download can repair it, so it

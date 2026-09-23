@@ -339,8 +339,9 @@ pub(crate) enum ChainProbe {
     Complete(Vec<LanguageLock>),
     /// A language is missing, unreadable, or not installable by name.
     Incomplete,
-    /// A language's lock is held by an install or uninstall mid-publish, so
-    /// the chain cannot be judged right now. Other probes never cause this.
+    /// A language's lock is held exclusively by an install (staging or
+    /// publishing it) or an uninstall, so the chain cannot be judged right
+    /// now. Other probes never cause this.
     Busy,
 }
 
@@ -1307,9 +1308,10 @@ fn stage_queries_recursive(
 
 /// Record a parent a search path provides and walk the parents it declares.
 ///
-/// Nothing is published for it, so it is neither locked nor copied; the
-/// uninstall tombstone cleared for it before the fetch was an old uninstall's
-/// leftover under its lock, and nothing here republishes the language.
+/// Nothing is published for it, so it is neither staged, published, nor held
+/// in the publish transaction. Only the tombstone clear before its fetch took
+/// its lock, briefly; the tombstone was an old uninstall's leftover, and
+/// nothing here republishes the language.
 fn stage_provided_parent(
     source: &QueryDependencySource<'_>,
     language: &str,
@@ -1846,7 +1848,8 @@ fn try_lock_language(data_dir: &Path, language: &str) -> LanguageLockProbe {
             queries_parent,
             language: language.to_string(),
         }),
-        // Only contention means an install is in flight. A filesystem that
+        // Only contention means an install or uninstall holds the language:
+        // probes share the lock, so they never contend. A filesystem that
         // cannot do advisory locks at all — some NFS and FUSE mounts — errors
         // here too, and calling that busy would make every language on such a
         // mount read as unusable while the repair it triggers fails for the
@@ -1897,7 +1900,7 @@ fn open_language_lock_file(
 /// Take [`lock_language`] for every language an install depends on.
 ///
 /// `languages` must be sorted: two installs whose dependency sets overlap
-/// acquire the shared locks in the same order, so they queue instead of
+/// acquire the same exclusive locks in the same order, so they queue instead of
 /// deadlocking. Holding the parents' locks too is what stops an install of one
 /// language from publishing over — or uninstalling — a base language another
 /// install has already decided to rely on.
