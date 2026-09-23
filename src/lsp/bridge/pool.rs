@@ -941,18 +941,28 @@ impl LanguageServerPool {
     pub(crate) async fn consolidate_shared_instance(&self, server_name: &str) {
         let shared_key = ConnectionKey::shared(server_name);
         let mut connections = self.connections.lock().await;
-        if !connections
-            .get(&shared_key)
-            .is_some_and(|shared| shared.supports_workspace_folder_changes())
-        {
+        if !connections.get(&shared_key).is_some_and(|shared| {
+            shared.state() == ConnectionState::Ready && shared.supports_workspace_folder_changes()
+        }) {
             return;
         }
+        // A marker-rooted connection launched WITHOUT the preference is a
+        // per-root instance by configuration, not a divert — possible only
+        // across a reload flipping the preference, where a caller still
+        // holding the old config can spawn under it while the reload's purge
+        // runs. A handle with no recorded launch config (still handshaking,
+        // or test-built) is taken as launched under the current preference.
         let diverted: Vec<ConnectionKey> = connections
-            .keys()
-            .filter(|key| {
-                key.server() == server_name && !key.is_shared() && !key.is_client_fallback()
+            .iter()
+            .filter(|(key, handle)| {
+                key.server() == server_name
+                    && !key.is_shared()
+                    && !key.is_client_fallback()
+                    && handle
+                        .launch_config()
+                        .is_none_or(|config| config.prefers_shared_instance())
             })
-            .cloned()
+            .map(|(key, _)| key.clone())
             .collect();
         if diverted.is_empty() {
             return;
@@ -4893,6 +4903,40 @@ mod tests {
         pool.consolidate_shared_instance("srv").await;
 
         assert!(upstream_requests.try_recv().is_err());
+    }
+
+    /// Only diverts are consolidated: a per-root connection launched without
+    /// the preference is per-root by configuration (a reload flip can leave
+    /// one beside a shared key launched under the old config), and a shared
+    /// handle that is no longer Ready cannot take anyone's roots.
+    #[tokio::test]
+    async fn consolidating_keeps_per_root_instances_that_are_not_diverts() {
+        let pool = LanguageServerPool::new();
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("srv")).await;
+        shared.set_server_capabilities(Default::default());
+        register_folder_changes(&shared);
+        let configured_key = ConnectionKey::new("srv", Some("file:///repo/b".to_string()));
+        let configured =
+            create_handle_with_key(ConnectionState::Ready, configured_key.clone()).await;
+        configured.record_launch_config(&devnull_config());
+        pool.insert_connection(Arc::clone(&shared)).await;
+        pool.insert_connection(configured).await;
+
+        pool.consolidate_shared_instance("srv").await;
+        assert!(pool.connections.lock().await.contains_key(&configured_key));
+
+        let diverted_key = ConnectionKey::new("srv", Some("file:///repo/c".to_string()));
+        let diverted = create_handle_with_key(ConnectionState::Ready, diverted_key.clone()).await;
+        diverted.record_launch_config(&shared_config());
+        pool.insert_connection(diverted).await;
+        shared.set_state(ConnectionState::Failed);
+
+        pool.consolidate_shared_instance("srv").await;
+        assert!(
+            pool.connections.lock().await.contains_key(&diverted_key),
+            "a shared handle that is no longer Ready retires nothing"
+        );
     }
 
     #[tokio::test]
