@@ -148,7 +148,13 @@ impl InjectionCoordinator {
         let evicted = self.diagnostics.evict_region_servers(uri, &deselected);
         let publisher = self.publisher.clone();
         let host = uri.clone();
-        tokio::spawn(async move { publisher.publish_retraction(&host, evicted).await });
+        let shutdown = self.shutdown.clone();
+        tokio::spawn(async move {
+            // Nothing to tell an editor the server is leaving.
+            if !shutdown.is_cancelled() {
+                publisher.publish_retraction(&host, evicted).await;
+            }
+        });
     }
 
     /// Resolve all injection regions for a document, with stable region IDs from
