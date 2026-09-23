@@ -238,12 +238,6 @@ impl InjectionCoordinator {
         if !settled() {
             return None;
         }
-        let Some(injection_query) = injection_query else {
-            // Queries are published before the parser, so a visible parser
-            // with no injection query is definitive.
-            return settled().then(Vec::new);
-        };
-
         // Tree, text, language and lifetime from ONE current snapshot: the
         // legacy document's tree can already be a replacement parse's while
         // the current snapshot (and the language the caller screened) is
@@ -261,6 +255,16 @@ impl InjectionCoordinator {
             // Trailing or never parsed: could not look.
             return None;
         };
+        if snapshot.language.as_deref() != Some(host_language) {
+            // A re-detection between the caller's screen and this read also
+            // invalidates a no-query answer for the old language.
+            return None;
+        }
+        let Some(injection_query) = injection_query else {
+            // Queries are published before the parser, so a visible parser
+            // with no injection query is definitive for THIS host language.
+            return settled().then(Vec::new);
+        };
         let Some(tree) = snapshot.tree.clone() else {
             // No tree under a published parser: a reload placeholder
             // (`Document::invalidate_parse`, version-current and tree-less) or
@@ -268,11 +272,6 @@ impl InjectionCoordinator {
             // at.
             return None;
         };
-        if snapshot.language.as_deref() != Some(host_language) {
-            // The tree belongs to another language than the one asked about
-            // (a re-detection between the caller's screen and this read).
-            return None;
-        }
         let text = std::sync::Arc::clone(&snapshot.text);
         let incarnation = snapshot.incarnation;
 
@@ -1714,22 +1713,27 @@ mod tests {
         }
     }
 
+    #[rstest::rstest]
+    #[case::with_query(true)]
+    #[case::without_query(false)]
     #[tokio::test]
-    async fn bridge_fast_path_rejects_a_language_from_before_redetection() {
+    async fn bridge_fast_path_rejects_a_language_from_before_redetection(#[case] has_query: bool) {
         let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
         let server = service.inner();
         let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
-        // Both names have a published parser/query, so a stale language cannot
+        // Both names have a published parser, so a stale language cannot
         // be rejected merely because its parser has not finished loading.
         for name in ["rust", "old-rust"] {
             server
                 .language
                 .language_registry_for_parallel()
                 .register(name.into(), language.clone());
-            server.language.query_store().insert_injection_query(
-                name.into(),
-                std::sync::Arc::new(tree_sitter::Query::new(&language, "").unwrap()),
-            );
+            if has_query {
+                server.language.query_store().insert_injection_query(
+                    name.into(),
+                    std::sync::Arc::new(tree_sitter::Query::new(&language, "").unwrap()),
+                );
+            }
         }
         let uri = Url::parse("file:///redetected.rs").unwrap();
         let text = "fn main() {}";
