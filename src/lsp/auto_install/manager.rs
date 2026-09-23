@@ -319,6 +319,16 @@ impl AutoInstallManager {
         initial_pass || first
     }
 
+    /// Whether a repair of `language` already failed in `generation`, for a
+    /// probe admitting its answer after other repairs may have finished.
+    pub(crate) fn query_repair_failed(&self, language: &str, generation: u64) -> bool {
+        let checked = self
+            .query_dependency_checks
+            .lock()
+            .recover_poison("AutoInstallManager::query_repair_failed");
+        generation == checked.generation && checked.failed.contains(language)
+    }
+
     /// Undo [`Self::begin_query_dependency_check`]'s mark for a check that could not
     /// reach an answer, so a later pass in the same generation checks again.
     pub(crate) fn forget_query_dependency_check(&self, language: &str, generation: u64) {

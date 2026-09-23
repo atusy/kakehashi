@@ -369,7 +369,11 @@ impl InstallCoordinator {
         state: QueryChainState,
     ) -> bool {
         match state {
-            QueryChainState::NeedsRepair => true,
+            // Probes run concurrently; a repair that failed while this one
+            // read the chain has already answered for this generation.
+            QueryChainState::NeedsRepair => {
+                !self.auto_install.query_repair_failed(language, generation)
+            }
             QueryChainState::Settled => false,
             // A lock held exclusively by an install (staging or publishing)
             // or an uninstall is not evidence of a missing language. Leave the answer
