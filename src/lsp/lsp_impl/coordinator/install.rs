@@ -795,6 +795,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_repair_leaves_the_first_snapshot_to_the_inline_parse() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), tree_sitter_rust::LANGUAGE.into());
+        // didOpen spawns the repair beside the inline parse, which has not
+        // published yet.
+        let uri = Url::parse("file:///repair-before-parse.rs").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "fn main() {}".into(),
+            Some("rust".into()),
+            None,
+        );
+        let claim = server.auto_install.begin_test_claim(
+            "rust",
+            query_dependency_paths(&server.settings_manager.load_settings(), "rust"),
+        );
+        let install = server.install_coordinator();
+        let mut repair = Box::pin(install.maybe_auto_install_language(
+            "rust",
+            uri.clone(),
+            false,
+            Some(incarnation),
+            InstallRequest::new(true),
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(repair.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        claim.complete(crate::lsp::auto_install::InstallOutcome::Failed);
+        repair.await;
+        assert!(
+            server
+                .documents
+                .latest_snapshot(&uri)
+                .and_then(|view| view.slot.snapshot)
+                .is_none(),
+            "a tree-less give-up would wake first-parse readers before the tree lands"
+        );
+    }
+
+    #[tokio::test]
     async fn query_repair_request_survives_a_siblings_publication() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
