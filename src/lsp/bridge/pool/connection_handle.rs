@@ -735,7 +735,9 @@ impl ConnectionHandle {
     ///
     /// The registry is read live rather than latched, even though the
     /// capability is treated as effectively monotone: an `unregisterCapability`
-    /// for the method really withdraws it. Latching would keep forwarding
+    /// of a dynamic registration really withdraws it. (A static
+    /// `changeNotifications` id is not in the registry, so unregistering that
+    /// id leaves the static declaration standing — as before #968.) Latching would keep forwarding
     /// notifications to a server that opted out; reading live instead lets the
     /// next upstream folder change find the connection incapable and recycle
     /// it through the ordinary invalidate path — bounded staleness, no

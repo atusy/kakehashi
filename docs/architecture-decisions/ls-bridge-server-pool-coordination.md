@@ -112,20 +112,25 @@ The capability is treated as effectively monotone (#968): servers register
 `didChangeWorkspaceFolders` seconds after `initialized` and practically never
 unregister it. It is read live at each decision point — the divert above, the
 announce, and the upstream folder-change fan-out to client-root fallbacks —
-with no ordering between registration and those decisions, because every race
-degrades to the static-only behavior: a check that misses an in-flight
-registration diverts a root or recycles a fallback, both self-healing. The
-rare reverse transition is not synchronized either: an unregistration only
-drops the registry entry, and the next upstream folder change recycles the
-now-incapable fallback through the ordinary invalidate path (a latched flag
-would instead keep notifying a server that opted out). Because registration
-arrives only after `initialized` while the divert check runs at `Ready`, roots
-acquired in that window divert deterministically; when the registration
-arrives on the shared connection, the pool retires that server's marker-rooted
-connections through the same invalidate path, and their documents re-open on
-the shared connection at their next acquisition — no data-structure
-migration. A divert racing that sweep leaves at worst the per-root split that
-existed before. Accepted risk: a server whose `didChangeWorkspaceFolders`
+with no ordering between registration and those decisions: a check that misses
+an in-flight registration diverts a root or recycles a fallback, which is what
+the static-only check did every time. The rare reverse transition is not
+synchronized either: an unregistration only drops the registry entry, and the
+next upstream folder change recycles the now-incapable fallback through the
+ordinary invalidate path (a latched flag would instead keep notifying a server
+that opted out). Because registration arrives only after `initialized` while
+the divert check runs at `Ready`, roots acquired in that window divert
+deterministically; when the registration arrives on the shared connection, the
+pool retires that server's diverts (marker-rooted connections launched under
+the preference) through the same invalidate path and asks for the respawn
+re-open against the live shared connection (which, as for any respawn,
+covers injected-region documents; host-bridged documents move at their next
+acquisition), so documents move there without a data-structure migration. Two races remain and are healed rather
+than prevented: a divert still handshaking when the sweep retires it falls back
+to the shared connection, and a divert landing after the sweep (or a per-root
+key a command's routing token revives) is retired by the next acquisition of
+its root before that root's documents open on the shared connection beside
+it. Accepted risk: a server whose `didChangeWorkspaceFolders`
 handling is broken is no longer masked by constant restarts.
 
 **Known limitation:** per-root pooling multiplies process count with the number
@@ -574,8 +579,9 @@ languageServers:
   `workspace/didChangeWorkspaceFolders` now count as folder-change capable
   (#968), read live at every decision point with no added synchronization;
   a registration on a shared connection retires that server's diverted
-  per-root connections. Supersedes #751's ordering-lock design, which bought
-  exactness for capable→incapable transitions that practically never occur.
+  per-root connections. Chosen over #751's (closed) ordering-lock design,
+  which bought exactness for capable→incapable transitions that practically
+  never occur.
 - **2026-07-18**: Added field-level recovery for malformed downstream
   initialize capabilities (#860). Structurally unusable envelopes and global
   position-encoding violations still fail initialization; independent malformed

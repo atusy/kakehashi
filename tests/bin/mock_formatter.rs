@@ -178,7 +178,7 @@
 //!   changeNotifications}` + `hoverProvider`; records the `initialize`-time
 //!   workspace folders and every `workspace/didChangeWorkspaceFolders`
 //!   addition, then answers `textDocument/hover` with the sorted list of folder
-//!   URIs it currently knows (not gated on `didOpen` — the folder set is the
+//!   URIs it currently knows plus its process id (`folders:<uris>;pid:<n>`) (not gated on `didOpen` — the folder set is the
 //!   subject under test, populated by initialize + didChangeWorkspaceFolders).
 //!   Used by
 //!   `tests/e2e/e2e_shared_instance.rs` (#391) to prove the shared-instance opt-in
@@ -186,8 +186,8 @@
 //! - `workspace-folders-dynamic` — like `workspace-folders`, but declares only
 //!   `workspaceFolders.supported` statically and registers
 //!   `workspace/didChangeWorkspaceFolders` via `client/registerCapability` on
-//!   `initialized` (Pyright-style, #968). Its hover also reports the process id
-//!   so a test can tell a forwarded folder change from a restart.
+//!   `initialized` (Pyright-style, #968). The hover's process id lets a test
+//!   tell a forwarded folder change from a restart.
 //! - `workspace-folders-dynamic-late` — like `workspace-folders-dynamic`, but
 //!   registers on the first `textDocument/hover` this process receives, so a
 //!   test can let other roots divert before the capability appears.

@@ -882,7 +882,9 @@ impl LanguageServerPool {
 
     /// Remove each of `invalidated` from the held `connections` map and purge
     /// everything keyed on it — host routing, tracked documents, open-transition
-    /// locks — arming each key for a re-open by its eventual replacement.
+    /// locks — arming each key for a re-open by its eventual replacement (a
+    /// consolidated divert expects none: its debt stays armed, unclaimed,
+    /// until some later spawn under that key).
     ///
     /// Returns the removed handles, already marked shutting down, for the
     /// caller to [`shutdown_invalidated_connection`] once it has released
@@ -925,17 +927,21 @@ impl LanguageServerPool {
     /// diverted to per-root processes. Once it registers, routing already
     /// resolves those roots to the shared key; retiring their processes is
     /// what stops them serving what they already hold. Nothing is migrated:
-    /// each document re-opens on the shared instance at its next acquisition,
-    /// where `announce_shared_root`'s FIFO puts the root announcement ahead of
-    /// the `didOpen`.
+    /// injected-region documents are re-opened on the shared instance by the
+    /// respawn repair requested below, and host-bridged ones at their next
+    /// acquisition, where
+    /// `announce_shared_root`'s FIFO puts the root announcement ahead of the
+    /// `didOpen`.
     ///
-    /// Only marker-rooted keys are diverts — the shared routing never mints a
-    /// client-root key for this server. The capability is re-checked on the
-    /// live shared connection under `connections`, so a request that outlived
-    /// an unregistration (or a replacement that never registered) retires
-    /// nothing. A divert racing this sweep can still land after it, leaving at
-    /// worst the split this exists to remove — the same residual as before
-    /// consolidation existed, not a new failure.
+    /// Only marker-rooted keys launched under the preference are diverts — the
+    /// shared routing never mints a client-root key for this server. The
+    /// capability is re-checked on the live shared connection under
+    /// `connections`, so a request that outlived an unregistration (or a
+    /// replacement that never registered) retires nothing. A divert racing
+    /// this sweep can still land after it; `resolve_acquire` retires such a
+    /// straggler at the next acquisition of its root, and a divert the sweep
+    /// retires mid-handshake falls back to the shared instance
+    /// (`get_or_create_connection_wait_ready`).
     pub(crate) async fn consolidate_shared_instance(&self, server_name: &str) {
         let shared_key = ConnectionKey::shared(server_name);
         let mut connections = self.connections.lock().await;
@@ -3131,7 +3137,8 @@ impl LanguageServerPool {
 
     /// For a shared-instance connection (#391), record this acquisition's marker
     /// root in the connection's folder set and, when it is newly added and the
-    /// downstream server advertised the `workspaceFolders` capability, announce
+    /// downstream server is folder-change capable (declared or dynamically
+    /// registered, [`ConnectionHandle::supports_workspace_folder_changes`]), announce
     /// it with `workspace/didChangeWorkspaceFolders`. The notification is queued
     /// through the single-writer loop, so a `didOpen` the caller sends next on
     /// the same connection follows it on the wire (FIFO), satisfying "announce
