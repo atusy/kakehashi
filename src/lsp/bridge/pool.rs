@@ -974,6 +974,32 @@ impl LanguageServerPool {
         for (key, handle) in stale_handles {
             shutdown_invalidated_connection(key, handle);
         }
+        // Their documents now route to the shared key, but nothing would open
+        // them there until something touches each one — an idle tab's pushed
+        // diagnostics died with the retired process and would stay gone. Run
+        // the respawn repair against the LIVE shared connection: it derives
+        // what routes to that key from the documents open now, and opening one
+        // that is already open there is a no-op. The retired keys stay armed
+        // too, but nothing routes to them any more, so no replacement claims
+        // that debt.
+        self.pending_reopen.arm(&shared_key);
+        if let Some(done) = self.pending_reopen.claim(&shared_key)
+            && let Err(e) = self
+                .upstream_request_tx
+                .send(UpstreamRequest::ReopenDocuments {
+                    key: shared_key.clone(),
+                    done,
+                })
+        {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "Failed to queue re-open of consolidated documents on {shared_key} \
+                 (forwarding loop gone): {e}"
+            );
+            if let UpstreamRequest::ReopenDocuments { done, .. } = e.0 {
+                self.pending_reopen.rearm(&shared_key, &done);
+            }
+        }
     }
 
     /// Set the upstream client capabilities.
@@ -4795,6 +4821,50 @@ mod tests {
             pool.pending_reopen.claim(&diverted_key).is_some(),
             "the retirement goes through the shared invalidate path"
         );
+    }
+
+    /// The documents a retired divert held route to the shared key now, but
+    /// nothing would open them there until each is touched again — so the
+    /// consolidation asks for the same derive-from-open-documents repair a
+    /// respawn gets, against the live shared connection.
+    #[tokio::test]
+    async fn consolidating_reopens_the_moved_documents_on_the_shared_instance() {
+        let pool = LanguageServerPool::new();
+        let mut upstream_requests = pool.take_upstream_request_rx().expect("receiver");
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("srv")).await;
+        shared.set_server_capabilities(Default::default());
+        register_folder_changes(&shared);
+        let diverted_key = ConnectionKey::new("srv", Some("file:///repo/b".to_string()));
+        pool.insert_connection(Arc::clone(&shared)).await;
+        pool.insert_connection(create_handle_with_key(ConnectionState::Ready, diverted_key).await)
+            .await;
+
+        pool.consolidate_shared_instance("srv").await;
+
+        match upstream_requests.try_recv() {
+            Ok(UpstreamRequest::ReopenDocuments { key, .. }) => assert_eq!(&key, shared.key()),
+            other => panic!(
+                "expected a re-open of the shared instance, got {:?}",
+                other.is_ok()
+            ),
+        }
+    }
+
+    /// Nothing was retired, so nothing moved: no repair is asked for.
+    #[tokio::test]
+    async fn consolidating_without_diverts_reopens_nothing() {
+        let pool = LanguageServerPool::new();
+        let mut upstream_requests = pool.take_upstream_request_rx().expect("receiver");
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("srv")).await;
+        shared.set_server_capabilities(Default::default());
+        register_folder_changes(&shared);
+        pool.insert_connection(shared).await;
+
+        pool.consolidate_shared_instance("srv").await;
+
+        assert!(upstream_requests.try_recv().is_err());
     }
 
     #[tokio::test]
