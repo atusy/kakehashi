@@ -282,22 +282,6 @@ impl AutoInstallManager {
             .insert(language.to_string(), outcome);
     }
 
-    #[cfg(test)]
-    pub(crate) fn first_query_dependency_check(&self, language: &str, generation: u64) -> bool {
-        let mut checked = self
-            .query_dependency_checks
-            .lock()
-            .recover_poison("AutoInstallManager::first_query_dependency_check");
-        if !checked.observe(generation) {
-            return false;
-        }
-        if checked.languages.contains(language) {
-            return false;
-        }
-        checked.languages.insert(language.to_string());
-        true
-    }
-
     /// Remember that repairing `language`'s queries failed in `generation`.
     pub(crate) fn record_query_repair_failure(&self, language: &str, generation: u64) {
         let mut checked = self
@@ -332,7 +316,7 @@ impl AutoInstallManager {
         initial_pass || first
     }
 
-    /// Undo [`Self::first_query_dependency_check`] for a check that could not
+    /// Undo [`Self::begin_query_dependency_check`]'s mark for a check that could not
     /// reach an answer, so a later pass in the same generation checks again.
     pub(crate) fn forget_query_dependency_check(&self, language: &str, generation: u64) {
         let mut checked = self
@@ -997,13 +981,22 @@ mod tests {
     fn query_dependency_checks_follow_generation_not_parser_load_events() {
         let manager = create_test_manager();
         let sibling = manager.clone();
-        assert!(manager.first_query_dependency_check("lua", 10));
-        assert!(!sibling.first_query_dependency_check("lua", 10));
-        assert!(sibling.first_query_dependency_check("python", 10));
-        assert!(manager.first_query_dependency_check("lua", 11));
-        assert!(!sibling.first_query_dependency_check("lua", 10));
-        assert!(!manager.first_query_dependency_check("lua", 11));
-        assert!(manager.first_query_dependency_check("python", 11));
+        assert!(manager.begin_query_dependency_check("lua", 10, false));
+        assert!(!sibling.begin_query_dependency_check("lua", 10, false));
+        assert!(sibling.begin_query_dependency_check("python", 10, false));
+        // An initial pass checks even after the generation's mark is used.
+        assert!(sibling.begin_query_dependency_check("lua", 10, true));
+        assert!(manager.begin_query_dependency_check("lua", 11, false));
+        // A stale generation neither marks nor sees the newer marks...
+        assert!(!sibling.begin_query_dependency_check("lua", 10, false));
+        // ...but its initial pass still checks.
+        assert!(sibling.begin_query_dependency_check("lua", 10, true));
+        assert!(!manager.begin_query_dependency_check("lua", 11, false));
+        assert!(manager.begin_query_dependency_check("python", 11, false));
+        // A failed repair declines even an initial pass, until a new generation.
+        manager.record_query_repair_failure("python", 11);
+        assert!(!manager.begin_query_dependency_check("python", 11, true));
+        assert!(manager.begin_query_dependency_check("python", 12, true));
     }
 
     #[tokio::test]

@@ -290,18 +290,6 @@ impl InstallCoordinator {
             .await;
     }
 
-    #[cfg(test)]
-    pub(crate) fn should_check_query_dependencies(
-        &self,
-        language: &str,
-        initial_pass: bool,
-    ) -> bool {
-        let first = self
-            .auto_install
-            .first_query_dependency_check(language, self.cache.semantic_token_generation());
-        initial_pass || first
-    }
-
     /// Whether an already-loaded managed parser's query chain should be
     /// repaired now. `initial_pass` marks lifecycle passes (open, install
     /// completion) that check regardless of this generation's earlier checks.
@@ -733,37 +721,24 @@ mod tests {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
         server
+            .settings_manager
+            .apply_settings(auto_install_settings());
+        server
             .language
             .language_registry_for_parallel()
             .register("rust".into(), tree_sitter_rust::LANGUAGE.into());
         let loaded = server.language.ensure_language_loaded_async("rust").await;
         assert!(loaded.success && loaded.events.is_empty());
-        assert!(
-            server
-                .install_coordinator()
-                .should_check_query_dependencies("rust", false)
-        );
-        assert!(
-            !server
-                .install_coordinator()
-                .should_check_query_dependencies("rust", false)
-        );
-        assert!(
-            server
-                .install_coordinator()
-                .should_check_query_dependencies("rust", true)
-        );
-        assert!(
-            !server
-                .install_coordinator()
-                .should_check_query_dependencies("rust", false)
-        );
+        let install = server.install_coordinator();
+        let due = |initial_pass| {
+            install.decide_query_repair("rust", initial_pass, || QueryChainState::NeedsRepair)
+        };
+        assert!(due(false), "no load event, yet the first pass checks");
+        assert!(!due(false), "an edit pass checks once per generation");
+        assert!(due(true), "an initial pass always checks");
+        assert!(!due(false));
         server.cache.bump_semantic_token_generation();
-        assert!(
-            server
-                .install_coordinator()
-                .should_check_query_dependencies("rust", false)
-        );
+        assert!(due(false), "a reload re-arms the check");
     }
 
     fn auto_install_settings() -> WorkspaceSettings {
