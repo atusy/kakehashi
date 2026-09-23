@@ -160,7 +160,7 @@ impl LanguageServerPool {
             // the wrap existed only to nest it — steady state, so every
             // client resolve of that item that clears the gates above
             // lands here; say so quietly. Otherwise the origin did advertise
-            // and a respawn or dynamic unregister withdrew the capability
+            // and a dynamic unregister withdrew the capability
             // under the item: anomalous.
             if nests_reserved_key(item.data.as_ref()) {
                 debug!(
@@ -238,7 +238,7 @@ impl LanguageServerPool {
             // the wrap existed only to nest it — steady state, so every
             // client resolve of that item that clears the gates above
             // lands here; say so quietly. Otherwise the origin did advertise
-            // and a respawn or dynamic unregister withdrew the capability
+            // and a dynamic unregister withdrew the capability
             // under the item: anomalous.
             if nests_reserved_key(item.data.as_ref()) {
                 debug!(
