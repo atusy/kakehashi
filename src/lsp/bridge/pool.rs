@@ -3360,16 +3360,56 @@ impl LanguageServerPool {
         if rootless {
             connection_key = ConnectionKey::shared(server_name);
         }
-        self.get_or_create_connection_resolved(
-            server_name,
-            server_config,
-            connection_key,
-            marker,
-            timeout,
-            rootless,
-            admit,
-        )
-        .await
+        let diverted = server_config.prefers_shared_instance()
+            && !connection_key.is_shared()
+            && !connection_key.is_client_fallback();
+        let acquired = self
+            .get_or_create_connection_resolved(
+                server_name,
+                server_config,
+                connection_key,
+                marker.clone(),
+                timeout,
+                rootless,
+                admit,
+            )
+            .await;
+        // The spawner awaits the divert's handshake, which a dynamically
+        // registering shared instance's consolidation can retire midway (the
+        // same race `get_or_create_connection_wait_ready` absorbs): the
+        // failure then means the divert is no longer needed. Take the shared
+        // instance, whose reuse path announces this root first.
+        if acquired.is_err() && diverted && self.shared_accepts_folder_changes(server_name).await {
+            return self
+                .get_or_create_connection_resolved(
+                    server_name,
+                    server_config,
+                    ConnectionKey::shared(server_name),
+                    marker,
+                    timeout,
+                    false,
+                    admit,
+                )
+                .await;
+        }
+        acquired
+    }
+
+    /// Whether `server_name`'s shared instance is live and folder-change
+    /// capable — the condition under which a divert of it is no longer needed.
+    async fn shared_accepts_folder_changes(&self, server_name: &str) -> bool {
+        let shared = {
+            let connections = self.connections.lock().await;
+            connections
+                .get(&ConnectionKey::shared(server_name))
+                .map(Arc::clone)
+        };
+        shared.is_some_and(|shared| {
+            matches!(
+                shared.state(),
+                ConnectionState::Initializing | ConnectionState::Ready
+            ) && shared.supports_workspace_folder_changes()
+        })
     }
 
     /// Get-or-spawn against an ALREADY-resolved `(connection_key, marker)` pair
@@ -5364,6 +5404,43 @@ mod tests {
             .expect("a divert retired by consolidation must fall back to the shared instance");
         assert!(Arc::ptr_eq(&result, &shared));
         assert!(!Arc::ptr_eq(&result, &per_root));
+    }
+
+    /// The fast-fail spawner awaits its divert's handshake too, so the same
+    /// consolidation race must not fail it: a divert retired mid-handshake
+    /// falls back to the now-capable shared instance (#968).
+    #[tokio::test]
+    async fn fast_fail_acquire_takes_the_shared_instance_when_its_divert_is_retired() {
+        let (_tmp, doc) = marker_rooted_doc();
+        let pool = Arc::new(LanguageServerPool::new());
+        let config = shared_config();
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
+        shared.set_server_capabilities(Default::default());
+        pool.insert_connection(Arc::clone(&shared)).await;
+        let (shared_clone, pool_clone) = (Arc::clone(&shared), Arc::clone(&pool));
+        tokio::spawn(async move {
+            // The divert has spawned (its `cat` never answers `initialize`)
+            // when the shared instance registers and consolidates.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            register_folder_changes(&shared_clone);
+            pool_clone.consolidate_shared_instance("lua").await;
+        });
+
+        let handle = tokio::time::timeout(
+            Duration::from_secs(10),
+            pool.get_or_create_connection_with_timeout(
+                "lua",
+                &config,
+                Some(&doc),
+                Duration::from_secs(8),
+                None,
+            ),
+        )
+        .await
+        .expect("the retired divert's handshake must end promptly")
+        .expect("falls back to the shared instance");
+        assert!(Arc::ptr_eq(&handle, &shared));
     }
 
     /// The incapable-shared divert proves served-ness against the SPAWN root,
