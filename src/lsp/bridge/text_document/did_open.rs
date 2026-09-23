@@ -75,6 +75,7 @@ pub(crate) struct OpenExpectation<'a> {
 pub(crate) struct OpenRevision<'a> {
     pub(crate) content_version: u64,
     pub(crate) edit_lock: &'a tokio::sync::Mutex<()>,
+    /// The caller also rejects retired query generations and reloads in progress.
     pub(crate) read: &'a (dyn Fn() -> Option<super::super::HostRevision> + Send + Sync),
 }
 
@@ -459,6 +460,18 @@ impl LanguageServerPool {
                 return OpenOutcome::NotOpened;
             }
 
+            // Reloads do not take the edit lock. Recheck after the awaited
+            // locks, before this connection can receive old snapshot content.
+            if let Some(revision) = &revision
+                && (revision.read)()
+                    != Some(super::super::HostRevision {
+                        incarnation: expected_incarnation,
+                        content_version: revision.content_version,
+                    })
+            {
+                return OpenOutcome::NotOpened;
+            }
+
             let opened = if revision.is_some() {
                 self.ensure_document_opened_from_snapshot(
                     &mut sender,
@@ -478,6 +491,18 @@ impl LanguageServerPool {
                 )
                 .await
             };
+            // The query set can also change while opening. The connection
+            // guard orders sends, but a changed query set is not caught up.
+            if let Some(revision) = &revision
+                && (revision.read)()
+                    != Some(super::super::HostRevision {
+                        incarnation: expected_incarnation,
+                        content_version: revision.content_version,
+                    })
+            {
+                return OpenOutcome::NotOpened;
+            }
+
             if let Err(e) = opened {
                 log::debug!(
                     target: "kakehashi::bridge",
@@ -938,12 +963,16 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::current(1, OpenOutcome::Opened)]
-    #[case::superseded(2, OpenOutcome::NotOpened)]
+    #[case::current(1, 0, OpenOutcome::Opened, true)]
+    #[case::superseded(2, 0, OpenOutcome::NotOpened, false)]
+    #[case::reload_before_enqueue(1, 2, OpenOutcome::NotOpened, false)]
+    #[case::reload_during_enqueue(1, 3, OpenOutcome::NotOpened, true)]
     #[tokio::test]
     async fn repair_checks_content_revision_under_the_edit_lock(
         #[case] current_version: u64,
+        #[case] reject_read: usize,
         #[case] expected: OpenOutcome,
+        #[case] opened: bool,
     ) {
         let pool = LanguageServerPool::new();
         let key = crate::lsp::bridge::ConnectionKey::for_server("test-server");
@@ -953,7 +982,12 @@ mod tests {
         let uri = url_to_uri(&host_uri);
         pool.open_host_incarnation(&host_uri, 1).await;
         let edit_lock = tokio::sync::Mutex::new(());
+        let reads = std::sync::atomic::AtomicUsize::new(0);
         let read = || {
+            let count = reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if count == reject_read {
+                return None;
+            }
             assert!(
                 edit_lock.try_lock().is_err(),
                 "revision must be checked while edits are serialized"
@@ -992,7 +1026,7 @@ mod tests {
                 &VirtualDocumentUri::new(&uri, "lua", TEST_ULID_LUA_0),
                 &key,
             ),
-            expected == OpenOutcome::Opened
+            opened
         );
         assert!(
             edit_lock.try_lock().is_ok(),

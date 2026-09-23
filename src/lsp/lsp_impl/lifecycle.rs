@@ -1814,10 +1814,10 @@ fn spawn_upstream_request(
                                 continue;
                             }
                         }
-                        // Capture the revision BEFORE resolving injections. An
-                        // edit or reopen during resolution must not let a new
-                        // snapshot validate an empty result from the old one.
-                        let Some(revision) = injection.document_revision(&host) else {
+                        // Capture document and query revisions BEFORE resolving
+                        // injections. An edit, reopen, or query reload must not
+                        // validate a result derived from the old inputs.
+                        let Some(revision) = injection.reopen_revision(&host) else {
                             continue;
                         };
                         let Some((host_language, injections)) = injection.bridge_injections(&host)

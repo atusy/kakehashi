@@ -75,6 +75,14 @@ pub(crate) enum ReopenSnapshotState {
     Changed,
 }
 
+/// Inputs whose identity must survive from injection discovery to repair.
+/// Query reloads can change regions without editing the document.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReopenRevision {
+    document: crate::lsp::bridge::HostRevision,
+    query_generation: u64,
+}
+
 impl InjectionCoordinator {
     pub(crate) fn new(server: &Kakehashi) -> Self {
         Self {
@@ -964,10 +972,38 @@ impl InjectionCoordinator {
             })
     }
 
+    pub(crate) fn reopen_revision(&self, uri: &Url) -> Option<ReopenRevision> {
+        let query_generation = self.cache.semantic_token_generation();
+        self.document_revision(uri).map(|document| ReopenRevision {
+            document,
+            query_generation,
+        })
+    }
+
+    fn reopen_document_revision(
+        &self,
+        uri: &Url,
+        expected: ReopenRevision,
+    ) -> Option<crate::lsp::bridge::HostRevision> {
+        let document = self.document_revision(uri)?;
+        self.reopen_queries_are_current(expected)
+            .then_some(document)
+    }
+
+    fn reopen_queries_are_current(&self, expected: ReopenRevision) -> bool {
+        // Also reject the swapping interval before the final generation bump.
+        let pool = self
+            .parser_pool
+            .lock()
+            .recover_poison("InjectionCoordinator::reopen_queries_are_current");
+        !pool.reload_in_progress()
+            && self.cache.semantic_token_generation() == expected.query_generation
+    }
+
     pub(crate) fn reopen_snapshot_state(
         &self,
         uri: &Url,
-        expected: crate::lsp::bridge::HostRevision,
+        expected: ReopenRevision,
     ) -> ReopenSnapshotState {
         // One store read distinguishes a closed document from an unchanged
         // resolution and from a newer parse/lifetime. Independent liveness and
@@ -975,13 +1011,12 @@ impl InjectionCoordinator {
         let Some(view) = self.documents.latest_snapshot(uri) else {
             return ReopenSnapshotState::Gone;
         };
-        if view.slot.current_incarnation == expected.incarnation
-            && view.content_version == expected.content_version
-            && view
-                .slot
-                .snapshot
-                .as_ref()
-                .is_some_and(|snapshot| snapshot.parsed_version == expected.content_version)
+        if view.slot.current_incarnation == expected.document.incarnation
+            && view.content_version == expected.document.content_version
+            && view.slot.snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot.parsed_version == expected.document.content_version
+            })
+            && self.reopen_queries_are_current(expected)
         {
             ReopenSnapshotState::Current
         } else {
@@ -994,12 +1029,12 @@ impl InjectionCoordinator {
         settings: &std::sync::Arc<crate::config::WorkspaceSettings>,
         host_language: &str,
         uri: &Url,
-        revision: crate::lsp::bridge::HostRevision,
+        revision: ReopenRevision,
         key: &crate::lsp::bridge::ConnectionKey,
         injections: Vec<BridgeInjection>,
     ) -> crate::lsp::bridge::OpenOutcome {
         let edit_lock = self.documents.edit_lock(uri);
-        let read = || self.document_revision(uri);
+        let read = || self.reopen_document_revision(uri, revision);
         let outcome = self
             .bridge
             .ensure_server_documents_open(
@@ -1007,11 +1042,11 @@ impl InjectionCoordinator {
                 host_language,
                 uri,
                 crate::lsp::bridge::OpenExpectation {
-                    incarnation: revision.incarnation,
+                    incarnation: revision.document.incarnation,
                     connection: Some(key),
                     expected_connection: None,
                     revision: Some(crate::lsp::bridge::OpenRevision {
-                        content_version: revision.content_version,
+                        content_version: revision.document.content_version,
                         edit_lock: &edit_lock,
                         read: &read,
                     }),
@@ -1026,9 +1061,13 @@ impl InjectionCoordinator {
         // Routing can decide that none of the resolved regions belongs to
         // this connection without reaching the open's edit guard. An edit
         // during that decision may introduce an applicable region, so confirm
-        // the original revision before accepting a no-target result.
-        if outcome == crate::lsp::bridge::OpenOutcome::NotApplicable
-            && self.reopen_snapshot_state(uri, revision) == ReopenSnapshotState::Changed
+        // the original revision before accepting a no-target result. Also
+        // recheck successful opens: query reloads are not held by edit locks.
+        if matches!(
+            outcome,
+            crate::lsp::bridge::OpenOutcome::NotApplicable
+                | crate::lsp::bridge::OpenOutcome::Opened
+        ) && self.reopen_snapshot_state(uri, revision) == ReopenSnapshotState::Changed
         {
             crate::lsp::bridge::OpenOutcome::NotOpened
         } else {
@@ -1802,6 +1841,60 @@ mod tests {
     }
 
     #[rstest::rstest]
+    #[case::completed_reload(false)]
+    #[case::reload_in_progress(true)]
+    #[tokio::test]
+    async fn reopen_rejects_queries_changed_without_a_document_edit(#[case] in_progress: bool) {
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let uri = Url::parse("file:///reopen-query-generation.rs").unwrap();
+        let text = "fn main() {}";
+        server.documents.insert(
+            uri.clone(),
+            text.into(),
+            Some("rust".into()),
+            parser.parse(text, None),
+        );
+        let injection = server.injection_coordinator();
+        let revision = injection.reopen_revision(&uri).unwrap();
+        assert_eq!(
+            injection.reopen_snapshot_state(&uri, revision),
+            super::ReopenSnapshotState::Current
+        );
+        assert_eq!(
+            injection.reopen_document_revision(&uri, revision),
+            Some(revision.document)
+        );
+        if in_progress {
+            server.parser_pool.lock().unwrap().begin_reload();
+        } else {
+            server.cache.bump_semantic_token_generation();
+        }
+        assert_eq!(
+            injection.document_revision(&uri),
+            Some(revision.document),
+            "reload preserves the document revision"
+        );
+        assert_eq!(
+            injection.reopen_document_revision(&uri, revision),
+            None,
+            "enqueue must reject the retired query result"
+        );
+        assert_eq!(
+            injection.reopen_snapshot_state(&uri, revision),
+            super::ReopenSnapshotState::Changed,
+            "empty and no-target results need the same query guard"
+        );
+        if in_progress {
+            server.parser_pool.lock().unwrap().finish_reload();
+        }
+    }
+
+    #[rstest::rstest]
     #[case::current(false, crate::lsp::bridge::OpenOutcome::NotApplicable)]
     #[case::edited(true, crate::lsp::bridge::OpenOutcome::NotOpened)]
     #[tokio::test]
@@ -1824,7 +1917,7 @@ mod tests {
             parser.parse(text, None),
         );
         let injection = server.injection_coordinator();
-        let revision = injection.document_revision(&uri).unwrap();
+        let revision = injection.reopen_revision(&uri).unwrap();
         if edited {
             let newer = "fn newer() {}";
             server
@@ -1880,7 +1973,7 @@ mod tests {
             parser.parse(text, None),
         );
         let injection = server.injection_coordinator();
-        let revision = injection.document_revision(&uri).unwrap();
+        let revision = injection.reopen_revision(&uri).unwrap();
         assert!(
             injection
                 .bridge_injections(&uri)

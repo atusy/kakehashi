@@ -311,6 +311,11 @@ that the host has no injections. A nonempty resolution that routes to no units
 on this connection must pass the same revision check after routing: an edit
 while routing is pending may introduce a unit that does belong here.
 
+The captured revision also includes the query generation. Auto-install and
+query repair can replace injection queries without editing the document.
+Empty and no-target results therefore reject a changed generation or a reload
+in progress, even when the document revision still matches.
+
 ### Undeterminable parses fail soft
 
 `invalidate_parse` publishes a tree-less snapshot whose `parsed_version`
@@ -331,10 +336,14 @@ trade-off. It is not evidence that the downstream already holds its documents.
 ### Required opens use revision-validated content
 
 A nonempty resolution carries the same captured incarnation and content
-version into the open. After routing completes, each injection takes the host
-edit lock, checks that revision, and retains the lock through enqueue. An edit
+version into the open, together with the query generation. After routing
+completes, each injection takes the host edit lock, checks the document revision
+and query currency, and retains the edit lock through enqueue. An edit
 that supersedes the resolved text makes the repair incomplete. Routing runs
 before this lock is acquired because it may wait on downstream queries.
+Query currency is rechecked after acquiring the connection and after the open
+completes. The connection guard orders content sends; the completion check
+prevents a reload during enqueue from reporting the old query set caught up.
 
 A required open uses the verified snapshot text directly: the latest forwarded
 virtual-content cache may still lag the completed parse. If another request
