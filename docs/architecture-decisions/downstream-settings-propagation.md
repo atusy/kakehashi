@@ -231,7 +231,9 @@ The following are **deferred** and intentionally out of scope:
   root in effect, so the answer anchors to it. A folder change that keeps the
   root does not ask, and neither does a reload rejected as invalid: that
   keeps the old root, so an answer would anchor to a workspace the editor
-  has left. Asking has a price: a non-empty answer is applied like any pull,
+  has left. For the same reason an answer to a request asked at an earlier
+  root is dropped when it arrives: the root change that moved the session has
+  already queued a pull for the new one. Asking has a price: a non-empty answer is applied like any pull,
   so the reload's reparse of open documents and semantic-token refresh
   happen a second time, and one more layer is retained for later replays.
   Accepted, because a root change is rare next to an edit. The answer is
