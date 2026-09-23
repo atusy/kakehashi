@@ -6,7 +6,8 @@
 //!
 //! For most URIs (file://, https://, etc.), the virtual URI preserves the
 //! original scheme and directory. For "cannot-be-a-base" URIs (untitled:,
-//! mailto:, data:), a kakehashi:// scheme fallback is used.
+//! mailto:, data:) and hosts without a usable `url` form, a kakehashi://
+//! scheme fallback is used.
 
 use std::str::FromStr;
 
@@ -143,7 +144,8 @@ fn validated_rendering(
 /// - Format: `{scheme}:///{host_dir}/kakehashi-virtual-uri-{region_id}.{ext}`
 /// - Example: `file:///project/docs/kakehashi-virtual-uri-01ARZ3NDEKTSV4.lua`
 ///
-/// For cannot-be-a-base URIs (untitled:, mailto:, data:):
+/// For cannot-be-a-base URIs (untitled:, mailto:, data:) and hosts without a
+/// usable `url` form (see `HostBase::parse`):
 /// - Format: `kakehashi:///virtual/{encoded_host}/kakehashi-virtual-uri-{region_id}.{ext}`
 /// - Example: `kakehashi:///virtual/untitled%3AUntitled-1/kakehashi-virtual-uri-REGION.lua`
 #[derive(Debug, Clone)]
@@ -319,7 +321,8 @@ impl VirtualDocumentUri {
     /// preserving the host URI's scheme (file://, https://, …) and directory so
     /// downstream servers can resolve relative imports and discover project
     /// configs (pyproject.toml, tsconfig.json, …). Cannot-be-a-base host schemes
-    /// (untitled:, mailto:, data:) fall back to `kakehashi:///virtual/{encoded_host}/…`.
+    /// (untitled:, mailto:, data:) and hosts without a usable `url` form fall
+    /// back to `kakehashi:///virtual/{encoded_host}/…`.
     /// The distinctive prefix avoids real-file collisions; the ULID `region_id`
     /// gives global uniqueness and the language-derived extension lets servers
     /// like lua-language-server recognize the file type. On both paths the
@@ -345,15 +348,15 @@ impl VirtualDocumentUri {
         })
     }
 
-    /// The host-relative form, or `None` for a cannot-be-a-base host.
+    /// The host-relative form, or `None` for a host without a [`HostBase`].
     fn render_hierarchical(&self, filename: &EncodedFilename<'_>) -> Option<String> {
         // The host part is identical for every region of a host document, but
         // this function runs once per forwarded message — for a fence-heavy
         // document the repeated full URL parse was a measured tokio-side
         // hotspot (thousands of parses on the runtime). Cache it per host URI
         // (tiny map — one entry per open host document — and never stale: the
-        // value is a pure function of the key). Cannot-be-a-base hosts
-        // (untitled:, mailto:, data:) cache `None`.
+        // value is a pure function of the key). Hosts without a base
+        // (untitled:, mailto:, data:, see `HostBase::parse`) cache `None`.
         static HOST_BASES: std::sync::OnceLock<dashmap::DashMap<String, Option<HostBase>>> =
             std::sync::OnceLock::new();
         // Values are pure functions of the key, so eviction never risks
@@ -376,8 +379,8 @@ impl VirtualDocumentUri {
         rendered
     }
 
-    /// The `kakehashi:` form for hosts without a directory: every component is
-    /// percent-encoded, keeping the host URI for traceability.
+    /// The `kakehashi:` form for hosts without a [`HostBase`]: every component
+    /// is percent-encoded, keeping the host URI for traceability.
     fn render_fallback(&self, filename: &EncodedFilename<'_>) -> String {
         let encoded_host = percent_encoding::utf8_percent_encode(
             self.host_uri.as_str(),
@@ -1220,7 +1223,8 @@ mod properties {
     /// Host shapes covering the render paths and the host parts `Url` may
     /// re-serialize: root, drive letter, empty and escaped segments,
     /// userinfo/port/query, IPv6, empty path, fragment, escaped authority,
-    /// non-special and cannot-be-a-base.
+    /// non-special, cannot-be-a-base, re-serialized invalidly, and rejected
+    /// by `url`.
     const HOSTS: &[&str] = &[
         "file:///doc.md",
         "file:///project/docs/doc.md",
@@ -1228,6 +1232,7 @@ mod properties {
         "file:///a//doc.md",
         "file:///a%2Fb/doc.md",
         "file://h%7B/p/doc.md",
+        "https://h:99999/p/doc.md",
         "https://u:p@h:8080/p/doc.md?q=1",
         "http://[::1]/p/doc.md",
         "git:/x/doc.md",
