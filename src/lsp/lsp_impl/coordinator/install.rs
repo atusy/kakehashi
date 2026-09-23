@@ -339,8 +339,15 @@ impl InstallCoordinator {
             })
         })
         .await
-        // A probe that could not finish reached no answer, like a busy one.
-        .unwrap_or(QueryChainState::Busy);
+        .unwrap_or_else(|error| {
+            // A probe that panics would panic again on the next pass; reading
+            // it as busy would re-arm the check and respawn it every edit.
+            log::warn!(
+                target: "kakehashi::install",
+                "Query dependency check for {language:?} did not finish: {error}"
+            );
+            QueryChainState::Settled
+        });
         self.finish_query_repair_check(language, generation, state)
     }
 
