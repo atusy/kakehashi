@@ -193,8 +193,9 @@ impl Kakehashi {
         }
 
         // One pull at a time, with a burst collapsed into at most one trailing
-        // pull. Startup pulls, and so does every no-payload notification, so
-        // two can be in flight at once — and since the reload lock is only
+        // pull. Startup pulls, and so do every no-payload notification and
+        // every folder change that moves the root, so two can be in flight at
+        // once — and since the reload lock is only
         // taken once an answer arrives, the older answer could apply last and
         // merge its snapshot over the newer one.
         //
