@@ -3040,10 +3040,24 @@ impl LanguageServerPool {
         let shared_key = ConnectionKey::shared(server_name);
         // Clone the shared handle out under the lock, then probe its capability
         // and folder set without nesting the folder-set lock under `connections`.
-        let shared_handle = {
+        // Also note whether this root still has a per-root connection of its
+        // own: one diverted after consolidation already swept (a divert racing
+        // the registration), or revived by a command's routing token. Probed
+        // under the same guard, so it costs one lookup, not another lock.
+        let (shared_handle, per_root_live) = {
             let connections = self.connections.lock().await;
-            connections.get(&shared_key).map(Arc::clone)
+            (
+                connections.get(&shared_key).map(Arc::clone),
+                marker.is_some() && connections.contains_key(&per_root_key),
+            )
         };
+        // Such a straggler on a capable shared instance is a split nothing else
+        // would ever retire — consolidation runs once, on registration — and
+        // this root's documents are about to open on the shared key beside it.
+        let heal_straggler = per_root_live
+            && shared_handle
+                .as_ref()
+                .is_some_and(|handle| handle.supports_workspace_folder_changes());
 
         let key = match shared_handle {
             // A Ready shared connection without the folder-CHANGE
@@ -3082,6 +3096,9 @@ impl LanguageServerPool {
             // route to the shared instance.
             _ => shared_key,
         };
+        if heal_straggler {
+            self.consolidate_shared_instance(server_name).await;
+        }
 
         (marker, key)
     }
@@ -5559,6 +5576,36 @@ mod tests {
 
         let (_marker, key) = pool.resolve_acquire("lua", &config, Some(&doc)).await;
         assert_eq!(key, ConnectionKey::shared("lua"));
+    }
+
+    /// A per-root connection that outlived consolidation — a divert that
+    /// raced the registration, or one a command's routing token revived — is
+    /// retired by the next acquisition of its root, before that root's
+    /// documents open on the shared instance beside it (#968).
+    #[tokio::test]
+    async fn resolve_acquire_retires_a_straggling_divert_of_a_capable_shared() {
+        let (_tmp, doc) = marker_rooted_doc();
+        let pool = LanguageServerPool::new();
+        let config = shared_config();
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
+        shared.set_server_capabilities(Default::default());
+        register_folder_changes(&shared);
+        pool.insert_connection(shared).await;
+        let straggler_key = pool.connection_key("lua", &devnull_config(), Some(&doc));
+        assert!(!straggler_key.is_shared() && !straggler_key.is_client_fallback());
+        pool.insert_connection(
+            create_handle_with_key(ConnectionState::Ready, straggler_key.clone()).await,
+        )
+        .await;
+
+        let (_marker, key) = pool.resolve_acquire("lua", &config, Some(&doc)).await;
+
+        assert_eq!(key, ConnectionKey::shared("lua"));
+        assert!(
+            !pool.connections.lock().await.contains_key(&straggler_key),
+            "the root's own per-root process must not keep serving beside the shared one"
+        );
     }
 
     /// A Ready shared connection whose server never advertised the
