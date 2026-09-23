@@ -872,13 +872,12 @@ fn code_action_not_advertised_without_literal_support() {
         Value::Null,
         "codeActionProvider must be withheld without literal support"
     );
-    // executeCommand is gated on the same condition — commands only reach the
-    // bridge through a bridged code action, so it must be withheld too (pins
-    // the gating expression, not just the capability's presence).
+    // Inlay-hint label parts can carry commands without code-action support.
+    // Clients that gate execution on provider presence still need this provider.
     assert_eq!(
-        init_response["result"]["capabilities"]["executeCommandProvider"],
-        Value::Null,
-        "executeCommandProvider must be withheld without literal support"
+        init_response["result"]["capabilities"]["executeCommandProvider"]["commands"],
+        json!([]),
+        "command execution must not require code-action literal support"
     );
     shutdown(&mut client);
 }
