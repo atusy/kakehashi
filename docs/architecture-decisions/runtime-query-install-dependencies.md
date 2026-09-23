@@ -45,8 +45,15 @@ per language. This does not make an in-flight request track later settings
 changes automatically.
 
 Retain the language-level union and stage the discovered languages into the
-data directory, including parents already available elsewhere. The standalone
-CLI installation remains scoped to the data directory; this decision adds no
+data directory. An inherited parent whose base (non-`extends`) `highlights.scm`
+is readable on a search path outside the data directory is left to that path:
+the loader resolves it there, so it is neither downloaded nor required as a
+managed copy, but the parents it declares remain part of the chain. The same
+rule decides staging, completeness, and the pre-publication checks, so a
+user-provided parent absent upstream no longer fails the install. An overlay
+alone does not provide a parent.
+
+The standalone CLI installation remains scoped to the data directory; this decision adds no
 configuration discovery to that command. Explicit query-path lists, inline
 queries, bindings, and captures kinds remain outside installer discovery.
 
@@ -70,11 +77,12 @@ queries, bindings, and captures kinds remain outside installer discovery.
 1. Keep external parents manual. This avoids expanding the inputs that can
    trigger network access, but leaves the loader and installer inconsistent.
 2. Stage the union declared by configured runtime files into the data directory
-   (chosen). This extends the existing installation contract without teaching
-   it to treat unmanaged query files as installed artifacts.
+   (chosen). This extends the existing installation contract. Unmanaged query
+   files count only as the loader would read them: a base highlights query
+   that provides an inherited parent, never as a managed installation.
 3. Resolve completeness per query kind across all runtime paths. This could
-   avoid extra downloads and support custom parents absent upstream, but would
-   also require changing staging and concurrent publication checks consistently.
+   avoid extra downloads for kinds a parent does not need, but would also
+   require changing staging and concurrent publication checks consistently.
    It remains a separate design change, as discussed in #1060.
 
 ## Consequences
@@ -82,8 +90,9 @@ queries, bindings, and captures kinds remain outside installer discovery.
 An auto-install attempt can satisfy an external overlay's query dependencies.
 Configured runtime paths can now cause additional downloads, and the
 conservative union can still over-fetch or fail offline. A custom parent
-available only outside the data directory and absent upstream is not treated as
-an installed dependency. Users who maintain their query assets themselves can
+provided only by a base highlights query outside the data directory satisfies
+the chain; one that provides other kinds but no base highlights query does not.
+Users who maintain their query assets themselves can
 disable auto-install.
 
 No file watcher or automatic retry on overlay edits is introduced. An edit that
@@ -92,7 +101,9 @@ races the last dependency check may require another installation attempt.
 ## Confirmation
 
 Local HTTP fixtures cover external and transitive dependencies, optional
-parents, existing installations, unavailable parents, and forced replacement.
+parents, existing installations, unavailable parents, parents provided by a
+search path (including one absent upstream), overlay-only parents, and forced
+replacement.
 Completeness tests check that a missing overlay parent prevents an early
 success. Publication tests mutate an overlay after staging to verify that a
 new dependency visible before publication is rejected.

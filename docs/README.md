@@ -382,9 +382,11 @@ requested language's managed parser; `languages.<name>.base` aliases do not
 redirect installation to their base. Install or repair that base separately.
 
 The installer continues to collect dependencies per language across those two
-query kinds. It stages parents into the data directory even if a copy is
-available on another search path; this can fetch more than a particular query
-needs. A parent named by `bindings.scm` or a captures kind must still be put on
+query kinds, which can fetch more than a particular query needs. An inherited
+parent whose base (not `;; extends`) `highlights.scm` is already on a search
+path outside the data directory is used from there: it is neither downloaded
+nor required in the data directory, though the parents it names still are. An
+overlay alone does not count, so its base is still installed. A parent named by `bindings.scm` or a captures kind must still be put on
 a search path by hand. Inline queries and explicit query-path lists do not
 participate in this dependency discovery. This does not add file watching or
 trigger installation when an already-loaded language's overlay is edited.
