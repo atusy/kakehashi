@@ -1586,3 +1586,227 @@ fn e2e_downstream_refresh_gated_off_for_refresh_incapable_client() {
     client.send_request("shutdown", json!(null));
     client.send_notification("exit", json!(null));
 }
+
+// ---------------------------------------------------------------------------
+// #916: `aggregation.<method>.priorities` is an allowlist over server names —
+// and it now also gates what a server PUSHES, not only what kakehashi
+// dispatches. Each surface is gated by its own method key: the proactive
+// `publishDiagnostics` by `textDocument/publishDiagnostics`, the client-pull
+// fold by `textDocument/diagnostic`.
+// ---------------------------------------------------------------------------
+
+/// Host line of the lua fence content in [`MD_MIXED_TEXT`].
+const MIXED_LUA_LINE: i64 = 3;
+/// Host line of the python fence content in [`MD_MIXED_TEXT`].
+const MIXED_PYTHON_LINE: i64 = 7;
+/// [`MD_MIXED_TEXT`] with only the python fence's content edited, so the
+/// python virtual document gets a `didChange` (and the mock re-pushes empty
+/// for it) while the lua region is untouched.
+const MD_MIXED_TEXT_PYTHON_EDITED: &str =
+    "# Test\n\n```lua\nlocal x = 1\n```\n\n```python\nprint('y')\n```\n";
+
+/// Start kakehashi with one push-only `mock-push` serving lua AND python, and
+/// the given `languages.markdown.bridge` table.
+fn init_mixed_push_client(bridge: Value) -> (LspClient, tempfile::TempDir) {
+    let config_dir = tempfile::TempDir::new().expect("temp dir");
+    let config_path = config_dir.path().join("push_priorities.toml");
+    std::fs::write(&config_path, "").expect("write config");
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("utf8 path"))
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-push": {
+                        "cmd": [mock_bin(), "diagnostics-push"],
+                        "languages": ["lua", "python"]
+                    }
+                },
+                "languages": { "markdown": { "bridge": bridge } }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    (client, config_dir)
+}
+
+/// Whether `diagnostics` holds a mock push anchored on host `line`.
+fn has_mock_push_on_line(diagnostics: &[Value], line: i64) -> bool {
+    diagnostics
+        .iter()
+        .any(|d| is_mock_push(d) && d["range"]["start"]["line"] == json!(line))
+}
+
+/// Pull the host until the response satisfies `ready`, returning its items.
+/// A positive wait: the cached pushes it waits for are recorded by the reader
+/// independently of any gate under test.
+fn pull_until(client: &mut LspClient, ready: impl Fn(&[Value]) -> bool) -> Vec<Value> {
+    let mut last = Vec::new();
+    for _ in 0..150 {
+        let response = client.send_request(
+            "textDocument/diagnostic",
+            json!({ "textDocument": { "uri": MD_URI } }),
+        );
+        last = response["result"]["items"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if ready(&last) {
+            return last;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("the pull never became ready; last items: {last:?}");
+}
+
+#[test]
+fn e2e_publish_priorities_exclude_a_pushing_server_from_the_region_publish() {
+    // lua's publish allowlist names only a server that is not `mock-push`, so
+    // the mock's lua push must not reach the editor's publishDiagnostics —
+    // while its python push (no restriction) still does.
+    let (mut client, _config_dir) = init_mixed_push_client(json!({
+        "lua": {
+            "aggregation": {
+                "textDocument/publishDiagnostics": { "priorities": ["pyright"] }
+            }
+        }
+    }));
+    open_host_with_text(&mut client, MD_MIXED_TEXT);
+
+    // Both pushes are recorded: the pull key is unrestricted, so the pull fold
+    // shows each (this is also the per-key control — the publish key must not
+    // leak into the pull surface).
+    pull_until(&mut client, |items| {
+        has_mock_push_on_line(items, MIXED_LUA_LINE)
+            && has_mock_push_on_line(items, MIXED_PYTHON_LINE)
+    });
+
+    // Force a publish after both slots are cached: editing the python fence
+    // makes the mock clear its python push.
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": MD_URI, "version": 2 },
+            "contentChanges": [{ "text": MD_MIXED_TEXT_PYTHON_EDITED }]
+        }),
+    );
+    let (_, published) = client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            |params| {
+                params["uri"] == json!(MD_URI)
+                    && params["diagnostics"]
+                        .as_array()
+                        .is_some_and(|ds| !has_mock_push_on_line(ds, MIXED_PYTHON_LINE))
+            },
+        )
+        .expect("clearing the python push must republish the host");
+    let diagnostics = published["diagnostics"].as_array().unwrap();
+    assert!(
+        !has_mock_push_on_line(diagnostics, MIXED_LUA_LINE),
+        "a server outside lua's publishDiagnostics priorities must not publish there: \
+         {diagnostics:?}"
+    );
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+#[test]
+fn e2e_pull_priorities_exclude_a_pushing_server_from_the_pull_fold() {
+    // lua's pull allowlist excludes `mock-push`: its cached lua push must not
+    // be folded into the client-pull answer, while python's still is.
+    let (mut client, _config_dir) = init_mixed_push_client(json!({
+        "lua": {
+            "aggregation": {
+                "textDocument/diagnostic": { "priorities": ["pyright"] }
+            }
+        }
+    }));
+    open_host_with_text(&mut client, MD_MIXED_TEXT);
+
+    // The publish key is unrestricted, so the lua push reaching the editor
+    // proves its slot is cached before the pull below.
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            |params| {
+                params["uri"] == json!(MD_URI)
+                    && params["diagnostics"]
+                        .as_array()
+                        .is_some_and(|ds| has_mock_push_on_line(ds, MIXED_LUA_LINE))
+            },
+        )
+        .expect("the unrestricted publish must carry the lua push");
+
+    let items = pull_until(&mut client, |items| {
+        has_mock_push_on_line(items, MIXED_PYTHON_LINE)
+    });
+    assert!(
+        !has_mock_push_on_line(&items, MIXED_LUA_LINE),
+        "a server outside lua's textDocument/diagnostic priorities must not be folded \
+         into the pull: {items:?}"
+    );
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+#[test]
+fn e2e_priorities_change_retracts_an_already_published_push() {
+    // A config change that excludes a server must retract what it already
+    // pushed, without waiting for it to push again.
+    let (mut client, _config_dir) = init_mixed_push_client(json!({ "lua": {} }));
+    open_host(&mut client);
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            has_pushed_diag,
+        )
+        .expect("precondition: the unrestricted lua push is published");
+
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": {
+                "kakehashi": {
+                    "languages": {
+                        "markdown": {
+                            "bridge": {
+                                "lua": {
+                                    "aggregation": {
+                                        "textDocument/publishDiagnostics": {
+                                            "priorities": ["pyright"]
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }),
+    );
+
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            cleared_host_diag,
+        )
+        .expect("excluding the server must republish the host without its push");
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
