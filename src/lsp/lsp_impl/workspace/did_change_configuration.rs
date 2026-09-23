@@ -207,6 +207,15 @@ impl Kakehashi {
         // trigger would lose the change until the next one. A rejected trigger
         // is recorded instead, and whoever holds the claim runs one more pull
         // before letting go.
+        //
+        // The handoff is two separate atomics, not one compare-and-swap, and
+        // that is sound only because neither side awaits in its window: a
+        // failed claim marks `pending` before yielding, and the owner releases
+        // the claim and reads `pending` before yielding. Every caller runs
+        // inside a service future (`initialized`, `didChangeConfiguration`,
+        // `didChangeWorkspaceFolders`), and tower-lsp polls all of those from
+        // one task, so the two windows cannot interleave. Calling this from a
+        // spawned task would break that, and needs a real handoff first.
         loop {
             {
                 let Some(_in_flight) = SingleFlightPull::claim(&self.configuration_pull_in_flight)
