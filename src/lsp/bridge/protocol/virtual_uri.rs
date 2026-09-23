@@ -1070,19 +1070,28 @@ mod tests {
     fn normal_path_encodes_characters_ls_types_rejects() {
         // `PathSegmentsMut::push` left these literal, so `to_lsp_uri` fell back
         // to the host URI and the region aliased its host document downstream.
-        for (host, language, filename) in [
-            ("file:///p/doc.md", "a|b", "kakehashi-virtual-uri-R.a%7Cb"),
+        // Full strings: the kakehashi: form would also end with the filename.
+        for (host, language, expected) in [
+            (
+                "file:///p/doc.md",
+                "a|b",
+                "file:///p/kakehashi-virtual-uri-R.a%7Cb",
+            ),
             (
                 "file:///p/doc.md",
                 "a[b]^",
-                "kakehashi-virtual-uri-R.a%5Bb%5D%5E",
+                "file:///p/kakehashi-virtual-uri-R.a%5Bb%5D%5E",
             ),
-            ("git:/p/doc.md", "a\\b", "kakehashi-virtual-uri-R.a%5Cb"),
+            (
+                "git:/p/doc.md",
+                "a\\b",
+                "git:/p/kakehashi-virtual-uri-R.a%5Cb",
+            ),
         ] {
             let host_uri: Uri = host.parse().unwrap();
             let virtual_uri = VirtualDocumentUri::new(&host_uri, language, "R");
             let rendered = virtual_uri.to_uri_string();
-            assert!(rendered.ends_with(filename), "{rendered}");
+            assert_eq!(rendered, expected);
             assert_eq!(virtual_uri.to_lsp_uri().as_str(), rendered);
         }
     }
@@ -1150,13 +1159,15 @@ mod properties {
     use tower_lsp_server::ls_types::Uri;
 
     /// Host shapes covering the render paths and the host parts `Url` may
-    /// re-serialize: root, drive letter, userinfo/port/query, IPv6, empty
-    /// path, fragment, escaped authority, non-special and cannot-be-a-base.
+    /// re-serialize: root, drive letter, empty and escaped segments,
+    /// userinfo/port/query, IPv6, empty path, fragment, escaped authority,
+    /// non-special and cannot-be-a-base.
     const HOSTS: &[&str] = &[
         "file:///doc.md",
         "file:///project/docs/doc.md",
         "file:///C:/x/doc.md",
         "file:///a//doc.md",
+        "file:///a%2Fb/doc.md",
         "https://u:p@h:8080/p/doc.md?q=1",
         "http://[::1]/p/doc.md",
         "git:/x/doc.md",
@@ -1224,6 +1235,23 @@ mod properties {
             let host_url = url::Url::parse(host.as_str())
                 .ok()
                 .filter(|url| !url.cannot_be_a_base());
+            match &host_url {
+                // Same scheme, authority and directory, byte for byte.
+                Some(host_url) => {
+                    prop_assert_eq!(
+                        &rendered_url[..url::Position::BeforePath],
+                        &host_url[..url::Position::BeforePath]
+                    );
+                    let directory = |path: &str| {
+                        path.rfind('/').map_or(String::new(), |slash| path[..slash].to_string())
+                    };
+                    prop_assert_eq!(
+                        directory(rendered_url.path()),
+                        directory(host_url.path())
+                    );
+                }
+                None => prop_assert!(rendered.starts_with("kakehashi:///virtual/")),
+            }
             prop_assert_eq!(
                 rendered_url.query(),
                 host_url.as_ref().and_then(url::Url::query)
