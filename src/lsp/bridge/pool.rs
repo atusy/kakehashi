@@ -2035,12 +2035,33 @@ impl LanguageServerPool {
     /// roots a dead shared instance was serving died with its folder set, and
     /// this path has no document to re-derive any root from. Routing to a
     /// *live* shared connection works; only reviving a dead one is refused.
+    ///
+    /// A dead MARKER key of a `preferSharedInstance` server whose shared
+    /// instance is now folder-change capable is a divert that consolidation
+    /// retired (#968): its root now routes to the shared instance, which is
+    /// where its documents were re-opened, so the command goes there instead
+    /// of reviving a per-root process that holds nothing.
     pub(super) async fn reconnect_by_key(
         &self,
         key: &ConnectionKey,
         config: &crate::config::settings::BridgeServerConfig,
     ) -> Option<Arc<ConnectionHandle>> {
         let server = key.server();
+        if config.prefers_shared_instance() && !key.is_shared() && !key.is_client_fallback() {
+            let shared = {
+                let connections = self.connections.lock().await;
+                connections
+                    .get(&ConnectionKey::shared(server))
+                    .map(Arc::clone)
+            };
+            if let Some(shared) = shared
+                && shared.state() == ConnectionState::Ready
+                && shared.supports_workspace_folder_changes()
+                && shared.matches_launch_config(config)
+            {
+                return Some(shared);
+            }
+        }
         // A connection can exist under this key and simply not be Ready yet —
         // `ready_connection_by_key_for_config` filters on Ready, so a respawn mid-handshake
         // lands here. Wait it out rather than spawn a second process: this is the
@@ -5677,6 +5698,29 @@ mod tests {
     /// naming a DEAD shared connection is refused rather than revived (which
     /// marker roots it was serving died with its folder set). The next document
     /// acquisition revives the instance; commands fail soft until then.
+    /// A routing token minted by a divert that consolidation has since
+    /// retired names a dead per-root key; its root now routes to the capable
+    /// shared instance, so the command goes there rather than reviving an
+    /// empty per-root process nothing would ever retire again (#968).
+    #[tokio::test]
+    async fn reconnect_by_key_routes_a_consolidated_divert_to_the_shared_instance() {
+        let pool = LanguageServerPool::new();
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
+        shared.set_server_capabilities(Default::default());
+        register_folder_changes(&shared);
+        pool.insert_connection(Arc::clone(&shared)).await;
+        let retired = ConnectionKey::new("lua", Some("file:///repo/b".to_string()));
+
+        let handle = pool
+            .reconnect_by_key(&retired, &shared_config())
+            .await
+            .expect("the shared instance serves the consolidated root");
+
+        assert!(Arc::ptr_eq(&handle, &shared));
+        assert!(!pool.connections.lock().await.contains_key(&retired));
+    }
+
     #[tokio::test]
     async fn reconnect_by_key_refuses_a_dead_shared_key() {
         let pool = LanguageServerPool::new();
