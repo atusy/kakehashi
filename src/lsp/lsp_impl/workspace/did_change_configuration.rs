@@ -8,6 +8,7 @@ use serde_json::Value;
 use tower_lsp_server::ls_types::{ConfigurationItem, DidChangeConfigurationParams};
 
 use crate::config::{RawWorkspaceSettings, WorkspaceSettings, merge_workspace_settings};
+use crate::error::LockResultExt;
 
 use super::super::{Kakehashi, lock_settings_reload};
 
@@ -497,10 +498,10 @@ impl Kakehashi {
                 // Remembered under the same reload transaction that publishes
                 // the merged settings, so a concurrent workspace-root change
                 // cannot rebuild the layers from a half-updated override.
-                self.client_settings_overrides
+                self.client_layers
                     .write()
-                    .expect("client settings overrides lock poisoned")
-                    .push(replay_layer);
+                    .recover_poison("client_layers push")
+                    .append_pushed(replay_layer);
                 let warnings = Self::misconfigured_settings_warnings(&settings);
                 self.apply_raw_settings_locked(&reload, merged_ts, settings)
                     .await;

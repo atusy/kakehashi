@@ -3,6 +3,7 @@
 use tower_lsp_server::ls_types::DidChangeWorkspaceFoldersParams;
 
 use crate::config::WorkspaceSettings;
+use crate::error::LockResultExt;
 use crate::lsp::load_settings_with_client_layers;
 
 use super::super::{Kakehashi, lifecycle::config_root_after_folder_change, lock_settings_reload};
@@ -78,10 +79,10 @@ impl Kakehashi {
         // the new root over the old snapshot, so the next pushed layer would
         // anchor to a workspace the settings in effect know nothing about.
         let client_overrides = self
-            .client_settings_overrides
+            .client_layers
             .read()
-            .expect("client settings overrides lock poisoned")
-            .clone();
+            .recover_poison("client_layers replay")
+            .to_fold_order();
         let outcome = load_settings_with_client_layers(
             root_path.as_deref(),
             client_overrides,

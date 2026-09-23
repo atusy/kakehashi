@@ -25,6 +25,7 @@ use url::Url;
 
 use crate::analysis::{LEGEND_MODIFIERS, LEGEND_TYPES};
 use crate::config::WorkspaceSettings;
+use crate::error::LockResultExt;
 use crate::lsp::client::check_semantic_tokens_refresh_support;
 use crate::lsp::{SettingsSource, load_settings};
 
@@ -472,14 +473,15 @@ impl Kakehashi {
             (raw_settings, settings)
         };
         *self
-            .client_settings_overrides
+            .client_layers
             .write()
-            .expect("client settings overrides lock poisoned") = initialization_merge_was_accepted
-            .then_some(initialization_options)
-            .flatten()
-            .and_then(|value| serde_json::from_value(value).ok())
-            .into_iter()
-            .collect();
+            .recover_poison("client_layers initialize") =
+            super::client_layers::ClientLayers::from_initialization_options(
+                initialization_merge_was_accepted
+                    .then_some(initialization_options)
+                    .flatten()
+                    .and_then(|value| serde_json::from_value(value).ok()),
+            );
         // Derive the onTypeFormatting trigger union before settings move into
         // apply_raw_settings: kakehashi cannot know downstream trigger
         // characters at initialize time (servers spawn lazily), so the

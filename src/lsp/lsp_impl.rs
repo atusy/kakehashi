@@ -1,6 +1,7 @@
 mod apply_edit_translation;
 pub(crate) mod bridge_context;
 mod cli;
+mod client_layers;
 mod coordinator;
 mod settle_retry;
 pub(crate) use coordinator::DiagnosticPublisher;
@@ -348,7 +349,7 @@ pub struct Kakehashi {
     /// Ordered client-supplied settings layers kept separate from the merged
     /// effective snapshot so a workspace-root change can replay clears as well
     /// as values without carrying the previous project's layer forward.
-    client_settings_overrides: std::sync::RwLock<Vec<RawWorkspaceSettings>>,
+    client_layers: std::sync::RwLock<client_layers::ClientLayers>,
     /// Explicit config layers retained after their single allowed read, so a
     /// workspace-root change can replay relative client layers above them.
     explicit_config: std::sync::OnceLock<Option<crate::lsp::settings::ExplicitConfig>>,
@@ -506,7 +507,7 @@ impl Kakehashi {
             documents: std::sync::Arc::new(DocumentStore::new()),
             cache: std::sync::Arc::new(CacheCoordinator::new()),
             settings_manager: std::sync::Arc::new(SettingsManager::new()),
-            client_settings_overrides: std::sync::RwLock::new(Vec::new()),
+            client_layers: std::sync::RwLock::default(),
             explicit_config: std::sync::OnceLock::new(),
             auto_install,
             bridge: std::sync::Arc::new(bridge),
