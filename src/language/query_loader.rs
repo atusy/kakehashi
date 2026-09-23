@@ -96,7 +96,11 @@ pub(crate) fn format_search_paths<P: AsRef<Path>>(paths: &[P]) -> String {
             if i > 0 {
                 buf.push_str(", ");
             }
-            let _ = write!(buf, "{}", p.as_ref().display());
+            let _ = write!(
+                buf,
+                "{}",
+                escape_terminal_controls(&p.as_ref().to_string_lossy())
+            );
         }
         buf.push(']');
         buf
@@ -168,7 +172,7 @@ impl QueryLoader {
         if visited.contains(lang_name) {
             return Err(LspError::query(format!(
                 "Circular inheritance detected for language '{}'",
-                lang_name
+                escape_terminal_controls(lang_name)
             ))
             .into());
         }
@@ -188,7 +192,7 @@ impl QueryLoader {
             let content = fs::read_to_string(path).map_err(|e| {
                 LspError::query(format!(
                     "Failed to read query file {}: {}",
-                    path.display(),
+                    escape_terminal_controls(&path.to_string_lossy()),
                     e
                 ))
             })?;
@@ -217,7 +221,7 @@ impl QueryLoader {
             } else {
                 debug!(
                     "Query file {} is shadowed by an earlier search path (mark it `;; extends` to merge it)",
-                    path.display()
+                    escape_terminal_controls(&path.to_string_lossy())
                 );
             }
         }
@@ -242,9 +246,9 @@ impl QueryLoader {
                     return Err(LspError::query(format!(
                         "Query file {} not found for language {} (inherited by {} in {}) in search paths: {}",
                         file_name,
-                        parent,
-                        lang_name,
-                        declared_in.display(),
+                        escape_terminal_controls(parent),
+                        escape_terminal_controls(lang_name),
+                        escape_terminal_controls(&declared_in.to_string_lossy()),
                         format_search_paths(runtime_bases)
                     ))
                     .into());
@@ -277,7 +281,7 @@ impl QueryLoader {
                 Err(e) => {
                     return Err(LspError::query(format!(
                         "Failed to read query file {}: {e}",
-                        normalized_path.display()
+                        escape_terminal_controls(&normalized_path.to_string_lossy())
                     )));
                 }
             }

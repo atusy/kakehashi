@@ -1038,7 +1038,8 @@ impl LanguageCoordinator {
             Err(crate::language::query_loader::QueryLoadError::NotFound) => {
                 debug!(
                     "Query file {}/{} not found in search paths (this is normal if not provided)",
-                    ctx.language_id, filename
+                    escape_terminal_controls(ctx.language_id),
+                    filename
                 );
                 return;
             }
@@ -1048,19 +1049,19 @@ impl LanguageCoordinator {
                     format!(
                         "Failed to load {} query for {}: {err}",
                         ctx.query_kind.name(),
-                        ctx.language_id
+                        escape_terminal_controls(ctx.language_id)
                     ),
                 ));
                 return;
             }
         };
 
-        let query_label = format!("{}/{}", ctx.language_id, filename);
+        let query_label = format!("{}/{}", escape_terminal_controls(ctx.language_id), filename);
         let success_prefix = format!(
             "{} {} for {}",
             context,
             ctx.query_kind.name(),
-            ctx.language_id
+            escape_terminal_controls(ctx.language_id)
         );
         self.process_query_result(result, &query_label, &success_prefix, events, insert_fn);
     }
@@ -1082,18 +1083,22 @@ impl LanguageCoordinator {
                     format!(
                         "Failed to load {} query for {}: {err}",
                         ctx.query_kind.name(),
-                        ctx.language_id
+                        escape_terminal_controls(ctx.language_id)
                     ),
                 ));
                 return;
             }
         };
 
-        let query_label = format!("{} {} query", ctx.language_id, ctx.query_kind.name());
+        let query_label = format!(
+            "{} {} query",
+            escape_terminal_controls(ctx.language_id),
+            ctx.query_kind.name()
+        );
         let success_prefix = format!(
             "{} query loaded for {}",
             ctx.query_kind.name(),
-            ctx.language_id
+            escape_terminal_controls(ctx.language_id)
         );
         self.process_query_result(result, &query_label, &success_prefix, events, insert_fn);
     }
@@ -2140,6 +2145,32 @@ mod tests {
         let (resolved, load_result) = result.unwrap();
         assert_eq!(resolved, "bash");
         assert!(load_result.success);
+    }
+
+    #[test]
+    fn query_messages_escape_names_without_changing_store_identity() {
+        let coordinator = LanguageCoordinator::new();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("highlights.scm");
+        std::fs::write(&path, "(identifier) @variable").unwrap();
+        let name = "日本語\n\u{1b}[31m\u{202e}";
+        let events = coordinator.load_unified_queries(
+            name,
+            &[crate::config::settings::QueryItem {
+                path: path.to_str().unwrap().to_owned(),
+                kind: Some(QueryKind::Highlights),
+            }],
+            &tree_sitter_rust::LANGUAGE.into(),
+        );
+        assert!(coordinator.highlight_query(name).is_some());
+        let LanguageEvent::Log { message, .. } = &events[0] else {
+            panic!("expected successful query log");
+        };
+        assert!(
+            message.contains(r"日本語\n\u{1b}[31m\u{202e}"),
+            "{message:?}"
+        );
+        assert!(!message.chars().any(char::is_control));
     }
 
     #[test]
