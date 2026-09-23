@@ -52,15 +52,22 @@ pub(crate) fn supports_initial_workspace_folders(caps: &ServerCapabilities) -> b
         .is_some_and(|folders| folders.supported == Some(true))
 }
 
-/// Whether `caps` advertises everything the shared-instance opt-in (#391)
-/// needs to drive one connection across roots via
+/// The notification a server can register dynamically instead of declaring
+/// `workspace.workspaceFolders.changeNotifications` statically (#968).
+pub(crate) const DID_CHANGE_WORKSPACE_FOLDERS_METHOD: &str = "workspace/didChangeWorkspaceFolders";
+
+/// Whether `caps` STATICALLY advertises everything the shared-instance opt-in
+/// (#391) needs to drive one connection across roots via
 /// `workspace/didChangeWorkspaceFolders`: `workspace.workspaceFolders` with
 /// `supported == true` AND `changeNotifications` set to a value other than the
 /// explicit `false` (either `true` or a registration id string). Anything
-/// missing or `Left(false)` means the server will not act on folder-change
-/// notifications, so the bridge diverts new, unserved marker roots to
-/// per-root instances — roots the connection already serves (its spawn root,
-/// and initialize-listed folders under `supported == true`) and marker-less
+/// missing or `Left(false)` means the `InitializeResult` alone does not
+/// promise folder-change handling — the server may still register the
+/// notification dynamically, which
+/// [`ConnectionHandle::supports_workspace_folder_changes`] also consults.
+/// Without either, the bridge diverts new, unserved marker roots to per-root
+/// instances — roots the connection already serves (its spawn root, and
+/// initialize-listed folders under `supported == true`) and marker-less
 /// riders stay on the shared connection (`incapable_shared_serves`).
 pub(crate) fn supports_workspace_folder_changes(caps: &ServerCapabilities) -> bool {
     let Some(folders) = caps
@@ -721,14 +728,33 @@ impl ConnectionHandle {
         &self.workspace_folders
     }
 
-    /// Whether the downstream server advertised support for receiving
-    /// `workspace/didChangeWorkspaceFolders` notifications — the capability
-    /// the shared-instance opt-in (#391) requires. Returns `false` until the
-    /// initialize handshake stores capabilities, so a still-initializing
-    /// connection is treated as not-yet-capable.
+    /// Whether the downstream server wants `workspace/didChangeWorkspaceFolders`
+    /// notifications — the capability the shared-instance opt-in (#391) and
+    /// the upstream folder-change forwarding both require. Either declaration
+    /// counts: the static `InitializeResult` shape
+    /// ([`supports_workspace_folder_changes`]) or a live dynamic registration
+    /// of the notification (Pyright-style, #968). Returns `false` until the
+    /// initialize handshake stores capabilities or a registration arrives, so
+    /// a still-initializing connection is treated as not-yet-capable.
+    ///
+    /// The registry is read live rather than latched, even though the
+    /// capability is treated as effectively monotone: an `unregisterCapability`
+    /// for the method really withdraws it. Latching would keep forwarding
+    /// notifications to a server that opted out; reading live instead lets the
+    /// next upstream folder change find the connection incapable and recycle
+    /// it through the ordinary invalidate path — bounded staleness, no
+    /// ordering between registration and folder-change handling. A check that
+    /// races an in-flight registration just sees the older answer, whose worst
+    /// case is what the static-only check did unconditionally (a spurious
+    /// recycle or divert). The registry's lock is a leaf: its writer, the
+    /// reader task's register handler, never holds `connections`, so reading
+    /// it under `connections` cannot invert an order.
     pub(crate) fn supports_workspace_folder_changes(&self) -> bool {
         self.server_capabilities()
             .is_some_and(supports_workspace_folder_changes)
+            || self
+                .dynamic_capabilities
+                .has_registration(DID_CHANGE_WORKSPACE_FOLDERS_METHOD)
     }
 
     /// Whether the server declared `workspace.workspaceFolders.supported`,
