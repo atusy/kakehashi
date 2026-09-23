@@ -1712,6 +1712,24 @@ impl LanguageServerPool {
         self.finish_all_host_routing(host_uri);
     }
 
+    /// Forget the routing decided for one connection's copy of a virtual
+    /// document, keeping every other server's decision for the same URI.
+    /// Exact-key removals, unlike the whole-URI scans of
+    /// [`Self::clear_host_document_routing`].
+    pub(crate) fn clear_virtual_routing_for_connection(
+        &self,
+        virtual_uri: &Url,
+        connection_key: &ConnectionKey,
+    ) {
+        let by_connection = (virtual_uri.to_string(), connection_key.clone());
+        self.host_routing_suppressed.remove(&by_connection);
+        self.host_routing_decided.remove(&by_connection);
+        let by_server = (by_connection.0, connection_key.server().to_string());
+        self.host_routing_by_server.remove(&by_server);
+        self.host_routing_workspace_folders.remove(&by_server);
+        self.host_routing_rootless.remove(&by_server);
+    }
+
     pub(crate) fn clear_host_routing_for_connection(&self, connection_key: &ConnectionKey) {
         self.host_routing_suppressed
             .retain(|(_, key), _| key != connection_key);

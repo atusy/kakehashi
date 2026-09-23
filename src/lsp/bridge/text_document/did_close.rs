@@ -15,6 +15,17 @@ use super::super::pool::{
 };
 use super::super::protocol::{VirtualDocumentUri, build_didclose_notification};
 
+/// Which routing decisions a close forgets.
+#[derive(Clone, Copy)]
+enum RoutingForget {
+    /// Every server's decision for the URI: the region itself is gone or
+    /// replaced, so every copy of it is being closed.
+    WholeUri,
+    /// Only the closed connection's: other servers keep serving the same
+    /// region (or stay routed away from it), and their decisions still hold.
+    ThisConnection,
+}
+
 impl LanguageServerPool {
     /// Send a didClose notification for a virtual document.
     ///
@@ -155,8 +166,17 @@ impl LanguageServerPool {
     /// connection and purges its generation, preventing orphaned downstream and
     /// provenance state from accumulating.
     pub(crate) async fn close_single_virtual_doc(&self, doc: &OpenedVirtualDoc) {
+        self.close_virtual_doc(doc, RoutingForget::WholeUri).await;
+    }
+
+    async fn close_virtual_doc(&self, doc: &OpenedVirtualDoc, forget: RoutingForget) {
         if let Ok(uri) = url::Url::parse(&doc.virtual_uri.to_uri_string()) {
-            self.clear_host_routing_suppression(&uri);
+            match forget {
+                RoutingForget::WholeUri => self.clear_host_routing_suppression(&uri),
+                RoutingForget::ThisConnection => {
+                    self.clear_virtual_routing_for_connection(&uri, &doc.connection_key)
+                }
+            }
         }
         let handle = self.connection_for_didclose(&doc.connection_key).await;
         let transition = self.open_transition_lock(&doc.virtual_uri, &doc.connection_key);
@@ -291,7 +311,8 @@ impl LanguageServerPool {
             .take_host_virtual_docs_where(host_uri, |doc| !is_selected(doc))
             .await;
         for doc in &to_close {
-            self.close_single_virtual_doc(doc).await;
+            self.close_virtual_doc(doc, RoutingForget::ThisConnection)
+                .await;
         }
         to_close
     }
