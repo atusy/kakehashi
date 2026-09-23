@@ -49,13 +49,16 @@ per language. This does not make an in-flight request track later settings
 changes automatically.
 
 Retain the language-level union and stage the discovered languages into the
-data directory. An inherited parent whose base (non-`extends`) `highlights.scm`
-is readable on a search path outside the data directory is left to that path:
-the loader resolves it there, so it is neither downloaded nor required as a
-managed copy, but the parents it declares remain part of the chain. The same
-rule decides staging, completeness, and the pre-publication checks, so a
-user-provided parent absent upstream no longer fails the install. An overlay
-alone does not provide a parent. An unreadable runtime file declares nothing:
+data directory, including parents a search path also provides: the loader
+resolves each query kind separately, so a runtime highlights base does not
+supply the other kinds an upstream copy would. Only a parent upstream does not
+publish (a 404 for its highlights query) is left to a search path outside the
+data directory that has a readable base (non-`extends`) `highlights.scm` for
+it; it is then neither copied nor locked, and the parents it declares remain
+part of the chain. Completeness and the pre-publication checks accept such a
+provided parent when the data directory has no complete copy, so a
+user-provided parent absent upstream no longer fails the install or requests
+repair. An overlay alone does not provide a parent. An unreadable runtime file declares nothing:
 the loader fails only that query kind and no download can repair it, so it
 must not block the install. The managed copy stays strict.
 
@@ -85,7 +88,8 @@ queries, bindings, and captures kinds remain outside installer discovery.
 2. Stage the union declared by configured runtime files into the data directory
    (chosen). This extends the existing installation contract. Unmanaged query
    files count only as the loader would read them: a base highlights query
-   that provides an inherited parent, never as a managed installation.
+   that provides an inherited parent upstream lacks, never as a managed
+   installation.
 3. Resolve completeness per query kind across all runtime paths. This could
    avoid extra downloads for kinds a parent does not need, but would also
    require changing staging and concurrent publication checks consistently.
@@ -98,6 +102,10 @@ Configured runtime paths can now cause additional downloads, and the
 conservative union can still over-fetch or fail offline. A custom parent
 provided only by a base highlights query outside the data directory satisfies
 the chain; one that provides other kinds but no base highlights query does not.
+Completeness is judged per language, not per kind: when the managed copy of an
+upstream parent is missing and a search path provides only its highlights
+base, a kind it lacks there (such as its injections) is not detected as
+missing.
 Users who maintain their query assets themselves can
 disable auto-install.
 

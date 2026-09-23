@@ -1160,26 +1160,6 @@ fn stage_queries_recursive(
 
     let queries_dir = data_dir.join("queries").join(language);
     let queries_parent = data_dir.join("queries");
-    // A parent the loader resolves from a search path is left there: fetching
-    // it would fail for a user's own language absent upstream, and nothing
-    // here would read the copy. Only its declarations join the chain. Decided
-    // before the tombstone clear, since nothing is installed for it.
-    if role.is_included()
-        && !query_install_is_complete(&queries_dir)
-        && provided_outside_data_dir(&queries_parent, language, search_paths)
-    {
-        visits.external.insert(language.to_string());
-        let parents = inherited_languages_with_search_paths(&queries_dir, language, search_paths)
-            .ok_or_else(|| {
-            QueryInstallError::IoError(std::io::Error::other(format!(
-                "cannot read the runtime query files for '{language}' to find what it inherits"
-            )))
-        })?;
-        for parent in required_parents(parents, true) {
-            stage_queries_recursive(source, &parent, StageRole::Parent, visits, entries)?;
-        }
-        return Ok(StageOutcome::NothingToDo);
-    }
 
     // Clear any uninstall tombstone here rather than at the call sites, so a
     // language the graph reaches twice — a cycle, or two languages sharing a
@@ -1243,6 +1223,23 @@ fn stage_queries_recursive(
                 // highlights.scm is required, others are optional
                 if *query_file == "highlights.scm" {
                     return match e {
+                        // A parent upstream does not publish, such as a
+                        // user's own language, is left to the search path
+                        // that provides it. Only when upstream lacks it: the
+                        // loader resolves each kind separately, and a
+                        // provided highlights base says nothing about the
+                        // other kinds an upstream copy would supply.
+                        QueryInstallError::HttpStatus { code: 404, .. }
+                            if role.is_included()
+                                && provided_outside_data_dir(
+                                    &queries_parent,
+                                    language,
+                                    search_paths,
+                                ) =>
+                        {
+                            drop(staged_dir);
+                            stage_provided_parent(source, language, visits, entries)
+                        }
                         QueryInstallError::HttpStatus { code: 404, .. } => Err(
                             QueryInstallError::LanguageNotSupported(language.to_string()),
                         ),
@@ -1288,6 +1285,32 @@ fn stage_queries_recursive(
     entries.push(staged_dir);
 
     Ok(StageOutcome::Staged { files_downloaded })
+}
+
+/// Record a parent a search path provides and walk the parents it declares.
+///
+/// Nothing is published for it, so it is neither locked nor copied; the
+/// uninstall tombstone cleared for it before the fetch was an old uninstall's
+/// leftover under its lock, and nothing here republishes the language.
+fn stage_provided_parent(
+    source: &QueryDependencySource<'_>,
+    language: &str,
+    visits: &mut StageVisits<'_>,
+    entries: &mut Vec<StagedQueryDir>,
+) -> Result<StageOutcome, QueryInstallError> {
+    visits.external.insert(language.to_string());
+    let queries_dir = source.data_dir.join("queries").join(language);
+    let parents =
+        inherited_languages_with_search_paths(&queries_dir, language, source.search_paths)
+            .ok_or_else(|| {
+                QueryInstallError::IoError(std::io::Error::other(format!(
+                    "cannot read the runtime query files for '{language}' to find what it inherits"
+                )))
+            })?;
+    for parent in required_parents(parents, true) {
+        stage_queries_recursive(source, &parent, StageRole::Parent, visits, entries)?;
+    }
+    Ok(StageOutcome::NothingToDo)
 }
 
 pub fn query_install_is_complete(queries_dir: &Path) -> bool {
