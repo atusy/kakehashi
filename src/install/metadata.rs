@@ -404,6 +404,55 @@ return {
         assert_eq!(cache.read().as_deref(), Some(VALID_METADATA));
     }
 
+    // A cut-off file still holds complete language blocks before the cut, so
+    // counting parsed languages alone would accept a partial language list.
+    const TRUNCATED_METADATA: &str = r#"
+return {
+  lua = {
+    install_info = {
+      revision = 'abc123',
+      url = 'https://example.com/tree-sitter-lua',
+    },
+  },
+  rust = {
+    install_info = {
+      revision = 'def456',
+"#;
+
+    #[test]
+    fn truncated_fresh_cache_is_replaced_from_network() {
+        let temp = tempdir().unwrap();
+        let cache = MetadataCache::with_default_ttl(temp.path());
+        cache.write(TRUNCATED_METADATA).unwrap();
+
+        let parsers = fetch_parsers_lua_with_cache(Some(&cache), || Ok(VALID_METADATA.to_owned()))
+            .expect("truncated cached metadata should trigger a download");
+
+        assert_eq!(parsers["lua"].revision, "abc123");
+        assert_eq!(cache.read().as_deref(), Some(VALID_METADATA));
+    }
+
+    #[test]
+    fn truncated_download_is_rejected_without_caching() {
+        let temp = tempdir().unwrap();
+        let cache = MetadataCache::with_default_ttl(temp.path());
+
+        let result =
+            fetch_parsers_lua_with_cache(Some(&cache), || Ok(TRUNCATED_METADATA.to_owned()));
+
+        assert!(matches!(result, Err(MetadataError::ParseError(_))));
+        assert!(cache.read().is_none());
+    }
+
+    #[test]
+    fn metadata_with_content_after_the_returned_table_is_rejected() {
+        let interleaved = format!("{VALID_METADATA}{TRUNCATED_METADATA}");
+
+        let result = parse_parsers_lua(&interleaved);
+
+        assert!(matches!(result, Err(MetadataError::ParseError(_))));
+    }
+
     #[test]
     fn test_fetch_parser_metadata_with_caching() {
         // This test verifies that FetchOptions can be used to enable caching
