@@ -3684,6 +3684,98 @@ mod tests {
         );
     }
 
+    /// The retraction closes exactly the `(injection language, server)` pairs
+    /// current settings no longer select, whatever made them unselected — a
+    /// host bridge filter or a disabled server — and leaves every other copy,
+    /// including other servers on the same region and the same server on
+    /// another language, open.
+    #[tokio::test]
+    async fn close_deselected_docs_closes_only_unselected_server_language_pairs() {
+        let coordinator = BridgeCoordinator::new();
+        let server = |languages: &[&str], enabled: Option<bool>| BridgeServerConfig {
+            cmd: Some(vec!["server".to_string()]),
+            languages: Some(languages.iter().map(|l| l.to_string()).collect()),
+            enabled,
+            ..Default::default()
+        };
+        let bridge_filter = HashMap::from([
+            (
+                "python".to_string(),
+                BridgeLanguageConfig {
+                    enabled: Some(true),
+                    ..Default::default()
+                },
+            ),
+            (
+                "lua".to_string(),
+                BridgeLanguageConfig {
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let settings = Arc::new(WorkspaceSettings {
+            languages: HashMap::from([(
+                "markdown".to_string(),
+                LanguageSettings {
+                    bridge: Some(bridge_filter),
+                    ..Default::default()
+                },
+            )]),
+            language_servers: HashMap::from([
+                ("pyright".to_string(), server(&["python"], None)),
+                ("ruff".to_string(), server(&["python"], Some(false))),
+                ("harper".to_string(), server(&[LANGUAGES_WILDCARD], None)),
+            ]),
+            auto_install: false,
+            ..Default::default()
+        });
+        let host = Url::parse("file:///project/doc.md").unwrap();
+        let host_lsp = crate::lsp::lsp_impl::url_to_uri(&host).unwrap();
+        let python = super::super::protocol::VirtualDocumentUri::new(&host_lsp, "python", "PY");
+        let lua = super::super::protocol::VirtualDocumentUri::new(&host_lsp, "lua", "LUA");
+        for (uri, server) in [
+            (&python, "pyright"),
+            (&python, "ruff"),
+            (&python, "harper"),
+            (&lua, "harper"),
+        ] {
+            coordinator
+                .register_opened_document_for_test(&host, uri, &ConnectionKey::for_server(server))
+                .await;
+        }
+
+        let mut closed = coordinator
+            .close_deselected_docs(&settings, "markdown", &host)
+            .await;
+        closed.sort();
+
+        assert_eq!(
+            closed,
+            vec![
+                ("LUA".to_string(), "harper".to_string()),
+                ("PY".to_string(), "ruff".to_string()),
+            ]
+        );
+        let mut python_servers = coordinator
+            .pool
+            .get_all_connections_for_virtual_uri(&python);
+        python_servers.sort_by(|a, b| a.server().cmp(b.server()));
+        assert_eq!(
+            python_servers,
+            vec![
+                ConnectionKey::for_server("harper"),
+                ConnectionKey::for_server("pyright")
+            ]
+        );
+        assert!(
+            coordinator
+                .pool
+                .get_all_connections_for_virtual_uri(&lua)
+                .is_empty()
+        );
+    }
+
     #[test]
     fn test_get_all_configs_returns_empty_when_blocked_by_filter() {
         let coordinator = BridgeCoordinator::new();
