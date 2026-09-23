@@ -173,12 +173,15 @@ impl Kakehashi {
     /// supersedes anything: the layer is appended in arrival order like any
     /// other (#734).
     ///
-    /// The item carries no `scopeUri`, which asks for the client's global
-    /// settings. kakehashi resolves one effective settings snapshot for the
-    /// whole process, so naming a scope and then applying the answer
-    /// process-wide would silently promote one folder's configuration to
-    /// global. Asking unscoped asks for exactly what the single layer means;
-    /// scoped pull is the separate half of #952.
+    /// The item's `scopeUri` is the selected configuration root — the one
+    /// directory every client layer is anchored to and the project config is
+    /// read from. kakehashi resolves one effective settings snapshot for the
+    /// whole process, and that root is what it is resolved for, so asking for
+    /// the root's scope asks for exactly what the single snapshot means. Any
+    /// other folder's configuration would be promoted to global; per-folder
+    /// resolution is not implemented. A root kakehashi chose itself — the
+    /// launch directory — is not the client's to answer for, so that session
+    /// asks unscoped, for the client's global settings.
     ///
     /// The answer is trusted as authored: a field written as an empty container
     /// clears the layer below, exactly as the same spelling would in a config
@@ -187,10 +190,11 @@ impl Kakehashi {
     /// worth knowing before registering such a default, and the reason a pull
     /// answer is not merged more leniently than a push.
     ///
-    /// Those global settings are still anchored against the workspace root, as
-    /// a push is. Relative paths in a client's global configuration therefore
-    /// resolve against whichever workspace is open — accepted, because the
-    /// alternative leaves them resolving against the launch directory.
+    /// The answer is anchored against the workspace root, as a push is — the
+    /// root it was asked for, when the client named one. An unscoped answer's
+    /// relative paths therefore resolve against whichever workspace is open —
+    /// accepted, because the alternative leaves them resolving against the
+    /// launch directory.
     pub(crate) async fn pull_client_configuration(&self) {
         if !self.settings_manager.supports_configuration_pull() {
             return;
@@ -244,7 +248,7 @@ impl Kakehashi {
     async fn pull_client_configuration_once(&self) {
         let asked_at = self.settings_manager.root_path().as_ref().clone();
         let items = vec![ConfigurationItem {
-            scope_uri: None,
+            scope_uri: self.settings_manager.root_scope(),
             section: Some("kakehashi".to_string()),
         }];
         // Bounded by shutdown: this await lives in a service future —
@@ -771,7 +775,7 @@ mod tests {
         let server = service.inner();
         server
             .settings_manager
-            .set_root_path(Some(std::path::PathBuf::from("/workspace")));
+            .set_root(Some(std::path::PathBuf::from("/workspace")), None);
 
         server
             .did_change_configuration_impl(DidChangeConfigurationParams {
@@ -801,7 +805,7 @@ mod tests {
     async fn pushed_relative_paths_survive_an_unknown_workspace_root() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
-        server.settings_manager.set_root_path(None);
+        server.settings_manager.set_root(None, None);
 
         server
             .did_change_configuration_impl(DidChangeConfigurationParams {

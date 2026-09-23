@@ -122,6 +122,23 @@ impl ClientRoot<'_> {
             }
         }
     }
+
+    /// The root as a directory plus the client's URI for it — the scope a
+    /// `workspace/configuration` pull names. `None` when the root has no
+    /// usable file path, since a scope must name the root settings resolve
+    /// against. A folder or `rootUri` is named exactly as the client spelled
+    /// it, so the client can match it; the deprecated `rootPath` has no URI
+    /// spelling of its own and is converted.
+    fn to_config_root(&self) -> Option<(std::path::PathBuf, Option<Uri>)> {
+        let path = self.to_file_path()?;
+        let scope = match self {
+            Self::WorkspaceFolder(uri) | Self::RootUri(uri) => Some((*uri).clone()),
+            Self::LegacyPath(_) => Url::from_directory_path(&path)
+                .ok()
+                .and_then(|url| url.as_str().parse().ok()),
+        };
+        Some((path, scope))
+    }
 }
 
 /// Pick the root from the workspace inputs the upstream client actually sent.
@@ -168,11 +185,20 @@ fn client_root_without_folders(params: &InitializeParams) -> Option<ClientRoot<'
 /// relative config paths and `kakehashi.toml` discovery and never reaches a
 /// downstream server, so a no-workspace session forwards nothing while still
 /// resolving Kakehashi's own configuration.
-fn config_root_path(root: Option<ClientRoot<'_>>) -> (Option<std::path::PathBuf>, &'static str) {
-    match root.and_then(|root| root.to_file_path().map(|path| (path, root.source()))) {
-        Some((path, source)) => (Some(path), source),
+///
+/// The scope is the client's URI for the root, and `None` for the CWD: that
+/// root is kakehashi's own choice, not a workspace the client could answer for.
+fn config_root_path(
+    root: Option<ClientRoot<'_>>,
+) -> (Option<std::path::PathBuf>, Option<Uri>, &'static str) {
+    match root.and_then(|root| {
+        root.to_config_root()
+            .map(|resolved| (resolved, root.source()))
+    }) {
+        Some(((path, scope), source)) => (Some(path), scope, source),
         None => (
             std::env::current_dir().ok(),
+            None,
             "current working directory (fallback)",
         ),
     }
@@ -190,12 +216,16 @@ fn config_root_path(root: Option<ClientRoot<'_>>) -> (Option<std::path::PathBuf>
 /// `kakehashi.toml` may name parser libraries to load — is not something closing
 /// a folder should do. A client that named no other root gets no project layer,
 /// which is what it had before it opened the folder.
+///
+/// Returned with the client's URI for the root, as for `initialize`.
 pub(super) fn config_root_after_folder_change(
     folder: Option<&Uri>,
-    folderless: Option<std::path::PathBuf>,
-) -> Option<std::path::PathBuf> {
+    folderless: (Option<std::path::PathBuf>, Option<Uri>),
+) -> (Option<std::path::PathBuf>, Option<Uri>) {
     match folder {
-        Some(uri) => ClientRoot::WorkspaceFolder(uri).to_file_path(),
+        Some(uri) => ClientRoot::WorkspaceFolder(uri)
+            .to_config_root()
+            .map_or((None, None), |(path, scope)| (Some(path), scope)),
         None => folderless,
     }
 }
@@ -274,7 +304,7 @@ impl Kakehashi {
     ) -> Result<InitializeResult> {
         // Reject an unusable `--config-file` before anything from `params` is
         // latched. Several of the stores below are first-write-wins
-        // (`set_capabilities`, `set_folderless_root_path`), and
+        // (`set_capabilities`, `set_folderless_root`), and
         // tower-lsp-server resets to `Uninitialized` after an error response,
         // so a client may fix the file and retry: without this, the retry would
         // load the corrected settings while downstream servers kept the failed
@@ -330,16 +360,18 @@ impl Kakehashi {
 
         // Resolved here, into owned values, because `params.capabilities` is
         // moved into the pool below and that ends any borrow of `params`.
-        let (root_path, source) = config_root_path(client_root(&params));
+        let (root_path, root_scope, source) = config_root_path(client_root(&params));
         // The root a later `didChangeWorkspaceFolders` falls back to once it
         // empties the folder list. Resolved here because `params` does not
         // outlive this request, and deliberately without `config_root_path`'s
         // process-CWD rung: a session that started folderless may load the
         // launch directory's config, while one that lost its last folder gets
         // no project layer — see `config_root_after_folder_change`.
-        self.settings_manager.set_folderless_root_path(
-            client_root_without_folders(&params).and_then(|root| root.to_file_path()),
-        );
+        let (folderless_path, folderless_scope) = client_root_without_folders(&params)
+            .and_then(|root| root.to_config_root())
+            .map_or((None, None), |(path, scope)| (Some(path), scope));
+        self.settings_manager
+            .set_folderless_root(folderless_path, folderless_scope);
 
         // Forward root_uri and workspace_folders to bridge pool for downstream server initialization
         let workspace_folders_for_bridge =
@@ -371,7 +403,8 @@ impl Kakehashi {
                 tower_lsp_server::ls_types::MessageType::INFO,
                 format!("Using workspace root from {}: {}", source, path.display()),
             ));
-            self.settings_manager.set_root_path(Some(path.clone()));
+            self.settings_manager
+                .set_root(Some(path.clone()), root_scope);
         } else {
             startup_logs.push((
                 tower_lsp_server::ls_types::MessageType::WARNING,
@@ -2381,9 +2414,9 @@ mod tests {
         let uri = Uri::from_str("file:///current").expect("a file URI");
 
         assert_eq!(
-            config_root_after_folder_change(Some(&uri), Some(PathBuf::from("/folderless"))),
-            Some(PathBuf::from("/current")),
-            "a folder outranks the folderless fallback",
+            config_root_after_folder_change(Some(&uri), (Some(PathBuf::from("/folderless")), None)),
+            (Some(PathBuf::from("/current")), Some(uri.clone())),
+            "a folder outranks the folderless fallback, and is its own scope",
         );
     }
 
@@ -2393,13 +2426,18 @@ mod tests {
     fn config_root_after_folder_change_falls_back_when_no_folder_remains() {
         use std::path::PathBuf;
 
+        let folderless_scope =
+            Some(<Uri as std::str::FromStr>::from_str("file:///folderless").expect("a file URI"));
         assert_eq!(
-            config_root_after_folder_change(None, Some(PathBuf::from("/folderless"))),
-            Some(PathBuf::from("/folderless")),
+            config_root_after_folder_change(
+                None,
+                (Some(PathBuf::from("/folderless")), folderless_scope.clone())
+            ),
+            (Some(PathBuf::from("/folderless")), folderless_scope),
         );
         assert_eq!(
-            config_root_after_folder_change(None, None),
-            None,
+            config_root_after_folder_change(None, (None, None)),
+            (None, None),
             "a client that named no other root gets no project layer",
         );
     }
@@ -2414,10 +2452,13 @@ mod tests {
         use std::str::FromStr as _;
         let uri = Uri::from_str("untitled:Untitled-1").expect("a non-file URI");
 
-        assert_eq!(config_root_after_folder_change(Some(&uri), None), None);
         assert_eq!(
-            config_root_after_folder_change(Some(&uri), Some(PathBuf::from("/folderless"))),
-            None,
+            config_root_after_folder_change(Some(&uri), (None, None)),
+            (None, None)
+        );
+        assert_eq!(
+            config_root_after_folder_change(Some(&uri), (Some(PathBuf::from("/folderless")), None)),
+            (None, None),
             "an unresolvable folder does not fall through to the folderless rungs \
              either — the handshake ladder stops at its top rung too",
         );
@@ -2457,7 +2498,11 @@ mod tests {
 
         assert_eq!(bridge_root_uri(&params), None, "nothing is forwarded");
 
-        let (root_path, source) = config_root_path(client_root(&params));
+        let (root_path, scope, source) = config_root_path(client_root(&params));
+        assert_eq!(
+            scope, None,
+            "the launch directory is not the client's to scope by"
+        );
         assert_eq!(root_path, std::env::current_dir().ok());
         assert_eq!(source, "current working directory (fallback)");
     }
@@ -2473,7 +2518,14 @@ mod tests {
             "workspaceFolders": null
         }));
 
-        let (resolved, source) = config_root_path(client_root(&params));
+        let (resolved, scope, source) = config_root_path(client_root(&params));
+        assert_eq!(
+            scope.map(|uri| uri.as_str().to_owned()),
+            Url::from_directory_path(&root_path)
+                .ok()
+                .map(|url| url.as_str().to_owned()),
+            "a legacy root is still the client's, and scopes the pull as a file URI"
+        );
         assert_eq!(resolved, Some(root_path));
         assert_eq!(
             source, "root_path (deprecated)",
@@ -2489,7 +2541,11 @@ mod tests {
             "workspaceFolders": null
         }));
 
-        let (root_path, source) = config_root_path(client_root(&params));
+        let (root_path, scope, source) = config_root_path(client_root(&params));
+        assert_eq!(
+            scope, None,
+            "the launch directory is not the client's to scope by"
+        );
         assert_eq!(root_path, std::env::current_dir().ok());
         assert_eq!(
             source, "current working directory (fallback)",
