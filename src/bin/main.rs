@@ -1328,26 +1328,49 @@ fn write_forced_output_with(
     path: &std::path::Path,
     write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    let permissions = forced_output_permissions(path)?;
-    let mut temp = output_temporary_file(path, permissions.as_ref())?;
+    let metadata = forced_output_metadata(path)?;
+    let mut temp = output_temporary_file(path, metadata.as_ref().map(|m| &m.permissions))?;
     write(temp.as_file_mut())?;
-    if let Some(permissions) = permissions {
-        // Creation applies umask, and writing may clear Unix set-ID bits.
-        // Restore the exact mode after writing, before syncing and publication.
-        temp.as_file().set_permissions(permissions)?;
+    if let Some(metadata) = metadata {
+        restore_forced_output_metadata(temp.as_file(), &metadata)?;
     }
     temp.as_file().sync_all()?;
 
     // Refuse a link or special entry introduced while preparing the output.
     // Persist replaces the directory entry, so even a later leaf swap cannot
     // redirect the write into a symlink target.
-    forced_output_permissions(path)?;
+    forced_output_metadata(path)?;
     temp.persist(path).map(|_| ()).map_err(|e| e.error)
 }
 
-fn forced_output_permissions(
-    path: &std::path::Path,
-) -> std::io::Result<Option<std::fs::Permissions>> {
+struct ForcedOutputMetadata {
+    permissions: std::fs::Permissions,
+    #[cfg(unix)]
+    uid: u32,
+    #[cfg(unix)]
+    gid: u32,
+}
+
+fn restore_forced_output_metadata(
+    file: &std::fs::File,
+    metadata: &ForcedOutputMetadata,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let staged = file.metadata()?;
+        if staged.uid() != metadata.uid || staged.gid() != metadata.gid {
+            // Refuse publication if ownership cannot be retained, rather than
+            // making a user's private configuration belong to the invoker.
+            std::os::unix::fs::fchown(file, Some(metadata.uid), Some(metadata.gid))?;
+        }
+    }
+    // Creation applies umask; writing and chown may clear Unix set-ID bits.
+    // Restore the exact mode last, before syncing and publication.
+    file.set_permissions(metadata.permissions.clone())
+}
+
+fn forced_output_metadata(path: &std::path::Path) -> std::io::Result<Option<ForcedOutputMetadata>> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1386,7 +1409,15 @@ fn forced_output_permissions(
             format!("refusing to replace read-only output '{}'", path.display()),
         ));
     }
-    Ok(Some(permissions))
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt as _;
+    Ok(Some(ForcedOutputMetadata {
+        permissions,
+        #[cfg(unix)]
+        uid: metadata.uid(),
+        #[cfg(unix)]
+        gid: metadata.gid(),
+    }))
 }
 
 /// Run the config init command
@@ -2094,6 +2125,37 @@ mod tests {
             std::fs::read_to_string(sibling).unwrap(),
             "previous configuration"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forced_output_preserves_destination_owner_and_group() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("config.toml");
+        std::fs::write(&output, "previous configuration").unwrap();
+        let original = output.metadata().unwrap();
+        let groups = std::process::Command::new("id").arg("-G").output().unwrap();
+        assert!(groups.status.success());
+        let group = std::str::from_utf8(&groups.stdout)
+            .unwrap()
+            .split_whitespace()
+            .map(|group| group.parse::<u32>().unwrap())
+            .find(|&group| group != original.gid());
+        let Some(group) = group else {
+            eprintln!("no supplementary group available for ownership-change fixture");
+            return;
+        };
+        std::os::unix::fs::chown(&output, None, Some(group)).unwrap();
+        assert_eq!(output.metadata().unwrap().gid(), group);
+
+        write_forced_output(&output, "replacement").unwrap();
+
+        let replaced = output.metadata().unwrap();
+        assert_eq!(replaced.uid(), original.uid());
+        assert_eq!(replaced.gid(), group);
+        assert_eq!(std::fs::read_to_string(output).unwrap(), "replacement");
     }
 
     #[cfg(unix)]
