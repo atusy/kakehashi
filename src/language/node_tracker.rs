@@ -6,7 +6,7 @@
 //! with START-priority invalidation.
 
 mod tree_scope;
-pub(crate) use tree_scope::NodeTreeScope;
+pub(crate) use tree_scope::{NodeTreeScope, UnresolvedTreeScope};
 use tree_scope::{TREE_SCOPE_BASE, TreeScopes};
 
 use dashmap::DashMap;
@@ -1041,7 +1041,8 @@ impl NodeTracker {
         invalidated
     }
 
-    /// Retire scopes absent from a complete, current injection-tree walk.
+    /// Retire scopes proven absent from a current full injection-tree walk,
+    /// preserving only scopes that unavailable branches could still contain.
     /// The caller also serializes document/query currency with reconciliation;
     /// this latch keeps edits and close/reopen from pruning a newer index.
     pub(crate) fn retain_tree_scopes(
@@ -1050,6 +1051,7 @@ impl NodeTracker {
         expected: (u64, u64),
         incarnation: u64,
         current: &std::collections::HashSet<NodeTreeScope>,
+        unresolved: &[UnresolvedTreeScope],
     ) {
         let Some(mut entry) = self.entries.get_mut(uri) else {
             return;
@@ -1063,7 +1065,7 @@ impl NodeTracker {
         {
             return;
         }
-        let retired = entry.tree_scopes.retire_absent(current);
+        let retired = entry.tree_scopes.retire_absent(current, unresolved);
         if retired.is_empty() {
             return;
         }
@@ -1398,7 +1400,7 @@ mod tests {
         );
         tracker.apply_input_edits(&uri, &[EditInfo::new(10, 10, 11)]);
         let shifted = scope(&[(0, 22)]);
-        tracker.retain_tree_scopes(&uri, epoch, 0, &Default::default());
+        tracker.retain_tree_scopes(&uri, epoch, 0, &Default::default(), &[]);
         assert!(
             tracker.tree_scope_needs_reconciliation(&uri, &shifted),
             "a raced edit must not clear reconciliation debt"
@@ -1408,6 +1410,7 @@ mod tests {
             tracker.mint_epoch(&uri),
             0,
             &std::collections::HashSet::from([shifted.clone(), scope(&[(0, 21)])]),
+            &[],
         );
         assert!(
             !tracker.tree_scope_needs_reconciliation(&uri, &shifted),
@@ -1436,6 +1439,7 @@ mod tests {
                 tracker.mint_epoch(&uri),
                 0,
                 &std::collections::HashSet::from([current]),
+                &[],
             );
             if let Some(old) = previous {
                 assert!(
@@ -1460,7 +1464,7 @@ mod tests {
             .mint_tree_batch(&uri, old_epoch, 1, Some(&current), [(12, 15, "identifier")])
             .unwrap()[0];
         tracker.apply_input_edits(&uri, &[EditInfo::new(0, 0, 1)]);
-        tracker.retain_tree_scopes(&uri, old_epoch, 1, &Default::default());
+        tracker.retain_tree_scopes(&uri, old_epoch, 1, &Default::default(), &[]);
         assert!(tracker.lookup_node(&uri, &id).is_some());
         tracker.cleanup(&uri, 1);
         tracker.open_incarnation(&uri, 2);
@@ -1473,7 +1477,7 @@ mod tests {
                 [(12, 15, "identifier")],
             )
             .unwrap()[0];
-        tracker.retain_tree_scopes(&uri, tracker.mint_epoch(&uri), 1, &Default::default());
+        tracker.retain_tree_scopes(&uri, tracker.mint_epoch(&uri), 1, &Default::default(), &[]);
         assert!(tracker.lookup_node(&uri, &newer).is_some());
     }
 

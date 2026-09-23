@@ -359,8 +359,8 @@ impl Kakehashi {
                             );
                             &fresh
                         };
-                        layers.complete.then(|| {
-                            layers
+                        (layers.complete || !layers.unresolved.is_empty()).then(|| {
+                            let scopes = layers
                                 .layers
                                 .iter()
                                 .map(|layer| {
@@ -370,7 +370,8 @@ impl Kakehashi {
                                         &layer.tree,
                                     )
                                 })
-                                .collect::<std::collections::HashSet<_>>()
+                                .collect::<std::collections::HashSet<_>>();
+                            (scopes, layers.unresolved.clone())
                         })
                     });
                 let ulid = tracker
@@ -400,7 +401,7 @@ impl Kakehashi {
         let Some((result, scopes)) = result else {
             return Ok(Value::Null);
         };
-        if let Some(scopes) = scopes {
+        if let Some((scopes, unresolved)) = scopes {
             // Match captures' retirement discipline: neither an edit nor query
             // publication may supersede the complete geometry before pruning.
             let edit_lock = self.documents.edit_lock(&uri);
@@ -422,6 +423,7 @@ impl Kakehashi {
                     mint_epoch,
                     incarnation,
                     &scopes,
+                    &unresolved,
                 );
             }
             if self.documents.get(&uri).is_none() {
@@ -645,8 +647,11 @@ mod tests {
     use super::*;
     use tower_lsp_server::LspService;
 
+    #[rstest::rstest]
+    #[case::complete(false)]
+    #[case::unrelated_missing_grammar(true)]
     #[tokio::test]
-    async fn node_only_boundary_growth_retires_obsolete_scopes() {
+    async fn node_only_boundary_growth_retires_obsolete_scopes(#[case] missing_grammar: bool) {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
         let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
@@ -656,14 +661,17 @@ mod tests {
                 .language_registry_for_parallel()
                 .register(name.into(), language.clone());
         }
-        let query = tree_sitter::Query::new(&language,
-            r#"((source_file) @injection.content (#set! injection.language "scope_inner") (#set! injection.include-children))"#).unwrap();
+        let mut query_text = r#"((source_file) @injection.content (#set! injection.language "scope_inner") (#set! injection.include-children))"#.to_string();
+        if missing_grammar {
+            query_text.push_str(r#" ((integer_literal) @injection.content (#set! injection.language "scope_missing"))"#);
+        }
+        let query = tree_sitter::Query::new(&language, &query_text).unwrap();
         server
             .language
             .query_store()
             .insert_injection_query("rust".into(), std::sync::Arc::new(query));
         let uri = Url::parse("file:///node-only-growth.rs").unwrap();
-        let mut text = "fn name() {}".to_string();
+        let mut text = "fn name() { let value = 1; }".to_string();
         server
             .documents
             .insert(uri.clone(), text.clone(), Some("rust".into()), None);

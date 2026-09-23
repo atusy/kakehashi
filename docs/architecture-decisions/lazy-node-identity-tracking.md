@@ -159,18 +159,21 @@ URI lifetime, so a delayed navigation cannot mint into a different scope after
 its old one is retired. If an edit makes two scopes equal, both existing tokens
 remain resolvable and new mints choose one surviving token. Scopes without live
 nodes are reclaimed during edit processing; closing the document releases the
-URI registry. A complete, current full-injection captures walk also retires
-scopes absent from its full tree geometry together with their node IDs. This
+URI registry. A current full-injection captures walk also retires scopes proven
+absent from its tree geometry together with their node IDs. This
 keeps repeated boundary changes from accumulating obsolete scopes whose interior
 nodes survive ordinary edit adjustment. Geometry includes trees without the
-requested kind query; range-only, cancelled, stale, and incomplete walks cannot
-prune scopes. Edit, incarnation, query-generation, and reload checks protect the
-retirement. The node entry point also reconciles full geometry when it discovers
+requested kind query. Unavailable grammar/parse branches preserve scopes with
+matching root geometry and possible descendants whose included ranges lie fully
+within that branch; unrelated absent scopes can still be reclaimed. Range-only,
+cancelled, and stale walks cannot prune. Edit, incarnation, query-generation,
+and reload checks protect retirement. The node entry point also reconciles full geometry when it discovers
 a new scope alongside existing scopes, so node-only clients reclaim obsolete
 boundary geometries too. It reuses the snapshot layer cache; requests for an
 already-known scope keep their cursor-local walk after reconciliation succeeds.
-A pending flag preserves reconciliation across incomplete walks or lost final
-admission races, including later requests for an already-known scope. The cost is one scope record
+A pending flag preserves reconciliation while unknown branches retain otherwise
+absent scopes or a walk loses final admission, including later requests for an
+already-known scope. The cost is one scope record
 per distinct retained parse scope and range adjustment alongside node adjustment.
 
 **Invalidation with composite keys**: node START-priority invalidation remains

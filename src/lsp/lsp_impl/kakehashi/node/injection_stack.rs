@@ -802,8 +802,8 @@ fn ranges_intersect(
 /// snapshot calls this lazily and the result rides the `ParseSnapshot`, so
 /// subsequent per-keystroke walks iterate pre-parsed layers instead of
 /// re-running the walk. Byte-identical to the inline walk by construction —
-/// it IS the inline walk, with a collecting visitor. The completeness flag
-/// distinguishes absent regions from branches skipped for unavailable parsers.
+/// it IS the inline walk, with a collecting visitor. Unresolved branch geometry
+/// distinguishes absent scopes from scopes an unavailable parser might hide.
 pub(crate) fn collect_document_layer_trees(
     coordinator: &LanguageCoordinator,
     host_language: &str,
@@ -811,13 +811,18 @@ pub(crate) fn collect_document_layer_trees(
     host_tree: &tree_sitter::Tree,
 ) -> crate::document::SnapshotLayerTrees {
     let mut layers = Vec::new();
-    let complete = walk_document_layers(
+    let mut unresolved = Vec::new();
+    let complete = walk_child_layers(
         coordinator,
         host_language,
-        host_text,
         host_tree,
+        &[whole_document_range(host_text)],
+        host_text,
+        1,
         None,
         None,
+        &mut std::collections::HashSet::new(),
+        &mut unresolved,
         &mut |language, tree, depth| {
             // The host layer (depth 0) already lives on the snapshot as
             // `ParseSnapshot::tree`; store only the injected layers.
@@ -837,7 +842,11 @@ pub(crate) fn collect_document_layer_trees(
             });
         },
     );
-    crate::document::SnapshotLayerTrees { layers, complete }
+    crate::document::SnapshotLayerTrees {
+        layers,
+        complete,
+        unresolved,
+    }
 }
 
 /// Visit every injection layer of the document in **document-order DFS**: the
@@ -878,6 +887,7 @@ pub(in crate::lsp::lsp_impl::kakehashi) fn walk_document_layers(
         byte_filter,
         cancel,
         &mut std::collections::HashSet::new(),
+        &mut Vec::new(),
         visit,
     )
 }
@@ -893,6 +903,7 @@ fn walk_child_layers(
     byte_filter: Option<&std::ops::Range<usize>>,
     cancel: Option<&crate::cancel::CancelToken>,
     visited: &mut std::collections::HashSet<crate::language::node_tracker::NodeTreeScope>,
+    unresolved: &mut Vec<crate::language::node_tracker::UnresolvedTreeScope>,
     visit: &mut dyn FnMut(&str, &tree_sitter::Tree, usize),
 ) -> bool {
     // Match cursor selection and scope resolution's injected depth bound.
@@ -922,10 +933,19 @@ fn walk_child_layers(
         if crate::cancel::is_cancelled(cancel) {
             return false;
         }
+        let gap = |language: Option<&str>| crate::language::node_tracker::UnresolvedTreeScope {
+            language: language.map(Into::into),
+            depth,
+            ranges: absolute_ranges
+                .iter()
+                .map(|range| (range.start_byte, range.end_byte))
+                .collect(),
+        };
         let content = &host_text[effective_content_range(&region, host_text)];
         let Some((resolved_lang, _)) =
             coordinator.resolve_injection_language(&region.language, content)
         else {
+            unresolved.push(gap(None));
             complete = false;
             continue;
         };
@@ -946,10 +966,12 @@ fn walk_child_layers(
             .language_registry_for_parallel()
             .get(&resolved_lang)
         else {
+            unresolved.push(gap(Some(&resolved_lang)));
             complete = false;
             continue;
         };
         let Some(tree) = parse_with_absolute_ranges(&language, host_text, &absolute_ranges) else {
+            unresolved.push(gap(Some(&resolved_lang)));
             complete = false;
             continue;
         };
@@ -964,6 +986,7 @@ fn walk_child_layers(
             byte_filter,
             cancel,
             visited,
+            unresolved,
             visit,
         );
     }

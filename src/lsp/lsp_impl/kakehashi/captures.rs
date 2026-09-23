@@ -1270,10 +1270,10 @@ impl Kakehashi {
                     walk_start.elapsed().as_millis(),
                     walked.as_ref().map_or(0, |(m, _)| m.len()),
                 );
-                let scopes = layers.filter(|set| set.complete && lsp_range.is_none() && mint_into_tracker && !inner_cancel.is_cancelled())
-                    .map(|set| set.layers.iter().map(|layer|
+                let scopes = layers.filter(|set| (set.complete || !set.unresolved.is_empty()) && lsp_range.is_none() && mint_into_tracker && !inner_cancel.is_cancelled())
+                    .map(|set| (set.layers.iter().map(|layer|
                         crate::language::node_tracker::NodeTreeScope::new(
-                            &layer.language, layer.depth, &layer.tree)).collect::<HashSet<_>>());
+                            &layer.language, layer.depth, &layer.tree)).collect::<HashSet<_>>(), set.unresolved.clone()));
                 (walked, scopes)
             });
         let walked = if let Some(cancel_rx) = cancel_rx {
@@ -1336,7 +1336,7 @@ impl Kakehashi {
             if !current {
                 return Ok(None);
             }
-            if let Some(scopes) = scopes {
+            if let Some((scopes, unresolved)) = scopes {
                 // Keep reload publication out of the final generation check
                 // and retirement, just as the edit guard excludes didChange.
                 let pool = self
@@ -1352,6 +1352,7 @@ impl Kakehashi {
                         entry_mint_epoch,
                         incarnation,
                         &scopes,
+                        &unresolved,
                     );
                 }
             }
@@ -1883,9 +1884,9 @@ mod tests {
     #[case::complete_full(true, false, true, true)]
     #[case::range(true, true, true, false)]
     #[case::host_only(false, false, true, false)]
-    #[case::missing_grammar(true, false, false, false)]
+    #[case::missing_grammar(true, false, false, true)]
     #[tokio::test]
-    async fn only_complete_full_geometry_retires_absent_scopes(
+    async fn full_geometry_retires_provably_absent_scopes(
         #[case] injection: bool,
         #[case] ranged: bool,
         #[case] grammar_available: bool,
@@ -1956,17 +1957,12 @@ mod tests {
         let current_id = mint(&current);
         let obsolete_id = mint(&obsolete);
         if !grammar_available {
-            // Resolve a now-unavailable language with the same layer geometry.
-            let query = tree_sitter::Query::new(
-                &language,
-                r#"((block) @injection.content
-                (#set! injection.language "scope_missing") (#set! injection.include-children))"#,
-            )
-            .unwrap();
+            // The current root geometry is known even without its parser.
+            // Preserve that scope, but a different same-depth range is absent.
             server
                 .language
-                .query_store()
-                .insert_injection_query("rust".into(), Arc::new(query));
+                .language_registry_for_parallel()
+                .unregister("scope_inner");
         }
         let range = ranged.then_some(Range::new(Position::new(0, 0), Position::new(0, 1)));
         // This kind has no query file: geometry retention must not depend on

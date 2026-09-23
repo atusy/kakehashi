@@ -45,6 +45,45 @@ impl NodeTreeScope {
     }
 }
 
+/// Geometry reached by discovery whose grammar or parse was unavailable.
+/// Only this branch can hide additional current scopes.
+#[derive(Clone, Debug)]
+pub(crate) struct UnresolvedTreeScope {
+    pub(crate) language: Option<Arc<str>>,
+    pub(crate) depth: usize,
+    pub(crate) ranges: Vec<(usize, usize)>,
+}
+
+impl UnresolvedTreeScope {
+    fn may_contain(&self, scope: &NodeTreeScope) -> bool {
+        if scope.depth < self.depth {
+            return false;
+        }
+        if scope.depth == self.depth {
+            return self.ranges == scope.ranges
+                && self
+                    .language
+                    .as_ref()
+                    .is_none_or(|language| *language == scope.language);
+        }
+        // Descendants inherit every exclusion from their parents. Check the
+        // full range union, not a bounding span that fills excluded gaps.
+        scope.ranges.iter().all(|&(start, end)| {
+            let mut covered = start;
+            for &(left, right) in &self.ranges {
+                if left > covered {
+                    break;
+                }
+                covered = covered.max(right);
+                if covered >= end {
+                    return true;
+                }
+            }
+            false
+        })
+    }
+}
+
 /// Tokens are never reused within a document incarnation: navigation may retain one
 /// across an await after its scope has been retired.
 #[derive(Default)]
@@ -110,11 +149,18 @@ impl TreeScopes {
         self.reindex();
     }
 
-    pub(super) fn retire_absent(&mut self, current: &HashSet<NodeTreeScope>) -> HashSet<usize> {
+    pub(super) fn retire_absent(
+        &mut self,
+        current: &HashSet<NodeTreeScope>,
+        unresolved: &[UnresolvedTreeScope],
+    ) -> HashSet<usize> {
         self.reconciliation_pending = false;
         let mut retired = HashSet::new();
         self.by_token.retain(|token, scope| {
-            let keep = current.contains(scope.as_ref());
+            let known = current.contains(scope.as_ref());
+            let uncertain = !known && unresolved.iter().any(|branch| branch.may_contain(scope));
+            self.reconciliation_pending |= uncertain;
+            let keep = known || uncertain;
             if !keep {
                 retired.insert(*token);
             }
@@ -136,5 +182,53 @@ impl TreeScopes {
                 .and_modify(|old| *old = (*old).min(token))
                 .or_insert(token);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_branches_preserve_only_possible_scopes_and_keep_retry_debt() {
+        let branch = UnresolvedTreeScope {
+            language: Some("rust".into()),
+            depth: 1,
+            ranges: vec![(10, 20), (30, 40)],
+        };
+        let scope = |language: &str, depth, ranges: &[(usize, usize)]| NodeTreeScope {
+            language: language.into(),
+            depth,
+            ranges: ranges.to_vec(),
+        };
+        let root = scope("rust", 1, &[(10, 20), (30, 40)]);
+        let descendant = scope("python", 2, &[(12, 18), (32, 38)]);
+        assert!(branch.may_contain(&root));
+        assert!(branch.may_contain(&descendant));
+        for absent in [
+            scope("go", 1, &[(10, 20), (30, 40)]),
+            scope("rust", 1, &[(10, 19), (30, 40)]),
+            scope("rust", 2, &[(12, 38)]),
+            scope("rust", 2, &[(50, 60)]),
+            scope("rust", 0, &[(12, 18)]),
+        ] {
+            assert!(!branch.may_contain(&absent));
+        }
+        let mut scopes = TreeScopes::default();
+        let protected = scopes.register(&descendant).unwrap();
+        let obsolete = scopes.register(&scope("rust", 1, &[(0, 8)])).unwrap();
+        let retired = scopes.retire_absent(&HashSet::new(), &[branch]);
+        assert_eq!(retired, HashSet::from([obsolete]));
+        assert!(scopes.contains(protected));
+        assert!(
+            scopes.reconciliation_pending,
+            "an unresolved retained scope must be revisited after grammar recovery"
+        );
+        assert!(
+            scopes
+                .retire_absent(&HashSet::from([descendant]), &[])
+                .is_empty()
+        );
+        assert!(!scopes.reconciliation_pending);
     }
 }

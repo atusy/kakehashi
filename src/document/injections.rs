@@ -148,8 +148,9 @@ pub(crate) struct SnapshotLayerTree {
 }
 
 /// The parsed injection layers and whether discovery reached every branch.
-/// Incomplete geometry can serve available captures but cannot retire scopes.
+/// Unavailable branches preserve only scopes their geometry could contain.
 pub(crate) struct SnapshotLayerTrees {
     pub layers: Vec<SnapshotLayerTree>,
     pub complete: bool,
+    pub unresolved: Vec<crate::language::node_tracker::UnresolvedTreeScope>,
 }
