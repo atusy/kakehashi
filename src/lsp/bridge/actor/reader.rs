@@ -215,6 +215,11 @@ pub(crate) enum UpstreamRequest {
     /// incapable. Routed upward only because the reader holds no pool
     /// reference; the pool re-checks the capability before acting.
     ConsolidateSharedInstance { server: String },
+    /// Re-sync the open host documents `server` host-bridges onto wherever
+    /// they now route: a consolidation retired the per-root connections that
+    /// held them (#968). Routed upward because the document text lives on the
+    /// server side; injected regions are re-opened through `ReopenDocuments`.
+    ResyncHostDocuments { server: String },
     /// Bring `key`'s virtual documents up to date: its previous connection was
     /// purged and has now been replaced by a `Ready` process
     /// (respawn-reopen-derives-its-targets).

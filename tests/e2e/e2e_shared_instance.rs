@@ -403,6 +403,25 @@ fn e2e_late_registration_consolidates_diverted_roots() {
         retired > 0,
         "the diverted root's process must be retired once the shared instance registers"
     );
+    // Root B's host document moves to the shared instance WITHOUT anything
+    // touching it: a didOpen of it logged after the retired process's
+    // `shutdown` can only come from the shared one.
+    let opened_b = format!("textDocument/didOpen\t{}", roots.doc_b);
+    let mut reopened = false;
+    for _ in 0..200 {
+        let log = std::fs::read_to_string(&wire_log).unwrap_or_default();
+        reopened = log
+            .split_once("shutdown\t")
+            .is_some_and(|(_, after)| after.lines().any(|line| line == opened_b));
+        if reopened {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        reopened,
+        "an untouched document of a retired root must be re-opened on the shared instance"
+    );
 
     let consolidated = poll_hover(&mut client, &roots.doc_b, |f| f.contains(&roots.root_a));
     assert!(

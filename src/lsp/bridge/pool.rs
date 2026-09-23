@@ -928,10 +928,9 @@ impl LanguageServerPool {
     /// resolves those roots to the shared key; retiring their processes is
     /// what stops them serving what they already hold. Nothing is migrated:
     /// injected-region documents are re-opened on the shared instance by the
-    /// respawn repair requested below, and host-bridged ones at their next
-    /// acquisition, where
-    /// `announce_shared_root`'s FIFO puts the root announcement ahead of the
-    /// `didOpen`.
+    /// respawn repair requested below, and host-bridged ones by an upstream
+    /// re-sync (their text lives there); both acquire the shared instance
+    /// through paths that announce the root ahead of the `didOpen`.
     ///
     /// Only marker-rooted keys launched under the preference are diverts — the
     /// shared routing never mints a client-root key for this server. The
@@ -1025,6 +1024,20 @@ impl LanguageServerPool {
         drop(connections);
         for (key, handle) in stale_handles {
             shutdown_invalidated_connection(key, handle);
+        }
+        // Host-bridged documents are re-synced upstream, which holds their
+        // text; the re-open above covers injected regions only.
+        if let Err(e) = self
+            .upstream_request_tx
+            .send(UpstreamRequest::ResyncHostDocuments {
+                server: server_name.to_owned(),
+            })
+        {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "Failed to queue host-document re-sync for {server_name} \
+                 (forwarding loop gone): {e}"
+            );
         }
         if let Some(done) = reopen
             && let Err(e) = self
@@ -4933,8 +4946,7 @@ mod tests {
     /// Roots diverted to per-root processes while the shared instance looked
     /// incapable — deterministic in the window between `initialized` and a
     /// dynamic registration — are consolidated once it registers (#968):
-    /// their connections are retired through the ordinary invalidate path, so
-    /// their documents move to the shared instance on their next acquisition
+    /// their connections are retired through the ordinary invalidate path
     /// instead of a redundant process serving them for the rest of the
     /// session.
     #[tokio::test]
@@ -4996,13 +5008,25 @@ mod tests {
 
         pool.consolidate_shared_instance("srv").await;
 
-        match upstream_requests.try_recv() {
-            Ok(UpstreamRequest::ReopenDocuments { key, .. }) => assert_eq!(&key, shared.key()),
-            other => panic!(
-                "expected a re-open of the shared instance, got {:?}",
-                other.is_ok()
-            ),
+        let mut reopened = None;
+        let mut resynced = None;
+        while let Ok(request) = upstream_requests.try_recv() {
+            match request {
+                UpstreamRequest::ReopenDocuments { key, .. } => reopened = Some(key),
+                UpstreamRequest::ResyncHostDocuments { server } => resynced = Some(server),
+                _ => panic!("unexpected upstream request"),
+            }
         }
+        assert_eq!(
+            reopened.as_ref(),
+            Some(shared.key()),
+            "injected regions are re-opened on the shared instance"
+        );
+        assert_eq!(
+            resynced.as_deref(),
+            Some("srv"),
+            "host documents are re-synced from upstream, which holds their text"
+        );
     }
 
     /// A shared instance still handshaking settles the re-open itself: its
@@ -5023,10 +5047,12 @@ mod tests {
 
         pool.consolidate_shared_instance("srv").await;
 
-        assert!(
-            upstream_requests.try_recv().is_err(),
-            "no sweep before Ready"
-        );
+        while let Ok(request) = upstream_requests.try_recv() {
+            assert!(
+                !matches!(request, UpstreamRequest::ReopenDocuments { .. }),
+                "no sweep before Ready"
+            );
+        }
         assert!(
             pool.pending_reopen.claim(shared.key()).is_some(),
             "the debt stays armed for the handshake to claim"

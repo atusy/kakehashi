@@ -1556,6 +1556,21 @@ fn spawn_upstream_request(
                     .consolidate_shared_instance(&server)
                     .await;
             }
+            UpstreamRequest::ResyncHostDocuments { server } => {
+                let Some(context) = delivery_context else {
+                    // Unreachable in the wired server (the loop is spawned with a
+                    // context); logged rather than skipped silently.
+                    log::warn!(
+                        target: "kakehashi::bridge",
+                        "Cannot re-sync {server:?}'s host documents: no delivery context"
+                    );
+                    return;
+                };
+                context.injection.resync_host_documents_for_server(
+                    &context.settings_manager.load_settings(),
+                    &server,
+                );
+            }
             UpstreamRequest::ReopenDocuments { key, done } => {
                 // One source of truth for the server: carrying it alongside the
                 // key would be an invariant nobody checks, and a divergence

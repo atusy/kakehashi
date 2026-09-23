@@ -790,6 +790,69 @@ impl InjectionCoordinator {
         self.documents.open_uris()
     }
 
+    /// Re-sync every open host document that `server` host-bridges, onto
+    /// wherever each now routes (#968: a shared-instance consolidation retired
+    /// the per-root connections that held them).
+    ///
+    /// The respawn re-open covers injected regions only; a host document is
+    /// otherwise re-opened by its next edit or request, so an idle tab would
+    /// sit without the diagnostics its retired connection had pushed. The
+    /// sync goes to ALL of the host's servers, not just `server`: a host's
+    /// eager sync is one batch that supersedes the previous one, so a batch
+    /// naming one server would abort an in-flight re-sync to the others. For
+    /// connections that already hold the document at its current text the
+    /// sync is a no-op, and each send reads the live text.
+    pub(crate) fn resync_host_documents_for_server(
+        &self,
+        settings: &crate::config::WorkspaceSettings,
+        server: &str,
+    ) {
+        for uri in self.documents.open_uris() {
+            let Some(language) = self.document_language(&uri) else {
+                continue;
+            };
+            if !self
+                .bridge
+                .get_host_configs_for_language(settings, &language)
+                .iter()
+                .any(|config| config.server_name == server)
+            {
+                continue;
+            }
+            let Some((text, incarnation, content_version)) =
+                self.documents.get(&uri).map(|document| {
+                    (
+                        document.text_arc(),
+                        document.incarnation(),
+                        document.content_version(),
+                    )
+                })
+            else {
+                continue;
+            };
+            let documents = std::sync::Arc::clone(&self.documents);
+            let host_uri = uri.clone();
+            let live_text_reader: crate::lsp::bridge::HostTextReader =
+                std::sync::Arc::new(move || {
+                    documents
+                        .get(&host_uri)
+                        .filter(|doc| doc.incarnation() == incarnation)
+                        .map(|doc| (doc.text_arc(), doc.content_version()))
+                });
+            self.bridge.eager_open_host_document_on_servers(
+                settings,
+                &language,
+                &uri,
+                &text,
+                crate::lsp::bridge::HostRevision {
+                    incarnation,
+                    content_version,
+                },
+                live_text_reader,
+            );
+        }
+    }
+
     /// `uri`'s host language, without parsing or resolving anything.
     ///
     /// The cheap half of what [`Self::bridge_injections`] returns, so a caller

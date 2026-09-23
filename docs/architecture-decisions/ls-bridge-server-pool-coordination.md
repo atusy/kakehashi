@@ -123,9 +123,9 @@ the divert check runs at `Ready`, roots acquired in that window divert
 deterministically; when the registration arrives on the shared connection, the
 pool retires that server's diverts (marker-rooted connections launched under
 the preference) through the same invalidate path and asks for the respawn
-re-open against the live shared connection (which, as for any respawn,
-covers injected-region documents; host-bridged documents move at their next
-acquisition), so documents move there without a data-structure migration. Two races remain and are healed rather
+re-open against the live shared connection (injected regions) plus an
+upstream re-sync of the host-bridged documents it serves (their text lives
+upstream), so documents move there without a data-structure migration. Two races remain and are healed rather
 than prevented: a divert still handshaking when the sweep retires it falls back
 to the shared connection, and a divert landing after the sweep is retired by
 the next acquisition of its root before that root's documents open on the
