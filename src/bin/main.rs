@@ -1340,7 +1340,18 @@ fn write_forced_output_with(
     write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     let metadata = forced_output_metadata(path)?;
-    let mut temp = output_temporary_file(path, metadata.as_ref().map(|m| &m.permissions))?;
+    // Until ownership is restored, the staging inode may belong to a different
+    // Unix group. Do not expose its content through that inherited group.
+    #[cfg(unix)]
+    let staging_permissions = {
+        use std::os::unix::fs::PermissionsExt as _;
+        metadata
+            .as_ref()
+            .map(|_| std::fs::Permissions::from_mode(0o600))
+    };
+    #[cfg(not(unix))]
+    let staging_permissions = metadata.as_ref().map(|m| m.permissions.clone());
+    let mut temp = output_temporary_file(path, staging_permissions.as_ref())?;
     write(temp.as_file_mut())?;
     if let Some(metadata) = &metadata {
         restore_forced_output_metadata(temp.as_file(), metadata)?;
@@ -2142,6 +2153,31 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(sibling).unwrap(),
             "previous configuration"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_output_stays_private_until_ownership_is_restored() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("config.toml");
+        std::fs::write(&output, "previous configuration").unwrap();
+        std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        write_forced_output_with(&output, |file| {
+            use std::io::Write as _;
+            // A new inode may inherit a different group from its destination.
+            // Keep it private until ownership and final mode are restored.
+            assert_eq!(file.metadata()?.permissions().mode() & 0o077, 0);
+            file.write_all(b"replacement")
+        })
+        .unwrap();
+
+        assert_eq!(
+            output.metadata().unwrap().permissions().mode() & 0o777,
+            0o640
         );
     }
 
