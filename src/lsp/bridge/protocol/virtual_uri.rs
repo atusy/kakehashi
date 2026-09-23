@@ -155,13 +155,15 @@ fn validated_rendering(
 /// unreserved characters on both forms.
 ///
 /// For normal URIs (file://, https://, etc.):
-/// - Format: `{scheme}:///{host_dir}/kakehashi-virtual-uri-{region_id}.{ext}`
+/// - Format: `{host_dir}/kakehashi-virtual-uri-{region_id}.{ext}{host_query_and_fragment}`,
+///   where `{host_dir}` is the host URI (scheme and authority included) up
+///   to, not including, the last `/` of its path
 /// - Example: `file:///project/docs/kakehashi-virtual-uri-01ARZ3NDEKTSV4.lua`
 ///
 /// For cannot-be-a-base URIs (untitled:, mailto:, data:) and hosts without a
 /// usable `url` form (see `HostBase::parse`):
 /// - Format: `kakehashi:///virtual/{encoded_host}/kakehashi-virtual-uri-{region_id}.{ext}`
-/// - Example: `kakehashi:///virtual/untitled%3AUntitled-1/kakehashi-virtual-uri-REGION.lua`
+/// - Example: `kakehashi:///virtual/untitled%3AUntitled%2D1/kakehashi-virtual-uri-REGION.lua`
 #[derive(Debug, Clone)]
 pub(crate) struct VirtualDocumentUri {
     host_uri: tower_lsp_server::ls_types::Uri,
