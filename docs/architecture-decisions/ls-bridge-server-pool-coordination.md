@@ -127,9 +127,10 @@ re-open against the live shared connection (injected regions) plus an
 upstream re-sync of the host-bridged documents it serves (their text lives
 upstream), so documents move there without a data-structure migration. Two races remain and are healed rather
 than prevented: a divert still handshaking when the sweep retires it falls back
-to the shared connection, and a divert landing after the sweep is retired by
-the next acquisition of its root before that root's documents open on the
-shared connection beside it. A command whose routing token names a retired
+to the shared connection, and a divert landing after the sweep is found by the
+next acquisition of its root, which routes to the shared connection and queues
+another consolidation (on its own task, since request futures can be
+cancelled mid-retirement) — the root is briefly open on both until it runs. A command whose routing token names a retired
 divert is answered by the capable shared connection instead of reviving the
 per-root key. Accepted risk: a server whose `didChangeWorkspaceFolders`
 handling is broken is no longer masked by constant restarts.

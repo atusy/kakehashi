@@ -937,8 +937,8 @@ impl LanguageServerPool {
     /// capability is re-checked on the live shared connection under
     /// `connections`, so a request that outlived an unregistration (or a
     /// replacement that never registered) retires nothing. A divert racing
-    /// this sweep can still land after it; `resolve_acquire` retires such a
-    /// straggler at the next acquisition of its root, and a divert the sweep
+    /// this sweep can still land after it; the next acquisition of its root
+    /// (`resolve_acquire`) queues another consolidation, and a divert the sweep
     /// retires mid-handshake falls back to the shared instance (both
     /// `get_or_create_connection_wait_ready` and the fast-fail
     /// `get_or_create_connection_with_timeout`).
@@ -3233,8 +3233,23 @@ impl LanguageServerPool {
             // route to the shared instance.
             _ => shared_key,
         };
-        if heal_straggler {
-            self.consolidate_shared_instance(server_name).await;
+        // Handed to the upstream loop rather than awaited here: this runs in
+        // request futures a `$/cancelRequest` can drop, and retirement marks
+        // connections Closing before its cleanup awaits — a cancelled inline
+        // consolidation could strand a half-retired process. The loop runs it
+        // on a task of its own, moments after this acquisition.
+        if heal_straggler
+            && let Err(e) =
+                self.upstream_request_tx
+                    .send(UpstreamRequest::ConsolidateSharedInstance {
+                        server: server_name.to_owned(),
+                    })
+        {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "Failed to queue consolidation of {server_name}'s straggling divert \
+                 (forwarding loop gone): {e}"
+            );
         }
 
         (marker, key)
@@ -5984,9 +5999,9 @@ mod tests {
     }
 
     /// A per-root connection that outlived consolidation — a divert that
-    /// raced the registration — is retired by the next acquisition of its
-    /// root, before that root's documents open on the shared instance beside
-    /// it (#968).
+    /// raced the registration — is handed to a consolidation by the next
+    /// acquisition of its root, which itself already routes to the shared
+    /// instance (#968).
     #[tokio::test]
     async fn resolve_acquire_retires_a_straggling_divert_of_a_capable_shared() {
         let (_tmp, doc) = marker_rooted_doc();
@@ -6004,9 +6019,17 @@ mod tests {
         )
         .await;
 
+        let mut upstream_requests = pool.take_upstream_request_rx().expect("receiver");
         let (_marker, key) = pool.resolve_acquire("lua", &config, Some(&doc)).await;
 
         assert_eq!(key, ConnectionKey::shared("lua"));
+        match upstream_requests.try_recv() {
+            Ok(UpstreamRequest::ConsolidateSharedInstance { server }) => {
+                assert_eq!(server, "lua");
+            }
+            _ => panic!("the straggler must be handed to a consolidation"),
+        }
+        pool.consolidate_shared_instance("lua").await;
         assert!(
             !pool.connections.lock().await.contains_key(&straggler_key),
             "the root's own per-root process must not keep serving beside the shared one"
