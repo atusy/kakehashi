@@ -2428,6 +2428,30 @@ print("hello")
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
         configure_rust_self_host(server);
+        let mut settings = (*server.settings_manager.load_settings()).clone();
+        settings
+            .languages
+            .get_mut("rust")
+            .unwrap()
+            .bridge
+            .as_mut()
+            .unwrap()
+            .insert(
+                "rust".to_string(),
+                BridgeLanguageConfig {
+                    enabled: Some(true),
+                    aggregation: None,
+                },
+            );
+        server.settings_manager.apply_settings(settings);
+        let query = Query::new(
+            &tree_sitter_rust::LANGUAGE.into(),
+            r#"((function_item body: (block) @injection.content) (#set! injection.language "rust"))"#,
+        ).unwrap();
+        server
+            .language
+            .query_store()
+            .insert_injection_query("rust".to_string(), std::sync::Arc::new(query));
         let handle = server
             .bridge
             .insert_diagnostic_test_connection("rust_ls")
@@ -2439,35 +2463,39 @@ print("hello")
             Some("rust".to_string()),
             None,
         );
+        server.bridge.open_tracker_incarnation(&uri, incarnation);
         server.bridge.open_host_incarnation(&uri, incarnation).await;
         assert!(server.documents.get(&uri).unwrap().tree().is_none());
         server
             .diagnostic_scheduler()
             .spawn_synthetic_diagnostic_task_when_current(uri.clone(), incarnation, 0);
 
-        for message in ["before parse", "after parse"] {
-            let request_id = tokio::time::timeout(Duration::from_secs(2), async {
+        for (message, count) in [("before parse", 1), ("after parse", 2)] {
+            let request_ids = tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
-                    if let Some(id) = handle
+                    let ids: Vec<_> = handle
                         .router()
                         .pending_ids()
                         .into_iter()
-                        .find(|id| handle.router().is_sent(*id))
-                    {
-                        break id;
+                        .filter(|id| handle.router().is_sent(*id))
+                        .collect();
+                    if ids.len() == count {
+                        break ids;
                     }
                     tokio::task::yield_now().await;
                 }
             })
             .await
             .expect("saved host pull must not wait for a tree, and must follow up once it lands");
-            let _ = handle.router().route(json!({
+            for request_id in request_ids {
+                let _ = handle.router().route(json!({
                 "jsonrpc": "2.0", "id": request_id.as_i64(),
                 "result": { "kind": "full", "items": [{
                     "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
                     "message": message
                 }] }
-            }));
+                }));
+            }
             tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
                     let snapshot = server.diagnostics.snapshot(&uri);
@@ -2475,7 +2503,8 @@ print("hello")
                         .get(&DiagnosticSource::PullLayer)
                         .and_then(|slots| slots.get(PULL_LAYER_SERVER))
                         .is_some_and(|slot| {
-                            slot.diagnostics.iter().any(|diag| diag.message == message)
+                            slot.diagnostics.len() == count
+                                && slot.diagnostics.iter().all(|diag| diag.message == message)
                         })
                     {
                         break;
@@ -2485,6 +2514,20 @@ print("hello")
             })
             .await
             .expect("saved host result should reach the proactive cache");
+            if message == "after parse" {
+                let snapshot = server.diagnostics.snapshot(&uri);
+                let mut columns: Vec<_> = snapshot[&DiagnosticSource::PullLayer][PULL_LAYER_SERVER]
+                    .diagnostics
+                    .iter()
+                    .map(|diag| diag.range.start.character)
+                    .collect();
+                columns.sort();
+                assert_eq!(
+                    columns,
+                    vec![0, 10],
+                    "host and virtual results both survive the saved follow-up"
+                );
+            }
             if message == "before parse" {
                 assert!(server.documents.get(&uri).unwrap().tree().is_none());
                 let lineage = server
@@ -2492,6 +2535,15 @@ print("hello")
                     .parse_document(uri.clone(), Some("rust"), None, Some(incarnation))
                     .await
                     .unwrap();
+                assert_eq!(
+                    server
+                        .diagnostic_scheduler()
+                        .prepare_diagnostic_snapshot(&uri)
+                        .unwrap()
+                        .virt_contexts
+                        .len(),
+                    1
+                );
                 // A late Open callback cannot take ownership from the Save.
                 server
                     .diagnostic_scheduler()
