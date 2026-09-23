@@ -128,32 +128,35 @@ const CONFIGURATION_PULL_TIMEOUT: std::time::Duration = std::time::Duration::fro
 
 /// How a client-supplied configuration reached kakehashi.
 ///
-/// Only used to describe it back to the user: the two arrive by different
-/// routes, and a message naming the wrong one sends people looking for a
-/// notification they never sent.
-#[derive(Clone, Copy)]
+/// The two arrive by different routes, and a message naming the wrong one
+/// sends people looking for a notification they never sent. A pull also
+/// remembers the root it was asked at, since its answer describes that
+/// workspace.
 pub(crate) enum ConfigurationIngress {
     /// The client pushed `workspace/didChangeConfiguration`.
     Push,
-    /// kakehashi asked, via `workspace/configuration`.
-    Pull,
+    /// kakehashi asked, via `workspace/configuration`, while `asked_at` was
+    /// the selected configuration root.
+    Pull {
+        asked_at: Option<std::path::PathBuf>,
+    },
 }
 
 impl ConfigurationIngress {
-    fn describe(self) -> &'static str {
+    fn describe(&self) -> &'static str {
         match self {
             Self::Push => "workspace/didChangeConfiguration",
-            Self::Pull => "the configuration read from the client",
+            Self::Pull { .. } => "the configuration read from the client",
         }
     }
 
     /// What to say once the layer is in effect. A pull runs at startup for
     /// every capable client, where "Configuration updated!" would describe an
     /// event the user did not cause.
-    fn applied_message(self) -> &'static str {
+    fn applied_message(&self) -> &'static str {
         match self {
             Self::Push => "Configuration updated!",
-            Self::Pull => "Applied the configuration read from the client",
+            Self::Pull { .. } => "Applied the configuration read from the client",
         }
     }
 }
@@ -229,6 +232,7 @@ impl Kakehashi {
 
     /// One round trip: ask, and apply whatever comes back.
     async fn pull_client_configuration_once(&self) {
+        let asked_at = self.settings_manager.root_path().as_ref().clone();
         let items = vec![ConfigurationItem {
             scope_uri: None,
             section: Some("kakehashi".to_string()),
@@ -281,7 +285,7 @@ impl Kakehashi {
 
         self.apply_client_configuration(
             serde_json::json!({ "kakehashi": section }),
-            ConfigurationIngress::Pull,
+            ConfigurationIngress::Pull { asked_at },
         )
         .await;
     }
@@ -377,7 +381,7 @@ impl Kakehashi {
                 // the very section being pulled. Rejecting the layer over one
                 // of those would make the pull useless for the editors it
                 // exists for; the keys are dropped by parsing instead.
-                ConfigurationIngress::Pull => {
+                ConfigurationIngress::Pull { .. } => {
                     self.notifier()
                         .log_info(format!(
                             "Ignoring {} in the configuration read from the client",
@@ -418,6 +422,22 @@ impl Kakehashi {
         // left — permanently, since anchoring yields absolute paths that no
         // later reload re-bases.
         let reload = lock_settings_reload().await;
+
+        // Asked while the session sat at one root and answered after it moved
+        // to another: the answer was read for a workspace no longer selected.
+        // The root change that moved it pulls again, so this one is dropped
+        // rather than anchored to, and retained under, a root it never
+        // described.
+        if let ConfigurationIngress::Pull { asked_at } = &ingress
+            && *self.settings_manager.root_path() != *asked_at
+        {
+            drop(reload);
+            log::debug!(
+                target: "kakehashi::config",
+                "Discarding a configuration answer read at a root no longer selected: {asked_at:?}"
+            );
+            return;
+        }
 
         // A pushed path is workspace-local, matching `initializationOptions`:
         // the client knows the workspace it opened, not the directory the server
