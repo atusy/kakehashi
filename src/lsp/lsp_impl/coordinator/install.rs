@@ -734,6 +734,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_query_repair_is_not_retried_until_the_next_reload() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .apply_settings(auto_install_settings());
+        let uri = Url::parse("file:///failed-repair.rs").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "fn main() {}".into(),
+            Some("rust".into()),
+            None,
+        );
+        let claim = server.auto_install.begin_test_claim(
+            "rust",
+            query_dependency_paths(&server.settings_manager.load_settings(), "rust"),
+        );
+        let install = server.install_coordinator();
+        let mut repair = Box::pin(install.maybe_auto_install_language(
+            "rust",
+            uri.clone(),
+            false,
+            Some(incarnation),
+            InstallRequest::new(true),
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(repair.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        claim.complete(crate::lsp::auto_install::InstallOutcome::Failed);
+        repair.await;
+
+        assert!(
+            !install.decide_query_repair("rust", true, || QueryChainState::NeedsRepair),
+            "reopening must not repeat a repair that just failed"
+        );
+        server.cache.bump_semantic_token_generation();
+        assert!(
+            install.decide_query_repair("rust", true, || QueryChainState::NeedsRepair),
+            "a reload (settings change or another install) retries it"
+        );
+    }
+
+    #[tokio::test]
     async fn query_repair_request_survives_a_siblings_publication() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
