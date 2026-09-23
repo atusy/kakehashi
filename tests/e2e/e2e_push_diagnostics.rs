@@ -2104,3 +2104,37 @@ fn e2e_disabling_a_bridged_language_retracts_its_open_virtual_documents() {
     client.send_request("shutdown", json!(null));
     client.send_notification("exit", json!(null));
 }
+
+/// #917: the retraction is invisible to a pull-mode editor — it displays what
+/// it pulled, and a settings change gives it no reason to pull again — so the
+/// bridge must nudge it with `workspace/diagnostic/refresh`.
+#[test]
+fn e2e_disabling_a_bridged_language_refreshes_pull_clients() {
+    let (mut client, _config_dir) =
+        init_client_with_mode_caps("diagnostics-push", refresh_capable_caps());
+    open_host(&mut client);
+
+    // The spontaneous push itself drives one refresh (#422); acknowledge it so
+    // the single-flighted refresh (#497) is free for the retraction's.
+    let (push_refresh_id, _, _) = client
+        .wait_for_server_request_watching(
+            "workspace/diagnostic/refresh",
+            Duration::from_secs(15),
+            &["textDocument/publishDiagnostics"],
+        )
+        .expect("the spontaneous push must drive a workspace/diagnostic/refresh (#422)");
+    client.send_response(push_refresh_id, json!(null));
+
+    set_markdown_lua_bridge(&mut client, false);
+    let (retract_refresh_id, _, _) = client
+        .wait_for_server_request_watching(
+            "workspace/diagnostic/refresh",
+            Duration::from_secs(10),
+            &["textDocument/publishDiagnostics"],
+        )
+        .expect("retracting a pushed diagnostic must nudge pull-mode clients");
+    client.send_response(retract_refresh_id, json!(null));
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
