@@ -307,7 +307,9 @@ current parse, and a changed document. A closed document is no longer owed a
 repair. A newer current parse or a reopened lifetime cannot confirm the old
 empty result; the sweep reports incomplete instead. The snapshot language is
 also checked before cached regions or a missing injection query can establish
-that the host has no injections.
+that the host has no injections. A nonempty resolution that routes to no units
+on this connection must pass the same revision check after routing: an edit
+while routing is pending may introduce a unit that does belong here.
 
 ### Undeterminable parses fail soft
 

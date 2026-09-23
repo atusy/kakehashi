@@ -1023,7 +1023,17 @@ impl InjectionCoordinator {
         if self.documents.get(uri).is_none() {
             self.documents.remove_edit_lock_if_unshared(uri, &edit_lock);
         }
-        outcome
+        // Routing can decide that none of the resolved regions belongs to
+        // this connection without reaching the open's edit guard. An edit
+        // during that decision may introduce an applicable region, so confirm
+        // the original revision before accepting a no-target result.
+        if outcome == crate::lsp::bridge::OpenOutcome::NotApplicable
+            && self.reopen_snapshot_state(uri, revision) == ReopenSnapshotState::Changed
+        {
+            crate::lsp::bridge::OpenOutcome::NotOpened
+        } else {
+            outcome
+        }
     }
 
     /// The host language and resolved bridge injections for `uri`, or `None`
@@ -1789,6 +1799,62 @@ mod tests {
             assert_eq!(a.region_id, b.region_id, "region id must match");
             assert_eq!(a.content, b.content, "clean content must match");
         }
+    }
+
+    #[rstest::rstest]
+    #[case::current(false, crate::lsp::bridge::OpenOutcome::NotApplicable)]
+    #[case::edited(true, crate::lsp::bridge::OpenOutcome::NotOpened)]
+    #[tokio::test]
+    async fn reopen_not_applicable_requires_the_resolved_revision(
+        #[case] edited: bool,
+        #[case] expected: crate::lsp::bridge::OpenOutcome,
+    ) {
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let uri = Url::parse("file:///reopen-not-applicable.rs").unwrap();
+        let text = "fn main() {}";
+        server.documents.insert(
+            uri.clone(),
+            text.into(),
+            Some("rust".into()),
+            parser.parse(text, None),
+        );
+        let injection = server.injection_coordinator();
+        let revision = injection.document_revision(&uri).unwrap();
+        if edited {
+            let newer = "fn newer() {}";
+            server
+                .documents
+                .update_document(uri.clone(), newer.into(), None);
+            publish_test_snapshot(
+                server,
+                &uri,
+                newer,
+                parser.parse(newer, None).unwrap(),
+                "rust",
+            );
+        }
+        // These nonempty resolved regions belong to the captured revision.
+        // A no-target answer must not validate them against a newer parse.
+        let outcome = injection
+            .reopen_server_documents(
+                &server.settings_manager.load_settings(),
+                "rust",
+                &uri,
+                revision,
+                &crate::lsp::bridge::ConnectionKey::for_server("not-selected"),
+                vec![super::BridgeInjection {
+                    language: "python".into(),
+                    region_id: "00000000000000000000000000".into(),
+                    content: "old()".into(),
+                }],
+            )
+            .await;
+        assert_eq!(outcome, expected);
     }
 
     #[rstest::rstest]
