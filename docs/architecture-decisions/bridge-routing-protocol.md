@@ -1162,8 +1162,9 @@ configured. Two pieces close most of the gap:
   re-evaluated on configuration reload for servers not already running
   under that key — the point where the stopped-set check has teeth, since
   the set is empty at session start. Because `didChangeConfiguration`
-  layers accumulate (configuration-merging-strategy), `forceStart = true`
-  persists until an explicit `false`, and a reload flipping it to `false`
+  layers accumulate (configuration-merging-strategy), a pushed
+  `forceStart = true` persists until an explicit `false` (a pulled one until
+  a newer answer drops it), and a reload flipping it to `false`
   never stops an already-running server — within a session the flag is
   effectively one-way; `stop` is the lever that stops. It also starts a
   server rather than supervising one: every recovery path in the pool is

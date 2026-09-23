@@ -106,14 +106,16 @@ impl Kakehashi {
                 self.apply_raw_settings_locked(&reload, raw, settings).await;
                 drop(reload);
                 self.warn_on_misconfigured_settings(&warnings).await;
-                // The client's configuration was read while the session sat in
-                // the old workspace, and even unscoped an editor may resolve it
-                // per workspace. Asked only once the new root is in effect, so
-                // the answer anchors to it; a rejected reload keeps the old
-                // root, where an answer would anchor to a workspace the editor
-                // has left. Awaited like the pull a
-                // no-payload `didChangeConfiguration` triggers, under the same
-                // timeout and single-flight.
+                // The client's configuration was asked for the old root's
+                // scope, and does not describe the new one. Asked only once the
+                // new root is in effect, so the answer names and anchors to it;
+                // a rejected reload keeps the old root, where an answer would
+                // anchor to a workspace the editor has left. Until it arrives,
+                // the old answer stays in effect: withdrawing it here would run
+                // this reload without the client's configuration, respawning
+                // every bridge server configured only through the editor.
+                // Awaited like the pull a no-payload `didChangeConfiguration`
+                // triggers, under the same timeout and single-flight.
                 if root_changed {
                     self.pull_client_configuration().await;
                 }

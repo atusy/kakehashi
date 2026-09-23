@@ -182,9 +182,10 @@ impl Kakehashi {
     /// whole process, and that root is what it is resolved for, so asking for
     /// the root's scope asks for exactly what the single snapshot means. Any
     /// other folder's configuration would be promoted to global; per-folder
-    /// resolution is not implemented. A root kakehashi chose itself — the
-    /// launch directory — is not the client's to answer for, so that session
-    /// asks unscoped, for the client's global settings.
+    /// resolution is not implemented. A root that is not a `file:` location
+    /// the client named — the launch directory kakehashi fell back to, or no
+    /// root at all — is not the client's to answer for, so that session asks
+    /// unscoped, for the client's global settings.
     ///
     /// The answer is trusted as authored: a field written as an empty container
     /// clears the layer below, exactly as the same spelling would in a config
@@ -193,11 +194,10 @@ impl Kakehashi {
     /// worth knowing before registering such a default, and the reason a pull
     /// answer is not merged more leniently than a push.
     ///
-    /// The answer is anchored against the workspace root, as a push is — the
-    /// root it was asked for, when the client named one. An unscoped answer's
-    /// relative paths therefore resolve against whichever workspace is open —
-    /// accepted, because the alternative leaves them resolving against the
-    /// launch directory.
+    /// The answer is anchored against the root it was asked for, as a push is
+    /// against the root in effect. For an unscoped answer that is the launch
+    /// directory, or nothing when there is no root, in which case its relative
+    /// paths stay as written.
     pub(crate) async fn pull_client_configuration(&self) {
         if !self.settings_manager.supports_configuration_pull() {
             return;
@@ -398,7 +398,7 @@ impl Kakehashi {
                 // vscode-languageclient's near-universal convention, inside
                 // the very section being pulled. Rejecting the layer over one
                 // of those would make the pull useless for the editors it
-                // exists for; the keys are dropped by parsing instead.
+                // exists for; the keys are dropped before parsing instead.
                 ConfigurationIngress::Pull { .. } => {
                     self.notifier()
                         .log_info(format!(

@@ -95,8 +95,9 @@ fn updated_settings_after_install(
         updated_settings.search_paths.push(data_dir_str.clone());
 
         // Raw settings are re-expanded by everything that reads them — a
-        // `didChangeConfiguration` merges onto this snapshot and converts it
-        // again — so the directory has to be spelled so that expanding it gives
+        // pushed `didChangeConfiguration` merges onto this snapshot and
+        // converts it again (a pull answer instead rebuilds from the retained
+        // layers, which do not hold this directory; see #948) — so the directory has to be spelled so that expanding it gives
         // it back. A literal `$` takes the documented escape; a leading `~`
         // (reachable with a quoted `--data-dir '~/data'`, naming a directory
         // actually called `~`) is put out of reach of tilde expansion by a `./`

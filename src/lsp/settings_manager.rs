@@ -1,7 +1,7 @@
 //! `SettingsManager`: workspace settings (`ArcSwap`, hot-swappable via
 //! `apply_settings`) plus initialize-only state — `client_capabilities` and
-//! `folderless_root` (both `OnceLock`) — and `root_path`, which is not
-//! initialize-only; see below.
+//! `folderless_root` (both `OnceLock`) — and `root_path` with its `root_scope`,
+//! which are not initialize-only; see below.
 //!
 //! `root_path` is an `ArcSwap`, not a `OnceLock`, because `initialize()` is not
 //! its only writer: `didChangeWorkspaceFolders` restores it when the client's
@@ -11,15 +11,9 @@
 //! root the session has already left, and the merge would then hold paths
 //! anchored to two different workspaces. What keeps that sound is that every
 //! writer AND every reader that anchors takes the settings-reload transaction;
-//! any further one has to do the same.
-//!
-//! Two carve-outs the transaction does not cover, both tracked by #948:
-//!
-//! - an explicit `--config-file` session stores the new root and returns
-//!   without re-deriving, since no file layer of its can change with the root;
-//! - a `didChangeConfiguration` layer is anchored when it is pushed and
-//!   accumulated in that form, so a later root change moves the project layer
-//!   and `initializationOptions` (stored raw) but not that layer's paths.
+//! any further one has to do the same. Client layers are retained in authored
+//! form and anchored at each rebuild, so a root change moves every one of them
+//! to the new root, including in an explicit `--config-file` session.
 
 use arc_swap::ArcSwap;
 use path_clean::PathClean;
@@ -67,6 +61,7 @@ pub(crate) struct SettingsManager {
     ///
     /// A `OnceLock` because no rung below `workspaceFolders` can change after
     /// the handshake — only the folder list does.
+    ///
     /// Paired with the client's URI for it, the scope a pull names once the
     /// session falls back to this root.
     folderless_root: OnceLock<(Option<PathBuf>, Option<Uri>)>,

@@ -227,9 +227,10 @@ Clients that declare `workspace.configuration` support are also asked for the
 
 The request's `scopeUri` is the workspace root (see below), exactly as the
 client named it, because kakehashi keeps one effective configuration for the
-whole session and resolves it for that root. When kakehashi fell back to its
-launch directory because the client named no workspace, the request carries
-no `scopeUri` and asks for the client's global configuration. Configuration an
+whole session and resolves it for that root. When that root is not a `file:`
+location the client named — kakehashi fell back to its launch directory, or a
+folder change left the session without a root — the request carries no
+`scopeUri` and asks for the client's global configuration. Configuration an
 editor keeps for other workspace folders is not read.
 
 The answer is the client's configuration, one layer above the configuration
@@ -240,7 +241,8 @@ it. An answer holding nothing for kakehashi (`{}`, or only keys such as
 `trace.server`) withdraws the previous answer. An answer of `null`, an error
 response, or no answer within 10 seconds leaves the settings in effect
 unchanged, and so does an answer to a request made for a root the session has
-since left — the root change asks again. Unlike a push, an answer containing
+since left — the root change asks again. Until the root change's answer
+arrives, the previous answer stays in effect. Unlike a push, an answer containing
 keys kakehashi does not know (editors keep settings such as `trace.server` in
 the same section) is not rejected: those keys are ignored and the rest
 applies.

@@ -228,10 +228,20 @@ The following are **deferred** and intentionally out of scope:
   has put the new root in effect, so the answer anchors to it. A folder change
   that keeps the root does not ask, and neither does a reload rejected as
   invalid: that keeps the old root, so an answer would anchor to a workspace
-  the editor has left. Asking has a price: a non-empty answer rebuilds the
-  settings, so the reload's reparse of open documents and semantic-token
-  refresh happen a second time. Accepted, because a root change is rare next
-  to an edit.
+  the editor has left. Asking has a price: an answer that changes the
+  retained layers rebuilds the settings, so the reload's reparse of open
+  documents and semantic-token refresh happen a second time. Accepted,
+  because a root change is rare next to an edit.
+
+  Until that answer arrives, the previous answer stays in effect — it was
+  read for the old root, and the reload replays it anchored to the new one.
+  It is kept as the last known answer rather than withdrawn at the reload:
+  withdrawing would run one reload without the client's configuration,
+  tearing down and respawning every bridge server configured only through
+  the editor on each folder switch, to cover a re-pull failing. If the re-pull
+  answers `null`, errors, or times out, the old root's answer therefore keeps
+  applying. That differs from an answer that *arrives* for a root the session
+  has left, which is discarded (see `scopeUri` below).
 
   The answer is ingested as a push of the same section is (unknown keys
   aside, see configuration-merging-strategy), but retained differently. A push
@@ -240,16 +250,23 @@ The following are **deferred** and intentionally out of scope:
   arrival, above older pushes — the newest answer is the newest statement of
   the client's configuration. An answer holding nothing for kakehashi
   withdraws the previous one; `null`, an error, or a timeout is no answer and
-  changes nothing. Because the fold is not associative, taking the previous
-  answer out cannot be done on the merged snapshot: each applied answer
-  rebuilds the settings from the retained layers, re-reading the implicit
-  config files as a root change does. That rebuild inherits two gaps #948
-  tracks for root changes, now reachable on every pull: an installed parser
-  directory appended after an install is dropped if no layer names it (masked
-  under the default `searchPaths`, which already include the data directory
-  installs go to), and a config file that turned invalid since it was last
-  read fails the rebuild, which keeps the settings in effect and discards the
-  answer.
+  changes nothing — which also means an editor that answers `null` once
+  nothing is configured has no way to withdraw an earlier answer; LSP defines
+  `null` as "cannot provide", so it is not read as "nothing configured".
+
+  Because the fold is not associative, taking the previous answer out cannot
+  be done on the merged snapshot. Each applied answer rebuilds the settings
+  instead, folding the retained client layers over the defaults-and-files
+  prefix kept from the load that last read the configuration files
+  (initialize, or a root change) — a prefix checkpoint, which #948 records as
+  safe. The files are not read again for a pull, so a file saved half-edited
+  since cannot drop out of effect because the editor's settings changed; an
+  edited file takes effect at the next root change, as before. The rebuild
+  inherits one gap #948 tracks for root changes, now reachable on every pull:
+  a parser directory appended to the settings in effect after an install is
+  in no layer, so a rebuild drops it (#948 describes when that is reachable —
+  auto-install only runs when `searchPaths` already includes the default data
+  directory).
 
   One consequence worth stating for anyone writing an editor integration: a
   field the client answers with an empty container **clears** the layer below,
@@ -260,15 +277,18 @@ The following are **deferred** and intentionally out of scope:
   is not an option — it would make an intentional clear unspellable through a
   pull-model editor — so register defaults as absent rather than empty.
 - **`scopeUri`**: upstream, **implemented for the selected root** (#952).
-  The pull's `scopeUri` is the process-wide configuration root — the first
-  workspace folder, else `rootUri`, else the deprecated `rootPath` converted to
-  a file URI — sent as the client spelled it. It is `null` only when kakehashi
-  fell back to its launch directory, which is not a workspace the client can
-  answer for. This keeps the invariant that one server process resolves one
+  The pull's `scopeUri` names the process-wide configuration root the client
+  selected — the first workspace folder, else `rootUri`, else the deprecated
+  `rootPath` converted to a file URI — sent as the client spelled it. It is
+  `null` whenever the root is not a `file:` location the client named: when
+  kakehashi fell back to its launch directory (including when the first rung
+  the client sent is not a `file:` URI — the ladder does not skip past it),
+  and when a folder change leaves the session with no root at all. This keeps the invariant that one server process resolves one
   effective settings snapshot: the scope is the root that snapshot is resolved
   for, so no folder's configuration is promoted beyond the scope it already
-  had. An answer to a request made for a root the session has since left is
-  discarded; the root change pulls again for the new scope.
+  had. An answer to a request made for a root the session has since left —
+  by path or by scope — is discarded; the root change pulls again for the new
+  scope.
 
   On the downstream side `ConfigurationItem.scopeUri` is still ignored — a
   single per-server `settings` value answers all scopes.
@@ -279,7 +299,7 @@ The following are **deferred** and intentionally out of scope:
   not answer:
   - *Which scope a request resolves to* — the containing workspace folder, or
     the document's own URI.
-  - *Parser selection* — parsers and queries are loaded once per language name
+  - *Parser selection* — parsers and queries are held once per language name
     for the whole process; two folders naming different parser paths or query
     sets for one language cannot both be honoured without per-scope registries.
   - *Bridge server spawning and reuse* — pooled connections are keyed without a
