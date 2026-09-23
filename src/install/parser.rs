@@ -789,11 +789,9 @@ fn extract_parser_archive(
             )));
         }
 
-        // Prevent path traversal attacks (zip slip)
-        if relative
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
+        // Re-check after stripping: on Windows, a formerly nested `C:/...`
+        // component becomes a drive prefix that would replace `dest` on join.
+        if !archive_path_is_confined(&relative) {
             return Err(ParserInstallError::ArchiveError(format!(
                 "Path traversal attempt detected in archive: {}",
                 relative.display()
@@ -819,6 +817,15 @@ fn extract_parser_archive(
     }
 
     Ok(())
+}
+
+fn archive_path_is_confined(path: &Path) -> bool {
+    path.components().all(|component| {
+        matches!(
+            component,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    })
 }
 
 /// Derive the expected root directory name inside a GitHub archive tarball.
@@ -2111,6 +2118,40 @@ mod tests {
         assert_eq!(
             archive_root_dir_name("tree-sitter-json", "0.24.8"),
             "tree-sitter-json-0.24.8"
+        );
+    }
+
+    #[test]
+    fn parser_archive_path_boundary_rejects_absolute_and_parent_paths() {
+        assert!(archive_path_is_confined(Path::new("src/parser.c")));
+        assert!(!archive_path_is_confined(Path::new("../outside")));
+        assert!(!archive_path_is_confined(Path::new("/outside")));
+        #[cfg(windows)]
+        for path in ["C:/outside", "C:outside", r"\outside", r"\\?\C:\outside"] {
+            assert!(!archive_path_is_confined(Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parser_archive_rejects_a_drive_prefix_exposed_by_root_stripping() {
+        let temp = tempdir().unwrap();
+        let victim = temp.path().join("outside");
+        let entry_path = format!("repo-rev/{}", victim.to_str().unwrap().replace('\\', "/"));
+        let mut archive = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(7);
+        archive
+            .append_data(&mut header, entry_path, &b"payload"[..])
+            .unwrap();
+        let bytes = archive.into_inner().unwrap();
+        assert!(
+            extract_parser_archive(&bytes[..], "repo-rev", &temp.path().join("source")).is_err()
+        );
+        assert!(
+            !victim.exists(),
+            "drive-prefixed entry must not escape source"
         );
     }
 
