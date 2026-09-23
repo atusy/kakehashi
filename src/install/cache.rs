@@ -84,6 +84,20 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn cache_write_replaces_existing_regular_file() {
+        let temp = tempdir().unwrap();
+        let cache = MetadataCache::with_default_ttl(temp.path());
+        cache.write("previous complete metadata").unwrap();
+
+        cache.write("replacement metadata").unwrap();
+
+        assert_eq!(cache.read().as_deref(), Some("replacement metadata"));
+    }
+
+    // Windows may refuse replacement while the destination is open; callers
+    // already treat a failed cache publication as best-effort.
+    #[cfg(unix)]
+    #[test]
     fn cache_replacement_preserves_an_open_reader() {
         use std::io::Read;
 
