@@ -350,6 +350,52 @@ mod tests {
         );
     }
 
+    /// Deselecting one server's copy of a virtual document must leave the
+    /// routing decisions of the other servers on that URI alone: those still
+    /// serve (or were routed away from) the same region, and forgetting a
+    /// "routed away" answer lets a request lazily open that server again.
+    #[tokio::test]
+    async fn close_deselected_docs_keeps_sibling_servers_routing() {
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///project/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "python", "REGION");
+        let routing_uri = Url::parse(&virtual_uri.to_uri_string()).unwrap();
+        for server in ["ruff", "pyright"] {
+            pool.register_opened_document(
+                &host_uri,
+                &virtual_uri,
+                &ConnectionKey::for_server(server),
+            )
+            .await;
+        }
+        pool.set_host_routing_by_server(&routing_uri, "pyright", true);
+        pool.set_host_routing_decided(&routing_uri, &ConnectionKey::for_server("pyright"));
+        pool.set_host_routing_by_server(&routing_uri, "mypy", false);
+        pool.set_host_routing_suppressed(&routing_uri, &ConnectionKey::for_server("mypy"));
+        pool.set_host_routing_by_server(&routing_uri, "ruff", true);
+
+        let closed = pool
+            .close_deselected_docs(&host_uri, |doc| doc.connection_key.server() != "ruff")
+            .await;
+
+        assert_eq!(closed.len(), 1);
+        assert_eq!(pool.host_routing_by_server(&routing_uri, "ruff"), None);
+        assert_eq!(
+            pool.host_routing_by_server(&routing_uri, "pyright"),
+            Some(true)
+        );
+        assert!(pool.is_host_routing_decided(&routing_uri, &ConnectionKey::for_server("pyright")));
+        assert_eq!(
+            pool.host_routing_by_server(&routing_uri, "mypy"),
+            Some(false)
+        );
+        assert!(pool.is_host_routing_suppressed(&routing_uri, &ConnectionKey::for_server("mypy")));
+        assert_eq!(
+            pool.get_all_connections_for_virtual_uri(&virtual_uri),
+            vec![ConnectionKey::for_server("pyright")]
+        );
+    }
+
     /// `close_scratch_document` removes the scratch URI from `host_to_virtual`.
     ///
     /// `ensure_document_opened` registers every virtual URI (scratch included)
