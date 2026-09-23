@@ -192,8 +192,10 @@ fn inherited_languages_in(
             // answering "no parents" would let a caller call the chain complete
             // on a file it never saw, so say the chain cannot be determined.
             Err(_) if matches!(unreadable, UnreadableQuery::Undetermined) => return None,
+            // Debug, not warn: the probe runs on every open, and the loader
+            // already reports the kind this file breaks.
             Err(e) => {
-                log::warn!(
+                log::debug!(
                     target: "kakehashi::install",
                     "Ignoring unreadable runtime query {} while collecting dependencies: {e}",
                     path.display()
