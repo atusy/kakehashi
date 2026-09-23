@@ -1203,8 +1203,8 @@ fn safe_query_entry_name(path: &Path) -> Option<String> {
 
 /// What to tell someone whose `--output` path is already taken. `--force`
 /// replaces regular file entries atomically; it does not update other hard
-/// links to the old file. Symlinks, reparse points and special files are
-/// refused rather than followed or replaced. The advice is not a promise
+/// links to the old file. Symlinks, reparse points and special files observed
+/// by the pre-publication checks are refused. The advice is not a promise
 /// that publication succeeds: directory permissions and open handles may
 /// still prevent replacement.
 ///
@@ -1358,9 +1358,10 @@ fn write_forced_output_with(
     }
     temp.as_file().sync_all()?;
 
-    // Refuse a link or special entry introduced while preparing the output.
-    // Persist replaces the directory entry, so even a later leaf swap cannot
-    // redirect the write into a symlink target.
+    // Refuse observed links, special entries and changed protection metadata.
+    // This is not a conditional rename: an entry swapped in after this check
+    // may itself be replaced. Persist never follows the leaf, so that race
+    // cannot redirect the write into a symlink target (#800).
     if forced_output_metadata(path)? != metadata {
         return Err(std::io::Error::other(
             "output permissions or ownership changed while preparing replacement; retry",
