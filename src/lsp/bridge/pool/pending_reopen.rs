@@ -436,7 +436,23 @@ mod tests {
         assert!(!waiter.is_finished(), "must block while the re-open runs");
 
         tx.send(true).expect("waiter holds the receiver");
-        waiter.await.expect("waiter completes once signalled");
+        assert!(waiter.await.expect("waiter completes once signalled"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_completed_reopen_releases_the_first_waiter() {
+        let registry = PendingReopenRegistry::default();
+        let key = ConnectionKey::for_server("ruff");
+        registry.arm(&key);
+        let done = registry.claim(&key).unwrap();
+        done.send(true).unwrap();
+        drop(done);
+
+        // The first attempt must observe success, not retire a failed barrier
+        // and only allow the second attempt through. Polling also proves that
+        // an already completed repair does not wait for the timeout.
+        let mut waiter = tokio_test::task::spawn(registry.wait_for_reopen(&key));
+        assert!(tokio_test::assert_ready!(waiter.poll()));
     }
 
     #[tokio::test]

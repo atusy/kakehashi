@@ -4618,6 +4618,48 @@ mod reopen_order_tests {
     use super::order_reopen_candidates;
     use url::Url;
 
+    /// Exercise the actual producer, not a test that supplies `done=true` by
+    /// hand. A false or missing completion must fail even though E2E command
+    /// retries can eventually pass a retired failed barrier.
+    #[tokio::test]
+    async fn completed_reopen_reports_success() {
+        use super::*;
+        use crate::lsp::bridge::{ConnectionKey, UpstreamRequest};
+        use tower_lsp_server::LspService;
+
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let context = Arc::new(UpstreamDeliveryContext {
+            diagnostic_publisher: Arc::new(
+                crate::lsp::lsp_impl::coordinator::DiagnosticPublisher::new(server),
+            ),
+            settings_manager: Arc::clone(&server.settings_manager),
+            injection: server.injection_coordinator(),
+        });
+        let (done, mut completion) = tokio::sync::watch::channel(false);
+        spawn_upstream_request(
+            server.bridge.pool().inbound_request_registry(),
+            None,
+            &server.client,
+            UpstreamRequest::ReopenDocuments {
+                key: ConnectionKey::for_server("retired-server"),
+                done,
+            },
+            false,
+            Some(context),
+        );
+        // No documents need repair. Await the producer's own completion signal,
+        // with a generous deadlock guard rather than a latency assertion.
+        tokio::time::timeout(std::time::Duration::from_secs(15), completion.changed())
+            .await
+            .expect("reopen task must finish")
+            .expect("reopen task must report its result before dropping the sender");
+        assert!(
+            *completion.borrow(),
+            "a completed repair must report success"
+        );
+    }
+
     #[test]
     fn current_documents_come_before_pending_ones_in_stable_order() {
         let hosts: Vec<Url> = [

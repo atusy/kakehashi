@@ -216,10 +216,8 @@ fn assert_advertised(init_response: &Value) {
 /// `didOpen` goes out.
 ///
 /// `stall_ms` selects which half of the barrier contract is under test.
-/// Longer than the pool's 2 s `REOPEN_WAIT` pins that an UNSETTLED barrier
-/// withholds the command; `0` pins that a SETTLED one releases it. Both
-/// directions are needed — a barrier that always reports failure satisfies
-/// the withhold half perfectly.
+/// Longer than the pool's 2 s `REOPEN_WAIT` forces the withholding path;
+/// `0` exercises the ordinary sweep over multiple open documents.
 fn init_client_reopen_order(
     log: &std::path::Path,
     stall_ms: u32,
@@ -371,33 +369,6 @@ fn open_second_host_on_the_predecessor(client: &mut LspClient, log: &std::path::
     panic!("the predecessor never surfaced an action for {SECOND_HOST_DIR}:\n{wire}");
 }
 
-/// Block until the replacement incarnation has both initialized AND received a
-/// `didOpen`, i.e. its re-open has actually run.
-///
-/// Waiting on the observable effect rather than on a duration is what keeps the
-/// caller's assertion about the barrier's RESULT instead of about the clock.
-fn await_replacement_reopen(log: &std::path::Path, uri_marker: &str) {
-    for _ in 0..300 {
-        if let Ok(wire) = std::fs::read_to_string(log)
-            && wire
-                .lines()
-                .filter(|l| l.split('\t').next() == Some("initialize"))
-                .count()
-                >= 2
-            && replacement_segment(&wire).iter().any(|l| {
-                let mut parts = l.split('\t');
-                parts.next() == Some("textDocument/didOpen")
-                    && parts.next().is_some_and(|uri| uri.contains(uri_marker))
-            })
-        {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let wire = std::fs::read_to_string(log).unwrap_or_default();
-    panic!("the replacement never re-opened a {uri_marker} document:\n{wire}");
-}
-
 /// Split the wire log into lines and return the segment belonging to the
 /// REPLACEMENT incarnation: everything from the last exact `initialize` on.
 /// Segmenting matters — the first incarnation legitimately received a didOpen
@@ -505,29 +476,13 @@ fn a_command_does_not_overtake_the_reopen_of_a_respawned_downstream() {
     shutdown(&mut client);
 }
 
-/// The other half of the barrier contract: a re-open that COMPLETES must
-/// release the command, on the first attempt.
-///
-/// Withholding is only half a guarantee. A barrier that reported failure
-/// unconditionally would satisfy
-/// `a_command_does_not_overtake_the_reopen_of_a_respawned_downstream`
-/// completely — its first command is null either way, and the retry loop
-/// still succeeds because a dropped completion sender retires the entry, so
-/// the second attempt sails through and the didOpen still precedes it. Nothing
-/// there distinguishes "waited and was released" from "never released, gave up
-/// waiting".
-///
-/// So this pins the positive direction. It does NOT race the barrier to do it:
-/// firing the command while the re-open is still in flight makes the assertion
-/// depend on the re-open beating `REOPEN_WAIT`, which a loaded machine breaks —
-/// and a fail-soft null is the CORRECT answer then, so the test would be
-/// failing on correct behaviour. Instead the re-open is allowed to finish
-/// first, and the command then fires against a barrier whose recorded result is
-/// already `true`. A barrier that reports failure leaves that result `false`
-/// with its sender dropped, which the wait reads as "connection may still be
-/// missing documents" and withholds the command — no timing involved.
+/// A real respawn sweep must reopen even a host no post-crash request touches
+/// before executing the command. Drive completion through command responses;
+/// a busy machine may legitimately exhaust one request's bounded reopen wait.
+/// The lifecycle and registry tests separately pin successful completion and
+/// first-waiter release, so retries here cannot hide an always-false signal.
 #[test]
-fn a_completed_reopen_releases_the_command_it_was_holding() {
+fn a_respawned_command_follows_the_derived_reopen() {
     let log_dir = tempfile::TempDir::new().expect("Failed to create log temp dir");
     let log = log_dir.path().join("wire.log");
     let (mut client, _config_dir) = init_client_reopen_order(&log, 0);
@@ -572,25 +527,31 @@ fn a_completed_reopen_releases_the_command_it_was_holding() {
 
     // The mock died surfacing that action. Drive the respawn with a SECOND
     // codeAction rather than with the command: codeAction never consults the
-    // barrier, so the re-open runs and settles while nothing has waited on it —
-    // and only a wait retires the entry, so its result is still there to read.
+    // barrier, so it starts the replacement without consuming the reopen
+    // result. The command attempts below then observe that result.
     let _ = code_action_with_retry(&mut client);
-    // Wait for the SECOND host specifically. Only the derived sweep can have
-    // opened it: the codeAction above touches the first host, so the request
-    // path's own lazy open cannot account for a virtual URI under `/second/`.
-    // Waiting on any didOpen would let a re-open that opened NOTHING satisfy
-    // this, because the request path produces one either way.
-    await_replacement_reopen(&log, SECOND_HOST_DIR);
-
-    // The barrier now holds a settled result. Releasing the command is the only
-    // correct response to one that reports success.
-    let response = client.send_request(
-        "workspace/executeCommand",
-        json!({ "command": routed, "arguments": [] }),
-    );
+    // Each attempt runs the production reopen barrier. An in-flight timeout
+    // keeps that barrier registered; only a downstream response ends the retry.
+    // No request touches the second host, so its didOpen below still proves
+    // the derived sweep ran rather than a request opening it lazily.
+    let mut delivered = false;
+    for _ in 0..40 {
+        let response = client.send_request(
+            "workspace/executeCommand",
+            json!({ "command": routed, "arguments": [] }),
+        );
+        assert!(
+            response.get("error").is_none(),
+            "command failed: {response}"
+        );
+        if !response["result"].is_null() {
+            delivered = true;
+            break;
+        }
+    }
     assert!(
-        !response["result"].is_null(),
-        "a settled re-open must release the command it was holding, got: {response:?}"
+        delivered,
+        "the command must succeed after the derived reopen"
     );
 
     let wire = std::fs::read_to_string(&log).expect("the mock wrote a wire log");
@@ -605,7 +566,13 @@ fn a_completed_reopen_releases_the_command_it_was_holding() {
         .unwrap_or_else(|| panic!("the replacement never received the command:\n{wire}"));
     let reopen = segment
         .iter()
-        .position(|l| l.split('\t').next() == Some("textDocument/didOpen"))
+        .position(|l| {
+            let mut parts = l.split('\t');
+            parts.next() == Some("textDocument/didOpen")
+                && parts
+                    .next()
+                    .is_some_and(|uri| uri.contains(SECOND_HOST_DIR))
+        })
         .unwrap_or_else(|| {
             panic!("no didOpen reached the replacement before the command:\n{wire}")
         });
