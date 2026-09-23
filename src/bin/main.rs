@@ -1302,15 +1302,18 @@ fn write_new_output_with(
 #[cfg(windows)]
 fn native_output_path(path: &std::path::Path) -> std::io::Result<PathBuf> {
     use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::ffi::OsStringExt as _;
+    use std::path::{Component, Prefix};
 
-    // Splitting parent/leaf would erase a directory-only trailing separator,
-    // potentially turning an invalid file output into a successful overwrite.
-    if path
-        .as_os_str()
-        .encode_wide()
-        .last()
-        .is_some_and(|last| last == u16::from(b'/') || last == u16::from(b'\\'))
-    {
+    // Apply Win32 lexical rules first; explicitly verbatim input is preserved.
+    // Normalization can itself introduce a separator (for example `file\.. `).
+    let absolute = std::path::absolute(path)?;
+    if [path, absolute.as_path()].iter().any(|path| {
+        path.as_os_str()
+            .encode_wide()
+            .last()
+            .is_some_and(|last| last == u16::from(b'/') || last == u16::from(b'\\'))
+    }) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "output file path must not end with a directory separator",
@@ -1318,15 +1321,22 @@ fn native_output_path(path: &std::path::Path) -> std::io::Result<PathBuf> {
     }
     // Rust's filesystem wrappers support extended-length paths, but tempfile's
     // native publication and our security APIs need the prefix explicitly.
-    // First apply Win32 lexical normalization (including ordinary trailing dots
-    // and spaces). absolute preserves explicitly verbatim input as-is.
-    let path = std::path::absolute(path)?;
-    // Canonicalize only the existing parent: the output leaf may be absent and
-    // must still be inspected without following a symlink/reparse point.
-    match path.file_name() {
-        Some(name) => Ok(output_parent(&path).canonicalize()?.join(name)),
-        None => Ok(path.to_owned()),
-    }
+    // Prefix the entire path as text: joining an extracted leaf can reparse a
+    // colon as a drive prefix or normalize literal verbatim components. Avoid
+    // canonicalize, which additionally needs filesystem access and DOS mappings.
+    let (prefix, skip) = match absolute.components().next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::Disk(_) => (r"\\?\", 0),
+            Prefix::UNC(_, _) => (r"\\?\UNC\", 2),
+            _ => return Ok(absolute),
+        },
+        _ => return Ok(absolute),
+    };
+    let native: Vec<u16> = prefix
+        .encode_utf16()
+        .chain(absolute.as_os_str().encode_wide().skip(skip))
+        .collect();
+    Ok(PathBuf::from(std::ffi::OsString::from_wide(&native)))
 }
 
 fn output_parent(path: &std::path::Path) -> &std::path::Path {
@@ -2368,6 +2378,37 @@ mod tests {
             std::fs::read_to_string(&output).unwrap(),
             "previous configuration"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_output_conversion_preserves_namespaces_and_literal_leaves() {
+        for (input, expected) in [
+            (
+                r"C:\directory\c:config.toml",
+                r"\\?\C:\directory\c:config.toml",
+            ),
+            (
+                r"\\?\C:\directory\foo/../config.toml",
+                r"\\?\C:\directory\foo/../config.toml",
+            ),
+            (
+                r"\\server\share\config.toml",
+                r"\\?\UNC\server\share\config.toml",
+            ),
+            (
+                r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\config.toml",
+                r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\config.toml",
+            ),
+        ] {
+            // These paths need not exist; conversion must require no parent I/O.
+            assert_eq!(
+                native_output_path(Path::new(input)).unwrap().as_os_str(),
+                expected
+            );
+        }
+        assert!(native_output_path(Path::new(r"C:\directory\config.toml\.. ")).is_err());
+        assert!(native_output_path(Path::new(r"C:\directory\config.toml\... ")).is_err());
     }
 
     #[cfg(windows)]
