@@ -961,6 +961,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_probe_outlived_by_a_reload_sees_the_newer_failure() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .apply_settings(auto_install_settings());
+        let install = server.install_coordinator();
+        // A reload lands while the probe reads, and a repair then fails in
+        // the new generation.
+        assert!(!install.decide_query_repair("rust", true, || {
+            server.cache.bump_semantic_token_generation();
+            server
+                .auto_install
+                .record_query_repair_failure("rust", server.cache.semantic_token_generation());
+            QueryChainState::NeedsRepair
+        }));
+    }
+
+    #[tokio::test]
     async fn query_repair_leaves_the_first_snapshot_to_the_inline_parse() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
