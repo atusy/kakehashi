@@ -125,10 +125,11 @@ impl Kakehashi {
                 drop(reload);
                 self.warn_on_misconfigured_settings(&warnings).await;
                 // The client's configuration was read while the session sat in
-                // the old workspace, and an editor resolves it per workspace.
-                // Asked only once the new root is in effect, so the answer
-                // anchors to it; a rejected reload keeps the old root, and so
-                // has nothing new to ask about. Awaited like the pull a
+                // the old workspace, and even unscoped an editor may resolve it
+                // per workspace. Asked only once the new root is in effect, so
+                // the answer anchors to it; a rejected reload keeps the old
+                // root, where an answer would anchor to a workspace the editor
+                // has left. Awaited like the pull a
                 // no-payload `didChangeConfiguration` triggers, under the same
                 // timeout and single-flight.
                 if root_changed {

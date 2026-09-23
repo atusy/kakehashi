@@ -223,11 +223,15 @@ The following are **deferred** and intentionally out of scope:
   `didChangeConfiguration` carries no usable payload — which is the shape
   pull-model editors send — and again after a `didChangeWorkspaceFolders`
   that moves the selected configuration root. The last is a decision, not a
-  protocol requirement: an editor resolves its configuration per workspace,
-  so an answer read in the old workspace may not describe the new one. It
-  asks only once the reload has put the new root in effect, so the answer
-  anchors to it; a folder change that keeps the root, or a reload rejected as
-  invalid (which keeps the old root), does not ask. The answer is applied as a configuration layer,
+  protocol requirement. Even unscoped, the answer may depend on the open
+  workspace — VS Code folds workspace settings into it, while Neovim answers
+  from settings that do not — so an answer read in the old workspace may not
+  describe the new one, and its relative paths anchor to whichever root is in
+  effect when it is applied. It asks only once the reload has put the new
+  root in effect, so the answer anchors to it. A folder change that keeps the
+  root does not ask, and neither does a reload rejected as invalid: that
+  keeps the old root, so an answer would anchor to a workspace the editor
+  has left. The answer is applied as a configuration layer,
   identically to a push of the same section (see the accumulate contract in
   configuration-merging-strategy), so nothing about the merge is special-cased
   for having been pulled.
