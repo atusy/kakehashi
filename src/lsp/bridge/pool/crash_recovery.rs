@@ -156,17 +156,19 @@ impl CrashRecoveryRegistry {
         }
     }
 
-    /// Give back the attempt a recovery took, because it respawned nothing
-    /// (the connection was already replaced, or settings or open documents no
-    /// longer need it). Only respawns spend the budget: stand-downs after
-    /// ordinary restarts or configuration changes must not exhaust it for a
-    /// later crash that does need recovering.
+    /// Give back the attempt a recovery took, because it stood down before
+    /// committing to a respawn (the connection was already replaced, or
+    /// settings or open documents no longer need it). Only respawns spend the
+    /// budget: stand-downs after ordinary restarts or configuration changes
+    /// must not exhaust it for a later crash that does need recovering.
     ///
-    /// Returns the decision for a crash this recovery was holding on to, which
-    /// would otherwise go unrecovered: one reported while it was scheduled
-    /// (absorbed as already scheduled), or one that found the budget exhausted
-    /// only because this attempt had not been given back yet. Nothing is
-    /// owed while another recovery holds the schedule: that one serves them.
+    /// Returns the decision for a crash reported while this recovery was
+    /// scheduled — absorbed as already scheduled, and otherwise unrecovered.
+    ///
+    /// A recovery that already committed gives nothing back: its attempt may
+    /// be interleaved with newer ones by then, and refunding it could let the
+    /// key restart more often than the cap. Erring toward fewer restarts is
+    /// the safe direction for a bound.
     pub(super) fn stand_down(
         &self,
         key: &ConnectionKey,
@@ -177,15 +179,12 @@ impl CrashRecoveryRegistry {
             .lock()
             .recover_poison("CrashRecoveryRegistry::stand_down");
         let state = keys.get_mut(key)?;
+        if state.scheduled != Some(reservation) {
+            return None;
+        }
+        state.scheduled = None;
         state.attempts = state.attempts.saturating_sub(1);
-        let owed = if state.scheduled == Some(reservation) {
-            state.scheduled = None;
-            std::mem::take(&mut state.missed) | std::mem::take(&mut state.gave_up)
-        } else if state.scheduled.is_none() {
-            std::mem::take(&mut state.gave_up)
-        } else {
-            false
-        };
+        let owed = std::mem::take(&mut state.missed);
         drop(keys);
         owed.then(|| self.schedule(key, Duration::ZERO))
     }
@@ -332,25 +331,17 @@ mod tests {
         ));
     }
 
+    /// Once committed, a recovery gives nothing back: newer attempts may be
+    /// interleaved with it by then, and a refund could lift the cap.
     #[test]
-    fn a_crash_that_found_the_budget_spent_is_handed_on_by_a_stand_down() {
+    fn a_committed_recovery_refunds_nothing() {
         let registry = CrashRecoveryRegistry::default();
-        let mut last = None;
-        for _ in 0..MAX_CONSECUTIVE_ATTEMPTS {
-            let (_, _, reservation) = retry(registry.schedule(&key(), SHORT_RUN));
-            registry.begin_attempt(&key(), reservation);
-            last = Some(reservation);
-        }
-        // The last attempt is still in flight when another crash arrives.
-        assert!(matches!(
-            registry.schedule(&key(), SHORT_RUN),
-            RecoveryDecision::GiveUp { .. }
-        ));
-        // It then respawns nothing, so that crash was not really out of budget.
-        assert!(matches!(
-            registry.stand_down(&key(), last.unwrap()),
-            Some(RecoveryDecision::Retry { .. })
-        ));
+        let (_, _, older) = retry(registry.schedule(&key(), SHORT_RUN));
+        registry.begin_attempt(&key(), older);
+        let (_, _, newer) = retry(registry.schedule(&key(), SHORT_RUN));
+        registry.begin_attempt(&key(), newer);
+        assert_eq!(registry.stand_down(&key(), older), None);
+        assert_eq!(retry(registry.schedule(&key(), SHORT_RUN)).0, 3);
     }
 
     /// A recovery that committed and then stood down must not release the
