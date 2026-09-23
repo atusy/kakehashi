@@ -134,6 +134,9 @@ pub(super) struct InstallCoordinatorDeps {
 #[derive(Clone, Copy)]
 pub(crate) struct InstallRequest {
     repair_queries: bool,
+    /// The requester already had a usable parser, so its own parse (or the
+    /// host's existing tree) publishes this document's first snapshot.
+    parser_loaded: bool,
     allow_recovery: bool,
 }
 
@@ -141,6 +144,7 @@ impl InstallRequest {
     pub(crate) fn new(repair_queries: bool) -> Self {
         Self {
             repair_queries,
+            parser_loaded: repair_queries,
             allow_recovery: true,
         }
     }
@@ -439,7 +443,14 @@ impl InstallCoordinator {
         // burn the full first-parse backstop. Harmless for AlreadyInstalling:
         // its eventual reload-reparse lands the same-version tree through the
         // snapshot cell's tree-upgrade clause.
-        if let Some(expected_incarnation) = expected_incarnation {
+        // A repair requested with a usable parser is the exception: the
+        // caller's own parse publishes the tree, and a give-up landing first
+        // would hand its parked readers a tree-less snapshot. A parser install
+        // that became a repair still owns the release: its caller skipped
+        // the inline parse.
+        if let Some(expected_incarnation) = expected_incarnation
+            && !request.parser_loaded
+        {
             self.documents
                 .publish_giveup_snapshot(&uri, expected_incarnation);
         }
