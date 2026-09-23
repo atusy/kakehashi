@@ -215,6 +215,29 @@ kakehashi's settings below `settings.kakehashi`:
 }
 ```
 
+Clients that declare `workspace.configuration` support are also asked for the
+`kakehashi` section with `workspace/configuration`:
+
+- once the handshake completes (`initialized`);
+- whenever `workspace/didChangeConfiguration` carries no usable `settings`
+  (`null` or `{}`, as VS Code sends) — the notification is then a trigger and
+  the answer is the content;
+- after `workspace/didChangeWorkspaceFolders` moves the workspace root (see
+  below).
+
+The request carries no `scopeUri`, because kakehashi keeps one effective
+configuration for the whole session. The answer is applied exactly like a
+pushed `settings.kakehashi`: it is one more layer on top of the ones already in
+effect, and keys it omits keep their current values. An answer of `null`, an
+error response, or no answer within 10 seconds leaves the settings in effect
+unchanged. Unlike a push, an answer containing keys kakehashi does not know
+(editors keep settings such as `trace.server` in the same section) is not
+rejected: those keys are ignored and the rest applies.
+
+A field answered with an empty container (`{}` or `[]`) clears the value below
+it, as the same spelling would in a config file. Editor integrations should
+therefore register their setting defaults as absent rather than empty.
+
 ### Environment Variable Expansion
 
 Path fields support environment variable expansion and tilde (`~`) expansion, making configurations portable across machines.
