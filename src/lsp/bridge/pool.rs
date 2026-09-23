@@ -2952,8 +2952,9 @@ impl LanguageServerPool {
     /// For a server without `preferSharedInstance`, this is exactly
     /// [`resolve_marker_and_key`](Self::resolve_marker_and_key) (per-root/#382).
     /// For an opt-in server it returns the shared-instance key — UNLESS a shared
-    /// connection already exists, is `Ready`, and did NOT advertise the
-    /// folder-change capability. In that case kakehashi logs once and degrades
+    /// connection already exists, is `Ready`, and is not (yet) folder-change
+    /// capable — neither declared statically nor registered dynamically. In
+    /// that case kakehashi logs once and degrades
     /// to per-root instances, so a misconfigured opt-in never wedges the 2nd+
     /// root on a server that ignores `didChangeWorkspaceFolders`. The fallback
     /// keeps every root the connection is already serving on the shared key —
@@ -2972,6 +2973,12 @@ impl LanguageServerPool {
     /// per-root connection if the shared one came up incapable — so no document
     /// is ever opened on an incapable shared connection for a root it does not
     /// already serve.
+    ///
+    /// A server that registers the capability dynamically is incapable between
+    /// Ready and its registration, so roots acquired in that window divert;
+    /// the registration then routes them back here and
+    /// [`consolidate_shared_instance`](Self::consolidate_shared_instance)
+    /// retires the diverted processes (#968).
     ///
     /// Briefly locks `connections` for the capability probe; the marker is still
     /// resolved with a single filesystem walk.
@@ -3009,8 +3016,8 @@ impl LanguageServerPool {
         };
 
         let key = match shared_handle {
-            // A Ready shared connection that never advertised the
-            // folder-CHANGE capability can't take on new roots via
+            // A Ready shared connection without the folder-CHANGE
+            // capability (static or, so far, dynamic) can't take on new roots via
             // didChangeWorkspaceFolders (it may still serve its
             // initialize-listed folders; the divert proof below accounts
             // for both).

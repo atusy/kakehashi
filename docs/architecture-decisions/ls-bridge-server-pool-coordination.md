@@ -85,7 +85,9 @@ sent no folders) is announced on their behalf, so a shared connection spawned
 under some marker root still learns the workspace such documents belong to. Keeping them on the client-root fallback would fork a
 second process whose session-wide state (e.g. a completion corpus over every
 open document) never meets the shared instance's. Root-JOINING is honored only when the downstream server advertises
-`workspace.workspaceFolders.{supported, changeNotifications}`
+`workspace.workspaceFolders.{supported, changeNotifications}` or has a live
+dynamic `client/registerCapability` registration of
+`workspace/didChangeWorkspaceFolders`
 (`ConnectionHandle::supports_workspace_folder_changes`); the acquire path
 (`resolve_acquire`) checks the existing shared connection's capability and, if
 it is `Ready` but incapable, logs once and falls back to the per-root key — so a
@@ -105,6 +107,26 @@ shared connection for a not-yet-known root, the pool CAS-inserts the root and
 emits `workspace/didChangeWorkspaceFolders { added: [root] }` ahead of the
 `didOpen` through the single-writer FIFO. The set is add-only; idle
 removal/eviction is a separate follow-up.
+
+The capability is treated as effectively monotone (#968): servers register
+`didChangeWorkspaceFolders` seconds after `initialized` and practically never
+unregister it. It is read live at each decision point — the divert above, the
+announce, and the upstream folder-change fan-out to client-root fallbacks —
+with no ordering between registration and those decisions, because every race
+degrades to the static-only behavior: a check that misses an in-flight
+registration diverts a root or recycles a fallback, both self-healing. The
+rare reverse transition is not synchronized either: an unregistration only
+drops the registry entry, and the next upstream folder change recycles the
+now-incapable fallback through the ordinary invalidate path (a latched flag
+would instead keep notifying a server that opted out). Because registration
+arrives only after `initialized` while the divert check runs at `Ready`, roots
+acquired in that window divert deterministically; when the registration
+arrives on the shared connection, the pool retires that server's marker-rooted
+connections through the same invalidate path, and their documents re-open on
+the shared connection at their next acquisition — no data-structure
+migration. A divert racing that sweep leaves at worst the per-root split that
+existed before. Accepted risk: a server whose `didChangeWorkspaceFolders`
+handling is broken is no longer masked by constant restarts.
 
 **Known limitation:** per-root pooling multiplies process count with the number
 of distinct roots opened, and there is no idle-eviction yet — see Consequences.
@@ -548,6 +570,12 @@ languageServers:
 
 ## Amendment History
 
+- **2026-09-23**: Dynamic `client/registerCapability` registrations of
+  `workspace/didChangeWorkspaceFolders` now count as folder-change capable
+  (#968), read live at every decision point with no added synchronization;
+  a registration on a shared connection retires that server's diverted
+  per-root connections. Supersedes #751's ordering-lock design, which bought
+  exactness for capable→incapable transitions that practically never occur.
 - **2026-07-18**: Added field-level recovery for malformed downstream
   initialize capabilities (#860). Structurally unusable envelopes and global
   position-encoding violations still fail initialization; independent malformed
