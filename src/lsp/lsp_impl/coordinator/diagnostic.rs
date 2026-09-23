@@ -323,9 +323,13 @@ impl DiagnosticScheduler {
                     expected_incarnation,
                     expected_content_version,
                 );
+                // None may mean language detection is temporarily unavailable
+                // during parser installation/reload. Keep Save ownership until
+                // its exact tree arrives; a late Open cannot replace its key.
+                // The waiter itself rejects closed or superseded documents.
                 let pending = snapshot_data
                     .as_ref()
-                    .is_some_and(|snapshot| snapshot.virtual_geometry_pending);
+                    .is_none_or(|snapshot| snapshot.virtual_geometry_pending);
                 let outcome =
                     collect_push_diagnostics(snapshot_data, &bridge_pool, &task_uri, LOG_TARGET)
                         .await;
