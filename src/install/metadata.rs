@@ -90,8 +90,8 @@ impl std::error::Error for MetadataError {}
 ///
 /// If `options` is provided and caching is enabled, the function will:
 /// 1. Check for a fresh cached copy
-/// 2. If cache hit, use cached content
-/// 3. If cache miss, fetch from network and update cache
+/// 2. Use cached content only if it parses successfully
+/// 3. Otherwise, fetch from network and update cache
 fn fetch_parsers_lua_with_options(
     options: Option<&FetchOptions>,
 ) -> Result<HashMap<String, ParserMetadata>, MetadataError> {
@@ -114,8 +114,9 @@ fn fetch_parsers_lua_with_cache(
     // Try cache first
     if let Some(cache) = cache
         && let Some(cached_content) = cache.read()
+        && let Ok(parsers) = parse_parsers_lua(&cached_content)
     {
-        return parse_parsers_lua(&cached_content);
+        return Ok(parsers);
     }
 
     let content = download()?;
@@ -315,6 +316,30 @@ pub fn is_language_supported(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    const VALID_METADATA: &str = r#"
+return {
+  lua = {
+    install_info = {
+      revision = 'abc123',
+      url = 'https://example.com/tree-sitter-lua',
+    },
+  },
+}
+"#;
+
+    #[test]
+    fn corrupt_fresh_cache_is_replaced_from_network() {
+        let temp = tempdir().unwrap();
+        let cache = MetadataCache::with_default_ttl(temp.path());
+        cache.write("return { lua = {").unwrap();
+
+        let parsers = fetch_parsers_lua_with_cache(Some(&cache), || Ok(VALID_METADATA.to_owned()))
+            .expect("invalid cached metadata should trigger a download");
+
+        assert_eq!(parsers["lua"].revision, "abc123");
+        assert_eq!(cache.read().as_deref(), Some(VALID_METADATA));
+    }
 
     #[test]
     fn test_fetch_parser_metadata_with_caching() {
@@ -590,22 +615,11 @@ return {
     }
 
     #[test]
-    fn test_is_language_supported_returns_error_for_invalid_metadata() {
-        use crate::install::test_helpers::setup_mock_metadata_cache;
-
-        let temp = tempdir().expect("Failed to create temp dir");
-        let options = FetchOptions {
-            data_dir: Some(temp.path()),
-            use_cache: true,
-        };
-
-        let mock_parsers_lua = "return {}";
-        setup_mock_metadata_cache(temp.path(), mock_parsers_lua);
-
-        let result = is_language_supported("lua", Some(&options));
+    fn invalid_download_returns_metadata_error() {
+        let result = fetch_parsers_lua_with_cache(None, || Ok("return {}".to_owned()));
         assert!(
             matches!(result, Err(MetadataError::EmptyMetadata)),
-            "Expected empty metadata error for invalid metadata"
+            "Expected empty metadata error for invalid downloaded metadata"
         );
     }
 }
