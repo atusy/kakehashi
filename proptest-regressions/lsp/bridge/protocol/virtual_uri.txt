@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 508385db8f469af7a98fa5e5fe24d249ada86e7e23f1b2b4492b332a00c72eb5 # shrinks to host = Uri(Uri { scheme: "file", authority: Some(Authority { userinfo: None, host: "", host_parsed: RegName(""), port: None }), path: "/doc.md", query: None, fragment: None }), language = "\t", region = "0"
+cc 1eea9ff444cd52b78eb4d73cf2ccacc5c693a6a8c9797cfda9138590cc4d5961 # shrinks to host = Uri(Uri { scheme: "file", authority: Some(Authority { userinfo: None, host: "", host_parsed: RegName(""), port: None }), path: "/doc.md", query: None, fragment: None }), language = "\t", region = "A", run = 0, step = 0
