@@ -675,7 +675,7 @@ impl AutoInstallManager {
         // arrived, and skipping on the parser meant that language could never
         // repair itself. Falling through costs a stat per half when everything
         // is there, since staging short-circuits on both.
-        if language_is_complete(language, &data_dir, &search_paths) {
+        if language_is_complete_off_worker(language, &data_dir, &search_paths).await {
             events.push(InstallEvent::Log {
                 level: MessageType::INFO,
                 message: format!(
@@ -715,7 +715,8 @@ impl AutoInstallManager {
                 search_paths.clone(),
             )
             .await;
-            let complete = language_is_complete(&task_lang, &task_data_dir, &search_paths);
+            let complete =
+                language_is_complete_off_worker(&task_lang, &task_data_dir, &search_paths).await;
             let terminal = classify_install_outcome(&result, complete, &task_data_dir);
             let mut install_marker = install_marker;
             // If the caller awaiting this task is cancelled, the task output is
@@ -797,6 +798,23 @@ impl AutoInstallManager {
     }
 }
 
+/// [`language_is_complete`] on the blocking pool: the chain walk canonicalizes
+/// and reads query files on every configured search path, which may sit on a
+/// slow filesystem, and must not stall a Tokio worker serving other requests.
+/// A walk that cannot finish answers "not complete", the side that installs.
+async fn language_is_complete_off_worker(
+    language: &str,
+    data_dir: &std::path::Path,
+    search_paths: &[PathBuf],
+) -> bool {
+    let language = language.to_string();
+    let data_dir = data_dir.to_path_buf();
+    let search_paths = search_paths.to_vec();
+    tokio::task::spawn_blocking(move || language_is_complete(&language, &data_dir, &search_paths))
+        .await
+        .unwrap_or(false)
+}
+
 /// Whether both halves of a language are on disk and usable.
 ///
 /// Read from disk rather than from an `InstallResult`, so it answers for
@@ -819,7 +837,7 @@ fn language_is_complete(
     // the chain is held still while this decides — an install mid-publish can still
     // roll its queries back, and a base language can be uninstalled out from
     // under the walk. Non-blocking, so a busy language answers "not ready"
-    // rather than stalling the async path.
+    // rather than waiting for the install that holds it.
     let Some(chain) =
         crate::install::queries::lock_complete_chain(data_dir, language, search_paths)
     else {
