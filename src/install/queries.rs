@@ -2500,12 +2500,16 @@ mod staging_tests {
 
         let held = lock_complete_chain(data_dir, "child", &[]).expect("a complete chain locks");
         assert_eq!(held.len(), 2, "both languages in the chain are held");
+        let (publisher, _) = open_language_lock_file(data_dir, "parent").unwrap();
         assert!(
-            matches!(
-                try_lock_language(data_dir, "parent"),
-                LanguageLockProbe::Busy
-            ),
-            "including the base language, which is the point"
+            matches!(publisher.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+            "an install cannot publish the base language, which is the point"
+        );
+        // Probes only read: a concurrent open of another language sharing
+        // the base must not read this probe as an install in flight.
+        assert!(
+            lock_complete_chain(data_dir, "child", &[]).is_some(),
+            "a second probe still judges the chain"
         );
         drop(held);
 
