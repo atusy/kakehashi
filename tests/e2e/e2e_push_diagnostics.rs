@@ -2138,3 +2138,93 @@ fn e2e_disabling_a_bridged_language_refreshes_pull_clients() {
     client.send_request("shutdown", json!(null));
     client.send_notification("exit", json!(null));
 }
+
+/// #917: a respawn re-open sweep that started before the language was
+/// disabled must not reopen what the disable retracted. The sweep is held
+/// (`KAKEHASHI_E2E_STALL_REOPEN_MS`) across the configuration change, so it
+/// can only open under settings it read before the change unless it re-reads
+/// them.
+#[test]
+fn e2e_respawn_reopen_does_not_undo_a_retraction() {
+    let wire_dir = tempfile::TempDir::new().expect("wire log dir");
+    let wire_log = wire_dir.path().join("wire.log");
+    let config_dir = tempfile::TempDir::new().expect("temp dir");
+    let config_path = config_dir.path().join("push_diagnostics.toml");
+    std::fs::write(&config_path, "").expect("write config");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("utf8 path"))
+        .env("MOCK_LSP_WIRE_LOG", wire_log.to_string_lossy())
+        .env("KAKEHASHI_E2E_STALL_REOPEN_MS", "2500")
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-push": {
+                        "cmd": [mock_bin(), "diagnostics-push-crash"],
+                        "languages": ["lua"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    open_host(&mut client);
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            has_pushed_diag,
+        )
+        .expect("the mock's pushed diagnostic should reach the editor");
+
+    // A content edit inside the region (its first byte untouched) crashes
+    // the mock; the crash eviction clears the host.
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": MD_URI, "version": 2 },
+            "contentChanges": [{ "text": MD_TEXT_EDITED }]
+        }),
+    );
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            cleared_host_diag,
+        )
+        .expect("the crash should clear the host");
+
+    // The next edit respawns the server, and the respawn arms the re-open
+    // sweep, which the stall holds before it opens anything. Disable the
+    // language while it is held: the sweep read its settings before this.
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": MD_URI, "version": 3 },
+            "contentChanges": [{ "text": MD_TEXT }]
+        }),
+    );
+    wait_for_wire_count(&wire_log, "initialized", 2);
+    set_markdown_lua_bridge(&mut client, false);
+
+    // Outlast the stalled sweep.
+    std::thread::sleep(Duration::from_millis(4000));
+    assert_eq!(
+        wire_log_uris(&wire_log, "textDocument/didOpen").len(),
+        1,
+        "nothing may reopen the region on the respawned server once its \
+         language is disabled; wire log:\n{}",
+        std::fs::read_to_string(&wire_log).unwrap_or_default()
+    );
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
