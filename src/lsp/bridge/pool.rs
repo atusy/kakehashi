@@ -31,6 +31,7 @@ pub(crate) use connection_action::BridgeError;
 use connection_action::{ConnectionAction, decide_connection_action};
 use handshake::perform_lsp_handshake;
 
+use super::protocol::DID_CHANGE_WORKSPACE_FOLDERS_METHOD;
 pub(in crate::lsp::bridge) use connection_handle::REQUEST_TIMEOUT;
 pub(crate) use connection_handle::{ConnectionHandle, NotificationSendResult};
 pub(crate) use connection_key::ConnectionKey;
@@ -4627,7 +4628,13 @@ fn incapable_shared_serves(handle: &ConnectionHandle, root: &Url) -> bool {
     {
         return true;
     }
-    handle.supports_initial_workspace_folders()
+    // A server that once registered folder changes was told of every folder
+    // it holds (announced, or listed at initialize to a server that asked for
+    // changes), so an unregistration does not unserve them (#968).
+    (handle.supports_initial_workspace_folders()
+        || handle
+            .dynamic_capabilities()
+            .ever_registered(DID_CHANGE_WORKSPACE_FOLDERS_METHOD))
         && handle
             .workspace_folders()
             .snapshot()
@@ -6194,6 +6201,39 @@ mod tests {
             !pool.connections.lock().await.contains_key(&straggler_key),
             "the root's own per-root process must not keep serving beside the shared one"
         );
+    }
+
+    fn unregister_folder_changes(handle: &ConnectionHandle) {
+        handle.dynamic_capabilities().unregister(vec![
+            tower_lsp_server::ls_types::Unregistration {
+                id: "folders".to_string(),
+                method: "workspace/didChangeWorkspaceFolders".to_string(),
+            },
+        ]);
+    }
+
+    /// A root announced to a dynamically registering server stays on the
+    /// shared instance after the server unregisters: it was told of the root
+    /// and holds its documents, so diverting it would split the root across
+    /// two processes (#968).
+    #[tokio::test]
+    async fn an_announced_root_stays_shared_after_the_server_unregisters() {
+        let (_tmp, doc) = marker_rooted_doc();
+        let pool = LanguageServerPool::new();
+        let config = shared_config();
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
+        shared.set_server_capabilities(Default::default());
+        register_folder_changes(&shared);
+        let (marker, _) = pool.resolve_marker_and_key("lua", &config, Some(&doc));
+        let (_root, folder) = marker.expect("marker-rooted");
+        shared.workspace_folders().replace(Some(vec![folder]));
+        unregister_folder_changes(&shared);
+        pool.insert_connection(shared).await;
+
+        let (_marker, key) = pool.resolve_acquire("lua", &config, Some(&doc)).await;
+
+        assert_eq!(key, ConnectionKey::shared("lua"));
     }
 
     /// A Ready shared connection whose server never advertised the
