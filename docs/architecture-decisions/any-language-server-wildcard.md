@@ -160,10 +160,10 @@ downstream as well as stopping future selections. This matters more with
 Neither pre-existing reconciliation covers it: `close_replaced_docs` closes a
 virtual document when its region changes language, and a host-filter edit
 touches no server's launch config, so `same_launch_config` never recycles the
-connection. Instead every injection pass that resolves injections checks each
-open virtual document for whether current settings still select its server
-for its injection language, and sends `didClose` for the ones they do not
-(#917). The answer is derived from settings rather than remembered, so it does
+connection. Instead every injection pass that could look at the host's
+injections, even one that finds none, checks each open virtual document for
+whether current settings still select its server for its injection language,
+and sends `didClose` for the ones they do not (#917). The answer is derived from settings rather than remembered, so it does
 not matter which change flipped it. A settings publication reaches open
 documents without an edit, through the reparse it already schedules, and the
 same pass's eager open reopens a language that is turned back on; the respawn

@@ -124,10 +124,10 @@ impl InjectionCoordinator {
     /// Close the virtual documents current settings no longer route to their
     /// server, and take their pushed diagnostics out of the editor (#917).
     ///
-    /// Runs in every pass that resolves injections, so a settings publication
-    /// reaches open documents through the reparse it schedules — no edit
-    /// needed — and a re-enabled language is reopened by the same pass's
-    /// eager open. It sits after `cancel_eager_open` for the same reason the
+    /// Runs in every pass that could look at the document's injections, even
+    /// one that finds none, so a settings publication reaches open documents
+    /// through the reparse it schedules — no edit needed — and a re-enabled
+    /// language is reopened by the same pass's eager open. It sits after `cancel_eager_open` for the same reason the
     /// replaced-language close does: an older pass's eager task must not
     /// reopen what this closes.
     ///
@@ -416,21 +416,23 @@ impl InjectionCoordinator {
             self.documents.remove_edit_lock_if_unshared(uri, &edit_lock);
             return true;
         };
-        if injections.is_empty() {
-            self.bridge.cancel_eager_open(uri);
-            return true;
-        }
-
         // Stop the previous pass before closing a replaced language-bearing URI;
         // otherwise an old eager task can enqueue didOpen after the close and
         // resurrect the stale URI. The new batch is created below after cleanup.
         self.bridge.cancel_eager_open(uri);
+        // Before the empty-regions return: the retraction asks only what
+        // settings select, and a settings change can deselect a server and
+        // leave the host without regions in the same stroke (a replaced
+        // injections query), which no edit-driven close would catch.
+        self.retract_deselected_docs(uri, &host_language).await;
+        if injections.is_empty() {
+            return true;
+        }
         let replaced_regions = self.bridge.close_replaced_docs(uri, &injections).await;
         for region_id in replaced_regions {
             self.diagnostics
                 .evict_source(uri, &DiagnosticSource::Region(region_id));
         }
-        self.retract_deselected_docs(uri, &host_language).await;
 
         if forward_did_change {
             self.bridge
