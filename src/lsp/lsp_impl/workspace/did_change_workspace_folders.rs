@@ -119,10 +119,21 @@ impl Kakehashi {
         ) {
             Ok(settings) => {
                 let warnings = Self::misconfigured_settings_warnings(&settings);
+                let root_changed = *self.settings_manager.root_path() != root_path;
                 self.settings_manager.set_root_path(root_path);
                 self.apply_raw_settings_locked(&reload, raw, settings).await;
                 drop(reload);
                 self.warn_on_misconfigured_settings(&warnings).await;
+                // The client's configuration was read while the session sat in
+                // the old workspace, and an editor resolves it per workspace.
+                // Asked only once the new root is in effect, so the answer
+                // anchors to it; a rejected reload keeps the old root, and so
+                // has nothing new to ask about. Awaited like the pull a
+                // no-payload `didChangeConfiguration` triggers, under the same
+                // timeout and single-flight.
+                if root_changed {
+                    self.pull_client_configuration().await;
+                }
             }
             Err(error) => {
                 drop(reload);
