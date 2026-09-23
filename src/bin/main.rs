@@ -1288,20 +1288,31 @@ fn write_new_output_with(
     let mut temp = output_temporary_file(path, None)?;
     write(temp.as_file_mut())?;
     temp.as_file().sync_all()?;
-    temp.persist_noclobber(path)
-        .map(|_| ())
-        .map_err(|e| e.error)
+    temp.persist_noclobber(path).map_err(|e| e.error)?;
+    sync_output_parent(path);
+    Ok(())
+}
+
+fn output_parent(path: &std::path::Path) -> &std::path::Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."))
+}
+
+fn sync_output_parent(path: &std::path::Path) {
+    // Match the formatter's best-effort directory sync: retain a successful
+    // publication even where opening or syncing directories is unsupported.
+    // The staged file's content was already synced before publication.
+    if let Ok(directory) = std::fs::File::open(output_parent(path)) {
+        let _ = directory.sync_all();
+    }
 }
 
 fn output_temporary_file(
     path: &std::path::Path,
     permissions: Option<&std::fs::Permissions>,
 ) -> std::io::Result<tempfile::NamedTempFile> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    #[cfg_attr(not(unix), allow(unused_mut))] // only the cfg(unix) block mutates
+    let parent = output_parent(path);
     let mut builder = tempfile::Builder::new();
     if let Some(permissions) = permissions {
         // Restrict the initial open itself: chmod after creation cannot revoke
@@ -1344,7 +1355,9 @@ fn write_forced_output_with(
             "output permissions or ownership changed while preparing replacement; retry",
         ));
     }
-    temp.persist(path).map(|_| ()).map_err(|e| e.error)
+    temp.persist(path).map_err(|e| e.error)?;
+    sync_output_parent(path);
+    Ok(())
 }
 
 #[derive(PartialEq, Eq)]
