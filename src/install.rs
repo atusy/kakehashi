@@ -555,10 +555,29 @@ fn install_language_blocking_allowing_http_queries_for_tests(
     queries_base_url: &str,
     compile: parser::ParserCompile,
 ) -> InstallResult {
+    install_language_with_search_paths_allowing_http_queries_for_tests(
+        language,
+        data_dir,
+        Vec::new(),
+        force,
+        queries_base_url,
+        compile,
+    )
+}
+
+#[cfg(test)]
+fn install_language_with_search_paths_allowing_http_queries_for_tests(
+    language: &str,
+    data_dir: &std::path::Path,
+    search_paths: Vec<PathBuf>,
+    force: bool,
+    queries_base_url: &str,
+    compile: parser::ParserCompile,
+) -> InstallResult {
     install_language_with_query_stager(
         language,
         &LanguageInstallOptions {
-            search_paths: Vec::new(),
+            search_paths,
             data_dir: data_dir.to_path_buf(),
             force,
             verbose: false,
@@ -1012,6 +1031,61 @@ mod tests {
         assert!(
             !data_dir.join("queries").join("orphan_child").exists(),
             "the child's queries must not be published without the parent it inherits"
+        );
+    }
+
+    /// A parent that a search path outside the data directory already
+    /// provides as a base query is what the loader resolves; it must not
+    /// block the requested language's install because upstream lacks it.
+    #[test]
+    fn a_parent_provided_only_by_a_search_path_does_not_block_the_install() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let data_dir = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        let parser_dir = data_dir.join("parser");
+        std::fs::create_dir_all(&parser_dir).unwrap();
+        std::fs::write(
+            parser_dir.join(format!("child_lang.{}", std::env::consts::DLL_EXTENSION)),
+            "",
+        )
+        .unwrap();
+        std::fs::create_dir_all(runtime.join("queries/child_lang")).unwrap();
+        std::fs::create_dir_all(runtime.join("queries/custom_lang")).unwrap();
+        std::fs::write(
+            runtime.join("queries/child_lang/highlights.scm"),
+            ";; extends\n;; inherits: custom_lang\n",
+        )
+        .unwrap();
+        std::fs::write(
+            runtime.join("queries/custom_lang/highlights.scm"),
+            "(comment) @comment\n",
+        )
+        .unwrap();
+        // Upstream has the child only: fetching custom_lang would 404.
+        let base_url = spawn_query_file_server(vec![(
+            "/child_lang/highlights.scm",
+            "(identifier) @variable\n",
+        )]);
+
+        let result = install_language_with_search_paths_allowing_http_queries_for_tests(
+            "child_lang",
+            &data_dir,
+            vec![runtime],
+            false,
+            &base_url,
+            parser::ParserCompile::InProcess,
+        );
+
+        assert!(
+            result.is_success(),
+            "a search-path parent must not fail the install: {:?} / {:?}",
+            result.parser_error,
+            result.queries_error
+        );
+        assert!(data_dir.join("queries/child_lang/highlights.scm").is_file());
+        assert!(
+            !data_dir.join("queries/custom_lang").exists(),
+            "a parent provided outside the data directory is not copied into it"
         );
     }
 }

@@ -3469,6 +3469,96 @@ mod tests {
         assert!(matches!(result, Err(QueryInstallError::IoError(_))));
     }
 
+    fn write_runtime_query(runtime: &Path, language: &str, content: &str) {
+        let dir = runtime.join("queries").join(language);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("highlights.scm"), content).unwrap();
+    }
+
+    #[test]
+    fn a_base_query_on_a_search_path_completes_the_chain_without_a_managed_copy() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        let child = data.join("queries/child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(child.join("highlights.scm"), "existing child").unwrap();
+        write_runtime_query(&runtime, "child", ";; extends\n;; inherits: custom\n");
+        write_runtime_query(&runtime, "custom", "(comment) @comment\n");
+        assert!(
+            lock_complete_chain(&data, "child", std::slice::from_ref(&runtime)).is_some(),
+            "the loader resolves custom from the search path"
+        );
+        // The provided parent's own declarations still count.
+        write_runtime_query(
+            &runtime,
+            "custom",
+            ";; inherits: grand\n(comment) @comment\n",
+        );
+        assert!(lock_complete_chain(&data, "child", std::slice::from_ref(&runtime)).is_none());
+    }
+
+    #[test]
+    fn an_overlay_alone_does_not_provide_a_parent() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        let child = data.join("queries/child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(child.join("highlights.scm"), "existing child").unwrap();
+        write_runtime_query(&runtime, "child", ";; extends\n;; inherits: parent\n");
+        write_runtime_query(&runtime, "parent", ";; extends\n(comment) @spell\n");
+        assert!(lock_complete_chain(&data, "child", std::slice::from_ref(&runtime)).is_none());
+        let base_url =
+            spawn_query_file_server(vec![("/parent/highlights.scm", "(comment) @comment\n")]);
+        let staged = stage_queries_with_dependencies(
+            &base_url,
+            "child",
+            &data,
+            false,
+            QueryHttpPolicy::AllowHttpForTests,
+            &[runtime],
+        )
+        .unwrap();
+        staged
+            .publish()
+            .unwrap_or_else(|_| panic!("publish failed"))
+            .commit();
+        assert!(
+            data.join("queries/parent/highlights.scm").is_file(),
+            "an overlay-only parent still needs the upstream base"
+        );
+    }
+
+    #[test]
+    fn a_search_path_parent_is_rechecked_before_publication() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        write_runtime_query(&runtime, "child", ";; extends\n;; inherits: custom\n");
+        write_runtime_query(&runtime, "custom", "(comment) @comment\n");
+        let base_url =
+            spawn_query_file_server(vec![("/child/highlights.scm", "(identifier) @variable\n")]);
+        let staged = stage_queries_with_dependencies(
+            &base_url,
+            "child",
+            &data,
+            false,
+            QueryHttpPolicy::AllowHttpForTests,
+            std::slice::from_ref(&runtime),
+        )
+        .unwrap();
+        assert_eq!(staged.unstable_dependency(), None);
+        write_runtime_query(
+            &runtime,
+            "custom",
+            ";; inherits: grand\n(comment) @comment\n",
+        );
+        assert_eq!(staged.unstable_dependency(), Some("custom"));
+        fs::remove_file(runtime.join("queries/custom/highlights.scm")).unwrap();
+        assert_eq!(staged.unstable_dependency(), Some("custom"));
+    }
+
     #[test]
     fn staging_installs_parents_declared_by_external_overlays() {
         let temp = TempDir::new().unwrap();
