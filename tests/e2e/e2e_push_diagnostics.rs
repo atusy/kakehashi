@@ -1608,6 +1608,14 @@ const MD_MIXED_TEXT_SHIFTED: &str =
 /// Start kakehashi with one push-only `mock-push` serving lua AND python, and
 /// the given `languages.markdown.bridge` table.
 fn init_mixed_push_client(bridge: Value) -> (LspClient, tempfile::TempDir) {
+    init_mixed_push_client_with_caps(bridge, json!({}))
+}
+
+/// [`init_mixed_push_client`] with explicit client `capabilities`.
+fn init_mixed_push_client_with_caps(
+    bridge: Value,
+    capabilities: Value,
+) -> (LspClient, tempfile::TempDir) {
     let config_dir = tempfile::TempDir::new().expect("temp dir");
     let config_path = config_dir.path().join("push_priorities.toml");
     std::fs::write(&config_path, "").expect("write config");
@@ -1621,7 +1629,7 @@ fn init_mixed_push_client(bridge: Value) -> (LspClient, tempfile::TempDir) {
         json!({
             "processId": std::process::id(),
             "rootUri": null,
-            "capabilities": {},
+            "capabilities": capabilities,
             "workspaceFolders": null,
             "initializationOptions": {
                 "languageServers": {
@@ -1871,6 +1879,64 @@ fn e2e_evicting_a_push_hidden_from_publish_still_refreshes_pull_clients() {
         .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(15))
         .expect("evicting a push only the pull showed must nudge pull clients");
     client.send_response(evict_refresh_id, json!(null));
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+#[test]
+fn e2e_pull_priorities_change_refreshes_pull_clients() {
+    // Excluding a server from the PULL surface at runtime changes what the
+    // editor's next pull returns, yet nothing a pull client displays is a
+    // publish — only `workspace/diagnostic/refresh` tells it to re-pull.
+    let (mut client, _config_dir) = init_mixed_push_client_with_caps(
+        json!({ "lua": {} }),
+        json!({ "workspace": { "diagnostics": { "refreshSupport": true } } }),
+    );
+    open_host(&mut client);
+    let (push_refresh_id, _) = client
+        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(15))
+        .expect("precondition: the lua push nudges pull clients");
+    client.send_response(push_refresh_id, json!(null));
+    let items = pull_until(&mut client, |items| has_mock_push_on_line(items, HOST_LINE));
+    assert!(has_mock_push_on_line(&items, HOST_LINE));
+
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": {
+                "kakehashi": {
+                    "languages": {
+                        "markdown": {
+                            "bridge": {
+                                "lua": {
+                                    "aggregation": {
+                                        "textDocument/diagnostic": { "priorities": ["pyright"] }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }),
+    );
+    let (refresh_id, _) = client
+        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(15))
+        .expect("a configuration change must nudge pull clients to re-pull");
+    client.send_response(refresh_id, json!(null));
+    let response = client.send_request(
+        "textDocument/diagnostic",
+        json!({ "textDocument": { "uri": MD_URI } }),
+    );
+    let items = response["result"]["items"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !has_mock_push_on_line(&items, HOST_LINE),
+        "the re-pull must drop the newly excluded server's push: {items:?}"
+    );
 
     client.send_request("shutdown", json!(null));
     client.send_notification("exit", json!(null));
