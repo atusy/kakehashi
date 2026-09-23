@@ -52,7 +52,7 @@ pub enum MetadataError {
     LanguageNotFound(String),
     /// HTTP request failed.
     HttpError(String),
-    /// JSON parsing failed.
+    /// Metadata content was malformed or incomplete.
     ParseError(String),
     /// Metadata existed but contained no languages.
     EmptyMetadata,
@@ -154,6 +154,7 @@ fn download_parsers_lua() -> Result<String, MetadataError> {
 ///
 /// Handles the main branch format where languages are direct table keys.
 fn parse_parsers_lua(content: &str) -> Result<HashMap<String, ParserMetadata>, MetadataError> {
+    let content = returned_table(content)?;
     let mut parsers = HashMap::new();
 
     // Pattern to match parser entries in main branch format: lang = { ... }
@@ -182,6 +183,29 @@ fn parse_parsers_lua(content: &str) -> Result<HashMap<String, ParserMetadata>, M
     }
 
     Ok(parsers)
+}
+
+/// Return the table that parsers.lua returns, rejecting incomplete content.
+///
+/// Complete language blocks survive a cut-off file, so parsing them alone
+/// cannot tell a partial language list from the full one. Requiring the
+/// returned table to close, with nothing but whitespace after it, catches
+/// truncation and interleaved writes.
+fn returned_table(content: &str) -> Result<&str, MetadataError> {
+    let return_re = Regex::new(r#"(?m)^\s*return\s*\{"#).expect("valid regex for return pattern");
+    let open_brace = return_re
+        .find(content)
+        .ok_or_else(|| MetadataError::ParseError("parsers.lua does not return a table".into()))?
+        .end()
+        - 1;
+    let table = find_matching_brace(&content[open_brace..])
+        .ok_or_else(|| MetadataError::ParseError("parsers.lua table is not closed".into()))?;
+    if !content[open_brace + table.len()..].trim().is_empty() {
+        return Err(MetadataError::ParseError(
+            "parsers.lua has content after the returned table".into(),
+        ));
+    }
+    Ok(table)
 }
 
 /// Check if a key is a reserved/internal key (not a language name)
