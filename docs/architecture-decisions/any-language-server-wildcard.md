@@ -153,28 +153,32 @@ serve, which per-method `priorities` cannot answer cheaply.
 
 Disabling a bridged language while a document is open
 (`languages.<host>.bridge.<lang>.enabled = false` via
-`workspace/didChangeConfiguration`) retracts the regions already open
-downstream, not just future selections. This matters more with `"*"`, since
-there is always a server holding the region.
+`workspace/didChangeConfiguration`) closes the regions already open
+downstream as well as stopping future selections. This matters more with
+`"*"`, since there is always a server holding the region.
 
 Neither pre-existing reconciliation covers it: `close_replaced_docs` closes a
 virtual document when its region changes language, and a host-filter edit
 touches no server's launch config, so `same_launch_config` never recycles the
-connection. Instead every injection pass re-asks, of each open virtual
-document, whether current settings still select its server for its injection
-language, and sends `didClose` for the ones they do not (#917). The answer is
-derived from settings rather than remembered, so it does not matter which
-change flipped it. A settings publication reaches open documents without an
-edit, through the reparse it already schedules, and the same pass's eager open
-reopens a language that is turned back on. The deselected server's pushed
-diagnostics for those regions are evicted — a sibling server on the same
-region keeps its own — and pull-mode clients are asked to re-pull.
+connection. Instead every injection pass that resolves injections checks each
+open virtual document for whether current settings still select its server
+for its injection language, and sends `didClose` for the ones they do not
+(#917). The answer is derived from settings rather than remembered, so it does
+not matter which change flipped it. A settings publication reaches open
+documents without an edit, through the reparse it already schedules, and the
+same pass's eager open reopens a language that is turned back on; the respawn
+re-open sweep reads settings per document for the same reason. The deselected
+server's pushed diagnostics for those regions are evicted — a sibling server
+on the same region keeps its own — and pull-mode clients are asked to re-pull.
 
-Two limits remain. A request-path open that resolved its server under the old
-settings can still land after the retraction (the resurrection class of
+Three limits remain. A request-path open that resolved its server under the
+old settings can still land after the retraction (the resurrection class of
 #1055); the next pass closes it again. The auto-install reload does not
 reparse open documents, so a settings change arriving only through it is
-reconciled at the document's next pass.
+reconciled at the document's next pass. And the host-document layer
+(`bridge._self`) is not retracted: turning it off only filters its
+diagnostics out of the next publish, while the host document stays open on
+its server.
 
 ### Scope: What `"*"` Does Not Widen
 
