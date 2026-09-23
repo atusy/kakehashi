@@ -312,7 +312,10 @@ impl AutoInstallManager {
         if current && checked.failed.contains(language) {
             return false;
         }
-        let first = current && checked.languages.insert(language.to_string());
+        // Edit passes land here on every keystroke: allocate only on a miss.
+        let first = current
+            && !checked.languages.contains(language)
+            && checked.languages.insert(language.to_string());
         initial_pass || first
     }
 

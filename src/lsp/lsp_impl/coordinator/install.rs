@@ -334,9 +334,6 @@ impl InstallCoordinator {
 
     /// The generation to probe in, or `None` when no probe is due.
     fn begin_query_repair_check(&self, language: &str, initial_pass: bool) -> Option<u64> {
-        if !self.settings_manager.is_auto_install_enabled(language) {
-            return None;
-        }
         // Discovery may already have loaded the parser before this task runs.
         // Track checks independently of load events; reload generations reset
         // eligibility while steady-state edits do no dependency filesystem
@@ -344,10 +341,17 @@ impl InstallCoordinator {
         // failed; a reload (settings change or any successful install) retries
         // it. The generation returned is the one the check was recorded in, so
         // a busy answer undoes this very mark even when a reload lands between.
+        //
+        // The memo goes first: on an edit pass it answers without the settings
+        // and data-directory work the auto-install check does. A mark taken
+        // while auto-install is off is harmless; enabling it is a settings
+        // change, which starts a new generation.
         let generation = self.cache.semantic_token_generation();
-        self.auto_install
+        (self
+            .auto_install
             .begin_query_dependency_check(language, generation, initial_pass)
-            .then_some(generation)
+            && self.settings_manager.is_auto_install_enabled(language))
+        .then_some(generation)
     }
 
     fn finish_query_repair_check(
