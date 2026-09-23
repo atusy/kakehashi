@@ -167,13 +167,15 @@ for its injection language, and sends `didClose` for the ones they do not
 not matter which change flipped it. A settings publication reaches open
 documents without an edit, through the reparse it already schedules, and the
 same pass's eager open reopens a language that is turned back on; the respawn
-re-open sweep reads settings per document for the same reason. The deselected
+re-open sweep reads settings again right before each document's open for the
+same reason. The deselected
 server's pushed diagnostics for those regions are evicted — a sibling server
 on the same region keeps its own — and pull-mode clients are asked to re-pull.
 
 Three limits remain. A request-path open that resolved its server under the
 old settings can still land after the retraction (the resurrection class of
-#1055); the next pass closes it again. The auto-install reload does not
+#1055), as can a respawn re-open whose own routing awaits straddle the
+change; the next pass closes it again. The auto-install reload does not
 reparse open documents, so a settings change arriving only through it is
 reconciled at the document's next pass. And the host-document layer
 (`bridge._self`) is not retracted: turning it off only filters its
