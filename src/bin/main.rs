@@ -1403,6 +1403,10 @@ fn write_forced_output_with(
     let staging_permissions = metadata.as_ref().map(|m| m.permissions.clone());
     let mut temp = output_temporary_file(path, staging_permissions.as_ref())?;
     if let Some(metadata) = &metadata {
+        // Restore ownership before widening the private creation mode, while
+        // the inode is empty. The final mode also restores inherited ACL masks
+        // before comparing them with the destination's access controls.
+        restore_forced_output_metadata(temp.as_file(), metadata)?;
         check_output_security(temp.as_file(), metadata)?;
     }
     write(temp.as_file_mut())?;
@@ -2356,6 +2360,27 @@ mod tests {
         xattr::set(path, "system.posix_acl_access", &bytes).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn forced_output_accepts_matching_inherited_acl() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("config.toml");
+        std::fs::write(&output, "previous").unwrap();
+        add_linux_access_acl(&output);
+        let acl = xattr::get(&output, "system.posix_acl_access")
+            .unwrap()
+            .unwrap();
+        xattr::set(temp.path(), "system.posix_acl_default", &acl).unwrap();
+
+        write_forced_output(&output, "replacement").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), "replacement");
+        assert_eq!(
+            xattr::get(&output, "system.posix_acl_access").unwrap(),
+            Some(acl)
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn forced_output_respects_owner_write_denial() {
@@ -2665,19 +2690,21 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn existing_output_stays_private_until_ownership_is_restored() {
-        use std::os::unix::fs::PermissionsExt as _;
+    fn existing_output_restores_ownership_and_mode_before_writing() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
         let temp = tempfile::TempDir::new().unwrap();
         let output = temp.path().join("config.toml");
         std::fs::write(&output, "previous configuration").unwrap();
         std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let original = output.metadata().unwrap();
 
         write_forced_output_with(&output, |file| {
             use std::io::Write as _;
-            // A new inode may inherit a different group from its destination.
-            // Keep it private until ownership and final mode are restored.
-            assert_eq!(file.metadata()?.permissions().mode() & 0o077, 0);
+            let staged = file.metadata()?;
+            assert_eq!(staged.uid(), original.uid());
+            assert_eq!(staged.gid(), original.gid());
+            assert_eq!(staged.permissions().mode(), original.permissions().mode());
             file.write_all(b"replacement")
         })
         .unwrap();
