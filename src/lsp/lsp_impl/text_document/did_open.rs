@@ -646,6 +646,62 @@ mod tests {
         );
     }
 
+    /// With auto-install on and the parser loaded, a query-chain repair may run
+    /// in the background, but the open still parses inline: a repair that
+    /// fails (here, scripted) must not leave the document without a tree.
+    #[tokio::test]
+    async fn loaded_parser_parses_inline_while_auto_install_is_on() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        server.settings_manager.apply_settings(WorkspaceSettings {
+            auto_install: true,
+            search_paths: vec![
+                crate::install::default_data_dir()
+                    .expect("test data directory")
+                    .to_string_lossy()
+                    .into_owned(),
+            ],
+            ..Default::default()
+        });
+        assert!(server.settings_manager.is_auto_install_enabled("rust"));
+        // Whatever the probe decides, no real install may run.
+        server
+            .auto_install
+            .script_next_install("rust", crate::lsp::auto_install::InstallOutcome::Failed);
+        let uri = Url::parse("file:///test/inline-with-auto-install.rs").unwrap();
+        let lsp_uri = crate::lsp::lsp_impl::url_to_uri(&uri).unwrap();
+        server
+            .did_open_impl(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: lsp_uri,
+                    language_id: "rust".to_string(),
+                    version: 1,
+                    text: "fn main() {}".to_string(),
+                },
+            })
+            .await;
+        let mut snapshots = server.documents.subscribe_snapshots(&uri).unwrap();
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if snapshots
+                    .borrow_and_update()
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.tree.is_some())
+                {
+                    break;
+                }
+                snapshots.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("the open parses inline instead of deferring to install");
+    }
+
     /// A parse publishes twice per version: the tree with its discovery as
     /// soon as populate hands them out — releasing every reader parked on
     /// the cell, the token readers above all — and the same version again,
