@@ -1067,7 +1067,9 @@ kakehashi config init --output ./kakehashi.toml
 kakehashi config init --output ./kakehashi.toml --force
 ```
 
-`--force` only applies when `--output` is used.
+`--force` only applies to file output. When writing to stdout (the default or
+`--output -`), it emits a warning to stderr and still prints the generated
+configuration or schema successfully.
 
 Without `--force`, an entry already at the output path is never touched: the
 file is created exclusively, so *anything* there — a regular file, a
