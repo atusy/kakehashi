@@ -2552,6 +2552,70 @@ print("hello")
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn saved_diagnostics_survive_unavailable_language_until_parser_registration() {
+        use crate::lsp::diagnostic_cache::DiagnosticSource;
+        use std::time::Duration;
+
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+        server.bridge.insert_ready_test_connection("rust_ls").await;
+        server
+            .language
+            .language_registry_for_parallel()
+            .unregister("rust");
+        let uri = Url::parse("file:///test/parser-install-save.rs").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        server.bridge.open_host_incarnation(&uri, incarnation).await;
+        assert!(
+            server
+                .diagnostic_scheduler()
+                .prepare_diagnostic_snapshot(&uri)
+                .is_none()
+        );
+        server
+            .diagnostic_scheduler()
+            .spawn_synthetic_diagnostic_task_when_current(uri.clone(), incarnation, 0);
+        // On this current-thread runtime, let Save observe the unavailable
+        // parser before the install completion publishes it.
+        tokio::task::yield_now().await;
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        let lineage = server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("rust"), None, Some(incarnation))
+            .await
+            .unwrap();
+        // The install callback's Open cannot override the Save ordering key,
+        // even if the old Save future already finished without collecting.
+        server
+            .diagnostic_scheduler()
+            .spawn_synthetic_diagnostic_task_for_parse(uri.clone(), lineage);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if server
+                    .diagnostics
+                    .snapshot(&uri)
+                    .contains_key(&DiagnosticSource::PullLayer)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the saved pull must survive the parser-registration window");
+    }
+
     #[tokio::test]
     async fn unparsed_non_injecting_host_has_complete_diagnostic_coverage() {
         let (service, _socket) = LspService::new(Kakehashi::new);
