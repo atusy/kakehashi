@@ -319,6 +319,8 @@ fn resolve_tree_scope(
         &[whole_document_range(host_text)],
         1,
         scope,
+        &mut std::collections::HashSet::new(),
+        &mut parse_with_absolute_ranges,
     )
 }
 
@@ -331,6 +333,12 @@ fn resolve_child_scope(
     parent_ranges: &[tree_sitter::Range],
     depth: usize,
     scope: &crate::language::node_tracker::NodeTreeScope,
+    visited: &mut std::collections::HashSet<crate::language::node_tracker::NodeTreeScope>,
+    parse: &mut impl FnMut(
+        &tree_sitter::Language,
+        &str,
+        &[tree_sitter::Range],
+    ) -> Option<tree_sitter::Tree>,
 ) -> Option<InjectionLayer> {
     let byte = scope.ranges.first()?.0;
     let filter = byte..byte;
@@ -363,7 +371,17 @@ fn resolve_child_scope(
         else {
             continue;
         };
-        let Some(tree) = parse_with_absolute_ranges(&language, host_text, &ranges) else {
+        // Distinct query patterns can produce identical recursive scopes.
+        // Their parse and descendants are identical, so revisit neither when
+        // another branch reaches the same inputs at this depth.
+        if !visited.insert(crate::language::node_tracker::NodeTreeScope {
+            language: language_name.as_str().into(),
+            depth,
+            ranges: ranges.iter().map(|r| (r.start_byte, r.end_byte)).collect(),
+        }) {
+            continue;
+        }
+        let Some(tree) = parse(&language, host_text, &ranges) else {
             continue;
         };
         if depth == scope.depth {
@@ -381,6 +399,8 @@ fn resolve_child_scope(
             &ranges,
             depth + 1,
             scope,
+            visited,
+            parse,
         ) {
             return Some(found);
         }
@@ -931,6 +951,53 @@ fn walk_child_layers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unavailable_recursive_scope_parses_each_distinct_scope_once() {
+        let coordinator = LanguageCoordinator::new();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        coordinator
+            .language_registry_for_parallel()
+            .register("rust".into(), language.clone());
+        let pattern = r#"((source_file) @injection.content
+            (#set! injection.language "rust") (#set! injection.include-children))"#;
+        let query = tree_sitter::Query::new(&language, &format!("{pattern}\n{pattern}")).unwrap();
+        coordinator
+            .query_store()
+            .insert_injection_query("rust".into(), std::sync::Arc::new(query));
+        let text = "fn main() {}\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(text, None).unwrap();
+        // An EOF append can leave an interior node and its old scope tracked,
+        // while both recursive patterns now cover a larger range at each level.
+        let scope = crate::language::node_tracker::NodeTreeScope {
+            language: "rust".into(),
+            depth: MAX_INJECTION_DEPTH,
+            ranges: vec![(0, text.len() - 1)],
+        };
+        let mut parses = 0;
+        let found = resolve_child_scope(
+            &coordinator,
+            "rust",
+            text,
+            &tree,
+            &[whole_document_range(text)],
+            1,
+            &scope,
+            &mut std::collections::HashSet::new(),
+            &mut |language, text, ranges| {
+                parses += 1;
+                parse_with_absolute_ranges(language, text, ranges)
+            },
+        );
+        assert!(found.is_none());
+        assert_eq!(
+            parses,
+            MAX_INJECTION_DEPTH - 1,
+            "identical recursive candidates must not multiply full-region parsing"
+        );
+    }
 
     #[test]
     fn overlapping_siblings_resolve_their_own_tree_and_node_pair() {
