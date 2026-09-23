@@ -544,8 +544,10 @@ impl InjectionCoordinator {
             // Parse-time discovery may have consumed the fresh load events.
             // Check once per language/reload generation, and again on open;
             // cached edits must not scan or lock the dependency graph.
-            let repair_queries =
-                install.query_repair_needed(&resolved_lang, check_query_dependencies);
+            let repair_queries = load_result.success
+                && install
+                    .query_repair_needed(&resolved_lang, check_query_dependencies)
+                    .await;
             if load_result.success {
                 load_events.extend(load_result.events);
                 if !repair_queries {

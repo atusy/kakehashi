@@ -309,37 +309,60 @@ impl InstallCoordinator {
     /// Whether an already-loaded managed parser's query chain should be
     /// repaired now. `initial_pass` marks lifecycle passes (open, install
     /// completion) that check regardless of this generation's earlier checks.
-    pub(crate) fn query_repair_needed(&self, language: &str, initial_pass: bool) -> bool {
-        self.decide_query_repair(language, initial_pass, || {
+    ///
+    /// The probe resolves the parser path, canonicalizes, takes lock files and
+    /// reads modelines across every search path, so it runs on the blocking
+    /// pool rather than on an async worker.
+    pub(crate) async fn query_repair_needed(&self, language: &str, initial_pass: bool) -> bool {
+        let Some(generation) = self.begin_query_repair_check(language, initial_pass) else {
+            return false;
+        };
+        let settings = self.settings_manager.load_settings();
+        let probe_language = language.to_string();
+        let state = tokio::task::spawn_blocking(move || {
             crate::install::default_data_dir().map_or(QueryChainState::Settled, |data_dir| {
-                managed_query_chain_state(
-                    &self.settings_manager.load_settings(),
-                    language,
-                    &data_dir,
-                )
+                managed_query_chain_state(&settings, &probe_language, &data_dir)
             })
         })
+        .await
+        // A probe that could not finish reached no answer, like a busy one.
+        .unwrap_or(QueryChainState::Busy);
+        self.finish_query_repair_check(language, generation, state)
     }
 
+    #[cfg(test)]
     fn decide_query_repair(
         &self,
         language: &str,
         initial_pass: bool,
         probe: impl FnOnce() -> QueryChainState,
     ) -> bool {
+        self.begin_query_repair_check(language, initial_pass)
+            .is_some_and(|generation| self.finish_query_repair_check(language, generation, probe()))
+    }
+
+    /// The generation to probe in, or `None` when no probe is due.
+    fn begin_query_repair_check(&self, language: &str, initial_pass: bool) -> Option<u64> {
         if !self.settings_manager.is_auto_install_enabled(language) {
-            return false;
+            return None;
         }
         let generation = self.cache.semantic_token_generation();
         // Opening another file does not change why the last repair failed;
         // a reload (settings change or any install) is what retries it.
         if self.auto_install.query_repair_failed(language, generation) {
-            return false;
+            return None;
         }
-        if !self.should_check_query_dependencies(language, initial_pass) {
-            return false;
-        }
-        match probe() {
+        self.should_check_query_dependencies(language, initial_pass)
+            .then_some(generation)
+    }
+
+    fn finish_query_repair_check(
+        &self,
+        language: &str,
+        generation: u64,
+        state: QueryChainState,
+    ) -> bool {
+        match state {
             QueryChainState::NeedsRepair => true,
             QueryChainState::Settled => false,
             // A held lock is an install mid-publish or another probe reading
@@ -379,7 +402,7 @@ impl InstallCoordinator {
 
         let query_repair = request.repair_queries
             || (self.language.has_parser_available(language)
-                && self.query_repair_needed(language, true));
+                && self.query_repair_needed(language, true).await);
         let request = InstallRequest {
             repair_queries: query_repair,
             ..request

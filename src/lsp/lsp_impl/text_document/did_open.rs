@@ -145,9 +145,13 @@ impl Kakehashi {
                 }
             }
 
-            if !load_result.success || self.install_coordinator().query_repair_needed(lang, true) {
-                if self.settings_manager.is_auto_install_enabled(lang) {
-                    // A parser or its query dependency chain needs installation.
+            let auto_install = self.settings_manager.is_auto_install_enabled(lang);
+            if !load_result.success || auto_install {
+                if auto_install {
+                    // A parser, or possibly its query dependency chain, needs
+                    // installation. Whether a loaded parser's chain does is
+                    // decided in the spawned task: the probe reads and locks
+                    // files across every search path.
                     //
                     // Move auto-install OFF the ingress writer ticket (#480
                     // liveness): a slow or hung parser *compile* must not hold the
@@ -170,6 +174,9 @@ impl Kakehashi {
                     // spawn is pure wasted work and races the bridge-state sweep.
                     let is_cli_mode = self.is_cli_mode();
                     tokio::spawn(async move {
+                        if load_result.success && !install.query_repair_needed(&lang, true).await {
+                            return;
+                        }
                         let completion = install
                             .maybe_auto_install_language(
                                 &lang,
