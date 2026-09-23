@@ -1009,24 +1009,18 @@ impl DiagnosticPublisher {
         ))
     }
 
-    /// Feed a proactive pull's combined result into the cache and republish.
+    /// Merge a proactive pull's per-layer results into the cache and republish.
     ///
-    /// The pull blob is already host-local; it replaces the
-    /// [`DiagnosticSource::PullLayer`] slot, then the merge folds in region push
-    /// slots.
-    ///
-    /// Staged limitation: `SyntheticDiagnosticsManager` aborts a superseded pull
-    /// task, but the abort cannot preempt the synchronous `set_pull_layer` write
-    /// below — so a superseded task can leave a slightly stale `PullLayer` that a
-    /// later republish includes until the next pull completes. This is the same
-    /// staleness class the deferred `content_epoch` version gate
-    /// (push-propagation-diagnostic-forwarding) handles generally; until then it
-    /// self-heals on the next completed pull.
+    /// Collected layers replace their previous contributions; pending layers
+    /// retain theirs. The cache combines these host-coordinate results into
+    /// the [`DiagnosticSource::PullLayer`] slot before publication folds in
+    /// eligible push slots. Production callers validate document lineage and
+    /// hold the edit lock through this commit.
     pub(crate) async fn publish_pull_layer(&self, host: &Url, diagnostics: PullLayerComponents) {
         // The nudge-less mutation stamps its pending pull-view-lag mark
         // atomically with the cache revision it produced; whichever republish
         // validates a covering revision settles it — Changed converts it into
-        // the lag, Unchanged drops it (see `set_pull_layer_nudgeless`). A
+        // the lag, Unchanged drops it (see `set_pull_components_nudgeless`). A
         // racing didClose's forget removes the mark on either side.
         self.aggregator
             .set_pull_components_nudgeless(host, diagnostics);
@@ -1238,7 +1232,7 @@ impl DiagnosticPublisher {
         // languages are known (`filter_excluded_region_slots`, below).
         self.filter_stale_host_slots(host, &settings, &mut snapshot, pushed);
         // Drop a pull-driven server's push slots when the host-event pull blob
-        // (`PullLayer`) is present: that server already contributes via the
+        // (`PullLayer`) covers its layer: that server already contributes via the
         // pull, so keeping its spontaneous push too would double-count it
         // (#425). The cache keeps the slot; only this publish snapshot is
         // filtered.
@@ -2824,7 +2818,7 @@ mod tests {
         server.settings_manager.apply_settings(rust_settings(true));
 
         // Insert WITHOUT parsing: the document is open but has no tree, so
-        // `prepare_diagnostic_snapshot` returns `None` transiently.
+        // snapshot preparation retains host inputs with virtual geometry pending.
         let uri = Url::parse("file:///test/tree_pending_host.rs").unwrap();
         server.documents.insert(
             uri.clone(),
