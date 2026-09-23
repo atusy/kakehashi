@@ -663,13 +663,13 @@ mod tests {
             "vscode-notebook-cell:// should preserve scheme and authority: {}",
             uri_string
         );
-        // Note: fragments are preserved by the url crate, so the URI ends with ".py#cell-id"
+        // The host fragment follows the filename, so the URI ends with ".py#cell-id"
         assert!(
             uri_string.contains(".py"),
             "vscode-notebook-cell:// URI should have language extension: {}",
             uri_string
         );
-        // Verify fragment is preserved (this is url crate behavior)
+        // Verify the fragment is preserved (HostBase keeps what follows the path)
         assert!(
             uri_string.ends_with("#cell-id"),
             "Fragment should be preserved: {}",
@@ -724,7 +724,7 @@ mod tests {
     #[test]
     fn percent_encodes_special_characters_in_region_id() {
         let host_uri = Url::parse("file:///project/doc.md").unwrap();
-        // Test with characters that need encoding: space, slash, question mark
+        // Test with characters that need encoding: slash, question mark
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", "region/0?test");
 
         let uri_string = virtual_uri.to_uri_string();
