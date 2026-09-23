@@ -1981,3 +1981,126 @@ fn init_publish_only_exclusion_client(mode: &str) -> (LspClient, tempfile::TempD
     client.send_notification("initialized", json!({}));
     (client, config_dir)
 }
+
+/// Set `languages.markdown.bridge.lua.enabled` at runtime.
+fn set_markdown_lua_bridge(client: &mut LspClient, enabled: bool) {
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": {
+                "languages": {
+                    "markdown": { "bridge": { "lua": { "enabled": enabled } } }
+                }
+            }
+        }),
+    );
+}
+
+/// The virtual URIs the mock received `method` for, in wire order.
+fn wire_log_uris(wire_log: &std::path::Path, method: &str) -> Vec<String> {
+    std::fs::read_to_string(wire_log)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .filter(|(logged, _)| *logged == method)
+        .map(|(_, uri)| uri.to_string())
+        .collect()
+}
+
+/// Wait until the mock has received `method` at least `count` times.
+fn wait_for_wire_count(wire_log: &std::path::Path, method: &str, count: usize) -> Vec<String> {
+    crate::helpers::lsp_polling::poll_until(100, 100, || {
+        let uris = wire_log_uris(wire_log, method);
+        (uris.len() >= count).then_some(uris)
+    })
+    .unwrap_or_else(|| {
+        panic!(
+            "the mock should receive {count} {method}; wire log:\n{}",
+            std::fs::read_to_string(wire_log).unwrap_or_default()
+        )
+    })
+}
+
+/// #917: turning a bridged injection language off at runtime retracts the
+/// virtual documents already open for it — the server gets `didClose` and its
+/// pushed diagnostics leave the editor — and turning it back on reopens them.
+///
+/// No `didChange` is sent: the `diagnostics-push` mock clears on every
+/// `didChange`, which would clear the diagnostic without any retraction, and
+/// an edit touching the region's first byte would reopen it anyway. The only
+/// trigger here is the configuration change itself.
+#[test]
+fn e2e_disabling_a_bridged_language_retracts_its_open_virtual_documents() {
+    let wire_dir = tempfile::TempDir::new().expect("wire log dir");
+    let wire_log = wire_dir.path().join("wire.log");
+    let config_dir = tempfile::TempDir::new().expect("temp dir");
+    let config_path = config_dir.path().join("push_diagnostics.toml");
+    std::fs::write(&config_path, "").expect("write config");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("utf8 path"))
+        .env("MOCK_LSP_WIRE_LOG", wire_log.to_string_lossy())
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-push": { "cmd": [mock_bin(), "diagnostics-push"], "languages": ["lua"] }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    open_host(&mut client);
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            has_pushed_diag,
+        )
+        .expect("the mock's pushed diagnostic should reach the editor");
+    let opened = wait_for_wire_count(&wire_log, "textDocument/didOpen", 1);
+    let virtual_uri = opened[0].clone();
+
+    set_markdown_lua_bridge(&mut client, false);
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(10),
+            cleared_host_diag,
+        )
+        .expect("disabling the bridged language must clear its pushed diagnostics");
+    let closed = wait_for_wire_count(&wire_log, "textDocument/didClose", 1);
+    assert_eq!(
+        closed[0], virtual_uri,
+        "the disabled region's virtual document must be closed downstream"
+    );
+    assert!(
+        wire_log_uris(&wire_log, "textDocument/didChange").is_empty(),
+        "nothing may reach the mock as didChange: its clearing push would make \
+         the cleared publish above prove nothing"
+    );
+
+    set_markdown_lua_bridge(&mut client, true);
+    let reopened = wait_for_wire_count(&wire_log, "textDocument/didOpen", 2);
+    assert_eq!(
+        reopened[1], virtual_uri,
+        "re-enabling the language must reopen the region on the next pass"
+    );
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(10),
+            has_pushed_diag,
+        )
+        .expect("the reopened region's pushed diagnostic should return");
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
