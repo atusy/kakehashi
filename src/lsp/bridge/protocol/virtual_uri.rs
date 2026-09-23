@@ -58,7 +58,7 @@ impl VirtualDocumentUri {
     ///
     /// `language` and `region_id` must be non-empty, and `region_id` must be
     /// dot-free (a ULID in production, optionally with a scratch suffix).
-    /// Debug builds assert non-emptiness; release builds skip those assertions.
+    /// Debug builds assert these invariants; release builds skip those assertions.
     /// Unknown languages use their name as the extension, including any dots.
     pub(crate) fn new(
         host_uri: &tower_lsp_server::ls_types::Uri,
@@ -67,6 +67,7 @@ impl VirtualDocumentUri {
     ) -> Self {
         debug_assert!(!language.is_empty(), "language must not be empty");
         debug_assert!(!region_id.is_empty(), "region_id must not be empty");
+        debug_assert!(!region_id.contains('.'), "region_id must be dot-free");
 
         Self {
             host_uri: host_uri.clone(),
@@ -607,16 +608,24 @@ mod tests {
     #[test]
     fn preserves_alphanumeric_and_safe_chars_in_region_id() {
         let host_uri = Url::parse("file:///project/doc.md").unwrap();
-        // RFC 3986 unreserved characters: A-Z a-z 0-9 - . _ ~
+        // Unreserved characters except the dot, which separates the extension.
         let virtual_uri =
-            VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", "ABC-xyz_123.test~v2");
+            VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", "ABC-xyz_123-test~v2");
 
         let uri_string = virtual_uri.to_uri_string();
         assert!(
-            uri_string.contains("ABC-xyz_123.test~v2.lua"),
+            uri_string.contains("ABC-xyz_123-test~v2.lua"),
             "Unreserved characters should not be encoded: {}",
             uri_string
         );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "region_id must be dot-free")]
+    fn panics_on_dotted_region_id_in_debug() {
+        let host: Uri = "file:///project/doc.md".parse().unwrap();
+        VirtualDocumentUri::new(&host, "lua", "region.part");
     }
 
     #[test]
