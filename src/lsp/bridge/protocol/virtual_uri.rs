@@ -16,14 +16,33 @@ use std::str::FromStr;
 /// This distinctive prefix identifies virtual URIs and prevents collisions with real files.
 const VIRTUAL_URI_PREFIX: &str = "kakehashi-virtual-uri-";
 
-/// Characters left literal in a virtual filename: RFC 3986 unreserved only.
-/// Everything else, including `%`, is percent-encoded, so the filename stays
-/// one path segment that both `url::Url` and `ls_types::Uri` accept.
+/// Characters left literal in a virtual filename: RFC 3986 `pchar` minus
+/// escapes, i.e. unreserved, sub-delims, `:` and `@`. Everything else,
+/// including `%`, `/`, `?` and `#`, is percent-encoded, so the filename
+/// stays one path segment that both `url::Url` and `ls_types::Uri` accept.
+///
+/// Keeping sub-delims literal matches what `PathSegmentsMut::push` produced
+/// wherever that output was valid, so escaping only characters that used to
+/// break a URI changes no string a downstream server may already hold or
+/// normalize (e.g. lowercasing escape hex).
 const FILENAME_ENCODE_SET: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'.')
     .remove(b'_')
-    .remove(b'~');
+    .remove(b'~')
+    .remove(b'!')
+    .remove(b'$')
+    .remove(b'&')
+    .remove(b'\'')
+    .remove(b'(')
+    .remove(b')')
+    .remove(b'*')
+    .remove(b'+')
+    .remove(b',')
+    .remove(b';')
+    .remove(b'=')
+    .remove(b':')
+    .remove(b'@');
 
 /// A virtual filename, `{prefix}{region_id}.{extension}`, displayed
 /// percent-encoded as a single path segment. The prefix and the `.` are
@@ -151,8 +170,8 @@ fn validated_rendering(
 /// ## URI Format
 ///
 /// `region_id` is dot-free, so the first `.` in the filename ends it; `{ext}`
-/// may itself contain dots. The filename is percent-encoded to RFC 3986
-/// unreserved characters on both forms.
+/// may itself contain dots. On both forms the filename escapes every
+/// character outside RFC 3986 `pchar` (see `FILENAME_ENCODE_SET`).
 ///
 /// For normal URIs (file://, https://, etc.):
 /// - Format: `{host_dir}/kakehashi-virtual-uri-{region_id}.{ext}{host_query_and_fragment}`,
@@ -1340,14 +1359,14 @@ mod properties {
                 last_segment(&rendered),
                 format!("{VIRTUAL_URI_PREFIX}{region}.{extension}")
             );
-            // RFC 3986 section 2.3: unreserved characters stay literal, so every
-            // escape in the filename stands for some other byte.
+            // Characters a path segment may carry literally (RFC 3986 `pchar`)
+            // stay literal, so every escape stands for some other byte.
             let raw_segment = rendered_segment(&rendered);
             for escape in raw_segment.split('%').skip(1) {
                 let byte = u8::from_str_radix(&escape[..2], 16).unwrap();
                 prop_assert!(
-                    !(byte.is_ascii_alphanumeric() || b"-._~".contains(&byte)),
-                    "{} encodes unreserved {:?}",
+                    !(byte.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@".contains(&byte)),
+                    "{} encodes pchar {:?}",
                     raw_segment,
                     byte as char
                 );
@@ -1382,6 +1401,36 @@ mod properties {
             prop_assert_eq!(
                 rendered_url.fragment(),
                 host_url.as_ref().and_then(url::Url::fragment)
+            );
+        }
+
+        #[test]
+        fn output_matches_origin_main_wherever_main_was_valid(
+            host in host(),
+            language in language(),
+            region in region_id(),
+        ) {
+            // The previous renderer: `PathSegmentsMut::push` of the raw
+            // filename. It dropped tabs and newlines, so skip those inputs.
+            prop_assume!(!language.contains(['\t', '\n', '\r']));
+            let Some(mut url) = url::Url::parse(host.as_str())
+                .ok()
+                .filter(|url| !url.cannot_be_a_base())
+            else {
+                return Ok(());
+            };
+            let extension = VirtualDocumentUri::language_to_extension(&language);
+            url.path_segments_mut()
+                .unwrap()
+                .pop()
+                .push(&format!("{VIRTUAL_URI_PREFIX}{region}.{extension}"));
+            let previous = url.to_string();
+            // Only where the previous string was a valid LSP URI: servers may
+            // hold it, and any re-encoding would change what they compare.
+            prop_assume!(Uri::from_str(&previous).is_ok());
+            prop_assert_eq!(
+                VirtualDocumentUri::new(&host, &language, &region).to_uri_string(),
+                previous
             );
         }
 
