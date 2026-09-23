@@ -1818,40 +1818,7 @@ fn e2e_push_hidden_from_publish_but_pulled_still_refreshes_pull_clients() {
     // while leaving the published set unchanged. A pull client learns of it
     // only through `workspace/diagnostic/refresh`, so the hidden push must
     // still nudge — else it sees the push only after its next edit.
-    let config_dir = tempfile::TempDir::new().expect("temp dir");
-    let config_path = config_dir.path().join("publish_only_exclusion.toml");
-    std::fs::write(&config_path, "").expect("write config");
-
-    let mut client = LspClient::builder()
-        .arg("--config-file")
-        .arg(config_path.to_str().expect("utf8 path"))
-        .build();
-    client.send_request(
-        "initialize",
-        json!({
-            "processId": std::process::id(),
-            "rootUri": null,
-            "capabilities": { "workspace": { "diagnostics": { "refreshSupport": true } } },
-            "workspaceFolders": null,
-            "initializationOptions": {
-                "languageServers": {
-                    "mock-push": { "cmd": [mock_bin(), "diagnostics-push"], "languages": ["lua"] }
-                },
-                "languages": {
-                    "markdown": {
-                        "bridge": {
-                            "lua": {
-                                "aggregation": {
-                                    "textDocument/publishDiagnostics": { "priorities": ["pyright"] }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }),
-    );
-    client.send_notification("initialized", json!({}));
+    let (mut client, _config_dir) = init_publish_only_exclusion_client("diagnostics-push");
     open_host(&mut client);
 
     let (refresh_id, _) = client
@@ -1874,4 +1841,75 @@ fn e2e_push_hidden_from_publish_but_pulled_still_refreshes_pull_clients() {
 
     client.send_request("shutdown", json!(null));
     client.send_notification("exit", json!(null));
+}
+
+#[test]
+fn e2e_evicting_a_push_hidden_from_publish_still_refreshes_pull_clients() {
+    // The eviction sibling of the test above: a crashed server's pushes the
+    // publish hid but the pull fold showed vanish from the next pull while the
+    // published set stays as it was — the pull client must still be nudged.
+    let (mut client, _config_dir) = init_publish_only_exclusion_client("diagnostics-push-crash");
+    open_host(&mut client);
+
+    let (push_refresh_id, _) = client
+        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(15))
+        .expect("precondition: the hidden push nudges pull clients");
+    // Acked, so the single-flighted eviction refresh below can be sent.
+    client.send_response(push_refresh_id, json!(null));
+
+    // The content-changing edit drives the mock to exit; its slots are evicted.
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": MD_URI, "version": 2 },
+            "contentChanges": [{ "text": MD_TEXT_EDITED }]
+        }),
+    );
+    let (evict_refresh_id, _) = client
+        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(15))
+        .expect("evicting a push only the pull showed must nudge pull clients");
+    client.send_response(evict_refresh_id, json!(null));
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+/// A refresh-capable client whose `mock-push` (in `mode`) serves lua, with
+/// lua's PUBLISH allowlist excluding it while the pull key stays unrestricted.
+fn init_publish_only_exclusion_client(mode: &str) -> (LspClient, tempfile::TempDir) {
+    let config_dir = tempfile::TempDir::new().expect("temp dir");
+    let config_path = config_dir.path().join("publish_only_exclusion.toml");
+    std::fs::write(&config_path, "").expect("write config");
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("utf8 path"))
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": { "workspace": { "diagnostics": { "refreshSupport": true } } },
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-push": { "cmd": [mock_bin(), mode], "languages": ["lua"] }
+                },
+                "languages": {
+                    "markdown": {
+                        "bridge": {
+                            "lua": {
+                                "aggregation": {
+                                    "textDocument/publishDiagnostics": { "priorities": ["pyright"] }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    (client, config_dir)
 }
