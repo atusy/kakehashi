@@ -37,9 +37,7 @@ use super::completion::{
 };
 use super::host::{HostDocument, sync_host_document};
 use crate::config::settings::WorkspaceSettings;
-use crate::config::{
-    merge_bridge_server_configs, resolve_with_wildcard, settings::BridgeServerConfig,
-};
+use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
 use crate::lsp::bridge::actor::RouterCleanupGuard;
 use crate::lsp::bridge::envelope::nests_reserved_key;
 use crate::lsp::bridge::{HostRevision, VirtualDocumentUri};
@@ -64,7 +62,9 @@ impl LanguageServerPool {
     /// a host-layer item, `send_completion_resolve_request` (coordinate
     /// translation + region guard) otherwise. If any routing step fails (no
     /// envelope, server not configured), the item is returned as-is.
-    /// `document` captures current text and geometry after connection setup;
+    /// Missing or retired producer stamps return the item unresolved without
+    /// creating a connection. `document` captures current text and geometry
+    /// only after the stamped producer has been found;
     /// the edit guard is consumed by transport and released after enqueue.
     pub(crate) async fn dispatch_completion_resolve(
         &self,
@@ -101,17 +101,37 @@ impl LanguageServerPool {
             return item;
         };
 
+        let Some(connection_key) = envelope
+            .connection_key
+            .as_ref()
+            .filter(|key| key.server() == envelope.origin)
+        else {
+            re_envelope_item(&mut item, &envelope);
+            return item;
+        };
+        let Some(generation) = envelope.connection_generation else {
+            re_envelope_item(&mut item, &envelope);
+            return item;
+        };
+        let Some(handle) = self
+            .ready_producer_by_key(connection_key, Some(&config), generation)
+            .await
+        else {
+            re_envelope_item(&mut item, &envelope);
+            return item;
+        };
+
         // Host-layer items are already in host coordinates — route their
         // resolve to the host server VERBATIM (no translation, #958). A genuine
         // host envelope has no region identity; requiring that blocks a client
         // flipping `host_layer` on a virt envelope to skip translation.
         if envelope.is_host_layer() {
             return self
-                .send_host_completion_resolve(&config, item, envelope, upstream_id, document)
+                .send_host_completion_resolve(&handle, item, envelope, upstream_id, document)
                 .await;
         }
 
-        self.send_completion_resolve_request(&config, item, envelope, upstream_id, document)
+        self.send_completion_resolve_request(&handle, item, envelope, upstream_id, document)
             .await
     }
 
@@ -122,46 +142,18 @@ impl LanguageServerPool {
     /// unresolved, envelope restored) at every step.
     async fn send_host_completion_resolve(
         &self,
-        server_config: &BridgeServerConfig,
+        handle: &Arc<ConnectionHandle>,
         mut item: CompletionItem,
         envelope: KakehashiEnvelope,
         upstream_id: Option<UpstreamId>,
         document: impl Future<Output = Option<CompletionResolveDocument>>,
     ) -> CompletionItem {
         let server_name = &envelope.origin;
-        // `host_uri` comes from client-supplied `data` (the resolve params echo
-        // the item's envelope), so an unparseable value fails soft rather than
-        // falling through to `get_or_create_connection(.., None)`, whose `None`
-        // document hint routes to the rootless client-fallback key (the shared
-        // instance for a `preferSharedInstance` server). The bridge only ever
-        // mints a valid `Url::as_str()` here, so a parse failure means
-        // a corrupt or foreign envelope. This rejects only UNPARSEABLE strings:
-        // a well-formed non-file URL parses, then fails root resolution and
-        // lands on that same rootless key anyway — the host path is fail-soft
-        // throughout, so that costs a wasted round trip, not correctness.
-        let Ok(host_url) = Url::parse(&envelope.host_uri) else {
-            warn!(
-                target: "kakehashi::bridge",
-                "completionItem/resolve (host): envelope host_uri {:?} is not a valid URL; ignoring",
-                envelope.host_uri
-            );
+        // A malformed host URI is never forwarded, even with a valid producer.
+        if Url::parse(&envelope.host_uri).is_err() {
             re_envelope_item(&mut item, &envelope);
             return item;
-        };
-        let handle = match self
-            .get_or_create_connection(server_name, server_config, Some(&host_url))
-            .await
-        {
-            Ok(h) => h,
-            Err(e) => {
-                warn!(
-                    target: "kakehashi::bridge",
-                    "completionItem/resolve (host): failed to connect to {server_name}: {e}"
-                );
-                re_envelope_item(&mut item, &envelope);
-                return item;
-            }
-        };
+        }
         if !handle.has_capability("completionItem/resolve") {
             // Two ways here. The payload nests the reserved key: as far as
             // this branch can tell, the origin never advertised resolve and
@@ -195,7 +187,7 @@ impl LanguageServerPool {
         // translation on the way back.
         match self
             .send_completion_resolve_on_handle(
-                &handle,
+                handle,
                 item.clone(),
                 upstream_id,
                 &envelope,
@@ -222,22 +214,13 @@ impl LanguageServerPool {
     /// restored so the client can still use the basic completion item.
     async fn send_completion_resolve_request(
         &self,
-        server_config: &BridgeServerConfig,
+        handle: &Arc<ConnectionHandle>,
         mut item: CompletionItem,
         envelope: KakehashiEnvelope,
         upstream_id: Option<UpstreamId>,
         document: impl Future<Output = Option<CompletionResolveDocument>>,
     ) -> CompletionItem {
         let server_name = &envelope.origin;
-        // Route to the SAME `(server, root)` connection the completion request
-        // ran on (#382): the envelope carries the originating host URI, which
-        // resolves to the same connection key. Without it (legacy envelope with
-        // an empty host_uri), this falls back to the server's client-root
-        // connection (its shared instance for a `preferSharedInstance` server)
-        // — a different process in a multi-root monorepo of per-root servers.
-        // The origin
-        // is normally already pooled by the completion request that produced the
-        // item; only if it died in between does this respawn.
         let Ok(host_uri) = Url::parse(&envelope.host_uri) else {
             re_envelope_item(&mut item, &envelope);
             return item;
@@ -249,28 +232,6 @@ impl LanguageServerPool {
             re_envelope_item(&mut item, &envelope);
             return item;
         }
-        let handle = match self
-            .get_or_create_virtual_connection(
-                server_name,
-                server_config,
-                &host_uri,
-                &envelope.injection_language,
-                &envelope.region_id,
-            )
-            .await
-        {
-            Ok(h) => h,
-            Err(e) => {
-                warn!(
-                    target: "kakehashi::bridge",
-                    "completionItem/resolve: failed to connect to {}: {}",
-                    server_name, e
-                );
-                re_envelope_item(&mut item, &envelope);
-                return item;
-            }
-        };
-
         if !handle.has_capability("completionItem/resolve") {
             // Two ways here. The payload nests the reserved key: as far as
             // this branch can tell, the origin never advertised resolve and
@@ -315,7 +276,7 @@ impl LanguageServerPool {
             prepare_completion_resolve_item(&item, &RegionOffset::from(&envelope.offset));
 
         match self
-            .send_completion_resolve_on_handle(&handle, outgoing, upstream_id, &envelope, document)
+            .send_completion_resolve_on_handle(handle, outgoing, upstream_id, &envelope, document)
             .await
         {
             Some(mut resolved) => {
@@ -367,9 +328,7 @@ impl LanguageServerPool {
         envelope: &KakehashiEnvelope,
         document: CompletionResolveDocument,
     ) -> Option<CompletionItem> {
-        // Route per-connection cancel state by this handle's pool key (#382) —
-        // the same connection the completion ran on, recovered from the
-        // envelope's host URI by the caller.
+        // Cancellation and synchronization use the stamped producer's key.
         let connection_key = handle.key();
         // The edit lock must not park behind a lifecycle writer waiting for
         // another downstream reply. Reordering these locks would conflict
@@ -409,9 +368,13 @@ impl LanguageServerPool {
             // Pin the generation through sync and enqueue, matching the normal
             // request path and excluding concurrent connection replacement.
             let connections = self.connections().await;
-            if !connections.get(connection_key).is_some_and(|live| {
-                Arc::ptr_eq(live, handle) && live.state() == ConnectionState::Ready
-            }) {
+            if envelope.connection_key.as_ref() != Some(connection_key)
+                || envelope.connection_generation
+                    != Some(self.document_connection_generation(connection_key))
+                || !connections.get(connection_key).is_some_and(|live| {
+                    Arc::ptr_eq(live, handle) && live.state() == ConnectionState::Ready
+                })
+            {
                 return Err(io::Error::other(
                     "completion origin was replaced or retired",
                 ));
@@ -522,7 +485,10 @@ impl LanguageServerPool {
                 let producer_is_live = connections.get(connection_key).is_some_and(|current| {
                     Arc::ptr_eq(current, handle) && current.state() == ConnectionState::Ready
                 });
-                producer_is_live.then(|| parse_completion_resolve_response(response))?
+                let generation_matches = envelope.connection_generation
+                    == Some(self.document_connection_generation(connection_key));
+                (producer_is_live && generation_matches)
+                    .then(|| parse_completion_resolve_response(response))?
             }
             Err(e) => {
                 warn!(
@@ -621,6 +587,7 @@ fn re_envelope_item(item: &mut CompletionItem, envelope: &KakehashiEnvelope) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::settings::BridgeServerConfig;
     use crate::lsp::bridge::envelope::ENVELOPE_KEY;
     use crate::lsp::bridge::text_document::completion::envelope_host_item;
     use serde_json::json;
@@ -1040,6 +1007,84 @@ mod tests {
     // ==========================================================================
     // dispatch_completion_resolve integration tests
     // ==========================================================================
+
+    #[cfg(unix)]
+    #[rstest::rstest]
+    #[case::host(true)]
+    #[case::virtual_layer(false)]
+    #[tokio::test]
+    async fn completion_resolve_rejects_a_replacement_before_reading_document(
+        #[case] host_layer: bool,
+    ) {
+        use crate::lsp::bridge::pool::test_helpers::{
+            create_handle_with_command, create_handle_with_key,
+        };
+        use crate::lsp::bridge::{ConnectionKey, ConnectionState};
+        use tower_lsp_server::ls_types::{CompletionOptions, ServerCapabilities};
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("lua-ls");
+        let old = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        pool.insert_connection(Arc::clone(&old)).await;
+        let mut envelope = test_envelope();
+        envelope.connection_generation = Some(pool.document_connection_generation(&key));
+        envelope.host_layer = host_layer;
+        if host_layer {
+            envelope.region_id.clear();
+        }
+        assert!(
+            pool.invalidate_connection_after_didclose_failure(&key, &old)
+                .await
+        );
+        let command = vec!["sh".into(), "-c".into(), "cat > /dev/null".into()];
+        let (replacement, _) = create_handle_with_command(
+            ConnectionState::Ready,
+            key.clone(),
+            command.clone(),
+            Some(ServerCapabilities {
+                completion_provider: Some(CompletionOptions {
+                    resolve_provider: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        )
+        .await;
+        pool.insert_connection(replacement).await;
+        pool.open_host_incarnation(&Url::parse(&envelope.host_uri).unwrap(), 1)
+            .await;
+        assert_ne!(
+            envelope.connection_generation,
+            Some(pool.document_connection_generation(&key))
+        );
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "lua-ls".into(),
+            BridgeServerConfig {
+                cmd: Some(command),
+                ..Default::default()
+            },
+        );
+        let mut item = CompletionItem {
+            label: "old".into(),
+            ..Default::default()
+        };
+        re_envelope_item(&mut item, &envelope);
+        let read = std::cell::Cell::new(false);
+        let result = pool
+            .dispatch_completion_resolve(item, &settings, None, async {
+                read.set(true);
+                None
+            })
+            .await;
+        assert!(
+            !read.get(),
+            "a replacement must be rejected before document preparation"
+        );
+        assert_eq!(
+            extract_envelope(&result).unwrap().connection_generation,
+            envelope.connection_generation
+        );
+    }
 
     /// Helper to create a completion item with a Kakehashi envelope.
     fn enveloped_item(server: &str) -> CompletionItem {

@@ -99,6 +99,11 @@ Partially implemented:
   same all-or-nothing edit guard as initial hint retrieval.
   `codeAction/resolve` carries and checks the same revision stamp before
   dispatch and after the reply, and the incarnation after the reply as well.
+  `completionItem/resolve` binds both layers to the producing connection key
+  and generation as well. Missing legacy stamps or a retired producer return
+  the item unresolved; resolve never creates a replacement connection. The
+  generation is rechecked under the connections lock before synchronization
+  and enqueue, and again after the reply. Re-enveloping retains these stamps.
   `completionItem/resolve` carries no revision stamp: a completion list is
   meant to outlive ordinary edits — the editor filters it locally while the
   user keeps typing and resolves on accept — so before dispatch it checks the

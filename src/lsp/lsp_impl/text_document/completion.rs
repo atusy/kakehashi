@@ -209,7 +209,7 @@ struct HostCompletion {
     response: CompletionResponse,
     /// The server that answered — the `origin` a later resolve routes to.
     server_name: String,
-    /// The real host document URI the resolve reconnects on.
+    /// The real host document URI used for resolve freshness checks.
     host_uri: String,
     /// Whether that server advertises `completionItem/resolve`.
     server_resolves: bool,

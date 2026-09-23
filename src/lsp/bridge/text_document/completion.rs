@@ -420,16 +420,9 @@ pub(crate) struct KakehashiEnvelope {
     /// Generation of the process that produced the opaque item data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connection_generation: Option<u64>,
-    /// Host document URI the completion was requested on. Used to re-resolve the
-    /// same `(server, root)` connection for `completionItem/resolve` so the
-    /// resolve reaches the very process that produced the item (#382) — without
-    /// it, resolve would land on the server's client-root fallback connection
-    /// (or, for a `preferSharedInstance` server, its shared instance),
-    /// a *different* process in a multi-root monorepo of per-root servers. Stored as a `String`
-    /// (not `url::Url`) because this crate does not enable the `url/serde`
-    /// feature; the resolve path parses it once. Empty (via `serde(default)`)
-    /// for envelopes from before this field existed → falls back to root-less
-    /// routing, matching the old behavior.
+    /// Host document URI for document lifetime and geometry checks. Connection
+    /// selection uses the stamped producer key and generation instead of
+    /// re-resolving this URI. Empty in legacy envelopes, which fail soft.
     #[serde(default)]
     pub host_uri: String,
     /// Stable injection region identity for live resolve-time geometry checks.
@@ -528,7 +521,7 @@ pub(crate) struct EnvelopeContext<'a> {
     pub connection_key: Option<&'a ConnectionKey>,
     pub connection_generation: Option<u64>,
     /// Host document URI the completion ran on, stored in the envelope so
-    /// `completionItem/resolve` can route back to the originating connection.
+    /// `completionItem/resolve` can check document lifetime and geometry.
     pub host_uri: &'a str,
     pub region_id: &'a str,
     pub offset: &'a RegionOffset,
