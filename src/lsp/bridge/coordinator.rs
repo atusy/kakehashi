@@ -1424,16 +1424,16 @@ impl BridgeCoordinator {
 
     /// Forward didChange notifications to opened virtual documents.
     ///
-    /// Delegates to the pool's forward_didchange_to_opened_docs method.
+    /// Returns false if any attempted enqueue fails and needs another sync pass.
     pub(crate) async fn forward_didchange_to_opened_docs(
         &self,
         uri: &Url,
         incarnation: u64,
         injections: &[BridgeInjection],
-    ) {
+    ) -> bool {
         self.pool
             .forward_didchange_to_opened_docs(uri, incarnation, injections)
-            .await;
+            .await
     }
 
     pub(crate) async fn open_host_incarnation(&self, uri: &Url, incarnation: u64) {

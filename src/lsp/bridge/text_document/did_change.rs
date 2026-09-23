@@ -26,7 +26,9 @@ use super::super::protocol::{JsonRpcNotification, VirtualDocumentUri};
 impl LanguageServerPool {
     /// Send `didChange` to every already-opened virtual document for `host_uri`,
     /// skipping injections that haven't been opened yet (`didOpen` happens on
-    /// their first request). Uses full content sync for simplicity.
+    /// their first request). Uses full content sync for simplicity. Returns
+    /// false if any attempted enqueue fails, leaving its sent fingerprint old
+    /// so a synchronization waiter can retry.
     ///
     /// Notifications go through `send_notification()` (single writer task,
     /// ls-bridge-message-ordering) for FIFO order — fire-and-forget but no reordering.
@@ -36,7 +38,7 @@ impl LanguageServerPool {
         host_uri: &Url,
         incarnation: u64,
         injections: &[crate::lsp::bridge::coordinator::BridgeInjection],
-    ) {
+    ) -> bool {
         // Convert host_uri to lsp_types::Uri for bridge protocol functions
         let host_uri_lsp = match crate::lsp::lsp_impl::url_to_uri(host_uri) {
             Ok(uri) => uri,
@@ -46,10 +48,11 @@ impl LanguageServerPool {
                     "Failed to convert host URI, skipping didChange: {}",
                     e
                 );
-                return;
+                return false;
             }
         };
 
+        let mut synchronized = true;
         // For each injection, check if it's actually opened and send didChange
         for injection in injections {
             // Publish the latest content even when no downstream document is
@@ -136,10 +139,13 @@ impl LanguageServerPool {
                         &injection.content,
                     )
                     .await;
+                } else {
+                    synchronized = false;
                 }
                 drop(transition_guard);
             }
         }
+        synchronized
     }
 
     /// Send a didChange notification for a virtual document, returning the

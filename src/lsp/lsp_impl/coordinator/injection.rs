@@ -450,11 +450,13 @@ impl InjectionCoordinator {
                 .evict_source(uri, &DiagnosticSource::Region(region_id));
         }
 
-        if forward_did_change {
+        let synchronized = if forward_did_change {
             self.bridge
                 .forward_didchange_to_opened_docs(uri, incarnation, &injections)
-                .await;
-        }
+                .await
+        } else {
+            true
+        };
 
         let languages: HashSet<String> =
             injections.iter().map(|inj| inj.language.clone()).collect();
@@ -513,7 +515,7 @@ impl InjectionCoordinator {
                     .await;
             },
         );
-        true
+        synchronized
     }
 
     /// Check injected languages and handle missing parsers: auto-install when enabled,
@@ -711,31 +713,29 @@ impl InjectionCoordinator {
     ) {
         const INJECTION_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
         const INJECTION_RETRY_POLL: std::time::Duration = std::time::Duration::from_millis(50);
-        // One waiter per document LIFETIME: a burst of passes deferred by the
-        // same window re-runs the pass once, when the language settles; a
-        // close and reopen in the meantime gets its own waiter, since this
-        // one exits at its lifetime check.
-        let Some(claim) = self.settle_retry_waiters.claim(
-            if matches!(required, Some(InjectionTarget::Parsed(_))) {
-                // An open retry is revision-bound and may become a no-op.
-                // A pass without forwarding also cannot repair already-opened
-                // content. Neither can absorb a latest-revision sync retry.
-                "open-injection"
-            } else if !forward_did_change {
-                "eager-injection"
-            } else {
-                "injection"
-            },
-            uri,
-            Some(incarnation),
-        ) else {
+        // Coalesce each retry kind per document lifetime. A forwarding pass
+        // retries failed enqueues within the original budget; close/reopen
+        // gets a separate waiter and the old pass fails its lifetime check.
+        let retry_kind = if matches!(required, Some(InjectionTarget::Parsed(_))) {
+            // Revision-bound and non-forwarding retries cannot absorb the
+            // latest-revision synchronization required by edits and repairs.
+            "open-injection"
+        } else if !forward_did_change {
+            "eager-injection"
+        } else {
+            "injection"
+        };
+        let Some(claim) = self
+            .settle_retry_waiters
+            .claim(retry_kind, uri, Some(incarnation))
+        else {
             return;
         };
         let this = self.clone();
         let uri = uri.clone();
         let host_language = host_language.to_string();
         tokio::spawn(async move {
-            let claim = claim;
+            let mut claim = Some(claim);
             let deadline = tokio::time::Instant::now() + INJECTION_RETRY_BUDGET;
             loop {
                 tokio::select! {
@@ -764,37 +764,40 @@ impl InjectionCoordinator {
                     // Release the slot BEFORE the rerun: a reload starting
                     // right now makes the rerun defer again, and its retry
                     // must be able to claim the slot this waiter held.
-                    drop(claim);
+                    drop(claim.take());
                     let query_generation = this.cache.semantic_token_generation();
-                    match required {
+                    let synchronized = match required {
                         Some(InjectionTarget::Parsed(lineage)) => {
-                            let _ = this.process_injections_for_parse(&uri, lineage).await;
+                            this.process_injections_for_parse(&uri, lineage).await
                         }
                         _ => {
-                            let _ = this
-                                .process_injections_for_incarnation(
-                                    &uri,
-                                    forward_did_change,
-                                    incarnation,
-                                )
-                                .await;
+                            this.process_injections_for_incarnation(
+                                &uri,
+                                forward_did_change,
+                                incarnation,
+                            )
+                            .await
                         }
-                    }
+                    };
                     // A reload can start after resolution, during the awaited
                     // downstream sends. Preserve the sync intent until a pass
                     // uses one settled query generation throughout.
                     if forward_did_change
                         && this.document_incarnation(&uri) == Some(incarnation)
-                        && (this.reload_in_progress()
+                        && (!synchronized
+                            || this.reload_in_progress()
                             || this.cache.semantic_token_generation() != query_generation)
+                        && tokio::time::Instant::now() < deadline
                     {
-                        this.retry_injection_pass_when_settled(
-                            &uri,
-                            &host_language,
-                            true,
-                            incarnation,
-                            Some(InjectionTarget::Incarnation(incarnation)),
-                        );
+                        // A failed enqueue leaves the sent fingerprint old.
+                        // Retry within this waiter's original budget; if another
+                        // sync waiter claimed the slot meanwhile, it owns recovery.
+                        claim =
+                            this.settle_retry_waiters
+                                .claim(retry_kind, &uri, Some(incarnation));
+                        if claim.is_some() {
+                            continue;
+                        }
                     }
                     return;
                 }
@@ -1078,7 +1081,7 @@ impl InjectionCoordinator {
         if self.documents.get(uri).is_none() {
             self.documents.remove_edit_lock_if_unshared(uri, &edit_lock);
         }
-        // Rejection can follow one or more successful enqueues. A query-only
+        // Failure can follow one or more successful enqueues. A query-only
         // reload can preserve their URIs while changing extracted content;
         // ordinary parse passes skip didChange and already-opened documents.
         // Re-resolve and forward every current region, including earlier batch
@@ -1086,7 +1089,11 @@ impl InjectionCoordinator {
         // the existing bounded settlement wait; it does not turn the failed
         // repair barrier into a success.
         let snapshot_state = self.reopen_snapshot_state(uri, revision);
-        if snapshot_state == ReopenSnapshotState::Changed
+        // Queue backpressure also leaves existing content stale even when
+        // the snapshot is still current. Retry that failed synchronization
+        // after the settlement delay, rather than requiring another edit.
+        if (snapshot_state == ReopenSnapshotState::Changed
+            || matches!(outcome, crate::lsp::bridge::OpenOutcome::NotOpened))
             && self.document_incarnation(uri) == Some(revision.document.incarnation)
         {
             self.retry_injection_pass_when_settled(
@@ -1882,8 +1889,11 @@ mod tests {
         }
     }
 
+    #[rstest::rstest]
+    #[case::query_reload(true)]
+    #[case::queue_backpressure(false)]
     #[tokio::test]
-    async fn rejected_reopen_resynchronizes_all_regions_after_query_reload() {
+    async fn rejected_reopen_resynchronizes_all_regions(#[case] query_reload: bool) {
         use crate::lsp::bridge::OutboundMessage;
         use crate::lsp::bridge::VirtualDocumentUri;
         use crate::lsp::bridge::{ConnectionKey, OpenOutcome};
@@ -1919,15 +1929,33 @@ mod tests {
         );
         let coordinator = server.injection_coordinator();
         let revision = coordinator.reopen_revision(&uri).unwrap();
-        let old = coordinator.resolve_injection_data(&uri, "rust").unwrap();
+        let mut old = coordinator.resolve_injection_data(&uri, "rust").unwrap();
+        let resolved = old.clone();
+        if !query_reload {
+            for region in &mut old {
+                region.content = format!("stale-{}", region.content);
+            }
+        }
         assert_eq!(old.len(), 2);
         let pool = server.bridge.pool();
         pool.open_host_incarnation(&uri, incarnation).await;
         let key = ConnectionKey::for_server("test");
-        pool.insert_connection(
-            test_helpers::create_handle_with_state(ConnectionState::Ready).await,
-        )
-        .await;
+        let handle = test_helpers::create_handle_with_state(ConnectionState::Ready).await;
+        pool.insert_connection(std::sync::Arc::clone(&handle)).await;
+        server
+            .settings_manager
+            .apply_settings(crate::config::WorkspaceSettings {
+                auto_install: false,
+                language_servers: std::collections::HashMap::from([(
+                    "test".into(),
+                    crate::config::settings::BridgeServerConfig {
+                        cmd: Some(vec!["sh".into(), "-c".into(), "cat > /dev/null".into()]),
+                        languages: Some(vec!["rust".into()]),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            });
         let host_uri = crate::lsp::lsp_impl::url_to_uri(&uri).unwrap();
         let (mut sender, mut received) = tokio::sync::mpsc::channel(8);
         for region in &old {
@@ -1955,8 +1983,13 @@ mod tests {
             .settle_retry_waiters
             .claim("open-injection", &uri, Some(incarnation))
             .unwrap();
-        install_query(1);
-        server.cache.bump_semantic_token_generation();
+        let reserved = if query_reload {
+            install_query(1);
+            server.cache.bump_semantic_token_generation();
+            None
+        } else {
+            Some(handle.reserve_outbound_capacity_for_test().await)
+        };
         let current = coordinator.resolve_injection_data(&uri, "rust").unwrap();
         assert_eq!(
             old.iter().map(|r| &r.region_id).collect::<Vec<_>>(),
@@ -1974,10 +2007,17 @@ mod tests {
                 &uri,
                 revision,
                 &key,
-                old.clone(),
+                resolved,
             )
             .await;
         assert_eq!(outcome, OpenOutcome::NotOpened);
+        if !query_reload {
+            assert_eq!(
+                coordinator.reopen_snapshot_state(&uri, revision),
+                super::ReopenSnapshotState::Current,
+                "backpressure must fail repair without changing its snapshot"
+            );
+        }
         // Probe normal opens on fresh connections: they consume the forwarded
         // cache, which must also stop overriding current content with old text.
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -2008,7 +2048,31 @@ mod tests {
             }
         })
         .await
-        .expect("query rejection must refresh the forwarded cache without an edit");
+        .expect("failed repair must refresh the forwarded cache without an edit");
+        if !query_reload {
+            assert!(
+                coordinator
+                    .settle_retry_waiters
+                    .claim("injection", &uri, Some(incarnation))
+                    .is_none(),
+                "a failed first retry must keep synchronization pending"
+            );
+        }
+        drop(reserved);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if coordinator
+                    .settle_retry_waiters
+                    .claim("injection", &uri, Some(incarnation))
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("recovery must finish after queue capacity returns");
         // Both regions opened before the rejection were synchronized, including
         // the earlier batch region. An authoritative repeat should send nothing.
         for region in &current {
