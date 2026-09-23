@@ -2583,7 +2583,7 @@ print("hello")
     }
 
     #[cfg(unix)]
-    async fn assert_saved_pull_after_parser_registration(give_up: bool) {
+    async fn assert_saved_pull_after_parser_registration(give_up: bool, previous_give_up: bool) {
         use crate::lsp::diagnostic_cache::DiagnosticSource;
         use std::time::Duration;
 
@@ -2609,6 +2609,9 @@ print("hello")
                 .prepare_diagnostic_snapshot(&uri)
                 .is_none()
         );
+        if previous_give_up {
+            server.documents.publish_giveup_snapshot(&uri, incarnation);
+        }
         server
             .diagnostic_scheduler()
             .spawn_synthetic_diagnostic_task_when_current(uri.clone(), incarnation, 0);
@@ -2738,13 +2741,19 @@ print("hello")
     #[cfg(unix)]
     #[tokio::test]
     async fn saved_diagnostics_survive_unavailable_language_until_parser_registration() {
-        assert_saved_pull_after_parser_registration(false).await;
+        assert_saved_pull_after_parser_registration(false, false).await;
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn saved_host_diagnostics_resume_after_parser_registration_and_parse_giveup() {
-        assert_saved_pull_after_parser_registration(true).await;
+        assert_saved_pull_after_parser_registration(true, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn saved_host_diagnostics_resume_after_repeated_parse_giveup() {
+        assert_saved_pull_after_parser_registration(true, true).await;
     }
 
     #[tokio::test]
