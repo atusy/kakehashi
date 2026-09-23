@@ -5,11 +5,15 @@ use tower_lsp_server::ls_types::Diagnostic;
 
 use crate::config::settings::{AggregationStrategy, LayerSource, ResolvedLayerConfig};
 
-/// A layer that was not collected differs from one that returned clean.
+/// An uncollected layer differs from a collected empty result.
 #[derive(Debug, Clone)]
 pub(crate) enum PullContribution {
     Pending,
     NotPulled,
+    /// Result of eligible collection, including an empty result. Host events
+    /// retain their best-effort policy: request errors do not switch a
+    /// pull-driven server to its push cache. Refresh prefetch separately
+    /// counts errors and vetoes the cache commit on failure.
     Pulled(Arc<[Diagnostic]>),
 }
 
