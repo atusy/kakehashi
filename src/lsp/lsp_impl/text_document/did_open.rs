@@ -2552,12 +2552,48 @@ print("hello")
         }
     }
 
+    #[tokio::test]
+    async fn unparsed_non_injecting_host_has_complete_diagnostic_coverage() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+        let uri = Url::parse("file:///test/non-injecting.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        assert!(server.language.injection_query("rust").is_none());
+        let snapshot = server
+            .diagnostic_scheduler()
+            .prepare_diagnostic_snapshot(&uri)
+            .unwrap();
+        assert!(snapshot.host.is_some());
+        assert!(
+            !snapshot.virtual_geometry_pending,
+            "no query means there is no virtual layer to await"
+        );
+        assert!(
+            !snapshot.narrower_than_editor_pull,
+            "host-only collection covers this language completely"
+        );
+    }
+
     /// Live host text remains available while virtual geometry awaits reparse.
     #[tokio::test]
     async fn diagnostic_snapshot_keeps_host_text_while_virtual_geometry_is_pending() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
         configure_rust_self_host(server);
+        let query = Query::new(
+            &tree_sitter_rust::LANGUAGE.into(),
+            r#"((function_item body: (block) @injection.content) (#set! injection.language "rust"))"#,
+        ).unwrap();
+        server
+            .language
+            .query_store()
+            .insert_injection_query("rust".to_string(), std::sync::Arc::new(query));
 
         let uri = Url::parse("file:///test/diag_follow.rs").unwrap();
         server.documents.insert(
