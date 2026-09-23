@@ -313,6 +313,12 @@ fn provided_outside_data_dir(
     search_paths: &[PathBuf],
 ) -> bool {
     let managed = queries_parent.join(language).clean();
+    // A managed base of any kind, even an empty leftover, is what the loader
+    // takes first when the data directory precedes the runtime path; only
+    // with none at all is the runtime base the one it reads.
+    if fs::symlink_metadata(managed.join("highlights.scm")).is_ok() {
+        return false;
+    }
     let managed_root = fs::canonicalize(&managed).ok();
     search_paths.iter().any(|base| {
         let directory = base.join("queries").join(language).clean();
@@ -762,7 +768,10 @@ impl StagedQueryInstall {
         // A provided parent is a user's file: it may since have been removed,
         // turned into an overlay, or made to inherit something new.
         for language in &self.external {
-            if !provided_outside_data_dir(&self.queries_parent, language, &self.search_paths) {
+            // A managed copy another install completed meanwhile serves too.
+            if !query_install_is_complete(&self.queries_parent.join(language))
+                && !provided_outside_data_dir(&self.queries_parent, language, &self.search_paths)
+            {
                 return Some(language);
             }
             let Some(parents) = inherited_languages_with_search_paths(

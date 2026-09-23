@@ -387,8 +387,10 @@ downloaded even when another search path also has them. A parent upstream does
 not publish (a language of your own) is instead used from a search path outside
 the data directory that has a base (not `;; extends`) `highlights.scm` for it;
 the parents it names still count. An overlay alone does not count. When the data
-directory has no complete copy of a parent, such a highlights base also counts
-as installed for repair purposes, even if the parent's other kinds are missing.
+directory has no `highlights.scm` for a parent at all, such a highlights base
+also counts as installed for repair purposes, even if the parent's other kinds
+are missing; a leftover managed file (even an empty one) must be removed or
+repaired instead.
 A parent named by `bindings.scm` or a captures kind must still be put on
 a search path by hand. Inline queries and explicit query-path lists do not
 participate in this dependency discovery. This does not add file watching or

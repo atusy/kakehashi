@@ -55,9 +55,11 @@ resolves each query kind separately, so a runtime highlights base does not
 supply the other kinds an upstream copy would. Only a parent upstream does not
 publish (a 404 for its highlights query) is left to a search path outside the
 data directory that has a readable base (non-`extends`) `highlights.scm` for
-it; it is then neither staged, published, nor held in the publish transaction,
+it, and only while the data directory holds no `highlights.scm` for it at all
+(even an empty leftover is what the loader reads first when the data directory
+precedes the runtime path); it is then neither staged, published, nor held in the publish transaction,
 and the parents it declares remain part of the chain. Completeness accepts such
-a provided parent when the data directory has no complete copy, and the
+a provided parent on the same condition, and the
 pre-publication checks recheck the parents staging recorded as provided, so a
 user-provided parent absent upstream no longer fails the install or requests
 repair. An overlay alone does not provide a parent. An unreadable runtime file declares nothing:
