@@ -766,7 +766,8 @@ impl ConnectionHandle {
     }
 
     /// Log, at most once per connection, that a `preferSharedInstance` server
-    /// lacks the `workspaceFolders` capability, so marker-rooted documents its
+    /// lacks folder-change support (so far — a server may still register it
+    /// dynamically, which consolidates the diverts), so marker-rooted documents its
     /// connection does not already serve divert to the per-root-instance model
     /// (#391). Marker-less documents stay aboard — they bring no marker root
     /// (their client-workspace announcement is capability-gated away on such
@@ -780,9 +781,9 @@ impl ConnectionHandle {
         if first {
             log::info!(
                 target: "kakehashi::bridge",
-                "Server '{}' has preferSharedInstance set but does not advertise \
-                 workspace.workspaceFolders.{{supported, changeNotifications}}; \
-                 falling back to per-root instances",
+                "Server '{}' has preferSharedInstance set but has not (yet) declared \
+                 or registered workspace/didChangeWorkspaceFolders support; diverting \
+                 new roots to per-root instances until it does",
                 server
             );
         }
