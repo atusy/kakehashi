@@ -1416,6 +1416,8 @@ fn write_forced_output_with(
     // This is not a conditional rename: an entry swapped in after this check
     // may itself be replaced. Persist never follows the leaf, so that race
     // cannot redirect the write into a symlink target (#800).
+    // Publication uses path-based filesystem operations, like no-clobber output;
+    // it does not pin ancestor directories against concurrent namespace changes.
     if forced_output_metadata(path)? != metadata {
         return Err(std::io::Error::other(
             "output permissions, ownership or ACLs changed while preparing replacement; retry",
