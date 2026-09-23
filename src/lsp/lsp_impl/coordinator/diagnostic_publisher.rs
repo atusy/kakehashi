@@ -3936,6 +3936,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn host_slots_filtered_from_publish_when_priorities_omit_the_server() {
+        // #916, host layer: `bridge._self.aggregation."textDocument/publishDiagnostics"
+        // .priorities` is an allowlist over the host servers, so a `_self`
+        // server it omits must not publish through its pushes either.
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        register_rust(server);
+        server.settings_manager.apply_settings(rust_settings(true));
+
+        let uri = Url::parse("file:///test/host_priorities.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let publisher = DiagnosticPublisher::new(server);
+        publisher
+            .publish_host_push(
+                uri.as_str(),
+                "rust_ls".to_string(),
+                ProgressConnectionId::for_test(1),
+                vec![diag("e")],
+            )
+            .await;
+
+        let mut excluding = rust_settings(true);
+        excluding
+            .languages
+            .get_mut("rust")
+            .and_then(|lang| lang.bridge.as_mut())
+            .and_then(|bridge| bridge.get_mut(HOST_BRIDGE_KEY))
+            .expect("rust_settings defines the _self entry")
+            .aggregation = Some(HashMap::from([(
+            "textDocument/publishDiagnostics".to_string(),
+            crate::config::settings::AggregationConfig {
+                priorities: Some(vec!["other_ls".to_string()]),
+                ..Default::default()
+            },
+        )]));
+        server.settings_manager.apply_settings(excluding);
+
+        let mut snapshot = server.diagnostics.snapshot(&uri);
+        publisher.filter_stale_host_slots(&uri, &mut snapshot);
+        assert!(
+            !snapshot.contains_key(&DiagnosticSource::Host),
+            "a host server outside the publish priorities must not publish its push"
+        );
+    }
+
+    #[tokio::test]
     async fn host_push_dropped_after_server_disabled_but_stale_slot_lingers() {
         // A server disabled via `languageServers.*.enabled: false` after it
         // already spawned and pushed: its still-live connection's next push
