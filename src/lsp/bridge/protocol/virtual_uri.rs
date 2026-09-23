@@ -274,10 +274,9 @@ impl VirtualDocumentUri {
     /// `textDocument/publishDiagnostics`) must be discarded rather than
     /// forwarded (Decision point 7).
     pub(crate) fn is_scratch_uri(uri: &str) -> bool {
-        // Substring check first: it cheaply rejects the vast majority of URIs
-        // (every non-scratch one) before `region_id_of`'s URL parse. Only the
-        // region id decides: the extension and host directory may carry the
-        // marker too.
+        // Substring check first: it cheaply rejects nearly every non-scratch
+        // URI before `region_id_of`'s URL parse. Only the region id decides:
+        // the extension and host directory may carry the marker too.
         uri.contains(Self::SCRATCH_ID_MARKER)
             && Self::region_id_of(uri).is_some_and(|id| id.contains(Self::SCRATCH_ID_MARKER))
     }
