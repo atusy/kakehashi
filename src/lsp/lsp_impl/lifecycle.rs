@@ -505,6 +505,17 @@ impl Kakehashi {
             };
             (raw_settings, settings)
         };
+        // The prefix a client-layer rebuild resumes from. A rejected merge put
+        // the programmed defaults in effect, files included, so they are the
+        // prefix too — resuming from the rejected files would fail every
+        // rebuild the same way.
+        *self
+            .settings_base
+            .write()
+            .recover_poison("settings_base initialize") = settings_outcome
+            .base
+            .filter(|_| initialization_merge_was_accepted)
+            .unwrap_or_else(crate::config::defaults::default_settings);
         *self
             .client_layers
             .write()

@@ -88,7 +88,17 @@ impl Kakehashi {
             .recompose_settings(root_path.as_deref(), client_layers)
             .await
         {
-            Ok((raw, settings)) => {
+            Ok(super::recompose::Recomposed {
+                raw,
+                settings,
+                base,
+            }) => {
+                // The files were read for the new root: the prefix a later
+                // client-layer rebuild resumes from is theirs now.
+                *self
+                    .settings_base
+                    .write()
+                    .recover_poison("settings_base root change") = base;
                 let warnings = Self::misconfigured_settings_warnings(&settings);
                 let root_changed = *self.settings_manager.root_path() != root_path
                     || self.settings_manager.root_scope() != root_scope;

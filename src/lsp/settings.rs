@@ -82,6 +82,11 @@ pub struct SettingsLoadOutcome {
     /// First migration notice produced by an authored layer before merge-time
     /// normalization erases its legacy spelling.
     pub(crate) empty_container_notice: Option<String>,
+    /// The fold of the programmed defaults and the configuration files alone,
+    /// before any client layer — a prefix checkpoint (see [`fold_layers`]) a
+    /// later rebuild of the client layers can resume from without reading the
+    /// files again.
+    pub(crate) base: Option<RawWorkspaceSettings>,
 }
 
 /// Fold configuration layers into the settings they describe, lowest
@@ -607,13 +612,12 @@ fn load_settings_impl(
             .chain(client_layers.iter()),
     );
 
-    // Merge all layers: defaults < config layers < client layers.
-    let mut layers = vec![defaults];
-    layers.extend(config_layers);
-    layers.extend(client_layers.into_iter().map(Some));
-    let merged = fold_layers(layers);
-    let raw_settings = merged.clone();
-    let settings = expand_merged_settings(merged, home, &env_fn, &mut events);
+    // Merge all layers: defaults < config layers < client layers. The first
+    // two are folded on their own first — a prefix, so the result is the
+    // same — and kept, so the client layers can be rebuilt over them later.
+    let base = fold_layers(std::iter::once(defaults).chain(config_layers));
+    let (raw_settings, settings) =
+        fold_client_layers(base.clone(), client_layers, home, &env_fn, &mut events);
 
     SettingsLoadOutcome {
         settings,
@@ -621,7 +625,58 @@ fn load_settings_impl(
         events,
         deprecated_keys,
         empty_container_notice,
+        base,
     }
+}
+
+/// Rebuild the settings from a `base` a previous load produced and the client
+/// layers, without reading any configuration file: the client layers are
+/// anchored to `root_path` and folded over `base` in order.
+///
+/// For when only the client layers changed. The files keep the reading they
+/// had when `base` was taken — a file edited since is not seen, exactly as it
+/// would not have been had the client layer been merged onto the settings in
+/// effect.
+pub(crate) fn load_settings_over_base(
+    base: RawWorkspaceSettings,
+    mut client_layers: Vec<RawWorkspaceSettings>,
+    root_path: Option<&Path>,
+    home: Option<&str>,
+    env_fn: impl Fn(&str) -> Option<String>,
+) -> SettingsLoadOutcome {
+    let env_fn = crate::config::expand::with_kakehashi_defaults(env_fn);
+    let mut events = Vec::new();
+    for settings in &mut client_layers {
+        let _ = anchor_settings_paths(settings, root_path);
+    }
+    let empty_container_notice = empty_container_notice_for_layers(client_layers.iter());
+    let base = Some(base);
+    let (raw_settings, settings) =
+        fold_client_layers(base.clone(), client_layers, home, &env_fn, &mut events);
+    SettingsLoadOutcome {
+        settings,
+        raw_settings,
+        events,
+        deprecated_keys: DeprecatedKeysSeen::default(),
+        empty_container_notice,
+        base,
+    }
+}
+
+/// Fold already-anchored client layers over `base`, and expand the result.
+fn fold_client_layers(
+    base: Option<RawWorkspaceSettings>,
+    client_layers: Vec<RawWorkspaceSettings>,
+    home: Option<&str>,
+    env_fn: impl Fn(&str) -> Option<String>,
+    events: &mut Vec<SettingsEvent>,
+) -> (Option<RawWorkspaceSettings>, Option<WorkspaceSettings>) {
+    let merged = fold_layers(std::iter::once(base).chain(client_layers.into_iter().map(Some)));
+    let raw_settings = merged.clone();
+    (
+        raw_settings,
+        expand_merged_settings(merged, home, env_fn, events),
+    )
 }
 
 /// Report settings written as an explicitly empty container, where that used to

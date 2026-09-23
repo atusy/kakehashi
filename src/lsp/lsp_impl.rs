@@ -350,6 +350,12 @@ pub struct Kakehashi {
     /// effective snapshot so a workspace-root change can replay clears as well
     /// as values without carrying the previous project's layer forward.
     client_layers: std::sync::RwLock<client_layers::ClientLayers>,
+    /// The defaults-and-files prefix of the settings in effect, retained from
+    /// the load that last read the configuration files (initialize, or a
+    /// workspace-root change), so a change to a client layer alone can be
+    /// rebuilt without reading them again. Written and read under the
+    /// settings-reload transaction, together with what it was folded into.
+    settings_base: std::sync::RwLock<RawWorkspaceSettings>,
     /// Explicit config layers retained after their single allowed read, so a
     /// workspace-root change can replay relative client layers above them.
     explicit_config: std::sync::OnceLock<Option<crate::lsp::settings::ExplicitConfig>>,
@@ -508,6 +514,7 @@ impl Kakehashi {
             cache: std::sync::Arc::new(CacheCoordinator::new()),
             settings_manager: std::sync::Arc::new(SettingsManager::new()),
             client_layers: std::sync::RwLock::default(),
+            settings_base: std::sync::RwLock::new(crate::config::defaults::default_settings()),
             explicit_config: std::sync::OnceLock::new(),
             auto_install,
             bridge: std::sync::Arc::new(bridge),

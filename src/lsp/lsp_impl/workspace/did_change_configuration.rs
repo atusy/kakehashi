@@ -580,10 +580,10 @@ impl Kakehashi {
         }
         let root_path = self.settings_manager.root_path();
         match self
-            .recompose_settings(root_path.as_ref().as_deref(), layers.to_fold_order())
+            .recompose_client_layers(root_path.as_ref().as_deref(), layers.to_fold_order())
             .await
         {
-            Ok((raw, settings)) => {
+            Ok(super::recompose::Recomposed { raw, settings, .. }) => {
                 // Committed under the same transaction that publishes the
                 // rebuilt settings, so the retained layers never describe a
                 // snapshot other than the one in effect.
