@@ -2333,7 +2333,8 @@ async fn deliver_upstream_notification(
             // A downstream connection's reader exited (crash/respawn): drop the
             // diagnostic slots it produced and republish the affected hosts so a
             // dead server's diagnostics don't linger until didClose (#469). A
-            // `None` publisher (test loop) has no cache to evict.
+            // `None` context (test loop) has no cache to evict and nothing to
+            // respawn.
             if let Some(context) = delivery_context {
                 context
                     .diagnostic_publisher
