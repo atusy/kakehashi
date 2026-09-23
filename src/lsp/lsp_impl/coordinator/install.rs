@@ -290,10 +290,24 @@ impl InstallCoordinator {
             .await;
     }
 
+    #[cfg(test)]
     pub(crate) fn should_check_query_dependencies(
         &self,
         language: &str,
         initial_pass: bool,
+    ) -> bool {
+        self.should_check_query_dependencies_at(
+            language,
+            initial_pass,
+            self.cache.semantic_token_generation(),
+        )
+    }
+
+    fn should_check_query_dependencies_at(
+        &self,
+        language: &str,
+        initial_pass: bool,
+        generation: u64,
     ) -> bool {
         // Discovery may already have loaded the parser before this task runs.
         // Track checks independently of load events; reload generations reset
@@ -302,7 +316,7 @@ impl InstallCoordinator {
         // separately and waits for the next reload, even on open.
         let first = self
             .auto_install
-            .first_query_dependency_check(language, self.cache.semantic_token_generation());
+            .first_query_dependency_check(language, generation);
         initial_pass || first
     }
 
@@ -352,7 +366,10 @@ impl InstallCoordinator {
         if self.auto_install.query_repair_failed(language, generation) {
             return None;
         }
-        self.should_check_query_dependencies(language, initial_pass)
+        // The same generation as the failure check above and the forget in
+        // `finish_query_repair_check`: a busy answer must undo this very mark,
+        // even when a reload lands in between.
+        self.should_check_query_dependencies_at(language, initial_pass, generation)
             .then_some(generation)
     }
 
