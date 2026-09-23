@@ -26,25 +26,35 @@ fn document_matches_lineage(
         && document.content_version() == expected_content_version
 }
 
+/// Live inputs captured under one document guard. Only virtual diagnostics
+/// require the optional current tree; a stale tree must never accompany text
+/// from a newer revision.
+struct DiagnosticDocumentInputs {
+    text: std::sync::Arc<str>,
+    tree: Option<tree_sitter::Tree>,
+    language_id: Option<String>,
+    incarnation: u64,
+    content_version: u64,
+}
+
 fn snapshot_document_for_lineage(
     documents: &DocumentStore,
     uri: &Url,
     expected_lineage: Option<(u64, u64)>,
-) -> Option<(
-    crate::document::model::DocumentSnapshot,
-    Option<String>,
-    u64,
-)> {
+) -> Option<DiagnosticDocumentInputs> {
     let document = documents.get(uri)?;
     if expected_lineage.is_some_and(|(incarnation, content_version)| {
         !document_matches_lineage(&document, incarnation, content_version)
     }) {
         return None;
     }
-    let snapshot = document.snapshot()?;
-    let language_id = document.language_id().map(str::to_owned);
-    let content_version = document.content_version();
-    Some((snapshot, language_id, content_version))
+    Some(DiagnosticDocumentInputs {
+        text: document.text_arc(),
+        tree: document.tree(),
+        language_id: document.language_id().map(str::to_owned),
+        incarnation: document.incarnation(),
+        content_version: document.content_version(),
+    })
 }
 
 /// Whether the proactive pull's **config-level** server selection for a method
@@ -384,13 +394,16 @@ impl DiagnosticSnapshotPreparer {
         uri: &Url,
         expected_lineage: Option<(u64, u64)>,
     ) -> Option<DiagnosticSnapshot> {
-        let (snapshot, language_id, content_version) =
-            snapshot_document_for_lineage(&self.documents, uri, expected_lineage)?;
+        let snapshot = snapshot_document_for_lineage(&self.documents, uri, expected_lineage)?;
+        // Keep the existing publication gate until partial-layer cache updates
+        // can preserve virtual contributions while host diagnostics advance.
+        let tree = snapshot.tree.as_ref()?;
+        let content_version = snapshot.content_version;
         let language_name = self.language.detect_language(
             uri.path(),
-            snapshot.text(),
+            &snapshot.text,
             None,
-            language_id.as_deref(),
+            snapshot.language_id.as_deref(),
         )?;
 
         // Cross-layer gating, keyed by the same method name as the
@@ -458,10 +471,10 @@ impl DiagnosticSnapshotPreparer {
                             &self.language,
                             self.bridge.node_tracker(),
                             uri,
-                            snapshot.tree(),
-                            snapshot.text(),
+                            tree,
+                            &snapshot.text,
                             injection_query.as_ref(),
-                            snapshot.incarnation(),
+                            snapshot.incarnation,
                         )),
                     };
 
@@ -621,9 +634,9 @@ impl DiagnosticSnapshotPreparer {
             Some(HostRequestContext {
                 uri: uri.clone(),
                 language_id: language_name.clone(),
-                text: snapshot.text_arc(),
-                incarnation: snapshot.incarnation(),
-                content_version: snapshot.content_version(),
+                text: std::sync::Arc::clone(&snapshot.text),
+                incarnation: snapshot.incarnation,
+                content_version: snapshot.content_version,
                 configs,
                 priorities: agg.priorities,
                 strategy: agg.strategy,
@@ -652,7 +665,7 @@ impl DiagnosticSnapshotPreparer {
 
         Some(DiagnosticSnapshot {
             lineage: DiagnosticSnapshotLineage {
-                incarnation: snapshot.incarnation(),
+                incarnation: snapshot.incarnation,
                 content_version,
                 settings_generation,
             },
@@ -672,6 +685,25 @@ const LOG_TARGET: &str = "kakehashi::synthetic_diag";
 mod tests {
     use super::*;
     use tower_lsp_server::LspService;
+
+    #[test]
+    fn diagnostic_inputs_survive_a_missing_tree() {
+        let documents = DocumentStore::new();
+        let uri = Url::parse("file:///test/unparsed-host.rs").unwrap();
+        let incarnation = documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let inputs = snapshot_document_for_lineage(&documents, &uri, Some((incarnation, 0)))
+            .expect("host diagnostic inputs require live text and lineage, not a parse tree");
+        assert_eq!(&*inputs.text, "fn main() {}");
+        assert_eq!(inputs.language_id.as_deref(), Some("rust"));
+        assert_eq!(inputs.incarnation, incarnation);
+        assert_eq!(inputs.content_version, 0);
+        assert!(inputs.tree.is_none());
+    }
 
     #[tokio::test(start_paused = true)]
     async fn saved_diagnostic_wait_survives_the_virtual_settle_budget() {
