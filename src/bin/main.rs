@@ -1301,6 +1301,21 @@ fn write_new_output_with(
 
 #[cfg(windows)]
 fn native_output_path(path: &std::path::Path) -> std::io::Result<PathBuf> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    // Splitting parent/leaf would erase a directory-only trailing separator,
+    // potentially turning an invalid file output into a successful overwrite.
+    if path
+        .as_os_str()
+        .encode_wide()
+        .last()
+        .is_some_and(|last| last == u16::from(b'/') || last == u16::from(b'\\'))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "output file path must not end with a directory separator",
+        ));
+    }
     // Rust's filesystem wrappers support extended-length paths, but tempfile's
     // native publication and our security APIs need the prefix explicitly.
     // First apply Win32 lexical normalization (including ordinary trailing dots
@@ -2353,6 +2368,24 @@ mod tests {
             std::fs::read_to_string(&output).unwrap(),
             "previous configuration"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_output_rejects_trailing_directory_separators() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("config.toml");
+        std::fs::write(&output, "previous").unwrap();
+        let verbatim = output.canonicalize().unwrap();
+        let ordinary = verbatim.to_str().unwrap().strip_prefix(r"\\?\").unwrap();
+        for base in [ordinary, verbatim.to_str().unwrap()] {
+            for separator in ["\\", "/"] {
+                let invalid = PathBuf::from(format!("{base}{separator}"));
+                assert!(write_forced_output(&invalid, "replacement").is_err());
+                assert!(write_new_output_with(&invalid, |_| Ok(())).is_err());
+                assert_eq!(std::fs::read_to_string(&output).unwrap(), "previous");
+            }
+        }
     }
 
     #[cfg(windows)]
