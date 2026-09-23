@@ -351,7 +351,7 @@ pub struct Kakehashi {
     client_settings_overrides: std::sync::RwLock<Vec<RawWorkspaceSettings>>,
     /// Explicit config layers retained after their single allowed read, so a
     /// workspace-root change can replay relative client layers above them.
-    explicit_config: std::sync::OnceLock<Option<crate::lsp::settings::ExplicitConfig>>,
+    explicit_config: std::sync::OnceLock<Option<crate::lsp::settings::ConfigFileLayers>>,
     /// Isolated coordinator for parser auto-installation
     auto_install: AutoInstallManager,
     /// Bridge coordinator for downstream LS pool and node tracking

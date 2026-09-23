@@ -300,7 +300,7 @@ impl Kakehashi {
         let _ = self.explicit_config.set(
             explicit_config
                 .as_ref()
-                .map(crate::lsp::settings::ExplicitConfig::for_replay),
+                .map(crate::lsp::settings::ConfigFileLayers::for_replay),
         );
 
         let position_encoding = host_position_encoding(&params.capabilities);

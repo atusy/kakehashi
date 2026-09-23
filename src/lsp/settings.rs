@@ -126,7 +126,7 @@ const MAX_CONFIG_FILE_BYTES: u64 = 8 * 1024 * 1024;
 /// writer will simply block initialization — but reading once is what keeps the
 /// failure mode that of the path the user chose.)
 #[derive(Clone)]
-pub(crate) struct ExplicitConfig {
+pub(crate) struct ConfigFileLayers {
     layers: Vec<Option<RawWorkspaceSettings>>,
     events: Vec<SettingsEvent>,
     deprecated_keys: DeprecatedKeysSeen,
@@ -135,7 +135,7 @@ pub(crate) struct ExplicitConfig {
     pub(crate) fatal_error: Option<String>,
 }
 
-impl ExplicitConfig {
+impl ConfigFileLayers {
     /// Retain the already-read layers for workspace-root replay without
     /// pretending the files were read again or re-emitting their load events.
     pub(crate) fn for_replay(&self) -> Self {
@@ -159,7 +159,7 @@ impl ExplicitConfig {
 pub(crate) fn load_explicit_config(
     home: Option<&str>,
     env_fn: impl Fn(&str) -> Option<String>,
-) -> Option<ExplicitConfig> {
+) -> Option<ConfigFileLayers> {
     let files = crate::config::expand::config_file_override()?;
     Some(read_explicit_layers(files, home, env_fn))
 }
@@ -333,7 +333,7 @@ fn read_explicit_layers(
     files: &[std::path::PathBuf],
     home: Option<&str>,
     env_fn: impl Fn(&str) -> Option<String>,
-) -> ExplicitConfig {
+) -> ConfigFileLayers {
     let env_fn = crate::config::expand::with_kakehashi_defaults(env_fn);
     let mut events = vec![SettingsEvent::info(format!(
         "Using {} explicit config file(s); default config locations skipped",
@@ -481,7 +481,7 @@ fn read_explicit_layers(
         }
     }
 
-    ExplicitConfig {
+    ConfigFileLayers {
         layers,
         events,
         deprecated_keys,
@@ -501,7 +501,7 @@ pub fn load_settings(
     override_settings: Option<(SettingsSource, Value)>,
     home: Option<&str>,
     env_fn: impl Fn(&str) -> Option<String>,
-    explicit: Option<ExplicitConfig>,
+    explicit: Option<ConfigFileLayers>,
 ) -> SettingsLoadOutcome {
     load_settings_impl(
         root_path,
@@ -520,7 +520,7 @@ pub(crate) fn load_settings_with_client_layers(
     client_layers: Vec<RawWorkspaceSettings>,
     home: Option<&str>,
     env_fn: impl Fn(&str) -> Option<String>,
-    explicit: Option<ExplicitConfig>,
+    explicit: Option<ConfigFileLayers>,
 ) -> SettingsLoadOutcome {
     load_settings_impl(
         root_path,
@@ -541,7 +541,7 @@ fn load_settings_impl(
     client_layers: ClientSettingsLayers,
     home: Option<&str>,
     env_fn: impl Fn(&str) -> Option<String>,
-    explicit: Option<ExplicitConfig>,
+    explicit: Option<ConfigFileLayers>,
 ) -> SettingsLoadOutcome {
     let env_fn = crate::config::expand::with_kakehashi_defaults(env_fn);
     let mut events = Vec::new();
@@ -1906,7 +1906,7 @@ mod tests {
             )),
             None,
             |_| None,
-            Some(ExplicitConfig {
+            Some(ConfigFileLayers {
                 layers: vec![Some(lower_layer)],
                 events: Vec::new(),
                 deprecated_keys: DeprecatedKeysSeen::default(),
