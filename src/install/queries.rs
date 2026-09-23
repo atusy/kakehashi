@@ -3036,6 +3036,65 @@ mod tests {
     }
 
     #[test]
+    fn uninstall_tombstone_creation_is_idempotent_without_rewriting_existing_files() {
+        let temp = TempDir::new().unwrap();
+        let marker = uninstall_tombstone_path(temp.path(), "lua");
+        write_uninstall_tombstone(temp.path(), "lua").unwrap();
+        assert_eq!(fs::read(&marker).unwrap(), b"ok\n");
+        fs::write(&marker, b"existing intent").unwrap();
+        write_uninstall_tombstone(temp.path(), "lua").unwrap();
+        assert_eq!(fs::read(&marker).unwrap(), b"existing intent");
+    }
+
+    #[test]
+    fn uninstall_tombstone_refuses_a_directory_leaf() {
+        let temp = TempDir::new().unwrap();
+        let marker = uninstall_tombstone_path(temp.path(), "lua");
+        fs::create_dir(&marker).unwrap();
+        fs::write(marker.join("keep"), b"original").unwrap();
+        assert!(write_uninstall_tombstone(temp.path(), "lua").is_err());
+        assert_eq!(fs::read(marker.join("keep")).unwrap(), b"original");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn uninstall_tombstone_refuses_a_dangling_symlink() {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("absent-target");
+        let marker = uninstall_tombstone_path(temp.path(), "lua");
+        std::os::unix::fs::symlink(&target, &marker).unwrap();
+        assert!(write_uninstall_tombstone(temp.path(), "lua").is_err());
+        assert!(
+            fs::symlink_metadata(&marker)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!target.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn uninstall_tombstone_allows_a_symlinked_parent_directory() {
+        let temp = TempDir::new().unwrap();
+        let real_parent = temp.path().join("real-queries");
+        let linked_parent = temp.path().join("queries");
+        fs::create_dir(&real_parent).unwrap();
+        std::os::unix::fs::symlink(&real_parent, &linked_parent).unwrap();
+        write_uninstall_tombstone(&linked_parent, "lua").unwrap();
+        assert_eq!(
+            fs::read(uninstall_tombstone_path(&real_parent, "lua")).unwrap(),
+            b"ok\n"
+        );
+        assert!(
+            fs::symlink_metadata(linked_parent)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
     fn remove_dir_all_tolerates_a_confirmed_vanished_dir() {
         // The dir disappearing between the caller's observation and the
         // removal (external cleanup) must read as already-removed, not fail
