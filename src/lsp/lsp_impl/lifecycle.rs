@@ -2408,7 +2408,6 @@ fn spawn_crash_recovery(
     context: &UpstreamDeliveryContext,
     connection_id: crate::lsp::bridge::ProgressConnectionId,
 ) {
-    use crate::lsp::bridge::RecoveryDecision;
     let settings_manager = Arc::clone(&context.settings_manager);
     let injection = context.injection.clone();
     tokio::spawn(async move {
@@ -2428,117 +2427,169 @@ fn spawn_crash_recovery(
             );
             return;
         }
-        let delay = match pool.schedule_crash_recovery(&crashed) {
-            RecoveryDecision::Retry { attempt, delay } => {
-                log::debug!(
-                    target: "kakehashi::bridge",
-                    "Downstream {key} crashed; considering a respawn in {delay:?} (attempt {attempt})"
-                );
-                delay
-            }
-            RecoveryDecision::AlreadyScheduled | RecoveryDecision::Exhausted => return,
-            RecoveryDecision::GiveUp { attempts } => {
-                log::warn!(
-                    target: "kakehashi::bridge",
-                    "Downstream {key} kept crashing ({attempts} respawns); not respawning it \
-                     again until the next edit or request needs it"
-                );
-                return;
-            }
+        let Some(mut delay) = recovery_delay(&key, pool.schedule_crash_recovery(&crashed)) else {
+            return;
         };
-        let mut delay = delay;
         let mut after_own_failure = false;
         loop {
             tokio::time::sleep(delay).await;
-            loop {
-                if !pool
-                    .begin_crash_recovery_attempt(&key, after_own_failure)
-                    .await
-                {
-                    pool.stand_down_crash_recovery(&key);
-                    return;
+            let next = match attempt_crash_recovery(
+                &injection,
+                &bridge,
+                &settings_manager,
+                &key,
+                after_own_failure,
+            )
+            .await
+            {
+                RecoveryAttempt::Done => return,
+                RecoveryAttempt::Again {
+                    decision,
+                    after_own_failure: own,
+                } => {
+                    after_own_failure = own;
+                    decision
                 }
-                let snapshot = settings_manager.load_settings_pair();
-                let settings = &snapshot.settings;
-                let server = key.server();
-                let Some(config) = bridge.respawnable_server_config(settings, server) else {
-                    log::debug!(
-                        target: "kakehashi::bridge",
-                        "Not respawning {key}: settings no longer start {server:?}"
-                    );
-                    pool.stand_down_crash_recovery(&key);
-                    return;
-                };
-                if !crashed_connection_is_wanted(&injection, &bridge, settings, &key).await {
-                    log::debug!(
-                        target: "kakehashi::bridge",
-                        "Not respawning {key}: no open document routes to it"
-                    );
-                    pool.stand_down_crash_recovery(&key);
-                    return;
-                }
-                // Stand down if settings change before the spawn commits: the
-                // config in hand would then be history, and spawning from it would
-                // start a server the new settings do not describe.
-                let generation = snapshot.generation;
-                let admit = || settings_manager.settings_generation() == generation;
-                let error = match pool.revive_crashed_connection(&key, &config, &admit).await {
-                    Ok(_) => {
-                        log::info!(
-                            target: "kakehashi::bridge",
-                            "Respawned crashed downstream {key}"
-                        );
-                        return;
-                    }
-                    Err(error) => error,
-                };
-                if error.kind() == std::io::ErrorKind::Interrupted
-                    && settings_manager.settings_generation() != generation
-                {
-                    // Refused because settings moved on. Nothing was spawned, so no
-                    // crash will come to reschedule this: decide again under the
-                    // new settings. Each pass needs another settings change, so
-                    // this cannot spin on its own.
-                    continue;
-                }
-                if error.kind() == std::io::ErrorKind::Interrupted
-                    || pool.reports_crash_for(&key).await
-                {
-                    // Shutdown, or a process that started and died again: its
-                    // reader reports that crash, which schedules the next attempt.
-                    log::debug!(
-                        target: "kakehashi::bridge",
-                        "Respawning crashed downstream {key} did not complete: {error}"
-                    );
-                    return;
-                }
-                // No reader exit is coming to schedule another attempt: the
-                // command failed to start, the handshake was refused or timed out
-                // on a process that is still running, or the key is disabled.
-                // Schedule it here, under the same backoff and cap.
-                match pool.schedule_crash_retry(&key) {
-                    RecoveryDecision::Retry { delay: next, .. } => {
-                        log::warn!(
-                            target: "kakehashi::bridge",
-                            "Could not respawn crashed downstream {key}: {error}; retrying in {next:?}"
-                        );
-                        delay = next;
-                        after_own_failure = !pool.holds_connection(&key).await;
-                        break;
-                    }
-                    RecoveryDecision::GiveUp { attempts } => {
-                        log::warn!(
-                            target: "kakehashi::bridge",
-                            "Could not respawn crashed downstream {key}: {error}; giving up after \
-                             {attempts} attempts until the next edit or request needs it"
-                        );
-                        return;
-                    }
-                    RecoveryDecision::AlreadyScheduled | RecoveryDecision::Exhausted => return,
-                }
+            };
+            match recovery_delay(&key, next) {
+                Some(next) => delay = next,
+                None => return,
             }
         }
     });
+}
+
+/// What one crash-recovery attempt leaves to do.
+enum RecoveryAttempt {
+    /// Nothing more for this task: respawned, stood down with nothing owed,
+    /// or a replacement's own crash report takes over.
+    Done,
+    /// Try again as `decision` says; `after_own_failure` when this attempt's
+    /// own failed spawn emptied the key.
+    Again {
+        decision: crate::lsp::bridge::RecoveryDecision,
+        after_own_failure: bool,
+    },
+}
+
+/// The delay before the next attempt `decision` allows, logging a give-up.
+fn recovery_delay(
+    key: &crate::lsp::bridge::ConnectionKey,
+    decision: crate::lsp::bridge::RecoveryDecision,
+) -> Option<std::time::Duration> {
+    use crate::lsp::bridge::RecoveryDecision;
+    match decision {
+        RecoveryDecision::Retry { attempt, delay } => {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "Downstream {key} is down; considering a respawn in {delay:?} (attempt {attempt})"
+            );
+            Some(delay)
+        }
+        RecoveryDecision::AlreadyScheduled | RecoveryDecision::Exhausted => None,
+        RecoveryDecision::GiveUp { attempts } => {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "Downstream {key} kept failing ({attempts} respawns); not respawning it \
+                 again until the next edit or request needs it"
+            );
+            None
+        }
+    }
+}
+
+/// One crash-recovery attempt for `key`, after its delay.
+async fn attempt_crash_recovery(
+    injection: &crate::lsp::lsp_impl::coordinator::InjectionCoordinator,
+    bridge: &Arc<crate::lsp::bridge::BridgeCoordinator>,
+    settings_manager: &crate::lsp::settings_manager::SettingsManager,
+    key: &crate::lsp::bridge::ConnectionKey,
+    after_own_failure: bool,
+) -> RecoveryAttempt {
+    let pool = bridge.pool();
+    // Standing down gives the attempt back, and hands on any crash this
+    // recovery absorbed while it was scheduled.
+    let stand_down = || match pool.stand_down_crash_recovery(key) {
+        Some(decision) => RecoveryAttempt::Again {
+            decision,
+            after_own_failure: false,
+        },
+        None => RecoveryAttempt::Done,
+    };
+    loop {
+        if !pool
+            .begin_crash_recovery_attempt(key, after_own_failure)
+            .await
+        {
+            return stand_down();
+        }
+        let snapshot = settings_manager.load_settings_pair();
+        let settings = &snapshot.settings;
+        let server = key.server();
+        let Some(config) = bridge.respawnable_server_config(settings, server) else {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "Not respawning {key}: settings no longer start {server:?}"
+            );
+            return stand_down();
+        };
+        if !crashed_connection_is_wanted(injection, bridge, settings, key).await {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "Not respawning {key}: no open document routes to it"
+            );
+            return stand_down();
+        }
+        // Stand down if settings change before the spawn commits: the config
+        // in hand would then be history, and spawning from it would start a
+        // server the new settings do not describe.
+        let generation = snapshot.generation;
+        let admit = || settings_manager.settings_generation() == generation;
+        pool.commit_crash_recovery_attempt(key);
+        let error = match pool.revive_crashed_connection(key, &config, &admit).await {
+            Ok(true) => {
+                log::info!(
+                    target: "kakehashi::bridge",
+                    "Respawned crashed downstream {key}"
+                );
+                return RecoveryAttempt::Done;
+            }
+            // An edit or request replaced it first; this attempt spawned
+            // nothing and does not count.
+            Ok(false) => return stand_down(),
+            Err(error) => error,
+        };
+        if error.kind() == std::io::ErrorKind::Interrupted
+            && settings_manager.settings_generation() != generation
+        {
+            // Refused because settings moved on. Nothing was spawned, so no
+            // crash will come to reschedule this: decide again under the new
+            // settings. Each pass needs another settings change, so this
+            // cannot spin on its own.
+            continue;
+        }
+        if error.kind() == std::io::ErrorKind::Interrupted || pool.reports_crash_for(key).await {
+            // Shutdown, or a process that started and died again: its reader
+            // reports that crash, which schedules the next attempt.
+            log::debug!(
+                target: "kakehashi::bridge",
+                "Respawning crashed downstream {key} did not complete: {error}"
+            );
+            return RecoveryAttempt::Done;
+        }
+        // No reader exit is coming to schedule another attempt: the command
+        // failed to start, the handshake was refused or timed out on a process
+        // that is still running, or the key is disabled. Schedule it here,
+        // under the same backoff and cap.
+        log::warn!(
+            target: "kakehashi::bridge",
+            "Could not respawn crashed downstream {key}: {error}"
+        );
+        return RecoveryAttempt::Again {
+            decision: pool.schedule_crash_retry(key),
+            after_own_failure: !pool.holds_connection(key).await,
+        };
+    }
 }
 
 /// Cancellable upstream forwarding loop without a Client (for testing).

@@ -73,6 +73,9 @@ struct KeyState {
     attempts: u32,
     scheduled: bool,
     gave_up: bool,
+    /// A crash reported while a recovery was already scheduled: that recovery
+    /// owes it, and must hand it on if it stands down instead of respawning.
+    missed: bool,
 }
 
 #[derive(Default)]
@@ -90,6 +93,7 @@ impl CrashRecoveryRegistry {
             .recover_poison("CrashRecoveryRegistry::schedule");
         let state = keys.entry(key.clone()).or_default();
         if state.scheduled {
+            state.missed = true;
             return RecoveryDecision::AlreadyScheduled;
         }
         if uptime >= HEALTHY_PERIOD {
@@ -112,7 +116,9 @@ impl CrashRecoveryRegistry {
         }
     }
 
-    /// Mark `key`'s scheduled recovery as starting.
+    /// Commit `key`'s scheduled recovery to respawning: the respawn serves
+    /// whatever crashed under the key, including a crash reported while it was
+    /// scheduled.
     ///
     /// Clears the schedule BEFORE the respawn, not after it: a replacement that
     /// crashes during its own handshake reports that crash while the attempt is
@@ -123,22 +129,32 @@ impl CrashRecoveryRegistry {
             .keys
             .lock()
             .recover_poison("CrashRecoveryRegistry::begin_attempt");
-        keys.entry(key.clone()).or_default().scheduled = false;
+        let state = keys.entry(key.clone()).or_default();
+        state.scheduled = false;
+        state.missed = false;
     }
 
-    /// Give back the attempt a scheduled recovery took, because it stood down
-    /// without respawning anything (the connection was already replaced, or
-    /// settings or open documents no longer need it). Only respawns spend the
-    /// budget: stand-downs after ordinary restarts or configuration changes
-    /// must not exhaust it for a later crash that does need recovering.
-    pub(super) fn stand_down(&self, key: &ConnectionKey) {
+    /// Give back the attempt a recovery took, because it respawned nothing
+    /// (the connection was already replaced, or settings or open documents no
+    /// longer need it). Only respawns spend the budget: stand-downs after
+    /// ordinary restarts or configuration changes must not exhaust it for a
+    /// later crash that does need recovering.
+    ///
+    /// Returns the decision for a crash this recovery was holding on to, which
+    /// would otherwise go unrecovered: one reported while it was scheduled
+    /// (absorbed as already scheduled), or one that found the budget exhausted
+    /// only because this attempt had not been given back yet.
+    pub(super) fn stand_down(&self, key: &ConnectionKey) -> Option<RecoveryDecision> {
         let mut keys = self
             .keys
             .lock()
             .recover_poison("CrashRecoveryRegistry::stand_down");
-        if let Some(state) = keys.get_mut(key) {
-            state.attempts = state.attempts.saturating_sub(1);
-        }
+        let state = keys.get_mut(key)?;
+        state.scheduled = false;
+        state.attempts = state.attempts.saturating_sub(1);
+        let owed = std::mem::take(&mut state.missed) || std::mem::take(&mut state.gave_up);
+        drop(keys);
+        owed.then(|| self.schedule(key, Duration::ZERO))
     }
 }
 
@@ -268,7 +284,41 @@ mod tests {
                 RecoveryDecision::Retry { attempt: 1, .. }
             ));
             registry.begin_attempt(&key());
-            registry.stand_down(&key());
+            assert_eq!(registry.stand_down(&key()), None);
         }
+    }
+
+    #[test]
+    fn a_crash_absorbed_while_scheduled_is_handed_on_by_a_stand_down() {
+        let registry = CrashRecoveryRegistry::default();
+        let _ = registry.schedule(&key(), SHORT_RUN);
+        // A replacement crashed while the recovery waited.
+        assert_eq!(
+            registry.schedule(&key(), SHORT_RUN),
+            RecoveryDecision::AlreadyScheduled
+        );
+        assert!(matches!(
+            registry.stand_down(&key()),
+            Some(RecoveryDecision::Retry { attempt: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn a_crash_that_found_the_budget_spent_is_handed_on_by_a_stand_down() {
+        let registry = CrashRecoveryRegistry::default();
+        for _ in 0..MAX_CONSECUTIVE_ATTEMPTS {
+            let _ = registry.schedule(&key(), SHORT_RUN);
+            registry.begin_attempt(&key());
+        }
+        // The last attempt is still in flight when another crash arrives.
+        assert!(matches!(
+            registry.schedule(&key(), SHORT_RUN),
+            RecoveryDecision::GiveUp { .. }
+        ));
+        // It then respawns nothing, so that crash was not really out of budget.
+        assert!(matches!(
+            registry.stand_down(&key()),
+            Some(RecoveryDecision::Retry { .. })
+        ));
     }
 }

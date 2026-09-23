@@ -2369,8 +2369,17 @@ impl LanguageServerPool {
 
     /// Record that `key`'s scheduled recovery stood down without respawning
     /// (see [`CrashRecoveryRegistry::stand_down`]).
-    pub(crate) fn stand_down_crash_recovery(&self, key: &ConnectionKey) {
-        self.crash_recovery.stand_down(key);
+    pub(crate) fn stand_down_crash_recovery(
+        &self,
+        key: &ConnectionKey,
+    ) -> Option<RecoveryDecision> {
+        self.crash_recovery.stand_down(key)
+    }
+
+    /// Commit `key`'s scheduled recovery to respawning (see
+    /// [`CrashRecoveryRegistry::begin_attempt`]).
+    pub(crate) fn commit_crash_recovery_attempt(&self, key: &ConnectionKey) {
+        self.crash_recovery.begin_attempt(key);
     }
 
     /// Start a scheduled recovery of `key`: whether the connection the pool
@@ -2393,7 +2402,6 @@ impl LanguageServerPool {
         key: &ConnectionKey,
         after_own_failure: bool,
     ) -> bool {
-        self.crash_recovery.begin_attempt(key);
         if self.shutting_down.load(Ordering::Relaxed) {
             return false;
         }
@@ -2422,7 +2430,8 @@ impl LanguageServerPool {
             .is_some_and(|handle| !handle.router().is_accepting())
     }
 
-    /// Respawn the crashed connection under `key`. The replacement's
+    /// Respawn the crashed connection under `key`, answering whether this call
+    /// spawned the replacement (rather than finding one already there). The replacement's
     /// handshake claims the re-open its purge armed, so the documents it should
     /// hold are derived and opened the ordinary way
     /// (respawn-reopen-derives-its-targets).
@@ -2435,7 +2444,7 @@ impl LanguageServerPool {
         key: &ConnectionKey,
         config: &crate::config::settings::BridgeServerConfig,
         admit: &(dyn Fn() -> bool + Sync),
-    ) -> io::Result<Arc<ConnectionHandle>> {
+    ) -> io::Result<bool> {
         if key.is_shared() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -2450,16 +2459,21 @@ impl LanguageServerPool {
                 format!("bridge: root of {key} is not a usable workspace URI"),
             )
         })?;
-        self.acquire_resolved_wait_ready(
-            key.server(),
-            config,
-            key.clone(),
-            marker,
-            Duration::from_secs(INIT_TIMEOUT_SECS),
-            false,
-            Some(admit),
-        )
-        .await
+        let started = tokio::time::Instant::now();
+        let handle = self
+            .acquire_resolved_wait_ready(
+                key.server(),
+                config,
+                key.clone(),
+                marker,
+                Duration::from_secs(INIT_TIMEOUT_SECS),
+                false,
+                Some(admit),
+            )
+            .await?;
+        // A connection older than this call was already there: an edit or
+        // request replaced the crashed one first, and nothing was spawned.
+        Ok(handle.uptime() <= started.elapsed())
     }
 
     /// Resolve the exact `(server, root)` connection a document currently
@@ -11501,10 +11515,7 @@ mod tests {
                 true
             })
             .await;
-        assert_eq!(
-            result.map(|_| ()).unwrap_err().kind(),
-            io::ErrorKind::Unsupported
-        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Unsupported);
         assert!(pool.connections().await.is_empty());
     }
 
