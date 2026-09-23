@@ -756,4 +756,45 @@ mod tests {
             "an answer for the root the session left must not be applied"
         );
     }
+
+    /// A session that started on the launch directory and then gains a
+    /// folder at that same path has moved from a root kakehashi chose to one
+    /// the client named: the path is unchanged, but the scope a pull names is
+    /// not, so the client is asked again — for that folder.
+    #[tokio::test]
+    #[serial(xdg_env)]
+    async fn gaining_a_folder_at_the_launch_directory_pulls_for_it() {
+        let xdg_scratch = tempfile::tempdir().expect("failed to create scratch XDG_CONFIG_HOME");
+        let _xdg_guard = XdgConfigHomeGuard::set(xdg_scratch.path());
+
+        let (service, pulls) =
+            initialized_server_answering(serde_json::Value::Null, vec![serde_json::Value::Null])
+                .await;
+        let server = service.inner();
+        let launch_directory = server
+            .settings_manager
+            .root_path()
+            .as_ref()
+            .clone()
+            .expect("precondition: the launch directory stands in as the root");
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            server.did_change_workspace_folders_impl(DidChangeWorkspaceFoldersParams {
+                event: WorkspaceFoldersChangeEvent {
+                    added: vec![folder(&launch_directory, "launch")],
+                    removed: Vec::new(),
+                },
+            }),
+        )
+        .await
+        .expect("a folder change must not hang");
+
+        let pulls = pulls.lock().unwrap();
+        assert_eq!(
+            pulls.iter().map(scope_of).collect::<Vec<_>>(),
+            vec![Some(folder(&launch_directory, "launch").uri.as_str())],
+            "the client-named root must be asked for, though its path is unchanged"
+        );
+    }
 }
