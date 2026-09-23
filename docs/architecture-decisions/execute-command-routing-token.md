@@ -275,9 +275,22 @@ connections):
   of this happens there unless the user opts in by setting that capability. The
   palette-registration feature is inert in a default Neovim.
 
-Answered for Neovim only. The vscode-languageclient limitation is unmeasured, so
-`executeCommandProvider.commands` still stays empty in the initialize result —
-this path is dynamic registration only.
+Real-client measurements above cover Neovim only. Protocol E2E tests also
+verify that dynamically registered encoded names match the commands surfaced
+in actions and in eager/resolved inlay-hint label parts, and execute those
+commands on the producing connection. Inlay-hint coverage includes host and
+virtual documents and a client without code-action literal support. The
+execution provider is advertised independently of that code-action capability.
+These tests do not constitute a VS Code integration test.
+
+`executeCommandProvider.commands` stays empty in kakehashi's initialize result
+because downstream names and roots are discovered lazily. Both raw and encoded
+forms of the downstream's initial command list are registered dynamically when
+the client supports it. A name omitted from that downstream list, including
+one introduced only by a later downstream dynamic registration, is not
+registered upstream. Clients requiring registered ids cannot dispatch those
+unregistered names; the connection-encoded wire format alone cannot satisfy
+that client requirement.
 
 **A DEAD shared-instance connection cannot be re-rooted from the token alone.**
 A `preferSharedInstance` connection is keyed without a root, and announcing a
