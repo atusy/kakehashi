@@ -2360,6 +2360,13 @@ impl LanguageServerPool {
         self.crash_recovery.schedule(&crashed.key, crashed.uptime)
     }
 
+    /// Decide when to try `key` again after a respawn failed without starting
+    /// a process that could report its own crash — counted like a crash that
+    /// ended a start.
+    pub(crate) fn schedule_crash_retry(&self, key: &ConnectionKey) -> RecoveryDecision {
+        self.crash_recovery.schedule(key, Duration::ZERO)
+    }
+
     /// Record that `key`'s scheduled recovery stood down without respawning
     /// (see [`CrashRecoveryRegistry::stand_down`]).
     pub(crate) fn stand_down_crash_recovery(&self, key: &ConnectionKey) {
@@ -2377,15 +2384,29 @@ impl LanguageServerPool {
     /// serve it. Nor is the crashed handle held across the delay — holding it
     /// would keep a hung (liveness-failed but running) process alive until the
     /// attempt ends, next to its replacement.
-    pub(crate) async fn begin_crash_recovery_attempt(&self, key: &ConnectionKey) -> bool {
+    ///
+    /// `after_own_failure` is for a retry of a respawn that itself failed
+    /// before inserting a replacement: that failure already removed the
+    /// crashed connection, so an empty key is expected and still owed.
+    pub(crate) async fn begin_crash_recovery_attempt(
+        &self,
+        key: &ConnectionKey,
+        after_own_failure: bool,
+    ) -> bool {
         self.crash_recovery.begin_attempt(key);
         if self.shutting_down.load(Ordering::Relaxed) {
             return false;
         }
         let connections = self.connections.lock().await;
-        connections
-            .get(key)
-            .is_some_and(|mapped| mapped.state() == ConnectionState::Failed)
+        match connections.get(key) {
+            Some(mapped) => mapped.state() == ConnectionState::Failed,
+            None => after_own_failure,
+        }
+    }
+
+    /// Whether the pool holds any connection under `key`, in any state.
+    pub(crate) async fn holds_connection(&self, key: &ConnectionKey) -> bool {
+        self.connections.lock().await.contains_key(key)
     }
 
     /// Whether the connection the pool holds under `key` has lost its reader,
@@ -11444,11 +11465,11 @@ mod tests {
         let pool = LanguageServerPool::new();
         let key = ConnectionKey::for_server("crashy");
         insert_spawned_connection(&pool, &key, ConnectionState::Failed).await;
-        assert!(pool.begin_crash_recovery_attempt(&key).await);
+        assert!(pool.begin_crash_recovery_attempt(&key, false).await);
 
         // An edit respawned it before the recovery got there.
         insert_spawned_connection(&pool, &key, ConnectionState::Ready).await;
-        assert!(!pool.begin_crash_recovery_attempt(&key).await);
+        assert!(!pool.begin_crash_recovery_attempt(&key, false).await);
     }
 
     #[tokio::test]
@@ -11459,7 +11480,7 @@ mod tests {
         // A lazy respawn replaced it, and the replacement died too; its own
         // crash report found this recovery already scheduled.
         insert_spawned_connection(&pool, &key, ConnectionState::Failed).await;
-        assert!(pool.begin_crash_recovery_attempt(&key).await);
+        assert!(pool.begin_crash_recovery_attempt(&key, false).await);
     }
 
     #[tokio::test]
@@ -11469,7 +11490,7 @@ mod tests {
         let (_, id) = insert_spawned_connection(&pool, &key, ConnectionState::Failed).await;
         pool.shutting_down.store(true, Ordering::Relaxed);
         assert!(pool.crashed_connection(id).await.is_none());
-        assert!(!pool.begin_crash_recovery_attempt(&key).await);
+        assert!(!pool.begin_crash_recovery_attempt(&key, false).await);
     }
 
     #[tokio::test]
@@ -11499,5 +11520,21 @@ mod tests {
 
         handle.router().fail_all("bridge: reader error: EOF");
         assert!(pool.reports_crash_for(&key).await);
+    }
+
+    #[tokio::test]
+    async fn a_retry_after_a_failed_respawn_accepts_the_emptied_key() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("crashy");
+        assert!(
+            !pool.begin_crash_recovery_attempt(&key, false).await,
+            "a first attempt finds its crashed connection gone: settings evicted it"
+        );
+        assert!(pool.begin_crash_recovery_attempt(&key, true).await);
+        insert_spawned_connection(&pool, &key, ConnectionState::Ready).await;
+        assert!(
+            !pool.begin_crash_recovery_attempt(&key, true).await,
+            "a live replacement still ends the retry"
+        );
     }
 }
