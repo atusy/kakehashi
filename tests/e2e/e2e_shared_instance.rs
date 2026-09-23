@@ -59,6 +59,15 @@ fn two_roots() -> TwoRoots {
 /// `prefer_shared` and the mock running in `mock_mode` (`"workspace-folders"`
 /// advertises the capability; `"workspace-folders-incapable"` does not).
 fn init_client_mode(prefer_shared: bool, mock_mode: &str) -> (LspClient, tempfile::TempDir) {
+    init_client_with_folders(prefer_shared, mock_mode, Value::Null)
+}
+
+/// [`init_client_mode`] with the client's `workspaceFolders` at `initialize`.
+fn init_client_with_folders(
+    prefer_shared: bool,
+    mock_mode: &str,
+    workspace_folders: Value,
+) -> (LspClient, tempfile::TempDir) {
     let config_dir = tempfile::TempDir::new().expect("config tempdir");
     let config_path = config_dir.path().join("shared.toml");
     // Host-bridge the markdown document itself onto the downstream server.
@@ -79,7 +88,7 @@ fn init_client_mode(prefer_shared: bool, mock_mode: &str) -> (LspClient, tempfil
             "processId": std::process::id(),
             "rootUri": null,
             "capabilities": {},
-            "workspaceFolders": null,
+            "workspaceFolders": workspace_folders,
             "initializationOptions": {
                 "languageServers": {
                     "mock-ws": {
@@ -218,5 +227,94 @@ fn e2e_opt_in_falls_back_to_per_root_when_server_incapable() {
     assert!(
         folders_b.contains(&roots.root_b) && !folders_b.contains(&roots.root_a),
         "incapable opt-in must fall back to per-root isolation; got {folders_b:?}"
+    );
+}
+
+/// The process id a `workspace-folders-dynamic` hover reports.
+fn hover_pid(folders: &str) -> &str {
+    folders
+        .split_once(";pid:")
+        .map(|(_, pid)| pid)
+        .unwrap_or_default()
+}
+
+/// A server that declares folder-change support only through a dynamic
+/// `client/registerCapability` (Pyright-style) is as capable as one that
+/// declares it statically (#968): opting in keeps ONE process that learns root
+/// B through `didChangeWorkspaceFolders`, rather than diverting B to a per-root
+/// process that never hears of A.
+#[test]
+fn e2e_opt_in_shares_one_process_with_a_dynamically_registering_server() {
+    let roots = two_roots();
+    let (mut client, _cfg) = init_client_mode(true, "workspace-folders-dynamic");
+
+    open(&mut client, &roots.doc_a, "# A\n");
+    // The mock registers on `initialized`, before it can answer this hover, and
+    // the bridge records a registration before routing any later response — so
+    // once A answers, the shared connection is known capable.
+    let root_a = roots.root_a.clone();
+    let folders_a = poll_hover(&mut client, &roots.doc_a, |f| f.contains(&root_a));
+    assert!(
+        folders_a.contains(&roots.root_a),
+        "first root must be known to the shared process; got {folders_a:?}"
+    );
+
+    open(&mut client, &roots.doc_b, "# B\n");
+    let root_b = roots.root_b.clone();
+    let folders_b = poll_hover(&mut client, &roots.doc_b, |f| f.contains(&root_b));
+    assert!(
+        folders_b.contains(&roots.root_a) && folders_b.contains(&roots.root_b),
+        "a dynamically registered server must serve both roots; got {folders_b:?}"
+    );
+    assert_eq!(
+        hover_pid(&folders_b),
+        hover_pid(&folders_a),
+        "root B must join the shared process, not a diverted one"
+    );
+}
+
+/// A client-root fallback whose server registered folder-change support
+/// dynamically takes an upstream `workspace/didChangeWorkspaceFolders` as a
+/// notification (#968). Recycling it instead would ALSO leave the new folder
+/// known — the replacement initializes with the current snapshot — so only the
+/// unchanged process id tells forwarding apart from a restart.
+#[test]
+fn e2e_client_folder_change_is_forwarded_to_a_dynamically_registering_server() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    // No `.git` anywhere: the document resolves to the client-root fallback.
+    let dir_a = tmp.path().join("a");
+    let dir_b = tmp.path().join("b");
+    std::fs::create_dir_all(&dir_a).expect("mkdir a");
+    std::fs::create_dir_all(&dir_b).expect("mkdir b");
+    let doc_path = dir_a.join("doc.md");
+    std::fs::write(&doc_path, "# A\n").expect("write doc");
+    let to_uri = |p: &std::path::Path| url::Url::from_file_path(p).unwrap().to_string();
+    let (root_a, root_b, doc) = (to_uri(&dir_a), to_uri(&dir_b), to_uri(&doc_path));
+
+    let (mut client, _cfg) = init_client_with_folders(
+        false,
+        "workspace-folders-dynamic",
+        json!([{ "uri": root_a, "name": "a" }]),
+    );
+    open(&mut client, &doc, "# A\n");
+    let before = poll_hover(&mut client, &doc, |f| f.contains(&root_a));
+    assert!(
+        before.contains(&root_a),
+        "the fallback must start with the client folder; got {before:?}"
+    );
+
+    client.send_notification(
+        "workspace/didChangeWorkspaceFolders",
+        json!({ "event": { "added": [{ "uri": root_b, "name": "b" }], "removed": [] } }),
+    );
+    let after = poll_hover(&mut client, &doc, |f| f.contains(&root_b));
+    assert!(
+        after.contains(&root_b),
+        "the added folder must reach the server; got {after:?}"
+    );
+    assert_eq!(
+        hover_pid(&after),
+        hover_pid(&before),
+        "the folder change must be forwarded, not answered with a restart"
     );
 }

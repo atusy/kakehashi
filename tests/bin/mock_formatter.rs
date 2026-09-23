@@ -183,6 +183,11 @@
 //!   Used by
 //!   `tests/e2e/e2e_shared_instance.rs` (#391) to prove the shared-instance opt-in
 //!   grows one downstream process's folder set across roots.
+//! - `workspace-folders-dynamic` — like `workspace-folders`, but declares only
+//!   `workspaceFolders.supported` statically and registers
+//!   `workspace/didChangeWorkspaceFolders` via `client/registerCapability` on
+//!   `initialized` (Pyright-style, #968). Its hover also reports the process id
+//!   so a test can tell a forwarded folder change from a restart.
 //!
 //! Only built for E2E runs (`required-features = ["e2e"]` in Cargo.toml).
 
@@ -481,6 +486,16 @@ fn main() {
                             }
                         }
                     }),
+                    // Declares `supported` but NOT `changeNotifications`:
+                    // folder-change support arrives later, via a dynamic
+                    // registration sent on `initialized` (#968).
+                    "workspace-folders-dynamic" => json!({
+                        "hoverProvider": true,
+                        "textDocumentSync": 1,
+                        "workspace": {
+                            "workspaceFolders": { "supported": true }
+                        }
+                    }),
                     // Like `workspace-folders` but does NOT advertise the
                     // workspaceFolders capability, so a `preferSharedInstance`
                     // opt-in must fall back to per-root instances (#391).
@@ -520,6 +535,24 @@ fn main() {
                     );
                 }
             }
+            "initialized" if mode == "workspace-folders-dynamic" => {
+                // Pyright-style: declare folder-change support only now,
+                // through `client/registerCapability` (#968).
+                request_with_params(
+                    &mut writer,
+                    json!("register-workspace-folders"),
+                    "client/registerCapability",
+                    json!({
+                        "registrations": [{
+                            "id": "workspace-folders",
+                            "method": "workspace/didChangeWorkspaceFolders"
+                        }]
+                    }),
+                );
+            }
+            // A response to one of this mock's own requests: nothing to
+            // answer (the catch-all below would echo a bogus reply).
+            "" if id.is_some() => {}
             "shutdown" => respond(&mut writer, id, Value::Null),
             "exit" => break,
             "textDocument/didOpen" => {
@@ -806,7 +839,16 @@ fn main() {
                     let mut folders = workspace_folders.clone();
                     folders.sort();
                     folders.dedup();
-                    json!({ "contents": format!("folders:{}", folders.join(",")) })
+                    // `pid` lets a test tell one process that took a folder
+                    // change apart from a replacement that was re-initialized
+                    // with the same folders.
+                    json!({
+                        "contents": format!(
+                            "folders:{};pid:{}",
+                            folders.join(","),
+                            std::process::id()
+                        )
+                    })
                 } else {
                     message
                         .pointer("/params/textDocument/uri")

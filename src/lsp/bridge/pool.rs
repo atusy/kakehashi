@@ -4488,6 +4488,40 @@ mod tests {
         );
     }
 
+    /// A fallback whose server registered `didChangeWorkspaceFolders`
+    /// dynamically (Pyright-style) takes the notification like a statically
+    /// capable one: recycling it would restart the server, re-index, and drop
+    /// its open documents on every upstream folder change (#968).
+    #[tokio::test]
+    async fn workspace_folder_change_forwards_to_dynamically_registered_fallback() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("dynamic");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        handle.set_server_capabilities(Default::default());
+        handle
+            .dynamic_capabilities()
+            .register(vec![tower_lsp_server::ls_types::Registration {
+                id: "folders".to_string(),
+                method: "workspace/didChangeWorkspaceFolders".to_string(),
+                register_options: None,
+            }]);
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let added = tower_lsp_server::ls_types::WorkspaceFolder {
+            uri: "file:///added".parse().unwrap(),
+            name: "added".to_string(),
+        };
+
+        pool.apply_workspace_folder_change(vec![added.clone()], &[])
+            .await;
+
+        assert!(
+            pool.connections.lock().await.contains_key(&key),
+            "a dynamically registered server must be told, not restarted"
+        );
+        assert_eq!(handle.workspace_folders().snapshot(), Some(vec![added]));
+        assert!(pool.pending_reopen.claim(&key).is_none());
+    }
+
     #[tokio::test]
     async fn workspace_folder_change_recycles_initializing_connection() {
         let pool = LanguageServerPool::new();

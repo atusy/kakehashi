@@ -2439,6 +2439,40 @@ mod tests {
         assert!(handle.supports_workspace_folder_changes());
     }
 
+    /// Pyright-style servers declare folder-change support by registering the
+    /// notification dynamically after `initialized`, not in their
+    /// `InitializeResult`. Such a registration must count, or every decision
+    /// point keyed on this capability treats the server as incapable (#968).
+    #[tokio::test]
+    async fn handle_reports_workspace_folder_capability_from_dynamic_registration() {
+        use tower_lsp_server::ls_types::{Registration, Unregistration};
+
+        let handle = spawn_sink_handle().await;
+        handle.set_server_capabilities(ServerCapabilities::default());
+        assert!(!handle.supports_workspace_folder_changes());
+
+        handle.dynamic_capabilities().register(vec![Registration {
+            id: "folders".to_string(),
+            method: "workspace/didChangeWorkspaceFolders".to_string(),
+            register_options: None,
+        }]);
+        assert!(
+            handle.supports_workspace_folder_changes(),
+            "a live dynamic registration must make the connection capable"
+        );
+
+        handle
+            .dynamic_capabilities()
+            .unregister(vec![Unregistration {
+                id: "folders".to_string(),
+                method: "workspace/didChangeWorkspaceFolders".to_string(),
+            }]);
+        assert!(
+            !handle.supports_workspace_folder_changes(),
+            "an unregistration withdraws it again"
+        );
+    }
+
     #[tokio::test]
     async fn log_incapable_fallback_once_returns_true_only_first_time() {
         let handle = spawn_sink_handle().await;
