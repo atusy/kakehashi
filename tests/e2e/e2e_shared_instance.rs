@@ -59,16 +59,18 @@ fn two_roots() -> TwoRoots {
 /// `prefer_shared` and the mock running in `mock_mode` (`"workspace-folders"`
 /// advertises the capability; `"workspace-folders-incapable"` does not).
 fn init_client_mode(prefer_shared: bool, mock_mode: &str) -> (LspClient, tempfile::TempDir) {
-    init_client_with_folders(prefer_shared, mock_mode, Value::Null, None)
+    init_client_with_folders(prefer_shared, mock_mode, Value::Null, None, None)
 }
 
 /// [`init_client_mode`] with the client's `workspaceFolders` at `initialize`,
-/// and optionally the mock's cross-process wire log (`MOCK_LSP_WIRE_LOG`).
+/// optionally the mock's cross-process wire log (`MOCK_LSP_WIRE_LOG`), and
+/// optionally the server's `workspaceMarkers` (default: the `.git` default).
 fn init_client_with_folders(
     prefer_shared: bool,
     mock_mode: &str,
     workspace_folders: Value,
     wire_log: Option<&std::path::Path>,
+    workspace_markers: Option<Value>,
 ) -> (LspClient, tempfile::TempDir) {
     let config_dir = tempfile::TempDir::new().expect("config tempdir");
     let config_path = config_dir.path().join("shared.toml");
@@ -87,6 +89,14 @@ fn init_client_with_folders(
     }
     let mut client = builder.build();
 
+    let mut server = json!({
+        "cmd": [mock_bin(), mock_mode],
+        "languages": ["markdown"],
+        "preferSharedInstance": prefer_shared
+    });
+    if let Some(markers) = workspace_markers {
+        server["workspaceMarkers"] = markers;
+    }
     client.send_request(
         "initialize",
         json!({
@@ -95,13 +105,7 @@ fn init_client_with_folders(
             "capabilities": {},
             "workspaceFolders": workspace_folders,
             "initializationOptions": {
-                "languageServers": {
-                    "mock-ws": {
-                        "cmd": [mock_bin(), mock_mode],
-                        "languages": ["markdown"],
-                        "preferSharedInstance": prefer_shared
-                    }
-                }
+                "languageServers": { "mock-ws": server }
             }
         }),
     );
@@ -286,7 +290,8 @@ fn e2e_opt_in_shares_one_process_with_a_dynamically_registering_server() {
 #[test]
 fn e2e_client_folder_change_is_forwarded_to_a_dynamically_registering_server() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
-    // No `.git` anywhere: the document resolves to the client-root fallback.
+    // Marker search is switched off below, so the document resolves to the
+    // client-root fallback even when the temp dir sits inside a checkout.
     let dir_a = tmp.path().join("a");
     let dir_b = tmp.path().join("b");
     std::fs::create_dir_all(&dir_a).expect("mkdir a");
@@ -301,6 +306,7 @@ fn e2e_client_folder_change_is_forwarded_to_a_dynamically_registering_server() {
         "workspace-folders-dynamic",
         json!([{ "uri": root_a, "name": "a" }]),
         None,
+        Some(json!([])),
     );
     open(&mut client, &doc, "# A\n");
     let before = poll_hover(&mut client, &doc, |f| f.contains(&root_a));
@@ -341,6 +347,7 @@ fn e2e_late_registration_consolidates_diverted_roots() {
         "workspace-folders-dynamic-late",
         Value::Null,
         Some(&wire_log),
+        None,
     );
 
     // Bring the shared instance up for root A WITHOUT asking it anything, so
