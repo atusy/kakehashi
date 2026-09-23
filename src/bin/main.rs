@@ -1478,8 +1478,17 @@ fn forced_output_metadata(path: &std::path::Path) -> std::io::Result<Option<Forc
     #[cfg(windows)]
     let is_link = {
         use std::os::windows::fs::MetadataExt as _;
-        // Win32 FILE_ATTRIBUTE_REPARSE_POINT, returned by file_attributes().
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_ENCRYPTED, FILE_ATTRIBUTE_REPARSE_POINT,
+        };
+        // A sibling may be plaintext or use different EFS recipients even when
+        // its DACL matches. Do not publish it over an encrypted configuration.
+        if metadata.file_attributes() & FILE_ATTRIBUTE_ENCRYPTED != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "cannot retain EFS encryption in atomic replacement; use a new output path",
+            ));
+        }
         is_link || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
     };
     if is_link {
@@ -2378,6 +2387,44 @@ mod tests {
             std::fs::read_to_string(&output).unwrap(),
             "previous configuration"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn forced_output_preserves_windows_efs_encryption() {
+        use std::os::windows::ffi::OsStrExt as _;
+        use std::os::windows::fs::MetadataExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{EncryptFileW, FILE_ATTRIBUTE_ENCRYPTED};
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("config.toml");
+        std::fs::write(&output, "previous configuration").unwrap();
+        let path: Vec<u16> = output.as_os_str().encode_wide().chain(Some(0)).collect();
+        // SAFETY: path is a live NUL-terminated UTF-16 string.
+        if unsafe { EncryptFileW(path.as_ptr()) } == 0 {
+            panic!(
+                "EFS fixture encryption failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        assert_ne!(
+            output.metadata().unwrap().file_attributes() & FILE_ATTRIBUTE_ENCRYPTED,
+            0
+        );
+        let error = write_forced_output_with(&output, |_| {
+            panic!("must not write plaintext staging content for an EFS destination")
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            "previous configuration"
+        );
+        assert_ne!(
+            output.metadata().unwrap().file_attributes() & FILE_ATTRIBUTE_ENCRYPTED,
+            0
+        );
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
     }
 
     #[cfg(windows)]
