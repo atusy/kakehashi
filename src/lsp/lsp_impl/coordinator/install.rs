@@ -687,6 +687,42 @@ mod tests {
         );
     }
 
+    fn auto_install_settings() -> WorkspaceSettings {
+        WorkspaceSettings {
+            auto_install: true,
+            search_paths: vec![
+                crate::install::default_data_dir()
+                    .expect("test data directory")
+                    .to_string_lossy()
+                    .into_owned(),
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_busy_chain_is_not_repaired_and_stays_eligible_for_a_recheck() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .apply_settings(auto_install_settings());
+        let install = server.install_coordinator();
+        assert!(server.settings_manager.is_auto_install_enabled("rust"));
+        assert!(
+            !install.decide_query_repair("rust", false, || QueryChainState::Busy),
+            "a held lock is another install or probe at work, not a missing language"
+        );
+        assert!(
+            install.decide_query_repair("rust", false, || QueryChainState::NeedsRepair),
+            "a busy answer must not consume this generation's check"
+        );
+        assert!(
+            !install.decide_query_repair("rust", false, || QueryChainState::NeedsRepair),
+            "a definitive answer does consume it"
+        );
+    }
+
     #[tokio::test]
     async fn query_repair_request_survives_a_siblings_publication() {
         let (service, _socket) = LspService::new(Kakehashi::new);
