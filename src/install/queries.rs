@@ -3798,6 +3798,26 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn an_alias_of_the_managed_queries_does_not_provide_a_parent() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        let child = data.join("queries/child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(child.join("highlights.scm"), "; inherits: parent\n").unwrap();
+        write_install_marker(&child).unwrap();
+        let parent = data.join("queries/parent");
+        fs::create_dir_all(&parent).unwrap();
+        fs::write(parent.join("highlights.scm"), "").unwrap();
+        // The runtime root is its own directory; only its queries alias the
+        // managed ones.
+        fs::create_dir_all(&runtime).unwrap();
+        std::os::unix::fs::symlink(data.join("queries"), runtime.join("queries")).unwrap();
+        assert!(lock_complete_chain(&data, "child", &[runtime]).is_none());
+    }
+
     #[test]
     fn an_overlay_alone_does_not_provide_a_parent() {
         let temp = TempDir::new().unwrap();
