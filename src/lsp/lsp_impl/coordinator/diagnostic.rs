@@ -301,10 +301,9 @@ impl DiagnosticScheduler {
         );
     }
 
-    /// Spawn the didSave diagnostic pull immediately, but defer snapshotting
-    /// until the exact saved document version has a tree. The wait runs off
-    /// ingress and is registered with the synthetic-task manager, so a later
-    /// save, close, or shutdown supersedes it without blocking the writer.
+    /// Pull the saved host text immediately. If virtual geometry is pending,
+    /// keep the same Save-owned task alive until that exact version is parsed,
+    /// then refresh both layers. A later edit, save, or close supersedes it.
     pub(crate) fn spawn_synthetic_diagnostic_task_when_current(
         &self,
         uri: Url,
@@ -318,32 +317,42 @@ impl DiagnosticScheduler {
         let task_uri = uri.clone();
 
         let future = async move {
-            if !wait_for_expected_diagnostic_tree(
-                &documents,
-                &task_uri,
-                expected_incarnation,
-                expected_content_version,
-            )
-            .await
+            let collect_current = || async {
+                let snapshot_data = snapshot_preparer.prepare_diagnostic_snapshot_when_current(
+                    &task_uri,
+                    expected_incarnation,
+                    expected_content_version,
+                );
+                let pending = snapshot_data
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.virtual_geometry_pending);
+                let outcome =
+                    collect_push_diagnostics(snapshot_data, &bridge_pool, &task_uri, LOG_TARGET)
+                        .await;
+                commit_synthetic_diagnostics_when_current(
+                    &documents,
+                    &publisher,
+                    &task_uri,
+                    expected_incarnation,
+                    expected_content_version,
+                    outcome,
+                )
+                .await;
+                pending
+            };
+            if collect_current().await
+                && wait_for_expected_diagnostic_tree(
+                    &documents,
+                    &task_uri,
+                    expected_incarnation,
+                    expected_content_version,
+                )
+                .await
             {
-                return;
+                // Recollect the host too: replacing the combined cache with a
+                // virtual-only answer would discard the first phase's host.
+                collect_current().await;
             }
-            let snapshot_data = snapshot_preparer.prepare_diagnostic_snapshot_when_current(
-                &task_uri,
-                expected_incarnation,
-                expected_content_version,
-            );
-            let outcome =
-                collect_push_diagnostics(snapshot_data, &bridge_pool, &task_uri, LOG_TARGET).await;
-            commit_synthetic_diagnostics_when_current(
-                &documents,
-                &publisher,
-                &task_uri,
-                expected_incarnation,
-                expected_content_version,
-                outcome,
-            )
-            .await;
         };
 
         let settings_generation = self.settings_manager.settings_generation();
@@ -362,11 +371,11 @@ impl DiagnosticScheduler {
     ///
     /// Extracts all data synchronously before spawning to avoid lifetime issues
     /// with `self` references in async tasks. Return states: `None` (document
-    /// missing, no snapshot, no language, or nothing that could ever
-    /// contribute — skip), `Some(snapshot)` with no pull contributors (the
-    /// collection returns `Clear`, evicting any stale `PullLayer`; a
-    /// configured-but-pull-gated host still lands here so its re-sync runs), and
-    /// `Some(snapshot)` with virt regions and/or a pullable host context.
+    /// missing, no language, or nothing that could ever
+    /// contribute — skip), or `Some(snapshot)` with live host inputs and
+    /// optional virtual contexts. A snapshot with known-empty pull coverage
+    /// clears the pull cache; pending geometry instead retains the previous
+    /// virtual contribution. A pull-gated host still supplies re-sync text.
     pub(crate) fn prepare_diagnostic_snapshot(&self, uri: &Url) -> Option<DiagnosticSnapshot> {
         self.snapshot_preparer.prepare_diagnostic_snapshot(uri)
     }
@@ -395,9 +404,6 @@ impl DiagnosticSnapshotPreparer {
         expected_lineage: Option<(u64, u64)>,
     ) -> Option<DiagnosticSnapshot> {
         let snapshot = snapshot_document_for_lineage(&self.documents, uri, expected_lineage)?;
-        // Keep the existing publication gate until partial-layer cache updates
-        // can preserve virtual contributions while host diagnostics advance.
-        let tree = snapshot.tree.as_ref()?;
         let content_version = snapshot.content_version;
         let language_name = self.language.detect_language(
             uri.path(),
@@ -443,6 +449,10 @@ impl DiagnosticSnapshotPreparer {
         let mut narrower_than_editor_pull = layer_cfg.priorities != editor_layer_cfg.priorities
             || layer_cfg.strategy != editor_layer_cfg.strategy;
 
+        let virtual_geometry_pending =
+            snapshot.tree.is_none() && layer_cfg.allows(crate::config::settings::LayerSource::Virt);
+        narrower_than_editor_pull |= virtual_geometry_pending;
+
         // Virt layer: `None` = the document can never have virt diagnostics
         // (no injection query), distinct from `Some(vec![])` = gated off or
         // currently no regions (publish-empty-to-clear).
@@ -455,7 +465,7 @@ impl DiagnosticSnapshotPreparer {
                 escape_terminal_controls(&language_name)
             );
             Some(Vec::new())
-        } else {
+        } else if let Some(tree) = snapshot.tree.as_ref() {
             self.language
                 .injection_query(&language_name)
                 .map(|injection_query| {
@@ -585,6 +595,10 @@ impl DiagnosticSnapshotPreparer {
                     }
                     contexts
                 })
+        } else {
+            // A missing current tree cannot prove that virtual diagnostics
+            // are empty. Retain their cached contribution until parsing lands.
+            Some(Vec::new())
         };
 
         // Host layer (host-document-bridge): participates when listed in the
@@ -671,7 +685,7 @@ impl DiagnosticSnapshotPreparer {
             },
             virt_contexts,
             host_pull_enabled,
-            virtual_geometry_pending: false,
+            virtual_geometry_pending,
             narrower_than_editor_pull,
             host,
             layer_cfg,

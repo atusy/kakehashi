@@ -43,7 +43,7 @@ pub(crate) struct DiagnosticSnapshot {
     /// overwritten by an older in-flight pull.
     pub(crate) lineage: DiagnosticSnapshotLineage,
     /// Per-region virt contexts; empty when the virt layer is gated off or
-    /// the document has no bridgeable injection regions.
+    /// the document has no bridgeable injection regions, or geometry is pending.
     pub(crate) virt_contexts: Vec<DocumentRequestContext>,
     /// Current virtual geometry has not been parsed yet.
     pub(crate) virtual_geometry_pending: bool,
@@ -58,8 +58,8 @@ pub(crate) struct DiagnosticSnapshot {
     /// selection is empty; the context still drives the re-sync. Always `false`
     /// when `host` is `None`.
     pub(crate) host_pull_enabled: bool,
-    /// Whether `pullFallback = false` excluded a pull-eligible layer from this
-    /// snapshot. The editor's own `textDocument/diagnostic` fan-out does not
+    /// Whether pending geometry or configuration excluded a pull-eligible
+    /// layer from this snapshot. The editor's own `textDocument/diagnostic` fan-out does not
     /// honor `pullFallback` (it is a proactive-cache policy), so when this is
     /// set, a pull built from this snapshot covers LESS than the editor's
     /// re-pull would — the forwarded-refresh prefetch must then keep its
@@ -70,8 +70,8 @@ pub(crate) struct DiagnosticSnapshot {
 }
 
 impl DiagnosticSnapshot {
-    /// Whether any layer can contribute to the **pull** this event — the
-    /// Publish-vs-Clear decision for the `PullLayer`. The host counts only when
+    /// Whether any known layer can contribute to the **pull** this event.
+    /// Pending virtual geometry is handled separately. The host counts only when
     /// it will actually be pulled (`host_pull_enabled`); a configured-but-gated
     /// host context is for the re-sync, not the pull.
     pub(crate) fn has_contributors(&self) -> bool {
@@ -94,7 +94,7 @@ pub(crate) enum PullLayerOutcome {
     /// pull that ran and returned clean (that keeps an empty `PullLayer` present
     /// so the clean result still suppresses a pull-driven server's stale push).
     Clear,
-    /// A pull ran; publish its (possibly empty) result as the `PullLayer` blob.
+    /// Update collected layers while retaining any pending contribution.
     Publish(PullLayerComponents),
 }
 
@@ -104,7 +104,7 @@ pub(crate) enum PullLayerOutcome {
 /// Shared logic for both immediate (didSave/didOpen) and debounced (didChange)
 /// push diagnostics. Returns a [`PullLayerOutcome`]: `Skip` when there is no
 /// snapshot, `Clear` when nothing can pull this event (evict a stale pull blob),
-/// or `Publish` with the pull's combined result.
+/// or `Publish` with separate collected/pending layer contributions.
 pub(crate) async fn collect_push_diagnostics(
     snapshot_data: Option<DiagnosticSnapshot>,
     pool: &Arc<LanguageServerPool>,
