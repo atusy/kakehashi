@@ -354,6 +354,14 @@ impl InstallCoordinator {
         .then_some(generation)
     }
 
+    /// A repair a pass decided on but dropped before installing, because its
+    /// document's lifetime ended, answered nothing for the language: let a
+    /// later pass of another document check it again this generation.
+    fn release_dropped_repair(&self, language: &str, generation: u64) {
+        self.auto_install
+            .forget_query_dependency_check(language, generation);
+    }
+
     fn finish_query_repair_check(
         &self,
         language: &str,
@@ -395,6 +403,9 @@ impl InstallCoordinator {
         // a reload that lands meanwhile already counts as the retry trigger.
         let generation = self.cache.semantic_token_generation();
         if !self.same_document_incarnation(&uri, expected_incarnation) {
+            if request.repair_queries {
+                self.release_dropped_repair(language, generation);
+            }
             return InstallCompletion::default();
         }
 
@@ -417,6 +428,9 @@ impl InstallCoordinator {
                     .await;
             }
             if !self.same_document_incarnation(&uri, expected_incarnation) {
+                if query_repair {
+                    self.release_dropped_repair(language, generation);
+                }
                 return InstallCompletion::default();
             }
         }
