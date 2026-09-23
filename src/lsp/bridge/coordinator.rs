@@ -726,12 +726,56 @@ impl BridgeCoordinator {
         let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
             return OpenOutcome::NotOpened;
         };
+        let Some((config, for_server)) = self
+            .injections_routed_to_server(
+                settings,
+                host_language,
+                host_uri,
+                &host_uri_lsp,
+                injections,
+                server_name,
+                expect.connection,
+            )
+            .await
+        else {
+            return OpenOutcome::NotApplicable;
+        };
+        self.pool
+            .eager_open_virtual_documents(
+                server_name,
+                &config,
+                host_uri,
+                &host_uri_lsp,
+                expect,
+                for_server,
+            )
+            .await
+    }
+
+    /// `host_uri`'s injections that bridge to `server_name`, with that server's
+    /// resolved config — narrowed to those that route to `connection` when one
+    /// is named. `None` when nothing is left: this host supplies nothing for
+    /// that server (or that connection).
+    ///
+    /// Read-only: routing is resolved, never acquired, so asking about a host
+    /// that belongs to another root cannot spawn that root's server.
+    #[allow(clippy::too_many_arguments)]
+    async fn injections_routed_to_server(
+        &self,
+        settings: &Arc<WorkspaceSettings>,
+        host_language: &str,
+        host_uri: &Url,
+        host_uri_lsp: &tower_lsp_server::ls_types::Uri,
+        injections: Vec<BridgeInjection>,
+        server_name: &str,
+        connection: Option<&super::pool::ConnectionKey>,
+    ) -> Option<(Arc<BridgeServerConfig>, Vec<BridgeInjection>)> {
         let (routed, _) = self
             .route_virtual_injections(
                 settings,
                 host_language,
                 host_uri,
-                &host_uri_lsp,
+                host_uri_lsp,
                 injections,
                 Some(server_name),
                 None,
@@ -754,18 +798,18 @@ impl BridgeCoordinator {
             // config — resolved from the memo, before any pool lookup or marker
             // walk, so the hosts that bridge nowhere near this server cost
             // nothing to reject.
-            return OpenOutcome::NotApplicable;
+            return None;
         };
         // A repair is for one concrete connection. The same host can have
         // injections routed to several keys, so do not pass the whole server
         // batch to `eager_open_virtual_documents` and let its first injection
         // represent the rest. The normal eager path is partitioned earlier;
         // this filters the respawn path to the key being repaired.
-        let for_server = if let Some(expected_key) = expect.connection {
+        let for_server = if let Some(expected_key) = connection {
             let mut matching = Vec::new();
             for injection in for_server {
                 let virtual_uri = super::protocol::VirtualDocumentUri::new(
-                    &host_uri_lsp,
+                    host_uri_lsp,
                     &injection.language,
                     &injection.region_id,
                 );
@@ -785,18 +829,9 @@ impl BridgeCoordinator {
             for_server
         };
         if for_server.is_empty() {
-            return OpenOutcome::NotApplicable;
+            return None;
         }
-        self.pool
-            .eager_open_virtual_documents(
-                server_name,
-                &config,
-                host_uri,
-                &host_uri_lsp,
-                expect,
-                for_server,
-            )
-            .await
+        Some((config, for_server))
     }
 
     fn injection_open_on_connection(
