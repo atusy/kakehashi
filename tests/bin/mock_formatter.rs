@@ -415,7 +415,7 @@ fn main() {
                             "interFileDependencies": false,
                             "workspaceDiagnostics": false
                         },
-                        "hoverProvider": mode == "diagnostics-refresh-prefetch-mixed",
+                        "hoverProvider": matches!(mode.as_str(), "diagnostics-refresh-prefetch-mixed" | "diagnostics-refresh-prefetch-disabled"),
                         "textDocumentSync": 1
                     }),
                     // `completion-resolve`: advertises completion WITH
@@ -776,6 +776,8 @@ fn main() {
                         "position": message.pointer("/params/position"),
                     });
                     json!({ "contents": observation.to_string() })
+                } else if mode == "diagnostics-refresh-prefetch-disabled" {
+                    json!({ "contents": format!("diagnostic-requests:{diagnostic_generation}") })
                 } else if mode.starts_with("will-save") {
                     // Report the recorded willSave/didSave state as a JSON string
                     // so the test can prove the notifications reached this server
@@ -1348,7 +1350,9 @@ fn main() {
                         | "diagnostics-refresh-prefetch-disabled"
                 ) {
                     diagnostic_generation += 1;
-                    std::thread::sleep(std::time::Duration::from_millis(1000));
+                    if mode != "diagnostics-refresh-prefetch-disabled" {
+                        std::thread::sleep(std::time::Duration::from_millis(1000));
+                    }
                 }
                 if mode == "diagnostics-fail" {
                     // Healthy handshake (advertises diagnosticProvider), broken
