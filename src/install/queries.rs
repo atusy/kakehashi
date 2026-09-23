@@ -1308,13 +1308,19 @@ fn stage_provided_parent(
 ) -> Result<StageOutcome, QueryInstallError> {
     visits.external.insert(language.to_string());
     let queries_dir = source.data_dir.join("queries").join(language);
-    let parents =
-        inherited_languages_with_search_paths(&queries_dir, language, source.search_paths)
-            .ok_or_else(|| {
-                QueryInstallError::IoError(std::io::Error::other(format!(
-                    "cannot read the runtime query files for '{language}' to find what it inherits"
-                )))
-            })?;
+    let parents = inherited_languages_with_search_paths(
+        &queries_dir,
+        language,
+        source.search_paths,
+    )
+    // Runtime files are read leniently, so only the data directory's
+    // leftover copy can be unreadable here.
+    .ok_or_else(|| {
+        QueryInstallError::IoError(std::io::Error::other(format!(
+            "cannot read the query files left in {:?} for '{language}' to find what it inherits",
+            queries_dir
+        )))
+    })?;
     for parent in required_parents(parents, true) {
         stage_queries_recursive(source, &parent, StageRole::Parent, visits, entries)?;
     }
