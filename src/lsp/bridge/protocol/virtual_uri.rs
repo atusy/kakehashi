@@ -553,7 +553,7 @@ mod tests {
         for (host, language) in [
             ("file:///project/doc.md", "x-kakehashi-scratch-1-2"),
             ("file:///p-kakehashi-scratch-1-2/doc.md", "lua"),
-            ("untitled:x-kakehashi-scratch-1-2", "lua"),
+            ("untitled:Untitled-1", "x-kakehashi-scratch-1-2"),
         ] {
             let host_uri: Uri = host.parse().unwrap();
             let canonical = VirtualDocumentUri::new(&host_uri, language, "01ARZ3NDEKTSV4");
