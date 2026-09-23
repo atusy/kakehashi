@@ -3692,6 +3692,7 @@ mod tests {
         assert!(lock_complete_chain(&data, "child", std::slice::from_ref(&runtime)).is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_broken_managed_file_still_leaves_the_chain_incomplete() {
         let temp = TempDir::new().unwrap();
