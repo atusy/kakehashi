@@ -32,9 +32,9 @@ use crate::lsp::bridge::actor::{
 };
 use crate::lsp::bridge::connection::SplitConnectionWriter;
 use crate::lsp::bridge::protocol::{
-    JsonRpcNotification, JsonRpcRequest, ROUTING_METHOD, ROUTING_TIMEOUT, RequestId, RoutingAnswer,
-    RoutingParams, build_exit_notification, build_shutdown_request, jsonrpc_error_code,
-    parse_routing_response,
+    DID_CHANGE_WORKSPACE_FOLDERS_METHOD, JsonRpcNotification, JsonRpcRequest, ROUTING_METHOD,
+    ROUTING_TIMEOUT, RequestId, RoutingAnswer, RoutingParams, build_exit_notification,
+    build_shutdown_request, jsonrpc_error_code, parse_routing_response,
 };
 use crate::lsp::bridge::workspace::WorkspaceFolderSet;
 
@@ -51,10 +51,6 @@ pub(crate) fn supports_initial_workspace_folders(caps: &ServerCapabilities) -> b
         .and_then(|ws| ws.workspace_folders.as_ref())
         .is_some_and(|folders| folders.supported == Some(true))
 }
-
-/// The notification a server can register dynamically instead of declaring
-/// `workspace.workspaceFolders.changeNotifications` statically (#968).
-pub(crate) const DID_CHANGE_WORKSPACE_FOLDERS_METHOD: &str = "workspace/didChangeWorkspaceFolders";
 
 /// Whether `caps` STATICALLY advertises everything the shared-instance opt-in
 /// (#391) needs to drive one connection across roots via

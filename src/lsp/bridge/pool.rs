@@ -32,9 +32,7 @@ use connection_action::{ConnectionAction, decide_connection_action};
 use handshake::perform_lsp_handshake;
 
 pub(in crate::lsp::bridge) use connection_handle::REQUEST_TIMEOUT;
-pub(crate) use connection_handle::{
-    ConnectionHandle, DID_CHANGE_WORKSPACE_FOLDERS_METHOD, NotificationSendResult,
-};
+pub(crate) use connection_handle::{ConnectionHandle, NotificationSendResult};
 pub(crate) use connection_key::ConnectionKey;
 pub(crate) use connection_state::ConnectionState;
 pub(in crate::lsp::bridge) use document_tracker::DocumentTracker;

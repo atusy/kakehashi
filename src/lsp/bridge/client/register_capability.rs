@@ -16,7 +16,7 @@ use tower_lsp_server::jsonrpc;
 use tower_lsp_server::ls_types::RegistrationParams;
 
 use crate::lsp::bridge::actor::{ServerRequestDeps, UpstreamRequest};
-use crate::lsp::bridge::pool::DID_CHANGE_WORKSPACE_FOLDERS_METHOD;
+use crate::lsp::bridge::protocol::DID_CHANGE_WORKSPACE_FOLDERS_METHOD;
 
 /// Handle a `client/registerCapability` request, returning the JSON-RPC body
 /// the dispatcher wraps in a response.
