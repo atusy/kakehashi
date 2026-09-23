@@ -125,6 +125,21 @@ impl CrashRecoveryRegistry {
             .recover_poison("CrashRecoveryRegistry::begin_attempt");
         keys.entry(key.clone()).or_default().scheduled = false;
     }
+
+    /// Give back the attempt a scheduled recovery took, because it stood down
+    /// without respawning anything (the connection was already replaced, or
+    /// settings or open documents no longer need it). Only respawns spend the
+    /// budget: stand-downs after ordinary restarts or configuration changes
+    /// must not exhaust it for a later crash that does need recovering.
+    pub(super) fn stand_down(&self, key: &ConnectionKey) {
+        let mut keys = self
+            .keys
+            .lock()
+            .recover_poison("CrashRecoveryRegistry::stand_down");
+        if let Some(state) = keys.get_mut(key) {
+            state.attempts = state.attempts.saturating_sub(1);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -242,5 +257,18 @@ mod tests {
             registry.schedule(&ConnectionKey::for_server("other"), SHORT_RUN),
             RecoveryDecision::Retry { attempt: 1, .. }
         ));
+    }
+
+    #[test]
+    fn a_recovery_that_stands_down_spends_no_attempt() {
+        let registry = CrashRecoveryRegistry::default();
+        for _ in 0..MAX_CONSECUTIVE_ATTEMPTS + 1 {
+            assert!(matches!(
+                registry.schedule(&key(), SHORT_RUN),
+                RecoveryDecision::Retry { attempt: 1, .. }
+            ));
+            registry.begin_attempt(&key());
+            registry.stand_down(&key());
+        }
     }
 }

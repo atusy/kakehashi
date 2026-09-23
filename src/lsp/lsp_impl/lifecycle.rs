@@ -2449,6 +2449,7 @@ fn spawn_crash_recovery(
         tokio::time::sleep(delay).await;
         loop {
             if !pool.begin_crash_recovery_attempt(&key).await {
+                pool.stand_down_crash_recovery(&key);
                 return;
             }
             let snapshot = settings_manager.load_settings_pair();
@@ -2459,6 +2460,7 @@ fn spawn_crash_recovery(
                     target: "kakehashi::bridge",
                     "Not respawning {key}: settings no longer start {server:?}"
                 );
+                pool.stand_down_crash_recovery(&key);
                 return;
             };
             if !crashed_connection_is_wanted(&injection, &bridge, settings, &key).await {
@@ -2466,6 +2468,7 @@ fn spawn_crash_recovery(
                     target: "kakehashi::bridge",
                     "Not respawning {key}: no open document routes to it"
                 );
+                pool.stand_down_crash_recovery(&key);
                 return;
             }
             // Stand down if settings change before the spawn commits: the

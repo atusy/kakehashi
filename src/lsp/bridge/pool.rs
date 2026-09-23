@@ -2360,6 +2360,12 @@ impl LanguageServerPool {
         self.crash_recovery.schedule(&crashed.key, crashed.uptime)
     }
 
+    /// Record that `key`'s scheduled recovery stood down without respawning
+    /// (see [`CrashRecoveryRegistry::stand_down`]).
+    pub(crate) fn stand_down_crash_recovery(&self, key: &ConnectionKey) {
+        self.crash_recovery.stand_down(key);
+    }
+
     /// Start a scheduled recovery of `key`: whether the connection the pool
     /// holds for it is still a failed one. Shutdown, a settings eviction, or an
     /// edit or request that already brought up a live replacement leave nothing
