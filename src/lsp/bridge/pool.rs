@@ -11457,4 +11457,19 @@ mod tests {
         assert!(pool.crashed_connection(id).await.is_none());
         assert!(!pool.begin_crash_recovery_attempt(&key).await);
     }
+
+    #[tokio::test]
+    async fn a_shared_instance_is_not_revived_by_crash_recovery() {
+        let pool = LanguageServerPool::new();
+        let result = pool
+            .revive_crashed_connection(&ConnectionKey::shared("crashy"), &devnull_config(), &|| {
+                true
+            })
+            .await;
+        assert_eq!(
+            result.map(|_| ()).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert!(pool.connections().await.is_empty());
+    }
 }
