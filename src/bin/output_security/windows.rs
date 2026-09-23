@@ -1,13 +1,12 @@
 use std::io;
-use std::os::windows::{ffi::OsStrExt as _, io::AsRawHandle as _};
+use std::os::windows::io::AsRawHandle as _;
 use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, LocalFree};
 use windows_sys::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows_sys::Win32::Security::{
-    DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetFileSecurityW,
-    GetKernelObjectSecurity, LABEL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR,
+    DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetKernelObjectSecurity,
+    LABEL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
 };
 
 // Include mandatory integrity labels, which can restrict access independently
@@ -56,21 +55,6 @@ fn read(get: impl Fn(PSECURITY_DESCRIPTOR, u32, *mut u32) -> i32) -> io::Result<
         .collect();
     unsafe { LocalFree(string.cast()) };
     Ok(result)
-}
-
-pub fn from_path(path: &std::path::Path) -> io::Result<Vec<u8>> {
-    let mut path: Vec<u16> = path.as_os_str().encode_wide().collect();
-    if path.contains(&0) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "path contains NUL",
-        ));
-    }
-    path.push(0);
-    read(|buffer, length, needed| {
-        // SAFETY: path is NUL-terminated and read supplies the output buffer.
-        unsafe { GetFileSecurityW(path.as_ptr(), INFORMATION, buffer, length, needed) }
-    })
 }
 
 pub fn from_file(file: &std::fs::File) -> io::Result<Vec<u8>> {

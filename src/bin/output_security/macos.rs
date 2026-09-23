@@ -1,11 +1,10 @@
-use std::ffi::{CString, c_char, c_int, c_void};
+use std::ffi::{c_char, c_int, c_void};
 use std::io;
-use std::os::unix::{ffi::OsStrExt as _, io::AsRawFd as _};
+use std::os::unix::io::AsRawFd as _;
 
 // Darwin sys/acl.h. The libc crate does not expose these APIs.
 const ACL_TYPE_EXTENDED: c_int = 0x100;
 unsafe extern "C" {
-    fn acl_get_link_np(path: *const c_char, kind: c_int) -> *mut c_void;
     fn acl_get_fd_np(fd: c_int, kind: c_int) -> *mut c_void;
     fn acl_to_text(acl: *mut c_void, length: *mut isize) -> *mut c_char;
     fn acl_free(object: *mut c_void) -> c_int;
@@ -43,12 +42,6 @@ fn text(acl: *mut c_void) -> io::Result<Vec<u8>> {
     let length = usize::try_from(length).map_err(io::Error::other)?;
     // SAFETY: acl_to_text returned an allocation containing length bytes.
     Ok(unsafe { std::slice::from_raw_parts(value.0.cast::<u8>(), length) }.to_vec())
-}
-
-pub fn from_path(path: &std::path::Path) -> io::Result<Vec<u8>> {
-    let path = CString::new(path.as_os_str().as_bytes())?;
-    // SAFETY: path is a valid NUL-terminated string. This does not follow links.
-    text(unsafe { acl_get_link_np(path.as_ptr(), ACL_TYPE_EXTENDED) })
 }
 
 pub fn from_file(file: &std::fs::File) -> io::Result<Vec<u8>> {

@@ -2298,12 +2298,14 @@ mod tests {
             Ok(())
         })
         .unwrap_err();
-        assert!(error.to_string().contains("changed"));
+        // The final kernel access check observes the newly denied write.
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         assert_eq!(
             std::fs::read_to_string(&output).unwrap(),
             "previous configuration"
         );
-        assert!(!output_security::from_path(&output).unwrap().is_empty());
+        let original = std::fs::File::open(&output).unwrap();
+        assert!(!output_security::from_file(&original).unwrap().is_empty());
     }
 
     #[cfg(target_os = "macos")]
@@ -2350,7 +2352,25 @@ mod tests {
         xattr::set(path, "system.posix_acl_access", &bytes).unwrap();
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
+    #[test]
+    fn forced_output_respects_owner_write_denial() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let temp = tempfile::TempDir::new().unwrap();
+        if temp.path().metadata().unwrap().uid() == 0 {
+            eprintln!("owner permission selection cannot be checked as root");
+            return;
+        }
+        let output = temp.path().join("config.toml");
+        std::fs::write(&output, "previous").unwrap();
+        // The owner lacks write access even though the group-write bit is set.
+        std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o460)).unwrap();
+        let error = write_forced_output(&output, "replacement").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), "previous");
+    }
+
+    #[cfg(unix)]
     #[test]
     fn forced_output_accepts_write_only_files() {
         use std::os::unix::fs::PermissionsExt as _;

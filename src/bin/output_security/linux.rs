@@ -54,27 +54,6 @@ fn normalize(result: io::Result<Option<Vec<u8>>>) -> io::Result<Vec<u8>> {
     result.map(Option::unwrap_or_default)
 }
 
-pub fn from_path(path: &std::path::Path) -> io::Result<Vec<u8>> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    // Keep the old writer's kernel access checks without truncating or writing.
-    // In particular fs-verity forbids writable opens but permits replacement;
-    // matching mode/ACL/labels alone would silently bypass its integrity policy.
-    // NOFOLLOW retains leaf refusal; NONBLOCK avoids blocking on a raced FIFO
-    // or a write lease. Read metadata through this same non-truncating handle.
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
-        .open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "refusing to replace non-regular output",
-        ));
-    }
-    from_file(&file)
-}
-
 pub fn from_file(file: &std::fs::File) -> io::Result<Vec<u8>> {
     check_filesystem(fstatfs(file)?.filesystem_type())?;
     snapshot(|name| file.get_xattr(name))
