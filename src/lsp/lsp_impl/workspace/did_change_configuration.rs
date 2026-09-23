@@ -1,8 +1,8 @@
 //! didChangeConfiguration notification handler for Kakehashi.
 
 use crate::config::unknown_keys::{
-    is_feature_setting_key_or_typo, is_workspace_setting_key_or_typo, sort_and_dedup_unknown_keys,
-    unknown_workspace_setting_keys,
+    KNOWN_WORKSPACE_SETTING_KEYS, is_feature_setting_key_or_typo, is_workspace_setting_key_or_typo,
+    sort_and_dedup_unknown_keys, unknown_workspace_setting_keys,
 };
 use serde_json::Value;
 use tower_lsp_server::ls_types::{ConfigurationItem, DidChangeConfigurationParams, Uri};
@@ -408,6 +408,17 @@ impl Kakehashi {
                         .await;
                 }
             }
+        }
+
+        // The keys just reported as ignored are dropped before the emptiness
+        // check, so an answer holding only the editor's own keys counts as
+        // holding nothing — not as an empty layer that rebuilds the settings
+        // to no effect.
+        let mut settings_value = settings_value;
+        if let ConfigurationIngress::Pull { .. } = ingress
+            && let Some(object) = settings_value.as_object_mut()
+        {
+            object.retain(|key, _| KNOWN_WORKSPACE_SETTING_KEYS.contains(&key.as_str()));
         }
 
         // Nothing for kakehashi: a push that says nothing changes nothing, but
