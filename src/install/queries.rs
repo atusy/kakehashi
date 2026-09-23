@@ -3975,6 +3975,38 @@ mod tests {
     }
 
     #[test]
+    fn a_leftover_managed_base_shadows_a_provided_parent() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        let child = data.join("queries/child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(child.join("highlights.scm"), "; inherits: custom\n").unwrap();
+        write_install_marker(&child).unwrap();
+        write_runtime_query(&runtime, "custom", "(comment) @comment\n");
+        // An interrupted install left an empty, unmarked managed base, which
+        // the loader picks when the data directory is searched first.
+        let leftover = data.join("queries/custom");
+        fs::create_dir_all(&leftover).unwrap();
+        fs::write(leftover.join("highlights.scm"), "").unwrap();
+        let search_paths = [data.clone(), runtime.clone()];
+        assert!(lock_complete_chain(&data, "child", &search_paths).is_none());
+        // Staging cannot fall back to the runtime copy either: it would leave
+        // the shadowing leftover in place and the chain still incomplete.
+        let result = stage_queries_with_dependencies(
+            &spawn_query_file_server(vec![("/child/highlights.scm", "; inherits: custom\n")]),
+            "child",
+            &data,
+            true,
+            QueryHttpPolicy::AllowHttpForTests,
+            &search_paths,
+        );
+        assert!(
+            matches!(result, Err(QueryInstallError::LanguageNotSupported(ref name)) if name == "custom")
+        );
+    }
+
+    #[test]
     fn an_overlay_alone_does_not_provide_a_parent() {
         let temp = TempDir::new().unwrap();
         let data = temp.path().join("data");
