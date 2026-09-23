@@ -1997,9 +1997,13 @@ fn set_markdown_lua_bridge(client: &mut LspClient, enabled: bool) {
 }
 
 /// The virtual URIs the mock received `method` for, in wire order.
+///
+/// Only newline-terminated lines count: the mock appends each entry in
+/// several writes, so a read can catch the last one half written.
 fn wire_log_uris(wire_log: &std::path::Path, method: &str) -> Vec<String> {
-    std::fs::read_to_string(wire_log)
-        .unwrap_or_default()
+    let log = std::fs::read_to_string(wire_log).unwrap_or_default();
+    let complete = log.rfind('\n').map_or("", |end| &log[..end]);
+    complete
         .lines()
         .filter_map(|line| line.split_once('\t'))
         .filter(|(logged, _)| *logged == method)
