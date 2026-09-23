@@ -314,8 +314,9 @@ fn required_parents(
 /// install/uninstall while the guards live, so a caller can also read its parser.
 /// External runtime files are observed but not locked; user edits may change
 /// their declarations after this check. `None` means a language in the chain
-/// is missing, or one of them is mid-publish and its queries can still be rolled
-/// back, or the name is not one that could be installed.
+/// is missing, or one of them is held by an install (staging or publishing, so
+/// its queries can still change or be rolled back) or an uninstall, or the
+/// name is not one that could be installed.
 ///
 /// Locks are taken with [`try_lock_language`], so this never waits: it runs on
 /// the LSP's async path, and there "someone is publishing, look again later" is
@@ -1864,7 +1865,8 @@ enum LanguageLockProbe {
     /// No install holds the lock, and none can take it while this shared
     /// guard lives; other probes may hold it too.
     Idle(LanguageLock),
-    /// An install is mid-publish: what is on disk can still be rolled back.
+    /// An install (staging or publishing) or uninstall holds the language
+    /// exclusively: what is on disk can still change or be rolled back.
     Busy,
     /// The lock cannot be taken at all, so nothing can be publishing either.
     /// Whatever is on disk is as settled as it will ever be.

@@ -363,8 +363,8 @@ impl InstallCoordinator {
         match state {
             QueryChainState::NeedsRepair => true,
             QueryChainState::Settled => false,
-            // A held lock is an install or uninstall mid-publish, not
-            // evidence of a missing language. Leave the answer
+            // A lock held exclusively by an install (staging or publishing)
+            // or an uninstall is not evidence of a missing language. Leave the answer
             // to a later pass instead of spawning an install that would find
             // nothing to do and still reload every document's queries.
             QueryChainState::Busy => {
