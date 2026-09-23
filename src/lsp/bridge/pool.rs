@@ -2798,7 +2798,10 @@ impl LanguageServerPool {
         }
 
         // Acquire and wait through initialization for the resolved key.
-        let handle = self
+        let diverted_up_front = server_config.prefers_shared_instance()
+            && !connection_key.is_shared()
+            && !connection_key.is_client_fallback();
+        let handle = match self
             .acquire_resolved_wait_ready(
                 server_name,
                 server_config,
@@ -2807,7 +2810,32 @@ impl LanguageServerPool {
                 timeout,
                 rootless,
             )
-            .await?;
+            .await
+        {
+            Ok(handle) => handle,
+            // `resolve_acquire` already diverted (the shared instance was
+            // Ready and not yet registered), and consolidation retired that
+            // divert mid-handshake: same race, same fallback as the late
+            // divert below.
+            Err(_)
+                if diverted_up_front && self.shared_accepts_folder_changes(server_name).await =>
+            {
+                let remaining = timeout.saturating_sub(start.elapsed());
+                let shared = self
+                    .acquire_resolved_wait_ready(
+                        server_name,
+                        server_config,
+                        ConnectionKey::shared(server_name),
+                        marker.clone(),
+                        remaining,
+                        false,
+                    )
+                    .await?;
+                self.announce_shared_root(&shared, &marker).await?;
+                return Ok(shared);
+            }
+            Err(e) => return Err(e),
+        };
 
         // The shared connection's capability is only known now that it is Ready.
         // If it came up incapable and does not already serve this root, the
@@ -5458,6 +5486,37 @@ mod tests {
             .expect("a divert retired by consolidation must fall back to the shared instance");
         assert!(Arc::ptr_eq(&result, &shared));
         assert!(!Arc::ptr_eq(&result, &per_root));
+    }
+
+    /// The divert `resolve_acquire` picks up front (shared instance Ready but
+    /// not yet registered) races consolidation exactly like the late one, and
+    /// falls back to the now-capable shared instance the same way (#968).
+    #[tokio::test]
+    async fn wait_ready_takes_the_shared_instance_when_its_up_front_divert_is_retired() {
+        let (_tmp, doc) = marker_rooted_doc();
+        let pool = Arc::new(LanguageServerPool::new());
+        let config = shared_config();
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
+        shared.set_server_capabilities(Default::default());
+        pool.insert_connection(Arc::clone(&shared)).await;
+        let per_root_key = pool.connection_key("lua", &config, Some(&doc));
+        pool.insert_connection(
+            create_handle_with_key(ConnectionState::Initializing, per_root_key).await,
+        )
+        .await;
+        let (shared_clone, pool_clone) = (Arc::clone(&shared), Arc::clone(&pool));
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            register_folder_changes(&shared_clone);
+            pool_clone.consolidate_shared_instance("lua").await;
+        });
+
+        let handle = pool
+            .get_or_create_connection_wait_ready("lua", &config, Some(&doc), Duration::from_secs(2))
+            .await
+            .expect("falls back to the shared instance");
+        assert!(Arc::ptr_eq(&handle, &shared));
     }
 
     /// The fast-fail spawner awaits its divert's handshake too, so the same
