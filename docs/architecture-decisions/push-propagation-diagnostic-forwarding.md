@@ -652,9 +652,10 @@ because the #380 benefit now outweighs it:
   `LanguageServerPool::pull_driven_servers` (static initialize caps + dynamic
   registrations). The pull/push double-count is removed by the publisher's
   `filter_pull_driven_push_slots`, which drops a pull-driven server's push slot
-  from the publish whenever a `PullLayer` blob is present, so each server has one
-  native source while its slot stays cached (a spontaneous push from a
-  pull-driven server still publishes when no `PullLayer` exists).
+  from the publish when the cached pull covers its layer (host or virtual),
+  while its push slot stays cached. A host-only pull therefore does not hide
+  virtual pushes whose layer is still pending. A spontaneous push remains
+  eligible when the corresponding layer has no collected pull contribution.
 - Server-level `priorities` membership over cached pushes (#916). Each path
   admits only the push slots whose server its own key's `priorities` allowlist
   names for the slot's (host, injection language) — `publishDiagnostics` for
@@ -683,9 +684,9 @@ because the #380 benefit now outweighs it:
   diagnostic sorter makes the final wire order deterministic, but does not
   implement per-source selection or precedence.
   This also subsumes the **interim `pullFallback` dedup limitation**: because
-  `PullLayer` is one host-wide blob with no per-server identity,
-  `filter_pull_driven_push_slots` triggers on "any `PullLayer` present" rather
-  than "this exact server was pulled", so a *mixed* per-region `pullFallback`
+  `PullLayer` tracks host/virtual coverage but has no per-server identity,
+  `filter_pull_driven_push_slots` tests layer coverage rather than whether
+  this exact server was pulled, so a *mixed* per-region `pullFallback`
   (one region's pull-driven server pulled, a sibling's not) can over-suppress.
   Per-`(source, server)` pull slots remove it.
 - Region-invalidation and crash cache eviction.

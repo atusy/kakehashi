@@ -16,7 +16,8 @@
 //! ## Staging
 //! Three source kinds are populated:
 //! - [`DiagnosticSource::PullLayer`] — the host-event pull's already
-//!   cross-layer-combined result, in host coordinates, as one blob.
+//!   cross-layer-combined result, in host coordinates, alongside the raw
+//!   components needed to retain a pending layer.
 //! - [`DiagnosticSource::Region`] — a downstream push for an injection region, in
 //!   virtual coordinates, transformed to host coordinates at publish time.
 //! - [`DiagnosticSource::Host`] — a downstream `_self` host-layer push for the
@@ -480,7 +481,7 @@ pub(crate) struct DiagnosticAggregator {
     /// nudge-less** mutation (`publish_pull_layer`/`clear_pull_layer`, and
     /// the refresh prefetch's own commit) since the last **covering** editor
     /// pull — confirmed at the Changed republish that recorded the move (see
-    /// [`Self::set_pull_layer_nudgeless`] /
+    /// [`Self::set_pull_components_nudgeless`] /
     /// [`Self::settle_pending_pull_view_lag`]). Those writers never emit `workspace/diagnostic/refresh` (by
     /// design — they are normally paired with the editor's own event-driven
     /// pull), but that pairing is a race: the editor's pull can answer with
@@ -504,7 +505,7 @@ pub(crate) struct DiagnosticAggregator {
     /// Nudge-less mutations performed but not yet settled by a recorded
     /// republish, keyed to the CACHE REVISION current when the mutation
     /// landed (stamped inside the same `cache_revisions` critical section —
-    /// see [`Self::set_pull_layer_nudgeless`]). The republish that validates
+    /// see [`Self::set_pull_components_nudgeless`]). The republish that validates
     /// a revision `r` settles every mark with revision ≤ r: a Changed record
     /// converts it into the confirmed lag, an Unchanged record drops it (the
     /// mutation demonstrably left the merged set alone). Revision-keying is
@@ -1108,7 +1109,7 @@ impl DiagnosticAggregator {
     /// The pull-layer is a cross-connection aggregate, not a single connection's
     /// push, so its slot is tagged `None` and is never touched by crash eviction.
     /// Test-only since the production writers moved to
-    /// [`Self::set_pull_layer_nudgeless`] (which additionally stamps the
+    /// [`Self::set_pull_components_nudgeless`] (which additionally stamps the
     /// pending pull-view-lag mark in the same critical section).
     #[cfg(test)]
     pub(crate) fn set_pull_layer(&self, host: &Url, diagnostics: Vec<Diagnostic>) {
@@ -1304,6 +1305,8 @@ impl DiagnosticAggregator {
         });
     }
 
+    /// Merge collected components with any pending cached layers, then stamp
+    /// publication/coverage changes under the same revision and cache locks.
     pub(crate) fn set_pull_components_nudgeless(
         &self,
         host: &Url,
@@ -1330,7 +1333,7 @@ impl DiagnosticAggregator {
     }
 
     /// Evict the pull-layer blob AND stamp the pending mark, like
-    /// [`Self::set_pull_layer_nudgeless`] — the nudge-less variant of
+    /// [`Self::set_pull_components_nudgeless`] — the nudge-less variant of
     /// `evict_source(host, PullLayer)`.
     pub(crate) fn evict_pull_layer_nudgeless(&self, host: &Url) {
         self.update_pull_layer_nudgeless(host, |_| None);
