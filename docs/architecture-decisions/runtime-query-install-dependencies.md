@@ -32,7 +32,7 @@ Injected languages are checked on initial lifecycle passes and once per query
 reload generation, independently of which caller first loaded their parser;
 cached edit passes do not rescan the dependency graph. A repair that fails is
 not retried, even on open, until the next reload generation (a settings change
-or any install). A parser selected from
+or any successful install). A parser selected from
 outside the managed data directory is not a query-repair target. A chain
 whose managed lock is held by an install mid-publish is not treated as
 missing (probes share the lock, so they never block each other): the check is left to a later pass.

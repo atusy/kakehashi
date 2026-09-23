@@ -362,7 +362,7 @@ impl InstallCoordinator {
         }
         let generation = self.cache.semantic_token_generation();
         // Opening another file does not change why the last repair failed;
-        // a reload (settings change or any install) is what retries it.
+        // a reload (settings change or any successful install) retries it.
         if self.auto_install.query_repair_failed(language, generation) {
             return None;
         }
