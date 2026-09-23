@@ -5,7 +5,7 @@ use crate::config::unknown_keys::{
     unknown_workspace_setting_keys,
 };
 use serde_json::Value;
-use tower_lsp_server::ls_types::{ConfigurationItem, DidChangeConfigurationParams};
+use tower_lsp_server::ls_types::{ConfigurationItem, DidChangeConfigurationParams, Uri};
 
 use crate::config::{RawWorkspaceSettings, WorkspaceSettings, merge_workspace_settings};
 use crate::error::LockResultExt;
@@ -130,16 +130,18 @@ const CONFIGURATION_PULL_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// How a client-supplied configuration reached kakehashi.
 ///
 /// The two arrive by different routes, and a message naming the wrong one
-/// sends people looking for a notification they never sent. A pull also
-/// remembers the root it was asked at, since its answer describes that
-/// workspace.
+/// sends people looking for a notification they never sent. They also retain
+/// differently: a push accumulates, while a pull answer replaces the previous
+/// answer. And a pull remembers the root it was asked at, since its answer
+/// describes that workspace.
 pub(crate) enum ConfigurationIngress {
     /// The client pushed `workspace/didChangeConfiguration`.
     Push,
     /// kakehashi asked, via `workspace/configuration`, while `asked_at` was
-    /// the selected configuration root.
+    /// the selected configuration root and `scope` the client's URI for it.
     Pull {
         asked_at: Option<std::path::PathBuf>,
+        scope: Option<Uri>,
     },
 }
 
@@ -247,8 +249,9 @@ impl Kakehashi {
     /// One round trip: ask, and apply whatever comes back.
     async fn pull_client_configuration_once(&self) {
         let asked_at = self.settings_manager.root_path().as_ref().clone();
+        let scope = self.settings_manager.root_scope();
         let items = vec![ConfigurationItem {
-            scope_uri: self.settings_manager.root_scope(),
+            scope_uri: scope.clone(),
             section: Some("kakehashi".to_string()),
         }];
         // Bounded by shutdown: this await lives in a service future —
@@ -299,7 +302,7 @@ impl Kakehashi {
 
         self.apply_client_configuration(
             serde_json::json!({ "kakehashi": section }),
-            ConfigurationIngress::Pull { asked_at },
+            ConfigurationIngress::Pull { asked_at, scope },
         )
         .await;
     }
@@ -406,23 +409,39 @@ impl Kakehashi {
             }
         }
 
-        if settings_value
+        // Nothing for kakehashi: a push that says nothing changes nothing, but
+        // an answer that says nothing withdraws the previous answer.
+        let parsed = if settings_value
             .as_object()
             .is_some_and(serde_json::Map::is_empty)
         {
-            return;
-        }
-
-        // Parse the incoming settings.
-        let mut parsed = match serde_json::from_value::<RawWorkspaceSettings>(settings_value) {
-            Ok(settings) => settings,
-            Err(err) => {
-                self.notifier()
-                    .log_warning(format!("Failed to parse client configuration: {}", err))
-                    .await;
-                return;
+            None
+        } else {
+            match serde_json::from_value::<RawWorkspaceSettings>(settings_value) {
+                Ok(settings) => Some(settings),
+                Err(err) => {
+                    self.notifier()
+                        .log_warning(format!("Failed to parse client configuration: {}", err))
+                        .await;
+                    return;
+                }
             }
         };
+        match ingress {
+            ConfigurationIngress::Push => {
+                if let Some(parsed) = parsed {
+                    self.apply_pushed_layer(parsed).await;
+                }
+            }
+            ConfigurationIngress::Pull { asked_at, scope } => {
+                self.apply_pulled_layer(parsed, asked_at, scope).await;
+            }
+        }
+    }
+
+    /// Accumulate a pushed layer over the settings in effect.
+    async fn apply_pushed_layer(&self, mut parsed: RawWorkspaceSettings) {
+        let ingress = ConfigurationIngress::Push;
         // Retain the authored relative paths for a future workspace-root
         // reload; the copy applied below is anchored to the root current now.
         let replay_layer = parsed.clone();
@@ -436,22 +455,6 @@ impl Kakehashi {
         // left — permanently, since anchoring yields absolute paths that no
         // later reload re-bases.
         let reload = lock_settings_reload().await;
-
-        // Asked while the session sat at one root and answered after it moved
-        // to another: the answer was read for a workspace no longer selected.
-        // The root change that moved it pulls again, so this one is dropped
-        // rather than anchored to, and retained under, a root it never
-        // described.
-        if let ConfigurationIngress::Pull { asked_at } = &ingress
-            && *self.settings_manager.root_path() != *asked_at
-        {
-            drop(reload);
-            log::debug!(
-                target: "kakehashi::config",
-                "Discarding a configuration answer read at a root no longer selected: {asked_at:?}"
-            );
-            return;
-        }
 
         // A pushed path is workspace-local, matching `initializationOptions`:
         // the client knows the workspace it opened, not the directory the server
@@ -509,6 +512,86 @@ impl Kakehashi {
                 let warnings = Self::misconfigured_settings_warnings(&settings);
                 self.apply_raw_settings_locked(&reload, merged_ts, settings)
                     .await;
+                drop(reload);
+                self.warn_on_misconfigured_settings(&warnings).await;
+                self.notifier().log_info(ingress.applied_message()).await;
+            }
+            Err(errs) => {
+                drop(reload);
+                let event = crate::lsp::SettingsEvent::error(format!(
+                    "Invalid configuration: {errs}. \
+                     This configuration has been discarded; previous settings remain in effect. \
+                     Please correct the invalid settings or remove them from your config.",
+                ));
+                self.notifier().log_settings_events(&[event]).await;
+            }
+        }
+    }
+
+    /// Put a pull answer in place of the previous one and rebuild the
+    /// settings: `parsed` is the client's configuration for `scope`, asked
+    /// while `asked_at` was the root, or `None` for an answer holding nothing
+    /// for kakehashi.
+    ///
+    /// Rebuilt from the retained layers rather than merged onto the snapshot
+    /// in effect, because the snapshot still holds the previous answer and the
+    /// fold is not associative — no later layer can take its values, or its
+    /// clears, back out.
+    async fn apply_pulled_layer(
+        &self,
+        parsed: Option<RawWorkspaceSettings>,
+        asked_at: Option<std::path::PathBuf>,
+        scope: Option<Uri>,
+    ) {
+        let ingress = ConfigurationIngress::Pull {
+            asked_at: asked_at.clone(),
+            scope: scope.clone(),
+        };
+        // Anchoring, the root it reads, and publication share the reload
+        // transaction, as for a push.
+        let reload = lock_settings_reload().await;
+
+        // Asked for one root and answered after the session moved to another:
+        // the answer describes a workspace no longer selected. The root change
+        // that moved it pulls again for the new scope, so this one is dropped
+        // rather than applied over settings it was never asked for. Compared
+        // by path as well as scope, since an unscoped session has no scope to
+        // tell its roots apart by.
+        if *self.settings_manager.root_path() != asked_at
+            || self.settings_manager.root_scope() != scope
+        {
+            drop(reload);
+            log::debug!(
+                target: "kakehashi::config",
+                "Discarding a configuration answer read at a root no longer selected: \
+                 {asked_at:?} ({scope:?})"
+            );
+            return;
+        }
+
+        let mut layers = self
+            .client_layers
+            .read()
+            .recover_poison("client_layers pull")
+            .clone();
+        if !layers.replace_pulled(parsed) {
+            return;
+        }
+        let root_path = self.settings_manager.root_path();
+        match self
+            .recompose_settings(root_path.as_ref().as_deref(), layers.to_fold_order())
+            .await
+        {
+            Ok((raw, settings)) => {
+                // Committed under the same transaction that publishes the
+                // rebuilt settings, so the retained layers never describe a
+                // snapshot other than the one in effect.
+                *self
+                    .client_layers
+                    .write()
+                    .recover_poison("client_layers pull") = layers;
+                let warnings = Self::misconfigured_settings_warnings(&settings);
+                self.apply_raw_settings_locked(&reload, raw, settings).await;
                 drop(reload);
                 self.warn_on_misconfigured_settings(&warnings).await;
                 self.notifier().log_info(ingress.applied_message()).await;

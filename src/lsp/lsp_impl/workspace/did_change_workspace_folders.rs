@@ -90,7 +90,8 @@ impl Kakehashi {
         {
             Ok((raw, settings)) => {
                 let warnings = Self::misconfigured_settings_warnings(&settings);
-                let root_changed = *self.settings_manager.root_path() != root_path;
+                let root_changed = *self.settings_manager.root_path() != root_path
+                    || self.settings_manager.root_scope() != root_scope;
                 self.settings_manager.set_root(root_path, root_scope);
                 self.apply_raw_settings_locked(&reload, raw, settings).await;
                 drop(reload);
@@ -479,65 +480,6 @@ mod tests {
         .expect("a pull must not hang");
     }
 
-    /// An answer asked while the session sat at one root and arriving after it
-    /// moved to another was read for a workspace no longer selected: it is
-    /// dropped, and the root change's own pull asks again.
-    #[tokio::test]
-    #[serial(xdg_env)]
-    async fn an_answer_for_a_root_the_session_left_is_discarded() {
-        let xdg_scratch = tempfile::tempdir().expect("failed to create scratch XDG_CONFIG_HOME");
-        let _xdg_guard = XdgConfigHomeGuard::set(xdg_scratch.path());
-        let first = tempfile::tempdir().expect("failed to create first workspace dir");
-        let second = tempfile::tempdir().expect("failed to create second workspace dir");
-        let release_first = Arc::new(tokio::sync::Notify::new());
-
-        let (service, pulls) = initialized_server_holding_answers(
-            serde_json::json!([folder(first.path(), "first")]),
-            vec![
-                serde_json::json!({ "searchPaths": ["./stale"] }),
-                serde_json::Value::Null,
-            ],
-            Some(Arc::clone(&release_first)),
-        )
-        .await;
-        let server = service.inner();
-
-        let move_root_while_answering = async {
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while pulls.lock().unwrap().is_empty() {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("the first pull must be asked");
-            server
-                .did_change_workspace_folders_impl(DidChangeWorkspaceFoldersParams {
-                    event: WorkspaceFoldersChangeEvent {
-                        added: vec![folder(second.path(), "second")],
-                        removed: vec![folder(first.path(), "first")],
-                    },
-                })
-                .await;
-            release_first.notify_one();
-        };
-        tokio::join!(pull_now(server), move_root_while_answering);
-
-        assert_eq!(
-            pulls.lock().unwrap().len(),
-            2,
-            "the root change must still ask again"
-        );
-        assert!(
-            !server
-                .settings_manager
-                .load_settings()
-                .search_paths
-                .iter()
-                .any(|path| path.ends_with("stale")),
-            "an answer read for the root the session left must not be applied"
-        );
-    }
-
     fn scope_of(pull: &serde_json::Value) -> Option<&str> {
         pull["items"][0]["scopeUri"].as_str()
     }
@@ -747,6 +689,71 @@ mod tests {
         assert_eq!(
             server.settings_manager.load_settings().search_paths,
             vec!["/pulled-second".to_string()]
+        );
+    }
+
+    /// An answer asked for one root and arriving after the session moved to
+    /// another describes a workspace no longer selected: it is dropped, and
+    /// the root change's own pull asks for the new scope instead.
+    #[tokio::test]
+    #[serial(xdg_env)]
+    async fn an_answer_for_a_root_the_session_left_is_discarded() {
+        let xdg_scratch = tempfile::tempdir().expect("failed to create scratch XDG_CONFIG_HOME");
+        let _xdg_guard = XdgConfigHomeGuard::set(xdg_scratch.path());
+        let first = tempfile::tempdir().expect("failed to create first workspace dir");
+        let second = tempfile::tempdir().expect("failed to create second workspace dir");
+        let release_first = Arc::new(tokio::sync::Notify::new());
+
+        let (service, pulls) = initialized_server_holding_answers(
+            serde_json::json!([folder(first.path(), "first")]),
+            vec![
+                serde_json::json!({ "searchPaths": ["./stale"] }),
+                serde_json::Value::Null,
+            ],
+            Some(Arc::clone(&release_first)),
+        )
+        .await;
+        let server = service.inner();
+
+        let move_root_while_answering = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while pulls.lock().unwrap().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the first pull must be asked");
+            server
+                .did_change_workspace_folders_impl(DidChangeWorkspaceFoldersParams {
+                    event: WorkspaceFoldersChangeEvent {
+                        added: vec![folder(second.path(), "second")],
+                        removed: vec![folder(first.path(), "first")],
+                    },
+                })
+                .await;
+            release_first.notify_one();
+        };
+        tokio::join!(pull_now(server), move_root_while_answering);
+
+        let scopes = pulls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|pull| scope_of(pull).map(str::to_owned))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            scopes.last().cloned().flatten().as_deref(),
+            Some(folder(second.path(), "second").uri.as_str()),
+            "the root change must still ask for the new scope"
+        );
+        assert!(
+            !server
+                .settings_manager
+                .load_settings()
+                .search_paths
+                .iter()
+                .any(|path| path.ends_with("stale")),
+            "an answer for the root the session left must not be applied"
         );
     }
 }
