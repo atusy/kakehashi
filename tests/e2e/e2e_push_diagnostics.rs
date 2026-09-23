@@ -531,6 +531,93 @@ fn e2e_downstream_crash_evicts_its_pushed_diagnostics() {
     client.send_notification("exit", json!(null));
 }
 
+#[test]
+fn e2e_crashed_downstream_is_respawned_and_its_diagnostics_return() {
+    // #977: a crash evicts the dead server's diagnostics (#469), but nothing
+    // brought the server back — on a quiet document the diagnostics stayed gone
+    // until some unrelated edit happened to respawn it. The mock dies on a timer
+    // after its first push, with NO client input, so no edit or request can be
+    // what respawns it; the replacement tags its push, so the returning
+    // diagnostic can only come from a respawned, re-opened server.
+    let config_dir = tempfile::TempDir::new().expect("temp dir");
+    let config_path = config_dir.path().join("push_diagnostics.toml");
+    std::fs::write(&config_path, "").expect("write config");
+    let wire_log = config_dir.path().join("mock-wire.log");
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("utf8 path"))
+        .env("MOCK_LSP_WIRE_LOG", wire_log.to_string_lossy())
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-push": {
+                        "cmd": [mock_bin(), "diagnostics-push-crash-once"],
+                        "languages": ["lua"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    open_host(&mut client);
+
+    let is_replacement = |d: &Value| {
+        d["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("mock-push-diag") && m.ends_with(":replacement"))
+    };
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            |params| {
+                params["uri"] == json!(MD_URI)
+                    && params["diagnostics"]
+                        .as_array()
+                        .is_some_and(|ds| ds.iter().any(|d| is_mock_push(d) && !is_replacement(d)))
+            },
+        )
+        .expect("editor should receive the first process's pushed diagnostic");
+
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            cleared_host_diag,
+        )
+        .expect("the crash must evict the dead server's diagnostic and republish cleared");
+    assert!(
+        std::path::Path::new(&format!("{}.died", wire_log.display())).exists(),
+        "the first mock process must have crashed"
+    );
+
+    // No further client action: the bridge itself must respawn the server and
+    // re-open the document, whose push brings the diagnostic back.
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(20),
+            |params| {
+                params["uri"] == json!(MD_URI)
+                    && params["diagnostics"]
+                        .as_array()
+                        .is_some_and(|ds| ds.iter().any(is_replacement))
+            },
+        )
+        .expect("a crashed server must be respawned and its diagnostics re-published (#977)");
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
 /// Client capabilities advertising pull-diagnostic refresh support, so the bridge
 /// will send `workspace/diagnostic/refresh` (it's gated on this; an editor that
 /// doesn't advertise it is never sent the request).
