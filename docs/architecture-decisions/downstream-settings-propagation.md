@@ -219,9 +219,15 @@ The following are **deferred** and intentionally out of scope:
 - ~~**Upstream pull**~~ (kakehashi → editor `workspace/configuration`):
   **implemented** (#952 stage 1). Gated on the editor's
   `capabilities.workspace.configuration`, as this decision required. kakehashi
-  asks once the handshake completes, and again whenever a
+  asks once the handshake completes, again whenever a
   `didChangeConfiguration` carries no usable payload — which is the shape
-  pull-model editors send. The answer is applied as a configuration layer,
+  pull-model editors send — and again after a `didChangeWorkspaceFolders`
+  that moves the selected configuration root. The last is a decision, not a
+  protocol requirement: an editor resolves its configuration per workspace,
+  so an answer read in the old workspace may not describe the new one. It
+  asks only once the reload has put the new root in effect, so the answer
+  anchors to it; a folder change that keeps the root, or a reload rejected as
+  invalid (which keeps the old root), does not ask. The answer is applied as a configuration layer,
   identically to a push of the same section (see the accumulate contract in
   configuration-merging-strategy), so nothing about the merge is special-cased
   for having been pulled.
