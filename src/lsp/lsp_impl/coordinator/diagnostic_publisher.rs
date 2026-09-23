@@ -718,13 +718,13 @@ impl DiagnosticPublisher {
             // also covers a server disabled (`enabled: false`) after it already
             // spawned and pushed: its live connection can still emit pushes here,
             // but they must not be recorded. Its previously-published diagnostics
-            // can linger until some other trigger republishes this host — the same
-            // deferred config-change re-merge gap `_self`-disable and empty-cmd
-            // already have (see `republish`'s doc comment); `didChangeConfiguration`
-            // does not proactively republish open hosts. Not fixed here: doing so
-            // unconditionally on every rejected push previously cost a full
-            // lock+snapshot+merge republish per push for the life of the document
-            // (caught by review), for a gap this branch didn't introduce.
+            // are dropped by `filter_stale_host_slots` at the next republish; the
+            // settings reload reparses open documents, and the post-parse
+            // debounced diagnostic republishes any host that can still contribute
+            // — a host that no longer can (e.g. `_self` just disabled and no
+            // injection query) keeps them until some other trigger republishes
+            // it. Republishing on every rejected push instead cost a full
+            // lock+snapshot+merge republish per push for the life of the document.
             return None;
         }
         Some(self.record_push(
@@ -1121,7 +1121,8 @@ impl DiagnosticPublisher {
         // diagnostics don't linger in the editor after the user disables `_self`
         // (or unconfigures the server) via `workspace/didChangeConfiguration`. The
         // slots stay cached (cleared on `didClose`); they're just filtered out of
-        // this publish. (The analogous Region/config-change re-merge is deferred.)
+        // this publish. Region slots get the same treatment once their injection
+        // languages are known (`filter_excluded_region_slots`, below).
         self.filter_stale_host_slots(host, &settings, &mut snapshot);
         // Drop a pull-driven server's push slots when the host-event pull blob
         // (`PullLayer`) is present: that server already contributes via the
@@ -4174,9 +4175,8 @@ mod tests {
         // already spawned and pushed: its still-live connection's next push
         // must be dropped (not recorded as new data), matching every other
         // "not a host server" case. Whether the *previously* published
-        // diagnostics get proactively cleared is a separate, pre-existing,
-        // deferred concern (`republish`'s doc comment; `_self`-disable and
-        // empty-cmd have the identical gap) — not asserted here.
+        // diagnostics get cleared depends on a later republish (see
+        // `record_host_push`) — not asserted here.
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
         register_rust(server);

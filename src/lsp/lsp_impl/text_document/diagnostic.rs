@@ -650,8 +650,9 @@ impl Kakehashi {
             }
             match source {
                 // A `Region` slot only reaches `include` when `region_offsets`
-                // has its offset, i.e. its `pushFallback` is on — so the gate is
-                // already applied; nothing more to check beyond `pull_driven`.
+                // has its offset, i.e. its `pushFallback` is on, and after the
+                // `priorities` retain above — both gates already applied;
+                // nothing more to check beyond `pull_driven`.
                 DiagnosticSource::Region(_) => true,
                 DiagnosticSource::Host => host_admitted.is_some_and(|ctx| {
                     ctx.configs.iter().any(|c| c.server_name == server)
