@@ -2095,11 +2095,23 @@ impl LanguageServerPool {
                     .map(Arc::clone)
             };
             if let Some(shared) = shared
-                && shared.state() == ConnectionState::Ready
                 && shared.supports_workspace_folder_changes()
                 && shared.matches_launch_config(config)
             {
-                return Some(shared);
+                match shared.state() {
+                    ConnectionState::Ready => return Some(shared),
+                    // Registered while still handshaking (it can consolidate
+                    // then): wait it out rather than revive the retired key,
+                    // whose documents already route to the shared instance.
+                    ConnectionState::Initializing => {
+                        return shared
+                            .wait_for_ready(Duration::from_secs(INIT_TIMEOUT_SECS))
+                            .await
+                            .ok()
+                            .map(|()| shared);
+                    }
+                    _ => {}
+                }
             }
         }
         // A connection can exist under this key and simply not be Ready yet —
@@ -5968,6 +5980,33 @@ mod tests {
             .reconnect_by_key(&retired, &shared_config())
             .await
             .expect("the shared instance serves the consolidated root");
+
+        assert!(Arc::ptr_eq(&handle, &shared));
+        assert!(!pool.connections.lock().await.contains_key(&retired));
+    }
+
+    /// The same redirect waits out a shared instance that registered (and so
+    /// consolidated) while still handshaking, instead of reviving the retired
+    /// per-root key whose documents already route to the shared instance.
+    #[tokio::test]
+    async fn reconnect_by_key_waits_for_a_handshaking_shared_instance_that_registered() {
+        let pool = LanguageServerPool::new();
+        let shared =
+            create_handle_with_key(ConnectionState::Initializing, ConnectionKey::shared("lua"))
+                .await;
+        register_folder_changes(&shared);
+        pool.insert_connection(Arc::clone(&shared)).await;
+        let shared_clone = Arc::clone(&shared);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            shared_clone.set_state(ConnectionState::Ready);
+        });
+        let retired = ConnectionKey::new("lua", Some("file:///repo/b".to_string()));
+
+        let handle = pool
+            .reconnect_by_key(&retired, &shared_config())
+            .await
+            .expect("the shared instance serves the consolidated root once Ready");
 
         assert!(Arc::ptr_eq(&handle, &shared));
         assert!(!pool.connections.lock().await.contains_key(&retired));
