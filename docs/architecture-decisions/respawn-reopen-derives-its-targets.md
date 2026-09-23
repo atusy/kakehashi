@@ -311,10 +311,9 @@ that the host has no injections.
 
 ### Known limits of `done`
 
-Tracked as issue #929. The remaining cases affect the report for tree-less
-documents and the content sent by a required open. The next parse's eager open
-can repair the connection, but `done` must not imply that this has already
-happened.
+The remaining limitation tracked in #929 concerns tree-less documents. The
+next parse's eager open can repair the connection, but `done` must not imply
+that this has already happened.
 
 **An invalidation placeholder reads as a current parse.** `invalidate_parse`
 publishes a tree-less snapshot whose `parsed_version` equals the content
@@ -328,14 +327,22 @@ cost is that one command, also for a document that stays tree-less (no parser
 will ever come), which has no regions to route anyway. Same root cause as the
 reload-placeholder issue (#923).
 
-**A `didOpen` can carry superseded content.** `ensure_document_opened` re-reads
-the latest virtual content immediately before enqueue, but that cache is
-refreshed when a `didChange` is FORWARDED, which happens after the reparse the
-edit scheduled. A sweep that claims the document in between reads the older
-content and enqueues it. The open claim does order the eventual
-`didChange` after this `didOpen`, so the downstream converges — but it does not
-order either of them against the command the barrier is about to release, so a
-command can arrive between them.
+### Required opens use revision-validated content
+
+A nonempty resolution carries the same captured incarnation and content
+version into the open. After routing completes, each injection takes the host
+edit lock, checks that revision, and retains the lock through enqueue. An edit
+that supersedes the resolved text makes the repair incomplete. Routing runs
+before this lock is acquired because it may wait on downstream queries.
+
+A required open uses the verified snapshot text directly: the latest forwarded
+virtual-content cache may still lag the completed parse. If another request
+already opened the virtual document, the repair sends a full `didChange` when
+its content differs. A failed enqueue reports incomplete and leaves the sent
+content fingerprint unchanged, so a later attempt can retry. Thus the repair
+cannot report success merely because a document was already opened with older
+text. Ordinary deferred eager opens continue to refresh from the forwarded
+cache, since they do not carry this revision guarantee.
 
 ### Neutral
 
