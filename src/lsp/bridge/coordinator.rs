@@ -765,17 +765,43 @@ impl BridgeCoordinator {
         let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
             return false;
         };
-        self.injections_routed_to_server(
-            settings,
-            host_language,
-            host_uri,
-            &host_uri_lsp,
-            injections,
-            connection.server(),
-            Some(connection),
-        )
-        .await
-        .is_some()
+        // Server-level routing first (no key resolution), then the key per
+        // region only until one matches: a yes needs one region, and this is
+        // asked of every candidate host after a crash.
+        let server = connection.server();
+        let Some((config, for_server)) = self
+            .injections_routed_to_server(
+                settings,
+                host_language,
+                host_uri,
+                &host_uri_lsp,
+                injections,
+                server,
+                None,
+            )
+            .await
+        else {
+            return false;
+        };
+        for injection in for_server {
+            let virtual_uri = super::protocol::VirtualDocumentUri::new(
+                &host_uri_lsp,
+                &injection.language,
+                &injection.region_id,
+            );
+            let Ok(routing_uri) = Url::parse(&virtual_uri.to_uri_string()) else {
+                continue;
+            };
+            if &self
+                .pool
+                .resolved_connection_key(server, &config, &routing_uri)
+                .await
+                == connection
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// `host_uri`'s injections that bridge to `server_name`, with that server's
