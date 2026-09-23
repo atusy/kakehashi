@@ -149,7 +149,7 @@ fn validate_safe_language_name(language: &str) -> Result<(), QueryInstallError> 
 /// installer manages (`QUERY_FILES`).
 ///
 /// Each kind resolves its own `; inherits:` chain when it loads, and a parent it
-/// names but that is not installed makes that load fail outright — so
+/// names that no search path has makes that load fail outright — so
 /// injections.scm's parents matter exactly as much as highlights.scm's. A
 /// kind the installer does not fetch (bindings, captures kinds) resolves its
 /// parents the same way, but only from files the user placed on a search
@@ -291,8 +291,10 @@ fn required_parents(
         .map(|parent| parent.name)
 }
 
-/// Hold every language in an inheritance chain still, and report whether all of
-/// them are installed.
+/// Hold every managed language in an inheritance chain still, and report
+/// whether the chain is complete: every language installed, or, for an
+/// inherited parent with no complete managed copy, provided as a base query by
+/// a search path outside the data directory.
 ///
 /// `Some(guards)` means the managed chain is complete and protected from
 /// install/uninstall while the guards live, so a caller can also read its parser.
@@ -318,7 +320,8 @@ pub(crate) fn lock_complete_chain(
 
 /// What [`probe_chain`] found for an inheritance chain.
 pub(crate) enum ChainProbe {
-    /// Every language is installed; the guards hold them still.
+    /// Every language is installed or provided by a search path; the guards
+    /// hold the managed ones still.
     Complete(Vec<LanguageLock>),
     /// A language is missing, unreadable, or not installable by name.
     Incomplete,
@@ -588,7 +591,8 @@ pub(crate) struct StagedQueryInstall {
     requested_already_complete: bool,
     entries: Vec<StagedQueryDir>,
     /// Every language this install needs on disk — the requested one and its
-    /// whole `; inherits:` chain, whether staged or found already complete.
+    /// `; inherits:` chain, whether staged or found already complete, except
+    /// the parents in `external`.
     /// Sorted, so locking them in this order cannot deadlock against another
     /// install locking an overlapping set.
     dependencies: Vec<String>,
@@ -641,7 +645,8 @@ impl StagedQueryInstall {
     }
 
     /// Languages this install needs to lock before publishing: the requested
-    /// one and every language it reaches through `; inherits:`, sorted.
+    /// one and every language it reaches through `; inherits:` other than
+    /// those a search path provides, sorted.
     pub(crate) fn dependencies(&self) -> &[String] {
         &self.dependencies
     }
@@ -1047,8 +1052,9 @@ fn stage_queries_with_dependencies(
         .filter(|path| fs::canonicalize(path).unwrap_or_else(|_| path.clone()) != data_identity)
         .collect();
     let mut entries = Vec::new();
-    // Every language the recursion visits, staged or already complete: the set
-    // this install needs to still be there when it publishes.
+    // Every language the recursion visits, staged or already complete, other
+    // than those a search path provides: the set this install needs to still
+    // be there when it publishes.
     let mut staged = std::collections::HashSet::new();
     let mut external = std::collections::HashSet::new();
     // On any error the entries collected so far are dropped here, and with them
@@ -1118,8 +1124,8 @@ impl StageRole {
 }
 
 /// Languages a staging walk has visited: `staged` ones (downloaded or found
-/// complete in the data directory) are locked and published, `external` ones are
-/// provided by a search path and only re-checked.
+/// complete in the data directory) are locked, and published when downloaded;
+/// `external` ones are provided by a search path and only re-checked.
 struct StageVisits<'a> {
     staged: &'a mut std::collections::HashSet<String>,
     external: &'a mut std::collections::HashSet<String>,

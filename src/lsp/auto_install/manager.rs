@@ -779,8 +779,8 @@ fn language_is_complete(
     // files — is settled by definition, and must still be readable.
     // The whole chain, not just this language's own queries: a missing inherited
     // parent makes the query load fail outright, and skipping the install over
-    // it is what leaves such a language unrepairable. Every language in the
-    // chain is held still while this decides — an install mid-publish can still
+    // it is what leaves such a language unrepairable. Every managed language in
+    // the chain is held still while this decides — an install mid-publish can still
     // roll its queries back, and a base language can be uninstalled out from
     // under the walk. Non-blocking, so a busy language answers "not ready"
     // rather than stalling the async path.
