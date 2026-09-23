@@ -238,6 +238,18 @@ impl AutoInstallManager {
         true
     }
 
+    /// Undo [`Self::first_query_dependency_check`] for a check that could not
+    /// reach an answer, so a later pass in the same generation checks again.
+    pub(crate) fn forget_query_dependency_check(&self, language: &str, generation: u64) {
+        let mut checked = self
+            .query_dependency_checks
+            .lock()
+            .recover_poison("AutoInstallManager::forget_query_dependency_check");
+        if generation == checked.generation {
+            checked.languages.remove(language);
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn begin_test_claim(
         &self,

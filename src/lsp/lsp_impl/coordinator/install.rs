@@ -326,13 +326,23 @@ impl InstallCoordinator {
         if !self.settings_manager.is_auto_install_enabled(language) {
             return false;
         }
+        let generation = self.cache.semantic_token_generation();
         if !self.should_check_query_dependencies(language, initial_pass) {
             return false;
         }
-        matches!(
-            probe(),
-            QueryChainState::NeedsRepair | QueryChainState::Busy
-        )
+        match probe() {
+            QueryChainState::NeedsRepair => true,
+            QueryChainState::Settled => false,
+            // A held lock is an install mid-publish or another probe reading
+            // the chain, not evidence of a missing language. Leave the answer
+            // to a later pass instead of spawning an install that would find
+            // nothing to do and still reload every document's queries.
+            QueryChainState::Busy => {
+                self.auto_install
+                    .forget_query_dependency_check(language, generation);
+                false
+            }
+        }
     }
 
     /// Try to auto-install a language if not already being installed.
