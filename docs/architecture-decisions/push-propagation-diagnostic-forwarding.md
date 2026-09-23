@@ -487,8 +487,9 @@ Worked traces (servers `a1,a2` in one region, `priorities = [a1, a2]`):
 - Region invalidated by an edit (`close_invalidated_docs`) → evict **all** slots
   for that source across servers, then re-merge.
 - Downstream crash/restart → drop that server's slots, then re-merge
-  (publish-empty-to-clear falls out naturally). A crash is then followed by a
-  rate-limited respawn (ls-bridge-server-pool-coordination), whose re-open
+  (publish-empty-to-clear falls out naturally). While an open document's
+  injected region still routes to that connection, the crash is then followed
+  by a bounded respawn (ls-bridge-server-pool-coordination), whose re-open
   lets the server push again, so the cleared diagnostics return without an
   edit.
 - **Host-layer eager open**: a push-driven `_self` server only pushes once its
