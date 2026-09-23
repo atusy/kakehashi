@@ -142,7 +142,7 @@ filetime = "0.2"
 insta = { version = "1", features = ["json", "redactions"] }
 serial_test = "4"
 rstest = "0.26"
-proptest = "1"
+proptest = { version = "1", default-features = false, features = ["std"] }
 
 # A/B performance comparison of the semantic-tokens hot path across two server
 # binaries (e.g. HEAD vs origin/main). Custom harness (no criterion): it drives
