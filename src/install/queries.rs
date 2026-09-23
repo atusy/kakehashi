@@ -1096,12 +1096,6 @@ fn stage_queries_with_dependencies(
     })
 }
 
-/// Internal recursive helper for staging queries with dependencies.
-///
-/// Appends a language's staging directory to `entries` *after* recursing into
-/// the languages it inherits, so `entries` comes out in dependency order and
-/// publishing it forward puts every base language in place before the language
-/// that needs it.
 /// How a language is reached while staging an install.
 ///
 /// Only the requested language is loaded for itself, and only it may be
@@ -1138,6 +1132,12 @@ struct QueryDependencySource<'a> {
     search_paths: &'a [PathBuf],
 }
 
+/// Internal recursive helper for staging queries with dependencies.
+///
+/// Appends a language's staging directory to `entries` *after* recursing into
+/// the languages it inherits, so `entries` comes out in dependency order and
+/// publishing it forward puts every base language in place before the language
+/// that needs it.
 fn stage_queries_recursive(
     source: &QueryDependencySource<'_>,
     language: &str,
