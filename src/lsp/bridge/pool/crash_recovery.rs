@@ -25,6 +25,13 @@ use crate::error::LockResultExt;
 
 /// Delay before the first recovery attempt; each further consecutive attempt
 /// doubles it.
+///
+/// Longer than the default `maxWaitMs` (1 s) of the `publishDiagnostics` quiet
+/// window, which bounds how long the eviction's cleared publish can be
+/// withheld: a replacement re-pushing inside that window would merge into the
+/// same flush, and the editor would never see the crash. A user who raises
+/// `maxWaitMs` past this delay can see exactly that — the clear and the
+/// re-push collapsed into one publish.
 pub(super) const FIRST_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 /// Consecutive attempts before recovery gives up on a key: 2+4+8+16+32 s, about
