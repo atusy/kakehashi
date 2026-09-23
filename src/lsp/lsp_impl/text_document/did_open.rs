@@ -150,8 +150,9 @@ impl Kakehashi {
                 if auto_install {
                     // A parser, or possibly its query dependency chain, needs
                     // installation. Whether a loaded parser's chain does is
-                    // decided in the spawned task: the probe reads and locks
-                    // files across every search path.
+                    // decided in the spawned task: the probe reads modelines
+                    // across every search path and takes the data directory's
+                    // lock files.
                     //
                     // Move auto-install OFF the ingress writer ticket (#480
                     // liveness): a slow or hung parser *compile* must not hold the
