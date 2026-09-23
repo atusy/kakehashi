@@ -884,4 +884,63 @@ mod tests {
             "an answer that changes no layer must not republish the settings"
         );
     }
+
+    /// The discard compares scopes as well as paths: an unscoped answer asked
+    /// on the launch directory, arriving after a folder at that same path was
+    /// added, was read for the client's global settings rather than for that
+    /// folder — the path alone cannot tell the two apart.
+    #[tokio::test]
+    #[serial(xdg_env)]
+    async fn an_answer_for_a_scope_the_session_left_is_discarded() {
+        let xdg_scratch = tempfile::tempdir().expect("failed to create scratch XDG_CONFIG_HOME");
+        let _xdg_guard = XdgConfigHomeGuard::set(xdg_scratch.path());
+        let release_first = Arc::new(tokio::sync::Notify::new());
+
+        let (service, pulls) = initialized_server_holding_answers(
+            serde_json::Value::Null,
+            vec![
+                serde_json::json!({ "searchPaths": ["/stale"] }),
+                serde_json::Value::Null,
+            ],
+            Some(Arc::clone(&release_first)),
+        )
+        .await;
+        let server = service.inner();
+        let launch_directory = server
+            .settings_manager
+            .root_path()
+            .as_ref()
+            .clone()
+            .expect("precondition: the launch directory stands in as the root");
+
+        let add_the_same_path_while_answering = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while pulls.lock().unwrap().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the first pull must be asked");
+            server
+                .did_change_workspace_folders_impl(DidChangeWorkspaceFoldersParams {
+                    event: WorkspaceFoldersChangeEvent {
+                        added: vec![folder(&launch_directory, "launch")],
+                        removed: Vec::new(),
+                    },
+                })
+                .await;
+            release_first.notify_one();
+        };
+        tokio::join!(pull_now(server), add_the_same_path_while_answering);
+
+        assert!(
+            !server
+                .settings_manager
+                .load_settings()
+                .search_paths
+                .iter()
+                .any(|path| path == "/stale"),
+            "an unscoped answer must not stand in for the folder's"
+        );
+    }
 }
