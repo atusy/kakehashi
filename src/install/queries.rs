@@ -3816,6 +3816,28 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_link_to_another_languages_query_still_declares_its_parents() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        let child = data.join("queries/child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(child.join("highlights.scm"), "existing child").unwrap();
+        let other = data.join("queries/other");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("injections.scm"), "; inherits: parent\n").unwrap();
+        // The loader reads this as child's injections, parent and all.
+        fs::create_dir_all(runtime.join("queries/child")).unwrap();
+        std::os::unix::fs::symlink(
+            other.join("injections.scm"),
+            runtime.join("queries/child/injections.scm"),
+        )
+        .unwrap();
+        assert!(lock_complete_chain(&data, "child", &[runtime]).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_broken_runtime_file_neither_blocks_nor_hides_the_chain() {
         let temp = TempDir::new().unwrap();
         let data = temp.path().join("data");
