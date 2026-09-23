@@ -3734,6 +3734,37 @@ mod tests {
     }
 
     #[test]
+    fn an_upstream_parent_is_installed_even_when_a_search_path_overrides_it() {
+        // A Neovim-style plain override of the parent's highlights does not
+        // give the loader the parent's injections, which the child's
+        // upstream injections.scm inherits.
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        write_runtime_query(&runtime, "parent", "(comment) @comment\n");
+        let base_url = spawn_query_file_server(vec![
+            ("/child/highlights.scm", "(identifier) @variable\n"),
+            ("/child/injections.scm", "; inherits: parent\n"),
+            ("/parent/highlights.scm", "(comment) @comment\n"),
+            ("/parent/injections.scm", "(comment) @injection.content\n"),
+        ]);
+        let staged = stage_queries_with_dependencies(
+            &base_url,
+            "child",
+            &data,
+            false,
+            QueryHttpPolicy::AllowHttpForTests,
+            &[runtime],
+        )
+        .unwrap();
+        staged
+            .publish()
+            .unwrap_or_else(|_| panic!("publish failed"))
+            .commit();
+        assert!(data.join("queries/parent/injections.scm").is_file());
+    }
+
+    #[test]
     fn a_search_path_parent_is_rechecked_before_publication() {
         let temp = TempDir::new().unwrap();
         let data = temp.path().join("data");
