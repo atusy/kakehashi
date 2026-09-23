@@ -450,8 +450,8 @@ impl LanguageServerPool {
                 return OpenOutcome::NotOpened;
             }
 
-            if let Err(e) = self
-                .ensure_document_opened(
+            let opened = if revision.is_some() {
+                self.ensure_document_opened_from_snapshot(
                     &mut sender,
                     host_uri,
                     &virtual_uri,
@@ -459,7 +459,17 @@ impl LanguageServerPool {
                     &connection_key,
                 )
                 .await
-            {
+            } else {
+                self.ensure_document_opened(
+                    &mut sender,
+                    host_uri,
+                    &virtual_uri,
+                    &injection.content,
+                    &connection_key,
+                )
+                .await
+            };
+            if let Err(e) = opened {
                 log::debug!(
                     target: "kakehashi::bridge",
                     "Eager open: failed to open {} on {}: {}",

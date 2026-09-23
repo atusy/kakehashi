@@ -320,6 +320,11 @@ pub(super) struct HostDocSyncState {
 pub(in crate::lsp::bridge) type HostDocuments =
     Mutex<HashMap<String, HashMap<ConnectionKey, HostDocSyncState>>>;
 
+enum VirtualOpenContent<'a> {
+    LatestKnown(&'a str),
+    Snapshot(&'a str),
+}
+
 /// Cancellation-safe rollback for the pre-send virtual-document claim.
 /// Eager-open tasks are deliberately aborted when a newer parse supersedes
 /// them; dropping the handler between claim and FIFO enqueue must not leave a
@@ -2553,6 +2558,26 @@ impl LanguageServerPool {
             .await
     }
 
+    /// Open a missing virtual document from a revision-validated snapshot.
+    /// The caller keeps that revision stable until enqueue completes.
+    pub(crate) async fn ensure_document_opened_from_snapshot<S: message_sender::MessageSender>(
+        &self,
+        sender: &mut S,
+        host_uri: &Url,
+        virtual_uri: &VirtualDocumentUri,
+        virtual_content: &str,
+        connection_key: &ConnectionKey,
+    ) -> io::Result<()> {
+        self.ensure_document_opened_with_content(
+            sender,
+            host_uri,
+            virtual_uri,
+            VirtualOpenContent::Snapshot(virtual_content),
+            connection_key,
+        )
+        .await
+    }
+
     /// Send `didOpen` for the virtual document if not already opened, registering
     /// all tracking state on success. Callers handle error cleanup (router entry
     /// and upstream-request registry).
@@ -2570,6 +2595,24 @@ impl LanguageServerPool {
         host_uri: &Url,
         virtual_uri: &VirtualDocumentUri,
         virtual_content: &str,
+        connection_key: &ConnectionKey,
+    ) -> io::Result<()> {
+        self.ensure_document_opened_with_content(
+            sender,
+            host_uri,
+            virtual_uri,
+            VirtualOpenContent::LatestKnown(virtual_content),
+            connection_key,
+        )
+        .await
+    }
+
+    async fn ensure_document_opened_with_content<S: message_sender::MessageSender>(
+        &self,
+        sender: &mut S,
+        host_uri: &Url,
+        virtual_uri: &VirtualDocumentUri,
+        content: VirtualOpenContent<'_>,
         connection_key: &ConnectionKey,
     ) -> io::Result<()> {
         let connection_generation = self.document_tracker.connection_generation(connection_key);
@@ -2653,19 +2696,25 @@ impl LanguageServerPool {
         self.document_tracker
             .register_pending_document(host_uri, virtual_uri, connection_key)
             .await;
-        // Read as close to enqueue as possible, after pending registration's
-        // awaits. If an edit publishes after this read, it observes the open
-        // claim and serializes a didChange behind this didOpen transition.
-        let current_content = self.latest_virtual_contents.get(host_uri).and_then(|host| {
-            host.contents
-                .get(virtual_uri.language())
-                .and_then(|regions| {
-                    regions
-                        .get(virtual_uri.region_id())
-                        .map(|entry| Arc::clone(entry.value()))
-                })
-        });
-        let virtual_content = current_content.as_deref().unwrap_or(virtual_content);
+        // A deferred open refreshes from the forwarded-content cache as close
+        // to enqueue as possible. A revision-guarded repair already owns newer
+        // authoritative text: that cache can still trail the completed parse.
+        let (provided, current_content) = match content {
+            VirtualOpenContent::LatestKnown(provided) => (
+                provided,
+                self.latest_virtual_contents.get(host_uri).and_then(|host| {
+                    host.contents
+                        .get(virtual_uri.language())
+                        .and_then(|regions| {
+                            regions
+                                .get(virtual_uri.region_id())
+                                .map(|entry| Arc::clone(entry.value()))
+                        })
+                }),
+            ),
+            VirtualOpenContent::Snapshot(provided) => (provided, None),
+        };
+        let virtual_content = current_content.as_deref().unwrap_or(provided);
         let did_open = build_didopen_notification(virtual_uri, virtual_content);
         if let Err(e) = sender.send_notification(did_open).await {
             self.document_tracker
@@ -8112,6 +8161,43 @@ mod tests {
         assert_eq!(
             message["params"]["textDocument"]["text"],
             "print('current')"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_open_ignores_a_lagging_forwarded_content_cache() {
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///test/snapshot-open.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        pool.forward_didchange_to_opened_docs(
+            &host_uri,
+            1,
+            &[super::super::coordinator::BridgeInjection {
+                language: "lua".into(),
+                region_id: TEST_ULID_LUA_0.into(),
+                content: "print('previous')".into(),
+            }],
+        )
+        .await;
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(1);
+        pool.ensure_document_opened_from_snapshot(
+            &mut sender,
+            &host_uri,
+            &virtual_uri,
+            "print('resolved')",
+            &key,
+        )
+        .await
+        .unwrap();
+        let OutboundMessage::Untracked(message) = rx.try_recv().unwrap() else {
+            panic!("didOpen must be an untracked notification");
+        };
+        assert_eq!(message["method"], "textDocument/didOpen");
+        assert_eq!(
+            message["params"]["textDocument"]["text"], "print('resolved')",
+            "a validated repair snapshot is newer than the not-yet-forwarded cache"
         );
     }
 
