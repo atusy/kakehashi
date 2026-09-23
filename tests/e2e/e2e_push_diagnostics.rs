@@ -1810,3 +1810,68 @@ fn e2e_priorities_change_retracts_an_already_published_push() {
     client.send_request("shutdown", json!(null));
     client.send_notification("exit", json!(null));
 }
+
+#[test]
+fn e2e_push_hidden_from_publish_but_pulled_still_refreshes_pull_clients() {
+    // The two surfaces keep separate keys: a push the publish allowlist hides
+    // but the pull fold admits changes what the editor's NEXT pull returns
+    // while leaving the published set unchanged. A pull client learns of it
+    // only through `workspace/diagnostic/refresh`, so the hidden push must
+    // still nudge — else it sees the push only after its next edit.
+    let config_dir = tempfile::TempDir::new().expect("temp dir");
+    let config_path = config_dir.path().join("publish_only_exclusion.toml");
+    std::fs::write(&config_path, "").expect("write config");
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("utf8 path"))
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": { "workspace": { "diagnostics": { "refreshSupport": true } } },
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-push": { "cmd": [mock_bin(), "diagnostics-push"], "languages": ["lua"] }
+                },
+                "languages": {
+                    "markdown": {
+                        "bridge": {
+                            "lua": {
+                                "aggregation": {
+                                    "textDocument/publishDiagnostics": { "priorities": ["pyright"] }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    open_host(&mut client);
+
+    let (refresh_id, _) = client
+        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(15))
+        .expect("a push the pull fold admits must nudge pull clients even when unpublished");
+    client.send_response(refresh_id, json!(null));
+
+    let response = client.send_request(
+        "textDocument/diagnostic",
+        json!({ "textDocument": { "uri": MD_URI } }),
+    );
+    let items = response["result"]["items"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        has_mock_push_on_line(&items, HOST_LINE),
+        "the nudged pull must carry the push the publish hid: {items:?}"
+    );
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
