@@ -2417,9 +2417,10 @@ fn spawn_crash_recovery(
     tokio::spawn(async move {
         let bridge = Arc::clone(injection.bridge());
         let pool = bridge.pool();
-        let Some(key) = pool.crashed_connection(connection_id).await else {
+        let Some(crashed) = pool.crashed_connection(connection_id).await else {
             return;
         };
+        let key = crashed.key.clone();
         if key.is_shared() {
             // Nothing here can re-root a dead shared instance: the marker roots
             // it served died with its folder set. The next document that routes
@@ -2430,7 +2431,7 @@ fn spawn_crash_recovery(
             );
             return;
         }
-        let delay = match pool.schedule_crash_recovery(&key) {
+        let delay = match pool.schedule_crash_recovery(&crashed) {
             RecoveryDecision::Retry { attempt, delay } => {
                 log::info!(
                     target: "kakehashi::bridge",

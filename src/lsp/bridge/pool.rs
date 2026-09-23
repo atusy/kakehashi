@@ -38,6 +38,15 @@ pub(crate) use connection_handle::{ConnectionHandle, NotificationSendResult};
 pub(crate) use connection_key::ConnectionKey;
 pub(crate) use connection_state::ConnectionState;
 use crash_recovery::CrashRecoveryRegistry;
+
+/// A connection whose reader exited while the pool still held it as failed
+/// (see [`LanguageServerPool::crashed_connection`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CrashedConnection {
+    pub(crate) key: ConnectionKey,
+    /// How long the connection had existed when it crashed.
+    pub(crate) uptime: Duration,
+}
 pub(crate) use crash_recovery::RecoveryDecision;
 pub(in crate::lsp::bridge) use document_tracker::DocumentTracker;
 pub(crate) use document_tracker::{OpenedVirtualDoc, VirtualUriObserver};
@@ -2325,7 +2334,7 @@ impl LanguageServerPool {
     pub(crate) async fn crashed_connection(
         &self,
         connection_id: super::ProgressConnectionId,
-    ) -> Option<ConnectionKey> {
+    ) -> Option<CrashedConnection> {
         if self.shutting_down.load(Ordering::Relaxed) {
             return None;
         }
@@ -2334,14 +2343,16 @@ impl LanguageServerPool {
             .values()
             .find(|handle| handle.connection_id() == Some(connection_id))
             .filter(|handle| handle.state() == ConnectionState::Failed)
-            .map(|handle| handle.key().clone())
+            .map(|handle| CrashedConnection {
+                key: handle.key().clone(),
+                uptime: handle.uptime(),
+            })
     }
 
-    /// Decide when to recover `key`'s crashed connection (see
+    /// Decide when to recover a crashed connection (see
     /// [`CrashRecoveryRegistry::schedule`]).
-    pub(crate) fn schedule_crash_recovery(&self, key: &ConnectionKey) -> RecoveryDecision {
-        self.crash_recovery
-            .schedule(key, tokio::time::Instant::now())
+    pub(crate) fn schedule_crash_recovery(&self, crashed: &CrashedConnection) -> RecoveryDecision {
+        self.crash_recovery.schedule(&crashed.key, crashed.uptime)
     }
 
     /// Start a scheduled recovery of `key`: whether the connection the pool
@@ -2356,8 +2367,7 @@ impl LanguageServerPool {
     /// would keep a hung (liveness-failed but running) process alive until the
     /// attempt ends, next to its replacement.
     pub(crate) async fn begin_crash_recovery_attempt(&self, key: &ConnectionKey) -> bool {
-        self.crash_recovery
-            .begin_attempt(key, tokio::time::Instant::now());
+        self.crash_recovery.begin_attempt(key);
         if self.shutting_down.load(Ordering::Relaxed) {
             return false;
         }
@@ -11385,7 +11395,10 @@ mod tests {
         );
 
         handle.set_state(ConnectionState::Failed);
-        assert_eq!(pool.crashed_connection(id).await, Some(key.clone()));
+        assert_eq!(
+            pool.crashed_connection(id).await.map(|crashed| crashed.key),
+            Some(key.clone())
+        );
         let other = pool.progress_registry.new_connection_id();
         assert!(
             pool.crashed_connection(other).await.is_none(),

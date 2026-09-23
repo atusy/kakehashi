@@ -8,37 +8,36 @@
 //!
 //! This registry only decides WHEN, per connection key. A server that dies on
 //! every start would otherwise be respawned in a hot loop, so attempts back off
-//! exponentially and stop after [`MAX_CONSECUTIVE_ATTEMPTS`]. The count resets
-//! once a connection outlives [`HEALTHY_PERIOD`] after the last attempt, so an
-//! occasional crash in a long session is always recovered. Giving up only stops
-//! the proactive path: the next edit or request still respawns the server the
-//! ordinary way.
+//! exponentially and stop after [`MAX_CONSECUTIVE_ATTEMPTS`]. The count starts
+//! over only when a connection that ran for at least [`HEALTHY_PERIOD`]
+//! crashes: a crash that ends a healthy run is a new incident, while one that
+//! ends a short run is the same one continuing — however long ago the last
+//! attempt was, so an edit that restarts a server recovery gave up on does not
+//! buy that server another round. Giving up only stops the proactive path: the
+//! next edit or request still respawns the server the ordinary way.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
-
-use tokio::time::Instant;
 
 use super::ConnectionKey;
 use crate::error::LockResultExt;
 
 /// Delay before the first recovery attempt; each further consecutive attempt
 /// doubles it.
-///
-/// Not shorter than the 1 s per-host wire quiet window: the eviction's cleared
-/// publish can be withheld into that window's trailing flush, and a replacement
-/// re-pushing inside it would merge into the same flush — the editor would
-/// never see the crash, and neither would a test asserting it.
-pub(crate) const FIRST_RETRY_DELAY: Duration = Duration::from_secs(2);
+pub(super) const FIRST_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 /// Consecutive attempts before recovery gives up on a key: 2+4+8+16+32 s, about
 /// a minute of a server dying on every start.
-pub(crate) const MAX_CONSECUTIVE_ATTEMPTS: u32 = 5;
+pub(super) const MAX_CONSECUTIVE_ATTEMPTS: u32 = 5;
 
-/// How long after the last attempt a crash counts as unrelated to it, starting
-/// the backoff over.
-pub(crate) const HEALTHY_PERIOD: Duration = Duration::from_secs(60);
+// The delay doubles per attempt from a `u32` factor; keep the largest one well
+// inside `u32` so raising the cap cannot silently overflow it.
+const _: () = assert!(MAX_CONSECUTIVE_ATTEMPTS <= 16);
+
+/// How long a connection must have run for its crash to start the backoff
+/// over.
+pub(super) const HEALTHY_PERIOD: Duration = Duration::from_secs(60);
 
 /// What to do about a connection that just crashed.
 #[derive(Debug, PartialEq, Eq)]
@@ -57,19 +56,19 @@ pub(crate) enum RecoveryDecision {
 #[derive(Default)]
 struct KeyState {
     attempts: u32,
-    last_attempt_at: Option<Instant>,
     scheduled: bool,
     gave_up: bool,
 }
 
 #[derive(Default)]
-pub(crate) struct CrashRecoveryRegistry {
+pub(super) struct CrashRecoveryRegistry {
     keys: Mutex<HashMap<ConnectionKey, KeyState>>,
 }
 
 impl CrashRecoveryRegistry {
-    /// Decide how to recover `key`'s connection, which crashed at `now`.
-    pub(crate) fn schedule(&self, key: &ConnectionKey, now: Instant) -> RecoveryDecision {
+    /// Decide how to recover `key`'s connection, which crashed after running
+    /// for `uptime`.
+    pub(super) fn schedule(&self, key: &ConnectionKey, uptime: Duration) -> RecoveryDecision {
         let mut keys = self
             .keys
             .lock()
@@ -78,10 +77,7 @@ impl CrashRecoveryRegistry {
         if state.scheduled {
             return RecoveryDecision::AlreadyScheduled;
         }
-        if state
-            .last_attempt_at
-            .is_some_and(|at| now.saturating_duration_since(at) >= HEALTHY_PERIOD)
-        {
+        if uptime >= HEALTHY_PERIOD {
             *state = KeyState::default();
         }
         if state.attempts >= MAX_CONSECUTIVE_ATTEMPTS {
@@ -101,20 +97,18 @@ impl CrashRecoveryRegistry {
         }
     }
 
-    /// Mark `key`'s scheduled recovery as starting at `now`.
+    /// Mark `key`'s scheduled recovery as starting.
     ///
     /// Clears the schedule BEFORE the respawn, not after it: a replacement that
     /// crashes during its own handshake reports that crash while the attempt is
     /// still awaiting the handshake, and that crash must schedule the next
     /// attempt rather than read as already scheduled.
-    pub(crate) fn begin_attempt(&self, key: &ConnectionKey, now: Instant) {
+    pub(super) fn begin_attempt(&self, key: &ConnectionKey) {
         let mut keys = self
             .keys
             .lock()
             .recover_poison("CrashRecoveryRegistry::begin_attempt");
-        let state = keys.entry(key.clone()).or_default();
-        state.scheduled = false;
-        state.last_attempt_at = Some(now);
+        keys.entry(key.clone()).or_default().scheduled = false;
     }
 }
 
@@ -126,11 +120,14 @@ mod tests {
         ConnectionKey::for_server("crashy")
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn first_crash_retries_after_the_first_delay() {
+    /// A replacement that died shortly after starting.
+    const SHORT_RUN: Duration = Duration::from_millis(100);
+
+    #[test]
+    fn first_crash_retries_after_the_first_delay() {
         let registry = CrashRecoveryRegistry::default();
         assert_eq!(
-            registry.schedule(&key(), Instant::now()),
+            registry.schedule(&key(), SHORT_RUN),
             RecoveryDecision::Retry {
                 attempt: 1,
                 delay: FIRST_RETRY_DELAY
@@ -138,69 +135,65 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_second_crash_report_while_scheduled_is_absorbed() {
+    #[test]
+    fn a_second_crash_report_while_scheduled_is_absorbed() {
         let registry = CrashRecoveryRegistry::default();
-        let now = Instant::now();
-        let _ = registry.schedule(&key(), now);
+        let _ = registry.schedule(&key(), SHORT_RUN);
         assert_eq!(
-            registry.schedule(&key(), now),
+            registry.schedule(&key(), SHORT_RUN),
             RecoveryDecision::AlreadyScheduled
         );
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn consecutive_crashes_back_off_then_give_up_once() {
+    #[test]
+    fn consecutive_crashes_back_off_then_give_up_once() {
         let registry = CrashRecoveryRegistry::default();
-        let mut now = Instant::now();
         for attempt in 1..=MAX_CONSECUTIVE_ATTEMPTS {
             assert_eq!(
-                registry.schedule(&key(), now),
+                registry.schedule(&key(), SHORT_RUN),
                 RecoveryDecision::Retry {
                     attempt,
                     delay: FIRST_RETRY_DELAY * 2u32.pow(attempt - 1)
                 }
             );
-            now += FIRST_RETRY_DELAY * 2u32.pow(attempt - 1);
-            registry.begin_attempt(&key(), now);
-            // The replacement dies right away.
-            now += Duration::from_millis(100);
+            registry.begin_attempt(&key());
         }
         assert_eq!(
-            registry.schedule(&key(), now),
+            registry.schedule(&key(), SHORT_RUN),
             RecoveryDecision::GiveUp {
                 attempts: MAX_CONSECUTIVE_ATTEMPTS
             }
         );
-        assert_eq!(registry.schedule(&key(), now), RecoveryDecision::Exhausted);
+        assert_eq!(
+            registry.schedule(&key(), SHORT_RUN),
+            RecoveryDecision::Exhausted
+        );
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_crash_during_the_attempt_schedules_the_next_one() {
+    #[test]
+    fn a_crash_during_the_attempt_schedules_the_next_one() {
         let registry = CrashRecoveryRegistry::default();
-        let now = Instant::now();
-        let _ = registry.schedule(&key(), now);
-        registry.begin_attempt(&key(), now);
+        let _ = registry.schedule(&key(), SHORT_RUN);
+        registry.begin_attempt(&key());
         assert!(matches!(
-            registry.schedule(&key(), now),
+            registry.schedule(&key(), SHORT_RUN),
             RecoveryDecision::Retry { attempt: 2, .. }
         ));
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_healthy_period_resets_the_backoff_even_after_giving_up() {
+    #[test]
+    fn a_crash_ending_a_healthy_run_starts_over_even_after_giving_up() {
         let registry = CrashRecoveryRegistry::default();
-        let now = Instant::now();
         for _ in 0..MAX_CONSECUTIVE_ATTEMPTS {
-            let _ = registry.schedule(&key(), now);
-            registry.begin_attempt(&key(), now);
+            let _ = registry.schedule(&key(), SHORT_RUN);
+            registry.begin_attempt(&key());
         }
         assert!(matches!(
-            registry.schedule(&key(), now),
+            registry.schedule(&key(), SHORT_RUN),
             RecoveryDecision::GiveUp { .. }
         ));
         assert_eq!(
-            registry.schedule(&key(), now + HEALTHY_PERIOD),
+            registry.schedule(&key(), HEALTHY_PERIOD),
             RecoveryDecision::Retry {
                 attempt: 1,
                 delay: FIRST_RETRY_DELAY
@@ -208,15 +201,30 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn keys_back_off_independently() {
+    /// Time alone does not heal: after giving up, a server an edit restarts
+    /// that dies right away again is the same failure, not a new round.
+    #[test]
+    fn a_short_run_after_giving_up_stays_exhausted() {
         let registry = CrashRecoveryRegistry::default();
-        let now = Instant::now();
-        let _ = registry.schedule(&key(), now);
-        registry.begin_attempt(&key(), now);
-        let _ = registry.schedule(&key(), now);
+        for _ in 0..MAX_CONSECUTIVE_ATTEMPTS {
+            let _ = registry.schedule(&key(), SHORT_RUN);
+            registry.begin_attempt(&key());
+        }
+        let _ = registry.schedule(&key(), SHORT_RUN);
+        assert_eq!(
+            registry.schedule(&key(), SHORT_RUN),
+            RecoveryDecision::Exhausted
+        );
+    }
+
+    #[test]
+    fn keys_back_off_independently() {
+        let registry = CrashRecoveryRegistry::default();
+        let _ = registry.schedule(&key(), SHORT_RUN);
+        registry.begin_attempt(&key());
+        let _ = registry.schedule(&key(), SHORT_RUN);
         assert!(matches!(
-            registry.schedule(&ConnectionKey::for_server("other"), now),
+            registry.schedule(&ConnectionKey::for_server("other"), SHORT_RUN),
             RecoveryDecision::Retry { attempt: 1, .. }
         ));
     }

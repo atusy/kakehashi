@@ -193,6 +193,9 @@ pub(crate) struct ConnectionHandle {
     /// spawn so an exit notice, which carries only the id, can be matched back
     /// to the exact handle — a replacement under the same key has a new id.
     connection_id: OnceLock<crate::lsp::bridge::ProgressConnectionId>,
+    /// When this handle (and its process) was created, so crash recovery can
+    /// tell a crash that ends a long healthy run from one that ends a start.
+    created_at: tokio::time::Instant,
 }
 
 impl ConnectionHandle {
@@ -282,6 +285,7 @@ impl ConnectionHandle {
             launch_config: OnceLock::new(),
             spawn_root: OnceLock::new(),
             connection_id: OnceLock::new(),
+            created_at: tokio::time::Instant::now(),
         }
     }
 
@@ -328,6 +332,11 @@ impl ConnectionHandle {
     /// built without a spawn (tests).
     pub(super) fn connection_id(&self) -> Option<crate::lsp::bridge::ProgressConnectionId> {
         self.connection_id.get().copied()
+    }
+
+    /// How long this connection has existed.
+    pub(super) fn uptime(&self) -> std::time::Duration {
+        self.created_at.elapsed()
     }
 
     pub(super) fn launch_config(&self) -> Option<&crate::config::settings::BridgeServerConfig> {
