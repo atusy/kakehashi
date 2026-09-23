@@ -219,9 +219,9 @@ Clients that declare `workspace.configuration` support are also asked for the
 `kakehashi` section with `workspace/configuration`:
 
 - once the handshake completes (`initialized`);
-- whenever `workspace/didChangeConfiguration` carries no usable `settings`
-  (`null` or `{}`, as VS Code sends) — the notification is then a trigger and
-  the answer is the content;
+- whenever `workspace/didChangeConfiguration` carries empty `settings` —
+  `null`, as vscode-languageclient sends, or `{}` — the notification is then a
+  trigger and the answer is the content;
 - after `workspace/didChangeWorkspaceFolders` moves the workspace root (see
   below).
 
