@@ -66,10 +66,19 @@ impl MetadataCache {
         // Ensure cache directory exists
         fs::create_dir_all(&self.cache_dir)?;
 
+        #[cfg_attr(not(unix), expect(unused_mut))]
+        let mut builder = tempfile::Builder::new();
+        // Request the same mode fs::write uses so umask, not tempfile's
+        // owner-only default, decides who can read the published cache.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(fs::Permissions::from_mode(0o666));
+        }
         // Keep partial writes away from readers and replace a leaf symlink
         // itself rather than opening its target. The sibling stays on the same
         // filesystem so publication can use an atomic replacement.
-        let mut temporary = tempfile::NamedTempFile::new_in(&self.cache_dir)?;
+        let mut temporary = builder.tempfile_in(&self.cache_dir)?;
         temporary.write_all(content.as_bytes())?;
         temporary.as_file().sync_all()?;
         temporary.persist(self.cache_path()).map_err(|e| e.error)?;
