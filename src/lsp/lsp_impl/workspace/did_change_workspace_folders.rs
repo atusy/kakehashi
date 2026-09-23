@@ -2,8 +2,7 @@
 
 use tower_lsp_server::ls_types::DidChangeWorkspaceFoldersParams;
 
-use crate::config::WorkspaceSettings;
-use crate::lsp::load_settings_with_client_layers;
+use crate::error::LockResultExt;
 
 use super::super::{Kakehashi, lifecycle::config_root_after_folder_change, lock_settings_reload};
 
@@ -68,70 +67,55 @@ impl Kakehashi {
             .pool()
             .workspace_folders()
             .and_then(|folders| folders.first().cloned());
-        let root_path = config_root_after_folder_change(
+        let (root_path, root_scope) = config_root_after_folder_change(
             first_folder.as_ref().map(|folder| &folder.uri),
-            self.settings_manager.folderless_root_path(),
+            (
+                self.settings_manager.folderless_root_path(),
+                self.settings_manager.folderless_root_scope(),
+            ),
         );
 
         // The root stays local until the settings derived from it are the ones
         // in effect. Publishing it earlier would leave a rejected reload with
         // the new root over the old snapshot, so the next pushed layer would
         // anchor to a workspace the settings in effect know nothing about.
-        let client_overrides = self
-            .client_settings_overrides
+        let client_layers = self
+            .client_layers
             .read()
-            .expect("client settings overrides lock poisoned")
-            .clone();
-        let outcome = load_settings_with_client_layers(
-            root_path.as_deref(),
-            client_overrides,
-            self.home_dir.as_deref(),
-            |var| std::env::var(var).ok(),
-            // Explicit files are never re-read. Initialize retained their
-            // already-parsed, already-anchored layers specifically for this
-            // replay; only client-relative layers move with the workspace.
-            self.explicit_config.get().cloned().flatten(),
-        );
-        self.notifier().log_settings_events(&outcome.events).await;
-        if outcome.deprecated_keys.capture_mappings
-            && self
-                .settings_manager
-                .claim_capture_mappings_deprecation_warning()
+            .recover_poison("client_layers replay")
+            .to_fold_order();
+        match self
+            .recompose_settings(root_path.as_deref(), client_layers)
+            .await
         {
-            self.notifier()
-                .show_warning(crate::config::deprecation::CAPTURE_MAPPINGS_DEPRECATION_NOTICE)
-                .await;
-        }
-        if let Some(notice) = outcome.empty_container_notice.as_deref()
-            && self
-                .settings_manager
-                .claim_empty_container_migration_warning()
-        {
-            self.notifier().show_warning(notice).await;
-        }
-        let raw = outcome
-            .raw_settings
-            .unwrap_or_else(crate::config::defaults::default_settings);
-        match WorkspaceSettings::try_from_settings(
-            &raw,
-            self.home_dir.as_deref(),
-            crate::config::expand::with_kakehashi_defaults(|var| std::env::var(var).ok()),
-        ) {
-            Ok(settings) => {
+            Ok(super::recompose::Recomposed {
+                raw,
+                settings,
+                base,
+            }) => {
+                // The files were read for the new root: the prefix a later
+                // client-layer rebuild resumes from is theirs now.
+                *self
+                    .settings_base
+                    .write()
+                    .recover_poison("settings_base root change") = base;
                 let warnings = Self::misconfigured_settings_warnings(&settings);
-                let root_changed = *self.settings_manager.root_path() != root_path;
-                self.settings_manager.set_root_path(root_path);
+                let root_changed = *self.settings_manager.root_path() != root_path
+                    || self.settings_manager.root_scope() != root_scope;
+                self.settings_manager.set_root(root_path, root_scope);
                 self.apply_raw_settings_locked(&reload, raw, settings).await;
                 drop(reload);
                 self.warn_on_misconfigured_settings(&warnings).await;
-                // The client's configuration was read while the session sat in
-                // the old workspace, and even unscoped an editor may resolve it
-                // per workspace. Asked only once the new root is in effect, so
-                // the answer anchors to it; a rejected reload keeps the old
-                // root, where an answer would anchor to a workspace the editor
-                // has left. Awaited like the pull a
-                // no-payload `didChangeConfiguration` triggers, under the same
-                // timeout and single-flight.
+                // The client's configuration was asked for the old root's
+                // scope, and does not describe the new one. Asked only once the
+                // new root is in effect, so the answer names and anchors to it;
+                // a rejected reload keeps the old root, where an answer would
+                // anchor to a workspace the editor has left. Until it arrives,
+                // the old answer stays in effect: withdrawing it here would run
+                // this reload without the client's configuration, respawning
+                // every bridge server configured only through the editor.
+                // Awaited like the pull a no-payload `didChangeConfiguration`
+                // triggers, under the same timeout and single-flight.
                 if root_changed {
                     self.pull_client_configuration().await;
                 }
@@ -508,9 +492,221 @@ mod tests {
         .expect("a pull must not hang");
     }
 
-    /// An answer asked while the session sat at one root and arriving after it
-    /// moved to another was read for a workspace no longer selected: it is
-    /// dropped, and the root change's own pull asks again.
+    fn scope_of(pull: &serde_json::Value) -> Option<&str> {
+        pull["items"][0]["scopeUri"].as_str()
+    }
+
+    /// The pull names the selected configuration root as its scope, so the
+    /// client answers for the workspace the settings are resolved against —
+    /// and a root change asks for the new root's scope.
+    #[tokio::test]
+    #[serial(xdg_env)]
+    async fn the_pull_is_scoped_to_the_selected_root() {
+        let xdg_scratch = tempfile::tempdir().expect("failed to create scratch XDG_CONFIG_HOME");
+        let _xdg_guard = XdgConfigHomeGuard::set(xdg_scratch.path());
+        let first = tempfile::tempdir().expect("failed to create first workspace dir");
+        let second = tempfile::tempdir().expect("failed to create second workspace dir");
+
+        let (service, pulls) =
+            initialized_pull_capable_server(first.path(), serde_json::Value::Null).await;
+        let server = service.inner();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            server.did_change_configuration_impl(
+                tower_lsp_server::ls_types::DidChangeConfigurationParams {
+                    settings: serde_json::Value::Null,
+                },
+            ),
+        )
+        .await
+        .expect("a pull must not hang");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            server.did_change_workspace_folders_impl(DidChangeWorkspaceFoldersParams {
+                event: WorkspaceFoldersChangeEvent {
+                    added: vec![folder(second.path(), "second")],
+                    removed: vec![folder(first.path(), "first")],
+                },
+            }),
+        )
+        .await
+        .expect("a root change must not hang");
+
+        let pulls = pulls.lock().unwrap();
+        let scopes = pulls.iter().map(scope_of).collect::<Vec<_>>();
+        assert_eq!(
+            scopes,
+            vec![
+                Some(folder(first.path(), "first").uri.as_str()),
+                Some(folder(second.path(), "second").uri.as_str()),
+            ],
+            "each pull must name the root selected when it was asked"
+        );
+    }
+
+    /// A root kakehashi fell back to on its own — the launch directory, for a
+    /// client that named no workspace — is not the client's to scope by, so
+    /// the pull asks for the client's global configuration.
+    #[tokio::test]
+    #[serial(xdg_env)]
+    async fn a_session_without_a_client_root_pulls_unscoped() {
+        let xdg_scratch = tempfile::tempdir().expect("failed to create scratch XDG_CONFIG_HOME");
+        let _xdg_guard = XdgConfigHomeGuard::set(xdg_scratch.path());
+
+        let (service, pulls) =
+            initialized_server_answering(serde_json::Value::Null, vec![serde_json::Value::Null])
+                .await;
+        let server = service.inner();
+        assert!(
+            server.settings_manager.root_path().is_some(),
+            "precondition: the launch directory stands in as the root"
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            server.did_change_configuration_impl(
+                tower_lsp_server::ls_types::DidChangeConfigurationParams {
+                    settings: serde_json::Value::Null,
+                },
+            ),
+        )
+        .await
+        .expect("a pull must not hang");
+
+        let pulls = pulls.lock().unwrap();
+        assert_eq!(pulls.len(), 1);
+        assert_eq!(scope_of(&pulls[0]), None);
+    }
+
+    fn language_server(name: &str) -> serde_json::Value {
+        serde_json::json!({ "languageServers": { name: { "cmd": [name], "languages": ["zz"] } } })
+    }
+
+    fn has_language_server(server: &Kakehashi, name: &str) -> bool {
+        server
+            .settings_manager
+            .load_settings()
+            .language_servers
+            .contains_key(name)
+    }
+
+    /// A pull answer is the client's whole configuration for the scope, not a
+    /// delta: a newer answer takes the older one's place rather than
+    /// accumulating over it, so a server the client stopped configuring goes.
+    #[tokio::test]
+    #[serial(xdg_env)]
+    async fn a_newer_pull_answer_replaces_the_previous_one() {
+        let xdg_scratch = tempfile::tempdir().expect("failed to create scratch XDG_CONFIG_HOME");
+        let _xdg_guard = XdgConfigHomeGuard::set(xdg_scratch.path());
+        let first = tempfile::tempdir().expect("failed to create workspace dir");
+
+        let (service, _pulls) = initialized_server_answering(
+            serde_json::json!([folder(first.path(), "first")]),
+            vec![language_server("old-server"), language_server("new-server")],
+        )
+        .await;
+        let server = service.inner();
+
+        pull_now(server).await;
+        assert!(has_language_server(server, "old-server"), "precondition");
+        pull_now(server).await;
+
+        assert!(has_language_server(server, "new-server"));
+        assert!(
+            !has_language_server(server, "old-server"),
+            "the older answer must not survive beneath the newer one"
+        );
+    }
+
+    /// An answer that holds nothing for kakehashi — only keys the editor keeps
+    /// in the same section — says the client configures nothing here now, so
+    /// it withdraws what the previous answer configured.
+    #[tokio::test]
+    #[serial(xdg_env)]
+    async fn an_answer_with_nothing_for_kakehashi_withdraws_the_previous_one() {
+        let xdg_scratch = tempfile::tempdir().expect("failed to create scratch XDG_CONFIG_HOME");
+        let _xdg_guard = XdgConfigHomeGuard::set(xdg_scratch.path());
+        let first = tempfile::tempdir().expect("failed to create workspace dir");
+
+        let (service, _pulls) = initialized_server_answering(
+            serde_json::json!([folder(first.path(), "first")]),
+            vec![
+                language_server("old-server"),
+                serde_json::json!({ "trace": { "server": "off" } }),
+            ],
+        )
+        .await;
+        let server = service.inner();
+
+        pull_now(server).await;
+        assert!(has_language_server(server, "old-server"), "precondition");
+        pull_now(server).await;
+
+        assert!(!has_language_server(server, "old-server"));
+    }
+
+    /// `null` is the client saying it cannot answer, not that it configures
+    /// nothing: the previous answer stays in effect.
+    #[tokio::test]
+    #[serial(xdg_env)]
+    async fn a_null_answer_keeps_the_previous_one() {
+        let xdg_scratch = tempfile::tempdir().expect("failed to create scratch XDG_CONFIG_HOME");
+        let _xdg_guard = XdgConfigHomeGuard::set(xdg_scratch.path());
+        let first = tempfile::tempdir().expect("failed to create workspace dir");
+
+        let (service, _pulls) = initialized_server_answering(
+            serde_json::json!([folder(first.path(), "first")]),
+            vec![language_server("old-server"), serde_json::Value::Null],
+        )
+        .await;
+        let server = service.inner();
+
+        pull_now(server).await;
+        pull_now(server).await;
+
+        assert!(has_language_server(server, "old-server"));
+    }
+
+    /// The newest answer is the newest statement of the client's
+    /// configuration, so it lands above pushes that arrived before it rather
+    /// than back where the previous answer sat.
+    #[tokio::test]
+    #[serial(xdg_env)]
+    async fn a_pull_answer_lands_above_older_pushes() {
+        let xdg_scratch = tempfile::tempdir().expect("failed to create scratch XDG_CONFIG_HOME");
+        let _xdg_guard = XdgConfigHomeGuard::set(xdg_scratch.path());
+        let first = tempfile::tempdir().expect("failed to create workspace dir");
+
+        let (service, _pulls) = initialized_server_answering(
+            serde_json::json!([folder(first.path(), "first")]),
+            vec![
+                serde_json::json!({ "searchPaths": ["/pulled-first"] }),
+                serde_json::json!({ "searchPaths": ["/pulled-second"] }),
+            ],
+        )
+        .await;
+        let server = service.inner();
+
+        pull_now(server).await;
+        server
+            .did_change_configuration_impl(
+                tower_lsp_server::ls_types::DidChangeConfigurationParams {
+                    settings: serde_json::json!({ "kakehashi": { "searchPaths": ["/pushed"] } }),
+                },
+            )
+            .await;
+        pull_now(server).await;
+
+        assert_eq!(
+            server.settings_manager.load_settings().search_paths,
+            vec!["/pulled-second".to_string()]
+        );
+    }
+
+    /// An answer asked for one root and arriving after the session moved to
+    /// another describes a workspace no longer selected: it is dropped, and
+    /// the root change's own pull asks for the new scope instead.
     #[tokio::test]
     #[serial(xdg_env)]
     async fn an_answer_for_a_root_the_session_left_is_discarded() {
@@ -551,10 +747,16 @@ mod tests {
         };
         tokio::join!(pull_now(server), move_root_while_answering);
 
+        let scopes = pulls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|pull| scope_of(pull).map(str::to_owned))
+            .collect::<Vec<_>>();
         assert_eq!(
-            pulls.lock().unwrap().len(),
-            2,
-            "the root change must still ask again"
+            scopes.last().cloned().flatten().as_deref(),
+            Some(folder(second.path(), "second").uri.as_str()),
+            "the root change must still ask for the new scope"
         );
         assert!(
             !server
@@ -563,7 +765,213 @@ mod tests {
                 .search_paths
                 .iter()
                 .any(|path| path.ends_with("stale")),
-            "an answer read for the root the session left must not be applied"
+            "an answer for the root the session left must not be applied"
+        );
+    }
+
+    /// A session that started on the launch directory and then gains a
+    /// folder at that same path has moved from a root kakehashi chose to one
+    /// the client named: the path is unchanged, but the scope a pull names is
+    /// not, so the client is asked again — for that folder.
+    #[tokio::test]
+    #[serial(xdg_env)]
+    async fn gaining_a_folder_at_the_launch_directory_pulls_for_it() {
+        let xdg_scratch = tempfile::tempdir().expect("failed to create scratch XDG_CONFIG_HOME");
+        let _xdg_guard = XdgConfigHomeGuard::set(xdg_scratch.path());
+
+        let (service, pulls) =
+            initialized_server_answering(serde_json::Value::Null, vec![serde_json::Value::Null])
+                .await;
+        let server = service.inner();
+        let launch_directory = server
+            .settings_manager
+            .root_path()
+            .as_ref()
+            .clone()
+            .expect("precondition: the launch directory stands in as the root");
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            server.did_change_workspace_folders_impl(DidChangeWorkspaceFoldersParams {
+                event: WorkspaceFoldersChangeEvent {
+                    added: vec![folder(&launch_directory, "launch")],
+                    removed: Vec::new(),
+                },
+            }),
+        )
+        .await
+        .expect("a folder change must not hang");
+
+        let pulls = pulls.lock().unwrap();
+        assert_eq!(
+            pulls.iter().map(scope_of).collect::<Vec<_>>(),
+            vec![Some(folder(&launch_directory, "launch").uri.as_str())],
+            "the client-named root must be asked for, though its path is unchanged"
+        );
+    }
+
+    /// A pull rebuilds the settings to take the previous answer out, but the
+    /// configuration files were read when the root was selected and are not
+    /// read again for it: a project file saved half-edited in between must not
+    /// silently drop out of effect because the editor's settings changed.
+    #[tokio::test]
+    #[serial(xdg_env)]
+    async fn a_pull_does_not_reread_the_configuration_files() {
+        let xdg_scratch = tempfile::tempdir().expect("failed to create scratch XDG_CONFIG_HOME");
+        let _xdg_guard = XdgConfigHomeGuard::set(xdg_scratch.path());
+        let workspace = tempfile::tempdir().expect("failed to create workspace dir");
+        let project_file = workspace.path().join("kakehashi.toml");
+        std::fs::write(&project_file, "searchPaths = [\"/from-project\"]\n")
+            .expect("failed to write the project config");
+
+        let (service, _pulls) = initialized_server_answering(
+            serde_json::json!([folder(workspace.path(), "workspace")]),
+            vec![language_server("old-server"), language_server("new-server")],
+        )
+        .await;
+        let server = service.inner();
+        let from_project = |server: &Kakehashi| {
+            server
+                .settings_manager
+                .load_settings()
+                .search_paths
+                .iter()
+                .any(|path| path == "/from-project")
+        };
+
+        pull_now(server).await;
+        assert!(
+            from_project(server),
+            "precondition: the project file applies"
+        );
+
+        std::fs::write(&project_file, "searchPaths = [\n").expect("failed to break the config");
+        pull_now(server).await;
+
+        assert!(
+            has_language_server(server, "new-server"),
+            "the answer applies"
+        );
+        assert!(
+            from_project(server),
+            "the project file read at the root change must stay in effect"
+        );
+    }
+
+    /// An answer holding only keys the editor keeps in the same section, with
+    /// no earlier answer to withdraw, changes nothing — so nothing is rebuilt
+    /// or republished, however the emptiness is spelled.
+    #[rstest::rstest]
+    #[case::empty_section(serde_json::json!({}))]
+    #[case::editor_keys_only(serde_json::json!({ "trace": { "server": "off" } }))]
+    #[tokio::test]
+    #[serial(xdg_env)]
+    async fn an_answer_with_nothing_to_withdraw_changes_nothing(#[case] answer: serde_json::Value) {
+        let xdg_scratch = tempfile::tempdir().expect("failed to create scratch XDG_CONFIG_HOME");
+        let _xdg_guard = XdgConfigHomeGuard::set(xdg_scratch.path());
+        let first = tempfile::tempdir().expect("failed to create workspace dir");
+
+        let (service, _pulls) = initialized_server_answering(
+            serde_json::json!([folder(first.path(), "first")]),
+            vec![answer],
+        )
+        .await;
+        let server = service.inner();
+        let before = server.settings_manager.load_settings_pair();
+
+        pull_now(server).await;
+
+        assert!(
+            Arc::ptr_eq(&before, &server.settings_manager.load_settings_pair()),
+            "an answer that changes no layer must not republish the settings"
+        );
+    }
+
+    /// The discard compares scopes as well as paths: an unscoped answer asked
+    /// on the launch directory, arriving after a folder at that same path was
+    /// added, was read for the client's global settings rather than for that
+    /// folder — the path alone cannot tell the two apart.
+    #[tokio::test]
+    #[serial(xdg_env)]
+    async fn an_answer_for_a_scope_the_session_left_is_discarded() {
+        let xdg_scratch = tempfile::tempdir().expect("failed to create scratch XDG_CONFIG_HOME");
+        let _xdg_guard = XdgConfigHomeGuard::set(xdg_scratch.path());
+        let release_first = Arc::new(tokio::sync::Notify::new());
+
+        let (service, pulls) = initialized_server_holding_answers(
+            serde_json::Value::Null,
+            vec![
+                serde_json::json!({ "searchPaths": ["/stale"] }),
+                serde_json::Value::Null,
+            ],
+            Some(Arc::clone(&release_first)),
+        )
+        .await;
+        let server = service.inner();
+        let launch_directory = server
+            .settings_manager
+            .root_path()
+            .as_ref()
+            .clone()
+            .expect("precondition: the launch directory stands in as the root");
+
+        let add_the_same_path_while_answering = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while pulls.lock().unwrap().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the first pull must be asked");
+            server
+                .did_change_workspace_folders_impl(DidChangeWorkspaceFoldersParams {
+                    event: WorkspaceFoldersChangeEvent {
+                        added: vec![folder(&launch_directory, "launch")],
+                        removed: Vec::new(),
+                    },
+                })
+                .await;
+            release_first.notify_one();
+        };
+        tokio::join!(pull_now(server), add_the_same_path_while_answering);
+
+        assert!(
+            !server
+                .settings_manager
+                .load_settings()
+                .search_paths
+                .iter()
+                .any(|path| path == "/stale"),
+            "an unscoped answer must not stand in for the folder's"
+        );
+    }
+
+    /// A pull-model editor asks on every settings change, most of which are
+    /// not kakehashi's: an answer identical to the previous one leaves the
+    /// settings as they are, rather than republishing them — which would
+    /// reparse every open document and refresh semantic tokens for nothing.
+    #[tokio::test]
+    #[serial(xdg_env)]
+    async fn an_unchanged_answer_does_not_republish() {
+        let xdg_scratch = tempfile::tempdir().expect("failed to create scratch XDG_CONFIG_HOME");
+        let _xdg_guard = XdgConfigHomeGuard::set(xdg_scratch.path());
+        let first = tempfile::tempdir().expect("failed to create workspace dir");
+
+        let (service, _pulls) = initialized_server_answering(
+            serde_json::json!([folder(first.path(), "first")]),
+            vec![language_server("same-server")],
+        )
+        .await;
+        let server = service.inner();
+
+        pull_now(server).await;
+        assert!(has_language_server(server, "same-server"), "precondition");
+        let before = server.settings_manager.load_settings_pair();
+        pull_now(server).await;
+
+        assert!(
+            Arc::ptr_eq(&before, &server.settings_manager.load_settings_pair()),
+            "an answer that changes nothing must not republish the settings"
         );
     }
 }
