@@ -1030,6 +1030,11 @@ mod tests {
 
         let uri_string = virtual_uri.to_uri_string();
 
+        // The host is encoded with NON_ALPHANUMERIC, so its `-` is escaped too.
+        assert_eq!(
+            uri_string,
+            "kakehashi:///virtual/untitled%3AUntitled%2D1/kakehashi-virtual-uri-REGION123.lua"
+        );
         // Should use kakehashi:// scheme as fallback
         assert!(
             uri_string.starts_with("kakehashi:///virtual/"),
