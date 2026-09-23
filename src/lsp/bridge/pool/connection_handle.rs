@@ -32,9 +32,9 @@ use crate::lsp::bridge::actor::{
 };
 use crate::lsp::bridge::connection::SplitConnectionWriter;
 use crate::lsp::bridge::protocol::{
-    JsonRpcNotification, JsonRpcRequest, ROUTING_METHOD, ROUTING_TIMEOUT, RequestId, RoutingAnswer,
-    RoutingParams, build_exit_notification, build_shutdown_request, jsonrpc_error_code,
-    parse_routing_response,
+    DID_CHANGE_WORKSPACE_FOLDERS_METHOD, JsonRpcNotification, JsonRpcRequest, ROUTING_METHOD,
+    ROUTING_TIMEOUT, RequestId, RoutingAnswer, RoutingParams, build_exit_notification,
+    build_shutdown_request, jsonrpc_error_code, parse_routing_response,
 };
 use crate::lsp::bridge::workspace::WorkspaceFolderSet;
 
@@ -52,15 +52,18 @@ pub(crate) fn supports_initial_workspace_folders(caps: &ServerCapabilities) -> b
         .is_some_and(|folders| folders.supported == Some(true))
 }
 
-/// Whether `caps` advertises everything the shared-instance opt-in (#391)
-/// needs to drive one connection across roots via
+/// Whether `caps` STATICALLY advertises everything the shared-instance opt-in
+/// (#391) needs to drive one connection across roots via
 /// `workspace/didChangeWorkspaceFolders`: `workspace.workspaceFolders` with
 /// `supported == true` AND `changeNotifications` set to a value other than the
 /// explicit `false` (either `true` or a registration id string). Anything
-/// missing or `Left(false)` means the server will not act on folder-change
-/// notifications, so the bridge diverts new, unserved marker roots to
-/// per-root instances — roots the connection already serves (its spawn root,
-/// and initialize-listed folders under `supported == true`) and marker-less
+/// missing or `Left(false)` means the `InitializeResult` alone does not
+/// promise folder-change handling — the server may still register the
+/// notification dynamically, which
+/// [`ConnectionHandle::supports_workspace_folder_changes`] also consults.
+/// Without either, the bridge diverts new, unserved marker roots to per-root
+/// instances — roots the connection already serves (its spawn root, and
+/// initialize-listed folders under `supported == true`) and marker-less
 /// riders stay on the shared connection (`incapable_shared_serves`).
 pub(crate) fn supports_workspace_folder_changes(caps: &ServerCapabilities) -> bool {
     let Some(folders) = caps
@@ -721,14 +724,61 @@ impl ConnectionHandle {
         &self.workspace_folders
     }
 
-    /// Whether the downstream server advertised support for receiving
-    /// `workspace/didChangeWorkspaceFolders` notifications — the capability
-    /// the shared-instance opt-in (#391) requires. Returns `false` until the
-    /// initialize handshake stores capabilities, so a still-initializing
-    /// connection is treated as not-yet-capable.
+    /// Whether the downstream server wants `workspace/didChangeWorkspaceFolders`
+    /// notifications — the capability the shared-instance opt-in (#391) and
+    /// the upstream folder-change forwarding both require. Either declaration
+    /// counts: the static `InitializeResult` shape
+    /// ([`supports_workspace_folder_changes`]) or a live dynamic registration
+    /// of the notification (Pyright-style, #968). Returns `false` until the
+    /// initialize handshake stores capabilities or a registration arrives, so
+    /// a still-initializing connection is treated as not-yet-capable.
+    ///
+    /// The registry is read live rather than latched, even though the
+    /// capability is treated as effectively monotone: an `unregisterCapability`
+    /// of a dynamic registration really withdraws it. (A static
+    /// `changeNotifications` id is not in the registry, so unregistering that
+    /// id leaves the static declaration standing — as before #968; #1117.)
+    /// Latching would keep forwarding notifications to a server that opted
+    /// out; reading live instead lets the
+    /// next upstream folder change find the connection incapable and recycle
+    /// it through the ordinary invalidate path — bounded staleness, no
+    /// ordering between registration and folder-change handling. A check that
+    /// races an in-flight registration just sees the older answer, whose worst
+    /// case is what the static-only check did unconditionally (a spurious
+    /// recycle or divert). The registry's lock is a leaf: its writer, the
+    /// reader task's register handler, never holds `connections`, so reading
+    /// it under `connections` cannot invert an order.
     pub(crate) fn supports_workspace_folder_changes(&self) -> bool {
         self.server_capabilities()
             .is_some_and(supports_workspace_folder_changes)
+            || self
+                .dynamic_capabilities
+                .has_registration(DID_CHANGE_WORKSPACE_FOLDERS_METHOD)
+    }
+
+    /// Queue a `workspace/didChangeWorkspaceFolders` notification only while
+    /// the server accepts one, or `None` when it no longer does.
+    ///
+    /// A dynamically registered capability is held under the registration's
+    /// read lease across the send: an unregistration cannot land between
+    /// "still registered" and "queued", and its acknowledgement shares this
+    /// writer FIFO, so the server always receives the notification before it
+    /// learns the unregistration was accepted. A static declaration cannot be
+    /// withdrawn and needs no lease.
+    pub(crate) fn send_folder_change<P: serde::Serialize>(
+        &self,
+        notification: JsonRpcNotification<P>,
+    ) -> Option<NotificationSendResult> {
+        if self
+            .server_capabilities()
+            .is_some_and(supports_workspace_folder_changes)
+        {
+            return Some(self.send_notification(notification));
+        }
+        self.dynamic_capabilities
+            .with_registration(DID_CHANGE_WORKSPACE_FOLDERS_METHOD, || {
+                self.send_notification(notification)
+            })
     }
 
     /// Whether the server declared `workspace.workspaceFolders.supported`,
@@ -740,7 +790,8 @@ impl ConnectionHandle {
     }
 
     /// Log, at most once per connection, that a `preferSharedInstance` server
-    /// lacks the `workspaceFolders` capability, so marker-rooted documents its
+    /// lacks folder-change support (so far — a server may still register it
+    /// dynamically, which consolidates the diverts), so marker-rooted documents its
     /// connection does not already serve divert to the per-root-instance model
     /// (#391). Marker-less documents stay aboard — they bring no marker root
     /// (their client-workspace announcement is capability-gated away on such
@@ -754,9 +805,9 @@ impl ConnectionHandle {
         if first {
             log::info!(
                 target: "kakehashi::bridge",
-                "Server '{}' has preferSharedInstance set but does not advertise \
-                 workspace.workspaceFolders.{{supported, changeNotifications}}; \
-                 falling back to per-root instances",
+                "Server '{}' has preferSharedInstance set but has not (yet) declared \
+                 or registered workspace/didChangeWorkspaceFolders support; diverting \
+                 new roots to per-root instances until it does",
                 server
             );
         }
@@ -2437,6 +2488,40 @@ mod tests {
             Some(OneOf::Left(true)),
         ))));
         assert!(handle.supports_workspace_folder_changes());
+    }
+
+    /// Pyright-style servers declare folder-change support by registering the
+    /// notification dynamically after `initialized`, not in their
+    /// `InitializeResult`. Such a registration must count, or every decision
+    /// point keyed on this capability treats the server as incapable (#968).
+    #[tokio::test]
+    async fn handle_reports_workspace_folder_capability_from_dynamic_registration() {
+        use tower_lsp_server::ls_types::{Registration, Unregistration};
+
+        let handle = spawn_sink_handle().await;
+        handle.set_server_capabilities(ServerCapabilities::default());
+        assert!(!handle.supports_workspace_folder_changes());
+
+        handle.dynamic_capabilities().register(vec![Registration {
+            id: "folders".to_string(),
+            method: "workspace/didChangeWorkspaceFolders".to_string(),
+            register_options: None,
+        }]);
+        assert!(
+            handle.supports_workspace_folder_changes(),
+            "a live dynamic registration must make the connection capable"
+        );
+
+        handle
+            .dynamic_capabilities()
+            .unregister(vec![Unregistration {
+                id: "folders".to_string(),
+                method: "workspace/didChangeWorkspaceFolders".to_string(),
+            }]);
+        assert!(
+            !handle.supports_workspace_folder_changes(),
+            "an unregistration withdraws it again"
+        );
     }
 
     #[tokio::test]

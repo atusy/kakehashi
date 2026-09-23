@@ -973,28 +973,42 @@ impl DocumentTracker {
         host_uri: &Url,
         expected_languages: &std::collections::HashMap<&str, &str>,
     ) -> Vec<OpenedVirtualDoc> {
+        self.take_host_virtual_docs_where(host_uri, |doc| {
+            expected_languages
+                .get(doc.virtual_uri.region_id())
+                .is_some_and(|expected| doc.virtual_uri.language() != *expected)
+        })
+        .await
+    }
+
+    /// Take the host's opened documents that `should_take` selects. The
+    /// decision and the `host_to_virtual` removal share one lock acquisition,
+    /// so a concurrent registration cannot slip between them; the reverse
+    /// index is cleared right after the lock is released.
+    pub(super) async fn take_host_virtual_docs_where(
+        &self,
+        host_uri: &Url,
+        mut should_take: impl FnMut(&OpenedVirtualDoc) -> bool,
+    ) -> Vec<OpenedVirtualDoc> {
         let mut host_map = self.host_to_virtual.lock().await;
         let Some(docs) = host_map.get_mut(host_uri) else {
             return Vec::new();
         };
 
-        let mut to_close = Vec::new();
+        let mut taken = Vec::new();
         docs.retain(|doc| {
-            let Some(expected) = expected_languages.get(doc.virtual_uri.region_id()) else {
-                return true;
-            };
-            let replaced = doc.virtual_uri.language() != *expected;
-            if replaced {
-                to_close.push(doc.clone());
+            let take = should_take(doc);
+            if take {
+                taken.push(doc.clone());
             }
-            !replaced
+            !take
         });
         drop(host_map);
 
-        for doc in &to_close {
+        for doc in &taken {
             self.remove_from_reverse_index(&doc.virtual_uri.to_uri_string(), &doc.connection_key);
         }
-        to_close
+        taken
     }
 
     /// Decrement the reference count for an opened document URI.
@@ -2421,6 +2435,30 @@ mod tests {
                 .await,
             None
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_virtual_uri_recovers_dotted_language() {
+        for host in ["file:///project/doc.md", "untitled:Untitled-1"] {
+            let tracker = DocumentTracker::new();
+            let host_uri = Url::parse(host).unwrap();
+            let virtual_uri =
+                VirtualDocumentUri::new(&url_to_uri(&host_uri), "foo.bar", "region-0");
+            tracker
+                .register_opened_document(
+                    &host_uri,
+                    &virtual_uri,
+                    &ConnectionKey::for_server("custom"),
+                )
+                .await;
+            assert_eq!(
+                tracker
+                    .resolve_virtual_uri(&virtual_uri.to_uri_string())
+                    .await,
+                Some((host_uri, "region-0".to_string())),
+                "dotted language for {host}"
+            );
+        }
     }
 
     #[tokio::test]

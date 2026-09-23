@@ -94,6 +94,11 @@ pub(crate) fn build_didclose_notification(
     Some(JsonRpcNotification::new("textDocument/didClose", params))
 }
 
+/// The folder-change notification's method. A server may register it
+/// dynamically instead of declaring
+/// `workspace.workspaceFolders.changeNotifications` statically (#968).
+pub(crate) const DID_CHANGE_WORKSPACE_FOLDERS_METHOD: &str = "workspace/didChangeWorkspaceFolders";
+
 /// Build a `workspace/didChangeWorkspaceFolders` notification announcing newly
 /// added workspace folders (#391). Removal is not modeled — the shared-instance
 /// opt-in only ever grows a connection's folder set; idle eviction is a
@@ -105,7 +110,7 @@ pub(crate) fn build_did_change_workspace_folders_notification(
     let params = DidChangeWorkspaceFoldersParams {
         event: WorkspaceFoldersChangeEvent { added, removed },
     };
-    JsonRpcNotification::new("workspace/didChangeWorkspaceFolders", params)
+    JsonRpcNotification::new(DID_CHANGE_WORKSPACE_FOLDERS_METHOD, params)
 }
 
 /// Build a `workspace/didChangeConfiguration` notification carrying this
@@ -389,7 +394,10 @@ mod tests {
 
     #[test]
     fn initialize_request_includes_root_path_derived_from_root_uri() {
-        let root_uri = "file:///home/user/project";
+        // A platform-absolute path: `file:///home/...` has no drive letter, so
+        // on Windows it names no file path and rootPath is rightly null.
+        let project = std::env::temp_dir().join("project");
+        let root_uri = url::Url::from_file_path(&project).unwrap();
         let request = build_initialize_request(
             RequestId::new(1),
             None,
@@ -400,7 +408,10 @@ mod tests {
         );
 
         let json = serde_json::to_value(&request).unwrap();
-        assert_eq!(json["params"]["rootPath"], "/home/user/project");
+        assert_eq!(
+            json["params"]["rootPath"],
+            project.to_string_lossy().as_ref()
+        );
     }
 
     #[test]

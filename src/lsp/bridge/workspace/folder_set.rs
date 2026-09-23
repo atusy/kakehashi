@@ -93,10 +93,43 @@ impl WorkspaceFolderSet {
             .inner
             .lock()
             .recover_poison("WorkspaceFolderSet::apply_change");
-        if guard.is_none() && added.is_empty() {
+        Self::apply_to(&mut guard, added, removed);
+    }
+
+    /// [`Self::apply_change`], announced: `announce` runs **while the set
+    /// lock is held** (it enqueues `workspace/didChangeWorkspaceFolders`) and
+    /// the change commits only when it returns `true`. A server that pulls
+    /// `workspace/workspaceFolders` as soon as the notification arrives
+    /// therefore cannot read the set from before the change.
+    pub(crate) fn change_and_announce<F>(
+        &self,
+        added: Vec<WorkspaceFolder>,
+        removed: &[WorkspaceFolder],
+        announce: F,
+    ) -> bool
+    where
+        F: FnOnce() -> bool,
+    {
+        let mut guard = self
+            .inner
+            .lock()
+            .recover_poison("WorkspaceFolderSet::change_and_announce");
+        if !announce() {
+            return false;
+        }
+        Self::apply_to(&mut guard, added, removed);
+        true
+    }
+
+    fn apply_to(
+        folders: &mut Option<Vec<WorkspaceFolder>>,
+        added: Vec<WorkspaceFolder>,
+        removed: &[WorkspaceFolder],
+    ) {
+        if folders.is_none() && added.is_empty() {
             return;
         }
-        let folders = guard.get_or_insert_with(Vec::new);
+        let folders = folders.get_or_insert_with(Vec::new);
         folders.retain(|existing| !removed.iter().any(|item| item.uri == existing.uri));
         for folder in added {
             if !folders.iter().any(|existing| existing.uri == folder.uri) {
@@ -172,6 +205,39 @@ mod tests {
     /// (duplicate indexing downstream). Reachable since marker-less
     /// acquisitions spawn shared connections seeded with client-spelled
     /// folders that marker walks later regenerate in canonical form.
+    /// A server that pulls `workspace/workspaceFolders` right after the
+    /// change notification must not read the pre-change set: the announce
+    /// runs with the set locked, so no snapshot can slip in between the
+    /// queued notification and the commit. (The pull-side race itself is not
+    /// reproducible in a unit test; this pins the lock that closes it.)
+    #[test]
+    fn change_and_announce_holds_the_set_while_announcing_and_commits_on_success() {
+        let set = WorkspaceFolderSet::new(Some(vec![folder("file:///a")]));
+
+        let committed =
+            set.change_and_announce(vec![folder("file:///b")], &[folder("file:///a")], || {
+                assert!(
+                    set.inner.try_lock().is_err(),
+                    "the set must be locked while announcing"
+                );
+                true
+            });
+
+        assert!(committed);
+        assert_eq!(set.snapshot(), Some(vec![folder("file:///b")]));
+    }
+
+    #[test]
+    fn change_and_announce_commits_nothing_when_the_announce_fails() {
+        let set = WorkspaceFolderSet::new(Some(vec![folder("file:///a")]));
+
+        let committed =
+            set.change_and_announce(vec![folder("file:///b")], &[folder("file:///a")], || false);
+
+        assert!(!committed);
+        assert_eq!(set.snapshot(), Some(vec![folder("file:///a")]));
+    }
+
     #[test]
     fn add_and_announce_swallows_an_equivalent_spelling_of_a_present_folder() {
         // Build both spellings from a real platform path: a drive-less

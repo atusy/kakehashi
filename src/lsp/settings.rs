@@ -2092,14 +2092,21 @@ mod tests {
         );
         assert_eq!(
             settings.languages["lua"].parser.as_deref(),
-            Some(user_dir.join("parser/lua.so").to_string_lossy().as_ref()),
+            Some(
+                user_dir
+                    .join("parser")
+                    .join("lua.so")
+                    .to_string_lossy()
+                    .as_ref()
+            ),
             "the parser came from the user config, so it anchors there"
         );
         assert_eq!(
             settings.languages["lua"].queries.as_ref().unwrap()[0].path,
             project
                 .path()
-                .join("queries/highlights.scm")
+                .join("queries")
+                .join("highlights.scm")
                 .to_string_lossy(),
             "the query came from the project config, so it anchors there"
         );
@@ -2179,7 +2186,13 @@ mod tests {
             outcome.settings.expect("settings should load").languages["derived"]
                 .parser
                 .as_deref(),
-            Some(user_dir.join("parser/shared.so").to_string_lossy().as_ref()),
+            Some(
+                user_dir
+                    .join("parser")
+                    .join("shared.so")
+                    .to_string_lossy()
+                    .as_ref()
+            ),
             "inheriting a parser must not re-base it onto the inheriting layer"
         );
     }
@@ -2219,7 +2232,8 @@ mod tests {
             Some(
                 second_dir
                     .path()
-                    .join("parser/lua.so")
+                    .join("parser")
+                    .join("lua.so")
                     .to_string_lossy()
                     .as_ref()
             )

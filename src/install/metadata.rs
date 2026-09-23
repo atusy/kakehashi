@@ -52,7 +52,7 @@ pub enum MetadataError {
     LanguageNotFound(String),
     /// HTTP request failed.
     HttpError(String),
-    /// JSON parsing failed.
+    /// Metadata content was malformed or incomplete.
     ParseError(String),
     /// Metadata existed but contained no languages.
     EmptyMetadata,
@@ -90,8 +90,8 @@ impl std::error::Error for MetadataError {}
 ///
 /// If `options` is provided and caching is enabled, the function will:
 /// 1. Check for a fresh cached copy
-/// 2. If cache hit, use cached content
-/// 3. If cache miss, fetch from network and update cache
+/// 2. Use cached content only if it parses successfully
+/// 3. Otherwise, fetch from network and cache only successfully parsed content
 fn fetch_parsers_lua_with_options(
     options: Option<&FetchOptions>,
 ) -> Result<HashMap<String, ParserMetadata>, MetadataError> {
@@ -104,14 +104,34 @@ fn fetch_parsers_lua_with_options(
         }
     });
 
+    fetch_parsers_lua_with_cache(cache.as_ref(), download_parsers_lua)
+}
+
+fn fetch_parsers_lua_with_cache(
+    cache: Option<&MetadataCache>,
+    download: impl FnOnce() -> Result<String, MetadataError>,
+) -> Result<HashMap<String, ParserMetadata>, MetadataError> {
     // Try cache first
-    if let Some(ref cache) = cache
+    if let Some(cache) = cache
         && let Some(cached_content) = cache.read()
+        && let Ok(parsers) = parse_parsers_lua(&cached_content)
     {
-        return parse_parsers_lua(&cached_content);
+        return Ok(parsers);
     }
 
-    // Cache miss or no cache - fetch from network
+    let content = download()?;
+    let parsers = parse_parsers_lua(&content)?;
+
+    // Update cache if available
+    if let Some(cache) = cache {
+        // Ignore cache write errors - caching is best-effort
+        let _ = cache.write(&content);
+    }
+
+    Ok(parsers)
+}
+
+fn download_parsers_lua() -> Result<String, MetadataError> {
     let agent = agent_with_timeout(PARSERS_LUA_HTTP_TIMEOUT);
 
     let mut response = agent.get(PARSERS_LUA_URL).call().map_err(|e| match e {
@@ -127,19 +147,14 @@ fn fetch_parsers_lua_with_options(
         e => MetadataError::HttpError(e.to_string()),
     })?;
 
-    // Update cache if available
-    if let Some(cache) = cache {
-        // Ignore cache write errors - caching is best-effort
-        let _ = cache.write(&content);
-    }
-
-    parse_parsers_lua(&content)
+    Ok(content)
 }
 
 /// Parse the parsers.lua content to extract parser information.
 ///
 /// Handles the main branch format where languages are direct table keys.
 fn parse_parsers_lua(content: &str) -> Result<HashMap<String, ParserMetadata>, MetadataError> {
+    let content = returned_table(content)?;
     let mut parsers = HashMap::new();
 
     // Pattern to match parser entries in main branch format: lang = { ... }
@@ -168,6 +183,29 @@ fn parse_parsers_lua(content: &str) -> Result<HashMap<String, ParserMetadata>, M
     }
 
     Ok(parsers)
+}
+
+/// Return the table that parsers.lua returns, rejecting incomplete content.
+///
+/// Complete language blocks survive a cut-off file, so parsing them alone
+/// cannot tell a partial language list from the full one. Requiring the
+/// returned table to close, with nothing but whitespace after it, catches
+/// truncation and interleaved writes.
+fn returned_table(content: &str) -> Result<&str, MetadataError> {
+    let return_re = Regex::new(r#"(?m)^\s*return\s*\{"#).expect("valid regex for return pattern");
+    let open_brace = return_re
+        .find(content)
+        .ok_or_else(|| MetadataError::ParseError("parsers.lua does not return a table".into()))?
+        .end()
+        - 1;
+    let table = find_matching_brace(&content[open_brace..])
+        .ok_or_else(|| MetadataError::ParseError("parsers.lua table is not closed".into()))?;
+    if !content[open_brace + table.len()..].trim().is_empty() {
+        return Err(MetadataError::ParseError(
+            "parsers.lua has content after the returned table".into(),
+        ));
+    }
+    Ok(table)
 }
 
 /// Check if a key is a reserved/internal key (not a language name)
@@ -303,6 +341,141 @@ pub fn is_language_supported(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    const VALID_METADATA: &str = r#"
+return {
+  lua = {
+    install_info = {
+      revision = 'abc123',
+      url = 'https://example.com/tree-sitter-lua',
+    },
+  },
+}
+"#;
+
+    #[test]
+    fn valid_fresh_cache_does_not_download() {
+        let temp = tempdir().unwrap();
+        let cache = MetadataCache::with_default_ttl(temp.path());
+        cache.write(VALID_METADATA).unwrap();
+
+        let parsers = fetch_parsers_lua_with_cache(Some(&cache), || {
+            panic!("valid fresh cache must avoid the network")
+        })
+        .unwrap();
+
+        assert_eq!(parsers["lua"].revision, "abc123");
+    }
+
+    #[test]
+    fn corrupt_cache_recovery_propagates_download_error() {
+        let temp = tempdir().unwrap();
+        let cache = MetadataCache::with_default_ttl(temp.path());
+        cache.write("return {}").unwrap();
+
+        let result = fetch_parsers_lua_with_cache(Some(&cache), || Err(MetadataError::Timeout));
+
+        assert!(matches!(result, Err(MetadataError::Timeout)));
+        assert_eq!(cache.read().as_deref(), Some("return {}"));
+    }
+
+    #[test]
+    fn cache_write_failure_does_not_discard_valid_download() {
+        let temp = tempdir().unwrap();
+        let cache = MetadataCache::with_default_ttl(temp.path());
+        std::fs::write(temp.path().join("cache"), "blocks directory creation").unwrap();
+
+        let parsers =
+            fetch_parsers_lua_with_cache(Some(&cache), || Ok(VALID_METADATA.to_owned())).unwrap();
+
+        assert_eq!(parsers["lua"].revision, "abc123");
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("cache")).unwrap(),
+            "blocks directory creation"
+        );
+    }
+
+    #[test]
+    fn invalid_download_preserves_previous_cache() {
+        let temp = tempdir().unwrap();
+        let cache = MetadataCache::with_default_ttl(temp.path());
+        cache.write(VALID_METADATA).unwrap();
+        let path = temp.path().join("cache/parsers.lua");
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH)
+            .unwrap();
+        assert!(cache.read().is_none(), "the previous cache must be stale");
+
+        let result = fetch_parsers_lua_with_cache(Some(&cache), || Ok("return {}".to_owned()));
+
+        assert!(matches!(result, Err(MetadataError::EmptyMetadata)));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), VALID_METADATA);
+    }
+
+    #[test]
+    fn corrupt_fresh_cache_is_replaced_from_network() {
+        let temp = tempdir().unwrap();
+        let cache = MetadataCache::with_default_ttl(temp.path());
+        cache.write("return { lua = {").unwrap();
+
+        let parsers = fetch_parsers_lua_with_cache(Some(&cache), || Ok(VALID_METADATA.to_owned()))
+            .expect("invalid cached metadata should trigger a download");
+
+        assert_eq!(parsers["lua"].revision, "abc123");
+        assert_eq!(cache.read().as_deref(), Some(VALID_METADATA));
+    }
+
+    // A cut-off file still holds complete language blocks before the cut, so
+    // counting parsed languages alone would accept a partial language list.
+    const TRUNCATED_METADATA: &str = r#"
+return {
+  lua = {
+    install_info = {
+      revision = 'abc123',
+      url = 'https://example.com/tree-sitter-lua',
+    },
+  },
+  rust = {
+    install_info = {
+      revision = 'def456',
+"#;
+
+    #[test]
+    fn truncated_fresh_cache_is_replaced_from_network() {
+        let temp = tempdir().unwrap();
+        let cache = MetadataCache::with_default_ttl(temp.path());
+        cache.write(TRUNCATED_METADATA).unwrap();
+
+        let parsers = fetch_parsers_lua_with_cache(Some(&cache), || Ok(VALID_METADATA.to_owned()))
+            .expect("truncated cached metadata should trigger a download");
+
+        assert_eq!(parsers["lua"].revision, "abc123");
+        assert_eq!(cache.read().as_deref(), Some(VALID_METADATA));
+    }
+
+    #[test]
+    fn truncated_download_is_rejected_without_caching() {
+        let temp = tempdir().unwrap();
+        let cache = MetadataCache::with_default_ttl(temp.path());
+
+        let result =
+            fetch_parsers_lua_with_cache(Some(&cache), || Ok(TRUNCATED_METADATA.to_owned()));
+
+        assert!(matches!(result, Err(MetadataError::ParseError(_))));
+        assert!(cache.read().is_none());
+    }
+
+    #[test]
+    fn metadata_with_content_after_the_returned_table_is_rejected() {
+        let interleaved = format!("{VALID_METADATA}{TRUNCATED_METADATA}");
+
+        let result = parse_parsers_lua(&interleaved);
+
+        assert!(matches!(result, Err(MetadataError::ParseError(_))));
+    }
 
     #[test]
     fn test_fetch_parser_metadata_with_caching() {
@@ -578,22 +751,11 @@ return {
     }
 
     #[test]
-    fn test_is_language_supported_returns_error_for_invalid_metadata() {
-        use crate::install::test_helpers::setup_mock_metadata_cache;
-
-        let temp = tempdir().expect("Failed to create temp dir");
-        let options = FetchOptions {
-            data_dir: Some(temp.path()),
-            use_cache: true,
-        };
-
-        let mock_parsers_lua = "return {}";
-        setup_mock_metadata_cache(temp.path(), mock_parsers_lua);
-
-        let result = is_language_supported("lua", Some(&options));
+    fn invalid_download_returns_metadata_error() {
+        let result = fetch_parsers_lua_with_cache(None, || Ok("return {}".to_owned()));
         assert!(
             matches!(result, Err(MetadataError::EmptyMetadata)),
-            "Expected empty metadata error for invalid metadata"
+            "Expected empty metadata error for invalid downloaded metadata"
         );
     }
 }

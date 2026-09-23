@@ -562,6 +562,117 @@ pub(crate) fn resolve_aggregation_config_from_settings(
         .unwrap_or_else(ResolvedAggregationConfig::with_defaults)
 }
 
+/// Which servers may contribute **pushed** diagnostics to the injection
+/// regions of one host, under one method's `priorities` allowlist (#916).
+///
+/// `priorities` is an allowlist over server names
+/// (aggregation-priorities-wildcard), and a server the list omits must not
+/// reach the editor through a push any more than through a dispatch. The
+/// candidates are exactly the ones dispatch expands the list against (the
+/// per-snapshot memo `cached_configs_for_injection_language`), so a server
+/// the bridge filter, the `languages` list, or `enabled = false` removes is
+/// excluded as well.
+///
+/// Resolved lazily, once per injection language: a caller walks every cached
+/// region slot of one host, and a document usually holds many regions of a
+/// few languages.
+pub(crate) struct RegionPushAllowlist<'a> {
+    bridge: &'a crate::lsp::bridge::BridgeCoordinator,
+    settings: &'a std::sync::Arc<WorkspaceSettings>,
+    host_language: &'a str,
+    method: &'static str,
+    by_language: std::collections::HashMap<String, PushAllowlist>,
+}
+
+impl<'a> RegionPushAllowlist<'a> {
+    pub(crate) fn new(
+        bridge: &'a crate::lsp::bridge::BridgeCoordinator,
+        settings: &'a std::sync::Arc<WorkspaceSettings>,
+        host_language: &'a str,
+        method: &'static str,
+    ) -> Self {
+        Self {
+            bridge,
+            settings,
+            host_language,
+            method,
+            by_language: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Whether `server`'s push for a region of `injection_language` is admitted.
+    pub(crate) fn admits(&mut self, injection_language: &str, server: &str) -> bool {
+        // `get` first: the language key is cloned only on the resolving miss.
+        if let Some(allowlist) = self.by_language.get(injection_language) {
+            return allowlist.admits(server);
+        }
+        let allowlist = PushAllowlist {
+            candidates: self.bridge.cached_configs_for_injection_language(
+                self.settings,
+                self.host_language,
+                injection_language,
+            ),
+            priorities: resolve_aggregation_config_from_settings(
+                self.settings,
+                self.host_language,
+                injection_language,
+                self.method,
+            )
+            .priorities,
+        };
+        let admits = allowlist.admits(server);
+        self.by_language
+            .insert(injection_language.to_string(), allowlist);
+        admits
+    }
+}
+
+/// One bridge target's candidates and the `priorities` allowlist over them.
+pub(crate) struct PushAllowlist {
+    candidates: Vec<ResolvedServerConfig>,
+    priorities: Vec<String>,
+}
+
+impl PushAllowlist {
+    /// The `_self` host servers whose **pushed** diagnostics `host_language`
+    /// admits under `method`'s host-layer `priorities` — the host-layer sibling
+    /// of [`RegionPushAllowlist`] (#916). Admits nothing when `_self` is off or
+    /// has no configured server for the language.
+    pub(crate) fn for_host(
+        bridge: &crate::lsp::bridge::BridgeCoordinator,
+        settings: &std::sync::Arc<WorkspaceSettings>,
+        host_language: &str,
+        method: &str,
+    ) -> Self {
+        let candidates = bridge.cached_host_configs_for_language(settings, host_language);
+        let priorities = if candidates.is_empty() {
+            Vec::new()
+        } else {
+            settings
+                .resolve_host_language_settings(host_language)
+                .map(|lang| lang.resolve_host_aggregation(method).priorities)
+                .unwrap_or_default()
+        };
+        Self {
+            candidates,
+            priorities,
+        }
+    }
+
+    /// Whether this allowlist admits nothing at all.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.candidates.is_empty() || self.priorities.is_empty()
+    }
+
+    /// Whether `server`'s push is admitted.
+    pub(crate) fn admits(&self, server: &str) -> bool {
+        // A target has a handful of candidates, so a linear scan beats
+        // building a lookup set per republish.
+        self.candidates.iter().any(|c| c.server_name == server)
+            && crate::lsp::aggregation::server::priorities_admit(&self.priorities, server)
+    }
+}
+
 /// Find every (host_language, injection_language) pair whose configured
 /// aggregation for `textDocument/formatting` is the **misconfigured**
 /// `Concatenated`-without-explicit-`priorities` combination.

@@ -209,6 +209,17 @@ pub(crate) enum UpstreamRequest {
     /// back and retiring there would churn the palette on each respawn.
     /// Fire-and-forget for the same reason as its sibling.
     UnregisterCommands { commands: Vec<String> },
+    /// `server`'s shared instance just registered
+    /// `workspace/didChangeWorkspaceFolders` dynamically (#968): retire the
+    /// per-root processes its roots were diverted to while it looked
+    /// incapable. Routed upward only because the reader holds no pool
+    /// reference; the pool re-checks the capability before acting.
+    ConsolidateSharedInstance { server: String },
+    /// Re-sync the open host documents `server` host-bridges onto wherever
+    /// they now route: a consolidation retired the per-root connections that
+    /// held them (#968). Routed upward because the document text lives on the
+    /// server side; injected regions are re-opened through `ReopenDocuments`.
+    ResyncHostDocuments { server: String },
     /// Bring `key`'s virtual documents up to date: its previous connection was
     /// purged and has now been replaced by a `Ready` process
     /// (respawn-reopen-derives-its-targets).
@@ -232,6 +243,12 @@ pub(crate) enum UpstreamRequest {
         /// stopped being true — documents close, hosts re-root, and a
         /// connection that died young held nothing to capture at all.
         key: ConnectionKey,
+        /// Also re-sync, before `done` is signalled, the open host documents
+        /// this server host-bridges. Set only by a shared-instance
+        /// consolidation (#968), which moves host documents as well as
+        /// injected regions onto a live connection; a respawn re-open keeps
+        /// its injection-only scope.
+        host_documents: bool,
         done: tokio::sync::watch::Sender<bool>,
     },
 }
@@ -565,10 +582,13 @@ impl ReaderTaskHandle {
 /// Convenience wrapper for tests that don't need liveness timeout; production
 /// code should use `spawn_reader_task_with_liveness` directly.
 #[cfg(test)]
-pub(crate) fn spawn_reader_task(
-    reader: BridgeReader,
+pub(crate) fn spawn_reader_task<R>(
+    reader: BridgeReader<R>,
     router: Arc<ResponseRouter>,
-) -> ReaderTaskHandle {
+) -> ReaderTaskHandle
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
     spawn_reader_task_with_liveness(reader, router, None)
 }
 
@@ -578,11 +598,14 @@ pub(crate) fn spawn_reader_task(
 /// server names (ls-bridge-async-connection liveness timeout); production code should use
 /// `spawn_reader_task_for_server`.
 #[cfg(test)]
-pub(crate) fn spawn_reader_task_with_liveness(
-    reader: BridgeReader,
+pub(crate) fn spawn_reader_task_with_liveness<R>(
+    reader: BridgeReader<R>,
     router: Arc<ResponseRouter>,
     liveness_timeout: Option<Duration>,
-) -> ReaderTaskHandle {
+) -> ReaderTaskHandle
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
     let (response_tx, _response_rx) = mpsc::channel(16);
     let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
     let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
@@ -618,12 +641,15 @@ pub(crate) fn spawn_reader_task_with_liveness(
 /// `deps` carries the per-server context (name, channels, capability registry,
 /// workspace folders), snapshotted at spawn time like the rest of the server
 /// config (#378).
-pub(crate) fn spawn_reader_task_for_server(
-    reader: BridgeReader,
+pub(crate) fn spawn_reader_task_for_server<R>(
+    reader: BridgeReader<R>,
     router: Arc<ResponseRouter>,
     liveness_timeout: Option<Duration>,
     deps: ServerRequestDeps,
-) -> ReaderTaskHandle {
+) -> ReaderTaskHandle
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
     let cancel_token = CancellationToken::new();
     let token_clone = cancel_token.clone();
 
@@ -2042,6 +2068,65 @@ mod tests {
         }
     }
 
+    /// Only a shared instance registering folder-change support asks the pool
+    /// to consolidate (#968): a per-root registration comes from a process a
+    /// consolidation would retire, and other methods say nothing about roots.
+    #[tokio::test]
+    async fn register_capability_requests_consolidation_only_for_shared_folder_changes() {
+        let cases = [
+            (
+                ConnectionKey::shared("srv"),
+                "workspace/didChangeWorkspaceFolders",
+                true,
+            ),
+            (
+                ConnectionKey::new("srv", Some("file:///b".to_string())),
+                "workspace/didChangeWorkspaceFolders",
+                false,
+            ),
+            (
+                ConnectionKey::for_server("srv"),
+                "workspace/didChangeWorkspaceFolders",
+                false,
+            ),
+            (
+                ConnectionKey::shared("srv"),
+                "textDocument/diagnostic",
+                false,
+            ),
+        ];
+        for (key, method, expected) in cases {
+            let router = ResponseRouter::new();
+            let (mut deps, _window_rx, _keep) = server_request_deps_for(Some("srv"));
+            let (upstream_request_tx, mut upstream_request_rx) = mpsc::unbounded_channel();
+            deps.connection_key = key.clone();
+            deps.upstream_request_tx = upstream_request_tx;
+
+            handle_message(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "client/registerCapability",
+                    "params": { "registrations": [{ "id": "r", "method": method }] }
+                }),
+                &router,
+                "",
+                &deps,
+            )
+            .await;
+
+            assert!(deps.dynamic_capabilities.has_registration(method));
+            match upstream_request_rx.try_recv() {
+                Ok(UpstreamRequest::ConsolidateSharedInstance { server }) => {
+                    assert!(expected, "{key} registering {method} must not consolidate");
+                    assert_eq!(server, "srv");
+                }
+                Ok(_) => panic!("unexpected upstream request for {key} / {method}"),
+                Err(_) => assert!(!expected, "{key} registering {method} must consolidate"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn handle_message_answers_peer_discovery_on_a_downstream_connection() {
         let router = ResponseRouter::new();
@@ -2299,11 +2384,12 @@ mod tests {
         let router = ResponseRouter::new();
         let (deps, (mut response_rx, _upstream_rx, _window_rx)) =
             dummy_server_request_deps_with_rx();
-        let peer = crate::lsp::bridge::pool::test_helpers::create_handle_with_key(
-            ConnectionState::Ready,
-            ConnectionKey::for_server("oxfmt"),
-        )
-        .await;
+        let (peer, _silent_peer) =
+            crate::lsp::bridge::pool::test_helpers::create_silent_handle_with_key(
+                ConnectionState::Ready,
+                ConnectionKey::for_server("oxfmt"),
+            )
+            .await;
         deps.peer_directory.register(&peer);
         handle_message(
             json!({
@@ -3933,6 +4019,19 @@ mod tests {
         );
     }
 
+    /// A reader whose server stays connected but never writes. An idle child
+    /// process can't stand in under paused time: on Windows tokio reads child
+    /// stdio on the blocking pool, and a pending blocking read inhibits the
+    /// clock's auto-advance, so every sleep hangs. Keep the returned stream
+    /// alive; dropping it is EOF.
+    fn silent_reader() -> (
+        tokio::io::DuplexStream,
+        BridgeReader<tokio::io::DuplexStream>,
+    ) {
+        let (server, client) = tokio::io::duplex(64);
+        (server, BridgeReader::new(client))
+    }
+
     // Poll the real reader loop directly so every read and timer check completes
     // before advancing paused time. There is no child-process I/O or idle-runtime
     // auto-advance between supplying bytes and observing the reader's state.
@@ -4261,14 +4360,7 @@ mod tests {
         use crate::lsp::bridge::protocol::RequestId;
         use std::time::Duration;
 
-        let mut conn = AsyncBridgeConnection::spawn(vec![
-            "sh".to_string(),
-            "-c".to_string(),
-            "cat > /dev/null".to_string(),
-        ])
-        .await
-        .expect("should spawn process");
-        let (_writer, reader) = conn.split();
+        let (_silent_server, reader) = silent_reader();
         let router = Arc::new(ResponseRouter::new());
         let request_id = RequestId::new(1);
         let upstream_id = UpstreamId::Number(7);
@@ -4303,14 +4395,7 @@ mod tests {
         use crate::lsp::bridge::protocol::RequestId;
         use std::time::Duration;
 
-        let mut conn = AsyncBridgeConnection::spawn(vec![
-            "sh".to_string(),
-            "-c".to_string(),
-            "cat > /dev/null".to_string(),
-        ])
-        .await
-        .expect("should spawn process");
-        let (_writer, reader) = conn.split();
+        let (_silent_server, reader) = silent_reader();
         let router = Arc::new(ResponseRouter::new());
         let old_upstream = UpstreamId::Number(7);
         let (_old_rx, old_epoch) = router

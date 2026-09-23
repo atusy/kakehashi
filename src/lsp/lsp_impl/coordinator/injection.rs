@@ -52,6 +52,7 @@ pub(crate) struct InjectionCoordinator {
     auto_install: AutoInstallManager,
     bridge: std::sync::Arc<BridgeCoordinator>,
     diagnostics: std::sync::Arc<DiagnosticAggregator>,
+    publisher: super::DiagnosticPublisher,
     settle_retry_waiters: crate::lsp::lsp_impl::settle_retry::SettleRetryWaiters,
     shutdown: tokio_util::sync::CancellationToken,
 }
@@ -80,6 +81,7 @@ impl InjectionCoordinator {
             auto_install: server.auto_install.clone(),
             bridge: std::sync::Arc::clone(&server.bridge),
             diagnostics: std::sync::Arc::clone(&server.diagnostics),
+            publisher: super::DiagnosticPublisher::new(server),
             settle_retry_waiters: server.settle_retry_waiters.clone(),
             shutdown: server.shutdown_token.clone(),
         }
@@ -118,6 +120,43 @@ impl InjectionCoordinator {
             self.diagnostics
                 .evict_source(host_uri, &DiagnosticSource::Region(ulid.to_string()));
         }
+    }
+
+    /// Close the virtual documents current settings no longer route to their
+    /// server, and take their pushed diagnostics out of the editor (#917).
+    ///
+    /// Runs in every pass that could look at the document's injections, even
+    /// one that finds none, so a settings publication reaches open documents
+    /// through the reparse it schedules — no edit needed — and a re-enabled
+    /// language is reopened by the same pass's eager open. It sits after `cancel_eager_open` for the same reason the
+    /// replaced-language close does: an older pass's eager task must not
+    /// reopen what this closes.
+    ///
+    /// The slots are evicted after the tracker removal, so a push that
+    /// resolves its URI after the close can no longer re-record them. A push
+    /// that resolved it just before still can, as can one for a URI a
+    /// still-selected server holds; #916 gates pushes by selection. The
+    /// publish is detached: this pass holds the document's lifecycle lock, and
+    /// an editor publish must not stall the next pass.
+    async fn retract_deselected_docs(&self, uri: &Url, host_language: &str) {
+        let settings = self.settings_manager.load_settings();
+        let deselected = self
+            .bridge
+            .close_deselected_docs(&settings, host_language, uri)
+            .await;
+        if deselected.is_empty() {
+            return;
+        }
+        let evicted = self.diagnostics.evict_region_servers(uri, &deselected);
+        let publisher = self.publisher.clone();
+        let host = uri.clone();
+        let shutdown = self.shutdown.clone();
+        tokio::spawn(async move {
+            // Nothing to tell an editor the server is leaving.
+            if !shutdown.is_cancelled() {
+                publisher.publish_retraction(&host, evicted).await;
+            }
+        });
     }
 
     /// Resolve all injection regions for a document, with stable region IDs from
@@ -378,15 +417,18 @@ impl InjectionCoordinator {
             self.documents.remove_edit_lock_if_unshared(uri, &edit_lock);
             return true;
         };
-        if injections.is_empty() {
-            self.bridge.cancel_eager_open(uri);
-            return true;
-        }
-
         // Stop the previous pass before closing a replaced language-bearing URI;
         // otherwise an old eager task can enqueue didOpen after the close and
         // resurrect the stale URI. The new batch is created below after cleanup.
         self.bridge.cancel_eager_open(uri);
+        // Before the empty-regions return: the retraction asks only what
+        // settings select, and a settings change can deselect a server and
+        // leave the host without regions in the same stroke (a replaced
+        // injections query), which no edit-driven close would catch.
+        self.retract_deselected_docs(uri, &host_language).await;
+        if injections.is_empty() {
+            return true;
+        }
         let replaced_regions = self.bridge.close_replaced_docs(uri, &injections).await;
         for region_id in replaced_regions {
             self.diagnostics
@@ -749,6 +791,81 @@ impl InjectionCoordinator {
     /// per-host incarnation check rather than here.
     pub(crate) fn open_host_uris(&self) -> Vec<Url> {
         self.documents.open_uris()
+    }
+
+    /// Re-sync every open host document that `server` host-bridges, onto
+    /// wherever each now routes (#968: a shared-instance consolidation retired
+    /// the per-root connections that held them).
+    ///
+    /// The respawn re-open covers injected regions only; a host document is
+    /// otherwise re-opened by its next edit or request, so an idle tab would
+    /// sit without the diagnostics its retired connection had pushed. The
+    /// sync goes to ALL of the host's servers, not just `server`: a host's
+    /// eager sync is one batch that supersedes the previous one, so a batch
+    /// naming one server would abort an in-flight re-sync to the others. For
+    /// connections that already hold the document at its current text the
+    /// sync is a no-op, and each send reads the live text.
+    ///
+    /// Returns once every started sync has run (or been superseded), so a
+    /// re-open barrier can hold commands until the documents they name are
+    /// open on their new connection.
+    pub(crate) async fn resync_host_documents_for_server(
+        &self,
+        settings: &crate::config::WorkspaceSettings,
+        server: &str,
+    ) {
+        let mut batches = Vec::new();
+        for uri in self.documents.open_uris() {
+            let Some(language) = self.document_language(&uri) else {
+                continue;
+            };
+            if !self
+                .bridge
+                .get_host_configs_for_language(settings, &language)
+                .iter()
+                .any(|config| config.server_name == server)
+            {
+                continue;
+            }
+            let Some((text, incarnation, content_version)) =
+                self.documents.get(&uri).map(|document| {
+                    (
+                        document.text_arc(),
+                        document.incarnation(),
+                        document.content_version(),
+                    )
+                })
+            else {
+                continue;
+            };
+            let documents = std::sync::Arc::clone(&self.documents);
+            let host_uri = uri.clone();
+            let live_text_reader: crate::lsp::bridge::HostTextReader =
+                std::sync::Arc::new(move || {
+                    documents
+                        .get(&host_uri)
+                        .filter(|doc| doc.incarnation() == incarnation)
+                        .map(|doc| (doc.text_arc(), doc.content_version()))
+                });
+            let (finished, batch) = tokio::sync::oneshot::channel();
+            self.bridge.eager_open_host_document_on_servers_notifying(
+                settings,
+                &language,
+                &uri,
+                &text,
+                crate::lsp::bridge::HostRevision {
+                    incarnation,
+                    content_version,
+                },
+                live_text_reader,
+                finished,
+            );
+            batches.push(batch);
+        }
+        for batch in batches {
+            // Err is the only outcome: the sender is dropped when the batch ends.
+            let _ = batch.await;
+        }
     }
 
     /// `uri`'s host language, without parsing or resolving anything.

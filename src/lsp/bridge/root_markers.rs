@@ -492,7 +492,8 @@ mod tests {
             });
 
         let root = root_uri.expect("marker root becomes rootUri");
-        let canonical_root = Url::from_file_path(project.canonicalize().unwrap()).unwrap();
+        // Canonicalize both sides: a URL round trip drops Windows' verbatim
+        // `\\?\` prefix, so only one canonicalized side would never match.
         assert_eq!(
             Url::parse(&root)
                 .unwrap()
@@ -500,7 +501,7 @@ mod tests {
                 .unwrap()
                 .canonicalize()
                 .unwrap(),
-            canonical_root.to_file_path().unwrap()
+            project.canonicalize().unwrap()
         );
         let folders = folders.expect("marker root becomes the sole workspace folder");
         assert_eq!(folders.len(), 1);

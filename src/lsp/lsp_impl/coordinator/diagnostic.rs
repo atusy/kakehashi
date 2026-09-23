@@ -526,8 +526,11 @@ impl DiagnosticSnapshotPreparer {
                                         // the invariant "PullLayer present ⟺ a pull
                                         // dispatched to ≥1 server", so an absent/Clear
                                         // pull layer never falsely suppresses a
-                                        // server's spontaneous push. The push path is
-                                        // untouched — only kakehashi's pulling stops.
+                                        // server's spontaneous push. `pullFallback =
+                                        // false` stops only kakehashi's pulling; an
+                                        // empty or excluding `priorities` also drops
+                                        // the excluded servers' pushes, at republish
+                                        // (#916).
                                         //
                                         // A `pullFallback` drop narrows this snapshot
                                         // below the editor's re-pull surface even with

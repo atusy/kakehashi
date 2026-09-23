@@ -279,18 +279,13 @@ return {
 
     #[tokio::test]
     async fn test_should_skip_unsupported_language_reports_metadata_error() {
-        use crate::install::test_helpers::setup_mock_metadata_cache;
-        use tempfile::tempdir;
-
-        let temp = tempdir().expect("Failed to create temp dir");
-        setup_mock_metadata_cache(temp.path(), "return {}");
-
-        let options = FetchOptions {
-            data_dir: Some(temp.path()),
-            use_cache: true,
-        };
-
-        let result = should_skip_unsupported_language_tracked("lua", Some(&options)).await;
+        let result = should_skip_unsupported_language_with_checker_tracked(
+            "lua",
+            None,
+            METADATA_CHECK_TIMEOUT,
+            |_lang, _options| Err(MetadataError::EmptyMetadata),
+        )
+        .await;
         assert!(
             result.should_skip,
             "Metadata errors should prevent auto-install attempts"

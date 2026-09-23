@@ -1,6 +1,7 @@
 //! didClose notification handling for bridge connections.
 //!
-//! Cleans up when host documents are closed or regions are invalidated.
+//! Cleans up when host documents are closed, when regions are invalidated or
+//! change language, and when settings stop selecting a server for a region.
 //! Notifications are queued via the channel-based writer task (ls-bridge-message-ordering) for
 //! FIFO ordering.
 
@@ -14,6 +15,17 @@ use super::super::pool::{
     OpenedVirtualDoc,
 };
 use super::super::protocol::{VirtualDocumentUri, build_didclose_notification};
+
+/// Which routing decisions a close forgets.
+#[derive(Clone, Copy)]
+enum RoutingForget {
+    /// Every server's decision for the URI: the region itself is gone or
+    /// replaced, so every copy of it is being closed.
+    WholeUri,
+    /// Only the closed connection's: other servers keep serving the same
+    /// region (or stay routed away from it), and their decisions still hold.
+    ThisConnection,
+}
 
 impl LanguageServerPool {
     /// Send a didClose notification for a virtual document.
@@ -155,8 +167,17 @@ impl LanguageServerPool {
     /// connection and purges its generation, preventing orphaned downstream and
     /// provenance state from accumulating.
     pub(crate) async fn close_single_virtual_doc(&self, doc: &OpenedVirtualDoc) {
+        self.close_virtual_doc(doc, RoutingForget::WholeUri).await;
+    }
+
+    async fn close_virtual_doc(&self, doc: &OpenedVirtualDoc, forget: RoutingForget) {
         if let Ok(uri) = url::Url::parse(&doc.virtual_uri.to_uri_string()) {
-            self.clear_host_routing_suppression(&uri);
+            match forget {
+                RoutingForget::WholeUri => self.clear_host_routing_suppression(&uri),
+                RoutingForget::ThisConnection => {
+                    self.clear_virtual_routing_for_connection(&uri, &doc.connection_key)
+                }
+            }
         }
         let handle = self.connection_for_didclose(&doc.connection_key).await;
         let transition = self.open_transition_lock(&doc.virtual_uri, &doc.connection_key);
@@ -274,6 +295,31 @@ impl LanguageServerPool {
         }
         replaced_regions
     }
+
+    /// Close the host's virtual documents whose connection's server is no
+    /// longer selected for them, returning what was closed.
+    ///
+    /// Selection is a settings question, so nothing about the region itself
+    /// changes: the region stays live and its latest contents stay recorded,
+    /// since other servers may still hold it and a later re-selection reopens
+    /// from those recorded contents. A formatting scratch document is taken
+    /// too when its server is deselected mid-request; that step's request then
+    /// fails against the closed document, and the pipeline's own cleanup finds
+    /// it already closed.
+    pub(crate) async fn close_deselected_docs(
+        &self,
+        host_uri: &Url,
+        mut is_selected: impl FnMut(&OpenedVirtualDoc) -> bool,
+    ) -> Vec<OpenedVirtualDoc> {
+        let to_close = self
+            .take_host_virtual_docs_where(host_uri, |doc| !is_selected(doc))
+            .await;
+        for doc in &to_close {
+            self.close_virtual_doc(doc, RoutingForget::ThisConnection)
+                .await;
+        }
+        to_close
+    }
 }
 
 #[cfg(test)]
@@ -326,6 +372,52 @@ mod tests {
         assert!(
             !pool.is_document_opened(&scratch_uri),
             "second close must remain a no-op"
+        );
+    }
+
+    /// Deselecting one server's copy of a virtual document must leave the
+    /// routing decisions of the other servers on that URI alone: those still
+    /// serve (or were routed away from) the same region, and forgetting a
+    /// "routed away" answer lets a request lazily open that server again.
+    #[tokio::test]
+    async fn close_deselected_docs_keeps_sibling_servers_routing() {
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///project/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "python", "REGION");
+        let routing_uri = Url::parse(&virtual_uri.to_uri_string()).unwrap();
+        for server in ["ruff", "pyright"] {
+            pool.register_opened_document(
+                &host_uri,
+                &virtual_uri,
+                &ConnectionKey::for_server(server),
+            )
+            .await;
+        }
+        pool.set_host_routing_by_server(&routing_uri, "pyright", true);
+        pool.set_host_routing_decided(&routing_uri, &ConnectionKey::for_server("pyright"));
+        pool.set_host_routing_by_server(&routing_uri, "mypy", false);
+        pool.set_host_routing_suppressed(&routing_uri, &ConnectionKey::for_server("mypy"));
+        pool.set_host_routing_by_server(&routing_uri, "ruff", true);
+
+        let closed = pool
+            .close_deselected_docs(&host_uri, |doc| doc.connection_key.server() != "ruff")
+            .await;
+
+        assert_eq!(closed.len(), 1);
+        assert_eq!(pool.host_routing_by_server(&routing_uri, "ruff"), None);
+        assert_eq!(
+            pool.host_routing_by_server(&routing_uri, "pyright"),
+            Some(true)
+        );
+        assert!(pool.is_host_routing_decided(&routing_uri, &ConnectionKey::for_server("pyright")));
+        assert_eq!(
+            pool.host_routing_by_server(&routing_uri, "mypy"),
+            Some(false)
+        );
+        assert!(pool.is_host_routing_suppressed(&routing_uri, &ConnectionKey::for_server("mypy")));
+        assert_eq!(
+            pool.get_all_connections_for_virtual_uri(&virtual_uri),
+            vec![ConnectionKey::for_server("pyright")]
         );
     }
 

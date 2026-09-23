@@ -278,10 +278,13 @@ mod tests {
         // Save original value
         let original = env::var("XDG_CONFIG_HOME").ok();
 
-        // Set XDG_CONFIG_HOME to a custom path
+        // Set XDG_CONFIG_HOME to a custom path. It must be absolute on this
+        // platform (`/custom/config` has no drive on Windows), or the lookup
+        // rightly rejects it and falls back.
+        let custom = env::temp_dir().join("custom").join("config");
         // SAFETY: #[serial(xdg_env)] prevents concurrent modification of XDG_CONFIG_HOME
         unsafe {
-            env::set_var("XDG_CONFIG_HOME", "/custom/config");
+            env::set_var("XDG_CONFIG_HOME", &custom);
         }
 
         let path = user_config_path();
@@ -302,7 +305,7 @@ mod tests {
         let path = path.unwrap();
         assert_eq!(
             path,
-            PathBuf::from("/custom/config/kakehashi/kakehashi.toml"),
+            custom.join("kakehashi").join("kakehashi.toml"),
             "should use XDG_CONFIG_HOME/kakehashi/kakehashi.toml"
         );
     }
@@ -341,7 +344,7 @@ mod tests {
         // and contain ".config" in the path (the fallback behavior)
         let path_str = path.to_string_lossy();
         assert!(
-            path_str.ends_with("kakehashi/kakehashi.toml"),
+            path.ends_with(std::path::Path::new("kakehashi").join("kakehashi.toml")),
             "path should end with kakehashi/kakehashi.toml, got: {}",
             path_str
         );

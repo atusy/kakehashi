@@ -619,39 +619,14 @@ impl Kakehashi {
                 code_lens_provider: Some(CodeLensOptions {
                     resolve_provider: Some(true),
                 }),
-                // Bridged commands (a `Command` surfaced in a code action) are
-                // executed via `workspace/executeCommand`, routed back to their
-                // origin server by the encoded command name (#568 PR 6). Gated
-                // on the same literal-support condition as `code_action_provider`.
-                // No STATIC `commands` here: downstream servers connect lazily so
-                // their command names aren't known at initialize. Routed names
-                // are now per-CONNECTION rather than per-document
-                // (execute-command-routing-token), so the set IS finite — but
-                // roots are still discovered lazily, so advertising them remains
-                // a deferred follow-up (see that record's Gap section). Each
-                // server's RAW command
-                // names — those from its static initialize result; a
-                // downstream's later dynamic command registrations are not
-                // collected — are dynamically registered as it reaches Ready
-                // (`UpstreamRequest::RegisterCommands` below, gated on client
-                // `dynamicRegistration`), which serves palette-fired commands
-                // — via a session-global registry keyed by raw command id. That
-                // id carries no workspace context, so when several LIVE
-                // connections advertise the same one the dispatcher refuses
-                // rather than picking by handshake order (#823); the refusal is
-                // reported to the editor, not just logged.
-                // Action-embedded commands carry ENCODED per-connection names that
-                // are never registered: a client that dispatches an action's
-                // command on provider PRESENCE (Neovim's built-in client)
-                // executes them regardless; one that only dispatches command ids
-                // from registered lists (VS Code's vscode-languageclient) still
-                // shows such an action without running its command — a known
-                // limitation.
-                execute_command_provider: client_supports_code_action_literals.then(|| {
-                    ExecuteCommandOptions {
-                        commands: vec![],
-                        work_done_progress_options: Default::default(),
-                    }
+                // Commands also arrive through inlay-hint label parts and the
+                // palette, so execution must not depend on code-action support.
+                // Lazy downstream handshakes supply the names later: both raw
+                // and connection-encoded names are dynamically registered when
+                // the client supports workspace.executeCommand.dynamicRegistration.
+                execute_command_provider: Some(ExecuteCommandOptions {
+                    commands: vec![],
+                    work_done_progress_options: Default::default(),
                 }),
                 rename_provider: Some(OneOf::Right(RenameOptions {
                     prepare_provider: Some(true),
@@ -1539,7 +1514,46 @@ fn spawn_upstream_request(
                     ),
                 }
             }
-            UpstreamRequest::ReopenDocuments { key, done } => {
+            UpstreamRequest::ConsolidateSharedInstance { server } => {
+                let Some(context) = delivery_context else {
+                    // Unreachable in the wired server (the loop is spawned with a
+                    // context); logged rather than skipped silently.
+                    log::warn!(
+                        target: "kakehashi::bridge",
+                        "Cannot consolidate {server:?}'s shared instance: no delivery context"
+                    );
+                    return;
+                };
+                context
+                    .injection
+                    .bridge()
+                    .pool()
+                    .consolidate_shared_instance(&server)
+                    .await;
+            }
+            UpstreamRequest::ResyncHostDocuments { server } => {
+                let Some(context) = delivery_context else {
+                    // Unreachable in the wired server (the loop is spawned with a
+                    // context); logged rather than skipped silently.
+                    log::warn!(
+                        target: "kakehashi::bridge",
+                        "Cannot re-sync {server:?}'s host documents: no delivery context"
+                    );
+                    return;
+                };
+                context
+                    .injection
+                    .resync_host_documents_for_server(
+                        &context.settings_manager.load_settings(),
+                        &server,
+                    )
+                    .await;
+            }
+            UpstreamRequest::ReopenDocuments {
+                key,
+                host_documents,
+                done,
+            } => {
                 // One source of truth for the server: carrying it alongside the
                 // key would be an invariant nobody checks, and a divergence
                 // would make the repair a silent no-op.
@@ -1587,7 +1601,7 @@ fn spawn_upstream_request(
                     hosts.len()
                 );
                 use crate::lsp::bridge::{OpenOutcome, REOPEN_WAIT};
-                let settings = context.settings_manager.load_settings();
+                let settings_manager = Arc::clone(&context.settings_manager);
                 // Naming the connection still matters: the open is ACQUIRED by
                 // this key, never by whatever a host routes to, so the repair
                 // lands on the connection `done` signals for and a routed
@@ -1642,6 +1656,19 @@ fn spawn_upstream_request(
                     // release builds do not contain this branch.
                     #[cfg(feature = "e2e")]
                     e2e_stall_reopen().await;
+                    // A consolidation moved host documents too: sync them onto
+                    // their new connection before `done` can release a command
+                    // that names one (#968).
+                    // Current settings, read here rather than captured, for the
+                    // same reason the per-host reads below are (#917).
+                    if host_documents {
+                        injection
+                            .resync_host_documents_for_server(
+                                &settings_manager.load_settings(),
+                                &reopen_server,
+                            )
+                            .await;
+                    }
                     // ONE parse-wait deadline for the whole sweep, not one per
                     // host. Each surviving host can park waiting for its tree,
                     // so a per-host bound lets ten of them spend `REOPEN_WAIT`
@@ -1652,6 +1679,16 @@ fn spawn_upstream_request(
                     let sweep_deadline = std::time::Instant::now() + REOPEN_WAIT;
                     let mut budget_spent = false;
                     for host in hosts {
+                        // Settings are read per host, not once per sweep, and
+                        // read again for the open below: the sweep can outlive
+                        // a settings change (it waits on the parses that
+                        // change invalidates), and opening under a copy taken
+                        // before it would reopen a region the change's
+                        // injection pass just retracted from a server it no
+                        // longer selects (#917). This read only screens. The
+                        // selection memo is per snapshot, so each read is a
+                        // pointer load unless the snapshot really changed.
+                        let settings = settings_manager.load_settings();
                         // Stop if nobody can hear the answer. `rearm` and a
                         // later `claim` both drop the registry's receiver, so a
                         // closed channel means this re-open has been superseded
@@ -1841,6 +1878,13 @@ fn spawn_upstream_request(
                             }
                             continue;
                         }
+                        // Current settings, not the screen's: the parse wait
+                        // above spans exactly the window in which a settings
+                        // change retracts. What remains is the open's own
+                        // routing awaits, which the pass does not serialize
+                        // with; the next pass on the host closes a region
+                        // opened there.
+                        let settings = settings_manager.load_settings();
                         // Sequential: each host's didOpen goes out on the SAME
                         // connection, so fanning out would only contend on the
                         // single-writer outbound queue.
@@ -2376,11 +2420,14 @@ mod tests {
     fn config_root_after_folder_change_uses_the_current_first_folder() {
         use std::path::PathBuf;
         use std::str::FromStr as _;
-        let uri = Uri::from_str("file:///current").expect("a file URI");
+        // Platform-absolute: `file:///current` names no path on Windows.
+        let current = std::env::temp_dir().join("current");
+        let uri =
+            Uri::from_str(Url::from_file_path(&current).unwrap().as_str()).expect("a file URI");
 
         assert_eq!(
             config_root_after_folder_change(Some(&uri), Some(PathBuf::from("/folderless"))),
-            Some(PathBuf::from("/current")),
+            Some(current),
             "a folder outranks the folderless fallback",
         );
     }
@@ -4643,6 +4690,7 @@ mod reopen_order_tests {
             &server.client,
             UpstreamRequest::ReopenDocuments {
                 key: ConnectionKey::for_server("retired-server"),
+                host_documents: false,
                 done,
             },
             false,

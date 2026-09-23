@@ -283,14 +283,16 @@ concatenated-formatting-pipeline.
 
 **Applies to**: `textDocument/publishDiagnostics`
 
-Note: spontaneous pushes bypass the aggregation priorities/strategy machinery
-on the proactive republish path — the diagnostic cache concatenates them
-across servers, suppressing push slots from pull-capable servers in favor of
+Note: spontaneous pushes bypass the aggregation strategy machinery on the
+proactive republish path — the diagnostic cache concatenates them across the
+servers the `textDocument/publishDiagnostics` `priorities` admits (#916),
+suppressing push slots from pull-capable servers in favor of
 pull results while the pull layer is active (in mixed configurations this
 can suppress a push whose server was not itself pulled). Cached pushes
 answering a client pull via `pushFallback` fold in only push-driven servers'
-slots, under cross-layer priorities/strategy only — server-level
-`priorities`/`maxFanOut` are not reapplied. Configured
+slots admitted by the `textDocument/diagnostic` `priorities`, under
+cross-layer priorities/strategy — the server-level order and `maxFanOut` are
+not reapplied. Configured
 `_self` host-server pushes carry the real host URI and host-relative ranges,
 so they are republished as-is (no URI filtering or translation step applies
 to them).

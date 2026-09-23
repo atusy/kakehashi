@@ -65,6 +65,10 @@ arc-swap = "1"
 clap = { version = "4", features = ["derive"] }
 dashmap = "6"
 dirs = "6"
+# Strips Windows verbatim `\\?\` prefixes only when the plain form means the
+# same path (long paths, reserved names, and UNC edge cases stay verbatim);
+# a hand-rolled prefix strip would get those wrong. No-op elsewhere.
+dunce = "1"
 indexmap = "2"
 env_logger = "0.11"
 libloading = "0.9"

@@ -25,11 +25,12 @@ use super::super::{Kakehashi, uri_to_url};
 use crate::config::settings::{AggregationStrategy, LayerSource, ResolvedLayerConfig};
 use crate::lsp::aggregation::server::{
     FanInResult, FanOutTask, HostFanOutTask, dispatch_concatenated, dispatch_host_concatenated,
-    dispatch_host_preferred, dispatch_preferred,
+    dispatch_host_preferred, dispatch_preferred, priorities_admit,
 };
 use crate::lsp::bridge::{LanguageServerPool, RegionOffset};
 use crate::lsp::diagnostic_cache::{
     DiagnosticCoverageStamp, DiagnosticSource, cached_push_diagnostics, push_slot_servers,
+    retain_region_push_slots,
 };
 use crate::lsp::lsp_impl::bridge_context::{
     DocumentRequestContext, HostRequestContext, resolve_aggregation_config_from_settings,
@@ -371,7 +372,7 @@ impl Kakehashi {
             &uri,
             language_name,
             region_meta,
-            host_ctx.is_some(),
+            host_ctx.as_ref(),
             &mut virt_items,
             &mut host_items,
         )
@@ -524,33 +525,36 @@ impl Kakehashi {
     /// native source. Region pushes are transformed to host coordinates against
     /// the region's current offset; host pushes are already host-local.
     ///
-    /// `host_layer_participates` is `host_ctx.is_some()` — the host layer is in
-    /// the method's priorities AND `bridge._self` is opted in with configured
+    /// `host_ctx` is the live host pull's context — `Some` iff the host layer is
+    /// in the method's priorities AND `bridge._self` is opted in with configured
     /// servers (capability is *not* required: a push-only `_self` server yields a
     /// host context whose live pull returns empty, and this fold supplies it).
+    /// Its candidates and `priorities` also gate the folded host pushes, so the
+    /// fold admits exactly the servers the live host pull resolved.
     ///
     /// Under a per-region `strategy = preferred`, the folded push-driven slots are
     /// *appended* after the region's live election rather than competing in it —
     /// consistent with Path A's concatenate-everything merge and the deferred
     /// per-source strategy fan-in (push-propagation-diagnostic-forwarding), not an
-    /// election bug. For the same reason the fold honors only `pushFallback`, not
-    /// the visible walk: it does not re-apply `priorities`/`maxFanOut`, so a
-    /// push-driven server outside the walk is still folded — exactly what Path A's
-    /// proactive merge already publishes, until the deferred fan-in resolves the
-    /// walk for both paths together.
+    /// election bug. For the same reason the fold applies `priorities` as
+    /// membership only (#916) — a push-driven server the list omits is not
+    /// folded, the same rule Path A's proactive merge applies under its own
+    /// key — and neither the walk's order nor `maxFanOut` (see
+    /// `priorities_admit`), until the deferred fan-in resolves the walk
+    /// for both paths together.
     async fn fold_push_fallback_diagnostics(
         &self,
         host: &Url,
         language_name: &str,
         region_meta: Vec<(String, String, RegionOffset)>,
-        host_layer_participates: bool,
+        host_ctx: Option<&HostRequestContext>,
         virt_items: &mut Vec<Diagnostic>,
         host_items: &mut Vec<Diagnostic>,
     ) {
         // One snapshot drives both the candidate classification and the fold, so
         // a push arriving across the classifying `await` below cannot land in the
         // folded set while skipping classification (no TOCTOU double-count).
-        let snapshot = self.diagnostics.snapshot(host);
+        let mut snapshot = self.diagnostics.snapshot(host);
         let candidates = push_slot_servers(&snapshot);
         if candidates.is_empty() {
             return; // no cached pushes for this host
@@ -571,6 +575,30 @@ impl Kakehashi {
         // language). A region without an offset is skipped by
         // `cached_push_diagnostics`, so this map doubles as the per-region
         // pushFallback gate — no separate set, no `region_id` clone.
+        // The pull's own `priorities` allowlist gates the folded pushes too
+        // (#916): a push-driven server the list omits must not reach the
+        // editor through the fold any more than the live pull dispatches to it.
+        // Keyed by borrowed region metadata (no clones), and skipped outright
+        // when no region push is cached. A region without `pushFallback` needs
+        // no check here: it gets no offset below, so the fold skips it anyway.
+        if crate::lsp::diagnostic_cache::has_region_sources(&snapshot) {
+            let injection_languages: HashMap<&str, &str> = region_meta
+                .iter()
+                .map(|(region_id, language, _)| (region_id.as_str(), language.as_str()))
+                .collect();
+            let mut allowlist = crate::lsp::lsp_impl::bridge_context::RegionPushAllowlist::new(
+                &self.bridge,
+                &settings,
+                language_name,
+                "textDocument/diagnostic",
+            );
+            retain_region_push_slots(&mut snapshot, |region_id, server| {
+                injection_languages
+                    .get(region_id)
+                    .is_some_and(|language| allowlist.admits(language, server))
+            });
+        }
+
         let mut region_offsets = HashMap::new();
         let mut push_fallback_by_lang: HashMap<String, bool> = HashMap::new();
         for (region_id, injection_language, offset) in region_meta {
@@ -597,15 +625,17 @@ impl Kakehashi {
         }
 
         // Host `pushFallback` gate: the host layer participates AND pushFallback
-        // is on for the host's diagnostic method.
-        let host_push_enabled = host_layer_participates
-            && settings
+        // is on for the host's diagnostic method. Then the same `priorities`
+        // allowlist as the region fold above, over the host servers (#916) —
+        // read from the live pull's own context rather than re-resolved.
+        let host_admitted = host_ctx.filter(|_| {
+            settings
                 .resolve_host_language_settings(language_name)
-                .map(|s| {
+                .is_some_and(|s| {
                     s.resolve_host_aggregation("textDocument/diagnostic")
                         .push_fallback
                 })
-                .unwrap_or(false);
+        });
 
         let include = |source: &DiagnosticSource, server: &str| {
             // Pull-driven servers are excluded unconditionally: their native
@@ -621,10 +651,14 @@ impl Kakehashi {
             }
             match source {
                 // A `Region` slot only reaches `include` when `region_offsets`
-                // has its offset, i.e. its `pushFallback` is on — so the gate is
-                // already applied; nothing more to check beyond `pull_driven`.
+                // has its offset, i.e. its `pushFallback` is on, and after the
+                // `priorities` retain above — both gates already applied;
+                // nothing more to check beyond `pull_driven`.
                 DiagnosticSource::Region(_) => true,
-                DiagnosticSource::Host => host_push_enabled,
+                DiagnosticSource::Host => host_admitted.is_some_and(|ctx| {
+                    ctx.configs.iter().any(|c| c.server_name == server)
+                        && priorities_admit(&ctx.priorities, server)
+                }),
                 DiagnosticSource::PullLayer => false,
             }
         };
@@ -977,6 +1011,106 @@ mod tests {
         ResolvedLayerConfig {
             priorities,
             strategy,
+        }
+    }
+
+    /// Rust settings with a `_self` host server `rust_ls` whose `priorities`
+    /// under `method` admit only another server.
+    fn rust_host_settings_excluding_under(
+        method: &str,
+    ) -> crate::config::settings::WorkspaceSettings {
+        use crate::config::settings::{
+            AggregationConfig, BridgeLanguageConfig, BridgeServerConfig, HOST_BRIDGE_KEY,
+            LanguageSettings, WorkspaceSettings,
+        };
+        let server = BridgeServerConfig {
+            cmd: Some(vec!["true".to_string()]),
+            languages: Some(vec!["rust".to_string()]),
+            initialization_options: None,
+            workspace_markers: None,
+            on_type_formatting_triggers: None,
+            prefer_shared_instance: None,
+            force_start: None,
+            enabled: None,
+            settings: None,
+        };
+        let self_bridge = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(HashMap::from([(
+                method.to_string(),
+                AggregationConfig {
+                    priorities: Some(vec!["other_ls".to_string()]),
+                    ..Default::default()
+                },
+            )])),
+        };
+        WorkspaceSettings {
+            auto_install: false,
+            language_servers: HashMap::from([("rust_ls".to_string(), server)]),
+            languages: HashMap::from([(
+                "rust".to_string(),
+                LanguageSettings {
+                    bridge: Some(HashMap::from([(HOST_BRIDGE_KEY.to_string(), self_bridge)])),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn host_fold_admits_only_servers_the_pull_priorities_name() {
+        // #916, host layer of the client-pull fold: a push-driven `_self`
+        // server the `textDocument/diagnostic` priorities omit is not folded,
+        // while an exclusion under the publish key leaves the fold alone.
+        for (excluded_under, folded) in [
+            ("textDocument/diagnostic", false),
+            ("textDocument/publishDiagnostics", true),
+        ] {
+            let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+            let server = service.inner();
+            server
+                .settings_manager
+                .apply_settings(rust_host_settings_excluding_under(excluded_under));
+            let uri = Url::parse("file:///test/fold.rs").unwrap();
+            server.documents.insert(
+                uri.clone(),
+                "fn main() {}".to_string(),
+                Some("rust".to_string()),
+                None,
+            );
+            server.diagnostics.record(
+                &uri,
+                DiagnosticSource::Host,
+                "rust_ls".to_string(),
+                Some(crate::lsp::bridge::ProgressConnectionId::for_test(1)),
+                vec![diag("host push")],
+            );
+            let lsp_uri = crate::lsp::lsp_impl::url_to_uri(&uri).unwrap();
+            let ctx = server
+                .resolve_host_bridge_context_for_language(
+                    &lsp_uri,
+                    "textDocument/diagnostic",
+                    "rust",
+                )
+                .expect("the host layer participates");
+
+            let (mut virt, mut host) = (Vec::new(), Vec::new());
+            server
+                .fold_push_fallback_diagnostics(
+                    &uri,
+                    "rust",
+                    Vec::new(),
+                    Some(&ctx),
+                    &mut virt,
+                    &mut host,
+                )
+                .await;
+            assert_eq!(
+                !host.is_empty(),
+                folded,
+                "host push with rust_ls excluded under {excluded_under}: {host:?}"
+            );
         }
     }
 

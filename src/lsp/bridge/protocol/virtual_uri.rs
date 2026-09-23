@@ -56,11 +56,10 @@ impl Eq for VirtualDocumentUri {}
 impl VirtualDocumentUri {
     /// Build a virtual document URI for an injection region.
     ///
-    /// `language` and `region_id` must be non-empty: callers always have valid
-    /// values (ULID for `region_id`, Tree-sitter query name for `language`), so
-    /// emptiness is a programming error. Debug builds assert; release builds
-    /// accept invalid input (no per-call validation overhead) and unknown
-    /// languages fall back to `.txt` for the extension.
+    /// `language` and `region_id` must be non-empty, and `region_id` must be
+    /// dot-free (a ULID in production, optionally with a scratch suffix).
+    /// Debug builds assert these invariants; release builds skip those assertions.
+    /// Unknown languages use their name as the extension, including any dots.
     pub(crate) fn new(
         host_uri: &tower_lsp_server::ls_types::Uri,
         language: &str,
@@ -68,6 +67,7 @@ impl VirtualDocumentUri {
     ) -> Self {
         debug_assert!(!language.is_empty(), "language must not be empty");
         debug_assert!(!region_id.is_empty(), "region_id must not be empty");
+        debug_assert!(!region_id.contains('.'), "region_id must be dot-free");
 
         Self {
             host_uri: host_uri.clone(),
@@ -89,9 +89,8 @@ impl VirtualDocumentUri {
 
     /// Convert to `ls_types::Uri`.
     ///
-    /// Parse failure is structurally unreachable (`to_uri_string()` always produces
-    /// valid URIs via `url::Url::to_string()` or a hardcoded format string), but the
-    /// fallback to the host URI prevents panics for defense in depth.
+    /// If the URL and LSP URI parsers disagree on an exotic input, fall back to
+    /// the host URI instead of panicking.
     pub(crate) fn to_lsp_uri(&self) -> tower_lsp_server::ls_types::Uri {
         let uri_string = self.to_uri_string();
         tower_lsp_server::ls_types::Uri::from_str(&uri_string).unwrap_or_else(|e| {
@@ -127,22 +126,20 @@ impl VirtualDocumentUri {
         filename.starts_with(VIRTUAL_URI_PREFIX)
             && filename
                 .get(VIRTUAL_URI_PREFIX.len()..)
-                .and_then(|s| s.rsplit_once('.'))
+                .and_then(|s| s.split_once('.'))
                 .is_some_and(|(region_id, ext)| !region_id.is_empty() && !ext.is_empty())
     }
 
     /// Extract the `region_id` from a virtual-document URI string, or `None` if
     /// it isn't one. Parses the same `{prefix}{region_id}.{ext}` filename shape
     /// as [`Self::is_virtual_uri`]; `region_id`s are dot-free (a ULID in
-    /// production, also scratch/test ids), so the last `.` separates the id from
-    /// the extension. Used as a cheap pre-filter when scanning open virtual
-    /// documents (`DocumentTracker::resolve_virtual_uri`).
+    /// production, also scratch/test ids), so the first `.` separates the id from
+    /// the extension, which may itself contain dots. Used as a cheap pre-filter
+    /// when scanning open virtual documents (`DocumentTracker::resolve_virtual_uri`).
     pub(crate) fn region_id_of(uri: &str) -> Option<String> {
         let url = url::Url::parse(uri).ok()?;
         let filename = url.path_segments().and_then(|mut s| s.next_back())?;
-        let (region_id, ext) = filename
-            .strip_prefix(VIRTUAL_URI_PREFIX)?
-            .rsplit_once('.')?;
+        let (region_id, ext) = filename.strip_prefix(VIRTUAL_URI_PREFIX)?.split_once('.')?;
         // A real virtual URI always has a non-empty region_id and extension; an
         // empty region_id (`kakehashi-virtual-uri-.lua`) matches no open document.
         if region_id.is_empty() || ext.is_empty() {
@@ -285,7 +282,17 @@ impl VirtualDocumentUri {
             self.host_uri.as_str(),
             percent_encoding::NON_ALPHANUMERIC,
         );
-        format!("kakehashi:///virtual/{encoded_host}/{virtual_filename}")
+        // Keep only RFC 3986 unreserved characters literal. Url's path-segment
+        // writer allows a backslash in non-special schemes, which ls_types::Uri
+        // rejects; encoding here also preserves controls instead of dropping them.
+        const SEGMENT_ENCODE_SET: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+            .remove(b'-')
+            .remove(b'.')
+            .remove(b'_')
+            .remove(b'~');
+        let encoded_filename =
+            percent_encoding::utf8_percent_encode(&virtual_filename, SEGMENT_ENCODE_SET);
+        format!("kakehashi:///virtual/{encoded_host}/{encoded_filename}")
     }
 
     /// Map language name to file extension (downstream servers like
@@ -601,16 +608,24 @@ mod tests {
     #[test]
     fn preserves_alphanumeric_and_safe_chars_in_region_id() {
         let host_uri = Url::parse("file:///project/doc.md").unwrap();
-        // RFC 3986 unreserved characters: A-Z a-z 0-9 - . _ ~
+        // Unreserved characters except the dot, which separates the extension.
         let virtual_uri =
-            VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", "ABC-xyz_123.test~v2");
+            VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", "ABC-xyz_123-test~v2");
 
         let uri_string = virtual_uri.to_uri_string();
         assert!(
-            uri_string.contains("ABC-xyz_123.test~v2.lua"),
+            uri_string.contains("ABC-xyz_123-test~v2.lua"),
             "Unreserved characters should not be encoded: {}",
             uri_string
         );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "region_id must be dot-free")]
+    fn panics_on_dotted_region_id_in_debug() {
+        let host: Uri = "file:///project/doc.md".parse().unwrap();
+        VirtualDocumentUri::new(&host, "lua", "region.part");
     }
 
     #[test]
@@ -932,6 +947,53 @@ mod tests {
             "Fallback URI should be detected as virtual: {}",
             uri_string
         );
+    }
+
+    #[test]
+    fn fallback_encodes_filename_as_one_path_segment() {
+        for host in [
+            "untitled:Untitled-1",
+            "mailto:test@example.com",
+            "data:text/plain,test",
+        ] {
+            let host_uri: Uri = host.parse().unwrap();
+            for language in ["../../evil", "foo.bar", "x/y?z#p%é \\end\n"] {
+                for region in ["region", "region-kakehashi-scratch-7-0"] {
+                    let virtual_uri = VirtualDocumentUri::new(&host_uri, language, region);
+                    let rendered = virtual_uri.to_uri_string();
+                    let parsed = Url::parse(&rendered).unwrap();
+                    let segments: Vec<_> = parsed.path_segments().unwrap().collect();
+                    assert_eq!(segments.len(), 3, "{rendered}");
+                    assert_eq!(
+                        percent_encoding::percent_decode_str(segments[2])
+                            .decode_utf8()
+                            .unwrap(),
+                        format!("{VIRTUAL_URI_PREFIX}{region}.{language}")
+                    );
+                    assert!(parsed.query().is_none(), "{rendered}");
+                    assert!(parsed.fragment().is_none(), "{rendered}");
+                    assert!(VirtualDocumentUri::is_virtual_uri(&rendered));
+                    assert_eq!(
+                        VirtualDocumentUri::region_id_of(&rendered).as_deref(),
+                        Some(region)
+                    );
+                    assert_eq!(virtual_uri.to_lsp_uri().as_str(), rendered);
+                    assert_eq!(
+                        VirtualDocumentUri::is_scratch_uri(&rendered),
+                        region != "region"
+                    );
+                    if region != "region" {
+                        assert_eq!(
+                            VirtualDocumentUri::canonical_uri_for_scratch(&rendered),
+                            Some(
+                                VirtualDocumentUri::new(&host_uri, language, "region")
+                                    .to_uri_string()
+                            )
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

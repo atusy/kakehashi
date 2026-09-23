@@ -178,11 +178,19 @@
 //!   changeNotifications}` + `hoverProvider`; records the `initialize`-time
 //!   workspace folders and every `workspace/didChangeWorkspaceFolders`
 //!   addition, then answers `textDocument/hover` with the sorted list of folder
-//!   URIs it currently knows (not gated on `didOpen` — the folder set is the
+//!   URIs it currently knows plus its process id (`folders:<uris>;pid:<n>`) (not gated on `didOpen` — the folder set is the
 //!   subject under test, populated by initialize + didChangeWorkspaceFolders).
 //!   Used by
 //!   `tests/e2e/e2e_shared_instance.rs` (#391) to prove the shared-instance opt-in
 //!   grows one downstream process's folder set across roots.
+//! - `workspace-folders-dynamic` — like `workspace-folders`, but declares only
+//!   `workspaceFolders.supported` statically and registers
+//!   `workspace/didChangeWorkspaceFolders` via `client/registerCapability` on
+//!   `initialized` (Pyright-style, #968). The hover's process id lets a test
+//!   tell a forwarded folder change from a restart.
+//! - `workspace-folders-dynamic-late` — like `workspace-folders-dynamic`, but
+//!   registers on the first `textDocument/hover` this process receives, so a
+//!   test can let other roots divert before the capability appears.
 //!
 //! Only built for E2E runs (`required-features = ["e2e"]` in Cargo.toml).
 
@@ -204,6 +212,9 @@ fn main() {
     // `workspace-folders` mode: every folder URI this server has been told
     // about, via `initialize` params and `workspace/didChangeWorkspaceFolders`.
     let mut workspace_folders: Vec<String> = Vec::new();
+    // `workspace-folders-dynamic-late`: whether the one-shot registration on
+    // the first hover has been sent.
+    let mut registered_folder_changes = false;
     // `will-save` mode: counts + last-seen URI for the willSave/didSave
     // notifications, reported back via hover so the test can prove they arrived
     // and carried the right document URI (the virtual URI for a virt server,
@@ -345,6 +356,7 @@ fn main() {
                     | "inlay-hint-escaping-resolve"
                     | "inlay-hint-slow-resolve" => json!({
                         "inlayHintProvider": { "resolveProvider": true },
+                        "executeCommandProvider": { "commands": ["mock.hint", "mock.resolved"] },
                         "textDocumentSync": 1
                     }),
                     "inlay-hint-marker-resolve" => json!({
@@ -481,6 +493,16 @@ fn main() {
                             }
                         }
                     }),
+                    // Declares `supported` but NOT `changeNotifications`:
+                    // folder-change support arrives later, via a dynamic
+                    // registration sent on `initialized` (#968).
+                    "workspace-folders-dynamic" | "workspace-folders-dynamic-late" => json!({
+                        "hoverProvider": true,
+                        "textDocumentSync": 1,
+                        "workspace": {
+                            "workspaceFolders": { "supported": true }
+                        }
+                    }),
                     // Like `workspace-folders` but does NOT advertise the
                     // workspaceFolders capability, so a `preferSharedInstance`
                     // opt-in must fall back to per-root instances (#391).
@@ -520,6 +542,24 @@ fn main() {
                     );
                 }
             }
+            "initialized" if mode == "workspace-folders-dynamic" => {
+                // Pyright-style: declare folder-change support only now,
+                // through `client/registerCapability` (#968).
+                request_with_params(
+                    &mut writer,
+                    json!("register-workspace-folders"),
+                    "client/registerCapability",
+                    json!({
+                        "registrations": [{
+                            "id": "workspace-folders",
+                            "method": "workspace/didChangeWorkspaceFolders"
+                        }]
+                    }),
+                );
+            }
+            // A response to one of this mock's own requests: nothing to
+            // answer (the catch-all below would echo a bogus reply).
+            "" if id.is_some() => {}
             "shutdown" => respond(&mut writer, id, Value::Null),
             "exit" => break,
             "textDocument/didOpen" => {
@@ -770,6 +810,24 @@ fn main() {
                 }
             }
             "textDocument/hover" => {
+                if mode == "workspace-folders-dynamic-late" && !registered_folder_changes {
+                    // Register only once this process is first asked for
+                    // something, so a test decides WHEN the capability appears.
+                    // Sent before the hover answer: the bridge records it
+                    // before routing that answer.
+                    registered_folder_changes = true;
+                    request_with_params(
+                        &mut writer,
+                        json!("register-workspace-folders"),
+                        "client/registerCapability",
+                        json!({
+                            "registrations": [{
+                                "id": "workspace-folders",
+                                "method": "workspace/didChangeWorkspaceFolders"
+                            }]
+                        }),
+                    );
+                }
                 let result = if mode == "inlay-hint-marker-resolve" {
                     let observation = json!({
                         "uri": message.pointer("/params/textDocument/uri"),
@@ -806,7 +864,16 @@ fn main() {
                     let mut folders = workspace_folders.clone();
                     folders.sort();
                     folders.dedup();
-                    json!({ "contents": format!("folders:{}", folders.join(",")) })
+                    // `pid` lets a test tell one process that took a folder
+                    // change apart from a replacement that was re-initialized
+                    // with the same folders.
+                    json!({
+                        "contents": format!(
+                            "folders:{};pid:{}",
+                            folders.join(","),
+                            std::process::id()
+                        )
+                    })
                 } else {
                     message
                         .pointer("/params/textDocument/uri")

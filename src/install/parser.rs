@@ -162,6 +162,10 @@ pub fn compile_parser_inprocess(
             ),
         ))
     })?;
+    // `parser_source_dir` canonicalizes for its confinement check, which on
+    // Windows yields a verbatim `\\?\C:\...` path; MSVC's cl.exe cannot open
+    // sources under it (#1113). Hand the compiler the plain form.
+    let grammar_path = dunce::simplified(grammar_path);
     let loader = Loader::with_parser_lib_path(parent_dir.to_path_buf());
     loader
         .compile_parser_at_path(grammar_path, output_path.to_path_buf(), &[])
@@ -738,10 +742,21 @@ fn download_and_extract_archive(
     // into_reader() streams without a size limit; parser archives can exceed
     // ureq's 10MB read_to_* default.
     let decoder = GzDecoder::new(response.into_body().into_reader());
-    let mut archive = Archive::new(decoder);
-
     // GitHub names the root directory `{repo}-{revision_without_v_prefix}`
     let expected_prefix = archive_root_dir_name(repo_name, revision);
+    extract_parser_archive(decoder, &expected_prefix, dest)
+}
+
+/// Extract regular files and directories while stripping the repository root.
+///
+/// Production callers supply a fresh source directory inside a private TempDir.
+/// Archives with links or special entries fall back to the git-clone fetch path.
+fn extract_parser_archive(
+    reader: impl std::io::Read,
+    expected_prefix: &str,
+    dest: &Path,
+) -> Result<(), ParserInstallError> {
+    let mut archive = Archive::new(reader);
 
     fs::create_dir_all(dest)?;
 
@@ -757,7 +772,7 @@ fn download_and_extract_archive(
         })?;
 
         // Strip the root directory prefix (e.g., "tree-sitter-json-0.24.8/")
-        let relative = match path.strip_prefix(&expected_prefix) {
+        let relative = match path.strip_prefix(expected_prefix) {
             Ok(p) => p.to_path_buf(),
             Err(_) => continue,
         };
@@ -767,11 +782,20 @@ fn download_and_extract_archive(
             continue;
         }
 
-        // Prevent path traversal attacks (zip slip)
-        if relative
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
+        // Entry::unpack does not confine link targets. Reject links before any
+        // entry can create an alias that a later file or directory follows.
+        // A parser source archive needs only regular files and directories;
+        // devices and FIFOs must not be materialized either.
+        let entry_type = entry.header().entry_type();
+        if !entry_type.is_file() && !entry_type.is_dir() {
+            return Err(ParserInstallError::ArchiveError(format!(
+                "Unsupported entry type {entry_type:?} in parser archive at {relative:?}"
+            )));
+        }
+
+        // Re-check after stripping: on Windows, a formerly nested `C:/...`
+        // component becomes a drive prefix that would replace `dest` on join.
+        if !archive_path_is_confined(&relative) {
             return Err(ParserInstallError::ArchiveError(format!(
                 "Path traversal attempt detected in archive: {}",
                 relative.display()
@@ -780,7 +804,7 @@ fn download_and_extract_archive(
 
         let target = dest.join(&relative);
 
-        if entry.header().entry_type().is_dir() {
+        if entry_type.is_dir() {
             fs::create_dir_all(&target)?;
         } else {
             if let Some(parent) = target.parent() {
@@ -797,6 +821,15 @@ fn download_and_extract_archive(
     }
 
     Ok(())
+}
+
+fn archive_path_is_confined(path: &Path) -> bool {
+    path.components().all(|component| {
+        matches!(
+            component,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    })
 }
 
 /// Derive the expected root directory name inside a GitHub archive tarball.
@@ -2092,6 +2125,131 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parser_archive_path_boundary_rejects_absolute_and_parent_paths() {
+        assert!(archive_path_is_confined(Path::new("src/parser.c")));
+        assert!(!archive_path_is_confined(Path::new("../outside")));
+        assert!(!archive_path_is_confined(Path::new("/outside")));
+        #[cfg(windows)]
+        for path in ["C:/outside", "C:outside", r"\outside", r"\\?\C:\outside"] {
+            assert!(!archive_path_is_confined(Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parser_archive_rejects_a_drive_prefix_exposed_by_root_stripping() {
+        let temp = tempdir().unwrap();
+        let victim = temp.path().join("outside");
+        let entry_path = format!("repo-rev/{}", victim.to_str().unwrap().replace('\\', "/"));
+        let mut archive = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(7);
+        archive
+            .append_data(&mut header, entry_path, &b"payload"[..])
+            .unwrap();
+        let bytes = archive.into_inner().unwrap();
+        assert!(
+            extract_parser_archive(&bytes[..], "repo-rev", &temp.path().join("source")).is_err()
+        );
+        assert!(
+            !victim.exists(),
+            "drive-prefixed entry must not escape source"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn parser_archive_cannot_write_through_an_archived_symlink() {
+        let temp = tempdir().unwrap();
+        let victim_dir = temp.path().join("outside");
+        fs::create_dir(&victim_dir).unwrap();
+        let victim = victim_dir.join("payload");
+        fs::write(&victim, b"original").unwrap();
+
+        let mut archive = tar::Builder::new(Vec::new());
+        let mut link = tar::Header::new_gnu();
+        link.set_entry_type(tar::EntryType::Symlink);
+        link.set_mode(0o777);
+        link.set_size(0);
+        link.set_link_name(&victim_dir).unwrap();
+        archive
+            .append_data(&mut link, "repo-rev/escape", std::io::empty())
+            .unwrap();
+        let mut file = tar::Header::new_gnu();
+        file.set_mode(0o644);
+        file.set_size(9);
+        archive
+            .append_data(&mut file, "repo-rev/escape/payload", &b"malicious"[..])
+            .unwrap();
+        let bytes = archive.into_inner().unwrap();
+
+        let result = extract_parser_archive(&bytes[..], "repo-rev", &temp.path().join("source"));
+        assert_eq!(fs::read(&victim).unwrap(), b"original");
+        assert!(result.is_err(), "archive links must be refused");
+    }
+
+    #[test]
+    fn parser_archive_rejects_links_and_special_entries_before_unpacking() {
+        for entry_type in [
+            tar::EntryType::Symlink,
+            tar::EntryType::Link,
+            tar::EntryType::Fifo,
+            tar::EntryType::Char,
+            tar::EntryType::Block,
+        ] {
+            let temp = tempdir().unwrap();
+            let dest = temp.path().join("source");
+            let mut archive = tar::Builder::new(Vec::new());
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(entry_type);
+            header.set_mode(0o644);
+            header.set_size(0);
+            if entry_type.is_symlink() || entry_type.is_hard_link() {
+                header.set_link_name("target").unwrap();
+            }
+            archive
+                .append_data(&mut header, "repo-rev/entry", std::io::empty())
+                .unwrap();
+            let bytes = archive.into_inner().unwrap();
+
+            let error = extract_parser_archive(&bytes[..], "repo-rev", &dest).unwrap_err();
+            assert!(
+                error.to_string().contains("Unsupported entry type"),
+                "{entry_type:?}: {error}"
+            );
+            assert!(fs::symlink_metadata(dest.join("entry")).is_err());
+        }
+    }
+
+    #[test]
+    fn parser_archive_extracts_files_directories_and_long_paths() {
+        let temp = tempdir().unwrap();
+        let dest = temp.path().join("source");
+        let mut archive = tar::Builder::new(Vec::new());
+        let mut directory = tar::Header::new_gnu();
+        directory.set_entry_type(tar::EntryType::Directory);
+        directory.set_mode(0o755);
+        directory.set_size(0);
+        archive
+            .append_data(&mut directory, "repo-rev/src", std::io::empty())
+            .unwrap();
+        // GNU long-name metadata must remain supported by the entry iterator.
+        let relative = format!("src/{}/parser.c", "long".repeat(30));
+        let mut file = tar::Header::new_gnu();
+        file.set_mode(0o644);
+        file.set_size(6);
+        archive
+            .append_data(&mut file, format!("repo-rev/{relative}"), &b"parser"[..])
+            .unwrap();
+        let bytes = archive.into_inner().unwrap();
+
+        extract_parser_archive(&bytes[..], "repo-rev", &dest).unwrap();
+        assert_eq!(fs::read(dest.join(relative)).unwrap(), b"parser");
+        assert!(!dest.join("repo-rev").exists());
+    }
+
     /// Test that download_and_extract_archive downloads and extracts a GitHub archive.
     #[test]
     fn test_download_and_extract_archive_for_json_parser() {
@@ -2186,7 +2344,12 @@ mod tests {
         // `__compile-parser` subcommand, which is not present in the unit-test
         // harness binary. End-to-end subprocess wiring is covered by
         // `tests/test_compile_parser_subprocess.rs`.
-        compile_parser_inprocess(&clone_dir, &output_path).expect("compile should succeed");
+        //
+        // Resolve the source through `parser_source_dir` as install does: on
+        // Windows it canonicalizes to a verbatim `\\?\` path, which the C
+        // compiler cannot open (#1113).
+        let source_dir = parser_source_dir(&clone_dir, None).expect("source dir");
+        compile_parser_inprocess(&source_dir, &output_path).expect("compile should succeed");
 
         assert!(
             output_path.exists(),

@@ -59,6 +59,19 @@ fn two_roots() -> TwoRoots {
 /// `prefer_shared` and the mock running in `mock_mode` (`"workspace-folders"`
 /// advertises the capability; `"workspace-folders-incapable"` does not).
 fn init_client_mode(prefer_shared: bool, mock_mode: &str) -> (LspClient, tempfile::TempDir) {
+    init_client_with_folders(prefer_shared, mock_mode, Value::Null, None, None)
+}
+
+/// [`init_client_mode`] with the client's `workspaceFolders` at `initialize`,
+/// optionally the mock's cross-process wire log (`MOCK_LSP_WIRE_LOG`), and
+/// optionally the server's `workspaceMarkers` (default: the `.git` default).
+fn init_client_with_folders(
+    prefer_shared: bool,
+    mock_mode: &str,
+    workspace_folders: Value,
+    wire_log: Option<&std::path::Path>,
+    workspace_markers: Option<Value>,
+) -> (LspClient, tempfile::TempDir) {
     let config_dir = tempfile::TempDir::new().expect("config tempdir");
     let config_path = config_dir.path().join("shared.toml");
     // Host-bridge the markdown document itself onto the downstream server.
@@ -68,26 +81,31 @@ fn init_client_mode(prefer_shared: bool, mock_mode: &str) -> (LspClient, tempfil
     )
     .expect("write config");
 
-    let mut client = LspClient::builder()
+    let mut builder = LspClient::builder()
         .arg("--config-file")
-        .arg(config_path.to_str().expect("utf-8 path"))
-        .build();
+        .arg(config_path.to_str().expect("utf-8 path"));
+    if let Some(path) = wire_log {
+        builder = builder.env("MOCK_LSP_WIRE_LOG", path.to_string_lossy());
+    }
+    let mut client = builder.build();
 
+    let mut server = json!({
+        "cmd": [mock_bin(), mock_mode],
+        "languages": ["markdown"],
+        "preferSharedInstance": prefer_shared
+    });
+    if let Some(markers) = workspace_markers {
+        server["workspaceMarkers"] = markers;
+    }
     client.send_request(
         "initialize",
         json!({
             "processId": std::process::id(),
             "rootUri": null,
             "capabilities": {},
-            "workspaceFolders": null,
+            "workspaceFolders": workspace_folders,
             "initializationOptions": {
-                "languageServers": {
-                    "mock-ws": {
-                        "cmd": [mock_bin(), mock_mode],
-                        "languages": ["markdown"],
-                        "preferSharedInstance": prefer_shared
-                    }
-                }
+                "languageServers": { "mock-ws": server }
             }
         }),
     );
@@ -218,5 +236,202 @@ fn e2e_opt_in_falls_back_to_per_root_when_server_incapable() {
     assert!(
         folders_b.contains(&roots.root_b) && !folders_b.contains(&roots.root_a),
         "incapable opt-in must fall back to per-root isolation; got {folders_b:?}"
+    );
+}
+
+/// The process id a `workspace-folders-dynamic` hover reports.
+fn hover_pid(folders: &str) -> &str {
+    folders
+        .split_once(";pid:")
+        .map(|(_, pid)| pid)
+        .unwrap_or_default()
+}
+
+/// A server that declares folder-change support only through a dynamic
+/// `client/registerCapability` (Pyright-style) is as capable as one that
+/// declares it statically (#968): opting in keeps ONE process that learns root
+/// B through `didChangeWorkspaceFolders`, rather than diverting B to a per-root
+/// process that never hears of A.
+#[test]
+fn e2e_opt_in_shares_one_process_with_a_dynamically_registering_server() {
+    let roots = two_roots();
+    let (mut client, _cfg) = init_client_mode(true, "workspace-folders-dynamic");
+
+    open(&mut client, &roots.doc_a, "# A\n");
+    // The mock registers on `initialized`, before it can answer this hover, and
+    // the bridge records a registration before routing any later response — so
+    // once A answers, the shared connection is known capable.
+    let root_a = roots.root_a.clone();
+    let folders_a = poll_hover(&mut client, &roots.doc_a, |f| f.contains(&root_a));
+    assert!(
+        folders_a.contains(&roots.root_a),
+        "first root must be known to the shared process; got {folders_a:?}"
+    );
+
+    open(&mut client, &roots.doc_b, "# B\n");
+    let root_b = roots.root_b.clone();
+    let folders_b = poll_hover(&mut client, &roots.doc_b, |f| f.contains(&root_b));
+    assert!(
+        folders_b.contains(&roots.root_a) && folders_b.contains(&roots.root_b),
+        "a dynamically registered server must serve both roots; got {folders_b:?}"
+    );
+    assert_eq!(
+        hover_pid(&folders_b),
+        hover_pid(&folders_a),
+        "root B must join the shared process, not a diverted one"
+    );
+}
+
+/// A client-root fallback whose server registered folder-change support
+/// dynamically takes an upstream `workspace/didChangeWorkspaceFolders` as a
+/// notification (#968). Recycling it instead would ALSO leave the new folder
+/// known — the replacement initializes with the current snapshot — so only the
+/// unchanged process id tells forwarding apart from a restart.
+#[test]
+fn e2e_client_folder_change_is_forwarded_to_a_dynamically_registering_server() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    // Marker search is switched off below, so the document resolves to the
+    // client-root fallback even when the temp dir sits inside a checkout.
+    let dir_a = tmp.path().join("a");
+    let dir_b = tmp.path().join("b");
+    std::fs::create_dir_all(&dir_a).expect("mkdir a");
+    std::fs::create_dir_all(&dir_b).expect("mkdir b");
+    let doc_path = dir_a.join("doc.md");
+    std::fs::write(&doc_path, "# A\n").expect("write doc");
+    let to_uri = |p: &std::path::Path| url::Url::from_file_path(p).unwrap().to_string();
+    let (root_a, root_b, doc) = (to_uri(&dir_a), to_uri(&dir_b), to_uri(&doc_path));
+
+    let (mut client, _cfg) = init_client_with_folders(
+        false,
+        "workspace-folders-dynamic",
+        json!([{ "uri": root_a, "name": "a" }]),
+        None,
+        Some(json!([])),
+    );
+    open(&mut client, &doc, "# A\n");
+    let before = poll_hover(&mut client, &doc, |f| f.contains(&root_a));
+    assert!(
+        before.contains(&root_a),
+        "the fallback must start with the client folder; got {before:?}"
+    );
+
+    client.send_notification(
+        "workspace/didChangeWorkspaceFolders",
+        json!({ "event": { "added": [{ "uri": root_b, "name": "b" }], "removed": [] } }),
+    );
+    let after = poll_hover(&mut client, &doc, |f| f.contains(&root_b));
+    assert!(
+        after.contains(&root_b),
+        "the added folder must reach the server; got {after:?}"
+    );
+    assert_eq!(
+        hover_pid(&after),
+        hover_pid(&before),
+        "the folder change must be forwarded, not answered with a restart"
+    );
+}
+
+/// A root diverted to its own process while the shared instance had not yet
+/// registered folder-change support is consolidated once it does (#968): the
+/// diverted process is shut down rather than left serving a root the shared
+/// instance now takes. Routing alone would already send root B's NEXT request
+/// to the shared instance (the capability is read live), so the discriminating
+/// observation is the diverted process's `shutdown`.
+#[test]
+fn e2e_late_registration_consolidates_diverted_roots() {
+    let roots = two_roots();
+    let log_dir = tempfile::TempDir::new().expect("wire log dir");
+    let wire_log = log_dir.path().join("wire.log");
+    let (mut client, _cfg) = init_client_with_folders(
+        true,
+        "workspace-folders-dynamic-late",
+        Value::Null,
+        Some(&wire_log),
+        None,
+    );
+
+    // Bring the shared instance up for root A WITHOUT asking it anything, so
+    // it stays unregistered (the mock registers on its first hover). Wait for
+    // A's didOpen before opening B: the two eager opens race, and whichever
+    // lands first spawns the shared instance under its root.
+    open(&mut client, &roots.doc_a, "# A\n");
+    let opened_a = format!("textDocument/didOpen\t{}", roots.doc_a);
+    let mut a_is_open = false;
+    for _ in 0..200 {
+        a_is_open = std::fs::read_to_string(&wire_log)
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line == opened_a);
+        if a_is_open {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(a_is_open, "the shared instance must come up under root A");
+    open(&mut client, &roots.doc_b, "# B\n");
+    // Root B lands on a diverted per-root process: the shared one is Ready
+    // and still incapable.
+    let root_b = roots.root_b.clone();
+    let diverted = poll_hover(&mut client, &roots.doc_b, |f| f.contains(&root_b));
+    assert!(
+        diverted.contains(&roots.root_b) && !diverted.contains(&roots.root_a),
+        "before registration root B must be served by its own process; got {diverted:?}"
+    );
+    let shutdowns = |log: &std::path::Path| {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.starts_with("shutdown\t"))
+            .count()
+    };
+    assert_eq!(shutdowns(&wire_log), 0, "nothing has been retired yet");
+
+    // The shared instance's first hover makes it register.
+    let root_a = roots.root_a.clone();
+    let shared = poll_hover(&mut client, &roots.doc_a, |f| f.contains(&root_a));
+    assert!(shared.contains(&roots.root_a), "got {shared:?}");
+
+    let mut retired = 0;
+    for _ in 0..200 {
+        retired = shutdowns(&wire_log);
+        if retired > 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        retired > 0,
+        "the diverted root's process must be retired once the shared instance registers"
+    );
+    // Root B's host document moves to the shared instance WITHOUT anything
+    // touching it: the diverted process logged B's first didOpen, and nothing
+    // since has asked about B, so a second one can only be the re-sync onto
+    // the shared instance. (Counted rather than ordered against `shutdown`:
+    // the two processes append independently.)
+    let opened_b = format!("textDocument/didOpen\t{}", roots.doc_b);
+    let mut reopened = false;
+    for _ in 0..200 {
+        let log = std::fs::read_to_string(&wire_log).unwrap_or_default();
+        reopened = log.lines().filter(|line| *line == opened_b).count() >= 2;
+        if reopened {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        reopened,
+        "an untouched document of a retired root must be re-opened on the shared instance"
+    );
+
+    let consolidated = poll_hover(&mut client, &roots.doc_b, |f| f.contains(&roots.root_a));
+    assert!(
+        consolidated.contains(&roots.root_a) && consolidated.contains(&roots.root_b),
+        "root B must now be served by the shared instance; got {consolidated:?}"
+    );
+    assert_eq!(hover_pid(&consolidated), hover_pid(&shared));
+    assert_eq!(
+        shutdowns(&wire_log),
+        1,
+        "only the diverted process is retired; the shared one keeps serving"
     );
 }
