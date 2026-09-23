@@ -865,6 +865,24 @@ The `bridge` map in language configuration controls which injection languages ar
 
 ### Configuration Files
 
+**Trust project configuration before enabling kakehashi.** By default, the
+workspace's `kakehashi.toml` is loaded automatically, without a trust prompt or
+execution allowlist. It can select native parser libraries through
+`languages.<language>.parser` or `searchPaths`, and launch programs through
+`languageServers.<server>.cmd`. These run with the permissions of kakehashi;
+opening a file in an unfamiliar repository can therefore execute code selected
+by that repository's configuration. Review the configuration, any
+`baseConfigFiles`, and the libraries/programs they select. This also applies
+when changing workspace roots causes project configuration to be reloaded.
+
+To skip automatic user and project config discovery, configure your client to
+launch `kakehashi --config-file /absolute/path/to/trusted.toml`. Keep that file
+and its base files outside untrusted project control. An existing empty TOML
+file is sufficient if you only need the programmed defaults and trusted client
+settings. This controls kakehashi's configuration sources; it does not sandbox
+native parsers or downstream servers, which can have their own project config
+loading behavior. See the [configuration trust decision](architecture-decisions/configuration-merging-strategy.md#configuration-is-trusted-executable-input).
+
 kakehashi loads configuration from `~/.config/kakehashi/kakehashi.toml` (user config) and `./kakehashi.toml` (project config). Both use the same TOML format:
 
 ```toml
