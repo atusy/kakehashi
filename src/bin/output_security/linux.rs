@@ -1,5 +1,6 @@
 use nix::sys::statfs::{FsType, NFS_SUPER_MAGIC, SMB_SUPER_MAGIC, fstatfs};
 use std::io;
+use std::os::fd::AsRawFd as _;
 use xattr::FileExt as _;
 
 const ACCESS_ACL: &str = "system.posix_acl_access";
@@ -56,7 +57,45 @@ fn normalize(result: io::Result<Option<Vec<u8>>>) -> io::Result<Vec<u8>> {
 
 pub fn from_file(file: &std::fs::File) -> io::Result<Vec<u8>> {
     check_filesystem(fstatfs(file)?.filesystem_type())?;
+    reject_encryption(file)?;
     snapshot(|name| file.get_xattr(name))
+}
+
+fn reject_encryption(file: &std::fs::File) -> io::Result<()> {
+    // Linux UAPI linux/fscrypt.h: FS_IOC_GET_ENCRYPTION_POLICY is
+    // _IOW('f', 21, struct fscrypt_policy_v1), whose size is 12 bytes.
+    // The legacy query suffices for refusal: newer policies return EINVAL,
+    // which we propagate. Unlike GETFLAGS, this queries fscrypt directly.
+    let request = nix::libc::_IOW::<[u8; 12]>(u32::from(b'f'), 21);
+    let mut policy = [0u8; 12];
+    // SAFETY: file owns a live descriptor and policy is the UAPI output size.
+    let result = unsafe { nix::libc::ioctl(file.as_raw_fd(), request, policy.as_mut_ptr()) };
+    reject_encryption_result(if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    })
+}
+
+fn reject_encryption_result(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Ok(()) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "cannot retain fscrypt encryption in atomic replacement; use a new output path",
+        )),
+        // No policy, no filesystem encryption implementation, or encryption
+        // disabled in the kernel/superblock, respectively. Unknown policies
+        // and all other inspection errors must prevent publication.
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(nix::libc::ENODATA | nix::libc::ENOTTY | nix::libc::EOPNOTSUPP)
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn snapshot(mut get: impl FnMut(&str) -> io::Result<Option<Vec<u8>>>) -> io::Result<Vec<u8>> {
@@ -86,6 +125,22 @@ fn snapshot(mut get: impl FnMut(&str) -> io::Result<Option<Vec<u8>>>) -> io::Res
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn encrypted_and_unknown_policies_prevent_replacement() {
+        assert!(super::reject_encryption_result(Ok(())).is_err());
+        for code in [nix::libc::EINVAL, nix::libc::EOVERFLOW, nix::libc::EACCES] {
+            assert_eq!(
+                super::reject_encryption_result(Err(std::io::Error::from_raw_os_error(code)))
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(code)
+            );
+        }
+        for code in [nix::libc::ENODATA, nix::libc::ENOTTY, nix::libc::EOPNOTSUPP] {
+            super::reject_encryption_result(Err(std::io::Error::from_raw_os_error(code))).unwrap();
+        }
+    }
+
     #[test]
     fn network_acl_models_are_refused_even_without_visible_attributes() {
         for kind in [
