@@ -766,7 +766,7 @@ impl DiagnosticPublisher {
             return;
         };
         let settings = self.settings_manager.load_settings();
-        let admitted = crate::lsp::lsp_impl::bridge_context::admitted_host_push_servers(
+        let admitted = crate::lsp::lsp_impl::bridge_context::PushAllowlist::for_host(
             &self.bridge,
             &settings,
             &language_name,
@@ -780,7 +780,7 @@ impl DiagnosticPublisher {
             return;
         }
         let slots = entry.get_mut();
-        slots.retain(|server, _| admitted.contains(server));
+        slots.retain(|server, _| admitted.admits(server));
         if slots.is_empty() {
             entry.remove();
         }

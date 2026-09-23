@@ -537,7 +537,7 @@ impl Kakehashi {
     /// membership only (#916) — a push-driven server the list omits is not
     /// folded, the same rule Path A's proactive merge applies under its own
     /// key — and neither the walk's order nor `maxFanOut` (see
-    /// `admitted_server_names`), until the deferred fan-in resolves the walk
+    /// `priorities_admit`), until the deferred fan-in resolves the walk
     /// for both paths together.
     async fn fold_push_fallback_diagnostics(
         &self,
@@ -625,16 +625,14 @@ impl Kakehashi {
                         .push_fallback
                 })
                 .unwrap_or(false);
-        let host_admitted = if host_push_enabled {
-            crate::lsp::lsp_impl::bridge_context::admitted_host_push_servers(
+        let host_admitted = host_push_enabled.then(|| {
+            crate::lsp::lsp_impl::bridge_context::PushAllowlist::for_host(
                 &self.bridge,
                 &settings,
                 language_name,
                 "textDocument/diagnostic",
             )
-        } else {
-            std::collections::HashSet::new()
-        };
+        });
 
         let include = |source: &DiagnosticSource, server: &str| {
             // Pull-driven servers are excluded unconditionally: their native
@@ -653,7 +651,9 @@ impl Kakehashi {
                 // has its offset, i.e. its `pushFallback` is on — so the gate is
                 // already applied; nothing more to check beyond `pull_driven`.
                 DiagnosticSource::Region(_) => true,
-                DiagnosticSource::Host => host_admitted.contains(server),
+                DiagnosticSource::Host => host_admitted
+                    .as_ref()
+                    .is_some_and(|allowlist| allowlist.admits(server)),
                 DiagnosticSource::PullLayer => false,
             }
         };
