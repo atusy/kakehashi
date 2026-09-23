@@ -234,9 +234,11 @@ unchanged. Unlike a push, an answer containing keys kakehashi does not know
 (editors keep settings such as `trace.server` in the same section) is not
 rejected: those keys are ignored and the rest applies.
 
-A field answered with an empty container (`{}` or `[]`) clears the value below
-it, as the same spelling would in a config file. Editor integrations should
-therefore register their setting defaults as absent rather than empty.
+A field answered with an empty container (`{}` or `[]`) means what the same
+spelling means in a config file — for most settings, it clears the value below
+it (see [Omitted, empty, and non-empty](#omitted-empty-and-non-empty) for the
+exceptions). Editor integrations should therefore register their setting
+defaults as absent rather than empty.
 
 ### Environment Variable Expansion
 
