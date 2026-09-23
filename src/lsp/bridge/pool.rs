@@ -104,6 +104,22 @@ fn same_launch_config(
         && old.is_enabled() == new.is_enabled()
 }
 
+/// The marker workspace a key is rooted at, rebuilt from the key alone —
+/// `Some(None)` for a key with no marker root (the client-root fallback, whose
+/// rooting is exactly "no marker"), and `None` when the recorded root is not a
+/// usable workspace URI.
+fn marker_for_key(
+    key: &ConnectionKey,
+) -> Option<Option<(Url, tower_lsp_server::ls_types::WorkspaceFolder)>> {
+    match key.marker_root() {
+        Some(root) => Url::parse(root)
+            .ok()
+            .and_then(super::root_markers::workspace_at_root)
+            .map(Some),
+        None => Some(None),
+    }
+}
+
 fn shutdown_invalidated_connection(key: ConnectionKey, handle: Arc<ConnectionHandle>) {
     tokio::spawn(async move {
         const RELOAD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -2240,24 +2256,14 @@ impl LanguageServerPool {
             );
             return None;
         }
-        let marker = match key.marker_root() {
-            Some(root) => {
-                let Some(marker) = Url::parse(root)
-                    .ok()
-                    .and_then(super::root_markers::workspace_at_root)
-                else {
-                    log::warn!(
-                        target: "kakehashi::bridge",
-                        "executeCommand: routed root {root:?} for {server:?} is not a \
-                         usable workspace URI; ignoring"
-                    );
-                    return None;
-                };
-                Some(marker)
-            }
-            // Client-root fallback: no marker to restore, which is exactly the
-            // rooting this key means.
-            None => None,
+        let Some(marker) = marker_for_key(key) else {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "executeCommand: routed root {:?} for {server:?} is not a \
+                 usable workspace URI; ignoring",
+                key.marker_root()
+            );
+            return None;
         };
         match self
             .acquire_resolved_wait_ready(
@@ -2267,6 +2273,7 @@ impl LanguageServerPool {
                 marker,
                 Duration::from_secs(INIT_TIMEOUT_SECS),
                 false,
+                None,
             )
             .await
         {
@@ -2923,6 +2930,7 @@ impl LanguageServerPool {
                 marker.clone(),
                 timeout,
                 rootless,
+                None,
             )
             .await
         {
@@ -2995,6 +3003,7 @@ impl LanguageServerPool {
                         marker.clone(),
                         remaining,
                         false,
+                        None,
                     )
                     .await;
                 // A dynamically registering server makes this divert race its
@@ -3026,6 +3035,9 @@ impl LanguageServerPool {
     /// and wait (up to `timeout`) for it to reach Ready, transparently waiting
     /// through a concurrent spawn that returns `Initializing`. Does NOT apply
     /// shared-instance routing or announce — callers layer that on top.
+    /// `admit` is evaluated inside the acquire's critical section, as for
+    /// [`Self::get_or_create_connection_admitted`].
+    #[allow(clippy::too_many_arguments)]
     async fn acquire_resolved_wait_ready(
         &self,
         server_name: &str,
@@ -3034,6 +3046,7 @@ impl LanguageServerPool {
         marker: Option<(Url, tower_lsp_server::ls_types::WorkspaceFolder)>,
         timeout: Duration,
         rootless: bool,
+        admit: Option<&(dyn Fn() -> bool + Sync)>,
     ) -> io::Result<Arc<ConnectionHandle>> {
         match self
             .get_or_create_connection_resolved(
@@ -3047,7 +3060,7 @@ impl LanguageServerPool {
                 // stays within `timeout` overall.
                 timeout,
                 rootless,
-                None,
+                admit,
             )
             .await
         {
