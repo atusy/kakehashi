@@ -1047,6 +1047,90 @@ impl InjectionCoordinator {
         }
     }
 
+    /// Retry the actual Ready-only open, outside the lifecycle edit guard.
+    /// A detached eager-open task cannot confirm that an untracked didOpen was
+    /// enqueued. This waiter owns that outcome without changing the failed barrier.
+    fn retry_reopen_when_settled(
+        &self,
+        uri: &Url,
+        incarnation: u64,
+        key: &crate::lsp::bridge::ConnectionKey,
+    ) {
+        let Some(claim) =
+            self.settle_retry_waiters
+                .claim_connection("reopen", uri, incarnation, key)
+        else {
+            return;
+        };
+        let this = self.clone();
+        let uri = uri.clone();
+        let key = key.clone();
+        tokio::spawn(async move {
+            let _claim = claim;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            let retry = async {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    if this.document_incarnation(&uri) != Some(incarnation) {
+                        return;
+                    }
+                    let Some(host_language) = this.document_language(&uri) else {
+                        continue;
+                    };
+                    if this.language_is_unsettled(&host_language) {
+                        continue;
+                    }
+                    let Some(revision) = this.reopen_revision(&uri) else {
+                        return;
+                    };
+                    if revision.document.incarnation != incarnation {
+                        return;
+                    }
+                    let Some(injections) = this.resolve_injection_data(&uri, &host_language) else {
+                        continue;
+                    };
+                    let settings = this.settings_manager.load_settings();
+                    let edit_lock = this.documents.edit_lock(&uri);
+                    let read = || this.reopen_document_revision(&uri, revision);
+                    let outcome = this
+                        .bridge
+                        .ensure_server_documents_open(
+                            &settings,
+                            &host_language,
+                            &uri,
+                            crate::lsp::bridge::OpenExpectation {
+                                incarnation,
+                                connection: Some(&key),
+                                expected_connection: None,
+                                revision: Some(crate::lsp::bridge::OpenRevision {
+                                    content_version: revision.document.content_version,
+                                    edit_lock: &edit_lock,
+                                    read: &read,
+                                }),
+                            },
+                            injections,
+                            key.server(),
+                        )
+                        .await;
+                    if this.documents.get(&uri).is_none() {
+                        this.documents
+                            .remove_edit_lock_if_unshared(&uri, &edit_lock);
+                    }
+                    if outcome != crate::lsp::bridge::OpenOutcome::NotOpened
+                        && this.reopen_snapshot_state(&uri, revision)
+                            == ReopenSnapshotState::Current
+                    {
+                        return;
+                    }
+                }
+            };
+            tokio::select! {
+                _ = this.shutdown.cancelled() => {},
+                _ = tokio::time::timeout_at(deadline, retry) => {},
+            }
+        });
+    }
+
     pub(crate) async fn reopen_server_documents(
         &self,
         settings: &std::sync::Arc<crate::config::WorkspaceSettings>,
@@ -1103,6 +1187,7 @@ impl InjectionCoordinator {
                 revision.document.incarnation,
                 Some(InjectionTarget::Incarnation(revision.document.incarnation)),
             );
+            self.retry_reopen_when_settled(uri, revision.document.incarnation, key);
         }
         // Routing can decide that none of the resolved regions belongs to
         // this connection without reaching the open's edit guard. An edit
@@ -1890,10 +1975,14 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::query_reload(true)]
-    #[case::queue_backpressure(false)]
+    #[case::query_reload(true, false)]
+    #[case::queue_backpressure(false, false)]
+    #[case::unopened_queue_backpressure(false, true)]
     #[tokio::test]
-    async fn rejected_reopen_resynchronizes_all_regions(#[case] query_reload: bool) {
+    async fn rejected_reopen_resynchronizes_all_regions(
+        #[case] query_reload: bool,
+        #[case] unopened: bool,
+    ) {
         use crate::lsp::bridge::OutboundMessage;
         use crate::lsp::bridge::VirtualDocumentUri;
         use crate::lsp::bridge::{ConnectionKey, OpenOutcome};
@@ -1958,7 +2047,7 @@ mod tests {
             });
         let host_uri = crate::lsp::lsp_impl::url_to_uri(&uri).unwrap();
         let (mut sender, mut received) = tokio::sync::mpsc::channel(8);
-        for region in &old {
+        for region in old.iter().filter(|_| !unopened) {
             pool.record_latest_virtual_content(
                 &uri,
                 incarnation,
@@ -2049,7 +2138,7 @@ mod tests {
         })
         .await
         .expect("failed repair must refresh the forwarded cache without an edit");
-        if !query_reload {
+        if !query_reload && !unopened {
             assert!(
                 coordinator
                     .settle_retry_waiters
@@ -2058,7 +2147,32 @@ mod tests {
                 "a failed first retry must keep synchronization pending"
             );
         }
+        if unopened {
+            // Keep the queue full until the detached eager attempt has also
+            // failed, rather than letting a late first attempt consume capacity.
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !server.bridge.eager_open_tasks_finished(&uri) {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
         drop(reserved);
+        if unopened {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !current.iter().all(|region| {
+                    pool.is_document_opened_on_connection(
+                        &VirtualDocumentUri::new(&host_uri, &region.language, &region.region_id),
+                        &key,
+                    )
+                }) {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("a failed didOpen must recover after queue capacity returns");
+        }
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 if coordinator

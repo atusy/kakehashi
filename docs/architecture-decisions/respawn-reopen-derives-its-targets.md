@@ -352,7 +352,12 @@ its downstream pass or an enqueue fails. Queue backpressure also schedules this
 recovery when the snapshot remains current. Failed sends retain their old
 fingerprints, and forwarding retries share the original settlement deadline
 rather than resetting it on every full queue. Recovery does not report the
-failed repair as successful.
+failed repair as successful. A separate waiter, coalesced by host lifetime and
+connection key, awaits the Ready-only revision-guarded open itself. This covers
+a failed initial `didOpen`, which has rolled back its tracking and therefore is
+invisible to didChange forwarding. It re-resolves current inputs on every attempt
+and stops on confirmed success/no-target, close/reopen, shutdown, or its ten-second
+timeout. Detached eager-open scheduling alone is not completion evidence.
 
 A required open uses the verified snapshot text directly: the latest forwarded
 virtual-content cache may still lag the completed parse. If another request

@@ -16,8 +16,14 @@ use crate::error::LockResultExt;
 /// a close and reopen at the same URI while it is active must get its own
 /// waiter, since the old one exits at its lifetime check once the language
 /// settles and would otherwise take the reopened document's retry with it.
-/// (kind, host, lifetime the waiter is bound to — `None` for host-level work).
-type WaiterKey = (&'static str, Url, Option<u64>);
+/// The final axis optionally scopes repair work to one downstream connection;
+/// ordinary host passes use `None` for that axis.
+type WaiterKey = (
+    &'static str,
+    Url,
+    Option<u64>,
+    Option<crate::lsp::bridge::ConnectionKey>,
+);
 
 #[derive(Clone, Default)]
 pub(crate) struct SettleRetryWaiters {
@@ -42,7 +48,21 @@ impl SettleRetryWaiters {
         host: &Url,
         lifetime: Option<u64>,
     ) -> Option<SettleRetryClaim> {
-        let key = (kind, host.clone(), lifetime);
+        self.claim_key((kind, host.clone(), lifetime, None))
+    }
+
+    /// A repair for one downstream must not absorb another connection's opens.
+    pub(crate) fn claim_connection(
+        &self,
+        kind: &'static str,
+        host: &Url,
+        lifetime: u64,
+        connection: &crate::lsp::bridge::ConnectionKey,
+    ) -> Option<SettleRetryClaim> {
+        self.claim_key((kind, host.clone(), Some(lifetime), Some(connection.clone())))
+    }
+
+    fn claim_key(&self, key: WaiterKey) -> Option<SettleRetryClaim> {
         let inserted = self
             .active
             .lock()
@@ -59,7 +79,7 @@ impl SettleRetryWaiters {
         self.active
             .lock()
             .recover_poison("SettleRetryWaiters::is_active")
-            .contains(&(kind, host.clone(), lifetime))
+            .contains(&(kind, host.clone(), lifetime, None))
     }
 }
 
@@ -77,6 +97,36 @@ impl Drop for SettleRetryClaim {
 mod tests {
     use super::SettleRetryWaiters;
     use url::Url;
+
+    #[test]
+    fn connection_repairs_coalesce_only_for_the_same_target() {
+        let waiters = SettleRetryWaiters::default();
+        let uri = Url::parse("file:///repair.md").unwrap();
+        let first = crate::lsp::bridge::ConnectionKey::for_server("first");
+        let second = crate::lsp::bridge::ConnectionKey::for_server("second");
+        let claim = waiters.claim_connection("reopen", &uri, 1, &first).unwrap();
+        assert!(
+            waiters
+                .claim_connection("reopen", &uri, 1, &first)
+                .is_none()
+        );
+        assert!(
+            waiters
+                .claim_connection("reopen", &uri, 1, &second)
+                .is_some()
+        );
+        assert!(
+            waiters
+                .claim_connection("reopen", &uri, 2, &first)
+                .is_some()
+        );
+        drop(claim);
+        assert!(
+            waiters
+                .claim_connection("reopen", &uri, 1, &first)
+                .is_some()
+        );
+    }
 
     #[test]
     fn one_waiter_per_kind_and_host_until_it_drops() {

@@ -1592,7 +1592,7 @@ impl LanguageServerPool {
         self.document_tracker.is_document_opened(virtual_uri)
     }
 
-    pub(super) fn is_document_opened_on_connection(
+    pub(crate) fn is_document_opened_on_connection(
         &self,
         virtual_uri: &VirtualDocumentUri,
         connection_key: &ConnectionKey,
