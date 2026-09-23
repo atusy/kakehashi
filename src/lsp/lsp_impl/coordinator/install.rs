@@ -939,6 +939,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failure_recorded_during_a_probe_declines_its_repair() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .apply_settings(auto_install_settings());
+        let install = server.install_coordinator();
+        let generation = server.cache.semantic_token_generation();
+        // A concurrent open's repair fails while this probe is still reading.
+        assert!(!install.decide_query_repair("rust", true, || {
+            server
+                .auto_install
+                .record_query_repair_failure("rust", generation);
+            QueryChainState::NeedsRepair
+        }));
+    }
+
+    #[tokio::test]
     async fn query_repair_leaves_the_first_snapshot_to_the_inline_parse() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
