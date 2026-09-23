@@ -2300,3 +2300,63 @@ fn e2e_disabling_a_pull_only_bridged_language_refreshes_pull_clients() {
     client.send_request("shutdown", json!(null));
     client.send_notification("exit", json!(null));
 }
+
+/// #917: a settings change that disables a bridged language AND leaves the
+/// host with no injection regions at all (here an empty injections query)
+/// must still retract the documents open for it: the pass then has no
+/// regions to walk, but the retraction depends only on settings.
+#[test]
+fn e2e_disabling_a_bridged_language_retracts_even_when_no_regions_remain() {
+    let wire_dir = tempfile::TempDir::new().expect("wire log dir");
+    let wire_log = wire_dir.path().join("wire.log");
+    let empty_injections = wire_dir.path().join("injections.scm");
+    std::fs::write(&empty_injections, "").expect("write empty injections query");
+    let config_dir = tempfile::TempDir::new().expect("temp dir");
+    let config_path = config_dir.path().join("push_diagnostics.toml");
+    std::fs::write(&config_path, "").expect("write config");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("utf8 path"))
+        .env("MOCK_LSP_WIRE_LOG", wire_log.to_string_lossy())
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-push": { "cmd": [mock_bin(), "diagnostics-push"], "languages": ["lua"] }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    open_host(&mut client);
+    let opened = wait_for_wire_count(&wire_log, "textDocument/didOpen", 1);
+
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": {
+                "languages": {
+                    "markdown": {
+                        "bridge": { "lua": { "enabled": false } },
+                        "queries": [{
+                            "kind": "injections",
+                            "path": empty_injections.to_string_lossy()
+                        }]
+                    }
+                }
+            }
+        }),
+    );
+    let closed = wait_for_wire_count(&wire_log, "textDocument/didClose", 1);
+    assert_eq!(closed[0], opened[0]);
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
