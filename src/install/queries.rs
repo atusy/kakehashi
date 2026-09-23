@@ -155,6 +155,23 @@ fn validate_safe_language_name(language: &str) -> Result<(), QueryInstallError> 
 /// parents the same way, but only from files the user placed on a search
 /// path; nothing here can install those.
 fn inherited_languages_on_disk(queries_dir: &Path) -> Option<Vec<InheritedLanguage>> {
+    inherited_languages_in(queries_dir, UnreadableQuery::Undetermined)
+}
+
+/// What an unreadable query file means for the dependency set.
+#[derive(Clone, Copy)]
+enum UnreadableQuery {
+    /// A managed copy: the chain cannot be determined, so it is not complete.
+    Undetermined,
+    /// A user's runtime file: the loader fails only that kind, and no install
+    /// repairs it, so it declares nothing here.
+    Skipped,
+}
+
+fn inherited_languages_in(
+    queries_dir: &Path,
+    unreadable: UnreadableQuery,
+) -> Option<Vec<InheritedLanguage>> {
     let mut parents: Vec<InheritedLanguage> = Vec::new();
     for query_file in QUERY_FILES {
         let path = queries_dir.join(query_file);
@@ -171,10 +188,18 @@ fn inherited_languages_on_disk(queries_dir: &Path) -> Option<Vec<InheritedLangua
             {
                 continue;
             }
-            // A kind it has but that cannot be read. Answering "no parents"
-            // would let a caller call the chain complete on a file it never
-            // saw, so say the chain cannot be determined instead.
-            Err(_) => return None,
+            // A kind it has but that cannot be read. For a managed copy,
+            // answering "no parents" would let a caller call the chain complete
+            // on a file it never saw, so say the chain cannot be determined.
+            Err(_) if matches!(unreadable, UnreadableQuery::Undetermined) => return None,
+            Err(e) => {
+                log::warn!(
+                    target: "kakehashi::install",
+                    "Ignoring unreadable runtime query {} while collecting dependencies: {e}",
+                    path.display()
+                );
+                continue;
+            }
         };
         for parent in parse_modeline(&content).inherits {
             match parents.iter_mut().find(|p| p.name == parent.name) {
@@ -190,6 +215,7 @@ fn inherited_languages_on_disk(queries_dir: &Path) -> Option<Vec<InheritedLangua
 /// Include configured runtime files as dependency declarations. The loader reads
 /// modelines from every hit (including shadowed plain files), so scan all hits.
 /// Download destinations remain under the data directory; these paths are read-only.
+/// Only the managed copy must be readable: an unreadable runtime file is skipped.
 fn inherited_languages_with_search_paths(
     queries_dir: &Path,
     language: &str,
@@ -201,7 +227,7 @@ fn inherited_languages_with_search_paths(
         if directory == queries_dir {
             continue;
         }
-        for parent in inherited_languages_on_disk(&directory)? {
+        for parent in inherited_languages_in(&directory, UnreadableQuery::Skipped)? {
             match parents.iter_mut().find(|known| known.name == parent.name) {
                 Some(known) => known.optional &= parent.optional,
                 None => parents.push(parent),

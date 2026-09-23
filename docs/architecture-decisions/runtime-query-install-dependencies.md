@@ -51,7 +51,9 @@ the loader resolves it there, so it is neither downloaded nor required as a
 managed copy, but the parents it declares remain part of the chain. The same
 rule decides staging, completeness, and the pre-publication checks, so a
 user-provided parent absent upstream no longer fails the install. An overlay
-alone does not provide a parent.
+alone does not provide a parent. An unreadable runtime file declares nothing:
+the loader fails only that query kind and no download can repair it, so it
+must not block the install. The managed copy stays strict.
 
 The standalone CLI installation remains scoped to the data directory; this decision adds no
 configuration discovery to that command. Explicit query-path lists, inline
