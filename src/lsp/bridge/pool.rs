@@ -957,6 +957,10 @@ impl LanguageServerPool {
         if diverted.is_empty() {
             return;
         }
+        // A retired key's pull lineage must not outlive it: were the root
+        // diverted again (after an unregistration), its new process would be
+        // sent a `previousResultId` minted by the old one.
+        self.invalidate_diagnostic_connections(&diverted);
         log::info!(
             target: "kakehashi::bridge",
             "[{server_name}] shared instance now accepts workspace-folder changes; \
@@ -4789,7 +4793,37 @@ mod tests {
         drop(connections);
         assert!(
             pool.pending_reopen.claim(&diverted_key).is_some(),
-            "the retirement goes through the invalidate path, which arms a re-open"
+            "the retirement goes through the shared invalidate path"
+        );
+    }
+
+    #[tokio::test]
+    async fn consolidating_drops_the_diverted_roots_pull_lineage() {
+        let pool = LanguageServerPool::new();
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("srv")).await;
+        shared.set_server_capabilities(Default::default());
+        register_folder_changes(&shared);
+        let diverted_key = ConnectionKey::new("srv", Some("file:///repo/b".to_string()));
+        let diverted = create_handle_with_key(ConnectionState::Ready, diverted_key.clone()).await;
+        pool.insert_connection(shared).await;
+        pool.insert_connection(diverted).await;
+        pool.diagnostic_pull_baselines.insert(
+            (diverted_key.clone(), "file:///repo/b/doc.md".to_string()),
+            DiagnosticPullBaseline {
+                result_id: "r1".to_string(),
+                diagnostics: Arc::new(Vec::new()),
+                request_sequence: 1,
+            },
+        );
+
+        pool.consolidate_shared_instance("srv").await;
+
+        assert!(
+            !pool
+                .diagnostic_pull_baselines
+                .contains_key(&(diverted_key, "file:///repo/b/doc.md".to_string())),
+            "a retired divert's resultId must not seed a later process under its key"
         );
     }
 
