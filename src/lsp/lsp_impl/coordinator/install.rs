@@ -398,7 +398,8 @@ impl InstallCoordinator {
     /// reloads on success. An `AlreadyInstalling` caller waits for the shared
     /// install claim, then reloads its own document when the parser artifact exists.
     /// `parsed` names only a parse published by this call; successful recovery
-    /// through a sibling's tree does not authorize open downstream work.
+    /// through a sibling's tree does not authorize tree-dependent open work.
+    /// Host diagnostics use `same_lifetime` even when parsing gives up.
     pub(crate) async fn maybe_auto_install_language(
         &self,
         language: &str,

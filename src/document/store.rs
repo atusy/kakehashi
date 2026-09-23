@@ -523,6 +523,8 @@ impl DocumentStore {
     /// parked, and a tree-less publish would only downgrade serve-stale
     /// answers. A later successful parse of the SAME version is re-admitted
     /// by the cell's tree-upgrade clause (see [`SnapshotSlot::admits`]).
+    /// Existing snapshots are retained, but readiness waiters are still woken:
+    /// parser registration may now permit host work without a new tree.
     pub(crate) fn publish_giveup_snapshot(&self, uri: &Url, expected_incarnation: u64) {
         let Some(doc) = self.documents.get(uri) else {
             return;
@@ -531,6 +533,10 @@ impl DocumentStore {
             return;
         }
         if doc.latest_snapshot_slot().snapshot.is_some() {
+            // A prior give-up may predate parser registration. Wake host-input
+            // readiness waiters even though the retained snapshot must not be
+            // replaced by another tree-less result.
+            doc.notify_parse_attempt_finished();
             return;
         }
         let snapshot = super::snapshot::ParseSnapshot {
@@ -1655,8 +1661,8 @@ mod tests {
         }
 
         /// A give-up publish releases parked first-parse waiters at
-        /// bootstrap (tree-less, current version) but is a strict no-op once
-        /// any snapshot exists — it must never downgrade one.
+        /// bootstrap (tree-less, current version) but retains any existing
+        /// snapshot while notifying readiness waiters.
         #[test]
         fn giveup_publish_fills_bootstrap_only() {
             let store = DocumentStore::new();
@@ -1672,12 +1678,14 @@ mod tests {
             // A newer input version does NOT re-open the give-up: a snapshot
             // exists, so no first-parse waiter is parked.
             store.update_document(uri.clone(), "ab".into(), None);
+            let watcher = store.subscribe_snapshots(&uri).unwrap();
             store.publish_giveup_snapshot(&uri, incarnation);
+            assert!(watcher.has_changed().unwrap());
             let view = store.latest_snapshot(&uri).unwrap();
             assert_eq!(
                 view.slot.snapshot.unwrap().parsed_version,
                 0,
-                "give-up is a no-op once any snapshot exists"
+                "give-up retains any existing snapshot"
             );
         }
 
