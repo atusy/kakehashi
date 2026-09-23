@@ -613,14 +613,15 @@ true` can still be opted out of per server with `preferSharedInstance =
 false`. A wildcard-only entry is never spawned itself, and a concrete server
 whose merged `cmd` is still empty is skipped.
 
-A bridged server that crashes is restarted automatically while an open
-document still bridges to it: its virtual documents are re-opened, so the
-diagnostics that vanished with it come back without an edit. Restarts back off
+A bridged server that crashes is restarted automatically while an injected
+region of an open document still routes to it: those regions are re-opened on
+the new process, so the diagnostics that vanished with it come back without
+an edit. Restarts back off
 (2 s, doubling) and stop after five in a row, starting over once the server
 has stayed up for a minute; a server that keeps dying is left down until the
 next edit or request needs it. A server that configuration no longer starts is
-never restarted, and neither is a `preferSharedInstance` instance, which the
-next document that routes to it restarts instead.
+never restarted. A `preferSharedInstance` instance, and a server serving only
+host documents (`_self`), are left to the next request that needs them.
 
 **Servers for any language (`languages = ["*"]`)**
 

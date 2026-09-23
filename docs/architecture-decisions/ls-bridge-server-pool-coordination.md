@@ -259,9 +259,11 @@ respawn-reopen-derives-its-targets describes and the replacement is brought
 up to date the same way as any other. It is rate-limited per key: 2 s,
 doubling, at most five consecutive attempts, reset after 60 s of health; past
 that only the next request respawns the server. It is skipped when settings no
-longer start the server, when no open document could bridge to it, and for a
-shared-instance key, whose marker roots cannot be recovered without a
-document.
+longer start the server; when no open document has an injected region routing
+to that exact key (per key, not per server, so another root's documents do not
+revive an empty process — and host-layer documents do not count, because the
+re-open restores only injected regions); and for a shared-instance key, whose
+marker roots cannot be recovered without a document.
 
 **Malformed Initialize Capability Recovery:**
 
