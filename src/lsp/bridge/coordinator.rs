@@ -2662,6 +2662,69 @@ mod tests {
         );
     }
 
+    /// Crash recovery asks per connection (#977): a host whose region resolves
+    /// to one root's key must not keep another root's crashed connection of
+    /// the same server wanted.
+    #[tokio::test]
+    async fn a_host_routes_only_to_the_connection_its_regions_resolve_to() {
+        let coordinator = BridgeCoordinator::new();
+        let mut servers = HashMap::new();
+        servers.insert(
+            "test-server".to_string(),
+            crate::lsp::bridge::pool::test_helpers::devnull_config_for_language("lua"),
+        );
+        let settings = Arc::new(WorkspaceSettings {
+            auto_install: false,
+            language_servers: servers,
+            ..Default::default()
+        });
+        let host_uri = Url::parse("file:///doc.md").unwrap();
+        let injections = || {
+            vec![BridgeInjection {
+                language: "lua".to_string(),
+                region_id: "region-0".to_string(),
+                content: "print(1)\n".to_string(),
+            }]
+        };
+        // Decide routing up front, so no candidate server is asked (the
+        // devnull command would never answer a handshake).
+        let virtual_uri = super::super::protocol::VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap(),
+            "lua",
+            "region-0",
+        );
+        coordinator.pool().set_host_routing_by_server(
+            &Url::parse(&virtual_uri.to_uri_string()).unwrap(),
+            "test-server",
+            true,
+        );
+
+        // Under no marker root, the region resolves to the client fallback.
+        let fallback = ConnectionKey::new("test-server", None);
+        let elsewhere = ConnectionKey::new("test-server", Some("file:///elsewhere".to_string()));
+        let routes_to = |key: ConnectionKey| {
+            let coordinator = &coordinator;
+            let settings = &settings;
+            let host_uri = &host_uri;
+            let injections = injections();
+            async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    coordinator.host_routes_to_connection(
+                        settings, "markdown", host_uri, injections, &key,
+                    ),
+                )
+                .await
+                .expect("routing must not ask a candidate server")
+            }
+        };
+        assert!(routes_to(fallback).await);
+        assert!(
+            !routes_to(elsewhere).await,
+            "another root's key of the same server is not this host's"
+        );
+    }
+
     /// The wildcard supplies the flag like any other field, and — as with
     /// `preferSharedInstance` — a concrete server can opt out of a blanket
     /// opt-in. The wildcard entry itself is a template, never a server.
