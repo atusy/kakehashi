@@ -1051,6 +1051,8 @@ impl DiagnosticAggregator {
     /// it (`None` for the synthetic pull-layer), so a later crash can evict only
     /// that connection's slots (#469). A restart re-pushes with a new id, replacing
     /// and re-tagging the slot.
+    ///
+    /// Returns whether the slot's diagnostics changed.
     pub(crate) fn record(
         &self,
         host: &Url,
@@ -1058,7 +1060,7 @@ impl DiagnosticAggregator {
         server: String,
         connection_id: Option<ProgressConnectionId>,
         diagnostics: Vec<Diagnostic>,
-    ) {
+    ) -> bool {
         let mut revisions = self
             .cache_revisions
             .lock()
@@ -1085,6 +1087,7 @@ impl DiagnosticAggregator {
         if changed {
             revisions.insert(host.clone(), self.allocate_cache_revision());
         }
+        changed
     }
 
     /// Replace the cached host-event pull blob for a host
@@ -2227,6 +2230,28 @@ impl DiagnosticAggregator {
     /// contribution in the cross-connection `PullLayer` blob until the next
     /// host-event pull recomputes it — an intentional asymmetry (#469 targets the
     /// push path; the pull layer self-refreshes on the next pull).
+    /// Every non-empty push slot `connection_id` produced, as `(host, source,
+    /// server)` — what [`Self::evict_connection`] would remove visibly. Read
+    /// before an eviction so the caller can tell which servers' diagnostics
+    /// vanish (only on a connection exit, never on a hot path).
+    pub(crate) fn connection_push_slots(
+        &self,
+        connection_id: ProgressConnectionId,
+    ) -> Vec<(Url, DiagnosticSource, String)> {
+        let cache = self.lock();
+        let mut slots = Vec::new();
+        for (host, sources) in cache.iter() {
+            for (source, servers) in sources {
+                for (server, slot) in servers {
+                    if slot.connection_id == Some(connection_id) && !slot.diagnostics.is_empty() {
+                        slots.push((host.clone(), source.clone(), server.clone()));
+                    }
+                }
+            }
+        }
+        slots
+    }
+
     pub(crate) fn evict_connection(&self, connection_id: ProgressConnectionId) -> Vec<Url> {
         let mut revisions = self
             .cache_revisions
