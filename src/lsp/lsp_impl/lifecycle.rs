@@ -2433,9 +2433,9 @@ fn spawn_crash_recovery(
         }
         let delay = match pool.schedule_crash_recovery(&crashed) {
             RecoveryDecision::Retry { attempt, delay } => {
-                log::info!(
+                log::debug!(
                     target: "kakehashi::bridge",
-                    "Downstream {key} crashed; respawning in {delay:?} (attempt {attempt})"
+                    "Downstream {key} crashed; considering a respawn in {delay:?} (attempt {attempt})"
                 );
                 delay
             }
