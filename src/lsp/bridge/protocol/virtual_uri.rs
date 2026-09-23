@@ -34,6 +34,12 @@ struct EncodedFilename<'a> {
     extension: &'a str,
 }
 
+impl EncodedFilename<'_> {
+    fn unencoded_len(&self) -> usize {
+        VIRTUAL_URI_PREFIX.len() + self.region_id.len() + 1 + self.extension.len()
+    }
+}
+
 impl std::fmt::Display for EncodedFilename<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let encode = |part| percent_encoding::utf8_percent_encode(part, FILENAME_ENCODE_SET);
@@ -83,7 +89,14 @@ impl HostBase {
     /// Splice the filename in, byte for byte what `Url::set_path` produces
     /// for an already-encoded segment, without re-parsing the path.
     fn render(&self, filename: &EncodedFilename<'_>) -> String {
-        format!("{}/{filename}{}", self.directory, self.after_path)
+        use std::fmt::Write;
+        // Sized for the unencoded filename, which is exact for the usual
+        // unreserved ids and extensions, so the common case allocates once.
+        let mut rendered = String::with_capacity(
+            self.directory.len() + 1 + filename.unencoded_len() + self.after_path.len(),
+        );
+        let _ = write!(rendered, "{}/{filename}{}", self.directory, self.after_path);
+        rendered
     }
 }
 
