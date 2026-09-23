@@ -197,11 +197,13 @@ impl LanguageServerPool {
         }
     }
 
-    /// Fire `didOpen` for every resolved bridge virtual URI so the downstream
-    /// server starts analyzing immediately instead of waiting for the first
-    /// user request. Fire-and-forget: per-document failures are logged at
-    /// debug level and never propagated; one open failing leaves the others
-    /// alone.
+    /// Enqueue opens for resolved virtual documents so analysis can start
+    /// before the first request. A revision expectation also synchronizes
+    /// changed content on documents already open on this connection.
+    ///
+    /// Return `NotOpened` when a required enqueue fails or the expected
+    /// document/connection becomes stale. Individual enqueue failures allow
+    /// other injections to proceed, but the batch remains incomplete.
     pub(crate) async fn eager_open_virtual_documents(
         &self,
         server_name: &str,
