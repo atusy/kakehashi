@@ -86,17 +86,20 @@ impl HostBase {
     }
 }
 
-/// Pair a rendered virtual URI with its `ls_types::Uri`, so the string the
-/// document tracker keys by and the URI sent downstream never disagree.
+/// Pair a rendered virtual URI with its `ls_types::Uri`. Except on the
+/// logged last resort (tier 3), the URI's string form is the rendered string,
+/// so the key the document tracker uses and the URI sent downstream agree.
 ///
-/// Each tier is valid by construction for every input the tier before it
-/// accepts; the later tiers exist only for an encoder regression:
-/// 1. the host-relative form (`None` for cannot-be-a-base hosts);
-/// 2. the `kakehashi:` form, whose components are all percent-encoded;
-/// 3. the host URI on the wire, keeping the tier-2 string as the identity.
-///    Downstream then sees the region as its host document, so the error log
-///    marks a bug; failing the request instead would make every request
-///    builder fallible for a case the property tests rule out.
+/// 1. The host-relative form, when the host has a usable [`HostBase`].
+/// 2. Otherwise, or if tier 1 is rejected, the `kakehashi:` form. Its
+///    components are all percent-encoded; it is the normal form for hosts
+///    without a base.
+/// 3. The host URI on the wire, keeping the tier-2 string as the identity.
+///
+/// A rejected tier-1 or tier-2 candidate means an encoding defect, which the
+/// property tests have not produced. Tier 3 then presents the region to
+/// downstream as its host document, hence the error log; returning an error
+/// instead would make every request builder fallible for that case.
 fn validated_rendering(
     hierarchical: Option<String>,
     fallback: impl FnOnce() -> String,
@@ -202,7 +205,8 @@ impl VirtualDocumentUri {
     }
 
     /// Convert to `ls_types::Uri`. Its string form equals
-    /// [`to_uri_string`](Self::to_uri_string) (see [`validated_rendering`]).
+    /// [`to_uri_string`](Self::to_uri_string), except on
+    /// [`validated_rendering`]'s logged last resort, which sends the host URI.
     pub(crate) fn to_lsp_uri(&self) -> tower_lsp_server::ls_types::Uri {
         self.rendering().1.clone()
     }
