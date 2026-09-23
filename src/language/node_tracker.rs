@@ -254,8 +254,10 @@ impl UriEntries {
             .retain(|_, tracked| tracked.incarnation > closing_incarnation);
         self.reverse
             .retain(|_, tracked| tracked.incarnation > closing_incarnation);
-        let live_scopes = self.forward.keys().map(|key| key.layer).collect();
-        self.tree_scopes.retain(&live_scopes);
+        if !self.tree_scopes.is_empty() {
+            let live_scopes = self.forward.keys().map(|key| key.layer).collect();
+            self.tree_scopes.retain(&live_scopes);
+        }
         if self.latest_incarnation <= closing_incarnation {
             self.named_layers.clear();
             self.next_named_layer = 0;
@@ -285,7 +287,7 @@ struct PositionKey {
     /// losing any genuinely owned data.
     kind: &'static str,
     /// URI-owned parse-scope token (`0` = host). Scope ranges shift alongside
-    /// node positions; tokens are not reused while the URI entry lives.
+    /// node positions; tokens are not reused within a document incarnation.
     layer: usize,
 }
 
@@ -1019,8 +1021,12 @@ impl NodeTracker {
             }
         }
 
-        let live_scopes = new_entries.forward.keys().map(|key| key.layer).collect();
-        new_entries.tree_scopes.retain(&live_scopes);
+        // Host-only tracking has no scopes to reclaim. Avoid a second walk
+        // over every node and a temporary set on that common edit path.
+        if !new_entries.tree_scopes.is_empty() {
+            let live_scopes = new_entries.forward.keys().map(|key| key.layer).collect();
+            new_entries.tree_scopes.retain(&live_scopes);
+        }
         *entries = new_entries;
         invalidated
     }

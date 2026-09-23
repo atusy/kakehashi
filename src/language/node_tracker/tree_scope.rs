@@ -45,7 +45,7 @@ impl NodeTreeScope {
     }
 }
 
-/// Tokens are never reused within a URI entry: navigation may retain one
+/// Tokens are never reused within a document incarnation: navigation may retain one
 /// across an await after its scope has been retired.
 #[derive(Default)]
 pub(super) struct TreeScopes {
@@ -57,6 +57,10 @@ pub(super) struct TreeScopes {
 pub(super) const TREE_SCOPE_BASE: usize = crate::language::injection::MAX_INJECTION_DEPTH + 1;
 
 impl TreeScopes {
+    pub(super) fn is_empty(&self) -> bool {
+        self.by_token.is_empty()
+    }
+
     pub(super) fn get(&self, scope: &NodeTreeScope) -> Option<usize> {
         self.by_scope.get(scope).copied()
     }
