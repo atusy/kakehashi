@@ -105,9 +105,9 @@ These constraints mean bridging is not simply "forward request, return response"
 
 ### Security Model
 
-**Only explicitly configured servers are spawned.** kakehashi does not auto-discover or execute arbitrary language servers based on injection content. A malicious code block cannot trigger execution of unregistered commands.
+**Only explicitly configured servers are spawned.** kakehashi does not auto-discover or execute arbitrary language servers based on injection content. A malicious code block cannot trigger execution of unregistered commands. This assumes the configuration itself is trusted: automatically loaded project configuration can select executable commands and native parsers. See [configuration trust](configuration-merging-strategy.md#configuration-is-trusted-executable-input); these document-content restrictions are not a workspace-trust gate.
 
-- Servers must be listed in user configuration with explicit `cmd` field
+- Servers must be listed in the merged configuration with an explicit `cmd` field; project files can supply it
 - No shell expansion or command interpolation in server commands
 - Injection content reaches servers as in-memory virtual documents on the
   ordinary path, so no data-at-rest surface is created for it. A server that
