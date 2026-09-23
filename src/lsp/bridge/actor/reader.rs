@@ -243,6 +243,12 @@ pub(crate) enum UpstreamRequest {
         /// stopped being true — documents close, hosts re-root, and a
         /// connection that died young held nothing to capture at all.
         key: ConnectionKey,
+        /// Also re-sync, before `done` is signalled, the open host documents
+        /// this server host-bridges. Set only by a shared-instance
+        /// consolidation (#968), which moves host documents as well as
+        /// injected regions onto a live connection; a respawn re-open keeps
+        /// its injection-only scope.
+        host_documents: bool,
         done: tokio::sync::watch::Sender<bool>,
     },
 }

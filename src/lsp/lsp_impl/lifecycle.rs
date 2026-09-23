@@ -1566,12 +1566,19 @@ fn spawn_upstream_request(
                     );
                     return;
                 };
-                context.injection.resync_host_documents_for_server(
-                    &context.settings_manager.load_settings(),
-                    &server,
-                );
+                context
+                    .injection
+                    .resync_host_documents_for_server(
+                        &context.settings_manager.load_settings(),
+                        &server,
+                    )
+                    .await;
             }
-            UpstreamRequest::ReopenDocuments { key, done } => {
+            UpstreamRequest::ReopenDocuments {
+                key,
+                host_documents,
+                done,
+            } => {
                 // One source of truth for the server: carrying it alongside the
                 // key would be an invariant nobody checks, and a divergence
                 // would make the repair a silent no-op.
@@ -1674,6 +1681,19 @@ fn spawn_upstream_request(
                     // release builds do not contain this branch.
                     #[cfg(feature = "e2e")]
                     e2e_stall_reopen().await;
+                    // A consolidation moved host documents too: sync them onto
+                    // their new connection before `done` can release a command
+                    // that names one (#968).
+                    // Current settings, read here rather than captured, for the
+                    // same reason the per-host reads below are (#917).
+                    if host_documents {
+                        injection
+                            .resync_host_documents_for_server(
+                                &settings_manager.load_settings(),
+                                &reopen_server,
+                            )
+                            .await;
+                    }
                     // ONE parse-wait deadline for the whole sweep, not one per
                     // host. Each surviving host can park waiting for its tree,
                     // so a per-host bound lets ten of them spend `REOPEN_WAIT`
@@ -4695,6 +4715,7 @@ mod reopen_order_tests {
             &server.client,
             UpstreamRequest::ReopenDocuments {
                 key: ConnectionKey::for_server("retired-server"),
+                host_documents: false,
                 done,
             },
             false,

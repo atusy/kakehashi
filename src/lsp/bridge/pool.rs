@@ -1026,26 +1026,31 @@ impl LanguageServerPool {
             shutdown_invalidated_connection(key, handle);
         }
         // Host-bridged documents are re-synced upstream, which holds their
-        // text; the re-open above covers injected regions only.
+        // text — inside the re-open when there is one, so its barrier also
+        // covers them; on their own otherwise (a handshaking shared instance
+        // settles its injected regions through its handshake's re-open).
+        let Some(done) = reopen else {
+            if let Err(e) = self
+                .upstream_request_tx
+                .send(UpstreamRequest::ResyncHostDocuments {
+                    server: server_name.to_owned(),
+                })
+            {
+                log::warn!(
+                    target: "kakehashi::bridge",
+                    "Failed to queue host-document re-sync for {server_name} \
+                     (forwarding loop gone): {e}"
+                );
+            }
+            return;
+        };
         if let Err(e) = self
             .upstream_request_tx
-            .send(UpstreamRequest::ResyncHostDocuments {
-                server: server_name.to_owned(),
+            .send(UpstreamRequest::ReopenDocuments {
+                key: shared_key.clone(),
+                host_documents: true,
+                done,
             })
-        {
-            log::warn!(
-                target: "kakehashi::bridge",
-                "Failed to queue host-document re-sync for {server_name} \
-                 (forwarding loop gone): {e}"
-            );
-        }
-        if let Some(done) = reopen
-            && let Err(e) = self
-                .upstream_request_tx
-                .send(UpstreamRequest::ReopenDocuments {
-                    key: shared_key.clone(),
-                    done,
-                })
         {
             log::warn!(
                 target: "kakehashi::bridge",
@@ -3998,6 +4003,7 @@ impl LanguageServerPool {
                     if let Some(done) = pending_reopen_handoff
                         && let Err(e) = upstream_request_tx.send(UpstreamRequest::ReopenDocuments {
                             key: command_registration_key.clone(),
+                            host_documents: false,
                             done,
                         })
                     {
@@ -5051,24 +5057,23 @@ mod tests {
 
         pool.consolidate_shared_instance("srv").await;
 
-        let mut reopened = None;
-        let mut resynced = None;
-        while let Ok(request) = upstream_requests.try_recv() {
-            match request {
-                UpstreamRequest::ReopenDocuments { key, .. } => reopened = Some(key),
-                UpstreamRequest::ResyncHostDocuments { server } => resynced = Some(server),
-                _ => panic!("unexpected upstream request"),
+        match upstream_requests.try_recv() {
+            Ok(UpstreamRequest::ReopenDocuments {
+                key,
+                host_documents,
+                ..
+            }) => {
+                assert_eq!(&key, shared.key(), "re-opened on the shared instance");
+                assert!(
+                    host_documents,
+                    "host documents are re-synced inside the same barrier"
+                );
             }
+            _ => panic!("expected a re-open of the shared instance"),
         }
-        assert_eq!(
-            reopened.as_ref(),
-            Some(shared.key()),
-            "injected regions are re-opened on the shared instance"
-        );
-        assert_eq!(
-            resynced.as_deref(),
-            Some("srv"),
-            "host documents are re-synced from upstream, which holds their text"
+        assert!(
+            upstream_requests.try_recv().is_err(),
+            "one request covers both"
         );
     }
 
@@ -5090,12 +5095,11 @@ mod tests {
 
         pool.consolidate_shared_instance("srv").await;
 
-        while let Ok(request) = upstream_requests.try_recv() {
-            assert!(
-                !matches!(request, UpstreamRequest::ReopenDocuments { .. }),
-                "no sweep before Ready"
-            );
+        match upstream_requests.try_recv() {
+            Ok(UpstreamRequest::ResyncHostDocuments { server }) => assert_eq!(server, "srv"),
+            _ => panic!("host documents are re-synced on their own, with no sweep before Ready"),
         }
+        assert!(upstream_requests.try_recv().is_err());
         assert!(
             pool.pending_reopen.claim(shared.key()).is_some(),
             "the debt stays armed for the handshake to claim"

@@ -802,11 +802,16 @@ impl InjectionCoordinator {
     /// naming one server would abort an in-flight re-sync to the others. For
     /// connections that already hold the document at its current text the
     /// sync is a no-op, and each send reads the live text.
-    pub(crate) fn resync_host_documents_for_server(
+    ///
+    /// Returns once every started sync has run (or been superseded), so a
+    /// re-open barrier can hold commands until the documents they name are
+    /// open on their new connection.
+    pub(crate) async fn resync_host_documents_for_server(
         &self,
         settings: &crate::config::WorkspaceSettings,
         server: &str,
     ) {
+        let mut batches = Vec::new();
         for uri in self.documents.open_uris() {
             let Some(language) = self.document_language(&uri) else {
                 continue;
@@ -839,7 +844,8 @@ impl InjectionCoordinator {
                         .filter(|doc| doc.incarnation() == incarnation)
                         .map(|doc| (doc.text_arc(), doc.content_version()))
                 });
-            self.bridge.eager_open_host_document_on_servers(
+            let (finished, batch) = tokio::sync::oneshot::channel();
+            self.bridge.eager_open_host_document_on_servers_notifying(
                 settings,
                 &language,
                 &uri,
@@ -849,7 +855,13 @@ impl InjectionCoordinator {
                     content_version,
                 },
                 live_text_reader,
+                finished,
             );
+            batches.push(batch);
+        }
+        for batch in batches {
+            // Err is the only outcome: the sender is dropped when the batch ends.
+            let _ = batch.await;
         }
     }
 
