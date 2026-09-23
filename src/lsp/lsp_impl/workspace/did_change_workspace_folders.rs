@@ -945,4 +945,33 @@ mod tests {
             "an unscoped answer must not stand in for the folder's"
         );
     }
+
+    /// A pull-model editor asks on every settings change, most of which are
+    /// not kakehashi's: an answer identical to the previous one leaves the
+    /// settings as they are, rather than republishing them — which would
+    /// reparse every open document and refresh semantic tokens for nothing.
+    #[tokio::test]
+    #[serial(xdg_env)]
+    async fn an_unchanged_answer_does_not_republish() {
+        let xdg_scratch = tempfile::tempdir().expect("failed to create scratch XDG_CONFIG_HOME");
+        let _xdg_guard = XdgConfigHomeGuard::set(xdg_scratch.path());
+        let first = tempfile::tempdir().expect("failed to create workspace dir");
+
+        let (service, _pulls) = initialized_server_answering(
+            serde_json::json!([folder(first.path(), "first")]),
+            vec![language_server("same-server")],
+        )
+        .await;
+        let server = service.inner();
+
+        pull_now(server).await;
+        assert!(has_language_server(server, "same-server"), "precondition");
+        let before = server.settings_manager.load_settings_pair();
+        pull_now(server).await;
+
+        assert!(
+            Arc::ptr_eq(&before, &server.settings_manager.load_settings_pair()),
+            "an answer that changes nothing must not republish the settings"
+        );
+    }
 }
