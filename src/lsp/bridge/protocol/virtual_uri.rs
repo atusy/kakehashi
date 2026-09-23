@@ -363,7 +363,8 @@ impl VirtualDocumentUri {
     /// The host-relative form, or `None` for a host without a [`HostBase`].
     fn render_hierarchical(&self, filename: &EncodedFilename<'_>) -> Option<String> {
         // The host part is identical for every region of a host document, but
-        // this function runs once per forwarded message — for a fence-heavy
+        // this function runs once per `VirtualDocumentUri`, and callers such as
+        // didChange build one per region per message — for a fence-heavy
         // document the repeated full URL parse was a measured tokio-side
         // hotspot (thousands of parses on the runtime). Cache it per host URI
         // (tiny map — one entry per open host document — and never stale: the
