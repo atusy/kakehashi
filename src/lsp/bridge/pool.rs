@@ -2182,6 +2182,27 @@ impl LanguageServerPool {
         }
     }
 
+    /// [`resolved_connection_key`](Self::resolved_connection_key) plus the
+    /// marker workspace an acquisition on the shared key must announce — `None`
+    /// for a rootless routing, which announces nothing.
+    pub(super) async fn resolved_connection_key_and_marker(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        document_uri: &Url,
+    ) -> (
+        ConnectionKey,
+        Option<Option<(Url, tower_lsp_server::ls_types::WorkspaceFolder)>>,
+    ) {
+        if self.host_routing_rootless(document_uri, server_name) {
+            return (ConnectionKey::shared(server_name), None);
+        }
+        let (marker, key) = self
+            .resolve_acquire(server_name, server_config, Some(document_uri))
+            .await;
+        (key, Some(marker))
+    }
+
     /// Resolve the exact `(server, root)` connection a document currently
     /// routes to, including shared-instance capability fallback.
     pub(super) async fn resolved_connection_key(
@@ -3201,7 +3222,7 @@ impl LanguageServerPool {
     /// name), capability-less servers, or a root already in the set —
     /// including a connection's own initialize-time root, so the first root
     /// never re-announces.
-    async fn announce_shared_root(
+    pub(super) async fn announce_shared_root(
         &self,
         handle: &Arc<ConnectionHandle>,
         marker: &Option<(Url, tower_lsp_server::ls_types::WorkspaceFolder)>,
