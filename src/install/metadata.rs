@@ -91,7 +91,7 @@ impl std::error::Error for MetadataError {}
 /// If `options` is provided and caching is enabled, the function will:
 /// 1. Check for a fresh cached copy
 /// 2. Use cached content only if it parses successfully
-/// 3. Otherwise, fetch from network and update cache
+/// 3. Otherwise, fetch from network and cache only successfully parsed content
 fn fetch_parsers_lua_with_options(
     options: Option<&FetchOptions>,
 ) -> Result<HashMap<String, ParserMetadata>, MetadataError> {
@@ -120,6 +120,7 @@ fn fetch_parsers_lua_with_cache(
     }
 
     let content = download()?;
+    let parsers = parse_parsers_lua(&content)?;
 
     // Update cache if available
     if let Some(cache) = cache {
@@ -127,7 +128,7 @@ fn fetch_parsers_lua_with_cache(
         let _ = cache.write(&content);
     }
 
-    parse_parsers_lua(&content)
+    Ok(parsers)
 }
 
 fn download_parsers_lua() -> Result<String, MetadataError> {
@@ -327,6 +328,26 @@ return {
   },
 }
 "#;
+
+    #[test]
+    fn invalid_download_preserves_previous_cache() {
+        let temp = tempdir().unwrap();
+        let cache = MetadataCache::with_default_ttl(temp.path());
+        cache.write(VALID_METADATA).unwrap();
+        let path = temp.path().join("cache/parsers.lua");
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH)
+            .unwrap();
+        assert!(cache.read().is_none(), "the previous cache must be stale");
+
+        let result = fetch_parsers_lua_with_cache(Some(&cache), || Ok("return {}".to_owned()));
+
+        assert!(matches!(result, Err(MetadataError::EmptyMetadata)));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), VALID_METADATA);
+    }
 
     #[test]
     fn corrupt_fresh_cache_is_replaced_from_network() {
