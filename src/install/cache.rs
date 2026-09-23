@@ -114,6 +114,24 @@ mod tests {
         assert_eq!(cache.read().as_deref(), Some("replacement metadata"));
     }
 
+    // Temporary files default to owner-only access; the published cache must
+    // keep the umask-derived mode that fs::write gave it, so other users of a
+    // shared data directory can still read it.
+    #[cfg(unix)]
+    #[test]
+    fn cache_write_keeps_the_default_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let cache = MetadataCache::with_default_ttl(temp.path());
+        cache.write("metadata").unwrap();
+        let reference = cache.cache_dir.join("reference");
+        fs::write(&reference, "metadata").unwrap();
+
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&cache.cache_path()), mode(&reference));
+    }
+
     #[test]
     fn failed_publication_preserves_destination_and_cleans_temporary_file() {
         let temp = tempdir().unwrap();
