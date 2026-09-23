@@ -77,8 +77,12 @@ queries = [
    - Sources:
      - `initializationOptions` in the LSP `initialize` request (at startup)
      - `workspace/didChangeConfiguration` notification (at runtime)
+     - the answer to kakehashi's `workspace/configuration` pull (at runtime)
    - Purpose: Per-session overrides from the editor/client configuration
    - Note: Runtime changes via `didChangeConfiguration` re-trigger the merge process
+   - Note: pushed layers accumulate in arrival order (#734); a pull answer is
+     the client's whole configuration for the scope asked, so it replaces the
+     previous answer and lands at its own arrival (downstream-settings-propagation)
 
 ### File Entry Composition
 
@@ -159,8 +163,8 @@ it has no clear spelling, which is bound up with the separate question of
 disabling a language outright.
 
 Bases per layer: a config file uses its own directory (each `--config-file`
-layer its own), `initializationOptions` and `didChangeConfiguration` use the
-workspace root, and the programmed defaults have no base. That root is not
+layer its own), `initializationOptions`, `didChangeConfiguration` and a pulled
+answer use the workspace root, and the programmed defaults have no base. That root is not
 fixed at initialize: `workspace/didChangeWorkspaceFolders` re-selects it from
 the current folder list. Config-file layers keep their own anchoring, but
 accepted client layers are retained in authored form and replayed against the
