@@ -1029,6 +1029,16 @@ impl LanguageServerPool {
         // text — inside the re-open when there is one, so its barrier also
         // covers them; on their own otherwise (a handshaking shared instance
         // settles its injected regions through its handshake's re-open).
+        //
+        // Deliberately not closed further: two windows remain in which a
+        // command kept from a retired divert can reach the shared instance
+        // before the host document it names — a debounced host sync that
+        // supersedes the consolidation's batch releases the wait before the
+        // replacement batch's didOpen, and a handshaking shared instance's own
+        // injection-only re-open does not wait for the standalone re-sync.
+        // Both are the general gap that no respawn re-open covers host
+        // documents, present on every recycle before #968 (#1116); the fix
+        // belongs to the re-open protocol, not to consolidation.
         let Some(done) = reopen else {
             if let Err(e) = self
                 .upstream_request_tx
@@ -2080,7 +2090,9 @@ impl LanguageServerPool {
     /// instance is now folder-change capable is a divert that consolidation
     /// retired (#968): its root now routes to the shared instance, which is
     /// where its documents were re-opened, so the command goes there instead
-    /// of reviving a per-root process that holds nothing.
+    /// of reviving a per-root process that holds nothing. The command then
+    /// waits on the shared key's re-open barrier, which covers host-bridged
+    /// documents only as far as consolidation's re-sync does (#1116).
     pub(super) async fn reconnect_by_key(
         &self,
         key: &ConnectionKey,

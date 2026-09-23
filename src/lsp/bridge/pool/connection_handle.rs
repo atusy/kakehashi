@@ -737,8 +737,9 @@ impl ConnectionHandle {
     /// capability is treated as effectively monotone: an `unregisterCapability`
     /// of a dynamic registration really withdraws it. (A static
     /// `changeNotifications` id is not in the registry, so unregistering that
-    /// id leaves the static declaration standing — as before #968.) Latching would keep forwarding
-    /// notifications to a server that opted out; reading live instead lets the
+    /// id leaves the static declaration standing — as before #968; #1117.)
+    /// Latching would keep forwarding notifications to a server that opted
+    /// out; reading live instead lets the
     /// next upstream folder change find the connection incapable and recycle
     /// it through the ordinary invalidate path — bounded staleness, no
     /// ordering between registration and folder-change handling. A check that
