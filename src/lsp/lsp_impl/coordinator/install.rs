@@ -536,8 +536,10 @@ impl InstallCoordinator {
                     // The queries were reloaded (by the owner or above); the
                     // retry only needs a tree. Letting it re-decide keeps a
                     // repair request from owning another install and a second
-                    // workspace-wide reload.
-                    return Box::pin(self.maybe_auto_install_language(
+                    // workspace-wide reload. The reload it would skip already
+                    // happened, so its completion still authorizes downstream
+                    // work for the repaired queries.
+                    let mut retried = Box::pin(self.maybe_auto_install_language(
                         language,
                         uri,
                         is_injection,
@@ -549,6 +551,8 @@ impl InstallCoordinator {
                         },
                     ))
                     .await;
+                    retried.queries_reloaded |= query_repair;
+                    return retried;
                 }
                 return InstallCompletion::default();
             }
