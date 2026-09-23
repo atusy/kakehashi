@@ -233,8 +233,9 @@ impl Kakehashi {
             scope_uri: None,
             section: Some("kakehashi".to_string()),
         }];
-        // Bounded by shutdown: this await lives in the `initialized` service
-        // future, which the server joins on, so a client that never answers
+        // Bounded by shutdown: this await lives in a service future —
+        // `initialized`, or the notification that triggered the pull — which
+        // the server joins on, so a client that never answers
         // would keep `serve` from returning after `exit`. The SIGTERM handler
         // rescues that on Unix and nothing does on Windows.
         let answered = match tokio::select! {
