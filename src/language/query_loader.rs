@@ -507,6 +507,19 @@ impl QueryLoader {
     }
 }
 
+/// Append one file's text so the next file starts on a fresh line and no
+/// line is added that the file did not have: a file's line numbers in the
+/// combined text are then its own plus the lines of what precedes it, which
+/// is what a skipped-pattern warning quotes. An empty file has no lines and
+/// contributes none. `pub(crate)` so the asset tests join sources the same
+/// way and count lines the loader would.
+pub(crate) fn append_file(combined: &mut String, content: &str) {
+    combined.push_str(content);
+    if !content.is_empty() && !content.ends_with('\n') {
+        combined.push('\n');
+    }
+}
+
 /// Whether `value` names exactly one ordinary path component.
 ///
 /// Gates the language half of implicit asset lookup so a document-controlled
@@ -527,20 +540,7 @@ impl QueryLoader {
 /// stay readable, whereas the write side may be stricter because the name also
 /// becomes a URL segment. Rejection here is a path-shape decision only; it is
 /// not a charset filter and must not be relied on as one.
-/// Append one file's text so the next file starts on a fresh line and no
-/// line is added that the file did not have: a file's line numbers in the
-/// combined text are then its own plus the lines of what precedes it, which
-/// is what a skipped-pattern warning quotes. An empty file has no lines and
-/// contributes none. `pub(crate)` so the asset tests join sources the same
-/// way and count lines the loader would.
-pub(crate) fn append_file(combined: &mut String, content: &str) {
-    combined.push_str(content);
-    if !content.is_empty() && !content.ends_with('\n') {
-        combined.push('\n');
-    }
-}
-
-fn is_single_path_component(value: &str) -> bool {
+pub(crate) fn is_single_path_component(value: &str) -> bool {
     let mut components = Path::new(value).components();
     matches!(components.next(), Some(Component::Normal(name)) if name == value)
         && components.next().is_none()

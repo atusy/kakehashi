@@ -946,13 +946,21 @@ impl LanguageCoordinator {
         let library_path =
             QueryLoader::resolve_library_path(parser_config, lang_name, search_paths);
         let Some(lib_path) = library_path else {
-            return Err(LanguageLoadResult::failure_with(LanguageEvent::log(
-                missing_parser_level,
+            let message = if !super::query_loader::is_single_path_component(lang_name) {
+                format!(
+                    "Refused parser lookup for language '{}': not a single path component",
+                    escape_terminal_controls(lang_name),
+                )
+            } else {
                 format!(
                     "No parser path found for language '{}' in search paths: {}",
                     escape_terminal_controls(lang_name),
                     format_search_paths(search_paths),
-                ),
+                )
+            };
+            return Err(LanguageLoadResult::failure_with(LanguageEvent::log(
+                missing_parser_level,
+                message,
             )));
         };
 
@@ -2132,6 +2140,22 @@ mod tests {
         let (resolved, load_result) = result.unwrap();
         assert_eq!(resolved, "bash");
         assert!(load_result.success);
+    }
+
+    #[test]
+    fn rejected_parser_name_reports_refusal_instead_of_absence() {
+        let coordinator = LanguageCoordinator::new();
+        let failure = coordinator
+            .load_parser("../bad\n", None, &[], LanguageLogLevel::Error)
+            .err()
+            .expect("implicit lookup must reject traversal");
+        let LanguageEvent::Log { level, message } = &failure.events[0] else {
+            panic!("expected parser diagnostic");
+        };
+        assert_eq!(*level, LanguageLogLevel::Error);
+        assert!(message.contains("not a single path component"), "{message}");
+        assert!(message.contains(r"../bad\n"));
+        assert!(!message.contains("not found"));
     }
 
     #[test]
