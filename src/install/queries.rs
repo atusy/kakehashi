@@ -155,7 +155,14 @@ fn validate_safe_language_name(language: &str) -> Result<(), QueryInstallError> 
 /// parents the same way, but only from files the user placed on a search
 /// path; nothing here can install those.
 fn inherited_languages_on_disk(queries_dir: &Path) -> Option<Vec<InheritedLanguage>> {
-    inherited_languages_in(queries_dir, UnreadableQuery::Undetermined)
+    inherited_languages_in(queries_dir, UnreadableQuery::Undetermined, None)
+}
+
+/// Whether `file` resolves into the managed query tree rooted at the
+/// canonical `managed_root`: through any link, it is then a managed copy,
+/// never a runtime source.
+fn resolves_into(file: &Path, managed_root: Option<&Path>) -> bool {
+    managed_root.is_some_and(|root| fs::canonicalize(file).is_ok_and(|file| file.starts_with(root)))
 }
 
 /// What an unreadable query file means for the dependency set.
@@ -168,13 +175,19 @@ enum UnreadableQuery {
     Skipped,
 }
 
+/// `managed_root`, the canonical managed query tree, is given when reading a
+/// runtime directory: files resolving into it are skipped as managed copies.
 fn inherited_languages_in(
     queries_dir: &Path,
     unreadable: UnreadableQuery,
+    managed_root: Option<&Path>,
 ) -> Option<Vec<InheritedLanguage>> {
     let mut parents: Vec<InheritedLanguage> = Vec::new();
     for query_file in QUERY_FILES {
         let path = queries_dir.join(query_file);
+        if resolves_into(&path, managed_root) {
+            continue;
+        }
         let content = match fs::read_to_string(&path) {
             Ok(content) => content,
             // A kind this language does not have — but only when there is no
@@ -237,12 +250,19 @@ fn inherited_languages_replacing(
     search_paths: &[PathBuf],
 ) -> Option<Vec<InheritedLanguage>> {
     let mut parents = inherited_languages_on_disk(queries_dir)?;
+    let managed_root = managed
+        .parent()
+        .and_then(|root| fs::canonicalize(root).ok());
     for base in search_paths {
         let directory = base.join("queries").join(language).clean();
         if same_directory(&directory, queries_dir) || same_directory(&directory, managed) {
             continue;
         }
-        for parent in inherited_languages_in(&directory, UnreadableQuery::Skipped)? {
+        for parent in inherited_languages_in(
+            &directory,
+            UnreadableQuery::Skipped,
+            managed_root.as_deref(),
+        )? {
             match parents.iter_mut().find(|known| known.name == parent.name) {
                 Some(known) => known.optional &= parent.optional,
                 None => parents.push(parent),
@@ -292,11 +312,15 @@ fn provided_outside_data_dir(
     search_paths: &[PathBuf],
 ) -> bool {
     let managed = queries_parent.join(language).clean();
+    let managed_root = fs::canonicalize(queries_parent).ok();
     search_paths.iter().any(|base| {
         let directory = base.join("queries").join(language).clean();
-        // Compared by identity: a link to the managed copy is not another source.
+        let highlights = directory.join("highlights.scm");
+        // Compared by identity: a link to the managed copy, of the directory
+        // or of the file, is not another source.
         !same_directory(&directory, &managed)
-            && fs::read_to_string(directory.join("highlights.scm")).is_ok_and(|content| {
+            && !resolves_into(&highlights, managed_root.as_deref())
+            && fs::read_to_string(&highlights).is_ok_and(|content| {
                 let modeline = parse_modeline(&content);
                 // Reached as a parent, so an optional self-name is skipped as
                 // the loader skips it, and does not mark an overlay.
