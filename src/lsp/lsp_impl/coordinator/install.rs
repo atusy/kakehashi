@@ -806,7 +806,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_query_repair_is_not_retried_until_the_next_reload() {
+    async fn a_waiter_leaves_a_shared_failure_to_the_owners_generation() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
         server
@@ -819,10 +819,13 @@ mod tests {
             Some("rust".into()),
             None,
         );
+        // An attempt started before a reload is still running afterwards...
         let claim = server.auto_install.begin_test_claim(
             "rust",
             query_dependency_paths(&server.settings_manager.load_settings(), "rust"),
         );
+        server.cache.bump_semantic_token_generation();
+        // ...and a repair requested after the reload joins it.
         let install = server.install_coordinator();
         let mut repair = Box::pin(install.maybe_auto_install_language(
             "rust",
@@ -840,13 +843,8 @@ mod tests {
         repair.await;
 
         assert!(
-            !install.decide_query_repair("rust", true, || QueryChainState::NeedsRepair),
-            "reopening must not repeat a repair that just failed"
-        );
-        server.cache.bump_semantic_token_generation();
-        assert!(
             install.decide_query_repair("rust", true, || QueryChainState::NeedsRepair),
-            "a reload (settings change or another install) retries it"
+            "the reload's retry must not be spent on an attempt from before it"
         );
     }
 
@@ -879,7 +877,12 @@ mod tests {
             .await;
         assert!(
             !install.decide_query_repair("rust", true, || QueryChainState::NeedsRepair),
-            "the repair's own failure must be remembered, not only a shared one"
+            "reopening must not repeat a repair that just failed"
+        );
+        server.cache.bump_semantic_token_generation();
+        assert!(
+            install.decide_query_repair("rust", true, || QueryChainState::NeedsRepair),
+            "a reload (settings change or a successful install) retries it"
         );
     }
 
