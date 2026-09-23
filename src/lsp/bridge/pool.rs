@@ -1015,17 +1015,16 @@ impl LanguageServerPool {
         // the shared connection (`reconnect_by_key`), and it must find the
         // re-open pending rather than overtake the didOpens it depends on.
         //
-        // A shared instance still handshaking must settle the debt itself:
-        // its handshake claims just before flipping Ready and sends the
-        // re-open after, whereas a sweep sent now would find no Ready
-        // connection to open on and spend the debt (the respawn's own
-        // included) on nothing. Arm only, then claim only if it has already
-        // turned Ready — a claim the handshake beat returns `None`. What is
-        // left is a handshake that claimed (finding nothing armed) just
-        // before our arm and flips Ready just after our state check; the debt
-        // then waits for the next spawn under the key, and the documents move
-        // at their next acquisition instead.
+        // A shared instance still handshaking cannot take a sweep yet — it
+        // would find no Ready connection and spend the debt (the respawn's own
+        // included) on nothing. Its handshake claims just before flipping
+        // Ready and re-opens after, so arm now and let it; if it claimed
+        // before our arm (finding nothing), wait for Ready below and claim
+        // the debt ourselves — a claim the handshake beat returns `None`.
+        // This runs on the upstream loop's own task, so the wait holds up no
+        // request.
         self.pending_reopen.arm(&shared_key);
+        let handshaking = shared.state() == ConnectionState::Initializing;
         let reopen = (shared.state() == ConnectionState::Ready)
             .then(|| self.pending_reopen.claim(&shared_key))
             .flatten();
@@ -1033,10 +1032,18 @@ impl LanguageServerPool {
         for (key, handle) in stale_handles {
             shutdown_invalidated_connection(key, handle);
         }
+        let reopen = match reopen {
+            None if handshaking => shared
+                .wait_for_ready(Duration::from_secs(INIT_TIMEOUT_SECS))
+                .await
+                .ok()
+                .and_then(|()| self.pending_reopen.claim(&shared_key)),
+            reopen => reopen,
+        };
         // Host-bridged documents are re-synced upstream, which holds their
         // text — inside the re-open when there is one, so its barrier also
-        // covers them; on their own otherwise (a handshaking shared instance
-        // settles its injected regions through its handshake's re-open).
+        // covers them; on their own otherwise (the handshake's re-open took
+        // the debt and settles the injected regions).
         //
         // Deliberately not closed further: two windows remain in which a
         // command kept from a retired divert can reach the shared instance
@@ -5109,11 +5116,58 @@ mod tests {
         );
     }
 
-    /// A shared instance still handshaking settles the re-open itself: its
-    /// handshake claims the debt right before turning Ready. Sending the sweep
-    /// now would find no Ready connection, open nothing, and spend the debt.
+    /// A shared instance still handshaking cannot take a sweep yet. When its
+    /// handshake claims the debt consolidation armed (the usual order), the
+    /// handshake's own re-open settles the injected regions and consolidation
+    /// only re-syncs host documents.
     #[tokio::test]
     async fn consolidating_leaves_an_initializing_shared_instances_reopen_to_its_handshake() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let mut upstream_requests = pool.take_upstream_request_rx().expect("receiver");
+        let shared =
+            create_handle_with_key(ConnectionState::Initializing, ConnectionKey::shared("srv"))
+                .await;
+        register_folder_changes(&shared);
+        let diverted_key = ConnectionKey::new("srv", Some("file:///repo/b".to_string()));
+        pool.insert_connection(Arc::clone(&shared)).await;
+        pool.insert_connection(create_handle_with_key(ConnectionState::Ready, diverted_key).await)
+            .await;
+        let (handshake_pool, handshake) = (Arc::clone(&pool), Arc::clone(&shared));
+        let handshake = tokio::spawn(async move {
+            // The handshake claims just before flipping Ready.
+            loop {
+                if handshake_pool
+                    .pending_reopen
+                    .claim(handshake.key())
+                    .is_some()
+                {
+                    handshake.set_state(ConnectionState::Ready);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            pool.consolidate_shared_instance("srv"),
+        )
+        .await
+        .expect("consolidation finishes once the handshake turns Ready");
+        handshake.await.unwrap();
+
+        match upstream_requests.try_recv() {
+            Ok(UpstreamRequest::ResyncHostDocuments { server }) => assert_eq!(server, "srv"),
+            _ => panic!("the handshake owns the sweep; host documents are re-synced on their own"),
+        }
+        assert!(upstream_requests.try_recv().is_err());
+    }
+
+    /// The other order: the handshake claimed (finding nothing) before
+    /// consolidation armed, then turned Ready. Nobody would claim the debt,
+    /// so consolidation waits for Ready and runs the re-open itself.
+    #[tokio::test]
+    async fn consolidating_claims_the_reopen_when_the_handshake_claimed_first() {
         let pool = LanguageServerPool::new();
         let mut upstream_requests = pool.take_upstream_request_rx().expect("receiver");
         let shared =
@@ -5124,18 +5178,31 @@ mod tests {
         pool.insert_connection(Arc::clone(&shared)).await;
         pool.insert_connection(create_handle_with_key(ConnectionState::Ready, diverted_key).await)
             .await;
+        assert!(pool.pending_reopen.claim(shared.key()).is_none());
+        let flip = Arc::clone(&shared);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            flip.set_state(ConnectionState::Ready);
+        });
 
-        pool.consolidate_shared_instance("srv").await;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            pool.consolidate_shared_instance("srv"),
+        )
+        .await
+        .expect("consolidation finishes once the shared instance is Ready");
 
         match upstream_requests.try_recv() {
-            Ok(UpstreamRequest::ResyncHostDocuments { server }) => assert_eq!(server, "srv"),
-            _ => panic!("host documents are re-synced on their own, with no sweep before Ready"),
+            Ok(UpstreamRequest::ReopenDocuments {
+                key,
+                host_documents,
+                ..
+            }) => {
+                assert_eq!(&key, shared.key());
+                assert!(host_documents);
+            }
+            _ => panic!("the stranded debt must be claimed and re-opened"),
         }
-        assert!(upstream_requests.try_recv().is_err());
-        assert!(
-            pool.pending_reopen.claim(shared.key()).is_some(),
-            "the debt stays armed for the handshake to claim"
-        );
     }
 
     /// Nothing was retired, so nothing moved: no repair is asked for.
@@ -5205,7 +5272,9 @@ mod tests {
         )
         .await;
 
-        pool.consolidate_shared_instance("srv").await;
+        // Retirement happens before consolidation waits out the handshake.
+        let consolidation = pool.consolidate_shared_instance("srv");
+        let _ = tokio::time::timeout(Duration::from_millis(200), consolidation).await;
 
         assert!(!pool.connections.lock().await.contains_key(&diverted_key));
     }
