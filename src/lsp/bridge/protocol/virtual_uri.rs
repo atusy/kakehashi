@@ -36,6 +36,10 @@ fn encode_filename(filename: &str) -> percent_encoding::PercentEncode<'_> {
 ///
 /// ## URI Format
 ///
+/// `region_id` is dot-free, so the first `.` in the filename ends it; `{ext}`
+/// may itself contain dots. The filename is percent-encoded to RFC 3986
+/// unreserved characters on both forms.
+///
 /// For normal URIs (file://, https://, etc.):
 /// - Format: `{scheme}:///{host_dir}/kakehashi-virtual-uri-{region_id}.{ext}`
 /// - Example: `file:///project/docs/kakehashi-virtual-uri-01ARZ3NDEKTSV4.lua`
@@ -224,8 +228,9 @@ impl VirtualDocumentUri {
     /// (untitled:, mailto:, data:) fall back to `kakehashi:///virtual/{encoded_host}/…`.
     /// The distinctive prefix avoids real-file collisions; the ULID `region_id`
     /// gives global uniqueness and the language-derived extension lets servers
-    /// like lua-language-server recognize the file type. The url crate
-    /// percent-encodes `region_id` (defense-in-depth; ULIDs are alphanumeric).
+    /// like lua-language-server recognize the file type. On both paths the
+    /// whole filename is percent-encoded as one segment ([`encode_filename`]),
+    /// since unknown languages pass through as document-controlled extensions.
     pub(crate) fn to_uri_string(&self) -> String {
         self.rendered
             .get_or_init(|| self.render_uri_string())
@@ -238,15 +243,13 @@ impl VirtualDocumentUri {
         let extension = Self::language_to_extension(&self.language);
         let virtual_filename = format!("{VIRTUAL_URI_PREFIX}{}.{extension}", self.region_id);
 
-        // The parsed host URL with its filename segment popped is identical
-        // for every region of a host document, but this function runs once per
-        // forwarded message — for a fence-heavy document the repeated full URL
-        // parse was a measured tokio-side hotspot (thousands of parses on the
-        // runtime). Cache the parsed+popped `Url` per host URI (tiny map — one
-        // entry per open host document — and never stale: the value is a pure
-        // function of the key). Per call, clone it and push the virtual
-        // filename, keeping `Url`'s percent-encoding and fragment handling
-        // byte-identical to the uncached path.
+        // The parsed host URL is identical for every region of a host
+        // document, but this function runs once per forwarded message — for a
+        // fence-heavy document the repeated full URL parse was a measured
+        // tokio-side hotspot (thousands of parses on the runtime). Cache the
+        // parsed `Url` per host URI (tiny map — one entry per open host
+        // document — and never stale: the value is a pure function of the
+        // key). Cannot-be-a-base hosts (untitled:, mailto:, data:) cache `None`.
         static HOST_BASES: std::sync::OnceLock<dashmap::DashMap<String, Option<url::Url>>> =
             std::sync::OnceLock::new();
         // Values are pure functions of the key, so eviction never risks
@@ -263,30 +266,25 @@ impl VirtualDocumentUri {
                 }
                 let computed = url::Url::parse(self.host_uri.as_str())
                     .ok()
-                    .and_then(|mut url| {
-                        // path_segments_mut() returns Err for cannot-be-a-base URIs
-                        // (untitled:, mailto:, data:)
-                        url.path_segments_mut()
-                            .map(|mut segments| {
-                                segments.pop(); // Remove the host filename
-                            })
-                            .ok()?;
-                        Some(url)
-                    });
+                    .filter(|url| !url.cannot_be_a_base());
                 bases
                     .entry(self.host_uri.as_str().to_string())
                     .or_insert_with(|| computed.clone());
                 computed
             }
         };
-        if let Some(mut url) = base
-            && url
-                .path_segments_mut()
-                .map(|mut segments| {
-                    segments.push(&virtual_filename);
-                })
-                .is_ok()
-        {
+        let encoded_filename = encode_filename(&virtual_filename);
+        if let Some(mut url) = base {
+            // Replace the host filename with the pre-encoded one via
+            // `set_path`, which keeps existing escapes. `PathSegmentsMut::push`
+            // would re-escape `%` and leaves characters such as `|` or `[`
+            // literal, which `ls_types::Uri` rejects.
+            let directory = url
+                .path()
+                .rfind('/')
+                .map_or("", |slash| &url.path()[..slash]);
+            let path = format!("{directory}/{encoded_filename}");
+            url.set_path(&path);
             return url.to_string();
         }
 
@@ -296,7 +294,6 @@ impl VirtualDocumentUri {
             self.host_uri.as_str(),
             percent_encoding::NON_ALPHANUMERIC,
         );
-        let encoded_filename = encode_filename(&virtual_filename);
         format!("kakehashi:///virtual/{encoded_host}/{encoded_filename}")
     }
 
@@ -1002,6 +999,27 @@ mod tests {
     }
 
     #[test]
+    fn normal_path_encodes_characters_ls_types_rejects() {
+        // `PathSegmentsMut::push` left these literal, so `to_lsp_uri` fell back
+        // to the host URI and the region aliased its host document downstream.
+        for (host, language, filename) in [
+            ("file:///p/doc.md", "a|b", "kakehashi-virtual-uri-R.a%7Cb"),
+            (
+                "file:///p/doc.md",
+                "a[b]^",
+                "kakehashi-virtual-uri-R.a%5Bb%5D%5E",
+            ),
+            ("git:/p/doc.md", "a\\b", "kakehashi-virtual-uri-R.a%5Cb"),
+        ] {
+            let host_uri: Uri = host.parse().unwrap();
+            let virtual_uri = VirtualDocumentUri::new(&host_uri, language, "R");
+            let rendered = virtual_uri.to_uri_string();
+            assert!(rendered.ends_with(filename), "{rendered}");
+            assert_eq!(virtual_uri.to_lsp_uri().as_str(), rendered);
+        }
+    }
+
+    #[test]
     fn region_id_of_round_trips_to_uri_string() {
         // Standard (file://) form and the cannot-be-a-base fallback form both
         // recover the region_id.
@@ -1027,5 +1045,135 @@ mod tests {
             VirtualDocumentUri::region_id_of("file:///project/kakehashi-virtual-uri-.lua"),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod properties {
+    use super::*;
+    use proptest::prelude::*;
+    use tower_lsp_server::ls_types::Uri;
+
+    /// Host shapes covering the render paths and the host parts `Url` may
+    /// re-serialize: root, drive letter, userinfo/port/query, IPv6, empty
+    /// path, fragment, escaped authority, non-special and cannot-be-a-base.
+    const HOSTS: &[&str] = &[
+        "file:///doc.md",
+        "file:///project/docs/doc.md",
+        "file:///C:/x/doc.md",
+        "file:///a//doc.md",
+        "https://u:p@h:8080/p/doc.md?q=1",
+        "http://[::1]/p/doc.md",
+        "git:/x/doc.md",
+        "foo://h",
+        "vscode-notebook-cell://a/p.ipynb#W1",
+        "vscode-remote://ssh-remote%2Bh/p/doc.md",
+        "vscode-vfs://github/o/r/doc.md",
+        "untitled:Untitled-1",
+        "mailto:test@example.com",
+        "data:text/plain,test",
+    ];
+
+    fn host() -> impl Strategy<Value = Uri> {
+        proptest::sample::select(HOSTS).prop_map(|host| host.parse().unwrap())
+    }
+
+    /// Document-controlled language names: arbitrary Unicode (controls
+    /// included) and ASCII biased toward URI delimiters.
+    fn language() -> impl Strategy<Value = String> {
+        prop_oneof![any::<String>(), "[ -~\t\n\\\\|^\\[\\]%?#/.]{1,12}",]
+            .prop_filter("language must be non-empty", |language| {
+                !language.is_empty()
+            })
+    }
+
+    /// Dot-free region ids, as `VirtualDocumentUri::new` requires.
+    fn region_id() -> impl Strategy<Value = String> {
+        "[A-Za-z0-9_~-]{1,26}"
+    }
+
+    fn last_segment(rendered: &str) -> String {
+        let url = url::Url::parse(rendered).unwrap();
+        let segment = url.path_segments().unwrap().next_back().unwrap();
+        percent_encoding::percent_decode_str(segment)
+            .decode_utf8()
+            .unwrap()
+            .into_owned()
+    }
+
+    proptest! {
+        #[test]
+        fn rendered_uri_is_a_valid_virtual_identity(
+            host in host(),
+            language in language(),
+            region in region_id(),
+        ) {
+            let virtual_uri = VirtualDocumentUri::new(&host, &language, &region);
+            let rendered = virtual_uri.to_uri_string();
+
+            let lsp_uri = virtual_uri.to_lsp_uri();
+            prop_assert_eq!(lsp_uri.as_str(), rendered.as_str());
+            prop_assert_ne!(rendered.as_str(), host.as_str());
+            prop_assert!(VirtualDocumentUri::is_virtual_uri(&rendered));
+            prop_assert_eq!(
+                VirtualDocumentUri::region_id_of(&rendered),
+                Some(region.clone())
+            );
+            let extension = VirtualDocumentUri::language_to_extension(&language);
+            prop_assert_eq!(
+                last_segment(&rendered),
+                format!("{VIRTUAL_URI_PREFIX}{region}.{extension}")
+            );
+
+            let rendered_url = url::Url::parse(&rendered).unwrap();
+            let host_url = url::Url::parse(host.as_str())
+                .ok()
+                .filter(|url| !url.cannot_be_a_base());
+            prop_assert_eq!(
+                rendered_url.query(),
+                host_url.as_ref().and_then(url::Url::query)
+            );
+            prop_assert_eq!(
+                rendered_url.fragment(),
+                host_url.as_ref().and_then(url::Url::fragment)
+            );
+        }
+
+        #[test]
+        fn scratch_uri_maps_back_to_its_canonical_uri(
+            host in host(),
+            language in language(),
+            region in region_id(),
+            run in 0usize..100,
+            step in 0usize..100,
+        ) {
+            let scratch_region =
+                format!("{region}{}{run}-{step}", VirtualDocumentUri::SCRATCH_ID_MARKER);
+            let scratch = VirtualDocumentUri::new(&host, &language, &scratch_region);
+            let canonical = VirtualDocumentUri::new(&host, &language, &region);
+
+            prop_assert!(VirtualDocumentUri::is_scratch_uri(&scratch.to_uri_string()));
+            prop_assert_eq!(
+                VirtualDocumentUri::canonical_uri_for_scratch(&scratch.to_uri_string()),
+                Some(canonical.to_uri_string())
+            );
+        }
+
+        #[test]
+        fn distinct_extensions_render_distinct_uris(
+            host in host(),
+            first in language(),
+            second in language(),
+            region in region_id(),
+        ) {
+            prop_assume!(
+                VirtualDocumentUri::language_to_extension(&first)
+                    != VirtualDocumentUri::language_to_extension(&second)
+            );
+            prop_assert_ne!(
+                VirtualDocumentUri::new(&host, &first, &region).to_uri_string(),
+                VirtualDocumentUri::new(&host, &second, &region).to_uri_string()
+            );
+        }
     }
 }
