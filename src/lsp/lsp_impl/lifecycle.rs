@@ -1539,6 +1539,21 @@ fn spawn_upstream_request(
                     ),
                 }
             }
+            UpstreamRequest::ConsolidateSharedInstance { server } => {
+                let Some(context) = delivery_context else {
+                    log::warn!(
+                        target: "kakehashi::bridge",
+                        "Cannot consolidate {server:?}'s shared instance: no delivery context"
+                    );
+                    return;
+                };
+                context
+                    .injection
+                    .bridge()
+                    .pool()
+                    .consolidate_shared_instance(&server)
+                    .await;
+            }
             UpstreamRequest::ReopenDocuments { key, done } => {
                 // One source of truth for the server: carrying it alongside the
                 // key would be an invariant nobody checks, and a divergence

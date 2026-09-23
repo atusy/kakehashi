@@ -32,7 +32,9 @@ use connection_action::{ConnectionAction, decide_connection_action};
 use handshake::perform_lsp_handshake;
 
 pub(in crate::lsp::bridge) use connection_handle::REQUEST_TIMEOUT;
-pub(crate) use connection_handle::{ConnectionHandle, NotificationSendResult};
+pub(crate) use connection_handle::{
+    ConnectionHandle, DID_CHANGE_WORKSPACE_FOLDERS_METHOD, NotificationSendResult,
+};
 pub(crate) use connection_key::ConnectionKey;
 pub(crate) use connection_state::ConnectionState;
 pub(in crate::lsp::bridge) use document_tracker::DocumentTracker;
@@ -916,10 +918,58 @@ impl LanguageServerPool {
         stale_handles
     }
 
-    /// Retire `server_name`'s per-root connections once its shared instance
-    /// can take new roots (#968). Not implemented yet.
+    /// Retire `server_name`'s diverted per-root connections once its shared
+    /// instance has become folder-change capable (#968).
+    ///
+    /// A shared instance whose server registers `didChangeWorkspaceFolders`
+    /// dynamically looks incapable between Ready and that registration, so
+    /// roots acquired in that window (a session-restore burst, typically) are
+    /// diverted to per-root processes. Once it registers, routing already
+    /// resolves those roots to the shared key; retiring their processes is
+    /// what stops them serving what they already hold. Nothing is migrated:
+    /// each document re-opens on the shared instance at its next acquisition,
+    /// where `announce_shared_root`'s FIFO puts the root announcement ahead of
+    /// the `didOpen`.
+    ///
+    /// Only marker-rooted keys are diverts — the shared routing never mints a
+    /// client-root key for this server. The capability is re-checked on the
+    /// live shared connection under `connections`, so a request that outlived
+    /// an unregistration (or a replacement that never registered) retires
+    /// nothing. A divert racing this sweep can still land after it, leaving at
+    /// worst the split this exists to remove — the same residual as before
+    /// consolidation existed, not a new failure.
     pub(crate) async fn consolidate_shared_instance(&self, server_name: &str) {
-        let _ = server_name;
+        let shared_key = ConnectionKey::shared(server_name);
+        let mut connections = self.connections.lock().await;
+        if !connections
+            .get(&shared_key)
+            .is_some_and(|shared| shared.supports_workspace_folder_changes())
+        {
+            return;
+        }
+        let diverted: Vec<ConnectionKey> = connections
+            .keys()
+            .filter(|key| {
+                key.server() == server_name && !key.is_shared() && !key.is_client_fallback()
+            })
+            .cloned()
+            .collect();
+        if diverted.is_empty() {
+            return;
+        }
+        log::info!(
+            target: "kakehashi::bridge",
+            "[{server_name}] shared instance now accepts workspace-folder changes; \
+             retiring {} per-root instance(s)",
+            diverted.len()
+        );
+        let stale_handles = self
+            .retire_invalidated_connections(&mut connections, diverted)
+            .await;
+        drop(connections);
+        for (key, handle) in stale_handles {
+            shutdown_invalidated_connection(key, handle);
+        }
     }
 
     /// Set the upstream client capabilities.
