@@ -279,15 +279,12 @@ impl Kakehashi {
         // together with the layer selection and the mint over its result.
         let language = std::sync::Arc::clone(&self.language);
         let tracker = self.bridge.node_tracker_arc();
-        // Latch before checking snapshot currency so compute-pool work cannot
-        // reserve a scope or mint coordinates superseded by an edit or close.
-        let mint_epoch = tracker.mint_epoch(&uri);
-        if !self.documents.latest_snapshot(&uri).is_some_and(|view| {
-            view.slot.current_incarnation == incarnation
-                && view.content_version == snapshot.parsed_version
-        }) {
+        let Some(mint_epoch) = self
+            .node_mint_epoch(&uri, incarnation, snapshot.parsed_version)
+            .await
+        else {
             return Ok(Value::Null);
-        }
+        };
         let result = self
             .compute_pool
             .run(None, move || {
@@ -351,6 +348,27 @@ impl Kakehashi {
 
         // None = the work-unit panicked (logged by the pool) → protocol null.
         Ok(result.unwrap_or(Value::Null))
+    }
+
+    /// Read the tracker epoch and document revision under the edit lock so
+    /// tracker shifting cannot admit coordinates from the pre-edit snapshot.
+    async fn node_mint_epoch(
+        &self,
+        uri: &Url,
+        incarnation: u64,
+        parsed_version: u64,
+    ) -> Option<(u64, u64)> {
+        let edit_lock = self.documents.edit_lock(uri);
+        let _edit_guard = edit_lock.lock().await;
+        let latch = self.bridge.node_tracker().mint_epoch(uri);
+        let latest = self.documents.latest_snapshot(uri);
+        let current = latest.as_ref().is_some_and(|view| {
+            view.slot.current_incarnation == incarnation && view.content_version == parsed_version
+        });
+        if latest.is_none() {
+            self.documents.remove_edit_lock_if_unshared(uri, &edit_lock);
+        }
+        current.then_some(latch)
     }
 
     /// Host-layer lookup, factored out so the no-injection request keeps
@@ -544,6 +562,37 @@ fn deepest_node_ending_at(node: tree_sitter::Node<'_>, target_end: usize) -> tre
 mod tests {
     use super::*;
     use tower_lsp_server::LspService;
+
+    #[tokio::test]
+    async fn node_mint_epoch_waits_for_the_complete_document_edit() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///mint-gate.rs").unwrap();
+        let incarnation =
+            server
+                .documents
+                .insert(uri.clone(), "old".into(), Some("rust".into()), None);
+        let initial = server.node_mint_epoch(&uri, incarnation, 0).await;
+        assert!(initial.is_some());
+        let lock = server.documents.edit_lock(&uri);
+        let guard = lock.lock().await;
+        server.bridge.node_tracker().apply_input_edits(
+            &uri,
+            &[crate::language::node_tracker::EditInfo::new(0, 0, 1)],
+        );
+        // didChange has shifted the tracker but has not published its content
+        // version yet. A node request must not accept this intermediate pair.
+        let mut gate = Box::pin(server.node_mint_epoch(&uri, incarnation, 0));
+        assert!(futures::poll!(gate.as_mut()).is_pending());
+        server
+            .documents
+            .update_document(uri.clone(), "new".into(), None);
+        drop(guard);
+        assert!(
+            gate.await.is_none(),
+            "the completed edit supersedes the old snapshot"
+        );
+    }
 
     #[tokio::test]
     async fn injection_node_rejects_close_reopen_during_language_load() {
