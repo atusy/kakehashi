@@ -3774,6 +3774,30 @@ mod tests {
     }
 
     #[test]
+    fn a_provided_parent_being_replaced_is_busy_not_complete() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        let child = data.join("queries/child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(child.join("highlights.scm"), "; inherits: custom\n").unwrap();
+        write_install_marker(&child).unwrap();
+        write_runtime_query(&runtime, "custom", "(comment) @comment\n");
+        // A forced install of the parent holds its lock while its managed
+        // copy is between renames, so the copy looks absent.
+        let publishing = lock_language(&data, "custom").unwrap();
+        assert!(matches!(
+            probe_chain(&data, "child", std::slice::from_ref(&runtime)),
+            ChainProbe::Busy
+        ));
+        drop(publishing);
+        assert!(matches!(
+            probe_chain(&data, "child", std::slice::from_ref(&runtime)),
+            ChainProbe::Complete(_)
+        ));
+    }
+
+    #[test]
     fn an_overlay_alone_does_not_provide_a_parent() {
         let temp = TempDir::new().unwrap();
         let data = temp.path().join("data");
