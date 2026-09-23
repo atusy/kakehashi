@@ -52,6 +52,9 @@ pub(super) struct TreeScopes {
     by_scope: HashMap<Arc<NodeTreeScope>, usize>,
     by_token: HashMap<usize, Arc<NodeTreeScope>>,
     next: usize,
+    /// New scopes can coexist with obsolete boundary geometries until a
+    /// complete, current walk is admitted. Edits/reloads cannot erase this debt.
+    pub(super) reconciliation_pending: bool,
 }
 
 pub(super) const TREE_SCOPE_BASE: usize = crate::language::injection::MAX_INJECTION_DEPTH + 1;
@@ -82,6 +85,7 @@ impl TreeScopes {
         if token >= crate::language::injection::REGION_IDENTITY_LAYER_BASE {
             return None;
         }
+        self.reconciliation_pending |= !self.by_token.is_empty();
         self.next += 1;
         let scope = Arc::new(scope.clone());
         self.by_scope.insert(Arc::clone(&scope), token);
@@ -107,6 +111,7 @@ impl TreeScopes {
     }
 
     pub(super) fn retire_absent(&mut self, current: &HashSet<NodeTreeScope>) -> HashSet<usize> {
+        self.reconciliation_pending = false;
         let mut retired = HashSet::new();
         self.by_token.retain(|token, scope| {
             let keep = current.contains(scope.as_ref());

@@ -165,8 +165,13 @@ keeps repeated boundary changes from accumulating obsolete scopes whose interior
 nodes survive ordinary edit adjustment. Geometry includes trees without the
 requested kind query; range-only, cancelled, stale, and incomplete walks cannot
 prune scopes. Edit, incarnation, query-generation, and reload checks protect the
-retirement. The cost is one scope record per distinct retained parse scope
-and range adjustment alongside node adjustment.
+retirement. The node entry point also reconciles full geometry when it discovers
+a new scope alongside existing scopes, so node-only clients reclaim obsolete
+boundary geometries too. It reuses the snapshot layer cache; requests for an
+already-known scope keep their cursor-local walk after reconciliation succeeds.
+A pending flag preserves reconciliation across incomplete walks or lost final
+admission races, including later requests for an already-known scope. The cost is one scope record
+per distinct retained parse scope and range adjustment alongside node adjustment.
 
 **Invalidation with composite keys**: node START-priority invalidation remains
 unchanged. Position adjustment preserves the token while updating the scope's

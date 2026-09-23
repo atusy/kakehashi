@@ -279,6 +279,9 @@ impl Kakehashi {
         // together with the layer selection and the mint over its result.
         let language = std::sync::Arc::clone(&self.language);
         let tracker = self.bridge.node_tracker_arc();
+        let generation = self.cache.semantic_token_generation();
+        let snapshot_for_layers = std::sync::Arc::clone(&snapshot);
+        let uri_for_walk = uri.clone();
         let Some(mint_epoch) = self
             .node_mint_epoch(&uri, incarnation, snapshot.parsed_version)
             .await
@@ -288,6 +291,7 @@ impl Kakehashi {
         let result = self
             .compute_pool
             .run(None, move || {
+                let uri = uri_for_walk;
                 let stack = injection_stack_at(&language, &host_language, &text, &tree, byte);
 
                 let layer_index = match selector {
@@ -301,18 +305,18 @@ impl Kakehashi {
                     }
                     InjectionSelector::Index(n) => {
                         let Some(idx) = resolve_index(n, stack.len()) else {
-                            return Value::Null;
+                            return (Value::Null, None);
                         };
                         idx
                     }
                 };
 
                 let Some(layer) = stack.get(layer_index) else {
-                    return Value::Null;
+                    return (Value::Null, None);
                 };
 
                 let Some(node) = smallest_containing_node(&layer.tree, byte, doc_len) else {
-                    return Value::Null;
+                    return (Value::Null, None);
                 };
 
                 // Mint with the full tree scope so host and injected nodes
@@ -326,6 +330,49 @@ impl Kakehashi {
                         &layer.tree,
                     )
                 });
+                // Only a new geometry alongside existing scopes can accumulate
+                // obsolete boundary scopes. Reuse captures' snapshot geometry
+                // cache when possible; known scopes avoid this walk once
+                // any pending reconciliation has succeeded.
+                let scopes = scope
+                    .as_ref()
+                    .filter(|scope| tracker.tree_scope_needs_reconciliation(&uri, scope))
+                    .and_then(|_| {
+                        let cached = snapshot_for_layers.layer_trees.get_or_init(|| {
+                            let layers = super::injection_stack::collect_document_layer_trees(
+                                &language,
+                                &host_language,
+                                &text,
+                                &tree,
+                            );
+                            (generation, std::sync::Arc::new(layers))
+                        });
+                        let fresh;
+                        let layers = if cached.0 == generation {
+                            cached.1.as_ref()
+                        } else {
+                            fresh = super::injection_stack::collect_document_layer_trees(
+                                &language,
+                                &host_language,
+                                &text,
+                                &tree,
+                            );
+                            &fresh
+                        };
+                        layers.complete.then(|| {
+                            layers
+                                .layers
+                                .iter()
+                                .map(|layer| {
+                                    crate::language::node_tracker::NodeTreeScope::new(
+                                        &layer.language,
+                                        layer.depth,
+                                        &layer.tree,
+                                    )
+                                })
+                                .collect::<std::collections::HashSet<_>>()
+                        })
+                    });
                 let ulid = tracker
                     .mint_tree_batch(
                         &uri,
@@ -336,18 +383,53 @@ impl Kakehashi {
                     )
                     .and_then(|mut ids| ids.pop());
                 let Some(ulid) = ulid else {
-                    return Value::Null;
+                    return (Value::Null, None);
                 };
 
-                json!({
-                    "id": ulid.to_string(),
-                    "kind": node.kind(),
-                })
+                (
+                    json!({
+                        "id": ulid.to_string(),
+                        "kind": node.kind(),
+                    }),
+                    scopes,
+                )
             })
             .await;
 
         // None = the work-unit panicked (logged by the pool) → protocol null.
-        Ok(result.unwrap_or(Value::Null))
+        let Some((result, scopes)) = result else {
+            return Ok(Value::Null);
+        };
+        if let Some(scopes) = scopes {
+            // Match captures' retirement discipline: neither an edit nor query
+            // publication may supersede the complete geometry before pruning.
+            let edit_lock = self.documents.edit_lock(&uri);
+            let _edit_guard = edit_lock.lock().await;
+            let current = self.documents.latest_snapshot(&uri).is_some_and(|view| {
+                view.slot.current_incarnation == incarnation
+                    && view.content_version == snapshot.parsed_version
+            });
+            let pool = self
+                .parser_pool
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if current
+                && !pool.reload_in_progress()
+                && self.cache.semantic_token_generation() == generation
+            {
+                self.bridge.node_tracker().retain_tree_scopes(
+                    &uri,
+                    mint_epoch,
+                    incarnation,
+                    &scopes,
+                );
+            }
+            if self.documents.get(&uri).is_none() {
+                self.documents
+                    .remove_edit_lock_if_unshared(&uri, &edit_lock);
+            }
+        }
+        Ok(result)
     }
 
     /// Read the tracker epoch and document revision under the edit lock so
@@ -562,6 +644,83 @@ fn deepest_node_ending_at(node: tree_sitter::Node<'_>, target_end: usize) -> tre
 mod tests {
     use super::*;
     use tower_lsp_server::LspService;
+
+    #[tokio::test]
+    async fn node_only_boundary_growth_retires_obsolete_scopes() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        for name in ["rust", "scope_inner"] {
+            server
+                .language
+                .language_registry_for_parallel()
+                .register(name.into(), language.clone());
+        }
+        let query = tree_sitter::Query::new(&language,
+            r#"((source_file) @injection.content (#set! injection.language "scope_inner") (#set! injection.include-children))"#).unwrap();
+        server
+            .language
+            .query_store()
+            .insert_injection_query("rust".into(), std::sync::Arc::new(query));
+        let uri = Url::parse("file:///node-only-growth.rs").unwrap();
+        let mut text = "fn name() {}".to_string();
+        server
+            .documents
+            .insert(uri.clone(), text.clone(), Some("rust".into()), None);
+        let mut previous = None;
+        for _ in 0..8 {
+            assert!(
+                server
+                    .parse_coordinator()
+                    .parse_document(uri.clone(), Some("rust"), None, None)
+                    .await
+                    .is_some()
+            );
+            let result = server
+                .kakehashi_node(NodeParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: uri.as_str().parse().unwrap(),
+                    },
+                    position: Position::new(0, 3),
+                    injection: Some(Value::Bool(true)),
+                })
+                .await
+                .unwrap();
+            assert_eq!(result["kind"], "identifier");
+            let id: ulid::Ulid = result["id"].as_str().unwrap().parse().unwrap();
+            if let Some(old) = previous {
+                assert!(
+                    server
+                        .bridge
+                        .node_tracker()
+                        .lookup_node(&uri, &old)
+                        .is_none(),
+                    "node-only clients must retire absent tree scopes after boundary growth"
+                );
+            }
+            assert!(
+                server
+                    .bridge
+                    .node_tracker()
+                    .lookup_node(&uri, &id)
+                    .is_some()
+            );
+            previous = Some(id);
+            let end = text.len();
+            text.push(' ');
+            server.bridge.node_tracker().apply_input_edits(
+                &uri,
+                &[crate::language::node_tracker::EditInfo::new(
+                    end,
+                    end,
+                    end + 1,
+                )],
+            );
+            server
+                .documents
+                .update_document(uri.clone(), text.clone(), None);
+        }
+    }
 
     #[tokio::test]
     async fn node_mint_epoch_waits_for_the_complete_document_edit() {

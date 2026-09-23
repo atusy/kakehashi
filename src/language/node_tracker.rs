@@ -641,6 +641,16 @@ impl NodeTracker {
         Some((entries.scoped_node(first)?, entries.scoped_node(second)?))
     }
 
+    /// A new scope can leave old boundary geometries behind. Existing scopes
+    /// and the first injected tree need no whole-document reconciliation unless
+    /// a previous attempt was incomplete or lost its final admission race.
+    pub(crate) fn tree_scope_needs_reconciliation(&self, uri: &Url, scope: &NodeTreeScope) -> bool {
+        self.entries.get(uri).is_some_and(|entry| {
+            entry.tree_scopes.reconciliation_pending
+                || (!entry.tree_scopes.is_empty() && entry.tree_scopes.get(scope).is_none())
+        })
+    }
+
     /// Reserve a tree identity and mint its nodes in the same edit/close latch.
     pub(crate) fn mint_tree_batch(
         &self,
@@ -1365,6 +1375,44 @@ mod tests {
             depth: 1,
             ranges: ranges.to_vec(),
         }
+    }
+
+    #[test]
+    fn known_scope_keeps_reconciliation_pending_until_current_walk_is_admitted() {
+        let tracker = NodeTracker::new();
+        let uri = test_uri("scope_debt");
+        let old = scope(&[(0, 20)]);
+        let current = scope(&[(0, 21)]);
+        let epoch = tracker.mint_epoch(&uri);
+        tracker
+            .mint_tree_batch(&uri, epoch, 0, Some(&old), [(5, 8, "identifier")])
+            .unwrap();
+        assert!(!tracker.tree_scope_needs_reconciliation(&uri, &old));
+        assert!(tracker.tree_scope_needs_reconciliation(&uri, &current));
+        tracker
+            .mint_tree_batch(&uri, epoch, 0, Some(&current), [(5, 8, "identifier")])
+            .unwrap();
+        assert!(
+            tracker.tree_scope_needs_reconciliation(&uri, &current),
+            "an incomplete walk must leave debt for even a known scope"
+        );
+        tracker.apply_input_edits(&uri, &[EditInfo::new(10, 10, 11)]);
+        let shifted = scope(&[(0, 22)]);
+        tracker.retain_tree_scopes(&uri, epoch, 0, &Default::default());
+        assert!(
+            tracker.tree_scope_needs_reconciliation(&uri, &shifted),
+            "a raced edit must not clear reconciliation debt"
+        );
+        tracker.retain_tree_scopes(
+            &uri,
+            tracker.mint_epoch(&uri),
+            0,
+            &std::collections::HashSet::from([shifted.clone(), scope(&[(0, 21)])]),
+        );
+        assert!(
+            !tracker.tree_scope_needs_reconciliation(&uri, &shifted),
+            "a complete current walk clears debt even when no scopes retire"
+        );
     }
 
     #[test]
