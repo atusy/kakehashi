@@ -142,12 +142,13 @@ impl InjectionCoordinator {
             .bridge
             .close_deselected_docs(&settings, host_language, uri)
             .await;
-        if deselected.is_empty() || !self.diagnostics.evict_region_servers(uri, &deselected) {
+        if deselected.is_empty() {
             return;
         }
+        let evicted = self.diagnostics.evict_region_servers(uri, &deselected);
         let publisher = self.publisher.clone();
         let host = uri.clone();
-        tokio::spawn(async move { publisher.publish_retraction(&host).await });
+        tokio::spawn(async move { publisher.publish_retraction(&host, evicted).await });
     }
 
     /// Resolve all injection regions for a document, with stable region IDs from

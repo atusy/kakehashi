@@ -1101,18 +1101,23 @@ impl DiagnosticPublisher {
         }
     }
 
-    /// Publish a host whose visible diagnostics were evicted without an editor
-    /// event — a settings change retracted a server from its regions (#917).
+    /// Tell the editor that a settings change retracted servers from a host's
+    /// regions (#917) — an event it cannot observe on its own.
     ///
-    /// The caller has already established that the eviction removed something
-    /// the editor shows, so pull-mode clients are nudged unconditionally: the
-    /// reparse that the same settings change scheduled runs its own debounced
-    /// pull, whose republish can land first and leave this one `Unchanged`,
-    /// yet that pull path deliberately never nudges. Follows
-    /// [`Self::evict_connection_diagnostics`] otherwise: bump coverage so the
-    /// gated refresh fires (#497), then request it.
-    pub(crate) async fn publish_retraction(&self, host: &Url) {
-        self.republish(host).await;
+    /// `evicted` says whether the retraction removed pushed diagnostics from
+    /// the cache; only then is there anything to republish. Pull-mode clients
+    /// are nudged either way: a pull-only server leaves no pushed slot behind,
+    /// yet the editor still displays what it pulled from it. Nor can the nudge
+    /// wait on this republish's outcome, since the same settings change's
+    /// reparse republishes too — its geometry re-merge and its debounced pull
+    /// — and may land first, leaving this one `Unchanged`, while neither of
+    /// those ever nudges. Follows [`Self::evict_connection_diagnostics`]
+    /// otherwise: bump coverage so the gated refresh fires (#497), then
+    /// request it.
+    pub(crate) async fn publish_retraction(&self, host: &Url, evicted: bool) {
+        if evicted {
+            self.republish(host).await;
+        }
         self.bump_current_if_open(host);
         self.request_pull_diagnostic_refresh(false);
     }
