@@ -2449,9 +2449,7 @@ fn spawn_crash_recovery(
                 return;
             }
         };
-        // Anchored now, so the delay does not stretch by however long this
-        // task waited to be polled.
-        tokio::time::sleep_until(tokio::time::Instant::now() + delay).await;
+        tokio::time::sleep(delay).await;
         loop {
             if !pool.begin_crash_recovery_attempt(&key).await {
                 return;
