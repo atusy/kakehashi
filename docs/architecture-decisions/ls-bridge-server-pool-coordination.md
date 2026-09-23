@@ -118,7 +118,11 @@ the static-only check did every time. The rare reverse transition is not
 synchronized either: an unregistration only drops the registry entry, and the
 next upstream folder change recycles the now-incapable fallback through the
 ordinary invalidate path (a latched flag would instead keep notifying a server
-that opted out). Because registration arrives only after `initialized` while
+that opted out). On a shared connection, roots it was already told of stay
+aboard after an unregistration (the served-root proof accepts its folder set
+for any server that ever registered folder changes); only new roots divert,
+and a root whose announce loses that race fails its acquisition rather than
+opening unannounced. Because registration arrives only after `initialized` while
 the divert check runs at `Ready`, roots acquired in that window divert
 deterministically; when the registration arrives on the shared connection, the
 pool retires that server's diverts (marker-rooted connections launched under
