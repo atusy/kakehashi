@@ -22,7 +22,6 @@ use url::Url;
 
 use super::super::{Kakehashi, uri_to_url};
 use crate::config::settings::{AggregationStrategy, LayerSource, ResolvedLayerConfig};
-use crate::language::InjectionResolver;
 use crate::lsp::aggregation::server::{
     FanInResult, FanOutTask, HostFanOutTask, dispatch_concatenated, dispatch_host_concatenated,
     dispatch_host_preferred, dispatch_preferred,
@@ -149,8 +148,43 @@ impl Kakehashi {
         // (resolve_host_bridge_context returns None otherwise).
         let layer_cfg = self.resolve_layer_config(&language_name, "textDocument/diagnostic");
         let virt_enabled = layer_cfg.allows(LayerSource::Virt);
+        // Snapshot for the VIRT layer ONLY, and ONLY ensure a fresh tree when virt
+        // actually participates: `didChange` clears the tree and reparses
+        // off-ingress, so the virt injection regions would otherwise be empty for
+        // the reparse window after each edit. The HOST layer needs no tree, so a
+        // host-only document must not pay the freshness wait. A still-missing tree
+        // (parse pending/failed) yields `None` — host still pulls, virt skips.
+        let snapshot = if virt_enabled {
+            match self
+                .wait_for_current_snapshot(&uri, Duration::from_millis(200))
+                .await
+            {
+                crate::lsp::lsp_impl::snapshot_read::SnapshotWait::Current(snapshot)
+                    if snapshot.tree.is_some() =>
+                {
+                    Some(snapshot)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        // A parse may re-detect the host while we wait. Its regions and all
+        // routing decisions must use the same language, including persistent
+        // fallback snapshots whose stored document label intentionally differs.
+        let language_name = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.language.as_deref())
+            .unwrap_or(&language_name);
+        let layer_cfg = self.resolve_layer_config(language_name, "textDocument/diagnostic");
+        let virt_enabled = layer_cfg.allows(LayerSource::Virt);
         let host_ctx = if layer_cfg.allows(LayerSource::Host) {
-            self.resolve_host_bridge_context(&lsp_uri, "textDocument/diagnostic")
+            self.resolve_host_bridge_context_for_language(
+                &lsp_uri,
+                "textDocument/diagnostic",
+                language_name,
+            )
         } else {
             None
         };
@@ -164,18 +198,7 @@ impl Kakehashi {
             return Ok(empty_diagnostic_report());
         }
 
-        // Snapshot for the VIRT layer ONLY, and ONLY ensure a fresh tree when virt
-        // actually participates: `didChange` clears the tree and reparses
-        // off-ingress, so the virt injection regions would otherwise be empty for
-        // the reparse window after each edit. The HOST layer needs no tree, so a
-        // host-only document must not pay the freshness wait. A still-missing tree
-        // (parse pending/failed) yields `None` — host still pulls, virt skips.
-        let snapshot = if virt_enabled {
-            self.ensure_document_parsed(&uri).await;
-            self.documents.get(&uri).and_then(|doc| doc.snapshot())
-        } else {
-            None
-        };
+        let snapshot = snapshot.as_ref().filter(|_| virt_enabled);
 
         // Tee the request-failure count through an internal sink: the caller's
         // sink (CLI diagnose) receives the total after the fan-out settles,
@@ -198,33 +221,11 @@ impl Kakehashi {
 
         // Resolve injection regions once: the live virt pull below and the
         // pushFallback fold (#425) after the join share them.
-        let virt_regions = match (virt_enabled, snapshot.as_ref()) {
-            (true, Some(snapshot)) => self
-                .language
-                .injection_query(&language_name)
-                .map(|injection_query| {
-                    match self
-                        .documents
-                        .current_resolved_regions(&uri, self.cache.semantic_token_generation())
-                    {
-                        Some(regions) => regions,
-                        None => std::sync::Arc::new(InjectionResolver::resolve_all(
-                            &self.language,
-                            self.bridge.node_tracker(),
-                            &uri,
-                            snapshot.tree(),
-                            snapshot.text(),
-                            injection_query.as_ref(),
-                            snapshot.incarnation(),
-                        )),
-                    }
-                })
-                .unwrap_or_default(),
-            // Virt gated off, or no tree yet (the host layer still pulls). The
-            // wait+on-demand above already tried, so a missing tree here is the
-            // rare parse-failure case, self-healing on the next pull.
-            _ => std::sync::Arc::new(Vec::new()),
-        };
+        let resolved_regions = snapshot
+            .as_ref()
+            .and_then(|snapshot| self.whole_document_regions(&uri, snapshot));
+        let regions_unavailable = resolved_regions.is_none();
+        let virt_regions = resolved_regions.unwrap_or_default();
         // Lightweight per-region metadata `(region_id, injection_language,
         // current offset)` for the pushFallback fold; the live pull below moves
         // the regions themselves.
@@ -251,7 +252,7 @@ impl Kakehashi {
         // request; the resulting set is a cheap lookup inside the region loop.
         let incapable_servers = self
             .incapable_virt_servers(
-                &language_name,
+                language_name,
                 virt_regions.iter().map(|r| r.injection_language.as_str()),
                 "textDocument/diagnostic",
             )
@@ -264,7 +265,7 @@ impl Kakehashi {
             let mut outer_join_set: JoinSet<Vec<Diagnostic>> = JoinSet::new();
             for resolved in virt_regions.iter() {
                 let mut configs = self.bridge_configs_for_injection_language(
-                    &language_name,
+                    language_name,
                     &resolved.injection_language,
                 );
                 // Drop known-incapable servers before building the fan-out
@@ -279,7 +280,7 @@ impl Kakehashi {
                 // Resolve strategy per-region so different injection languages can use
                 // different strategies (e.g., Python=Preferred, Lua=All in the same host).
                 let agg = self.resolve_aggregation_config(
-                    &language_name,
+                    language_name,
                     &resolved.injection_language,
                     "textDocument/diagnostic",
                 );
@@ -367,7 +368,7 @@ impl Kakehashi {
         // cached pushes so they also answer the client pull.
         self.fold_push_fallback_diagnostics(
             &uri,
-            &language_name,
+            language_name,
             region_meta,
             host_ctx.is_some(),
             &mut virt_items,
@@ -387,7 +388,7 @@ impl Kakehashi {
 
         // Degraded-answer guard (the pull-side sibling of `republish`'s
         // geometry-unknown deferral): the bounded parse wait above can lapse
-        // under load, leaving `snapshot` `None` for an open document while the
+        // under load, or a reload can make the query/regions unavailable while the
         // aggregator holds live region pushes — the fold above then silently
         // skipped every cached `Region` slot, so this answer is missing whole
         // servers' diagnostics. A pull must respond (there is no "defer" for a
@@ -396,16 +397,16 @@ impl Kakehashi {
         // TOCTOU guard below) consumes it and requests the recovery refresh
         // (single-flighted, forced past the coverage gate) that brings the
         // client back to a full view, instead of the gap being masked until
-        // the next edit. The predicate mirrors `republish`'s `needs_geometry`
-        // (non-empty region slots only).
-        // Missing-virt evidence for a tree-less answer: cached Region push
+        // the next edit.
+        // Missing-virt evidence: an unreadable query with a tree, cached Region push
         // slots (mirrors `republish`'s `needs_geometry`) OR a non-empty
         // cached PullLayer — a pull-only injected server's diagnostics live
         // only there, and this answer's virt layer silently skipped them
         // just the same.
         let degraded_virt = virt_enabled
-            && snapshot.is_none()
-            && (self.diagnostics.has_region_slots(&uri)
+            && regions_unavailable
+            && (snapshot.is_some()
+                || self.diagnostics.has_region_slots(&uri)
                 || self.diagnostics.has_nonempty_pull_layer(&uri));
 
         // The editor is about to receive the current merged set: advance `served` to
@@ -416,31 +417,7 @@ impl Kakehashi {
             // The debt drives the post-parse recovery refresh (see
             // `DiagnosticAggregator::degraded_pulls`).
             self.diagnostics.record_degraded_pull(&uri, coverage_stamp);
-            // TOCTOU guard: `snapshot` was captured before the fan-out/fold
-            // awaits above, so the parse may have landed — and the post-parse
-            // debt consumer already run — in between, leaving this
-            // freshly-recorded debt with no consumer until the next edit. If
-            // geometry is available NOW, consume the debt here and fire the
-            // recovery refresh ourselves. FORCED past the coverage gate (still
-            // single-flighted): the debt itself proves the client just
-            // received a non-covering answer, which the version-based gate
-            // cannot see — an edit-race degradation leaves served == current
-            // (no push-origin change), so a gated request would be suppressed
-            // while the client displays the region-less set. `take` on both
-            // consumers makes double-firing impossible; if the snapshot is
-            // still absent, the parse that produces it has not run its
-            // post-parse pass yet, so that pass will consume. Loop-bounded:
-            // the refresh-induced re-pull sees the ready geometry, answers
-            // covering, and clears everything.
-            let geometry_ready = self
-                .documents
-                .get(&uri)
-                .and_then(|doc| doc.snapshot())
-                .is_some();
-            if geometry_ready && self.diagnostics.take_degraded_pull(&uri) {
-                crate::lsp::lsp_impl::DiagnosticPublisher::new(self)
-                    .request_pull_diagnostic_refresh(true);
-            }
+            self.recover_degraded_pull(&uri);
         } else {
             // A failed/partial fan-out (`!pull_clean`) still advances the
             // coverage version but clears neither the pull-view lag nor the
@@ -461,6 +438,46 @@ impl Kakehashi {
             return Ok(unchanged_diagnostic_report(result_id));
         }
         Ok(make_diagnostic_report(items, result_id))
+    }
+
+    /// Recover after a degraded answer has recorded its debt.
+    fn recover_degraded_pull(&self, uri: &Url) {
+        // The pull's snapshot was captured before the fan-out/fold awaits,
+        // so the parse may have landed — and the post-parse
+        // debt consumer already run — in between, leaving this
+        // freshly-recorded debt with no consumer until the next edit. If
+        // geometry and queries are settled NOW, consume the debt here and fire the
+        // recovery refresh ourselves. FORCED past the coverage gate (still
+        // single-flighted): the debt itself proves the client just
+        // received a non-covering answer, which the version-based gate
+        // cannot see — an edit-race degradation leaves served == current
+        // (no push-origin change), so a gated request would be suppressed
+        // while the client displays the region-less set. `take` in each
+        // consumer prevents duplicate recovery of the same debt; if the snapshot is
+        // still absent, the parse that produces it has not run its
+        // post-parse pass yet, so that pass will consume. Loop-bounded:
+        // the refresh-induced re-pull sees the ready geometry, answers
+        // covering, and clears everything.
+        let current = self.documents.latest_snapshot(uri);
+        let geometry_ready = current
+            .as_ref()
+            .and_then(|view| {
+                view.slot
+                    .snapshot
+                    .as_ref()
+                    .filter(|s| s.parsed_version == view.content_version)
+            })
+            .and_then(|snapshot| self.whole_document_regions(uri, snapshot))
+            .is_some();
+        if geometry_ready && self.diagnostics.take_degraded_pull(uri) {
+            crate::lsp::lsp_impl::DiagnosticPublisher::new(self)
+                .request_pull_diagnostic_refresh(true);
+        } else if !geometry_ready && let Some(current) = current {
+            // The initial read may have been tree-less even though its parse
+            // already finished. Bind recovery to the document that exists NOW.
+            crate::lsp::lsp_impl::DiagnosticPublisher::new(self)
+                .retry_degraded_pull_after_reload(uri, current.slot.current_incarnation);
+        }
     }
 
     /// A pull answered with a covering (non-degraded) report: advance the
@@ -1164,6 +1181,306 @@ mod tests {
         assert!(
             server.diagnostics.take_degraded_pull(&uri),
             "the degraded answer records the per-host debt that keys the post-parse recovery refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_pull_does_not_mark_the_change_served() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        let uri = Url::parse("file:///test/degraded_pull.rs").unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse("fn main() {}", None).unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            Some(tree),
+        );
+        let _reload = crate::lsp::lsp_impl::ParserReloadGuard::begin(&server.parser_pool);
+        server.cache.bump_semantic_token_generation();
+        assert!(server.documents.get(&uri).unwrap().snapshot().is_some());
+        server.diagnostics.record(
+            &uri,
+            crate::lsp::diagnostic_cache::DiagnosticSource::Region("region-1".to_string()),
+            "lua_ls".to_string(),
+            Some(crate::lsp::bridge::ProgressConnectionId::for_test(1)),
+            vec![diag("boom")],
+        );
+        server.diagnostics.bump_current(&uri);
+        assert!(
+            server.diagnostics.is_dirty(),
+            "the push made the host dirty"
+        );
+
+        let params = DocumentDiagnosticParams {
+            text_document: tower_lsp_server::ls_types::TextDocumentIdentifier {
+                uri: "file:///test/degraded_pull.rs".parse().expect("uri"),
+            },
+            identifier: None,
+            previous_result_id: None,
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let report = server
+            .diagnostic_impl(params)
+            .await
+            .expect("a degraded pull still answers");
+        let DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(full)) = report
+        else {
+            panic!("degraded answer is a full report");
+        };
+        assert!(
+            full.full_document_diagnostic_report.items.is_empty(),
+            "the region push cannot be folded without geometry (that's the degradation)"
+        );
+        assert!(
+            server.diagnostics.is_dirty(),
+            "a degraded answer must not advance `served` — the gap would be masked"
+        );
+        assert!(
+            server.diagnostics.take_degraded_pull(&uri),
+            "the degraded answer records the per-host debt that keys the post-parse recovery refresh"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reload_pull_refreshes_without_a_reparse() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        let uri = Url::parse("file:///test/degraded_pull.rs").unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse("fn main() {}", None).unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            Some(tree),
+        );
+        server
+            .settings_manager
+            .set_capabilities(tower_lsp_server::ls_types::ClientCapabilities {
+                workspace: Some(tower_lsp_server::ls_types::WorkspaceClientCapabilities {
+                    diagnostics: Some(
+                        tower_lsp_server::ls_types::DiagnosticWorkspaceClientCapabilities {
+                            refresh_support: Some(true),
+                        },
+                    ),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        let reload_lock = crate::lsp::lsp_impl::lock_settings_reload().await;
+        let reload = crate::lsp::lsp_impl::ParserReloadGuard::begin(&server.parser_pool);
+        server.cache.bump_semantic_token_generation();
+        assert!(server.documents.get(&uri).unwrap().snapshot().is_some());
+        let params = DocumentDiagnosticParams {
+            text_document: tower_lsp_server::ls_types::TextDocumentIdentifier {
+                uri: "file:///test/degraded_pull.rs".parse().expect("uri"),
+            },
+            identifier: None,
+            previous_result_id: None,
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let report = server
+            .diagnostic_impl(params)
+            .await
+            .expect("a degraded pull still answers");
+        let DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(full)) = report
+        else {
+            panic!("degraded answer is a full report");
+        };
+        assert!(
+            full.full_document_diagnostic_report.items.is_empty(),
+            "unsettled queries yield a degraded empty answer"
+        );
+        tokio::task::yield_now().await;
+        // Recovery must survive reloads longer than the former 10-second budget.
+        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(server.diagnostics.metrics_snapshot().refreshes_requested, 0);
+        drop(reload);
+        drop(reload_lock);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while server.diagnostics.metrics_snapshot().refreshes_requested == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("settling queries must refresh even without a parse or previous diagnostics");
+        assert!(
+            !server.diagnostics.take_degraded_pull(&uri),
+            "recovery consumes the debt"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initially_unparsed_pull_recovers_after_parse_and_reload() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        let uri = Url::parse("file:///test/degraded_pull.rs").unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse("fn main() {}", None).unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let initial_snapshot = server
+            .documents
+            .latest_snapshot(&uri)
+            .unwrap()
+            .slot
+            .snapshot;
+        assert!(initial_snapshot.is_none());
+        // The parse finishes and consumes any old debt while the pull is
+        // still awaiting its host fan-out. This pull has not recorded debt yet.
+        server
+            .documents
+            .update_document(uri.clone(), "fn main() {}".into(), Some(tree));
+        assert!(!server.diagnostics.take_degraded_pull(&uri));
+        server
+            .settings_manager
+            .set_capabilities(tower_lsp_server::ls_types::ClientCapabilities {
+                workspace: Some(tower_lsp_server::ls_types::WorkspaceClientCapabilities {
+                    diagnostics: Some(
+                        tower_lsp_server::ls_types::DiagnosticWorkspaceClientCapabilities {
+                            refresh_support: Some(true),
+                        },
+                    ),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        let reload_lock = crate::lsp::lsp_impl::lock_settings_reload().await;
+        let reload = crate::lsp::lsp_impl::ParserReloadGuard::begin(&server.parser_pool);
+        server.cache.bump_semantic_token_generation();
+        assert!(server.documents.get(&uri).unwrap().snapshot().is_some());
+        // Query reload starts after that parse. The earlier tree-less answer
+        // now records debt, so only the post-answer recovery can refresh it.
+        server.diagnostics.record_degraded_pull(&uri, None);
+        server.recover_degraded_pull(&uri);
+        tokio::task::yield_now().await;
+        assert_eq!(server.diagnostics.metrics_snapshot().refreshes_requested, 0);
+        drop(reload);
+        drop(reload_lock);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while server.diagnostics.metrics_snapshot().refreshes_requested == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("a parse that finished before debt registration must not strand recovery");
+        assert!(
+            !server.diagnostics.take_degraded_pull(&uri),
+            "recovery consumes the debt"
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostic_routes_with_language_changed_during_snapshot_wait() {
+        assert_snapshot_language_routing(crate::document::LanguageCheck::Record).await;
+    }
+
+    #[tokio::test]
+    async fn diagnostic_routes_with_persistent_fallback_snapshot_language() {
+        assert_snapshot_language_routing(crate::document::LanguageCheck::Expect(Some("rust")))
+            .await;
+    }
+
+    async fn assert_snapshot_language_routing(language_check: crate::document::LanguageCheck<'_>) {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let registry = server.language.language_registry_for_parallel();
+        registry.register("rust".into(), tree_sitter_rust::LANGUAGE.into());
+        let lua: tree_sitter::Language = tree_sitter_lua::LANGUAGE.into();
+        registry.register("lua".into(), lua.clone());
+        let mut settings = (*server.settings_manager.load_settings()).clone();
+        settings.languages.insert("lua".into(), serde_json::from_value(serde_json::json!({
+            "layers": { "aggregation": { "textDocument/diagnostic": { "priorities": ["native"] } } }
+        })).unwrap());
+        server.settings_manager.apply_settings(settings);
+        let uri = Url::parse("file:///redetected").unwrap();
+        let text = "return 1";
+        server
+            .documents
+            .insert(uri.clone(), text.into(), Some("rust".into()), None);
+        server.diagnostics.bump_current(&uri);
+        let params = DocumentDiagnosticParams {
+            text_document: tower_lsp_server::ls_types::TextDocumentIdentifier {
+                uri: uri.as_str().parse().unwrap(),
+            },
+            identifier: None,
+            previous_result_id: None,
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let mut request = Box::pin(server.diagnostic_impl(params.clone()));
+        // Stop at the snapshot wait, after routing selected the old language.
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(request.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&lua).unwrap();
+        let (incarnation, parsed_version) = {
+            let doc = server.documents.get(&uri).unwrap();
+            (doc.incarnation(), doc.content_version())
+        };
+        let installed = server.documents.install_parse(
+            &uri,
+            language_check,
+            Arc::new(crate::document::snapshot::ParseSnapshot {
+                text: Arc::from(text),
+                tree: Some(parser.parse(text, None).unwrap()),
+                language: Some("lua".into()),
+                parsed_version,
+                incarnation,
+                injection_regions: None,
+                regions: None,
+                layer_trees: Arc::new(std::sync::OnceLock::new()),
+            }),
+        );
+        assert!(installed.current);
+        // With Lua's virt layer disabled, reload must not create degraded debt.
+        // Using the entry Rust settings would instead skip unavailable regions
+        // and keep coverage dirty. Expect also leaves the stored label as Rust.
+        let _reload = crate::lsp::lsp_impl::ParserReloadGuard::begin(&server.parser_pool);
+        assert!(request.await.is_ok());
+        assert!(
+            !server.diagnostics.is_dirty(),
+            "the snapshot language disables virt"
+        );
+        assert!(!server.diagnostics.take_degraded_pull(&uri));
+        server.diagnostics.bump_current(&uri);
+        assert!(server.diagnostic_impl(params).await.is_ok());
+        assert!(
+            !server.diagnostics.is_dirty(),
+            "subsequent pulls remain answerable"
         );
     }
 

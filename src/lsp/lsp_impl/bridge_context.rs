@@ -1243,6 +1243,18 @@ impl Kakehashi {
         method_name: &str,
     ) -> Option<HostRequestContext> {
         let uri = uri_to_url(lsp_uri).ok()?;
+        let language_name = self.document_language(&uri)?;
+        self.resolve_host_bridge_context_for_language(lsp_uri, method_name, &language_name)
+    }
+
+    /// Resolve host routing for the language chosen by a settled parse snapshot.
+    pub(crate) fn resolve_host_bridge_context_for_language(
+        &self,
+        lsp_uri: &Uri,
+        method_name: &str,
+        language_name: &str,
+    ) -> Option<HostRequestContext> {
+        let uri = uri_to_url(lsp_uri).ok()?;
         // Host tier needs only the text, never the parse tree
         // (parse-decoupled-document-lifecycle ADR): read `text_arc()` directly
         // rather than `snapshot()?`, which requires a tree. Otherwise — now that
@@ -1261,10 +1273,9 @@ impl Kakehashi {
                 document.content_version(),
             )
         };
-        let language_name = self.document_language(&uri)?;
 
         let settings = self.settings_manager.load_settings();
-        let lang_settings = settings.resolve_host_language_settings(&language_name)?;
+        let lang_settings = settings.resolve_host_language_settings(language_name)?;
         if !lang_settings.is_host_bridging_enabled() {
             log::debug!(
                 "{}: host bridging not opted in for {} (bridge._self.enabled)",
@@ -1276,7 +1287,7 @@ impl Kakehashi {
 
         let configs = self
             .bridge
-            .cached_host_configs_for_language(&settings, &language_name);
+            .cached_host_configs_for_language(&settings, language_name);
         if configs.is_empty() {
             log::debug!(
                 "{}: no host-capable server configured for {}",
@@ -1293,7 +1304,7 @@ impl Kakehashi {
             text,
             incarnation,
             content_version,
-            language_id: language_name,
+            language_id: language_name.to_owned(),
             configs,
             priorities: agg.priorities,
             strategy: agg.strategy,

@@ -1563,16 +1563,67 @@ impl DiagnosticPublisher {
         true
     }
 
-    /// Map each currently-resolvable injection region of the host document to its
-    /// offset, recomputed from the live document so region push slots re-anchor
-    /// after edits above them.
-    ///
-    /// `None` means the geometry is **unknown**: the document is open but has no
-    /// parse snapshot (`did_change` cleared the tree; the off-ingress reparse
-    /// hasn't landed) — the caller must defer publishing rather than treat the
-    /// regions as gone. `Some(empty)` means there legitimately are no regions to
-    /// anchor: the document is closed, or its language resolves to no injection
-    /// query — stale region slots drop from the merge.
+    /// Recover a pull that read unsettled queries even when the reload does
+    /// not reparse this host (notably another language's auto-install).
+    /// One waiter per lifetime, cancelled on close or shutdown.
+    pub(crate) fn retry_degraded_pull_after_reload(&self, host: &Url, lifetime: u64) {
+        let Some(claim) = self
+            .settle_retry_waiters
+            .claim("degraded-pull", host, Some(lifetime))
+        else {
+            return;
+        };
+        let Some(mut snapshots) = self.documents.subscribe_snapshots(host) else {
+            return;
+        };
+        let this = self.clone();
+        let host = host.clone();
+        tokio::spawn(async move {
+            let lifetime_ended = async {
+                loop {
+                    if snapshots.borrow_and_update().current_incarnation != lifetime {
+                        return;
+                    }
+                    if snapshots.changed().await.is_err() {
+                        return;
+                    }
+                }
+            };
+            let recovery = async {
+                let _reload = crate::lsp::lsp_impl::lock_settings_reload().await;
+                // Release the waiter before the reload lock: a new reload must
+                // be able to claim its own recovery after this one completes.
+                let _claim = claim;
+                if this.documents.get(&host).map(|doc| doc.incarnation()) != Some(lifetime) {
+                    return;
+                }
+                let Some(language) = this.settled_snapshot_language(&host) else {
+                    return; // A pending parse owns recovery instead.
+                };
+                // Auto-install reloads invalidate dynamically discovered parser
+                // registrations without reparsing other open hosts. Keep the
+                // reload lock through publication and geometry validation, as
+                // the install path does, so another reload cannot unpublish the
+                // parser between loading it and consuming recovery debt.
+                if !this.language.has_parser_available(&language) {
+                    let _ = this.language.ensure_language_loaded_async(&language).await;
+                }
+                if this.documents.get(&host).map(|doc| doc.incarnation()) == Some(lifetime)
+                    && this.current_region_offsets(&host).is_some()
+                    && this.aggregator.take_degraded_pull(&host)
+                {
+                    this.request_pull_diagnostic_refresh(true);
+                }
+            };
+            tokio::select! {
+                _ = this.shutdown.cancelled() => {}
+                _ = lifetime_ended => {}
+                // A timeout would strand debt after a slow non-reparsing reload.
+                _ = recovery => {}
+            }
+        });
+    }
+
     /// Re-run `republish` for `host` once no reload is in progress, bounded:
     /// the deferral otherwise relies on the reparse loop, which an injected
     /// language's auto-install reload never triggers for the host.
@@ -1672,6 +1723,16 @@ impl DiagnosticPublisher {
         })
     }
 
+    /// Map each currently-resolvable injection region of the host document to its
+    /// offset, recomputed from the live document so region push slots re-anchor
+    /// after edits above them.
+    ///
+    /// `None` means the geometry is **unknown**: the document is open but has no
+    /// parse snapshot (`did_change` cleared the tree; the off-ingress reparse
+    /// hasn't landed) — the caller must defer publishing rather than treat the
+    /// regions as gone. `Some(empty)` means there legitimately are no regions to
+    /// anchor: the document is closed, or its language resolves to no injection
+    /// query — stale region slots drop from the merge.
     fn current_region_offsets(&self, host: &Url) -> Option<HashMap<String, RegionOffset>> {
         let mut offsets = HashMap::new();
 

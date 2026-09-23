@@ -182,6 +182,25 @@ that snapshot instead of looking up the store again: a new publish must never
 pair the old text/tree with new regions. Generation mismatch preserves inline
 fallback rather than turning an unavailable result into a definitive empty one.
 
+Whole-document requests also check that the host parser is published and no
+query reload is in progress, then recheck the reload flag and settings generation
+after reading or resolving regions. This applies to cached regions too: a parse
+can publish old-query regions under a transitional generation. An unavailable
+read makes the one-shot virtual layer return `ContentModified`. Under `preferred`,
+other enabled layers may still answer. Under `concatenated`, the existing
+all-layers-success rule rejects the request instead of presenting a partial set
+as complete. A settled language without an injection query returns an empty
+region set. Pull diagnostics retains degraded-answer debt instead of
+marking the document covered. Its immediate recovery check requires settled
+queries as well as a current tree. An unsettled recovery check also starts one
+reload-completion waiter for the current document lifetime, because
+auto-install reloads do not reparse other hosts. The initial read may have been
+tree-less even though its parse finished before debt registration. The waiter
+reloads a missing host parser and requests recovery once geometry is readable;
+a still-pending parse retains the post-parse recovery path. The waiter survives
+slow reloads and is cancelled when the document lifetime ends or the server shuts
+down.
+
 - **Incarnation-scoped, strict monotonicity.** The `>` is strict — equal-version
   double-publishes (e.g. a racing open-parse and reparse both at version 0) must
   not swap the `Tree` under an already-issued `result_id` and fire a spurious
