@@ -3875,10 +3875,15 @@ mod tests {
             !agg.evict_region_servers(&host(), &[("R1".to_string(), "deselected".to_string())]),
             "evicting an absent slot reports nothing removed"
         );
+    }
 
+    #[test]
+    fn evict_region_servers_reports_nothing_visible_for_an_empty_slot() {
+        let agg = DiagnosticAggregator::new();
+        let region = DiagnosticSource::Region("R1".to_string());
         agg.record(
             &host(),
-            region.clone(),
+            region,
             "cleared".to_string(),
             Some(ProgressConnectionId::for_test(1)),
             Vec::new(),
