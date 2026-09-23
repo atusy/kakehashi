@@ -2452,42 +2452,69 @@ fn spawn_crash_recovery(
         // Anchored now, so the delay does not stretch by however long this
         // task waited to be polled.
         tokio::time::sleep_until(tokio::time::Instant::now() + delay).await;
-        if !pool.begin_crash_recovery_attempt(&key).await {
+        loop {
+            if !pool.begin_crash_recovery_attempt(&key).await {
+                return;
+            }
+            let snapshot = settings_manager.load_settings_pair();
+            let settings = &snapshot.settings;
+            let server = key.server();
+            let Some(config) = bridge.respawnable_server_config(settings, server) else {
+                log::debug!(
+                    target: "kakehashi::bridge",
+                    "Not respawning {key}: settings no longer start {server:?}"
+                );
+                return;
+            };
+            if !crashed_connection_is_wanted(&injection, &bridge, settings, &key).await {
+                log::debug!(
+                    target: "kakehashi::bridge",
+                    "Not respawning {key}: no open document routes to it"
+                );
+                return;
+            }
+            // Stand down if settings change before the spawn commits: the
+            // config in hand would then be history, and spawning from it would
+            // start a server the new settings do not describe.
+            let generation = snapshot.generation;
+            let admit = || settings_manager.settings_generation() == generation;
+            let error = match pool.revive_crashed_connection(&key, &config, &admit).await {
+                Ok(_) => {
+                    log::info!(
+                        target: "kakehashi::bridge",
+                        "Respawned crashed downstream {key}"
+                    );
+                    return;
+                }
+                Err(error) => error,
+            };
+            if error.kind() == std::io::ErrorKind::Interrupted
+                && settings_manager.settings_generation() != generation
+            {
+                // Refused because settings moved on. Nothing was spawned, so no
+                // crash will come to reschedule this: decide again under the
+                // new settings. Each pass needs another settings change, so
+                // this cannot spin on its own.
+                continue;
+            }
+            if error.kind() == std::io::ErrorKind::Interrupted || pool.holds_connection(&key).await
+            {
+                // Shutdown, or a process that started and died again: its
+                // reader reports that crash, which schedules the next attempt.
+                log::debug!(
+                    target: "kakehashi::bridge",
+                    "Respawning crashed downstream {key} did not complete: {error}"
+                );
+            } else {
+                // Not even a process to report a crash (the command failed to
+                // start, or the key is refused): proactive recovery ends here.
+                log::warn!(
+                    target: "kakehashi::bridge",
+                    "Could not respawn crashed downstream {key}: {error}; the next edit \
+                     or request that needs it will try again"
+                );
+            }
             return;
-        }
-        let snapshot = settings_manager.load_settings_pair();
-        let settings = &snapshot.settings;
-        let server = key.server();
-        let Some(config) = bridge.respawnable_server_config(settings, server) else {
-            log::debug!(
-                target: "kakehashi::bridge",
-                "Not respawning {key}: settings no longer start {server:?}"
-            );
-            return;
-        };
-        if !crashed_connection_is_wanted(&injection, &bridge, settings, &key).await {
-            log::debug!(
-                target: "kakehashi::bridge",
-                "Not respawning {key}: no open document routes to it"
-            );
-            return;
-        }
-        // Stand down if settings change before the spawn commits: the config
-        // in hand would then be history, and spawning from it would start a
-        // server the new settings do not describe.
-        let generation = snapshot.generation;
-        let admit = || settings_manager.settings_generation() == generation;
-        match pool.revive_crashed_connection(&key, &config, &admit).await {
-            Ok(_) => log::info!(
-                target: "kakehashi::bridge",
-                "Respawned crashed downstream {key}"
-            ),
-            // A replacement that dies again reports its own crash, which
-            // schedules the next attempt; nothing to do here.
-            Err(e) => log::debug!(
-                target: "kakehashi::bridge",
-                "Respawning crashed downstream {key} did not complete: {e}"
-            ),
         }
     });
 }

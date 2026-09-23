@@ -2377,6 +2377,11 @@ impl LanguageServerPool {
             .is_some_and(|mapped| mapped.state() == ConnectionState::Failed)
     }
 
+    /// Whether the pool holds any connection under `key`, in any state.
+    pub(crate) async fn holds_connection(&self, key: &ConnectionKey) -> bool {
+        self.connections.lock().await.contains_key(key)
+    }
+
     /// Respawn the crashed connection under `key`. The replacement's
     /// handshake claims the re-open its purge armed, so the documents it should
     /// hold are derived and opened the ordinary way
