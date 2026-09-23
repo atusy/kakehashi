@@ -384,8 +384,8 @@ fn e2e_late_registration_consolidates_diverted_roots() {
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    assert_eq!(
-        retired, 1,
+    assert!(
+        retired > 0,
         "the diverted root's process must be retired once the shared instance registers"
     );
 
@@ -395,4 +395,9 @@ fn e2e_late_registration_consolidates_diverted_roots() {
         "root B must now be served by the shared instance; got {consolidated:?}"
     );
     assert_eq!(hover_pid(&consolidated), hover_pid(&shared));
+    assert_eq!(
+        shutdowns(&wire_log),
+        1,
+        "only the diverted process is retired; the shared one keeps serving"
+    );
 }
