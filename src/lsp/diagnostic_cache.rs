@@ -2202,9 +2202,10 @@ impl DiagnosticAggregator {
     /// still be. Empty sources, and the host entry once empty, are removed.
     ///
     /// Returns whether a removed slot carried diagnostics, i.e. whether the
-    /// editor is now showing something the cache no longer holds. The answer
-    /// comes from the removal itself rather than from a later republish, which
-    /// a concurrent republish may already have made `Unchanged`.
+    /// cache lost something a republish may have been showing. (It may not
+    /// have been: a pull-driven server's push slot is filtered out of the
+    /// publish while a pull layer is present; the caller's republish is then
+    /// merely `Unchanged`.)
     pub(crate) fn evict_region_servers(&self, host: &Url, slots: &[(String, String)]) -> bool {
         let mut revisions = self
             .cache_revisions
