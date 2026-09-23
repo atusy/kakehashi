@@ -738,10 +738,18 @@ fn download_and_extract_archive(
     // into_reader() streams without a size limit; parser archives can exceed
     // ureq's 10MB read_to_* default.
     let decoder = GzDecoder::new(response.into_body().into_reader());
-    let mut archive = Archive::new(decoder);
-
     // GitHub names the root directory `{repo}-{revision_without_v_prefix}`
     let expected_prefix = archive_root_dir_name(repo_name, revision);
+    extract_parser_archive(decoder, &expected_prefix, dest)
+}
+
+/// Extract a parser archive while stripping its expected repository root.
+fn extract_parser_archive(
+    reader: impl std::io::Read,
+    expected_prefix: &str,
+    dest: &Path,
+) -> Result<(), ParserInstallError> {
+    let mut archive = Archive::new(reader);
 
     fs::create_dir_all(dest)?;
 
@@ -757,7 +765,7 @@ fn download_and_extract_archive(
         })?;
 
         // Strip the root directory prefix (e.g., "tree-sitter-json-0.24.8/")
-        let relative = match path.strip_prefix(&expected_prefix) {
+        let relative = match path.strip_prefix(expected_prefix) {
             Ok(p) => p.to_path_buf(),
             Err(_) => continue,
         };
