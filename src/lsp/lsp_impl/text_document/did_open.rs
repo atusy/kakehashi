@@ -29,6 +29,25 @@ async fn spawn_synthetic_diagnostic_for_parse<F>(
     }
 }
 
+async fn spawn_synthetic_diagnostic_after_install(
+    documents: &DocumentStore,
+    diagnostic_scheduler: &crate::lsp::lsp_impl::coordinator::DiagnosticScheduler,
+    uri: url::Url,
+    incarnation: u64,
+) {
+    let edit_lock = documents.edit_lock(&uri);
+    let _lifecycle = edit_lock.lock().await;
+    let Some(document) = documents.get(&uri) else {
+        documents.remove_edit_lock_if_unshared(&uri, &edit_lock);
+        return;
+    };
+    let eligible = document.incarnation() == incarnation;
+    drop(document);
+    if eligible {
+        diagnostic_scheduler.spawn_synthetic_diagnostic_task(uri);
+    }
+}
+
 impl Kakehashi {
     pub(crate) async fn did_open_impl(&self, params: DidOpenTextDocumentParams) {
         self.did_open_impl_with_lock_probe(params, std::future::ready(()))
@@ -192,8 +211,8 @@ impl Kakehashi {
                         if !completion.same_lifetime {
                             return;
                         }
-                        // A new parse or a completed query reload grants this
-                        // pass. Query-only repair may retain the existing tree.
+                        // A new parse or completed query reload grants injection
+                        // work. Host diagnostics can also run after parse give-up.
                         if let Some(lineage) =
                             completion.downstream_lineage(&documents, &install_uri, incarnation)
                         {
@@ -217,6 +236,17 @@ impl Kakehashi {
                                 )
                                 .await;
                             }
+                        } else if !is_cli_mode {
+                            // Registration can succeed even when parsing gives up.
+                            // Re-check the lifetime under the edit lock before
+                            // collecting host diagnostics from the current text.
+                            spawn_synthetic_diagnostic_after_install(
+                                &documents,
+                                &diagnostic_scheduler,
+                                install_uri,
+                                incarnation,
+                            )
+                            .await;
                         }
                     });
                     skip_parse = !load_result.success;
@@ -2621,6 +2651,88 @@ print("hello")
             server.documents.get(&uri).unwrap().tree().is_none(),
             give_up
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn installed_host_diagnostics_run_after_parse_giveup() {
+        use crate::lsp::diagnostic_cache::DiagnosticSource;
+
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+        server.bridge.insert_ready_test_connection("rust_ls").await;
+        server
+            .language
+            .language_registry_for_parallel()
+            .unregister("rust");
+        let uri = Url::parse("file:///test/parser-install-open.rs").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        server.bridge.open_host_incarnation(&uri, incarnation).await;
+        let scheduler = server.diagnostic_scheduler();
+        assert!(scheduler.prepare_diagnostic_snapshot(&uri).is_none());
+        scheduler.spawn_synthetic_diagnostic_task(uri.clone());
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        server.documents.publish_giveup_snapshot(&uri, incarnation);
+        spawn_synthetic_diagnostic_after_install(
+            &server.documents,
+            &scheduler,
+            uri.clone(),
+            incarnation,
+        )
+        .await;
+        wait_until(|| {
+            server
+                .diagnostics
+                .snapshot(&uri)
+                .contains_key(&DiagnosticSource::PullLayer)
+        })
+        .await;
+        assert!(server.documents.get(&uri).unwrap().tree().is_none());
+    }
+
+    #[tokio::test]
+    async fn installed_host_diagnostics_do_not_register_for_reopened_document() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+        let uri = Url::parse("file:///test/parser-install-reopened.rs").unwrap();
+        let old = server.documents.insert(
+            uri.clone(),
+            "old".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let current = server.documents.insert(
+            uri.clone(),
+            "new".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        assert_ne!(old, current);
+        assert!(
+            server
+                .diagnostic_scheduler()
+                .prepare_diagnostic_snapshot(&uri)
+                .is_some()
+        );
+        spawn_synthetic_diagnostic_after_install(
+            &server.documents,
+            &server.diagnostic_scheduler(),
+            uri.clone(),
+            old,
+        )
+        .await;
+        assert!(!server.synthetic_diagnostics.has_active_task(&uri));
+        assert!(server.diagnostics.snapshot(&uri).is_empty());
     }
 
     #[cfg(unix)]
