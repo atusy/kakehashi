@@ -85,6 +85,51 @@ type PushSlot = (DiagnosticSource, String);
 /// eviction removed).
 type RecordedHost = (Url, Vec<PushSlot>);
 
+/// The `priorities` method key of each diagnostic surface (#916).
+const PUBLISH_METHOD: &str = "textDocument/publishDiagnostics";
+const PULL_METHOD: &str = "textDocument/diagnostic";
+
+/// The push slots a push-origin republish was asked for, and whether one of
+/// them changed only what the client-pull fold returns: the publish filters
+/// hid it while the pull allowlist admits it, so the published set cannot
+/// show the change and the pull client needs the refresh nudge instead.
+/// Noted as the filters drop slots, so the common push resolves nothing
+/// extra. Errs toward nudging: a hidden host slot of a pull-driven server
+/// (which the fold drops) still counts, and so does an emptied region slot
+/// when no geometry is resolved — each at most one spurious, coverage-gated
+/// nudge.
+struct PushedChanges<'a> {
+    slots: &'a [PushSlot],
+    pull_only_change: bool,
+}
+
+impl<'a> PushedChanges<'a> {
+    fn new(slots: &'a [PushSlot]) -> Self {
+        Self {
+            slots,
+            pull_only_change: false,
+        }
+    }
+
+    /// Whether `server`'s host slot changed and no pull-only change is noted
+    /// yet (one is enough to nudge, so later slots skip the pull resolution).
+    fn is_unnoted_host_change(&self, server: &str) -> bool {
+        !self.pull_only_change
+            && self
+                .slots
+                .iter()
+                .any(|(source, name)| matches!(source, DiagnosticSource::Host) && name == server)
+    }
+
+    /// [`Self::is_unnoted_host_change`] for a region slot.
+    fn is_unnoted_region_change(&self, region_id: &str, server: &str) -> bool {
+        !self.pull_only_change
+            && self.slots.iter().any(|(source, name)| {
+                matches!(source, DiagnosticSource::Region(id) if id == region_id) && name == server
+            })
+    }
+}
+
 /// A recorded push: its host, and its slot when the diagnostics changed.
 struct RecordedPush {
     host: Url,
@@ -656,9 +701,7 @@ impl DiagnosticPublisher {
         // sends, which the quiet window/seal may withhold.
         let mut nudged = 0;
         for (host, changed) in hosts {
-            if self.republish(&host).await.nudges_pull_clients()
-                || self.pull_admits_any_unpublished(&host, &changed)
-            {
+            if self.republish_pushed(&host, &changed).await {
                 self.bump_current_if_open(&host);
                 nudged += 1;
             }
@@ -801,33 +844,59 @@ impl DiagnosticPublisher {
         host: &Url,
         settings: &Arc<WorkspaceSettings>,
         snapshot: &mut crate::lsp::diagnostic_cache::SourceSlots,
+        pushed: &mut PushedChanges<'_>,
     ) {
+        use crate::lsp::lsp_impl::bridge_context::PushAllowlist;
         // Single map lookup via the entry API (no separate contains_key/get_mut/remove).
         let mut entry = match snapshot.entry(DiagnosticSource::Host) {
             std::collections::hash_map::Entry::Occupied(entry) => entry,
             std::collections::hash_map::Entry::Vacant(_) => return, // no host push slots
         };
         // If the doc is gone or its language no longer opts into `_self`, no server
-        // is valid — drop the whole Host source.
+        // is valid — drop the whole Host source. (A closed document has no pull
+        // view to nudge.)
         let Some(language_name) = self.open_document_language(host) else {
             entry.remove();
             return;
         };
-        let admitted = crate::lsp::lsp_impl::bridge_context::PushAllowlist::for_host(
-            &self.bridge,
-            settings,
-            &language_name,
-            "textDocument/publishDiagnostics",
-        );
+        let admitted =
+            PushAllowlist::for_host(&self.bridge, settings, &language_name, PUBLISH_METHOD);
+        // A changed slot this filter hides may still be folded into the pull
+        // (the keys can diverge): note it for the push-origin nudge. The pull
+        // allowlist is resolved only for such a slot.
+        let mut pull: Option<Option<PushAllowlist>> = None;
+        let mut note_hidden = |server: &str| {
+            if !pushed.is_unnoted_host_change(server) {
+                return;
+            }
+            let pull = pull.get_or_insert_with(|| {
+                settings
+                    .resolve_host_language_settings(&language_name)
+                    .is_some_and(|lang| lang.resolve_host_aggregation(PULL_METHOD).push_fallback)
+                    .then(|| {
+                        PushAllowlist::for_host(&self.bridge, settings, &language_name, PULL_METHOD)
+                    })
+            });
+            if pull.as_ref().is_some_and(|pull| pull.admits(server)) {
+                pushed.pull_only_change = true;
+            }
+        };
         if admitted.is_empty() {
             // No admitted host server for this language (`_self` disabled, none
             // configured, or `priorities` admits none) — every host slot is
-            // stale. Drop the whole source without scanning the slots.
+            // stale. Drop the whole source without filtering slot by slot.
+            entry.get().keys().for_each(|server| note_hidden(server));
             entry.remove();
             return;
         }
         let slots = entry.get_mut();
-        slots.retain(|server, _| admitted.admits(server));
+        slots.retain(|server, _| {
+            let keep = admitted.admits(server);
+            if !keep {
+                note_hidden(server);
+            }
+            keep
+        });
         if slots.is_empty() {
             entry.remove();
         }
@@ -1093,10 +1162,31 @@ impl DiagnosticPublisher {
         self.republish_with_wire_activity(host, true).await
     }
 
+    /// [`Self::republish`] for a push-origin caller: whether pull-mode clients
+    /// need the refresh nudge — the published set changed (or is deferred), or
+    /// one of the `changed` push slots is hidden from the publish yet admitted
+    /// by the client-pull fold (the surfaces' `priorities` keys can diverge,
+    /// #916), which changes only what the editor's next pull returns.
+    async fn republish_pushed(&self, host: &Url, changed: &[PushSlot]) -> bool {
+        let mut pushed = PushedChanges::new(changed);
+        let outcome = self.republish_core(host, true, &mut pushed).await;
+        outcome.nudges_pull_clients() || pushed.pull_only_change
+    }
+
     async fn republish_with_wire_activity(
         &self,
         host: &Url,
         wire_activity: bool,
+    ) -> RepublishOutcome {
+        self.republish_core(host, wire_activity, &mut PushedChanges::new(&[]))
+            .await
+    }
+
+    async fn republish_core(
+        &self,
+        host: &Url,
+        wire_activity: bool,
+        pushed: &mut PushedChanges<'_>,
     ) -> RepublishOutcome {
         // Serialize the whole snapshot→merge→publish so concurrent republishes
         // (region push vs host-event pull) emit in order and a stale snapshot can
@@ -1123,7 +1213,7 @@ impl DiagnosticPublisher {
         // slots stay cached (cleared on `didClose`); they're just filtered out of
         // this publish. Region slots get the same treatment once their injection
         // languages are known (`filter_excluded_region_slots`, below).
-        self.filter_stale_host_slots(host, &settings, &mut snapshot);
+        self.filter_stale_host_slots(host, &settings, &mut snapshot, pushed);
         // Drop a pull-driven server's push slots when the host-event pull blob
         // (`PullLayer`) is present: that server already contributes via the
         // pull, so keeping its spontaneous push too would double-count it
@@ -1144,7 +1234,7 @@ impl DiagnosticPublisher {
                 Some(geometry) => {
                     // Only now is each region's injection language known: gate
                     // the region pushes on the allowlist before the merge.
-                    self.filter_excluded_region_slots(&settings, &mut snapshot, &geometry);
+                    self.filter_excluded_region_slots(&settings, &mut snapshot, &geometry, pushed);
                     geometry.offsets
                 }
                 // The document is open but has no parse snapshot: `did_change`
@@ -1189,6 +1279,19 @@ impl DiagnosticPublisher {
                 }
             }
         } else {
+            // No live region slot, so no geometry to learn a changed region
+            // slot's language from — only an emptied one can be left here (a
+            // server clearing its push). Whether the publish hides it is
+            // unknown, so nudge: a clear follows a non-empty push, so this is
+            // at most one nudge per clear.
+            if pushed.slots.iter().any(|(source, server)| {
+                matches!(source, DiagnosticSource::Region(_))
+                    && snapshot
+                        .get(source)
+                        .is_some_and(|servers| servers.contains_key(server))
+            }) {
+                pushed.pull_only_change = true;
+            }
             HashMap::new()
         };
         let diagnostics = merge_cached_diagnostics(host, snapshot, &region_offsets);
@@ -1934,7 +2037,11 @@ impl DiagnosticPublisher {
         settings: &Arc<WorkspaceSettings>,
         snapshot: &mut crate::lsp::diagnostic_cache::SourceSlots,
         geometry: &RegionGeometry,
+        pushed: &mut PushedChanges<'_>,
     ) {
+        use crate::lsp::lsp_impl::bridge_context::{
+            RegionPushAllowlist, resolve_aggregation_config_from_settings,
+        };
         let (Some(host_language), Some(regions)) = (
             geometry.host_language.as_deref(),
             geometry.regions.as_deref(),
@@ -1950,37 +2057,57 @@ impl DiagnosticPublisher {
                 )
             })
             .collect();
-        let mut allowlist = crate::lsp::lsp_impl::bridge_context::RegionPushAllowlist::new(
-            &self.bridge,
-            settings,
-            host_language,
-            "textDocument/publishDiagnostics",
-        );
+        let mut allowlist =
+            RegionPushAllowlist::new(&self.bridge, settings, host_language, PUBLISH_METHOD);
+        // A changed slot this filter hides may still be folded into the pull
+        // (the keys can diverge): note it for the push-origin nudge, resolving
+        // the pull side only for such a slot.
+        let mut pull = RegionPushAllowlist::new(&self.bridge, settings, host_language, PULL_METHOD);
+        let mut push_fallback: HashMap<&str, bool> = HashMap::new();
         crate::lsp::diagnostic_cache::retain_region_push_slots(snapshot, |region_id, server| {
-            injection_languages
-                .get(region_id)
-                .is_none_or(|language| allowlist.admits(language, server))
+            let Some(&language) = injection_languages.get(region_id) else {
+                return true; // stale region: the merge drops it for want of an offset
+            };
+            if allowlist.admits(language, server) {
+                return true;
+            }
+            if pushed.is_unnoted_region_change(region_id, server)
+                && pull.admits(language, server)
+                && *push_fallback.entry(language).or_insert_with(|| {
+                    resolve_aggregation_config_from_settings(
+                        settings,
+                        host_language,
+                        language,
+                        PULL_METHOD,
+                    )
+                    .push_fallback
+                })
+            {
+                pushed.pull_only_change = true;
+            }
+            false
         });
     }
 
-    /// Whether any of `slots` — push slots whose diagnostics just changed — is
+    /// Whether any of `slots` — push slots a crash eviction just removed — was
     /// hidden from the publish yet admitted by the client-pull fold.
     ///
-    /// The two surfaces keep separate `priorities` keys (#916), so such a
-    /// change leaves the published set as it was (the republish reports no
-    /// change) while altering what the editor's next pull returns. A pull
-    /// client learns of it only through the refresh nudge, which push-origin
-    /// callers otherwise send only on a changed publish. Consulted only after
-    /// an unchanged republish, and only for the slots a push or eviction
-    /// actually changed, so the common path resolves nothing.
+    /// The eviction sibling of [`PushedChanges`]: the two surfaces keep
+    /// separate `priorities` keys (#916), so removing such a slot leaves the
+    /// published set as it was while emptying what the editor's next pull
+    /// returns. The republish filters cannot notice it — the slot is already
+    /// gone from the cache — so this re-resolves geometry and both allowlists
+    /// for the removed slots. Consulted only after an unchanged republish on
+    /// a connection exit, never on the push path.
     ///
-    /// Errs toward nudging: unknown region geometry answers `true`, and a host
-    /// slot ignores whether the host layer takes part in the pull (the nudge
+    /// Errs toward nudging: unknown region geometry answers `true`, and
+    /// neither pull-driven classification (the fold drops those servers) nor
+    /// whether the host layer takes part in the pull is consulted (the nudge
     /// is coverage-gated and single-flighted; a spurious one costs one
     /// `unchanged` re-pull).
     fn pull_admits_any_unpublished(&self, host: &Url, slots: &[PushSlot]) -> bool {
-        const PUBLISH: &str = "textDocument/publishDiagnostics";
-        const PULL: &str = "textDocument/diagnostic";
+        const PUBLISH: &str = PUBLISH_METHOD;
+        const PULL: &str = PULL_METHOD;
         if slots.is_empty() {
             return false;
         }
@@ -4100,6 +4227,7 @@ mod tests {
             &uri,
             &server.settings_manager.load_settings(),
             &mut snapshot,
+            &mut PushedChanges::new(&[]),
         );
         assert!(
             !snapshot.contains_key(&DiagnosticSource::Host),
@@ -4162,6 +4290,7 @@ mod tests {
             &uri,
             &server.settings_manager.load_settings(),
             &mut snapshot,
+            &mut PushedChanges::new(&[]),
         );
         assert!(
             !snapshot.contains_key(&DiagnosticSource::Host),
