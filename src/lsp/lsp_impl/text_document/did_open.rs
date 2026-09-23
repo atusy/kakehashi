@@ -2553,8 +2553,7 @@ print("hello")
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn saved_diagnostics_survive_unavailable_language_until_parser_registration() {
+    async fn assert_saved_pull_after_parser_registration(give_up: bool) {
         use crate::lsp::diagnostic_cache::DiagnosticSource;
         use std::time::Duration;
 
@@ -2590,16 +2589,20 @@ print("hello")
             .language
             .language_registry_for_parallel()
             .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
-        let lineage = server
-            .parse_coordinator()
-            .parse_document(uri.clone(), Some("rust"), None, Some(incarnation))
-            .await
-            .unwrap();
-        // The install callback's Open cannot override the Save ordering key,
-        // even if the old Save future already finished without collecting.
-        server
-            .diagnostic_scheduler()
-            .spawn_synthetic_diagnostic_task_for_parse(uri.clone(), lineage);
+        if give_up {
+            server.documents.publish_giveup_snapshot(&uri, incarnation);
+        } else {
+            let lineage = server
+                .parse_coordinator()
+                .parse_document(uri.clone(), Some("rust"), None, Some(incarnation))
+                .await
+                .unwrap();
+            // The install callback's Open cannot override the Save ordering key,
+            // even if the old Save future already finished without collecting.
+            server
+                .diagnostic_scheduler()
+                .spawn_synthetic_diagnostic_task_for_parse(uri.clone(), lineage);
+        }
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if server
@@ -2614,6 +2617,22 @@ print("hello")
         })
         .await
         .expect("the saved pull must survive the parser-registration window");
+        assert_eq!(
+            server.documents.get(&uri).unwrap().tree().is_none(),
+            give_up
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn saved_diagnostics_survive_unavailable_language_until_parser_registration() {
+        assert_saved_pull_after_parser_registration(false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn saved_host_diagnostics_resume_after_parser_registration_and_parse_giveup() {
+        assert_saved_pull_after_parser_registration(true).await;
     }
 
     #[tokio::test]

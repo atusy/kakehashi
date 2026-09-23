@@ -37,6 +37,10 @@ struct DiagnosticDocumentInputs {
     content_version: u64,
 }
 
+/// A live document exists, but its language cannot be detected until parser
+/// registration completes. Distinct from a document with no diagnostic inputs.
+struct DiagnosticLanguagePending;
+
 fn snapshot_document_for_lineage(
     documents: &DocumentStore,
     uri: &Url,
@@ -317,22 +321,36 @@ impl DiagnosticScheduler {
         let task_uri = uri.clone();
 
         let future = async move {
-            let collect_current = || async {
-                let snapshot_data = snapshot_preparer.prepare_diagnostic_snapshot_when_current(
+            // Subscribe before inspecting inputs: parser installation may
+            // publish either a tree or a tree-less give-up snapshot. Both can
+            // make host inputs available after language detection returned None.
+            let Some(mut readiness) = documents.subscribe_snapshots(&task_uri) else {
+                return;
+            };
+            loop {
+                let snapshot_data = match snapshot_preparer.prepare_diagnostic_snapshot_for_lineage(
                     &task_uri,
-                    expected_incarnation,
-                    expected_content_version,
-                );
-                // None may mean language detection is temporarily unavailable
-                // during parser installation/reload. Keep Save ownership until
-                // its exact tree arrives; a late Open cannot replace its key.
-                // The waiter itself rejects closed or superseded documents.
-                let pending = snapshot_data
-                    .as_ref()
-                    .is_none_or(|snapshot| snapshot.virtual_geometry_pending);
-                let outcome =
-                    collect_push_diagnostics(snapshot_data, &bridge_pool, &task_uri, LOG_TARGET)
-                        .await;
+                    Some((expected_incarnation, expected_content_version)),
+                ) {
+                    Ok(Some(snapshot)) => snapshot,
+                    Ok(None) => return,
+                    Err(DiagnosticLanguagePending) => {
+                        // The subscription predates preparation, so a parser
+                        // completion racing that read cannot be missed here.
+                        if readiness.changed().await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                };
+                let pending = snapshot_data.virtual_geometry_pending;
+                let outcome = collect_push_diagnostics(
+                    Some(snapshot_data),
+                    &bridge_pool,
+                    &task_uri,
+                    LOG_TARGET,
+                )
+                .await;
                 commit_synthetic_diagnostics_when_current(
                     &documents,
                     &publisher,
@@ -342,20 +360,19 @@ impl DiagnosticScheduler {
                     outcome,
                 )
                 .await;
-                pending
-            };
-            if collect_current().await
-                && wait_for_expected_diagnostic_tree(
-                    &documents,
-                    &task_uri,
-                    expected_incarnation,
-                    expected_content_version,
-                )
-                .await
-            {
-                // Recollect the host too: replacing the combined cache with a
-                // virtual-only answer would discard the first phase's host.
-                collect_current().await;
+                if !pending
+                    || !wait_for_expected_diagnostic_tree(
+                        &documents,
+                        &task_uri,
+                        expected_incarnation,
+                        expected_content_version,
+                    )
+                    .await
+                {
+                    return;
+                }
+                // Keep Save ownership while awaiting virtual geometry, then
+                // recollect both layers from the exact saved tree.
             }
         };
 
@@ -388,6 +405,8 @@ impl DiagnosticScheduler {
 impl DiagnosticSnapshotPreparer {
     pub(crate) fn prepare_diagnostic_snapshot(&self, uri: &Url) -> Option<DiagnosticSnapshot> {
         self.prepare_diagnostic_snapshot_for_lineage(uri, None)
+            .ok()
+            .flatten()
     }
 
     fn prepare_diagnostic_snapshot_when_current(
@@ -400,21 +419,28 @@ impl DiagnosticSnapshotPreparer {
             uri,
             Some((expected_incarnation, expected_content_version)),
         )
+        .ok()
+        .flatten()
     }
 
     fn prepare_diagnostic_snapshot_for_lineage(
         &self,
         uri: &Url,
         expected_lineage: Option<(u64, u64)>,
-    ) -> Option<DiagnosticSnapshot> {
-        let snapshot = snapshot_document_for_lineage(&self.documents, uri, expected_lineage)?;
+    ) -> Result<Option<DiagnosticSnapshot>, DiagnosticLanguagePending> {
+        let Some(snapshot) = snapshot_document_for_lineage(&self.documents, uri, expected_lineage)
+        else {
+            return Ok(None);
+        };
         let content_version = snapshot.content_version;
-        let language_name = self.language.detect_language(
+        let Some(language_name) = self.language.detect_language(
             uri.path(),
             &snapshot.text,
             None,
             snapshot.language_id.as_deref(),
-        )?;
+        ) else {
+            return Err(DiagnosticLanguagePending);
+        };
 
         // Cross-layer gating, keyed by the same method name as the
         // aggregation configs below. A layer gated off still yields a
@@ -678,11 +704,11 @@ impl DiagnosticSnapshotPreparer {
         // event / prefetch cycle — a no-op Clear plus an Unchanged republish
         // after the first, cleaned up on close.
         let virt_contexts = match (virt_contexts, host.is_some()) {
-            (None, false) if !narrower_than_editor_pull => return None,
+            (None, false) if !narrower_than_editor_pull => return Ok(None),
             (virt, _) => virt.unwrap_or_default(),
         };
 
-        Some(DiagnosticSnapshot {
+        Ok(Some(DiagnosticSnapshot {
             lineage: DiagnosticSnapshotLineage {
                 incarnation: snapshot.incarnation,
                 content_version,
@@ -694,7 +720,7 @@ impl DiagnosticSnapshotPreparer {
             narrower_than_editor_pull,
             host,
             layer_cfg,
-        })
+        }))
     }
 }
 
