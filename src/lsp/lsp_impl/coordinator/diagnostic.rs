@@ -7,6 +7,7 @@ use crate::lsp::bridge::{BridgeCoordinator, ResolvedServerConfig};
 use crate::lsp::debounced_diagnostics::DebouncedDiagnosticsManager;
 use crate::lsp::lsp_impl::bridge_context::resolve_aggregation_config_from_settings;
 use crate::lsp::lsp_impl::bridge_context::{DocumentRequestContext, HostRequestContext};
+use crate::text::terminal::escape_terminal_controls;
 use url::Url;
 
 use crate::lsp::lsp_impl::Kakehashi;
@@ -438,7 +439,7 @@ impl DiagnosticSnapshotPreparer {
             log::debug!(
                 target: LOG_TARGET,
                 "virt layer disabled for {} via layers.aggregation priorities",
-                language_name
+                escape_terminal_controls(&language_name)
             );
             Some(Vec::new())
         } else {

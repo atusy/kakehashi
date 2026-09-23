@@ -1,6 +1,7 @@
 //! Bridge coordinator unifying the language server pool and node tracker
 //! into a single coherent API.
 
+use crate::text::terminal::escape_terminal_controls;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -1010,8 +1011,8 @@ impl BridgeCoordinator {
             log::debug!(
                 target: "kakehashi::bridge",
                 "Bridge filter for {} blocks injection language {}",
-                host_language,
-                injection_language
+                escape_terminal_controls(host_language),
+                escape_terminal_controls(injection_language)
             );
             return Vec::new();
         }

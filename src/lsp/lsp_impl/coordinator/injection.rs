@@ -1,3 +1,4 @@
+use crate::text::terminal::escape_terminal_controls;
 use std::collections::HashSet;
 
 use url::Url;
@@ -697,7 +698,8 @@ impl InjectionCoordinator {
                 if !this.language_is_unsettled(&host_language) {
                     log::debug!(
                         target: "kakehashi::bridge",
-                        "Re-running the injection pass for {uri}: {host_language} has settled"
+                        "Re-running the injection pass for {uri}: {} has settled",
+                        escape_terminal_controls(&host_language),
                     );
                     // Release the slot BEFORE the rerun: a reload starting
                     // right now makes the rerun defer again, and its retry
@@ -722,7 +724,8 @@ impl InjectionCoordinator {
                 if tokio::time::Instant::now() >= deadline {
                     log::debug!(
                         target: "kakehashi::bridge",
-                        "Giving up the injection pass retry for {uri}: {host_language} did not settle"
+                        "Giving up the injection pass retry for {uri}: {} did not settle",
+                        escape_terminal_controls(&host_language),
                     );
                     return;
                 }

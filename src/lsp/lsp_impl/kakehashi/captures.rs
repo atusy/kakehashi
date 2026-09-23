@@ -36,6 +36,7 @@
 //! - JSON-RPC `InvalidParams` for a malformed `kind` (fails the character
 //!   whitelist guarding the filesystem lookup).
 
+use crate::text::terminal::escape_terminal_controls;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -431,14 +432,16 @@ fn load_kind_query(
         Err(QueryLoadError::NotFound) => {
             log::debug!(
                 target: "kakehashi::captures",
-                "no {file_name} for {language_id}"
+                "no {file_name} for {}",
+                escape_terminal_controls(language_id),
             );
             return KindQueryLoad::Unavailable;
         }
         Err(err) => {
             log::warn!(
                 target: "kakehashi::captures",
-                "failed to load {file_name} for {language_id}: {err}"
+                "failed to load {file_name} for {}: {err}",
+                escape_terminal_controls(language_id),
             );
             return KindQueryLoad::Unavailable;
         }
@@ -446,8 +449,9 @@ fn load_kind_query(
     let Some(query) = parsed.query else {
         log::warn!(
             target: "kakehashi::captures",
-            "{file_name} for {language_id} compiled to nothing: {:?}",
-            parsed.failure_reason
+            "{file_name} for {} compiled to nothing: {:?}",
+            escape_terminal_controls(language_id),
+            parsed.failure_reason,
         );
         return KindQueryLoad::Broken(parsed.skipped);
     };
