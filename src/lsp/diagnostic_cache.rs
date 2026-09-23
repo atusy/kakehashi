@@ -2196,6 +2196,48 @@ impl DiagnosticAggregator {
         removed
     }
 
+    /// Drop only the named servers' `Region` slots under `host`, each given as
+    /// `(region_id, server)` — a server that stopped being selected for a
+    /// region that is still live, while another server on the same region may
+    /// still be. Empty sources, and the host entry once empty, are removed.
+    ///
+    /// Returns whether a removed slot carried diagnostics, i.e. whether the
+    /// cache lost something a republish may have been showing. (It may not
+    /// have been: a pull-driven server's push slot is filtered out of the
+    /// publish while a pull layer is present; the caller's republish is then
+    /// merely `Unchanged`.)
+    pub(crate) fn evict_region_servers(&self, host: &Url, slots: &[(String, String)]) -> bool {
+        let mut revisions = self
+            .cache_revisions
+            .lock()
+            .recover_poison("DiagnosticAggregator::cache_revisions");
+        let mut cache = self.lock();
+        let Some(sources) = cache.get_mut(host) else {
+            return false;
+        };
+        let mut removed = false;
+        let mut removed_diagnostics = false;
+        for (region_id, server) in slots {
+            let source = DiagnosticSource::Region(region_id.clone());
+            if let Some(servers) = sources.get_mut(&source) {
+                if let Some(slot) = servers.remove(server) {
+                    removed = true;
+                    removed_diagnostics |= !slot.diagnostics.is_empty();
+                }
+                if servers.is_empty() {
+                    sources.remove(&source);
+                }
+            }
+        }
+        if sources.is_empty() {
+            cache.remove(host);
+        }
+        if removed {
+            revisions.insert(host.clone(), self.allocate_cache_revision());
+        }
+        removed_diagnostics
+    }
+
     /// Number of entries currently held in the republish-lock map (test-only).
     #[cfg(test)]
     fn republish_lock_count(&self) -> usize {
@@ -3794,6 +3836,64 @@ mod tests {
             !agg.evict_source(&host(), &region),
             "a second evict of the same source is a no-op"
         );
+    }
+
+    #[test]
+    fn evict_region_servers_spares_a_sibling_server_on_the_same_region() {
+        let agg = DiagnosticAggregator::new();
+        let region = DiagnosticSource::Region("R1".to_string());
+        for server in ["deselected", "still-selected"] {
+            agg.record(
+                &host(),
+                region.clone(),
+                server.to_string(),
+                Some(ProgressConnectionId::for_test(1)),
+                vec![diag(server)],
+            );
+        }
+        let before = agg.snapshot_with_revision(&host()).1;
+
+        assert!(agg.evict_region_servers(&host(), &[("R1".to_string(), "deselected".to_string())]));
+        let (snap, after) = agg.snapshot_with_revision(&host());
+        let servers = snap
+            .get(&region)
+            .expect("the region keeps its other server");
+        assert!(!servers.contains_key("deselected"));
+        assert!(servers.contains_key("still-selected"));
+        assert_ne!(
+            after, before,
+            "an eviction must invalidate the published revision"
+        );
+
+        assert!(
+            agg.evict_region_servers(&host(), &[("R1".to_string(), "still-selected".to_string())])
+        );
+        assert!(
+            agg.snapshot(&host()).is_empty(),
+            "the host entry goes with its last slot"
+        );
+        assert!(
+            !agg.evict_region_servers(&host(), &[("R1".to_string(), "deselected".to_string())]),
+            "evicting an absent slot reports nothing removed"
+        );
+    }
+
+    #[test]
+    fn evict_region_servers_reports_nothing_visible_for_an_empty_slot() {
+        let agg = DiagnosticAggregator::new();
+        let region = DiagnosticSource::Region("R1".to_string());
+        agg.record(
+            &host(),
+            region,
+            "cleared".to_string(),
+            Some(ProgressConnectionId::for_test(1)),
+            Vec::new(),
+        );
+        assert!(
+            !agg.evict_region_servers(&host(), &[("R1".to_string(), "cleared".to_string())]),
+            "a kept-but-empty slot showed nothing, so its removal changes nothing visible"
+        );
+        assert!(agg.snapshot(&host()).is_empty(), "but it is still removed");
     }
 
     #[test]

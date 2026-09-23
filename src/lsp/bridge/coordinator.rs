@@ -1143,6 +1143,52 @@ impl BridgeCoordinator {
         self.pool.close_replaced_docs(uri, injections).await
     }
 
+    /// Close the host's virtual documents whose server current settings no
+    /// longer select for them — the host's bridge filter turned the injection
+    /// language off, or the server stopped being a candidate for it — and
+    /// return each closed document's `(region_id, server)`.
+    ///
+    /// Derived, not remembered: every open document is re-asked "would the
+    /// selection pick this server for this language today?", so it does not
+    /// matter which settings change caused the answer to flip. A change to the
+    /// server's own launch config never reaches here with a live document; the
+    /// pool recycles that connection instead.
+    pub(crate) async fn close_deselected_docs(
+        &self,
+        settings: &Arc<WorkspaceSettings>,
+        host_language: &str,
+        uri: &Url,
+    ) -> Vec<(String, String)> {
+        // One selection per injection language, not per document: a markdown
+        // host can hold hundreds of regions of a handful of languages.
+        let mut selected: HashMap<String, Vec<String>> = HashMap::new();
+        self.pool
+            .close_deselected_docs(uri, |doc| {
+                let language = doc.virtual_uri.language();
+                let server = doc.connection_key.server();
+                if let Some(servers) = selected.get(language) {
+                    return servers.iter().any(|s| s == server);
+                }
+                let servers: Vec<String> = self
+                    .cached_configs_for_injection_language(settings, host_language, language)
+                    .into_iter()
+                    .map(|resolved| resolved.server_name)
+                    .collect();
+                let is_selected = servers.iter().any(|s| s == server);
+                selected.insert(language.to_string(), servers);
+                is_selected
+            })
+            .await
+            .into_iter()
+            .map(|doc| {
+                (
+                    doc.virtual_uri.region_id().to_string(),
+                    doc.connection_key.server().to_string(),
+                )
+            })
+            .collect()
+    }
+
     /// Take the upstream notification receiver for forwarding to the editor.
     ///
     /// Returns `Some(receiver)` on first call, `None` on subsequent calls.
@@ -3636,6 +3682,98 @@ mod tests {
             names,
             vec!["harper-ls".to_string(), "rust-analyzer".to_string()],
             "both answer for rust, in the documented name-sorted order"
+        );
+    }
+
+    /// The retraction closes exactly the `(injection language, server)` pairs
+    /// current settings no longer select, whatever made them unselected — a
+    /// host bridge filter or a disabled server — and leaves every other copy,
+    /// including other servers on the same region and the same server on
+    /// another language, open.
+    #[tokio::test]
+    async fn close_deselected_docs_closes_only_unselected_server_language_pairs() {
+        let coordinator = BridgeCoordinator::new();
+        let server = |languages: &[&str], enabled: Option<bool>| BridgeServerConfig {
+            cmd: Some(vec!["server".to_string()]),
+            languages: Some(languages.iter().map(|l| l.to_string()).collect()),
+            enabled,
+            ..Default::default()
+        };
+        let bridge_filter = HashMap::from([
+            (
+                "python".to_string(),
+                BridgeLanguageConfig {
+                    enabled: Some(true),
+                    ..Default::default()
+                },
+            ),
+            (
+                "lua".to_string(),
+                BridgeLanguageConfig {
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let settings = Arc::new(WorkspaceSettings {
+            languages: HashMap::from([(
+                "markdown".to_string(),
+                LanguageSettings {
+                    bridge: Some(bridge_filter),
+                    ..Default::default()
+                },
+            )]),
+            language_servers: HashMap::from([
+                ("pyright".to_string(), server(&["python"], None)),
+                ("ruff".to_string(), server(&["python"], Some(false))),
+                ("harper".to_string(), server(&[LANGUAGES_WILDCARD], None)),
+            ]),
+            auto_install: false,
+            ..Default::default()
+        });
+        let host = Url::parse("file:///project/doc.md").unwrap();
+        let host_lsp = crate::lsp::lsp_impl::url_to_uri(&host).unwrap();
+        let python = super::super::protocol::VirtualDocumentUri::new(&host_lsp, "python", "PY");
+        let lua = super::super::protocol::VirtualDocumentUri::new(&host_lsp, "lua", "LUA");
+        for (uri, server) in [
+            (&python, "pyright"),
+            (&python, "ruff"),
+            (&python, "harper"),
+            (&lua, "harper"),
+        ] {
+            coordinator
+                .register_opened_document_for_test(&host, uri, &ConnectionKey::for_server(server))
+                .await;
+        }
+
+        let mut closed = coordinator
+            .close_deselected_docs(&settings, "markdown", &host)
+            .await;
+        closed.sort();
+
+        assert_eq!(
+            closed,
+            vec![
+                ("LUA".to_string(), "harper".to_string()),
+                ("PY".to_string(), "ruff".to_string()),
+            ]
+        );
+        let mut python_servers = coordinator
+            .pool
+            .get_all_connections_for_virtual_uri(&python);
+        python_servers.sort_by(|a, b| a.server().cmp(b.server()));
+        assert_eq!(
+            python_servers,
+            vec![
+                ConnectionKey::for_server("harper"),
+                ConnectionKey::for_server("pyright")
+            ]
+        );
+        assert!(
+            coordinator
+                .pool
+                .get_all_connections_for_virtual_uri(&lua)
+                .is_empty()
         );
     }
 

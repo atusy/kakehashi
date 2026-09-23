@@ -1331,6 +1331,18 @@ impl LanguageServerPool {
             .await
     }
 
+    /// Take the host's opened documents that `should_take` selects; see
+    /// `DocumentTracker::take_host_virtual_docs_where`.
+    pub(super) async fn take_host_virtual_docs_where(
+        &self,
+        host_uri: &Url,
+        should_take: impl FnMut(&OpenedVirtualDoc) -> bool,
+    ) -> Vec<OpenedVirtualDoc> {
+        self.document_tracker
+            .take_host_virtual_docs_where(host_uri, should_take)
+            .await
+    }
+
     /// Remove a document from all tracking state (version tracking and opened state).
     pub(crate) async fn untrack_document(
         &self,
@@ -1698,6 +1710,24 @@ impl LanguageServerPool {
         self.host_routing_rootless
             .retain(|(doc_uri, _), _| doc_uri != &uri);
         self.finish_all_host_routing(host_uri);
+    }
+
+    /// Forget the routing decided for one connection's copy of a virtual
+    /// document, keeping every other server's decision for the same URI.
+    /// Exact-key removals, unlike the whole-URI scans of
+    /// [`Self::clear_host_document_routing`].
+    pub(super) fn clear_virtual_routing_for_connection(
+        &self,
+        virtual_uri: &Url,
+        connection_key: &ConnectionKey,
+    ) {
+        let by_connection = (virtual_uri.to_string(), connection_key.clone());
+        self.host_routing_suppressed.remove(&by_connection);
+        self.host_routing_decided.remove(&by_connection);
+        let by_server = (by_connection.0, connection_key.server().to_string());
+        self.host_routing_by_server.remove(&by_server);
+        self.host_routing_workspace_folders.remove(&by_server);
+        self.host_routing_rootless.remove(&by_server);
     }
 
     pub(crate) fn clear_host_routing_for_connection(&self, connection_key: &ConnectionKey) {

@@ -1981,3 +1981,382 @@ fn init_publish_only_exclusion_client(mode: &str) -> (LspClient, tempfile::TempD
     client.send_notification("initialized", json!({}));
     (client, config_dir)
 }
+
+/// Set `languages.markdown.bridge.lua.enabled` at runtime.
+fn set_markdown_lua_bridge(client: &mut LspClient, enabled: bool) {
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": {
+                "languages": {
+                    "markdown": { "bridge": { "lua": { "enabled": enabled } } }
+                }
+            }
+        }),
+    );
+}
+
+/// The virtual URIs the mock received `method` for, in wire order.
+///
+/// Only newline-terminated lines count: the mock appends each entry in
+/// several writes, so a read can catch the last one half written.
+fn wire_log_uris(wire_log: &std::path::Path, method: &str) -> Vec<String> {
+    let log = std::fs::read_to_string(wire_log).unwrap_or_default();
+    let complete = log.rfind('\n').map_or("", |end| &log[..end]);
+    complete
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .filter(|(logged, _)| *logged == method)
+        .map(|(_, uri)| uri.to_string())
+        .collect()
+}
+
+/// Wait until the mock has received `method` at least `count` times.
+fn wait_for_wire_count(wire_log: &std::path::Path, method: &str, count: usize) -> Vec<String> {
+    crate::helpers::lsp_polling::poll_until(100, 100, || {
+        let uris = wire_log_uris(wire_log, method);
+        (uris.len() >= count).then_some(uris)
+    })
+    .unwrap_or_else(|| {
+        panic!(
+            "the mock should receive {count} {method}; wire log:\n{}",
+            std::fs::read_to_string(wire_log).unwrap_or_default()
+        )
+    })
+}
+
+/// #917: turning a bridged injection language off at runtime retracts the
+/// virtual documents already open for it — the server gets `didClose` and its
+/// pushed diagnostics leave the editor — and turning it back on reopens them.
+///
+/// No `didChange` is sent: the `diagnostics-push` mock clears on every
+/// `didChange`, which would clear the diagnostic without any retraction, and
+/// an edit touching the region's first byte would reopen it anyway. The only
+/// trigger here is the configuration change itself.
+#[test]
+fn e2e_disabling_a_bridged_language_retracts_its_open_virtual_documents() {
+    let wire_dir = tempfile::TempDir::new().expect("wire log dir");
+    let wire_log = wire_dir.path().join("wire.log");
+    let config_dir = tempfile::TempDir::new().expect("temp dir");
+    let config_path = config_dir.path().join("push_diagnostics.toml");
+    std::fs::write(&config_path, "").expect("write config");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("utf8 path"))
+        .env("MOCK_LSP_WIRE_LOG", wire_log.to_string_lossy())
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-push": { "cmd": [mock_bin(), "diagnostics-push"], "languages": ["lua"] }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    open_host(&mut client);
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            has_pushed_diag,
+        )
+        .expect("the mock's pushed diagnostic should reach the editor");
+    let opened = wait_for_wire_count(&wire_log, "textDocument/didOpen", 1);
+    let virtual_uri = opened[0].clone();
+
+    set_markdown_lua_bridge(&mut client, false);
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(10),
+            cleared_host_diag,
+        )
+        .expect("disabling the bridged language must clear its pushed diagnostics");
+    let closed = wait_for_wire_count(&wire_log, "textDocument/didClose", 1);
+    assert_eq!(
+        closed[0], virtual_uri,
+        "the disabled region's virtual document must be closed downstream"
+    );
+    assert!(
+        wire_log_uris(&wire_log, "textDocument/didChange").is_empty(),
+        "nothing may reach the mock as didChange: its clearing push would make \
+         the cleared publish above prove nothing"
+    );
+
+    set_markdown_lua_bridge(&mut client, true);
+    let reopened = wait_for_wire_count(&wire_log, "textDocument/didOpen", 2);
+    assert_eq!(
+        reopened[1], virtual_uri,
+        "re-enabling the language must reopen the region on the next pass"
+    );
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(10),
+            has_pushed_diag,
+        )
+        .expect("the reopened region's pushed diagnostic should return");
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+/// #917: the retraction is invisible to a pull-mode editor — it displays what
+/// it pulled, and a settings change gives it no reason to pull again — so the
+/// bridge must nudge it with `workspace/diagnostic/refresh`.
+#[test]
+fn e2e_disabling_a_bridged_language_refreshes_pull_clients() {
+    let (mut client, _config_dir) =
+        init_client_with_mode_caps("diagnostics-push", refresh_capable_caps());
+    open_host(&mut client);
+
+    // The spontaneous push itself drives one refresh (#422); acknowledge it so
+    // the single-flighted refresh (#497) is free for the retraction's.
+    let (push_refresh_id, _, _) = client
+        .wait_for_server_request_watching(
+            "workspace/diagnostic/refresh",
+            Duration::from_secs(15),
+            &["textDocument/publishDiagnostics"],
+        )
+        .expect("the spontaneous push must drive a workspace/diagnostic/refresh (#422)");
+    client.send_response(push_refresh_id, json!(null));
+
+    set_markdown_lua_bridge(&mut client, false);
+    let (retract_refresh_id, _, _) = client
+        .wait_for_server_request_watching(
+            "workspace/diagnostic/refresh",
+            Duration::from_secs(10),
+            &["textDocument/publishDiagnostics"],
+        )
+        .expect("retracting a pushed diagnostic must nudge pull-mode clients");
+    client.send_response(retract_refresh_id, json!(null));
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+/// #917: a respawn re-open sweep that started before the language was
+/// disabled must not reopen what the disable retracted. The sweep is held
+/// (`KAKEHASHI_E2E_STALL_REOPEN_MS`) across the configuration change, so it
+/// can only open under settings it read before the change unless it re-reads
+/// them.
+#[test]
+fn e2e_respawn_reopen_does_not_undo_a_retraction() {
+    respawn_reopen_with_disable(true);
+}
+
+/// The positive control for the test above: without the disable, the same
+/// stalled sweep (or the respawning edit's eager open) does reopen the
+/// region on the respawned server — so the absence of a didOpen there is the
+/// retraction holding, not a sweep that never ran.
+#[test]
+fn e2e_respawn_reopen_reopens_a_still_enabled_region() {
+    respawn_reopen_with_disable(false);
+}
+
+fn respawn_reopen_with_disable(disable: bool) {
+    let wire_dir = tempfile::TempDir::new().expect("wire log dir");
+    let wire_log = wire_dir.path().join("wire.log");
+    let config_dir = tempfile::TempDir::new().expect("temp dir");
+    let config_path = config_dir.path().join("push_diagnostics.toml");
+    std::fs::write(&config_path, "").expect("write config");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("utf8 path"))
+        .env("MOCK_LSP_WIRE_LOG", wire_log.to_string_lossy())
+        .env("KAKEHASHI_E2E_STALL_REOPEN_MS", "2500")
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-push": {
+                        "cmd": [mock_bin(), "diagnostics-push-crash"],
+                        "languages": ["lua"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    open_host(&mut client);
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            has_pushed_diag,
+        )
+        .expect("the mock's pushed diagnostic should reach the editor");
+
+    // A content edit inside the region (its first byte untouched) crashes
+    // the mock; the crash eviction clears the host.
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": MD_URI, "version": 2 },
+            "contentChanges": [{ "text": MD_TEXT_EDITED }]
+        }),
+    );
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            cleared_host_diag,
+        )
+        .expect("the crash should clear the host");
+
+    // The next edit respawns the server, and the respawn arms the re-open
+    // sweep, which the stall holds before it opens anything. Disable the
+    // language while it is held: the sweep read its settings before this.
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": MD_URI, "version": 3 },
+            "contentChanges": [{ "text": MD_TEXT }]
+        }),
+    );
+    wait_for_wire_count(&wire_log, "initialized", 2);
+    if !disable {
+        wait_for_wire_count(&wire_log, "textDocument/didOpen", 2);
+        client.send_request("shutdown", json!(null));
+        client.send_notification("exit", json!(null));
+        return;
+    }
+    set_markdown_lua_bridge(&mut client, false);
+
+    // Outlast the stalled sweep.
+    std::thread::sleep(Duration::from_millis(4000));
+    assert_eq!(
+        wire_log_uris(&wire_log, "textDocument/didOpen").len(),
+        1,
+        "nothing may reopen the region on the respawned server once its \
+         language is disabled; wire log:\n{}",
+        std::fs::read_to_string(&wire_log).unwrap_or_default()
+    );
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+/// #917: a pull-only server leaves no pushed slot to evict, yet a pull-mode
+/// editor still shows what it pulled from it — so retracting its regions must
+/// nudge the editor to pull again all the same.
+#[test]
+fn e2e_disabling_a_pull_only_bridged_language_refreshes_pull_clients() {
+    let wire_dir = tempfile::TempDir::new().expect("wire log dir");
+    let wire_log = wire_dir.path().join("wire.log");
+    let config_dir = tempfile::TempDir::new().expect("temp dir");
+    let config_path = config_dir.path().join("push_diagnostics.toml");
+    std::fs::write(&config_path, "").expect("write config");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("utf8 path"))
+        .env("MOCK_LSP_WIRE_LOG", wire_log.to_string_lossy())
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": refresh_capable_caps(),
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-pull": { "cmd": [mock_bin(), "diagnostics"], "languages": ["lua"] }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    open_host(&mut client);
+    wait_for_wire_count(&wire_log, "textDocument/didOpen", 1);
+
+    set_markdown_lua_bridge(&mut client, false);
+    wait_for_wire_count(&wire_log, "textDocument/didClose", 1);
+    let (refresh_id, _, _) = client
+        .wait_for_server_request_watching(
+            "workspace/diagnostic/refresh",
+            Duration::from_secs(10),
+            &["textDocument/publishDiagnostics"],
+        )
+        .expect("retracting a pull-only server's regions must nudge pull-mode clients");
+    client.send_response(refresh_id, json!(null));
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+/// #917: a settings change that disables a bridged language AND leaves the
+/// host with no injection regions at all (here an empty injections query)
+/// must still retract the documents open for it: the pass then has no
+/// regions to walk, but the retraction depends only on settings.
+#[test]
+fn e2e_disabling_a_bridged_language_retracts_even_when_no_regions_remain() {
+    let wire_dir = tempfile::TempDir::new().expect("wire log dir");
+    let wire_log = wire_dir.path().join("wire.log");
+    let empty_injections = wire_dir.path().join("injections.scm");
+    std::fs::write(&empty_injections, "").expect("write empty injections query");
+    let config_dir = tempfile::TempDir::new().expect("temp dir");
+    let config_path = config_dir.path().join("push_diagnostics.toml");
+    std::fs::write(&config_path, "").expect("write config");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("utf8 path"))
+        .env("MOCK_LSP_WIRE_LOG", wire_log.to_string_lossy())
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-push": { "cmd": [mock_bin(), "diagnostics-push"], "languages": ["lua"] }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    open_host(&mut client);
+    let opened = wait_for_wire_count(&wire_log, "textDocument/didOpen", 1);
+
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": {
+                "languages": {
+                    "markdown": {
+                        "bridge": { "lua": { "enabled": false } },
+                        "queries": [{
+                            "kind": "injections",
+                            "path": empty_injections.to_string_lossy()
+                        }]
+                    }
+                }
+            }
+        }),
+    );
+    let closed = wait_for_wire_count(&wire_log, "textDocument/didClose", 1);
+    assert_eq!(closed[0], opened[0]);
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
