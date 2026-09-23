@@ -4,7 +4,7 @@
 //! when fetching parser metadata from nvim-treesitter.
 
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -61,13 +61,27 @@ impl MetadataCache {
         fs::read_to_string(&cache_path).ok()
     }
 
-    /// Write content to cache.
+    /// Atomically replace the cache entry with complete content.
     pub fn write(&self, content: &str) -> io::Result<()> {
         // Ensure cache directory exists
         fs::create_dir_all(&self.cache_dir)?;
 
-        // Write content
-        fs::write(self.cache_path(), content)?;
+        #[cfg_attr(not(unix), expect(unused_mut))]
+        let mut builder = tempfile::Builder::new();
+        // Request the same mode fs::write uses so umask, not tempfile's
+        // owner-only default, decides who can read the published cache.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(fs::Permissions::from_mode(0o666));
+        }
+        // Keep partial writes away from readers and replace a leaf symlink
+        // itself rather than opening its target. The sibling stays on the same
+        // filesystem so publication can use an atomic replacement.
+        let mut temporary = builder.tempfile_in(&self.cache_dir)?;
+        temporary.write_all(content.as_bytes())?;
+        temporary.as_file().sync_all()?;
+        temporary.persist(self.cache_path()).map_err(|e| e.error)?;
 
         Ok(())
     }
@@ -77,6 +91,106 @@ impl MetadataCache {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn cache_write_replaces_existing_regular_file() {
+        let temp = tempdir().unwrap();
+        let cache = MetadataCache::with_default_ttl(temp.path());
+        cache.write("previous complete metadata").unwrap();
+
+        cache.write("replacement metadata").unwrap();
+
+        assert_eq!(cache.read().as_deref(), Some("replacement metadata"));
+    }
+
+    // Windows may refuse replacement while the destination is open; callers
+    // already treat a failed cache publication as best-effort.
+    #[cfg(unix)]
+    #[test]
+    fn cache_replacement_preserves_an_open_reader() {
+        use std::io::Read;
+
+        let temp = tempdir().unwrap();
+        let cache = MetadataCache::with_default_ttl(temp.path());
+        cache.write("previous complete metadata").unwrap();
+        let mut reader = fs::File::open(cache.cache_path()).unwrap();
+
+        cache.write("replacement metadata").unwrap();
+
+        let mut previous = String::new();
+        reader.read_to_string(&mut previous).unwrap();
+        assert_eq!(previous, "previous complete metadata");
+        assert_eq!(cache.read().as_deref(), Some("replacement metadata"));
+    }
+
+    // Temporary files default to owner-only access; the published cache must
+    // keep the umask-derived mode that fs::write gave it, so other users of a
+    // shared data directory can still read it.
+    #[cfg(unix)]
+    #[test]
+    fn cache_write_keeps_the_default_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let cache = MetadataCache::with_default_ttl(temp.path());
+        cache.write("metadata").unwrap();
+        let reference = cache.cache_dir.join("reference");
+        fs::write(&reference, "metadata").unwrap();
+
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&cache.cache_path()), mode(&reference));
+    }
+
+    #[test]
+    fn failed_publication_preserves_destination_and_cleans_temporary_file() {
+        let temp = tempdir().unwrap();
+        let cache = MetadataCache::with_default_ttl(temp.path());
+        fs::create_dir_all(cache.cache_path()).unwrap();
+        let previous = cache.cache_path().join("keep");
+        fs::write(&previous, "unchanged").unwrap();
+
+        assert!(cache.write("replacement").is_err());
+
+        assert_eq!(fs::read_to_string(previous).unwrap(), "unchanged");
+        let entries: Vec<_> = fs::read_dir(&cache.cache_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("parsers.lua")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_write_replaces_dangling_symlink_without_creating_target() {
+        let temp = tempdir().unwrap();
+        let cache = MetadataCache::with_default_ttl(temp.path());
+        fs::create_dir_all(&cache.cache_dir).unwrap();
+        let missing = temp.path().join("absent.lua");
+        std::os::unix::fs::symlink(&missing, cache.cache_path()).unwrap();
+
+        cache.write("new metadata").unwrap();
+
+        assert!(!missing.exists());
+        assert!(fs::symlink_metadata(cache.cache_path()).unwrap().is_file());
+        assert_eq!(cache.read().as_deref(), Some("new metadata"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_write_replaces_symlink_without_modifying_target() {
+        let temp = tempdir().unwrap();
+        let cache = MetadataCache::with_default_ttl(temp.path());
+        fs::create_dir_all(&cache.cache_dir).unwrap();
+        let victim = temp.path().join("unrelated.lua");
+        fs::write(&victim, "keep this content").unwrap();
+        std::os::unix::fs::symlink(&victim, cache.cache_path()).unwrap();
+
+        cache.write("new metadata").unwrap();
+
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep this content");
+        assert!(fs::symlink_metadata(cache.cache_path()).unwrap().is_file());
+        assert_eq!(cache.read().as_deref(), Some("new metadata"));
+    }
 
     #[test]
     fn test_cache_write_and_read() {
