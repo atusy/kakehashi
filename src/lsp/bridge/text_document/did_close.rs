@@ -274,6 +274,27 @@ impl LanguageServerPool {
         }
         replaced_regions
     }
+
+    /// Close the host's virtual documents whose connection's server is no
+    /// longer selected for them, returning what was closed.
+    ///
+    /// Selection is a settings question, so nothing about the region itself
+    /// changes: the region stays live and its latest contents stay recorded
+    /// (other servers may still hold it, and a later re-selection reopens from
+    /// them).
+    pub(crate) async fn close_deselected_docs(
+        &self,
+        host_uri: &Url,
+        mut is_selected: impl FnMut(&OpenedVirtualDoc) -> bool,
+    ) -> Vec<OpenedVirtualDoc> {
+        let to_close = self
+            .take_host_virtual_docs_where(host_uri, |doc| !is_selected(doc))
+            .await;
+        for doc in &to_close {
+            self.close_single_virtual_doc(doc).await;
+        }
+        to_close
+    }
 }
 
 #[cfg(test)]

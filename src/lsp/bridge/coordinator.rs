@@ -1143,6 +1143,51 @@ impl BridgeCoordinator {
         self.pool.close_replaced_docs(uri, injections).await
     }
 
+    /// Close the host's virtual documents whose server current settings no
+    /// longer select for them — the host's bridge filter turned the injection
+    /// language off, or the server stopped being a candidate for it — and
+    /// return each closed document's `(region_id, server)`.
+    ///
+    /// Derived, not remembered: every open document is re-asked "would the
+    /// selection pick this server for this language today?", so it does not
+    /// matter which settings change caused the answer to flip. A change to the
+    /// server's own launch config never reaches here with a live document; the
+    /// pool recycles that connection instead.
+    pub(crate) async fn close_deselected_docs(
+        &self,
+        settings: &Arc<WorkspaceSettings>,
+        host_language: &str,
+        uri: &Url,
+    ) -> Vec<(String, String)> {
+        // One selection per injection language, not per document: a markdown
+        // host can hold hundreds of regions of a handful of languages.
+        let mut selected: HashMap<String, Vec<String>> = HashMap::new();
+        self.pool
+            .close_deselected_docs(uri, |doc| {
+                let language = doc.virtual_uri.language();
+                if !selected.contains_key(language) {
+                    let servers = self
+                        .cached_configs_for_injection_language(settings, host_language, language)
+                        .into_iter()
+                        .map(|resolved| resolved.server_name)
+                        .collect();
+                    selected.insert(language.to_string(), servers);
+                }
+                selected
+                    .get(language)
+                    .is_some_and(|servers| servers.iter().any(|s| s == doc.connection_key.server()))
+            })
+            .await
+            .into_iter()
+            .map(|doc| {
+                (
+                    doc.virtual_uri.region_id().to_string(),
+                    doc.connection_key.server().to_string(),
+                )
+            })
+            .collect()
+    }
+
     /// Take the upstream notification receiver for forwarding to the editor.
     ///
     /// Returns `Some(receiver)` on first call, `None` on subsequent calls.

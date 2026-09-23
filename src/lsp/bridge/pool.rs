@@ -1331,6 +1331,18 @@ impl LanguageServerPool {
             .await
     }
 
+    /// Take the host's opened documents that `should_take` selects; see
+    /// `DocumentTracker::take_host_virtual_docs_where`.
+    pub(crate) async fn take_host_virtual_docs_where(
+        &self,
+        host_uri: &Url,
+        should_take: impl FnMut(&OpenedVirtualDoc) -> bool,
+    ) -> Vec<OpenedVirtualDoc> {
+        self.document_tracker
+            .take_host_virtual_docs_where(host_uri, should_take)
+            .await
+    }
+
     /// Remove a document from all tracking state (version tracking and opened state).
     pub(crate) async fn untrack_document(
         &self,
