@@ -1165,17 +1165,18 @@ impl BridgeCoordinator {
         self.pool
             .close_deselected_docs(uri, |doc| {
                 let language = doc.virtual_uri.language();
-                if !selected.contains_key(language) {
-                    let servers = self
-                        .cached_configs_for_injection_language(settings, host_language, language)
-                        .into_iter()
-                        .map(|resolved| resolved.server_name)
-                        .collect();
-                    selected.insert(language.to_string(), servers);
+                let server = doc.connection_key.server();
+                if let Some(servers) = selected.get(language) {
+                    return servers.iter().any(|s| s == server);
                 }
-                selected
-                    .get(language)
-                    .is_some_and(|servers| servers.iter().any(|s| s == doc.connection_key.server()))
+                let servers: Vec<String> = self
+                    .cached_configs_for_injection_language(settings, host_language, language)
+                    .into_iter()
+                    .map(|resolved| resolved.server_name)
+                    .collect();
+                let is_selected = servers.iter().any(|s| s == server);
+                selected.insert(language.to_string(), servers);
+                is_selected
             })
             .await
             .into_iter()
