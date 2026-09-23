@@ -87,7 +87,7 @@ Key = (start_byte, end_byte, kind, layer)
 | `start_byte` | Primary identity anchor (per START-priority rule) |
 | `end_byte` | Disambiguates nested nodes at same start position |
 | `kind` | Disambiguates nodes with identical spans but different types |
-| `layer` | Disambiguates host vs injected nodes that share an identical span **and** kind (injection depth; `0` = host) |
+| `layer` | Disambiguates host vs injected nodes that share an identical span **and** kind (tree-scope token; `0` = host) |
 
 **Example**: At position 0-100, three nodes might exist:
 - `(0, 100, "document", 0)` → ULID_A
@@ -115,46 +115,57 @@ options below and the "Injection restructuring churn" consequence.)
 opaque ULID and never see the layer, so its representation can change without any
 protocol-visible effect.
 
-**Scope — region IDs stay at layer 0**: the injection-region tracking that
-predates this protocol (`calculate_region_id`) keeps minting through the
-host-layer `get_or_create` (`layer = 0`). This is correct, not a residual
-collision: a region's `content_node` is taken from the host document's injection
-query and is therefore a host-tree node. The discriminator only needs to split
-the host node from the *injected* node that overlays it, which navigation mints
-at `layer ≥ 1`. A host node and its region ID legitimately dedup to one ULID.
-The "at its root" framing above is thus scoped to a single parse's node
-identities; it does not retro-fit edit-stability onto region IDs.
+**Scope — bridge regions and navigable nodes**: bridge injection alternatives
+use their own named discriminators in the upper half of the numeric layer
+space. Navigable injected trees use tokens below that boundary; host nodes
+keep `0`. A bridge region's identity and an injected syntax tree's identity
+serve different consumers and are not interchangeable.
 
 ##### Layer discriminator: considered options
 
-The discriminator must (a) separate host from injected nodes including the
-same-language case, and (b) stay stable across edits per the START-priority rule.
+1. **Language name** cannot distinguish recursive same-language layers or
+   overlapping siblings parsed by the same grammar.
+2. **Containing region ULID** follows a content node through edits, but a
+   parsed tree can combine multiple regions or inherit excluded ranges from
+   its ancestors. One region alone does not describe that tree's parse inputs.
+3. **Injection depth** was the original choice. It distinguishes host and
+   nested layers, but captures visits overlapping siblings at the same depth,
+   whereas cursor selection chooses only the smallest containing region.
+   Their identical node tuples could share an ID and resolve in the wrong
+   sibling (#350).
+4. **Resolved tree scope** is now chosen: `(language, depth, included byte
+   ranges)`, with exact ranges rather than a hash-only identity. A URI-owned
+   registry assigns an internal token to each scope. Equal scopes parse the
+   same host text with the same grammar and included ranges; distinct siblings
+   receive separate tokens even when their captured node tuples coincide.
 
-1. **Language name** — rejected: cannot separate same-language recursion
-   (markdown-in-markdown share the name "markdown").
-2. **Containing injection region's ULID** (host = sentinel) — viable and the
-   most edit-stable: a region ULID is itself START-anchored, so it survives
-   edits that restructure outer nesting. Rejected **for now** as over-engineered:
-   the injection-stack walk does not currently carry region IDs, and
-   `calculate_region_id` is itself a `get_or_create` caller (a chicken-and-egg to
-   break), so it is materially more invasive than the bug requires.
-3. **Injection depth index** (`0` = host, `1+` = nesting depth) — **chosen**.
-   It is already in scope at every mint site (the stack index) and at resolve
-   time (`stack[layer]`), so it is nearly free to plumb. Its weakness is that a
-   depth index is not a tree identity: an edit which *restructures* injection
-   nesting (adds/removes an outer layer) shifts a node's true depth, so a held
-   ULID no longer points at the layer that minted it. When the stack becomes
-   *shallower* than the stored `layer`, resolution detects this (`stack[layer]`
-   is out of bounds) and returns a safe `null` ("re-acquire" per
-   node-reference-protocol). When restructuring keeps the same depth but puts a
-   *different* tree there, the index cannot detect it: resolution still returns
-   `null` unless that tree coincidentally holds a node at the identical
-   `(start, end, kind)`. So the guarantee is "re-acquire on `null`", **not**
-   "never wrong-tree". If that churn ever proves painful in practice, switch to
-   option 2 (region ULID), which *is* a tree identity and closes the gap;
-   because `layer` is internal, the swap is non-breaking.
+Captures reserves a scope and mints its nodes under the same edit/lifetime
+latch. A stale walk only looks up existing scopes and IDs. Cursor-based node
+selection still chooses the smallest containing layer, but records its full
+scope. Navigation resolves that scope among all current candidates, pruning
+regions that do not contain its first included byte; it never substitutes the
+smallest sibling. Host resolution remains a direct tree lookup.
 
-**Invalidation with composite keys**: The START-priority rule applies to the `start_byte` component. When `start_byte ∈ [edit.start, edit.old_end)`, all entries with that `start_byte` are invalidated regardless of their `end_byte`, `kind`, or `layer`. Position adjustment carries the stored `layer` through unchanged (a depth index does not move with byte positions). Note this preserves the *stored* layer, not an absolute identity: an edit that restructures injection nesting can leave that stored layer stale (see the considered options above and "Injection restructuring churn" below).
+The registry shifts scope ranges under the same lock as node coordinates.
+Replacing an included range's start or collapsing its range retires that
+scope and its nodes. Ordinary edits before a range shift it, and interior
+edits update its end, preserving its token. A current injection query must
+still produce the full shifted scope for a held ID to resolve. A changed
+language, nesting depth, or included-range geometry therefore returns `null`
+unless it matches the recorded scope.
+
+Node coordinates and scope are read together. Tokens are not reused within a
+URI lifetime, so a delayed navigation cannot mint into a different scope after
+its old one is retired. If an edit makes two scopes equal, both existing tokens
+remain resolvable and new mints choose one surviving token. Scopes without live
+nodes are reclaimed during edit processing; closing the document releases the
+URI registry. The cost is one scope record per distinct retained parse scope
+and range adjustment alongside node adjustment.
+
+**Invalidation with composite keys**: node START-priority invalidation remains
+unchanged. Position adjustment preserves the token while updating the scope's
+ranges; scope-boundary invalidation also retires its interior node IDs. Clients
+re-acquire after `null`, including when an edit changes injection nesting.
 
 ### Bidirectional Indexing
 
@@ -227,7 +238,7 @@ More text
 
 - **Lookup table rebuild**: After edit, reverse lookup must be rebuilt
 - **Nested nodes**: Multiple nodes at same position require the `(start, end, kind, layer)` tuple for uniqueness (see [Node Uniqueness Key](#node-uniqueness-key))
-- **Injection restructuring churn**: Because `layer` is an injection depth index (not a tree identity), an edit that adds or removes an *outer* injection layer shifts an inner node's depth, so its held ULID no longer points at the minting layer. A shallower stack is detected and degrades to a safe `null`; a same-depth-but-different-tree restructuring is not detectable and resolves to `null` unless the new tree coincidentally holds an identical `(start, end, kind)` node. Either way clients rely on the "re-acquire on `null`" contract. See the layer-discriminator options above
+- **Injection restructuring churn**: a changed language, depth, or included-range geometry that no longer matches the shifted tree scope makes held IDs resolve to `null`; clients re-acquire them. Edits at a scope boundary also retire its interior IDs.
 - **START edits invalidate**: Editing a code block's opening delimiter invalidates its ID
 - **START shifts outside range**: Nodes whose START shifts due to earlier edits are preserved
 - **Injection region reordering**: When code blocks are inserted or deleted above tracked injection regions, those regions' container nodes are preserved (START unchanged), but their ordinal position changes. Systems relying on positional region IDs (e.g., `region-0`, `region-1`) must handle URI changes via close/reopen cycles
