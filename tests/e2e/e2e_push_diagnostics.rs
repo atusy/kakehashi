@@ -2150,6 +2150,19 @@ fn e2e_disabling_a_bridged_language_refreshes_pull_clients() {
 /// them.
 #[test]
 fn e2e_respawn_reopen_does_not_undo_a_retraction() {
+    respawn_reopen_with_disable(true);
+}
+
+/// The positive control for the test above: without the disable, the same
+/// stalled sweep (or the respawning edit's eager open) does reopen the
+/// region on the respawned server — so the absence of a didOpen there is the
+/// retraction holding, not a sweep that never ran.
+#[test]
+fn e2e_respawn_reopen_reopens_a_still_enabled_region() {
+    respawn_reopen_with_disable(false);
+}
+
+fn respawn_reopen_with_disable(disable: bool) {
     let wire_dir = tempfile::TempDir::new().expect("wire log dir");
     let wire_log = wire_dir.path().join("wire.log");
     let config_dir = tempfile::TempDir::new().expect("temp dir");
@@ -2217,6 +2230,12 @@ fn e2e_respawn_reopen_does_not_undo_a_retraction() {
         }),
     );
     wait_for_wire_count(&wire_log, "initialized", 2);
+    if !disable {
+        wait_for_wire_count(&wire_log, "textDocument/didOpen", 2);
+        client.send_request("shutdown", json!(null));
+        client.send_notification("exit", json!(null));
+        return;
+    }
     set_markdown_lua_bridge(&mut client, false);
 
     // Outlast the stalled sweep.
