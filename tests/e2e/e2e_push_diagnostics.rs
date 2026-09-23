@@ -601,8 +601,10 @@ fn e2e_crashed_downstream_stays_down_once_its_documents_are_closed() {
         json!({ "textDocument": { "uri": MD_URI } }),
     );
 
-    // Past the first retry (2 s) with margin. A negative wait, but one that can
-    // only pass falsely (under load), never fail falsely.
+    // Past the first retry (2 s) with margin. A negative wait: under load it
+    // can pass falsely (the retry has not run yet), and it fails falsely only
+    // if the server processes the didClose above more than ~2 s after the
+    // crash, which would let the retry still see the document open.
     std::thread::sleep(Duration::from_secs(5));
     assert!(
         !std::path::Path::new(&format!("{}.replacement", wire_log.display())).exists(),
