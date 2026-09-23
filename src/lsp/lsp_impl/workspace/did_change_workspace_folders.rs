@@ -71,9 +71,12 @@ impl Kakehashi {
             .pool()
             .workspace_folders()
             .and_then(|folders| folders.first().cloned());
-        let root_path = config_root_after_folder_change(
+        let (root_path, root_scope) = config_root_after_folder_change(
             first_folder.as_ref().map(|folder| &folder.uri),
-            self.settings_manager.folderless_root_path(),
+            (
+                self.settings_manager.folderless_root_path(),
+                self.settings_manager.folderless_root_scope(),
+            ),
         );
 
         // The root stays local until the settings derived from it are the ones
@@ -123,7 +126,7 @@ impl Kakehashi {
             Ok(settings) => {
                 let warnings = Self::misconfigured_settings_warnings(&settings);
                 let root_changed = *self.settings_manager.root_path() != root_path;
-                self.settings_manager.set_root_path(root_path);
+                self.settings_manager.set_root(root_path, root_scope);
                 self.apply_raw_settings_locked(
                     &reload,
                     ReloadTrigger::WorkspaceFolders,
