@@ -1,4 +1,4 @@
-//! Terminal-safe rendering for untrusted CLI fields.
+//! Terminal-safe rendering for untrusted display fields.
 
 /// Visibly escape terminal controls while keeping real line breaks intact.
 ///
