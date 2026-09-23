@@ -1428,6 +1428,10 @@ fn write_forced_output_with(
     Ok(())
 }
 
+// Preserve access controls when publishing a new inode, not an archival copy of
+// the old inode. Non-access metadata (timestamps, user xattrs, audit policy,
+// backup/indexing hints, visibility and storage-layout attributes) is outside
+// this contract and may take the sibling file's defaults after replacement.
 #[derive(PartialEq, Eq)]
 struct ForcedOutputMetadata {
     permissions: std::fs::Permissions,
