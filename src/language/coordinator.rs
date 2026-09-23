@@ -8,6 +8,7 @@ use super::registry::LanguageRegistry;
 use crate::config::settings::{LanguageSettings, QueryKind, infer_query_kind};
 use crate::config::{CaptureMappings, WorkspaceSettings};
 use crate::error::LockResultExt;
+use crate::text::terminal::escape_terminal_controls;
 use log::debug;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -948,7 +949,8 @@ impl LanguageCoordinator {
             return Err(LanguageLoadResult::failure_with(LanguageEvent::log(
                 missing_parser_level,
                 format!(
-                    "No parser path found for language '{lang_name}' in search paths: {}",
+                    "No parser path found for language '{}' in search paths: {}",
+                    escape_terminal_controls(lang_name),
                     format_search_paths(search_paths),
                 ),
             )));
@@ -966,8 +968,10 @@ impl LanguageCoordinator {
                     return Err(LanguageLoadResult::failure_with(LanguageEvent::log(
                         LanguageLogLevel::Error,
                         format!(
-                            "Failed to load language {lang_name} from {}: {err}",
-                            lib_path.display()
+                            "Failed to load language {} from {}: {}",
+                            escape_terminal_controls(lang_name),
+                            escape_terminal_controls(&lib_path.to_string_lossy()),
+                            escape_terminal_controls(&err.to_string())
                         ),
                     )));
                 }
@@ -2124,6 +2128,25 @@ mod tests {
         let (resolved, load_result) = result.unwrap();
         assert_eq!(resolved, "bash");
         assert!(load_result.success);
+    }
+
+    #[test]
+    fn missing_parser_message_escapes_language_controls() {
+        let coordinator = LanguageCoordinator::new();
+        let language = "日本語\n\u{1b}[31m\u{202e}";
+        let failure = coordinator
+            .load_parser(language, None, &[], LanguageLogLevel::Warning)
+            .err()
+            .expect("no parser exists");
+        let LanguageEvent::Log { level, message } = &failure.events[0] else {
+            panic!("expected parser diagnostic");
+        };
+        assert_eq!(*level, LanguageLogLevel::Warning);
+        assert!(
+            message.contains(r"日本語\n\u{1b}[31m\u{202e}"),
+            "{message:?}"
+        );
+        assert!(!message.chars().any(char::is_control));
     }
 
     #[test]
