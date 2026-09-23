@@ -71,6 +71,14 @@ fn init_host_client_with_mode_and_cancel_dir(
     mode: &str,
     cancel_dir: Option<&std::path::Path>,
 ) -> (LspClient, tempfile::TempDir) {
+    init_host_client_with_debounce(mode, cancel_dir, 100)
+}
+
+fn init_host_client_with_debounce(
+    mode: &str,
+    cancel_dir: Option<&std::path::Path>,
+    debounce_ms: u64,
+) -> (LspClient, tempfile::TempDir) {
     let bin = mock_formatter_bin();
     let config_dir = tempfile::TempDir::new().expect("Failed to create config temp dir");
     let config_path = config_dir.path().join("host_code_lens_resolve.toml");
@@ -93,6 +101,7 @@ fn init_host_client_with_mode_and_cancel_dir(
             "capabilities": {},
             "workspaceFolders": null,
             "initializationOptions": {
+                "diagnosticsDebounceMs": debounce_ms,
                 "languageServers": {
                     "mock-codelens": {
                         "cmd": [bin, mode],
@@ -352,6 +361,27 @@ fn e2e_host_code_lens_resolve_round_trips_verbatim() {
     );
     assert_eq!(resolved["data"]["kakehashi"]["host_layer"], true);
 
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_host_code_lens_resolve_syncs_pending_edit() {
+    let (mut client, _config_dir) = init_host_client_with_debounce("code-lens", None, 60000);
+    open_markdown(&mut client);
+    let lenses = code_lens_with_retry(&mut client);
+    let edited = "# Changed\n\n```lua\nlocal x = 2\n```\n";
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": MARKDOWN_URI, "version": 2},
+            "contentChanges": [{"text": edited}]
+        }),
+    );
+    let response = client.send_request("codeLens/resolve", lenses[0].clone());
+    assert_eq!(
+        response["result"]["command"]["arguments"][0], edited,
+        "resolve must see the edited text before the debounce fires: {response}"
+    );
     shutdown(&mut client);
 }
 

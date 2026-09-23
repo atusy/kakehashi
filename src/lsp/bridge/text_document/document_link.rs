@@ -7,6 +7,7 @@
 //! Requests are queued via the channel-based writer task (`send_request()`) for
 //! FIFO ordering with other messages (ls-bridge-message-ordering single-writer loop).
 
+use super::host::{HostResolveContext, HostResolveReader};
 use std::io;
 use std::sync::Arc;
 
@@ -217,6 +218,7 @@ impl LanguageServerPool {
         mut link: DocumentLink,
         settings: &crate::config::settings::WorkspaceSettings,
         upstream_id: Option<UpstreamId>,
+        read_host: HostResolveReader<'_>,
     ) -> DocumentLink {
         let Some(envelope) = strip_document_link_envelope(&mut link) else {
             return link;
@@ -235,7 +237,7 @@ impl LanguageServerPool {
             return link;
         };
 
-        self.send_document_link_resolve_request(&config, link, envelope, upstream_id)
+        self.send_document_link_resolve_request(&config, link, envelope, upstream_id, read_host)
             .await
     }
 
@@ -245,6 +247,7 @@ impl LanguageServerPool {
         mut link: DocumentLink,
         envelope: DocumentLinkEnvelope,
         upstream_id: Option<UpstreamId>,
+        read_host: HostResolveReader<'_>,
     ) -> DocumentLink {
         let server_name = &envelope.origin;
         // One function serves both layers; tag the host one like the
@@ -331,25 +334,10 @@ impl LanguageServerPool {
             return link;
         }
 
-        let _host_lifecycle = if envelope.is_host_layer() {
-            let Some(expected_incarnation) = envelope.incarnation else {
-                re_envelope_link(&mut link, &envelope);
-                return link;
-            };
-            match self
-                .request_host_lifecycle_for_incarnation(&host_uri, expected_incarnation)
-                .await
-            {
-                Ok(lifecycle) => Some(lifecycle),
-                Err(_) => {
-                    re_envelope_link(&mut link, &envelope);
-                    return link;
-                }
-            }
-        } else {
-            None
-        };
-
+        if envelope.is_host_layer() && envelope.incarnation.is_none() {
+            re_envelope_link(&mut link, &envelope);
+            return link;
+        }
         let connection_key = handle.key();
         if let Some(ref id) = upstream_id {
             self.register_upstream_request_for_handle(id.clone(), &handle);
@@ -381,7 +369,21 @@ impl LanguageServerPool {
         let request = build_document_link_resolve_request(&outgoing, request_id);
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
 
-        let send_result = {
+        let send_result = if envelope.is_host_layer() {
+            self.enqueue_host_resolve(
+                &handle,
+                HostResolveContext {
+                    uri: &host_uri,
+                    incarnation: envelope.incarnation,
+                    content_version: None,
+                    connection_generation: envelope.connection_generation,
+                    read: read_host,
+                },
+                request,
+                request_id,
+            )
+            .await
+        } else {
             let connections = self.connections().await;
             let producer_is_live = connections.get(connection_key).is_some_and(|current| {
                 Arc::ptr_eq(current, &handle) && current.state() == ConnectionState::Ready
@@ -574,6 +576,7 @@ mod tests {
         pool.insert_connection(Arc::clone(&handle)).await;
         let host_uri = Url::parse("file:///test.lua").unwrap();
         pool.open_host_incarnation(&host_uri, 1).await;
+        super::super::test_helpers::open_resolve_host(&pool, &handle, &host_uri).await;
         let generation = pool.document_connection_generation(&key);
         let link = unresolved_link(Some(json!({ "token": 1 })));
         let envelope = DocumentLinkEnvelope {
@@ -598,6 +601,7 @@ mod tests {
                     link,
                     envelope,
                     Some(upstream_id),
+                    &super::super::test_helpers::resolve_host_snapshot,
                 )
                 .await
             })
@@ -961,7 +965,7 @@ mod tests {
         );
 
         let result = pool
-            .dispatch_document_link_resolve(link, &settings, None)
+            .dispatch_document_link_resolve(link, &settings, None, &|_| None)
             .await;
         let envelope = extract_document_link_envelope(&result).expect("envelope restored");
         assert_eq!(envelope.inner, Some(json!({"token": "link-1"})));
@@ -1009,7 +1013,7 @@ mod tests {
                 );
 
                 let result = pool
-                    .dispatch_document_link_resolve(links.remove(0), &settings, None)
+                    .dispatch_document_link_resolve(links.remove(0), &settings, None, &|_| None)
                     .await;
                 let envelope = extract_document_link_envelope(&result).expect("envelope restored");
                 assert_eq!(envelope.inner, Some(json!({"token": "link-1"})));
@@ -1063,7 +1067,7 @@ mod tests {
                 );
 
                 let result = pool
-                    .dispatch_document_link_resolve(links.remove(0), &settings, None)
+                    .dispatch_document_link_resolve(links.remove(0), &settings, None, &|_| None)
                     .await;
                 let envelope = extract_document_link_envelope(&result).expect("envelope restored");
                 assert_eq!(envelope.origin, "lua-ls");

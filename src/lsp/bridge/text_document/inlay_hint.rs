@@ -39,6 +39,7 @@ use tower_lsp_server::ls_types::{InlayHint, InlayHintLabel, Position, Range, Uri
 use url::Url;
 
 use super::super::pool::{ConnectionKey, ConnectionState, LanguageServerPool, UpstreamId};
+use super::host::{HostResolveContext, HostResolveReader};
 use tower_lsp_server::ls_types::{
     InlayHintParams, NumberOrString, TextDocumentIdentifier, WorkDoneProgressParams,
 };
@@ -293,6 +294,7 @@ impl LanguageServerPool {
         settings: &crate::config::settings::WorkspaceSettings,
         upstream_id: Option<UpstreamId>,
         region_end: Option<Position>,
+        read_host: HostResolveReader<'_>,
     ) -> InlayHint {
         let Some(envelope) = strip_inlay_hint_envelope(&mut hint) else {
             return hint;
@@ -309,8 +311,15 @@ impl LanguageServerPool {
             re_envelope_hint(&mut hint, &envelope);
             return hint;
         };
-        self.send_inlay_hint_resolve_request(&config, hint, envelope, upstream_id, region_end)
-            .await
+        self.send_inlay_hint_resolve_request(
+            &config,
+            hint,
+            envelope,
+            upstream_id,
+            region_end,
+            read_host,
+        )
+        .await
     }
 
     async fn send_inlay_hint_resolve_request(
@@ -320,6 +329,7 @@ impl LanguageServerPool {
         envelope: InlayHintEnvelope,
         upstream_id: Option<UpstreamId>,
         region_end: Option<Position>,
+        read_host: HostResolveReader<'_>,
     ) -> InlayHint {
         let server_name = &envelope.origin;
         // One function serves both layers; tag the host one like the
@@ -438,22 +448,24 @@ impl LanguageServerPool {
             })
         };
 
-        // Hold the host lifecycle through enqueue for BOTH layers. A virtual
-        // connection can remain live across a host close/reopen, so pointer +
-        // connection generation alone do not prevent a stale resolve from
-        // being queued after the virtual document's didClose.
+        // The host enqueue helper owns its lifecycle guard. The virtual
+        // path still needs one to exclude host close/reopen through enqueue.
         let Some(expected_incarnation) = envelope.incarnation else {
             re_envelope_hint(&mut hint, &envelope);
             return hint;
         };
-        let _host_lifecycle = match self
-            .request_host_lifecycle_for_incarnation(&host_uri, expected_incarnation)
-            .await
-        {
-            Ok(lifecycle) => lifecycle,
-            Err(_) => {
-                re_envelope_hint(&mut hint, &envelope);
-                return hint;
+        let _host_lifecycle = if envelope.is_host_layer() {
+            None
+        } else {
+            match self
+                .request_host_lifecycle_for_incarnation(&host_uri, expected_incarnation)
+                .await
+            {
+                Ok(lifecycle) => Some(lifecycle),
+                Err(_) => {
+                    re_envelope_hint(&mut hint, &envelope);
+                    return hint;
+                }
             }
         };
 
@@ -479,7 +491,21 @@ impl LanguageServerPool {
 
         let request = build_inlay_hint_resolve_request(&outgoing, request_id);
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
-        let send_result = {
+        let send_result = if envelope.is_host_layer() {
+            self.enqueue_host_resolve(
+                &handle,
+                HostResolveContext {
+                    uri: &host_uri,
+                    incarnation: envelope.incarnation,
+                    content_version: envelope.content_version,
+                    connection_generation: envelope.connection_generation,
+                    read: read_host,
+                },
+                request,
+                request_id,
+            )
+            .await
+        } else {
             let connections = self.connections().await;
             let producer_is_live = connections.get(connection_key).is_some_and(|current| {
                 Arc::ptr_eq(current, &handle) && current.state() == ConnectionState::Ready
@@ -908,6 +934,7 @@ mod tests {
         pool.insert_connection(Arc::clone(&handle)).await;
         let host_uri = Url::parse("file:///test.lua").unwrap();
         pool.open_host_incarnation(&host_uri, 1).await;
+        open_resolve_host(&pool, &handle, &host_uri).await;
         let generation = pool.document_connection_generation(&key);
         let hint: InlayHint = serde_json::from_value(json!({
             "position": { "line": 0, "character": 0 },
@@ -943,6 +970,7 @@ mod tests {
                     envelope,
                     Some(upstream_id),
                     None,
+                    &resolve_host_snapshot,
                 )
                 .await
             })
@@ -964,6 +992,86 @@ mod tests {
 
         let result = request.await.unwrap();
         assert!(result.text_edits.is_none());
+        assert!(extract_inlay_hint_envelope(&result).is_some());
+    }
+
+    #[tokio::test]
+    async fn host_resolve_syncs_before_enqueue() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("lua-ls");
+        let handle = create_handle_advertising_resolve_methods(key.clone()).await;
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let host_uri = Url::parse("file:///test.lua").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
+        open_resolve_host(&pool, &handle, &host_uri).await;
+        let generation = pool.document_connection_generation(&key);
+        let hint: InlayHint = serde_json::from_value(json!({
+            "position": { "line": 0, "character": 0 },
+            "label": ": old",
+            "data": { "token": 1 }
+        }))
+        .unwrap();
+        let envelope = InlayHintEnvelope {
+            origin: "lua-ls".into(),
+            host_uri: host_uri.to_string(),
+            region_id: String::new(),
+            injection_language: String::new(),
+            incarnation: Some(1),
+            content_version: Some(2),
+            connection_generation: Some(generation),
+            connection_key: Some(key.clone()),
+            offset: EnvelopeOffset::from(&RegionOffset::new(0, 0)),
+            // `strip_inlay_hint_envelope` moves the downstream payload into
+            // `hint.data` (above) and leaves the envelope's own `inner` empty;
+            // the resolve path is only ever reached with a stripped envelope.
+            inner: None,
+            host_layer: true,
+            translated_locations: Vec::new(),
+        };
+        let upstream_id = UpstreamId::Number(77);
+        let request = {
+            let pool = Arc::clone(&pool);
+            let upstream_id = upstream_id.clone();
+            tokio::spawn(async move {
+                pool.send_inlay_hint_resolve_request(
+                    &BridgeServerConfig::default(),
+                    hint,
+                    envelope,
+                    Some(upstream_id),
+                    None,
+                    &|uri| {
+                        let mut snapshot = resolve_host_snapshot(uri)?;
+                        snapshot.text = Arc::from("local x = 2");
+                        snapshot.revision.content_version = 2;
+                        Some(snapshot)
+                    },
+                )
+                .await
+            })
+        };
+        let downstream_id = wait_for_sent_request(&handle, &upstream_id).await;
+        let docs = pool.host_documents().await;
+        assert_eq!(
+            docs[host_uri.as_str()][&key].content_version,
+            Some(2),
+            "the current snapshot must be synchronized before resolve is sent"
+        );
+        drop(docs);
+        let _ = handle.router().route(json!({
+            "jsonrpc": "2.0",
+            "id": downstream_id.as_i64(),
+            "result": {
+                "position": { "line": 0, "character": 0 },
+                "label": ": stale",
+                "textEdits": [{
+                    "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } },
+                    "newText": "stale"
+                }]
+            }
+        }));
+
+        let result = request.await.unwrap();
+        assert!(result.text_edits.is_some());
         assert!(extract_inlay_hint_envelope(&result).is_some());
     }
 
@@ -1141,7 +1249,7 @@ mod tests {
                 );
 
                 let result = pool
-                    .dispatch_inlay_hint_resolve(hints.remove(0), &settings, None, None)
+                    .dispatch_inlay_hint_resolve(hints.remove(0), &settings, None, None, &|_| None)
                     .await;
                 let envelope = extract_inlay_hint_envelope(&result).expect("envelope restored");
                 assert_eq!(envelope.inner, Some(json!({ "token": 1 })));
@@ -1206,7 +1314,7 @@ mod tests {
                 let enveloped = hints[0].data.clone();
 
                 let result = pool
-                    .dispatch_inlay_hint_resolve(hints.remove(0), &settings, None, None)
+                    .dispatch_inlay_hint_resolve(hints.remove(0), &settings, None, None, &|_| None)
                     .await;
                 assert_eq!(result.data, enveloped, "wrap restored around the payload");
                 assert_eq!(
@@ -1280,7 +1388,13 @@ mod tests {
             .unwrap();
 
             let result = pool
-                .dispatch_inlay_hint_resolve(hint, &settings, None, Some(Position::new(2, 0)))
+                .dispatch_inlay_hint_resolve(
+                    hint,
+                    &settings,
+                    None,
+                    Some(Position::new(2, 0)),
+                    &|_| None,
+                )
                 .await;
             assert!(result.tooltip.is_none(), "hint stays unresolved");
             assert_eq!(

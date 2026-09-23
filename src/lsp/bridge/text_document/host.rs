@@ -57,6 +57,92 @@ pub(crate) struct HostDocument<'a> {
     pub(crate) revision: Option<crate::lsp::bridge::envelope::HostRevision>,
 }
 
+/// Store-backed text read immediately before a host resolve is enqueued.
+pub(crate) struct HostResolveSnapshot {
+    pub(crate) text: Arc<str>,
+    pub(crate) language_id: String,
+    pub(crate) revision: crate::lsp::bridge::HostRevision,
+}
+
+/// The caller owns document access; the pool invokes it under the sync lock.
+pub(crate) type HostResolveReader<'a> =
+    &'a (dyn Fn(&Url) -> Option<HostResolveSnapshot> + Send + Sync);
+
+pub(super) struct HostResolveContext<'a> {
+    pub(super) uri: &'a Url,
+    pub(super) incarnation: Option<u64>,
+    pub(super) content_version: Option<u64>,
+    pub(super) connection_generation: Option<u64>,
+    pub(super) read: HostResolveReader<'a>,
+}
+
+impl LanguageServerPool {
+    /// Flush received host changes before resolve, without reopening a closed
+    /// document or replacing the process that owns the item's opaque data.
+    /// Lifecycle, connection and sync locks cover enqueue only, not the reply.
+    pub(super) async fn enqueue_host_resolve<P: serde::Serialize>(
+        &self,
+        handle: &Arc<ConnectionHandle>,
+        context: HostResolveContext<'_>,
+        request: JsonRpcRequest<P>,
+        request_id: RequestId,
+    ) -> io::Result<()> {
+        let lifecycle = self.request_host_lifecycle(context.uri).await?;
+        if context
+            .incarnation
+            .is_some_and(|expected| expected != lifecycle.incarnation())
+        {
+            return Err(io::Error::other("host resolve incarnation changed"));
+        }
+        let connections = self.connections().await;
+        let key = handle.key();
+        if !connections
+            .get(key)
+            .is_some_and(|live| Arc::ptr_eq(live, handle) && live.state() == ConnectionState::Ready)
+        {
+            return Err(io::Error::other("host resolve producer was replaced"));
+        }
+        if context
+            .connection_generation
+            .is_some_and(|expected| self.document_connection_generation(key) != expected)
+        {
+            return Err(io::Error::other("host resolve producer generation changed"));
+        }
+        let mut docs = self.host_documents().await;
+        if !docs
+            .get(context.uri.as_str())
+            .is_some_and(|servers| servers.contains_key(key))
+        {
+            return Err(io::Error::other("host resolve document is no longer open"));
+        }
+        let snapshot = (context.read)(context.uri)
+            .ok_or_else(|| io::Error::other("host resolve document is unavailable"))?;
+        if snapshot.revision.incarnation != lifecycle.incarnation()
+            || context
+                .content_version
+                .is_some_and(|expected| expected != snapshot.revision.content_version)
+            || !self.accepts_host_language(context.uri, &snapshot.language_id)
+            || self.is_host_routing_suppressed(context.uri, key)
+        {
+            return Err(io::Error::other("host resolve document or routing changed"));
+        }
+        sync_host_document(
+            &mut ConnectionHandleSender(handle),
+            &mut docs,
+            &HostDocument {
+                uri: context.uri,
+                language_id: &snapshot.language_id,
+                text: &snapshot.text,
+                revision: Some(snapshot.revision),
+            },
+            None,
+            key,
+        )
+        .await?;
+        handle.send_request(request, request_id).map_err(Into::into)
+    }
+}
+
 /// A raw host-server response plus the very connection that answered it.
 ///
 /// The connection rides along because re-resolving it means repeating the

@@ -250,12 +250,14 @@ impl Kakehashi {
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
         let sweep_id = upstream_id.clone();
         let pool = self.bridge.pool_arc();
+        let read_host = |uri: &url::Url| self.host_resolve_snapshot(uri);
         let dispatch = pool.dispatch_code_action_resolve(
             action,
             &settings,
             upstream_caps,
             upstream_id,
             region_end,
+            &read_host,
         );
         // The cancel arm DROPS the in-flight dispatch, which then never
         // reaches its own refcounted unregister — an RAII sweep (dropped at

@@ -430,6 +430,83 @@ fn assert_host_document_link_replacement_fails_soft(change_pool_key: bool) {
 }
 
 #[test]
+fn e2e_host_document_link_resolve_syncs_pending_edit() {
+    let config_dir = tempfile::TempDir::new().expect("config temp dir");
+    let config_path = config_dir.path().join("host_document_link_resolve.toml");
+    std::fs::write(&config_path, "").expect("write config");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("UTF-8 config path"))
+        .build();
+    let init = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "diagnosticsDebounceMs": 60000,
+                "languageServers": {
+                    "mock-document-link": {
+                        "cmd": [mock_formatter_bin(), "document-link-resolve"],
+                        "languages": ["markdown"]
+                    }
+                },
+                "languages": {
+                    "markdown": { "bridge": { "_self": { "enabled": true } } }
+                }
+            }
+        }),
+    );
+    assert_eq!(
+        init["result"]["capabilities"]["documentLinkProvider"]["resolveProvider"],
+        json!(true)
+    );
+    client.send_notification("initialized", json!({}));
+
+    let uri = "file:///test_host_document_link_resolve.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri,
+            "languageId": "markdown",
+            "version": 1,
+            "text": "# Host link\n"
+        }}),
+    );
+
+    let links = document_links_with_retry(&mut client, uri);
+    let link = &links[0];
+    assert_eq!(link["range"]["start"]["line"], 0);
+    assert_eq!(link["data"]["kakehashi"]["host_layer"], true);
+
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri, "version": 2},
+            "contentChanges": [{"text": "# Edited host link\n"}]
+        }),
+    );
+    let response = client.send_request("documentLink/resolve", link.clone());
+    assert!(
+        response.get("error").is_none(),
+        "unexpected response: {response}"
+    );
+    let resolved = &response["result"];
+    assert_eq!(
+        resolved["data"]["kakehashi"]["inner"]["documentText"],
+        "# Edited host link\n"
+    );
+    assert_eq!(resolved["tooltip"], "mock resolved:link-1");
+    assert_eq!(resolved["target"], uri);
+    assert_eq!(resolved["range"], link["range"]);
+    assert_eq!(resolved["data"]["kakehashi"]["host_layer"], true);
+
+    shutdown_client(&mut client);
+}
+
+#[test]
 fn e2e_host_document_link_from_same_key_replacement_stays_unresolved() {
     assert_host_document_link_replacement_fails_soft(false);
 }

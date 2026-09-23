@@ -198,12 +198,16 @@ pub(in crate::lsp::bridge) async fn create_handle_advertising_resolve_methods(
     key: ConnectionKey,
 ) -> Arc<ConnectionHandle> {
     use tower_lsp_server::ls_types::{
-        CodeLensOptions, DocumentLinkOptions, InlayHintOptions, InlayHintServerCapabilities, OneOf,
-        ServerCapabilities,
+        CodeActionOptions, CodeActionProviderCapability, CodeLensOptions, DocumentLinkOptions,
+        InlayHintOptions, InlayHintServerCapabilities, OneOf, ServerCapabilities,
     };
 
     let handle = create_handle_with_key(ConnectionState::Ready, key).await;
     handle.set_server_capabilities(ServerCapabilities {
+        code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
+            resolve_provider: Some(true),
+            ..Default::default()
+        })),
         code_lens_provider: Some(CodeLensOptions {
             resolve_provider: Some(true),
         }),

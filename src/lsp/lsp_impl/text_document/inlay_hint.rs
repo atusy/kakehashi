@@ -274,7 +274,9 @@ impl Kakehashi {
         let upstream_id = current_upstream_id();
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
         let sweep_id = upstream_id.clone();
-        let dispatch = pool.dispatch_inlay_hint_resolve(hint, &settings, upstream_id, region_end);
+        let read_host = |uri: &url::Url| self.host_resolve_snapshot(uri);
+        let dispatch =
+            pool.dispatch_inlay_hint_resolve(hint, &settings, upstream_id, region_end, &read_host);
         let _sweep = crate::lsp::lsp_impl::bridge_context::UpstreamRegistrySweepGuard::new(
             std::sync::Arc::clone(&pool),
             sweep_id,

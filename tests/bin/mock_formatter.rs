@@ -1679,7 +1679,8 @@ fn main() {
                             if mode == "code-lens-replacement" { "replacement" } else { "mock" },
                             data["mock"].as_str().unwrap_or("?")
                         ),
-                        "command": "mock.codelens"
+                        "command": "mock.codelens",
+                        "arguments": [documents.values().next()]
                     },
                     "data": data
                 });
@@ -1811,6 +1812,10 @@ fn main() {
                     .cloned()
                     .unwrap_or(Value::Null);
                 data["receivedRange"] = range.clone();
+                data["documentText"] = data["uri"]
+                    .as_str()
+                    .and_then(|uri| documents.get(uri))
+                    .map_or(Value::Null, |text| json!(text));
                 let result = json!({
                     "range": range,
                     "target": data["uri"],

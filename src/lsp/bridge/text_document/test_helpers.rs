@@ -74,3 +74,37 @@ pub(super) fn assert_position_request(
         "Character should remain unchanged"
     );
 }
+
+/// Open a real host sync entry for resolve tests that bypass lsp_impl.
+pub(super) async fn open_resolve_host(
+    pool: &super::super::pool::LanguageServerPool,
+    handle: &std::sync::Arc<super::super::pool::ConnectionHandle>,
+    uri: &url::Url,
+) {
+    let snapshot = resolve_host_snapshot(uri).unwrap();
+    super::host::sync_host_document(
+        &mut super::super::pool::ConnectionHandleSender(handle),
+        &mut *pool.host_documents().await,
+        &super::host::HostDocument {
+            uri,
+            language_id: &snapshot.language_id,
+            text: &snapshot.text,
+            revision: Some(snapshot.revision),
+        },
+        None,
+        handle.key(),
+    )
+    .await
+    .unwrap();
+}
+
+pub(super) fn resolve_host_snapshot(_: &url::Url) -> Option<super::host::HostResolveSnapshot> {
+    Some(super::host::HostResolveSnapshot {
+        text: std::sync::Arc::from("local x = 1"),
+        language_id: "lua".into(),
+        revision: crate::lsp::bridge::HostRevision {
+            incarnation: 1,
+            content_version: 1,
+        },
+    })
+}
