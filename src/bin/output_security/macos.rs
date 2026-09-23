@@ -24,6 +24,8 @@ fn text(acl: *mut c_void) -> io::Result<Vec<u8>> {
     if acl.is_null() {
         let error = io::Error::last_os_error();
         // Darwin reports ENOENT for an existing inode with no extended ACL.
+        // Unsupported inspection is deliberately an error: unavailable ACL
+        // information does not establish that replacement retains protection.
         return if error.raw_os_error() == Some(nix::libc::ENOENT) {
             Ok(Vec::new())
         } else {
