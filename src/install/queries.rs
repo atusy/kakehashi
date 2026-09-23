@@ -239,6 +239,18 @@ fn inherited_languages_with_search_paths(
     Some(parents)
 }
 
+/// The configured search paths as dependency sources: normalized the way the
+/// loader folds them, and without any that resolve to the data directory,
+/// whose copies are read as managed ones rather than as runtime files.
+fn runtime_search_paths(data_dir: &Path, search_paths: &[PathBuf]) -> Vec<PathBuf> {
+    let data_identity = fs::canonicalize(data_dir.clean()).unwrap_or_else(|_| data_dir.clean());
+    search_paths
+        .iter()
+        .map(|path| path.clean())
+        .filter(|path| fs::canonicalize(path).unwrap_or_else(|_| path.clone()) != data_identity)
+        .collect()
+}
+
 /// Whether a search path outside the data directory supplies `language` as an
 /// inherited parent: a readable base (not `extends`) `highlights.scm` there is
 /// what the loader resolves the parent from, so no managed copy is needed.
@@ -388,13 +400,16 @@ pub(crate) fn probe_chain(data_dir: &Path, language: &str, search_paths: &[PathB
                 })
     }
 
+    // The same view staging uses: the managed copy is judged as the data
+    // directory, never again through an alias as if another path provided it.
+    let search_paths = runtime_search_paths(data_dir, search_paths);
     let mut guards = Vec::new();
     let mut busy = false;
     let complete = walk(
         data_dir,
         language,
         false,
-        search_paths,
+        &search_paths,
         &mut Vec::new(),
         &mut guards,
         &mut busy,
@@ -1047,12 +1062,7 @@ fn stage_queries_with_dependencies(
 ) -> Result<StagedQueryInstall, QueryInstallError> {
     // The staged copy replaces the data-directory view. Do not rediscover
     // dependencies from the old live copy during a forced replacement.
-    let data_identity = fs::canonicalize(data_dir.clean()).unwrap_or_else(|_| data_dir.clean());
-    let search_paths: Vec<PathBuf> = search_paths
-        .iter()
-        .map(|path| path.clean())
-        .filter(|path| fs::canonicalize(path).unwrap_or_else(|_| path.clone()) != data_identity)
-        .collect();
+    let search_paths = runtime_search_paths(data_dir, search_paths);
     let mut entries = Vec::new();
     // Every language the recursion visits, staged or already complete, other
     // than those a search path provides: the set this install needs to still
