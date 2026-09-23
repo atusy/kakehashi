@@ -567,4 +567,91 @@ mod tests {
             "an answer read for the root the session left must not be applied"
         );
     }
+
+    fn scope_of(pull: &serde_json::Value) -> Option<&str> {
+        pull["items"][0]["scopeUri"].as_str()
+    }
+
+    /// The pull names the selected configuration root as its scope, so the
+    /// client answers for the workspace the settings are resolved against —
+    /// and a root change asks for the new root's scope.
+    #[tokio::test]
+    #[serial(xdg_env)]
+    async fn the_pull_is_scoped_to_the_selected_root() {
+        let xdg_scratch = tempfile::tempdir().expect("failed to create scratch XDG_CONFIG_HOME");
+        let _xdg_guard = XdgConfigHomeGuard::set(xdg_scratch.path());
+        let first = tempfile::tempdir().expect("failed to create first workspace dir");
+        let second = tempfile::tempdir().expect("failed to create second workspace dir");
+
+        let (service, pulls) =
+            initialized_pull_capable_server(first.path(), serde_json::Value::Null).await;
+        let server = service.inner();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            server.did_change_configuration_impl(
+                tower_lsp_server::ls_types::DidChangeConfigurationParams {
+                    settings: serde_json::Value::Null,
+                },
+            ),
+        )
+        .await
+        .expect("a pull must not hang");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            server.did_change_workspace_folders_impl(DidChangeWorkspaceFoldersParams {
+                event: WorkspaceFoldersChangeEvent {
+                    added: vec![folder(second.path(), "second")],
+                    removed: vec![folder(first.path(), "first")],
+                },
+            }),
+        )
+        .await
+        .expect("a root change must not hang");
+
+        let pulls = pulls.lock().unwrap();
+        let scopes = pulls.iter().map(scope_of).collect::<Vec<_>>();
+        assert_eq!(
+            scopes,
+            vec![
+                Some(folder(first.path(), "first").uri.as_str()),
+                Some(folder(second.path(), "second").uri.as_str()),
+            ],
+            "each pull must name the root selected when it was asked"
+        );
+    }
+
+    /// A root kakehashi fell back to on its own — the launch directory, for a
+    /// client that named no workspace — is not the client's to scope by, so
+    /// the pull asks for the client's global configuration.
+    #[tokio::test]
+    #[serial(xdg_env)]
+    async fn a_session_without_a_client_root_pulls_unscoped() {
+        let xdg_scratch = tempfile::tempdir().expect("failed to create scratch XDG_CONFIG_HOME");
+        let _xdg_guard = XdgConfigHomeGuard::set(xdg_scratch.path());
+
+        let (service, pulls) =
+            initialized_server_answering(serde_json::Value::Null, vec![serde_json::Value::Null])
+                .await;
+        let server = service.inner();
+        assert!(
+            server.settings_manager.root_path().is_some(),
+            "precondition: the launch directory stands in as the root"
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            server.did_change_configuration_impl(
+                tower_lsp_server::ls_types::DidChangeConfigurationParams {
+                    settings: serde_json::Value::Null,
+                },
+            ),
+        )
+        .await
+        .expect("a pull must not hang");
+
+        let pulls = pulls.lock().unwrap();
+        assert_eq!(pulls.len(), 1);
+        assert_eq!(scope_of(&pulls[0]), None);
+    }
 }
