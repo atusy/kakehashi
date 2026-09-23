@@ -1209,6 +1209,13 @@ impl LanguageServerPool {
         self.connections.lock().await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn lock_connections_for_test(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, HashMap<ConnectionKey, Arc<ConnectionHandle>>> {
+        self.connections.lock().await
+    }
+
     /// Apply a resolved server-config reload to every live connection.
     ///
     /// `resolve` maps a server name to its newly merged config. A server that

@@ -22,6 +22,34 @@ use crate::lsp::lsp_impl::{build_notifier, detect_document_language};
 use super::InstallCoordinator;
 use super::install::InstallCoordinatorDeps;
 
+/// Keeps closed-document lock cleanup tied to the future's lifetime, including
+/// cancellation while routing or waiting for a connection. This owns a lock
+/// reference; the bridge acquires the mutex only around revision admission.
+struct ReopenEditLock<'a> {
+    documents: &'a DocumentStore,
+    uri: &'a Url,
+    lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+}
+
+impl<'a> ReopenEditLock<'a> {
+    fn new(documents: &'a DocumentStore, uri: &'a Url) -> Self {
+        Self {
+            documents,
+            uri,
+            lock: documents.edit_lock(uri),
+        }
+    }
+}
+
+impl Drop for ReopenEditLock<'_> {
+    fn drop(&mut self) {
+        if self.documents.get(self.uri).is_none() {
+            self.documents
+                .remove_edit_lock_if_unshared(self.uri, &self.lock);
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum InjectionTarget {
     Incarnation(u64),
@@ -1090,7 +1118,7 @@ impl InjectionCoordinator {
                         continue;
                     };
                     let settings = this.settings_manager.load_settings();
-                    let edit_lock = this.documents.edit_lock(&uri);
+                    let edit_lock = ReopenEditLock::new(&this.documents, &uri);
                     let read = || this.reopen_document_revision(&uri, revision);
                     let outcome = this
                         .bridge
@@ -1104,7 +1132,7 @@ impl InjectionCoordinator {
                                 expected_connection: None,
                                 revision: Some(crate::lsp::bridge::OpenRevision {
                                     content_version: revision.document.content_version,
-                                    edit_lock: &edit_lock,
+                                    edit_lock: &edit_lock.lock,
                                     read: &read,
                                 }),
                             },
@@ -1112,10 +1140,6 @@ impl InjectionCoordinator {
                             key.server(),
                         )
                         .await;
-                    if this.documents.get(&uri).is_none() {
-                        this.documents
-                            .remove_edit_lock_if_unshared(&uri, &edit_lock);
-                    }
                     if outcome != crate::lsp::bridge::OpenOutcome::NotOpened
                         && this.reopen_snapshot_state(&uri, revision)
                             == ReopenSnapshotState::Current
@@ -1140,7 +1164,7 @@ impl InjectionCoordinator {
         key: &crate::lsp::bridge::ConnectionKey,
         injections: Vec<BridgeInjection>,
     ) -> crate::lsp::bridge::OpenOutcome {
-        let edit_lock = self.documents.edit_lock(uri);
+        let edit_lock = ReopenEditLock::new(&self.documents, uri);
         let read = || self.reopen_document_revision(uri, revision);
         let outcome = self
             .bridge
@@ -1154,7 +1178,7 @@ impl InjectionCoordinator {
                     expected_connection: None,
                     revision: Some(crate::lsp::bridge::OpenRevision {
                         content_version: revision.document.content_version,
-                        edit_lock: &edit_lock,
+                        edit_lock: &edit_lock.lock,
                         read: &read,
                     }),
                 },
@@ -1162,9 +1186,6 @@ impl InjectionCoordinator {
                 key.server(),
             )
             .await;
-        if self.documents.get(uri).is_none() {
-            self.documents.remove_edit_lock_if_unshared(uri, &edit_lock);
-        }
         // Failure can follow one or more successful enqueues. A query-only
         // reload can preserve their URIs while changing extracted content;
         // ordinary parse passes skip didChange and already-opened documents.
@@ -1362,6 +1383,98 @@ fn parser_enabled_injection_language(language: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{InjectionTarget, parser_enabled_injection_language};
+
+    #[rstest::rstest]
+    #[case::timeout(false)]
+    #[case::shutdown(true)]
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_reopen_retry_reclaims_closed_document_lock(#[case] shutdown: bool) {
+        use crate::lsp::bridge::ConnectionKey;
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), language.clone());
+        server.language.query_store().insert_injection_query("rust".into(), Arc::new(
+            tree_sitter::Query::new(&language, r#"((string_literal) @injection.content (#set! injection.language "rust") (#set! injection.include-children))"#).unwrap()));
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let uri = Url::parse("file:///cancelled-reopen.rs").unwrap();
+        let text = r#"fn main() { let x = "old"; }"#;
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            text.into(),
+            Some("rust".into()),
+            parser.parse(text, None),
+        );
+        server
+            .settings_manager
+            .apply_settings(crate::config::WorkspaceSettings {
+                auto_install: false,
+                language_servers: std::collections::HashMap::from([(
+                    "test".into(),
+                    crate::config::settings::BridgeServerConfig {
+                        cmd: Some(vec!["unused".into()]),
+                        languages: Some(vec!["rust".into()]),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            });
+        let coordinator = server.injection_coordinator();
+        let key = ConnectionKey::for_server("test");
+        let pool = server.bridge.pool();
+        let _connections = pool.lock_connections_for_test().await;
+        coordinator.retry_reopen_when_settled(&uri, incarnation, &key);
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_millis(50)).await;
+        for _ in 0..100 {
+            if server.documents.has_edit_lock(&uri) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            server.documents.has_edit_lock(&uri),
+            "retry must reach blocked open"
+        );
+        {
+            let closing = server.documents.edit_lock(&uri);
+            let _guard = closing.lock().await;
+            server.documents.remove_preserving_edit_lock(&uri);
+            server
+                .documents
+                .remove_edit_lock_if_unshared(&uri, &closing);
+        }
+        assert!(
+            server.documents.has_edit_lock(&uri),
+            "in-flight retry owns the lock"
+        );
+        if shutdown {
+            coordinator.shutdown.cancel();
+        } else {
+            tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        }
+        let mut finished = false;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            if coordinator
+                .settle_retry_waiters
+                .claim_connection("reopen", &uri, incarnation, &key)
+                .is_some()
+            {
+                finished = true;
+                break;
+            }
+        }
+        assert!(finished, "retry must finish by cancellation");
+        assert!(
+            !server.documents.has_edit_lock(&uri),
+            "cancelled retry must reclaim closed document lock"
+        );
+    }
 
     #[test]
     fn explicit_plaintext_does_not_request_a_parser() {
