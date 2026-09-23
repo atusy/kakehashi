@@ -2017,7 +2017,28 @@ fn write_uninstall_tombstone(
     language: &str,
 ) -> Result<(), QueryInstallError> {
     validate_safe_language_name(language)?;
-    let mut file = fs::File::create(uninstall_tombstone_path(queries_parent, language))?;
+    let path = uninstall_tombstone_path(queries_parent, language);
+    // Existence records uninstall intent; marker contents are never read.
+    // Create exclusively so an existing leaf is never opened for writing,
+    // including a symlink swapped in before open. Parent symlinks are allowed.
+    let mut file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if fs::symlink_metadata(&path)?.is_file() {
+                return Ok(());
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("refusing non-regular uninstall tombstone {path:?}"),
+            )
+            .into());
+        }
+        Err(error) => return Err(error.into()),
+    };
     file.write_all(b"ok\n")?;
     Ok(())
 }
@@ -2987,6 +3008,32 @@ mod staging_tests {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    #[cfg(unix)]
+    fn uninstall_refuses_a_tombstone_symlink_without_removing_queries() {
+        let temp = TempDir::new().unwrap();
+        let data_dir = temp.path().join("data");
+        let queries_parent = data_dir.join("queries");
+        let queries_dir = queries_parent.join("lua");
+        fs::create_dir_all(&queries_dir).unwrap();
+        fs::write(queries_dir.join("highlights.scm"), "original queries").unwrap();
+        let victim = temp.path().join("victim");
+        fs::write(&victim, "original victim").unwrap();
+        std::os::unix::fs::symlink(&victim, uninstall_tombstone_path(&queries_parent, "lua"))
+            .unwrap();
+        let LanguageLockProbe::Idle(lock) = try_lock_language(&data_dir, "lua") else {
+            panic!("test language should be unlocked");
+        };
+
+        let result = remove_query_install_and_backups(&lock);
+        assert_eq!(fs::read_to_string(victim).unwrap(), "original victim");
+        assert!(result.is_err(), "a symlink leaf must be refused");
+        assert_eq!(
+            fs::read_to_string(queries_dir.join("highlights.scm")).unwrap(),
+            "original queries"
+        );
+    }
 
     #[test]
     fn remove_dir_all_tolerates_a_confirmed_vanished_dir() {
