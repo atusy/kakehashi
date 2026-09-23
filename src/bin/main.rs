@@ -2612,7 +2612,9 @@ mod tests {
         std::fs::write(&output, "previous configuration").unwrap();
         let status = std::process::Command::new("icacls")
             .arg(&output)
-            .args(["/deny", "*S-1-1-0:(R)"])
+            // Deny reading data without denying SYNCHRONIZE, which a writable
+            // open also needs. This reaches the incompatible-DACL comparison.
+            .args(["/deny", "*S-1-1-0:(RD)"])
             .status()
             .unwrap();
         assert!(status.success());
