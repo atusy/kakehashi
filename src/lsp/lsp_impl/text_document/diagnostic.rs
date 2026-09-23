@@ -29,6 +29,7 @@ use crate::lsp::aggregation::server::{
 use crate::lsp::bridge::{LanguageServerPool, RegionOffset};
 use crate::lsp::diagnostic_cache::{
     DiagnosticCoverageStamp, DiagnosticSource, cached_push_diagnostics, push_slot_servers,
+    retain_region_push_slots,
 };
 use crate::lsp::lsp_impl::bridge_context::{
     DocumentRequestContext, HostRequestContext, resolve_aggregation_config_from_settings,
@@ -532,11 +533,12 @@ impl Kakehashi {
     /// *appended* after the region's live election rather than competing in it —
     /// consistent with Path A's concatenate-everything merge and the deferred
     /// per-source strategy fan-in (push-propagation-diagnostic-forwarding), not an
-    /// election bug. For the same reason the fold honors only `pushFallback`, not
-    /// the visible walk: it does not re-apply `priorities`/`maxFanOut`, so a
-    /// push-driven server outside the walk is still folded — exactly what Path A's
-    /// proactive merge already publishes, until the deferred fan-in resolves the
-    /// walk for both paths together.
+    /// election bug. For the same reason the fold applies `priorities` as
+    /// membership only (#916) — a push-driven server the list omits is not
+    /// folded, the same rule Path A's proactive merge applies under its own
+    /// key — and neither the walk's order nor `maxFanOut` (see
+    /// `admitted_server_names`), until the deferred fan-in resolves the walk
+    /// for both paths together.
     async fn fold_push_fallback_diagnostics(
         &self,
         host: &Url,
@@ -549,7 +551,7 @@ impl Kakehashi {
         // One snapshot drives both the candidate classification and the fold, so
         // a push arriving across the classifying `await` below cannot land in the
         // folded set while skipping classification (no TOCTOU double-count).
-        let snapshot = self.diagnostics.snapshot(host);
+        let mut snapshot = self.diagnostics.snapshot(host);
         let candidates = push_slot_servers(&snapshot);
         if candidates.is_empty() {
             return; // no cached pushes for this host
@@ -571,6 +573,7 @@ impl Kakehashi {
         // `cached_push_diagnostics`, so this map doubles as the per-region
         // pushFallback gate — no separate set, no `region_id` clone.
         let mut region_offsets = HashMap::new();
+        let mut region_languages = HashMap::new();
         let mut push_fallback_by_lang: HashMap<String, bool> = HashMap::new();
         for (region_id, injection_language, offset) in region_meta {
             // `get` on the common (cache-hit) path is a single lookup; only the
@@ -586,14 +589,30 @@ impl Kakehashi {
                         "textDocument/diagnostic",
                     )
                     .push_fallback;
-                    push_fallback_by_lang.insert(injection_language, fallback);
+                    push_fallback_by_lang.insert(injection_language.clone(), fallback);
                     fallback
                 }
             };
             if push_fallback {
-                region_offsets.insert(region_id, offset);
+                region_offsets.insert(region_id.clone(), offset);
+                region_languages.insert(region_id, injection_language);
             }
         }
+
+        // The pull's own `priorities` allowlist gates the folded pushes too
+        // (#916): a push-driven server the list omits must not reach the
+        // editor through the fold any more than the live pull dispatches to it.
+        let mut allowlist = crate::lsp::lsp_impl::bridge_context::RegionPushAllowlist::new(
+            &self.bridge,
+            &settings,
+            language_name,
+            "textDocument/diagnostic",
+        );
+        retain_region_push_slots(&mut snapshot, |region_id, server| {
+            region_languages
+                .get(region_id)
+                .is_some_and(|language| allowlist.admits(language, server))
+        });
 
         // Host `pushFallback` gate: the host layer participates AND pushFallback
         // is on for the host's diagnostic method.

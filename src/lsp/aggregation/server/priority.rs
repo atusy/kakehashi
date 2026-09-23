@@ -124,6 +124,28 @@ pub(crate) fn truncate_entries(
     result
 }
 
+/// The servers a `priorities` allowlist admits, as a membership set.
+///
+/// For gating what a server *pushes* unsolicited (#916), where there is no
+/// walk to order — only "is this server allowed to contribute here".
+/// `maxFanOut` is deliberately not applied: it is a dispatch budget taken
+/// after the capability prefilter drops incapable servers, so the servers
+/// inside the cap depend on each request's candidates — a push-only server
+/// is never inside it for a pull — and it has no stable meaning as
+/// membership.
+pub(crate) fn admitted_server_names(
+    priorities: &[String],
+    configs: &[ResolvedServerConfig],
+) -> HashSet<String> {
+    expand_priorities(priorities, configs)
+        .into_iter()
+        .flat_map(|entry| match entry {
+            PriorityEntry::Server(name) => vec![name],
+            PriorityEntry::Rest(names) => names,
+        })
+        .collect()
+}
+
 /// Flatten entries to server names in walk order.
 ///
 /// This is the fan-out membership and spawn order, and the result ordering
@@ -194,6 +216,22 @@ mod tests {
                 PriorityEntry::Server("alpha".into()),
             ]
         );
+    }
+
+    #[test]
+    fn admitted_server_names_is_the_allowlist_membership() {
+        let servers = configs(&["alpha", "beta", "gamma"]);
+        let names = |p: &[&str]| {
+            let mut v: Vec<String> = admitted_server_names(&prios(p), &servers)
+                .into_iter()
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(names(&["*"]), prios(&["alpha", "beta", "gamma"]));
+        assert_eq!(names(&["gamma", "unconfigured"]), prios(&["gamma"]));
+        assert_eq!(names(&["beta", "*"]), prios(&["alpha", "beta", "gamma"]));
+        assert!(names(&[]).is_empty(), "[] admits nothing");
     }
 
     #[test]

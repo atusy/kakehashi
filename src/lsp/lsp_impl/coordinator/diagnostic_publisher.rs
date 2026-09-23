@@ -1076,8 +1076,13 @@ impl DiagnosticPublisher {
         // exactly that check.
         let needs_geometry = crate::lsp::diagnostic_cache::has_live_region_slots(&snapshot);
         let region_offsets = if needs_geometry {
-            match self.current_region_offsets(host) {
-                Some(offsets) => offsets,
+            match self.current_region_geometry(host) {
+                Some(geometry) => {
+                    // Only now is each region's injection language known: gate
+                    // the region pushes on the allowlist before the merge.
+                    self.filter_excluded_region_slots(&mut snapshot, &geometry);
+                    geometry.offsets
+                }
                 // The document is open but has no parse snapshot: `did_change`
                 // cleared the tree and the off-ingress reparse hasn't landed yet,
                 // so the regions' current offsets are UNKNOWN — not gone. Merging
@@ -1609,7 +1614,7 @@ impl DiagnosticPublisher {
                     let _ = this.language.ensure_language_loaded_async(&language).await;
                 }
                 if this.documents.get(&host).map(|doc| doc.incarnation()) == Some(lifetime)
-                    && this.current_region_offsets(&host).is_some()
+                    && this.current_region_geometry(&host).is_some()
                     && this.aggregator.take_degraded_pull(&host)
                 {
                     this.request_pull_diagnostic_refresh(true);
@@ -1733,8 +1738,8 @@ impl DiagnosticPublisher {
     /// regions as gone. `Some(empty)` means there legitimately are no regions to
     /// anchor: the document is closed, or its language resolves to no injection
     /// query — stale region slots drop from the merge.
-    fn current_region_offsets(&self, host: &Url) -> Option<HashMap<String, RegionOffset>> {
-        let mut offsets = HashMap::new();
+    fn current_region_geometry(&self, host: &Url) -> Option<RegionGeometry> {
+        let mut geometry = RegionGeometry::default();
 
         // The settled parse names the language authoritatively (a reload
         // that re-detects the document publishes the new language on the
@@ -1750,7 +1755,7 @@ impl DiagnosticPublisher {
         // wrongly. The view is
         // an owned clone; no store guard is held across the lookups below.
         let Some(view) = self.documents.latest_snapshot(host) else {
-            return Some(offsets); // closed host: nothing to anchor against
+            return Some(geometry); // closed host: nothing to anchor against
         };
         let Some(current) = view
             .slot
@@ -1779,7 +1784,7 @@ impl DiagnosticPublisher {
             self.language
                 .detect_language_trace(host.path(), &current.text, None, None)
         }) else {
-            return Some(offsets);
+            return Some(geometry);
         };
         // A language still publishing (queries land before the parser) has
         // unknown geometry: defer, like a pending tree. So does a settings
@@ -1794,7 +1799,7 @@ impl DiagnosticPublisher {
             let reload_in_progress = self
                 .parser_pool
                 .lock()
-                .recover_poison("DiagnosticPublisher::current_region_offsets")
+                .recover_poison("DiagnosticPublisher::current_region_geometry")
                 .reload_in_progress();
             !reload_in_progress && self.cache.semantic_token_generation() == generation_before
         };
@@ -1808,7 +1813,7 @@ impl DiagnosticPublisher {
         let Some(injection_query) = injection_query else {
             // Definitive only while still settled: a reload beginning right
             // here removes queries, and "no query" would read as no regions.
-            return settled().then_some(offsets);
+            return settled().then_some(geometry);
         };
 
         let resolved_regions = match self
@@ -1827,14 +1832,19 @@ impl DiagnosticPublisher {
             )),
         };
         for resolved in resolved_regions.iter() {
-            offsets.insert(
+            geometry.offsets.insert(
                 resolved.region.region_id.clone(),
                 RegionOffset::with_per_line_offsets(
                     resolved.region.line_range.start,
                     resolved.line_column_offsets.clone(),
                 ),
             );
+            geometry.injection_languages.insert(
+                resolved.region.region_id.clone(),
+                resolved.injection_language.clone(),
+            );
         }
+        geometry.host_language = Some(language_name);
         // The offsets describe the captured snapshot; an edit (or reopen)
         // landing since makes them stale positions for the text the editor
         // now holds, and edits do not move the generation `settled` watches.
@@ -1844,8 +1854,51 @@ impl DiagnosticPublisher {
             now.content_version == view.content_version
                 && now.slot.current_incarnation == view.slot.current_incarnation
         });
-        (settled() && document_unchanged).then_some(offsets)
+        (settled() && document_unchanged).then_some(geometry)
     }
+
+    /// Drop cached `Region` push slots from `snapshot` whose server the
+    /// region's `textDocument/publishDiagnostics` `priorities` allowlist
+    /// omits (#916), resolved against the CURRENT settings — so a config
+    /// change that excludes a server retracts what it already pushed at the
+    /// next republish (the settings reload reparses every open document, and
+    /// the reparse republishes while region slots remain cached).
+    ///
+    /// A region the geometry no longer resolves is left alone: the merge drops
+    /// it for want of an offset anyway.
+    fn filter_excluded_region_slots(
+        &self,
+        snapshot: &mut crate::lsp::diagnostic_cache::SourceSlots,
+        geometry: &RegionGeometry,
+    ) {
+        let Some(host_language) = geometry.host_language.as_deref() else {
+            return; // no regions resolve: the merge drops every region slot
+        };
+        let settings = self.settings_manager.load_settings();
+        let mut allowlist = crate::lsp::lsp_impl::bridge_context::RegionPushAllowlist::new(
+            &self.bridge,
+            &settings,
+            host_language,
+            "textDocument/publishDiagnostics",
+        );
+        crate::lsp::diagnostic_cache::retain_region_push_slots(snapshot, |region_id, server| {
+            geometry
+                .injection_languages
+                .get(region_id)
+                .is_none_or(|language| allowlist.admits(language, server))
+        });
+    }
+}
+
+/// A host's current injection geometry: each resolvable region's offset and
+/// injection language, and the host language they were resolved under.
+/// Empty when there legitimately are no regions (closed host, no injection
+/// query).
+#[derive(Default)]
+struct RegionGeometry {
+    host_language: Option<String>,
+    offsets: HashMap<String, RegionOffset>,
+    injection_languages: HashMap<String, String>,
 }
 
 /// Remove `Region`/`Host` push slots whose server is in `pull_driven` when a
@@ -3565,7 +3618,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn current_region_offsets_distinguishes_unknown_from_absent_geometry() {
+    async fn current_region_geometry_distinguishes_unknown_from_absent_geometry() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
         let publisher = DiagnosticPublisher::new(server);
@@ -3579,7 +3632,7 @@ mod tests {
             None,
         );
         assert!(
-            publisher.current_region_offsets(&pending).is_none(),
+            publisher.current_region_geometry(&pending).is_none(),
             "an open document with no parse snapshot has unknown geometry"
         );
 
@@ -3620,7 +3673,7 @@ mod tests {
             .unwrap_or(false);
         assert!(landed, "test publish must land");
         assert!(
-            publisher.current_region_offsets(&publishing).is_none(),
+            publisher.current_region_geometry(&publishing).is_none(),
             "a language whose parser is not published has unknown geometry"
         );
         // Parser published, but a reload is swapping its queries: unknown too.
@@ -3634,7 +3687,7 @@ mod tests {
             .expect("parser pool lock")
             .begin_reload();
         assert!(
-            publisher.current_region_offsets(&publishing).is_none(),
+            publisher.current_region_geometry(&publishing).is_none(),
             "a reload in progress has unknown geometry"
         );
         server
@@ -3648,8 +3701,8 @@ mod tests {
         let closed = Url::parse("file:///test/closed.md").unwrap();
         assert!(
             publisher
-                .current_region_offsets(&closed)
-                .is_some_and(|offsets| offsets.is_empty()),
+                .current_region_geometry(&closed)
+                .is_some_and(|geometry| geometry.offsets.is_empty()),
             "a closed document has no regions to anchor, not unknown geometry"
         );
     }
