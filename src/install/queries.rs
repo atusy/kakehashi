@@ -3698,6 +3698,31 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn forced_replacement_ignores_a_link_to_the_managed_language() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let runtime = temp.path().join("runtime");
+        let child = data.join("queries/child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(child.join("highlights.scm"), ";; inherits: obsolete\n").unwrap();
+        fs::create_dir_all(runtime.join("queries")).unwrap();
+        std::os::unix::fs::symlink(&child, runtime.join("queries/child")).unwrap();
+        let base_url = spawn_query_file_server(vec![("/child/highlights.scm", "replacement")]);
+        let staged = stage_queries_with_dependencies(
+            &base_url,
+            "child",
+            &data,
+            true,
+            QueryHttpPolicy::AllowHttpForTests,
+            &[runtime],
+        )
+        .unwrap_or_else(|e| panic!("the old copy's parents leaked into staging: {e}"));
+        assert_eq!(staged.dependencies(), &["child"]);
+        assert_eq!(staged.unstable_dependency(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_broken_runtime_file_neither_blocks_nor_hides_the_chain() {
         let temp = TempDir::new().unwrap();
         let data = temp.path().join("data");
