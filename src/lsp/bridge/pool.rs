@@ -994,10 +994,6 @@ impl LanguageServerPool {
         let stale_handles = self
             .retire_invalidated_connections(&mut connections, diverted)
             .await;
-        drop(connections);
-        for (key, handle) in stale_handles {
-            shutdown_invalidated_connection(key, handle);
-        }
         // Their documents now route to the shared key, but nothing would open
         // them there until something touches each one — an idle tab's pushed
         // diagnostics died with the retired process and would stay gone. Run
@@ -1006,6 +1002,11 @@ impl LanguageServerPool {
         // that is already open there is a no-op. The retired keys stay armed
         // too, but nothing routes to them any more, so no replacement claims
         // that debt.
+        //
+        // The barrier is installed BEFORE `connections` is released: from that
+        // moment a command whose token names a retired divert is redirected to
+        // the shared connection (`reconnect_by_key`), and it must find the
+        // re-open pending rather than overtake the didOpens it depends on.
         //
         // A shared instance still handshaking must settle the debt itself:
         // its handshake claims just before flipping Ready and sends the
@@ -1018,10 +1019,14 @@ impl LanguageServerPool {
         // then waits for the next spawn under the key, and the documents move
         // at their next acquisition instead.
         self.pending_reopen.arm(&shared_key);
-        if shared.state() != ConnectionState::Ready {
-            return;
+        let reopen = (shared.state() == ConnectionState::Ready)
+            .then(|| self.pending_reopen.claim(&shared_key))
+            .flatten();
+        drop(connections);
+        for (key, handle) in stale_handles {
+            shutdown_invalidated_connection(key, handle);
         }
-        if let Some(done) = self.pending_reopen.claim(&shared_key)
+        if let Some(done) = reopen
             && let Err(e) = self
                 .upstream_request_tx
                 .send(UpstreamRequest::ReopenDocuments {
