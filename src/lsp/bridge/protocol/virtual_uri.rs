@@ -182,8 +182,11 @@ impl VirtualDocumentUri {
     /// forwarded (Decision point 7).
     pub(crate) fn is_scratch_uri(uri: &str) -> bool {
         // Substring check first: it cheaply rejects the vast majority of URIs
-        // (every non-scratch one) before `is_virtual_uri`'s URL parse.
-        uri.contains(Self::SCRATCH_ID_MARKER) && Self::is_virtual_uri(uri)
+        // (every non-scratch one) before `region_id_of`'s URL parse. Only the
+        // region id decides: the extension and host directory may carry the
+        // marker too.
+        uri.contains(Self::SCRATCH_ID_MARKER)
+            && Self::region_id_of(uri).is_some_and(|id| id.contains(Self::SCRATCH_ID_MARKER))
     }
 
     /// Recover the canonical virtual URI whose region a formatting scratch
@@ -434,6 +437,26 @@ mod tests {
         assert!(!VirtualDocumentUri::is_scratch_uri(
             "file:///project/src/main.rs"
         ));
+    }
+
+    #[test]
+    fn is_scratch_uri_reads_the_marker_only_from_the_region_id() {
+        // The language extension and host directory are document- or
+        // user-controlled; a marker there must not hide a canonical document's
+        // diagnostics.
+        for (host, language) in [
+            ("file:///project/doc.md", "x-kakehashi-scratch-1-2"),
+            ("file:///p-kakehashi-scratch-1-2/doc.md", "lua"),
+            ("untitled:x-kakehashi-scratch-1-2", "lua"),
+        ] {
+            let host_uri: Uri = host.parse().unwrap();
+            let canonical = VirtualDocumentUri::new(&host_uri, language, "01ARZ3NDEKTSV4");
+            assert!(
+                !VirtualDocumentUri::is_scratch_uri(&canonical.to_uri_string()),
+                "{}",
+                canonical.to_uri_string()
+            );
+        }
     }
 
     // ==========================================================================
@@ -1153,6 +1176,7 @@ mod properties {
             let canonical = VirtualDocumentUri::new(&host, &language, &region);
 
             prop_assert!(VirtualDocumentUri::is_scratch_uri(&scratch.to_uri_string()));
+            prop_assert!(!VirtualDocumentUri::is_scratch_uri(&canonical.to_uri_string()));
             prop_assert_eq!(
                 VirtualDocumentUri::canonical_uri_for_scratch(&scratch.to_uri_string()),
                 Some(canonical.to_uri_string())
