@@ -24,7 +24,7 @@ use super::super::{Kakehashi, uri_to_url};
 use crate::config::settings::{AggregationStrategy, LayerSource, ResolvedLayerConfig};
 use crate::lsp::aggregation::server::{
     FanInResult, FanOutTask, HostFanOutTask, dispatch_concatenated, dispatch_host_concatenated,
-    dispatch_host_preferred, dispatch_preferred,
+    dispatch_host_preferred, dispatch_preferred, priorities_admit,
 };
 use crate::lsp::bridge::{LanguageServerPool, RegionOffset};
 use crate::lsp::diagnostic_cache::{
@@ -371,7 +371,7 @@ impl Kakehashi {
             &uri,
             language_name,
             region_meta,
-            host_ctx.is_some(),
+            host_ctx.as_ref(),
             &mut virt_items,
             &mut host_items,
         )
@@ -524,10 +524,12 @@ impl Kakehashi {
     /// native source. Region pushes are transformed to host coordinates against
     /// the region's current offset; host pushes are already host-local.
     ///
-    /// `host_layer_participates` is `host_ctx.is_some()` — the host layer is in
-    /// the method's priorities AND `bridge._self` is opted in with configured
+    /// `host_ctx` is the live host pull's context — `Some` iff the host layer is
+    /// in the method's priorities AND `bridge._self` is opted in with configured
     /// servers (capability is *not* required: a push-only `_self` server yields a
     /// host context whose live pull returns empty, and this fold supplies it).
+    /// Its candidates and `priorities` also gate the folded host pushes, so the
+    /// fold admits exactly the servers the live host pull resolved.
     ///
     /// Under a per-region `strategy = preferred`, the folded push-driven slots are
     /// *appended* after the region's live election rather than competing in it —
@@ -544,7 +546,7 @@ impl Kakehashi {
         host: &Url,
         language_name: &str,
         region_meta: Vec<(String, String, RegionOffset)>,
-        host_layer_participates: bool,
+        host_ctx: Option<&HostRequestContext>,
         virt_items: &mut Vec<Diagnostic>,
         host_items: &mut Vec<Diagnostic>,
     ) {
@@ -616,22 +618,15 @@ impl Kakehashi {
 
         // Host `pushFallback` gate: the host layer participates AND pushFallback
         // is on for the host's diagnostic method. Then the same `priorities`
-        // allowlist as the region fold above, over the host servers (#916).
-        let host_push_enabled = host_layer_participates
-            && settings
+        // allowlist as the region fold above, over the host servers (#916) —
+        // read from the live pull's own context rather than re-resolved.
+        let host_admitted = host_ctx.filter(|_| {
+            settings
                 .resolve_host_language_settings(language_name)
-                .map(|s| {
+                .is_some_and(|s| {
                     s.resolve_host_aggregation("textDocument/diagnostic")
                         .push_fallback
                 })
-                .unwrap_or(false);
-        let host_admitted = host_push_enabled.then(|| {
-            crate::lsp::lsp_impl::bridge_context::PushAllowlist::for_host(
-                &self.bridge,
-                &settings,
-                language_name,
-                "textDocument/diagnostic",
-            )
         });
 
         let include = |source: &DiagnosticSource, server: &str| {
@@ -651,9 +646,10 @@ impl Kakehashi {
                 // has its offset, i.e. its `pushFallback` is on — so the gate is
                 // already applied; nothing more to check beyond `pull_driven`.
                 DiagnosticSource::Region(_) => true,
-                DiagnosticSource::Host => host_admitted
-                    .as_ref()
-                    .is_some_and(|allowlist| allowlist.admits(server)),
+                DiagnosticSource::Host => host_admitted.is_some_and(|ctx| {
+                    ctx.configs.iter().any(|c| c.server_name == server)
+                        && priorities_admit(&ctx.priorities, server)
+                }),
                 DiagnosticSource::PullLayer => false,
             }
         };
