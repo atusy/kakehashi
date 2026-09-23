@@ -870,6 +870,28 @@ impl LanguageServerPool {
                 invalidated.push(key.clone());
             }
         }
+        let stale_handles = self
+            .retire_invalidated_connections(&mut connections, invalidated)
+            .await;
+        drop(connections);
+        for (key, handle) in stale_handles {
+            shutdown_invalidated_connection(key, handle);
+        }
+        true
+    }
+
+    /// Remove each of `invalidated` from the held `connections` map and purge
+    /// everything keyed on it — host routing, tracked documents, open-transition
+    /// locks — arming each key for a re-open by its eventual replacement.
+    ///
+    /// Returns the removed handles, already marked shutting down, for the
+    /// caller to [`shutdown_invalidated_connection`] once it has released
+    /// `connections`.
+    async fn retire_invalidated_connections(
+        &self,
+        connections: &mut HashMap<ConnectionKey, Arc<ConnectionHandle>>,
+        invalidated: Vec<ConnectionKey>,
+    ) -> Vec<(ConnectionKey, Arc<ConnectionHandle>)> {
         let mut stale_handles = Vec::new();
         for key in invalidated {
             if let Some(handle) = connections.get(&key) {
@@ -891,11 +913,7 @@ impl LanguageServerPool {
                 stale_handles.push((key, handle));
             }
         }
-        drop(connections);
-        for (key, handle) in stale_handles {
-            shutdown_invalidated_connection(key, handle);
-        }
-        true
+        stale_handles
     }
 
     /// Set the upstream client capabilities.
@@ -1028,25 +1046,9 @@ impl LanguageServerPool {
         }));
         self.invalidate_diagnostic_connections(&affected_connections);
 
-        let mut stale_handles = Vec::new();
-        for key in invalidated {
-            if let Some(handle) = connections.get(&key) {
-                handle.begin_shutdown();
-            }
-            self.host_documents.lock().await.retain(|_, connections| {
-                connections.remove(&key);
-                !connections.is_empty()
-            });
-            self.clear_host_routing_for_connection(&key);
-            self.document_tracker.purge_connection(&key).await;
-            // Arm before the replacement can claim: what this connection held
-            // is irrelevant, only that it owes a re-open.
-            self.pending_reopen.arm(&key);
-            self.purge_open_transition_locks(&key).await;
-            if let Some(handle) = connections.remove(&key) {
-                stale_handles.push((key, handle));
-            }
-        }
+        let stale_handles = self
+            .retire_invalidated_connections(&mut connections, invalidated)
+            .await;
 
         let mut pushed = 0;
         for (key, handle) in connections.iter() {
