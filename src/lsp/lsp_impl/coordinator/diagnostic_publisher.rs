@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use url::Url;
 
+use crate::config::WorkspaceSettings;
 use crate::document::DocumentStore;
 use crate::error::LockResultExt;
 use crate::language::{InjectionResolver, LanguageCoordinator};
@@ -752,6 +753,7 @@ impl DiagnosticPublisher {
     fn filter_stale_host_slots(
         &self,
         host: &Url,
+        settings: &Arc<WorkspaceSettings>,
         snapshot: &mut crate::lsp::diagnostic_cache::SourceSlots,
     ) {
         // Single map lookup via the entry API (no separate contains_key/get_mut/remove).
@@ -765,10 +767,9 @@ impl DiagnosticPublisher {
             entry.remove();
             return;
         };
-        let settings = self.settings_manager.load_settings();
         let admitted = crate::lsp::lsp_impl::bridge_context::PushAllowlist::for_host(
             &self.bridge,
-            &settings,
+            settings,
             &language_name,
             "textDocument/publishDiagnostics",
         );
@@ -1055,13 +1056,17 @@ impl DiagnosticPublisher {
         let _guard = self.aggregator.lock_republish(host).await;
 
         let (mut snapshot, cache_revision) = self.aggregator.snapshot_with_revision(host);
+        // One settings snapshot gates every push slot of this publish, so a
+        // configuration swap mid-republish cannot gate the host slots on the
+        // old allowlists and the region slots on the new ones.
+        let settings = self.settings_manager.load_settings();
         // Drop Host push slots whose server is no longer a configured `_self` host
         // server for the document's current language — so a host server's pushed
         // diagnostics don't linger in the editor after the user disables `_self`
         // (or unconfigures the server) via `workspace/didChangeConfiguration`. The
         // slots stay cached (cleared on `didClose`); they're just filtered out of
         // this publish. (The analogous Region/config-change re-merge is deferred.)
-        self.filter_stale_host_slots(host, &mut snapshot);
+        self.filter_stale_host_slots(host, &settings, &mut snapshot);
         // Drop a pull-driven server's push slots when the host-event pull blob
         // (`PullLayer`) is present: that server already contributes via the
         // pull, so keeping its spontaneous push too would double-count it
@@ -1082,7 +1087,7 @@ impl DiagnosticPublisher {
                 Some(geometry) => {
                     // Only now is each region's injection language known: gate
                     // the region pushes on the allowlist before the merge.
-                    self.filter_excluded_region_slots(&mut snapshot, &geometry);
+                    self.filter_excluded_region_slots(&settings, &mut snapshot, &geometry);
                     geometry.offsets
                 }
                 // The document is open but has no parse snapshot: `did_change`
@@ -1870,16 +1875,16 @@ impl DiagnosticPublisher {
     /// it for want of an offset anyway.
     fn filter_excluded_region_slots(
         &self,
+        settings: &Arc<WorkspaceSettings>,
         snapshot: &mut crate::lsp::diagnostic_cache::SourceSlots,
         geometry: &RegionGeometry,
     ) {
         let Some(host_language) = geometry.host_language.as_deref() else {
             return; // no regions resolve: the merge drops every region slot
         };
-        let settings = self.settings_manager.load_settings();
         let mut allowlist = crate::lsp::lsp_impl::bridge_context::RegionPushAllowlist::new(
             &self.bridge,
-            &settings,
+            settings,
             host_language,
             "textDocument/publishDiagnostics",
         );
@@ -3923,7 +3928,11 @@ mod tests {
         // stale host slot, while the cache itself keeps it (cleared on didClose).
         server.settings_manager.apply_settings(rust_settings(false));
         let mut snapshot = server.diagnostics.snapshot(&uri);
-        publisher.filter_stale_host_slots(&uri, &mut snapshot);
+        publisher.filter_stale_host_slots(
+            &uri,
+            &server.settings_manager.load_settings(),
+            &mut snapshot,
+        );
         assert!(
             !snapshot.contains_key(&DiagnosticSource::Host),
             "stale host slots are filtered out of the publish after _self is disabled"
@@ -3981,7 +3990,11 @@ mod tests {
         server.settings_manager.apply_settings(excluding);
 
         let mut snapshot = server.diagnostics.snapshot(&uri);
-        publisher.filter_stale_host_slots(&uri, &mut snapshot);
+        publisher.filter_stale_host_slots(
+            &uri,
+            &server.settings_manager.load_settings(),
+            &mut snapshot,
+        );
         assert!(
             !snapshot.contains_key(&DiagnosticSource::Host),
             "a host server outside the publish priorities must not publish its push"
