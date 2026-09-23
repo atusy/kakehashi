@@ -1587,7 +1587,7 @@ fn spawn_upstream_request(
                     hosts.len()
                 );
                 use crate::lsp::bridge::{OpenOutcome, REOPEN_WAIT};
-                let settings = context.settings_manager.load_settings();
+                let settings_manager = Arc::clone(&context.settings_manager);
                 // Naming the connection still matters: the open is ACQUIRED by
                 // this key, never by whatever a host routes to, so the repair
                 // lands on the connection `done` signals for and a routed
@@ -1652,6 +1652,15 @@ fn spawn_upstream_request(
                     let sweep_deadline = std::time::Instant::now() + REOPEN_WAIT;
                     let mut budget_spent = false;
                     for host in hosts {
+                        // Settings are re-read per host, not once per sweep:
+                        // the sweep can outlive a settings change (it waits on
+                        // the parses that change invalidates), and opening
+                        // under the copy taken before it would reopen a
+                        // region the change's injection pass just retracted
+                        // from a server it no longer selects (#917). The
+                        // selection memo is per snapshot, so this is a pointer
+                        // load unless the snapshot really changed.
+                        let settings = settings_manager.load_settings();
                         // Stop if nobody can hear the answer. `rearm` and a
                         // later `claim` both drop the registry's receiver, so a
                         // closed channel means this re-open has been superseded
