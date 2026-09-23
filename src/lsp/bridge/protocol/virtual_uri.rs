@@ -1005,12 +1005,16 @@ mod tests {
     #[case::kakehashi_in_dir("file:///home/.kakehashi/config.lua", false)]
     #[case::kakehashi_prefix_no_virtual("file:///project/kakehashi.config.lua", false)]
     #[case::no_extension("file:///project/kakehashi-virtual-uri-lua", false)]
+    #[case::empty_extension("file:///project/kakehashi-virtual-uri-R.", false)]
     #[case::empty_region_id("file:///project/kakehashi-virtual-uri-.lua", false)]
     #[case::not_a_url("not a url", false)]
     #[case::empty_string("", false)]
     #[case::missing_scheme("://missing-scheme", false)]
     fn is_virtual_uri(#[case] uri: &str, #[case] expected: bool) {
         assert_eq!(VirtualDocumentUri::is_virtual_uri(uri), expected);
+        // `is_scratch_uri` recognizes through `region_id_of`, so both parsers
+        // must accept exactly the same shapes.
+        assert_eq!(VirtualDocumentUri::region_id_of(uri).is_some(), expected);
     }
 
     // ==========================================================================
