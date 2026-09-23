@@ -3565,7 +3565,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_broken_overlay_is_not_a_complete_or_installable_chain() {
+    fn a_broken_runtime_file_neither_blocks_nor_hides_the_chain() {
         let temp = TempDir::new().unwrap();
         let data = temp.path().join("data");
         let runtime = temp.path().join("runtime");
@@ -3574,17 +3574,37 @@ mod tests {
         fs::create_dir_all(&child).unwrap();
         fs::create_dir_all(&overlay).unwrap();
         fs::write(child.join("highlights.scm"), "existing child").unwrap();
+        // The loader fails only this kind; nothing an install fetches fixes it.
         std::os::unix::fs::symlink("missing", overlay.join("injections.scm")).unwrap();
-        assert!(lock_complete_chain(&data, "child", std::slice::from_ref(&runtime)).is_none());
-        let result = stage_queries_with_dependencies(
+        assert!(lock_complete_chain(&data, "child", std::slice::from_ref(&runtime)).is_some());
+        let staged = stage_queries_with_dependencies(
             "https://unused.invalid",
             "child",
             &data,
             false,
             QueryHttpPolicy::HttpsOnly,
-            &[runtime],
-        );
-        assert!(matches!(result, Err(QueryInstallError::IoError(_))));
+            std::slice::from_ref(&runtime),
+        )
+        .unwrap_or_else(|e| panic!("staging failed: {e}"));
+        assert_eq!(staged.unstable_dependency(), None);
+        // A readable sibling in the same directory still declares its parents.
+        fs::write(
+            overlay.join("highlights.scm"),
+            ";; extends\n;; inherits: missing_parent\n",
+        )
+        .unwrap();
+        assert!(lock_complete_chain(&data, "child", std::slice::from_ref(&runtime)).is_none());
+    }
+
+    #[test]
+    fn a_broken_managed_file_still_leaves_the_chain_incomplete() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let child = data.join("queries/child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(child.join("highlights.scm"), "existing child").unwrap();
+        std::os::unix::fs::symlink("missing", child.join("injections.scm")).unwrap();
+        assert!(lock_complete_chain(&data, "child", &[]).is_none());
     }
 
     fn write_runtime_query(runtime: &Path, language: &str, content: &str) {
