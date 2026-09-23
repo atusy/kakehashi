@@ -24,9 +24,60 @@ const FILENAME_ENCODE_SET: &percent_encoding::AsciiSet = &percent_encoding::NON_
     .remove(b'_')
     .remove(b'~');
 
-/// Percent-encode a virtual filename as a single path segment.
-fn encode_filename(filename: &str) -> percent_encoding::PercentEncode<'_> {
-    percent_encoding::utf8_percent_encode(filename, FILENAME_ENCODE_SET)
+/// A virtual filename, `{prefix}{region_id}.{extension}`, displayed
+/// percent-encoded as a single path segment. The prefix and the `.` are
+/// unreserved, so encoding the two variable parts separately equals encoding
+/// the whole name, without building it first.
+struct EncodedFilename<'a> {
+    region_id: &'a str,
+    extension: &'a str,
+}
+
+impl std::fmt::Display for EncodedFilename<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let encode = |part| percent_encoding::utf8_percent_encode(part, FILENAME_ENCODE_SET);
+        write!(
+            f,
+            "{VIRTUAL_URI_PREFIX}{}.{}",
+            encode(self.region_id),
+            encode(self.extension)
+        )
+    }
+}
+
+/// A hierarchical host URI split around its filename: everything through the
+/// directory (without the final `/`), and the query and fragment after it.
+struct HostBase {
+    directory: String,
+    after_path: String,
+}
+
+impl HostBase {
+    /// `None` for a host `url` cannot parse or that has no directory.
+    fn parse(host: &str) -> Option<Self> {
+        let url = url::Url::parse(host).ok()?;
+        if url.cannot_be_a_base() {
+            return None;
+        }
+        let serialized = url.as_str();
+        let path_start = url[..url::Position::BeforePath].len();
+        let path_end = url[..url::Position::AfterPath].len();
+        // A non-empty path starts with `/`; an empty one (`foo://h`) keeps
+        // the whole prefix, and the spliced `/` starts the path.
+        let directory_end = serialized[path_start..path_end]
+            .rfind('/')
+            .map_or(path_start, |slash| path_start + slash);
+        Some(Self {
+            directory: serialized[..directory_end].to_string(),
+            after_path: serialized[path_end..].to_string(),
+        })
+    }
+
+    /// Splice the filename in, byte for byte what `Url::set_path` produces
+    /// for an already-encoded segment, without re-parsing the path.
+    fn render(&self, filename: &EncodedFilename<'_>) -> String {
+        format!("{}/{filename}{}", self.directory, self.after_path)
+    }
 }
 
 /// Pair a rendered virtual URI with its `ls_types::Uri`, so the string the
@@ -262,7 +313,7 @@ impl VirtualDocumentUri {
     /// The distinctive prefix avoids real-file collisions; the ULID `region_id`
     /// gives global uniqueness and the language-derived extension lets servers
     /// like lua-language-server recognize the file type. On both paths the
-    /// whole filename is percent-encoded as one segment ([`encode_filename`]),
+    /// whole filename is percent-encoded as one segment ([`EncodedFilename`]),
     /// since unknown languages pass through as document-controlled extensions.
     pub(crate) fn to_uri_string(&self) -> String {
         self.rendering().0.clone()
@@ -272,27 +323,28 @@ impl VirtualDocumentUri {
     /// [`to_lsp_uri`](Self::to_lsp_uri).
     fn rendering(&self) -> &(String, tower_lsp_server::ls_types::Uri) {
         self.rendered.get_or_init(|| {
-            let extension = Self::language_to_extension(&self.language);
-            let virtual_filename = format!("{VIRTUAL_URI_PREFIX}{}.{extension}", self.region_id);
-            let encoded_filename = encode_filename(&virtual_filename).to_string();
+            let filename = EncodedFilename {
+                region_id: &self.region_id,
+                extension: Self::language_to_extension(&self.language),
+            };
             validated_rendering(
-                self.render_hierarchical(&encoded_filename),
-                || self.render_fallback(&encoded_filename),
+                self.render_hierarchical(&filename),
+                || self.render_fallback(&filename),
                 &self.host_uri,
             )
         })
     }
 
     /// The host-relative form, or `None` for a cannot-be-a-base host.
-    fn render_hierarchical(&self, encoded_filename: &str) -> Option<String> {
-        // The parsed host URL is identical for every region of a host
-        // document, but this function runs once per forwarded message — for a
-        // fence-heavy document the repeated full URL parse was a measured
-        // tokio-side hotspot (thousands of parses on the runtime). Cache the
-        // parsed `Url` per host URI (tiny map — one entry per open host
-        // document — and never stale: the value is a pure function of the
-        // key). Cannot-be-a-base hosts (untitled:, mailto:, data:) cache `None`.
-        static HOST_BASES: std::sync::OnceLock<dashmap::DashMap<String, Option<url::Url>>> =
+    fn render_hierarchical(&self, filename: &EncodedFilename<'_>) -> Option<String> {
+        // The host part is identical for every region of a host document, but
+        // this function runs once per forwarded message — for a fence-heavy
+        // document the repeated full URL parse was a measured tokio-side
+        // hotspot (thousands of parses on the runtime). Cache it per host URI
+        // (tiny map — one entry per open host document — and never stale: the
+        // value is a pure function of the key). Cannot-be-a-base hosts
+        // (untitled:, mailto:, data:) cache `None`.
+        static HOST_BASES: std::sync::OnceLock<dashmap::DashMap<String, Option<HostBase>>> =
             std::sync::OnceLock::new();
         // Values are pure functions of the key, so eviction never risks
         // staleness — the cap only bounds memory in sessions that touch many
@@ -300,43 +352,28 @@ impl VirtualDocumentUri {
         // is fine: the map refills at one parse per open host document.
         const HOST_BASES_CAP: usize = 1024;
         let bases = HOST_BASES.get_or_init(dashmap::DashMap::new);
-        let base = match bases.get(self.host_uri.as_str()) {
-            Some(hit) => hit.clone(),
-            None => {
-                if bases.len() >= HOST_BASES_CAP {
-                    bases.clear();
-                }
-                let computed = url::Url::parse(self.host_uri.as_str())
-                    .ok()
-                    .filter(|url| !url.cannot_be_a_base());
-                bases
-                    .entry(self.host_uri.as_str().to_string())
-                    .or_insert_with(|| computed.clone());
-                computed
-            }
-        };
-        let mut url = base?;
-        // Replace the host filename with the pre-encoded one via `set_path`,
-        // which keeps existing escapes. `PathSegmentsMut::push` would re-escape
-        // `%` and leaves characters such as `|` or `[` literal, which
-        // `ls_types::Uri` rejects.
-        let directory = url
-            .path()
-            .rfind('/')
-            .map_or("", |slash| &url.path()[..slash]);
-        let path = format!("{directory}/{encoded_filename}");
-        url.set_path(&path);
-        Some(url.to_string())
+        if let Some(hit) = bases.get(self.host_uri.as_str()) {
+            return hit.as_ref().map(|base| base.render(filename));
+        }
+        if bases.len() >= HOST_BASES_CAP {
+            bases.clear();
+        }
+        let computed = HostBase::parse(self.host_uri.as_str());
+        let rendered = computed.as_ref().map(|base| base.render(filename));
+        bases
+            .entry(self.host_uri.as_str().to_string())
+            .or_insert(computed);
+        rendered
     }
 
     /// The `kakehashi:` form for hosts without a directory: every component is
     /// percent-encoded, keeping the host URI for traceability.
-    fn render_fallback(&self, encoded_filename: &str) -> String {
+    fn render_fallback(&self, filename: &EncodedFilename<'_>) -> String {
         let encoded_host = percent_encoding::utf8_percent_encode(
             self.host_uri.as_str(),
             percent_encoding::NON_ALPHANUMERIC,
         );
-        format!("kakehashi:///virtual/{encoded_host}/{encoded_filename}")
+        format!("kakehashi:///virtual/{encoded_host}/{filename}")
     }
 
     /// Map language name to file extension (downstream servers like
@@ -1260,6 +1297,26 @@ mod properties {
                 rendered_url.fragment(),
                 host_url.as_ref().and_then(url::Url::fragment)
             );
+        }
+
+        #[test]
+        fn host_base_splice_equals_url_set_path(
+            host in host(),
+            language in language(),
+            region in region_id(),
+        ) {
+            let Some(base) = HostBase::parse(host.as_str()) else {
+                return Ok(());
+            };
+            let filename = EncodedFilename {
+                region_id: &region,
+                extension: VirtualDocumentUri::language_to_extension(&language),
+            };
+            let mut url = url::Url::parse(host.as_str()).unwrap();
+            let directory = url.path().rfind('/').map_or("", |slash| &url.path()[..slash]);
+            let path = format!("{directory}/{filename}");
+            url.set_path(&path);
+            prop_assert_eq!(base.render(&filename), url.to_string());
         }
 
         #[test]
