@@ -322,6 +322,34 @@ mod tests {
         LspService<Kakehashi>,
         Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     ) {
+        initialized_server_answering(serde_json::json!([folder(first, "first")]), vec![answer])
+            .await
+    }
+
+    /// [`initialized_pull_capable_server`], with the `workspaceFolders` sent
+    /// at `initialize` spelled out and one answer per pull, in order — the
+    /// last one repeating once they run out.
+    async fn initialized_server_answering(
+        workspace_folders: serde_json::Value,
+        answers: Vec<serde_json::Value>,
+    ) -> (
+        LspService<Kakehashi>,
+        Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
+        initialized_server_holding_answers(workspace_folders, answers, None).await
+    }
+
+    /// [`initialized_server_answering`], but the first pull is answered only
+    /// once `release_first` is notified — so a test can move the session
+    /// while that answer is in flight.
+    async fn initialized_server_holding_answers(
+        workspace_folders: serde_json::Value,
+        answers: Vec<serde_json::Value>,
+        release_first: Option<Arc<tokio::sync::Notify>>,
+    ) -> (
+        LspService<Kakehashi>,
+        Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
         use futures::{SinkExt, StreamExt};
         use tower::{Service, ServiceExt};
         use tower_lsp_server::jsonrpc::{Request, Response};
@@ -336,10 +364,21 @@ mod tests {
                     continue;
                 };
                 let result = if request.method() == "workspace/configuration" {
-                    recorded
-                        .lock()
-                        .unwrap()
-                        .push(request.params().cloned().unwrap_or_default());
+                    let count = {
+                        let mut recorded = recorded.lock().unwrap();
+                        recorded.push(request.params().cloned().unwrap_or_default());
+                        recorded.len()
+                    };
+                    if count == 1
+                        && let Some(release) = release_first.as_ref()
+                    {
+                        release.notified().await;
+                    }
+                    let answer = answers
+                        .get(count - 1)
+                        .or(answers.last())
+                        .cloned()
+                        .unwrap_or_default();
                     serde_json::json!([answer])
                 } else {
                     serde_json::Value::Null
@@ -358,7 +397,7 @@ mod tests {
                     "configuration": true,
                     "workspaceFolders": true,
                 } },
-                "workspaceFolders": [folder(first, "first")],
+                "workspaceFolders": workspace_folders,
             }))
             .id(1)
             .finish();
@@ -451,6 +490,80 @@ mod tests {
         assert!(
             pulls.lock().unwrap().is_empty(),
             "a folder change that keeps the selected root must not pull"
+        );
+    }
+
+    /// Trigger a pull the way a pull-model editor does: a
+    /// `didChangeConfiguration` carrying no payload.
+    async fn pull_now(server: &Kakehashi) {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            server.did_change_configuration_impl(
+                tower_lsp_server::ls_types::DidChangeConfigurationParams {
+                    settings: serde_json::Value::Null,
+                },
+            ),
+        )
+        .await
+        .expect("a pull must not hang");
+    }
+
+    /// An answer asked while the session sat at one root and arriving after it
+    /// moved to another was read for a workspace no longer selected: it is
+    /// dropped, and the root change's own pull asks again.
+    #[tokio::test]
+    #[serial(xdg_env)]
+    async fn an_answer_for_a_root_the_session_left_is_discarded() {
+        let xdg_scratch = tempfile::tempdir().expect("failed to create scratch XDG_CONFIG_HOME");
+        let _xdg_guard = XdgConfigHomeGuard::set(xdg_scratch.path());
+        let first = tempfile::tempdir().expect("failed to create first workspace dir");
+        let second = tempfile::tempdir().expect("failed to create second workspace dir");
+        let release_first = Arc::new(tokio::sync::Notify::new());
+
+        let (service, pulls) = initialized_server_holding_answers(
+            serde_json::json!([folder(first.path(), "first")]),
+            vec![
+                serde_json::json!({ "searchPaths": ["./stale"] }),
+                serde_json::Value::Null,
+            ],
+            Some(Arc::clone(&release_first)),
+        )
+        .await;
+        let server = service.inner();
+
+        let move_root_while_answering = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while pulls.lock().unwrap().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the first pull must be asked");
+            server
+                .did_change_workspace_folders_impl(DidChangeWorkspaceFoldersParams {
+                    event: WorkspaceFoldersChangeEvent {
+                        added: vec![folder(second.path(), "second")],
+                        removed: vec![folder(first.path(), "first")],
+                    },
+                })
+                .await;
+            release_first.notify_one();
+        };
+        tokio::join!(pull_now(server), move_root_while_answering);
+
+        assert_eq!(
+            pulls.lock().unwrap().len(),
+            2,
+            "the root change must still ask again"
+        );
+        assert!(
+            !server
+                .settings_manager
+                .load_settings()
+                .search_paths
+                .iter()
+                .any(|path| path.ends_with("stale")),
+            "an answer read for the root the session left must not be applied"
         );
     }
 }
