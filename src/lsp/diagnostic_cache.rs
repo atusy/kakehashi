@@ -195,6 +195,13 @@ pub(crate) fn push_slot_servers(snapshot: &SourceSlots) -> std::collections::Has
     servers
 }
 
+/// Whether `slots` holds any `Region` source at all (empty slots included).
+pub(crate) fn has_region_sources(slots: &SourceSlots) -> bool {
+    slots
+        .keys()
+        .any(|source| matches!(source, DiagnosticSource::Region(_)))
+}
+
 /// Keep only the `Region` push slots `keep(region_id, server)` accepts,
 /// dropping any `Region` source left empty. `Host` and `PullLayer` sources are
 /// untouched. Filters a publish/pull snapshot clone; the cache keeps the slots,

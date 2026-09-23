@@ -1846,12 +1846,11 @@ impl DiagnosticPublisher {
                     resolved.line_column_offsets.clone(),
                 ),
             );
-            geometry.injection_languages.insert(
-                resolved.region.region_id.clone(),
-                resolved.injection_language.clone(),
-            );
         }
         geometry.host_language = Some(language_name);
+        // The regions are shared (`Arc`), so the per-region injection
+        // languages the push gate needs cost no clones here.
+        geometry.regions = Some(resolved_regions);
         // The offsets describe the captured snapshot; an edit (or reopen)
         // landing since makes them stale positions for the text the editor
         // now holds, and edits do not move the generation `settled` watches.
@@ -1879,9 +1878,21 @@ impl DiagnosticPublisher {
         snapshot: &mut crate::lsp::diagnostic_cache::SourceSlots,
         geometry: &RegionGeometry,
     ) {
-        let Some(host_language) = geometry.host_language.as_deref() else {
+        let (Some(host_language), Some(regions)) = (
+            geometry.host_language.as_deref(),
+            geometry.regions.as_deref(),
+        ) else {
             return; // no regions resolve: the merge drops every region slot
         };
+        let injection_languages: HashMap<&str, &str> = regions
+            .iter()
+            .map(|resolved| {
+                (
+                    resolved.region.region_id.as_str(),
+                    resolved.injection_language.as_str(),
+                )
+            })
+            .collect();
         let mut allowlist = crate::lsp::lsp_impl::bridge_context::RegionPushAllowlist::new(
             &self.bridge,
             settings,
@@ -1889,23 +1900,22 @@ impl DiagnosticPublisher {
             "textDocument/publishDiagnostics",
         );
         crate::lsp::diagnostic_cache::retain_region_push_slots(snapshot, |region_id, server| {
-            geometry
-                .injection_languages
+            injection_languages
                 .get(region_id)
                 .is_none_or(|language| allowlist.admits(language, server))
         });
     }
 }
 
-/// A host's current injection geometry: each resolvable region's offset and
-/// injection language, and the host language they were resolved under.
-/// Empty when there legitimately are no regions (closed host, no injection
-/// query).
+/// A host's current injection geometry: each resolvable region's offset, the
+/// resolved regions themselves (for their injection languages), and the host
+/// language they were resolved under. Empty when there legitimately are no
+/// regions (closed host, no injection query).
 #[derive(Default)]
 struct RegionGeometry {
     host_language: Option<String>,
     offsets: HashMap<String, RegionOffset>,
-    injection_languages: HashMap<String, String>,
+    regions: Option<Arc<Vec<crate::language::injection::ResolvedInjection>>>,
 }
 
 /// Remove `Region`/`Host` push slots whose server is in `pull_driven` when a

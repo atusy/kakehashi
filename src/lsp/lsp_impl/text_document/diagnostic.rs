@@ -574,8 +574,31 @@ impl Kakehashi {
         // language). A region without an offset is skipped by
         // `cached_push_diagnostics`, so this map doubles as the per-region
         // pushFallback gate — no separate set, no `region_id` clone.
+        // The pull's own `priorities` allowlist gates the folded pushes too
+        // (#916): a push-driven server the list omits must not reach the
+        // editor through the fold any more than the live pull dispatches to it.
+        // Keyed by borrowed region metadata (no clones), and skipped outright
+        // when no region push is cached. A region without `pushFallback` needs
+        // no check here: it gets no offset below, so the fold skips it anyway.
+        if crate::lsp::diagnostic_cache::has_region_sources(&snapshot) {
+            let injection_languages: HashMap<&str, &str> = region_meta
+                .iter()
+                .map(|(region_id, language, _)| (region_id.as_str(), language.as_str()))
+                .collect();
+            let mut allowlist = crate::lsp::lsp_impl::bridge_context::RegionPushAllowlist::new(
+                &self.bridge,
+                &settings,
+                language_name,
+                "textDocument/diagnostic",
+            );
+            retain_region_push_slots(&mut snapshot, |region_id, server| {
+                injection_languages
+                    .get(region_id)
+                    .is_some_and(|language| allowlist.admits(language, server))
+            });
+        }
+
         let mut region_offsets = HashMap::new();
-        let mut region_languages = HashMap::new();
         let mut push_fallback_by_lang: HashMap<String, bool> = HashMap::new();
         for (region_id, injection_language, offset) in region_meta {
             // `get` on the common (cache-hit) path is a single lookup; only the
@@ -591,30 +614,14 @@ impl Kakehashi {
                         "textDocument/diagnostic",
                     )
                     .push_fallback;
-                    push_fallback_by_lang.insert(injection_language.clone(), fallback);
+                    push_fallback_by_lang.insert(injection_language, fallback);
                     fallback
                 }
             };
             if push_fallback {
-                region_offsets.insert(region_id.clone(), offset);
-                region_languages.insert(region_id, injection_language);
+                region_offsets.insert(region_id, offset);
             }
         }
-
-        // The pull's own `priorities` allowlist gates the folded pushes too
-        // (#916): a push-driven server the list omits must not reach the
-        // editor through the fold any more than the live pull dispatches to it.
-        let mut allowlist = crate::lsp::lsp_impl::bridge_context::RegionPushAllowlist::new(
-            &self.bridge,
-            &settings,
-            language_name,
-            "textDocument/diagnostic",
-        );
-        retain_region_push_slots(&mut snapshot, |region_id, server| {
-            region_languages
-                .get(region_id)
-                .is_some_and(|language| allowlist.admits(language, server))
-        });
 
         // Host `pushFallback` gate: the host layer participates AND pushFallback
         // is on for the host's diagnostic method. Then the same `priorities`
