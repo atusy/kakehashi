@@ -58,6 +58,13 @@ impl TestInstallClaim {
             .expect("test claim is present")
             .complete(outcome);
     }
+
+    /// End the claim the way a cancelled owner does: its outcome is published,
+    /// but the post-install reload it owed never ran.
+    pub(crate) fn publish_without_reload(mut self, outcome: InstallOutcome) {
+        let mut guard = self.guard.take().expect("test claim is present");
+        guard.preserve_terminal(outcome);
+    }
 }
 
 impl Drop for InstallResult {

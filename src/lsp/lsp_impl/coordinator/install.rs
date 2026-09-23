@@ -875,6 +875,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_reloaded_owner_spares_query_repair_waiters_a_second_reload() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), tree_sitter_rust::LANGUAGE.into());
+        let uri = Url::parse("file:///settled-owner.rs").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "fn main() {}".into(),
+            Some("rust".into()),
+            None,
+        );
+        let original = server
+            .parse_coordinator()
+            .reparse_installed_document(uri.clone(), "rust", Some(incarnation))
+            .await
+            .expect("initial parse");
+        let claim = server.auto_install.begin_test_claim(
+            "rust",
+            query_dependency_paths(&server.settings_manager.load_settings(), "rust"),
+        );
+        let install = server.install_coordinator();
+        let mut waiter = Box::pin(install.maybe_auto_install_language(
+            "rust",
+            uri.clone(),
+            false,
+            Some(incarnation),
+            InstallRequest::new(true),
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(waiter.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        let generation = server.cache.semantic_token_generation();
+        // An owner completes its claim only after its own reload.
+        claim.complete(crate::lsp::auto_install::InstallOutcome::Success {
+            data_dir: "/installed".into(),
+        });
+        let completion = waiter.await;
+        assert_eq!(
+            server.cache.semantic_token_generation(),
+            generation,
+            "the owner already reloaded every document's queries"
+        );
+        assert_eq!(
+            completion.downstream_lineage(&server.documents, &uri, incarnation),
+            Some(original),
+            "the waiter still refreshes its own document's downstream"
+        );
+    }
+
+    #[tokio::test]
     async fn query_repair_request_survives_a_siblings_publication() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
@@ -917,10 +972,15 @@ mod tests {
         })
         .await;
         // Artifact success is intentionally published without an owner reload.
-        claim.complete(crate::lsp::auto_install::InstallOutcome::Success {
+        let generation = server.cache.semantic_token_generation();
+        claim.publish_without_reload(crate::lsp::auto_install::InstallOutcome::Success {
             data_dir: "/installed".into(),
         });
         let completion = waiter.await;
+        assert!(
+            server.cache.semantic_token_generation() > generation,
+            "a cancelled owner's reload falls to the waiter"
+        );
         assert!(completion.same_lifetime);
         assert!(
             completion.parsed.is_none(),
