@@ -803,16 +803,23 @@ Details:
   bridge-driven diagnostics off. With host bridging opted in, host servers
   are pulled with the real document URI and their diagnostics merge with
   the injection regions' per the layer `strategy`. Caveat: SPONTANEOUS
-  pushes a downstream server sends on its own bypass the
-  priorities/strategy machinery when proactively republished — cached and
-  concatenated across servers, except that push slots from pull-capable
+  pushes a downstream server sends on its own bypass the strategy
+  machinery when proactively republished — cached and concatenated across
+  servers, admitting only the servers the target's
+  `textDocument/publishDiagnostics` server-level `priorities` allowlist
+  names (`maxFanOut` is not applied), except that push slots from pull-capable
   servers are suppressed in favor of pull results while the pull layer is
   active (in mixed configurations this can suppress a push whose server was
   not itself pulled; host `_self` pushes keep their real host URIs and
   ranges as-is). When cached pushes later answer a client pull
   (`pushFallback`), only push-driven servers' slots fold in (pull-capable
-  servers excluded), under the CROSS-LAYER priorities/strategy only —
-  server-level `priorities`/`maxFanOut` are not reapplied.
+  servers excluded), admitting only the servers the
+  `textDocument/diagnostic` server-level `priorities` allowlist names, under
+  the CROSS-LAYER priorities/strategy — the server-level order and
+  `maxFanOut` are not reapplied. To keep a push-driven server (e.g. a
+  `languages = ["*"]` spell checker) out of one injection language on both
+  surfaces, omit it from both keys' `priorities` — or from the `_` method
+  wildcard's.
 - **Current effect**: the `virt` layer answers inside injection regions, and
   the `host` layer answers on the host document itself for the bridged
   request methods — including pull/push diagnostics, with the `bridge._self`
