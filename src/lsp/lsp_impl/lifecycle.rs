@@ -2354,10 +2354,11 @@ async fn deliver_upstream_notification(
 /// open documents under another root only, and respawning this key for them
 /// would start a process that holds nothing. The cheap configuration screen
 /// runs first, as in the respawn re-open; only its survivors pay for injection
-/// resolution and a (read-only) routing lookup. A document that cannot be
-/// looked at yet — its parse is still settling — counts as wanting the
-/// connection: respawning is the direction that does not lose diagnostics,
-/// and that parse would acquire the connection anyway.
+/// resolution and a routing lookup. A document that cannot be looked at —
+/// no settled tree — does not count: if a parse is pending, that parse's own
+/// eager open acquires the connection (respawning it) when it lands; if none
+/// ever will (no parser for its language), it has no regions to route, and
+/// counting it would let any such buffer revive every crashed connection.
 ///
 /// Injected regions only: the re-open that follows the respawn re-opens only
 /// injected regions, so a host-layer (`_self`) document would not bring the
@@ -2376,17 +2377,12 @@ async fn crashed_connection_is_wanted(
         if !bridge.host_language_can_reach_server(settings, &language, server) {
             continue;
         }
-        match injection.bridge_injections(&host) {
-            Some((host_language, Some(injections))) => {
-                if bridge
-                    .host_routes_to_connection(settings, &host_language, &host, injections, key)
-                    .await
-                {
-                    return true;
-                }
-            }
-            Some((_, None)) => return true,
-            None => {}
+        if let Some((host_language, Some(injections))) = injection.bridge_injections(&host)
+            && bridge
+                .host_routes_to_connection(settings, &host_language, &host, injections, key)
+                .await
+        {
+            return true;
         }
     }
     false
