@@ -752,6 +752,32 @@ impl BridgeCoordinator {
             .await
     }
 
+    /// Whether one of `host_uri`'s injections routes to exactly `connection`.
+    /// Read-only, like the routing it asks: nothing is opened or spawned.
+    pub(crate) async fn host_routes_to_connection(
+        &self,
+        settings: &Arc<WorkspaceSettings>,
+        host_language: &str,
+        host_uri: &Url,
+        injections: Vec<BridgeInjection>,
+        connection: &super::pool::ConnectionKey,
+    ) -> bool {
+        let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
+            return false;
+        };
+        self.injections_routed_to_server(
+            settings,
+            host_language,
+            host_uri,
+            &host_uri_lsp,
+            injections,
+            connection.server(),
+            Some(connection),
+        )
+        .await
+        .is_some()
+    }
+
     /// `host_uri`'s injections that bridge to `server_name`, with that server's
     /// resolved config — narrowed to those that route to `connection` when one
     /// is named. `None` when nothing is left: this host supplies nothing for

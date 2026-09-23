@@ -2347,6 +2347,51 @@ async fn deliver_upstream_notification(
     }
 }
 
+/// Whether some open document has an injected region that routes to `key` — a
+/// connection is only worth its process while one does (#977).
+///
+/// Per connection, not per server: under per-root pooling a server can have
+/// open documents under another root only, and respawning this key for them
+/// would start a process that holds nothing. The cheap configuration screen
+/// runs first, as in the respawn re-open; only its survivors pay for injection
+/// resolution and a (read-only) routing lookup. A document that cannot be
+/// looked at yet — its parse is still settling — counts as wanting the
+/// connection: respawning is the direction that does not lose diagnostics,
+/// and that parse would acquire the connection anyway.
+///
+/// Injected regions only: the re-open that follows the respawn re-opens only
+/// injected regions, so a host-layer (`_self`) document would not bring the
+/// server's diagnostics back and is left to its next request.
+async fn crashed_connection_is_wanted(
+    injection: &crate::lsp::lsp_impl::coordinator::InjectionCoordinator,
+    bridge: &crate::lsp::bridge::BridgeCoordinator,
+    settings: &Arc<crate::config::WorkspaceSettings>,
+    key: &crate::lsp::bridge::ConnectionKey,
+) -> bool {
+    let server = key.server();
+    for host in injection.open_host_uris() {
+        let Some((language, _)) = injection.screen_language(&host) else {
+            continue;
+        };
+        if !bridge.host_language_can_reach_server(settings, &language, server) {
+            continue;
+        }
+        match injection.bridge_injections(&host) {
+            Some((host_language, Some(injections))) => {
+                if bridge
+                    .host_routes_to_connection(settings, &host_language, &host, injections, key)
+                    .await
+                {
+                    return true;
+                }
+            }
+            Some((_, None)) => return true,
+            None => {}
+        }
+    }
+    false
+}
+
 /// Proactively respawn a downstream connection whose reader just exited, when
 /// that exit was a crash (#977).
 ///
@@ -2376,6 +2421,16 @@ fn spawn_crash_recovery(
             return;
         };
         let key = crashed.key().clone();
+        if key.is_shared() {
+            // Nothing here can re-root a dead shared instance: the marker roots
+            // it served died with its folder set. The next document that routes
+            // to it revives it with its roots intact.
+            log::debug!(
+                target: "kakehashi::bridge",
+                "Not respawning shared-instance {key}; the next document routed to it will"
+            );
+            return;
+        }
         let delay = match pool.schedule_crash_recovery(&key) {
             RecoveryDecision::Retry { attempt, delay } => {
                 log::info!(
@@ -2410,21 +2465,10 @@ fn spawn_crash_recovery(
             );
             return;
         };
-        // A server only earns its process back while some open document could
-        // use it. The same cheap configuration screen the re-open sweep runs
-        // first; a document it wrongly rejects is still healed the ordinary
-        // way, by its next edit.
-        let wanted = injection.open_host_uris().iter().any(|host| {
-            injection
-                .screen_language(host)
-                .is_some_and(|(language, _)| {
-                    bridge.host_language_can_reach_server(settings, &language, server)
-                })
-        });
-        if !wanted {
+        if !crashed_connection_is_wanted(&injection, &bridge, settings, &key).await {
             log::debug!(
                 target: "kakehashi::bridge",
-                "Not respawning {key}: no open document bridges to {server:?}"
+                "Not respawning {key}: no open document routes to it"
             );
             return;
         }
