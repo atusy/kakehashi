@@ -68,8 +68,10 @@ pub(crate) struct OpenExpectation<'a> {
     pub(crate) revision: Option<OpenRevision<'a>>,
 }
 
-/// Caller-owned document access for a revision-bound repair. Routing and
-/// connection acquisition happen before the edit lock is taken.
+/// Caller-owned document access for a revision-bound repair. Routing-provider
+/// requests and connection acquisition finish before the edit lock is taken.
+/// Queue-time workspace-folder announcements and connection liveness checks
+/// stay inside the edit/lifecycle critical section with the document enqueue.
 pub(crate) struct OpenRevision<'a> {
     pub(crate) content_version: u64,
     pub(crate) edit_lock: &'a tokio::sync::Mutex<()>,
@@ -409,6 +411,11 @@ impl LanguageServerPool {
                 drop(lifecycle_guard);
                 continue;
             }
+            // This applies an already-decided route through notifications; it
+            // does not await a routing-provider response. Keep these enqueues
+            // serialized with the following document open and host close. Both
+            // this operation and the open below need the pool's connection lock
+            // to reject a replaced handle before sending.
             if let Err(error) = self
                 .apply_host_routing_workspace_folders(&routing_uri, server_name, &handle)
                 .await
