@@ -104,14 +104,32 @@ fn fetch_parsers_lua_with_options(
         }
     });
 
+    fetch_parsers_lua_with_cache(cache.as_ref(), download_parsers_lua)
+}
+
+fn fetch_parsers_lua_with_cache(
+    cache: Option<&MetadataCache>,
+    download: impl FnOnce() -> Result<String, MetadataError>,
+) -> Result<HashMap<String, ParserMetadata>, MetadataError> {
     // Try cache first
-    if let Some(ref cache) = cache
+    if let Some(cache) = cache
         && let Some(cached_content) = cache.read()
     {
         return parse_parsers_lua(&cached_content);
     }
 
-    // Cache miss or no cache - fetch from network
+    let content = download()?;
+
+    // Update cache if available
+    if let Some(cache) = cache {
+        // Ignore cache write errors - caching is best-effort
+        let _ = cache.write(&content);
+    }
+
+    parse_parsers_lua(&content)
+}
+
+fn download_parsers_lua() -> Result<String, MetadataError> {
     let agent = agent_with_timeout(PARSERS_LUA_HTTP_TIMEOUT);
 
     let mut response = agent.get(PARSERS_LUA_URL).call().map_err(|e| match e {
@@ -127,13 +145,7 @@ fn fetch_parsers_lua_with_options(
         e => MetadataError::HttpError(e.to_string()),
     })?;
 
-    // Update cache if available
-    if let Some(cache) = cache {
-        // Ignore cache write errors - caching is best-effort
-        let _ = cache.write(&content);
-    }
-
-    parse_parsers_lua(&content)
+    Ok(content)
 }
 
 /// Parse the parsers.lua content to extract parser information.
