@@ -18,6 +18,7 @@ use crate::lsp::bridge::envelope::{ENVELOPE_KEY, should_envelope, wrap_envelope}
 use tower_lsp_server::ls_types::{CompletionItem, CompletionList, Position};
 use url::Url;
 
+use super::super::ConnectionKey;
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::translate_virtual_range_to_host;
 use super::super::protocol::{
@@ -63,9 +64,12 @@ impl LanguageServerPool {
         if !handle.has_capability("textDocument/completion") {
             return Ok(None);
         }
+        // Snapshot before sending: retirement advances the generation under
+        // the same connection lock that the request path checks before send.
+        let connection_key = handle.key().clone();
+        let connection_generation = self.document_connection_generation(&connection_key);
         // Read resolve support when the RESPONSE arrives, as the host layer
-        // does: a dynamic `resolveProvider` registration can land between
-        // send and reply, and the envelope decision should see it.
+        // does: a dynamic registration can land between send and reply.
         let origin = std::sync::Arc::clone(&handle);
         self.execute_position_bridge_request_with_handle(
             handle,
@@ -92,6 +96,8 @@ impl LanguageServerPool {
                         server_name,
                         injection_language,
                         incarnation: host_incarnation,
+                        connection_key: Some(&connection_key),
+                        connection_generation: Some(connection_generation),
                         host_uri: host_uri.as_str(),
                         region_id,
                         offset: ctx.offset,
@@ -408,6 +414,12 @@ pub(crate) struct KakehashiEnvelope {
     /// Host open incarnation that produced this item. Missing for legacy data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incarnation: Option<u64>,
+    /// Exact producing connection; absent in legacy envelopes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_key: Option<ConnectionKey>,
+    /// Generation of the process that produced the opaque item data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_generation: Option<u64>,
     /// Host document URI the completion was requested on. Used to re-resolve the
     /// same `(server, root)` connection for `completionItem/resolve` so the
     /// resolve reaches the very process that produced the item (#382) — without
@@ -513,6 +525,8 @@ pub(crate) struct EnvelopeContext<'a> {
     pub server_name: &'a str,
     pub injection_language: &'a str,
     pub incarnation: Option<u64>,
+    pub connection_key: Option<&'a ConnectionKey>,
+    pub connection_generation: Option<u64>,
     /// Host document URI the completion ran on, stored in the envelope so
     /// `completionItem/resolve` can route back to the originating connection.
     pub host_uri: &'a str,
@@ -537,6 +551,8 @@ pub(crate) fn envelope_item_data(item: &mut CompletionItem, ctx: &EnvelopeContex
         origin: ctx.server_name.to_string(),
         injection_language: ctx.injection_language.to_string(),
         incarnation: ctx.incarnation,
+        connection_key: ctx.connection_key.cloned(),
+        connection_generation: ctx.connection_generation,
         host_uri: ctx.host_uri.to_string(),
         region_id: ctx.region_id.to_string(),
         inner: None,
@@ -570,6 +586,8 @@ pub(crate) fn bridge_host_completion_items(
     host_uri: &str,
     incarnation: Option<u64>,
     server_resolves: bool,
+    connection_key: &ConnectionKey,
+    connection_generation: u64,
 ) {
     use tower_lsp_server::ls_types::CompletionResponse;
     let items = match response {
@@ -578,7 +596,14 @@ pub(crate) fn bridge_host_completion_items(
     };
     for item in items.iter_mut() {
         if should_envelope(item.data.as_ref(), server_resolves) {
-            envelope_host_item(item, server_name, host_uri, incarnation);
+            envelope_host_item(
+                item,
+                server_name,
+                host_uri,
+                incarnation,
+                connection_key,
+                connection_generation,
+            );
         }
     }
 }
@@ -593,12 +618,16 @@ pub(super) fn envelope_host_item(
     server_name: &str,
     host_uri: &str,
     incarnation: Option<u64>,
+    connection_key: &ConnectionKey,
+    connection_generation: u64,
 ) {
     let inner = item.data.take();
     let envelope = KakehashiEnvelope {
         origin: server_name.to_string(),
         injection_language: String::new(),
         incarnation,
+        connection_key: Some(connection_key.clone()),
+        connection_generation: Some(connection_generation),
         host_uri: host_uri.to_string(),
         region_id: String::new(),
         inner: None,
@@ -670,6 +699,8 @@ mod tests {
                 server_name: "lua-ls",
                 injection_language: "lua",
                 incarnation: Some(1),
+                connection_key: Some(&ConnectionKey::for_server("lua-ls")),
+                connection_generation: Some(0),
                 host_uri: "file:///test.md",
                 region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
                 offset,
@@ -1254,6 +1285,8 @@ mod tests {
             server_name: "lua-ls",
             injection_language: "markdown",
             incarnation: Some(1),
+            connection_key: Some(&ConnectionKey::for_server("lua-ls")),
+            connection_generation: Some(0),
             host_uri: "file:///test/doc.md",
             region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
             offset: &offset,
@@ -1339,13 +1372,26 @@ mod tests {
             items: vec![item()],
         });
         for response in [&mut array, &mut list] {
-            bridge_host_completion_items(response, "tsudoi-ls", "file:///doc.txt", Some(1), true);
+            bridge_host_completion_items(
+                response,
+                "tsudoi-ls",
+                "file:///doc.txt",
+                Some(1),
+                true,
+                &ConnectionKey::for_server("tsudoi-ls"),
+                17,
+            );
         }
 
         for (shape, items) in [("array", must_items(&array)), ("list", must_items(&list))] {
             let envelope = extract_envelope(&items[0])
                 .unwrap_or_else(|| panic!("{shape} response must be enveloped"));
             assert!(envelope.is_host_layer(), "{shape} envelope is host-layer");
+            assert_eq!(
+                envelope.connection_key,
+                Some(ConnectionKey::for_server("tsudoi-ls"))
+            );
+            assert_eq!(envelope.connection_generation, Some(17));
         }
     }
 
@@ -1383,6 +1429,8 @@ mod tests {
             "file:///doc.txt",
             Some(1),
             false,
+            &ConnectionKey::for_server("tsudoi-ls"),
+            0,
         );
 
         let items = must_items(&response);
@@ -1418,7 +1466,14 @@ mod tests {
             data: Some(json!({"pathCompletion": "/tmp/test"})),
             ..Default::default()
         };
-        envelope_host_item(&mut item, "tsudoi-ls", "file:///test/doc.txt", Some(1));
+        envelope_host_item(
+            &mut item,
+            "tsudoi-ls",
+            "file:///test/doc.txt",
+            Some(1),
+            &ConnectionKey::for_server("tsudoi-ls"),
+            0,
+        );
 
         // The two fields a host envelope leaves at their defaults must not
         // ride the wire — this rides in every enveloped item of a response.
@@ -1462,6 +1517,8 @@ mod tests {
                 server_name: "lua-ls",
                 injection_language: "markdown",
                 incarnation: Some(1),
+                connection_key: Some(&ConnectionKey::for_server("lua-ls")),
+                connection_generation: Some(0),
                 host_uri: "file:///test/doc.md",
                 region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
                 offset: &offset,
@@ -1486,6 +1543,8 @@ mod tests {
                 server_name: "lua-ls",
                 injection_language: "markdown",
                 incarnation: Some(1),
+                connection_key: Some(&ConnectionKey::for_server("lua-ls")),
+                connection_generation: Some(0),
                 host_uri: "file:///test/doc.md",
                 region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
                 offset: &offset,
@@ -1512,6 +1571,8 @@ mod tests {
             server_name: "lua-ls",
             injection_language: "markdown",
             incarnation: Some(1),
+            connection_key: Some(&ConnectionKey::for_server("lua-ls")),
+            connection_generation: Some(0),
             host_uri: "file:///test/doc.md",
             region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
             offset: &offset,
@@ -1555,6 +1616,8 @@ mod tests {
                 server_name: "lua-ls",
                 injection_language: "markdown",
                 incarnation: Some(1),
+                connection_key: Some(&ConnectionKey::for_server("lua-ls")),
+                connection_generation: Some(0),
                 host_uri: "file:///test/doc.md",
                 region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
                 offset: &offset,

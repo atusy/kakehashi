@@ -122,7 +122,9 @@ impl Kakehashi {
                 Ok(Some(HostCompletion {
                     response,
                     incarnation: expected_incarnation,
-                    // Two allocations per SERVER, versus an envelope per item
+                    connection_key: raw.handle.key().clone(),
+                    connection_generation: raw.connection_generation,
+                    // Keep identity per SERVER, versus an envelope per item
                     // in a task whose result the fan-in may well discard.
                     server_resolves: raw.handle.has_capability("completionItem/resolve"),
                     server_name: t.server_name,
@@ -213,6 +215,8 @@ struct HostCompletion {
     server_resolves: bool,
     /// The host lifetime the items were computed under.
     incarnation: u64,
+    connection_key: crate::lsp::bridge::ConnectionKey,
+    connection_generation: u64,
 }
 
 impl HostCompletion {
@@ -223,6 +227,8 @@ impl HostCompletion {
             &self.host_uri,
             Some(self.incarnation),
             self.server_resolves,
+            &self.connection_key,
+            self.connection_generation,
         );
         self.response
     }

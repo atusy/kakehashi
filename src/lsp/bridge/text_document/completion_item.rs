@@ -603,6 +603,8 @@ fn re_envelope_item(item: &mut CompletionItem, envelope: &KakehashiEnvelope) {
         server_name: &envelope.origin,
         injection_language: &envelope.injection_language,
         incarnation: envelope.incarnation,
+        connection_key: envelope.connection_key.as_ref(),
+        connection_generation: envelope.connection_generation,
         host_uri: &envelope.host_uri,
         region_id: &envelope.region_id,
         offset: &RegionOffset::from(&envelope.offset),
@@ -631,6 +633,8 @@ mod tests {
             origin: "lua-ls".to_string(),
             injection_language: "markdown".to_string(),
             incarnation: Some(1),
+            connection_key: Some(crate::lsp::bridge::ConnectionKey::for_server("lua-ls")),
+            connection_generation: Some(0),
             host_uri: "file:///test/doc.md".to_string(),
             region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
             inner: Some(json!({"resolve_id": 99})),
@@ -989,6 +993,8 @@ mod tests {
             "tsudoi-ls",
             "file:///test/doc.txt",
             None,
+            &crate::lsp::bridge::ConnectionKey::for_server("tsudoi-ls"),
+            0,
         );
 
         for round in 1..=2 {
@@ -998,6 +1004,22 @@ mod tests {
                 "envelope must stay host-layer through resolve round {round}"
             );
             re_envelope_item(&mut item, &envelope);
+        }
+    }
+
+    #[test]
+    fn repeated_resolve_preserves_completion_producer_identity() {
+        let key = crate::lsp::bridge::ConnectionKey::for_server("lua-ls");
+        let mut value = serde_json::to_value(test_envelope()).unwrap();
+        value["connection_key"] = serde_json::to_value(&key).unwrap();
+        value["connection_generation"] = json!(7);
+        let mut item = CompletionItem::default();
+        for _ in 0..2 {
+            let envelope: KakehashiEnvelope = serde_json::from_value(value).unwrap();
+            re_envelope_item(&mut item, &envelope);
+            value = serde_json::to_value(strip_envelope(&mut item).unwrap()).unwrap();
+            assert_eq!(value["connection_key"], serde_json::to_value(&key).unwrap());
+            assert_eq!(value["connection_generation"], json!(7));
         }
     }
 
@@ -1029,6 +1051,8 @@ mod tests {
             origin: server.to_string(),
             injection_language: "markdown".to_string(),
             incarnation: Some(1),
+            connection_key: Some(crate::lsp::bridge::ConnectionKey::for_server("lua-ls")),
+            connection_generation: Some(0),
             host_uri: "file:///test/doc.md".to_string(),
             region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
             inner: Some(payload.clone()),
@@ -1187,6 +1211,8 @@ mod tests {
             "tsudoi-ls",
             "file:///test/doc.txt",
             None,
+            &crate::lsp::bridge::ConnectionKey::for_server("tsudoi-ls"),
+            0,
         );
 
         let result = pool
@@ -1357,7 +1383,14 @@ mod tests {
             data: Some(json!({"resolve_id": 42})),
             ..Default::default()
         };
-        envelope_host_item(&mut item, "lua-ls", "file:///test/doc.md", None);
+        envelope_host_item(
+            &mut item,
+            "lua-ls",
+            "file:///test/doc.md",
+            None,
+            &crate::lsp::bridge::ConnectionKey::for_server("lua-ls"),
+            0,
+        );
         let (result, warnings) = resolve_warnings_for(item);
         let envelope = extract_envelope(&result).expect("envelope restored");
         assert!(
@@ -1401,7 +1434,14 @@ mod tests {
             data: Some(forged.clone()),
             ..Default::default()
         };
-        envelope_host_item(&mut item, "lua-ls", "file:///test/doc.md", None);
+        envelope_host_item(
+            &mut item,
+            "lua-ls",
+            "file:///test/doc.md",
+            None,
+            &crate::lsp::bridge::ConnectionKey::for_server("lua-ls"),
+            0,
+        );
         let (result, warnings) = resolve_warnings_for(item);
         let envelope = extract_envelope(&result).expect("envelope restored");
         assert!(envelope.is_host_layer());
