@@ -2219,17 +2219,6 @@ impl DiagnosticAggregator {
             .map_or(0, Arc::strong_count)
     }
 
-    /// Drop every push slot produced by `connection_id` — a downstream connection
-    /// whose reader exited (crash/respawn, #469) — returning the host URIs that
-    /// lost at least one slot, so the caller can re-merge and republish them. The
-    /// synthetic pull-layer (tagged `None`) is never touched, and a restart's
-    /// re-push lands under a *new* connection id, so its slots survive this sweep.
-    /// O(total slots); called only on the rare connection-exit path.
-    ///
-    /// This evicts only **pushed** slots. A pull-driven server that dies leaves its
-    /// contribution in the cross-connection `PullLayer` blob until the next
-    /// host-event pull recomputes it — an intentional asymmetry (#469 targets the
-    /// push path; the pull layer self-refreshes on the next pull).
     /// Every non-empty push slot `connection_id` produced, as `(host, source,
     /// server)` — what [`Self::evict_connection`] would remove visibly. Read
     /// before an eviction so the caller can tell which servers' diagnostics
@@ -2252,6 +2241,17 @@ impl DiagnosticAggregator {
         slots
     }
 
+    /// Drop every push slot produced by `connection_id` — a downstream connection
+    /// whose reader exited (crash/respawn, #469) — returning the host URIs that
+    /// lost at least one slot, so the caller can re-merge and republish them. The
+    /// synthetic pull-layer (tagged `None`) is never touched, and a restart's
+    /// re-push lands under a *new* connection id, so its slots survive this sweep.
+    /// O(total slots); called only on the rare connection-exit path.
+    ///
+    /// This evicts only **pushed** slots. A pull-driven server that dies leaves its
+    /// contribution in the cross-connection `PullLayer` blob until the next
+    /// host-event pull recomputes it — an intentional asymmetry (#469 targets the
+    /// push path; the pull layer self-refreshes on the next pull).
     pub(crate) fn evict_connection(&self, connection_id: ProgressConnectionId) -> Vec<Url> {
         let mut revisions = self
             .cache_revisions
