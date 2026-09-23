@@ -4881,6 +4881,63 @@ mod reopen_order_tests {
         );
     }
 
+    /// A document with no tree to resolve regions from — here, one whose
+    /// language has no parser — must not keep a crashed connection wanted,
+    /// even for a server that bridges every language (#977).
+    #[tokio::test]
+    async fn an_unparsed_document_does_not_keep_a_crashed_connection_wanted() {
+        use super::*;
+        use crate::config::settings::BridgeServerConfig;
+        use tower_lsp_server::LspService;
+        use tower_lsp_server::ls_types::{DidOpenTextDocumentParams, TextDocumentItem};
+
+        let (service, mut socket) = LspService::new(Kakehashi::new);
+        // Drain what the server sends the editor, so its notifications never
+        // block on a full client channel.
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            while socket.next().await.is_some() {}
+        });
+        let server = service.inner();
+        let settings = crate::config::WorkspaceSettings {
+            auto_install: false,
+            language_servers: std::collections::HashMap::from([(
+                "anything".to_string(),
+                BridgeServerConfig {
+                    cmd: Some(vec!["true".to_string()]),
+                    languages: Some(vec![
+                        crate::config::settings::LANGUAGES_WILDCARD.to_string(),
+                    ]),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        server
+            .apply_raw_settings(Default::default(), settings)
+            .await;
+        let uri = Url::parse("file:///notes.no-such-language").unwrap();
+        server
+            .did_open_impl(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: crate::lsp::lsp_impl::url_to_uri(&uri).unwrap(),
+                    language_id: "no-such-language".into(),
+                    version: 1,
+                    text: "anything\n".into(),
+                },
+            })
+            .await;
+        let injection = server.injection_coordinator();
+        assert!(
+            injection.open_host_uris().contains(&uri),
+            "the document must be open for the check to mean anything"
+        );
+
+        let settings = server.settings_manager.load_settings();
+        let key = crate::lsp::bridge::ConnectionKey::for_server("anything");
+        assert!(!crashed_connection_is_wanted(&injection, &server.bridge, &settings, &key).await);
+    }
+
     #[test]
     fn current_documents_come_before_pending_ones_in_stable_order() {
         let hosts: Vec<Url> = [
