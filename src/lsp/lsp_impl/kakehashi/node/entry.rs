@@ -279,6 +279,15 @@ impl Kakehashi {
         // together with the layer selection and the mint over its result.
         let language = std::sync::Arc::clone(&self.language);
         let tracker = self.bridge.node_tracker_arc();
+        // Latch before checking snapshot currency so compute-pool work cannot
+        // reserve a scope or mint coordinates superseded by an edit or close.
+        let mint_epoch = tracker.mint_epoch(&uri);
+        if !self.documents.latest_snapshot(&uri).is_some_and(|view| {
+            view.slot.current_incarnation == incarnation
+                && view.content_version == snapshot.parsed_version
+        }) {
+            return Ok(Value::Null);
+        }
         let result = self
             .compute_pool
             .run(None, move || {
@@ -309,18 +318,26 @@ impl Kakehashi {
                     return Value::Null;
                 };
 
-                // Mint with the resolved layer index so a host and injected node
+                // Mint with the full tree scope so host and injected nodes
                 // sharing (start, end, kind) get distinct ULIDs and stay navigable
                 // in their own tree (lazy-node-identity-tracking §"Node Uniqueness
                 // Key", issue #313).
-                let ulid = tracker.get_or_create_in_layer_for_incarnation(
-                    &uri,
-                    node.start_byte(),
-                    node.end_byte(),
-                    static_node_kind(&node),
-                    layer_index,
-                    incarnation,
-                );
+                let scope = (layer_index > 0).then(|| {
+                    crate::language::node_tracker::NodeTreeScope::new(
+                        &layer.language,
+                        layer_index,
+                        &layer.tree,
+                    )
+                });
+                let ulid = tracker
+                    .mint_tree_batch(
+                        &uri,
+                        mint_epoch,
+                        incarnation,
+                        scope.as_ref(),
+                        [(node.start_byte(), node.end_byte(), static_node_kind(&node))],
+                    )
+                    .and_then(|mut ids| ids.pop());
                 let Some(ulid) = ulid else {
                     return Value::Null;
                 };

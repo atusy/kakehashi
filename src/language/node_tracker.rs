@@ -5,6 +5,10 @@
 //! that remain stable across document edits using position-based composite keys
 //! with START-priority invalidation.
 
+mod tree_scope;
+pub(crate) use tree_scope::NodeTreeScope;
+use tree_scope::{TREE_SCOPE_BASE, TreeScopes};
+
 use dashmap::DashMap;
 use log::{error, warn};
 use std::collections::HashMap;
@@ -76,6 +80,12 @@ struct UriEntries {
     named_layers: HashMap<usize, HashMap<String, usize>>,
     next_named_layer: usize,
     free_named_layers: Vec<usize>,
+    tree_scopes: TreeScopes,
+}
+
+pub(crate) struct ScopedNode {
+    pub(crate) position: (usize, usize, &'static str, usize, u64),
+    pub(crate) scope: Option<std::sync::Arc<NodeTreeScope>>,
 }
 
 #[derive(Clone, Copy)]
@@ -91,6 +101,21 @@ struct TrackedPosition {
 }
 
 impl UriEntries {
+    fn scoped_node(&self, id: &Ulid) -> Option<ScopedNode> {
+        let tracked = self.reverse.get(id)?;
+        let key = tracked.key;
+        Some(ScopedNode {
+            position: (
+                key.start_byte,
+                key.end_byte,
+                key.kind,
+                key.layer,
+                tracked.incarnation,
+            ),
+            scope: self.tree_scopes.scope(key.layer),
+        })
+    }
+
     fn named_layer(
         &mut self,
         pattern_index: usize,
@@ -166,6 +191,12 @@ impl UriEntries {
         if incarnation < self.latest_incarnation {
             return None;
         }
+        if (TREE_SCOPE_BASE..crate::language::injection::REGION_IDENTITY_LAYER_BASE)
+            .contains(&key.layer)
+            && !self.tree_scopes.contains(key.layer)
+        {
+            return None;
+        }
         self.latest_incarnation = incarnation;
         if let Some(existing) = self.forward.get(&key) {
             if existing.incarnation == incarnation {
@@ -223,6 +254,8 @@ impl UriEntries {
             .retain(|_, tracked| tracked.incarnation > closing_incarnation);
         self.reverse
             .retain(|_, tracked| tracked.incarnation > closing_incarnation);
+        let live_scopes = self.forward.keys().map(|key| key.layer).collect();
+        self.tree_scopes.retain(&live_scopes);
         if self.latest_incarnation <= closing_incarnation {
             self.named_layers.clear();
             self.next_named_layer = 0;
@@ -237,7 +270,7 @@ impl UriEntries {
 /// injection layers ("a Markdown `fenced_code_block` vs a Python `module`
 /// differ by kind"). Recursive same-language injection breaks that: a
 /// ```` ```markdown ```` block injected into Markdown yields the same kind at the
-/// same span in both the host and injected tree. `layer` (injection depth, `0` =
+/// same span in both the host and injected tree. `layer` (tree-scope token, `0` =
 /// host) restores uniqueness so the two get distinct ULIDs — see
 /// lazy-node-identity-tracking §"Node Uniqueness Key". `layer` is internal:
 /// clients only ever see the opaque ULID.
@@ -251,13 +284,8 @@ struct PositionKey {
     /// Storing the static slice avoids an allocation per tracker entry without
     /// losing any genuinely owned data.
     kind: &'static str,
-    /// Injection depth that minted the node (`0` = host). Preserved by position
-    /// adjustment: a depth index does not move with byte positions, so it is
-    /// carried through edits unchanged. It is *not* an absolute identity — an
-    /// edit that restructures injection nesting (adds/removes an outer layer)
-    /// shifts a node's true depth, leaving the stored `layer` stale. The held
-    /// ULID then degrades to "re-acquire" (see `with_resolved_node`), rather
-    /// than guaranteeing the node still lives at this depth.
+    /// URI-owned parse-scope token (`0` = host). Scope ranges shift alongside
+    /// node positions; tokens are not reused while the URI entry lives.
     layer: usize,
 }
 
@@ -594,6 +622,94 @@ impl NodeTracker {
         ))
     }
 
+    /// Read coordinates and their tree scope under one URI lock, so an edit
+    /// cannot mix positions from before a shift with ranges from after it.
+    pub(crate) fn lookup_node_scope(&self, uri: &Url, id: &Ulid) -> Option<ScopedNode> {
+        let entries = self.entries.get(uri)?;
+        entries.scoped_node(id)
+    }
+
+    pub(crate) fn lookup_node_scope_pair(
+        &self,
+        uri: &Url,
+        first: &Ulid,
+        second: &Ulid,
+    ) -> Option<(ScopedNode, ScopedNode)> {
+        let entries = self.entries.get(uri)?;
+        Some((entries.scoped_node(first)?, entries.scoped_node(second)?))
+    }
+
+    /// Reserve a tree identity and mint its nodes in the same edit/close latch.
+    pub(crate) fn mint_tree_batch(
+        &self,
+        uri: &Url,
+        expected: (u64, u64),
+        incarnation: u64,
+        scope: Option<&NodeTreeScope>,
+        keys: impl IntoIterator<Item = (usize, usize, &'static str)>,
+    ) -> Option<Vec<Ulid>> {
+        if !self.admits_incarnation(uri, incarnation) {
+            return None;
+        }
+        let hit = self.entries.get_mut(uri);
+        let mut entry = match hit {
+            Some(entry) => entry,
+            None => self.entries.entry(uri.clone()).or_default(),
+        };
+        if !self.admits_incarnation(uri, incarnation) {
+            drop(entry);
+            self.remove_pristine_entry(uri);
+            return None;
+        }
+        let epoch = self
+            .cleanup_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
+        if (entry.shift_gen, epoch) != expected || incarnation < entry.latest_incarnation {
+            return None;
+        }
+        if incarnation > entry.latest_incarnation {
+            entry.tree_scopes = TreeScopes::default();
+            entry.latest_incarnation = incarnation;
+        }
+        let mut keys = keys.into_iter().peekable();
+        if keys.peek().is_none() {
+            return Some(Vec::new());
+        }
+        let layer = match scope {
+            Some(scope) => entry.tree_scopes.register(scope)?,
+            None => 0,
+        };
+        keys.map(|(start, end, kind)| {
+            entry.get_or_insert(PositionKey::new(start, end, kind, layer), incarnation)
+        })
+        .collect()
+    }
+
+    /// A trailing captures walk may reuse identities, but cannot reserve scopes.
+    pub(crate) fn lookup_tree_batch(
+        &self,
+        uri: &Url,
+        incarnation: u64,
+        scope: Option<&NodeTreeScope>,
+        keys: impl IntoIterator<Item = (usize, usize, &'static str)>,
+    ) -> Vec<Ulid> {
+        let entries = self.entries.get(uri);
+        let layer = scope.map_or(Some(0), |scope| entries.as_ref()?.tree_scopes.get(scope));
+        keys.into_iter()
+            .map(|(start, end, kind)| {
+                entries
+                    .as_ref()
+                    .and_then(|entries| {
+                        let tracked = entries
+                            .forward
+                            .get(&PositionKey::new(start, end, kind, layer?))?;
+                        (tracked.incarnation == incarnation).then_some(tracked.ulid)
+                    })
+                    .unwrap_or_else(Ulid::generate)
+            })
+            .collect()
+    }
+
     /// Get the ULID for a position in a layer if it exists, without creating
     /// it — the read-only half of `get_or_create_in_layer`.
     ///
@@ -858,10 +974,17 @@ impl NodeTracker {
             named_layers: std::mem::take(&mut entries.named_layers),
             next_named_layer: entries.next_named_layer,
             free_named_layers: std::mem::take(&mut entries.free_named_layers),
+            tree_scopes: std::mem::take(&mut entries.tree_scopes),
         };
 
+        new_entries.tree_scopes.shift(edit);
+
         for (key, tracked) in entries.drain() {
-            if Self::should_invalidate_node(&key, edit) {
+            if Self::should_invalidate_node(&key, edit)
+                || ((TREE_SCOPE_BASE..crate::language::injection::REGION_IDENTITY_LAYER_BASE)
+                    .contains(&key.layer)
+                    && !new_entries.tree_scopes.contains(key.layer))
+            {
                 invalidated.push(tracked.ulid);
                 continue; // INVALIDATE
             }
@@ -896,6 +1019,8 @@ impl NodeTracker {
             }
         }
 
+        let live_scopes = new_entries.forward.keys().map(|key| key.layer).collect();
+        new_entries.tree_scopes.retain(&live_scopes);
         *entries = new_entries;
         invalidated
     }
@@ -1027,6 +1152,7 @@ impl NodeTracker {
         self.mint_batch_if_unshifted_for_incarnation(uri, expected, 0, keys)
     }
 
+    #[cfg(test)]
     pub(crate) fn mint_batch_if_unshifted_for_incarnation(
         &self,
         uri: &Url,
@@ -1130,6 +1256,7 @@ impl NodeTracker {
     /// The latch check + mint body of
     /// [`mint_batch_if_unshifted`](Self::mint_batch_if_unshifted), run while
     /// the caller holds `entry`'s exclusive lock.
+    #[cfg(test)]
     fn mint_batch_in_entry(
         &self,
         entry: &mut UriEntries,
@@ -1185,6 +1312,152 @@ mod tests {
 
     fn test_uri(name: &str) -> Url {
         Url::parse(&format!("file:///test/{}.md", name)).unwrap()
+    }
+
+    fn scope(ranges: &[(usize, usize)]) -> NodeTreeScope {
+        NodeTreeScope {
+            language: "rust".into(),
+            depth: 1,
+            ranges: ranges.to_vec(),
+        }
+    }
+
+    #[test]
+    fn tree_scope_and_nodes_shift_together_and_keep_identity() {
+        let tracker = NodeTracker::new();
+        let uri = test_uri("scope_shift");
+        let old = scope(&[(10, 20), (30, 40)]);
+        let id = tracker
+            .mint_tree_batch(
+                &uri,
+                tracker.mint_epoch(&uri),
+                0,
+                Some(&old),
+                [(12, 15, "identifier")],
+            )
+            .unwrap()[0];
+        tracker.apply_input_edits(&uri, &[EditInfo::new(0, 0, 3)]);
+        let node = tracker.lookup_node_scope(&uri, &id).unwrap();
+        assert_eq!(node.position.0, 15);
+        assert_eq!(node.scope.as_deref().unwrap().ranges, [(13, 23), (33, 43)]);
+        let shifted = scope(&[(13, 23), (33, 43)]);
+        assert_eq!(
+            tracker
+                .mint_tree_batch(
+                    &uri,
+                    tracker.mint_epoch(&uri),
+                    0,
+                    Some(&shifted),
+                    [(15, 18, "identifier")]
+                )
+                .unwrap(),
+            [id]
+        );
+    }
+
+    #[test]
+    fn retired_tree_tokens_cannot_be_reused_by_delayed_navigation() {
+        let tracker = NodeTracker::new();
+        let uri = test_uri("scope_retire");
+        let old = scope(&[(10, 20)]);
+        let id = tracker
+            .mint_tree_batch(
+                &uri,
+                tracker.mint_epoch(&uri),
+                0,
+                Some(&old),
+                [(15, 18, "identifier")],
+            )
+            .unwrap()[0];
+        let token = tracker.lookup_node(&uri, &id).unwrap().3;
+        tracker.apply_input_edits(&uri, &[EditInfo::new(10, 11, 11)]);
+        assert!(
+            tracker.lookup_node(&uri, &id).is_none(),
+            "region boundary replacement retires its surviving interior nodes"
+        );
+        let new = tracker
+            .mint_tree_batch(
+                &uri,
+                tracker.mint_epoch(&uri),
+                0,
+                Some(&old),
+                [(15, 18, "identifier")],
+            )
+            .unwrap()[0];
+        assert_ne!(tracker.lookup_node(&uri, &new).unwrap().3, token);
+        assert!(
+            tracker
+                .get_or_create_in_layer_for_incarnation(&uri, 14, 19, "parent", token, 0)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn converging_tree_scopes_preserve_both_existing_tokens() {
+        let tracker = NodeTracker::new();
+        let uri = test_uri("scope_collision");
+        let ids: Vec<_> = [100, 90]
+            .into_iter()
+            .map(|end| {
+                tracker
+                    .mint_tree_batch(
+                        &uri,
+                        tracker.mint_epoch(&uri),
+                        0,
+                        Some(&scope(&[(0, end)])),
+                        [(10, 15, "identifier")],
+                    )
+                    .unwrap()[0]
+            })
+            .collect();
+        tracker.apply_input_edits(&uri, &[EditInfo::new(90, 100, 90)]);
+        let first = tracker.lookup_node_scope(&uri, &ids[0]).unwrap();
+        let second = tracker.lookup_node_scope(&uri, &ids[1]).unwrap();
+        assert_ne!(first.position.3, second.position.3);
+        assert_eq!(first.scope, second.scope);
+        let reused = tracker
+            .mint_tree_batch(
+                &uri,
+                tracker.mint_epoch(&uri),
+                0,
+                Some(&scope(&[(0, 90)])),
+                [(10, 15, "identifier")],
+            )
+            .unwrap()[0];
+        assert!(ids.contains(&reused));
+    }
+
+    #[test]
+    fn stale_tree_batch_does_not_reserve_a_scope() {
+        let tracker = NodeTracker::new();
+        let uri = test_uri("stale_scope");
+        let epoch = tracker.mint_epoch(&uri);
+        tracker.apply_input_edits(&uri, &[EditInfo::new(0, 0, 1)]);
+        let scope = scope(&[(10, 20)]);
+        assert!(
+            tracker
+                .mint_tree_batch(&uri, epoch, 0, Some(&scope), [(12, 15, "identifier")])
+                .is_none()
+        );
+        assert!(
+            tracker
+                .entries
+                .get(&uri)
+                .unwrap()
+                .tree_scopes
+                .get(&scope)
+                .is_none()
+        );
+        tracker.lookup_tree_batch(&uri, 0, Some(&scope), [(12, 15, "identifier")]);
+        assert!(
+            tracker
+                .entries
+                .get(&uri)
+                .unwrap()
+                .tree_scopes
+                .get(&scope)
+                .is_none()
+        );
     }
 
     #[test]

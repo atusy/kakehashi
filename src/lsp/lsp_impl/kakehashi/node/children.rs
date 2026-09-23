@@ -62,8 +62,10 @@ impl Kakehashi {
         // None means: never issued, invalidated by a prior edit, or this URI
         // has no entries. `layer` pins resolution and child minting to the
         // language tree that minted the node (node-reference-protocol Scope rule).
-        let Some((start, end, kind, layer, tracked_incarnation)) =
-            self.bridge.node_tracker().lookup_node(&uri, &ulid)
+        let Some(crate::language::node_tracker::ScopedNode {
+            position: (start, end, kind, layer, tracked_incarnation),
+            scope,
+        }) = self.bridge.node_tracker().lookup_node_scope(&uri, &ulid)
         else {
             return Ok(Value::Null);
         };
@@ -91,7 +93,7 @@ impl Kakehashi {
             return Ok(Value::Null);
         };
 
-        // Resolve in the minting layer only (`stack[layer]`), never falling back
+        // Resolve in the minting layer only (its recorded tree scope), never falling back
         // to other layers. node-reference-protocol "Navigation Methods":
         // children stay within a single language tree, so an injected node's
         // children come from the injected tree — not from the host node that
@@ -109,6 +111,7 @@ impl Kakehashi {
             end,
             kind,
             layer,
+            scope.as_deref(),
             |node| {
                 let mut cursor = node.walk();
                 node.children(&mut cursor)

@@ -21,7 +21,7 @@
 //! With `injection: true` the kind query runs across **every** layer — the
 //! host, then each injection region in document-order DFS — each layer
 //! resolving its own language's kind file, with result nodes minted in their
-//! layer's depth so they compose with `kakehashi/node/*` under the per-layer
+//! layer's tree scope so they compose with `kakehashi/node/*` under the per-layer
 //! Scope rule. Every match carries the producing layer's `language`. Deltas
 //! carry no `injection` parameter: the mode is **lineage state**, inherited
 //! from the most recent `full` for that `(uri, kind)`.
@@ -838,7 +838,7 @@ impl Kakehashi {
     /// Shared pipeline: validate `kind`, resolve the document, load + compile
     /// `queries/<lang>/<kind>.scm` per visited layer language, execute, and
     /// shape the wire JSON (matches tagged with their layer's `language` and
-    /// minted in their layer's depth).
+    /// minted in their layer's tree scope).
     ///
     /// `Err` only for a malformed `kind` (client bug); every "not currently
     /// resolvable" case — unknown document, no visited language with a kind
@@ -1562,7 +1562,7 @@ fn execute_captures_walk(
         // Per-layer id reconciliation (the §3 walk lever): resolve every
         // capture's ULID in ONE tracker entry-lock acquisition instead of
         // one per capture (~20k on an injection-heavy document). Minted in
-        // the layer's depth, so the id resolves in its minting layer via
+        // the layer's tree scope, so the id resolves in its minting layer via
         // kakehashi/node/* (per-layer Scope rule). The batch is keyed on the
         // walk's entry latch: a mid-walk edit refuses it wholesale (nothing
         // minted — no wrong-space entries, no purge), and the layer degrades
@@ -1572,44 +1572,29 @@ fn execute_captures_walk(
         // snapshot every span maps by construction, so the difference is
         // theoretical; the alignment (one id per capture, match order) is
         // what the shaping loop indexes by.
+        let scope = (depth > 0).then(|| {
+            crate::language::node_tracker::NodeTreeScope::new(layer_language, depth, layer_tree)
+        });
         let capture_keys = || {
             layer_matches.iter().flat_map(|m| {
                 m.captures
                     .iter()
-                    .map(|c| (c.start_byte + anchor, c.end_byte + anchor, c.kind, depth))
+                    .map(|c| (c.start_byte + anchor, c.end_byte + anchor, c.kind))
             })
         };
         let layer_ulids: Vec<ulid::Ulid> = if mint_into_tracker {
-            tracker.mint_batch_if_unshifted_for_incarnation(
+            tracker.mint_tree_batch(
                 uri,
                 entry_mint_epoch,
                 incarnation,
+                scope.as_ref(),
                 capture_keys(),
             )
         } else {
             None
         }
         .unwrap_or_else(|| {
-            // Read-only resolution (stale-at-entry serve, or a mid-walk edit
-            // refusing the batch): a position the intervening edits did not
-            // shift reuses its live id; an unknown position gets a fresh
-            // UNREGISTERED id — NOT Ulid::default() (the nil id), since
-            // unregistered ids must still be unique per capture.
-            capture_keys()
-                .map(|(start, end, kind, layer)| {
-                    match tracker.lookup_in_layer_for_incarnation(
-                        uri,
-                        start,
-                        end,
-                        kind,
-                        layer,
-                        incarnation,
-                    ) {
-                        Some(live) => live,
-                        None => ulid::Ulid::generate(),
-                    }
-                })
-                .collect()
+            tracker.lookup_tree_batch(uri, incarnation, scope.as_ref(), capture_keys())
         });
         let mut capture_idx = 0usize;
         for m in layer_matches.iter() {
@@ -3050,6 +3035,30 @@ mod tests {
                 cancel,
             )
         }
+    }
+
+    #[test]
+    fn overlapping_sibling_layers_mint_distinct_node_ids() {
+        let text = "fn outer() { let name = 1; }";
+        let rig = MatchCacheRig::new("file:///overlapping_node_layers.rs", text);
+        let layers = [
+            rust_layer(text, 0, text.len()),
+            rust_layer(text, text.find("let").unwrap(), text.find(';').unwrap() + 1),
+        ];
+        let (matches, _) = rig.walk(text, &layers, 0, None).unwrap();
+        let name_start = text.find("name").unwrap() as u64;
+        let ids: Vec<_> = matches
+            .iter()
+            .flat_map(|m| m["captures"].as_array().unwrap())
+            .filter(|c| c["range"]["start"]["character"].as_u64() == Some(name_start))
+            .map(|c| c["node"]["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 3, "host and both sibling trees capture name");
+        assert_eq!(
+            ids.iter().collect::<std::collections::HashSet<_>>().len(),
+            3,
+            "each minting tree must have its own node identity"
+        );
     }
 
     /// Batch id reconciliation alignment: every capture in a current serve
