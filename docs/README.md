@@ -616,12 +616,14 @@ whose merged `cmd` is still empty is skipped.
 A bridged server that crashes is restarted automatically while an injected
 region of an open document still routes to it: those regions are re-opened on
 the new process, so the diagnostics that vanished with it come back without
-an edit. Restarts back off
-(2 s, doubling) and stop after five in a row, starting over once the server
-has stayed up for a minute; a server that keeps dying is left down until the
-next edit or request needs it. A server that configuration no longer starts is
-never restarted. A `preferSharedInstance` instance, and a server serving only
-host documents (`_self`), are left to the next request that needs them.
+an edit. Restarts back off (2 s, doubling) and stop after five in a row,
+starting over only when a crash ends a run of at least a minute; a server that
+keeps dying is left down until the next edit or request needs it. A server
+that configuration no longer starts is never restarted. Host documents
+(`bridge._self`) are not re-opened by the restart, so their diagnostics return
+on the next request for that document — and a server serving only host
+documents, like a `preferSharedInstance` instance, is left for the next request
+to restart.
 
 **Servers for any language (`languages = ["*"]`)**
 
