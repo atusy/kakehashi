@@ -83,6 +83,57 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    #[test]
+    fn cache_replacement_preserves_an_open_reader() {
+        use std::io::Read;
+
+        let temp = tempdir().unwrap();
+        let cache = MetadataCache::with_default_ttl(temp.path());
+        cache.write("previous complete metadata").unwrap();
+        let mut reader = fs::File::open(cache.cache_path()).unwrap();
+
+        cache.write("replacement metadata").unwrap();
+
+        let mut previous = String::new();
+        reader.read_to_string(&mut previous).unwrap();
+        assert_eq!(previous, "previous complete metadata");
+        assert_eq!(cache.read().as_deref(), Some("replacement metadata"));
+    }
+
+    #[test]
+    fn failed_publication_preserves_destination_and_cleans_temporary_file() {
+        let temp = tempdir().unwrap();
+        let cache = MetadataCache::with_default_ttl(temp.path());
+        fs::create_dir_all(cache.cache_path()).unwrap();
+        let previous = cache.cache_path().join("keep");
+        fs::write(&previous, "unchanged").unwrap();
+
+        assert!(cache.write("replacement").is_err());
+
+        assert_eq!(fs::read_to_string(previous).unwrap(), "unchanged");
+        let entries: Vec<_> = fs::read_dir(&cache.cache_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("parsers.lua")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_write_replaces_dangling_symlink_without_creating_target() {
+        let temp = tempdir().unwrap();
+        let cache = MetadataCache::with_default_ttl(temp.path());
+        fs::create_dir_all(&cache.cache_dir).unwrap();
+        let missing = temp.path().join("absent.lua");
+        std::os::unix::fs::symlink(&missing, cache.cache_path()).unwrap();
+
+        cache.write("new metadata").unwrap();
+
+        assert!(!missing.exists());
+        assert!(fs::symlink_metadata(cache.cache_path()).unwrap().is_file());
+        assert_eq!(cache.read().as_deref(), Some("new metadata"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn cache_write_replaces_symlink_without_modifying_target() {

@@ -330,6 +330,48 @@ return {
 "#;
 
     #[test]
+    fn valid_fresh_cache_does_not_download() {
+        let temp = tempdir().unwrap();
+        let cache = MetadataCache::with_default_ttl(temp.path());
+        cache.write(VALID_METADATA).unwrap();
+
+        let parsers = fetch_parsers_lua_with_cache(Some(&cache), || {
+            panic!("valid fresh cache must avoid the network")
+        })
+        .unwrap();
+
+        assert_eq!(parsers["lua"].revision, "abc123");
+    }
+
+    #[test]
+    fn corrupt_cache_recovery_propagates_download_error() {
+        let temp = tempdir().unwrap();
+        let cache = MetadataCache::with_default_ttl(temp.path());
+        cache.write("return {}").unwrap();
+
+        let result = fetch_parsers_lua_with_cache(Some(&cache), || Err(MetadataError::Timeout));
+
+        assert!(matches!(result, Err(MetadataError::Timeout)));
+        assert_eq!(cache.read().as_deref(), Some("return {}"));
+    }
+
+    #[test]
+    fn cache_write_failure_does_not_discard_valid_download() {
+        let temp = tempdir().unwrap();
+        let cache = MetadataCache::with_default_ttl(temp.path());
+        std::fs::write(temp.path().join("cache"), "blocks directory creation").unwrap();
+
+        let parsers =
+            fetch_parsers_lua_with_cache(Some(&cache), || Ok(VALID_METADATA.to_owned())).unwrap();
+
+        assert_eq!(parsers["lua"].revision, "abc123");
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("cache")).unwrap(),
+            "blocks directory creation"
+        );
+    }
+
+    #[test]
     fn invalid_download_preserves_previous_cache() {
         let temp = tempdir().unwrap();
         let cache = MetadataCache::with_default_ttl(temp.path());
