@@ -1023,6 +1023,10 @@ impl LanguageCoordinator {
             filename,
         ) {
             Ok(r) => r,
+            Err(err @ crate::language::query_loader::QueryLoadError::RefusedLanguage(_)) => {
+                debug!("{err}");
+                return;
+            }
             Err(crate::language::query_loader::QueryLoadError::NotFound) => {
                 debug!(
                     "Query file {}/{} not found in search paths (this is normal if not provided)",

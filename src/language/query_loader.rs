@@ -1,5 +1,6 @@
 use crate::error::{LspError, LspResult};
 use crate::language::query_modeline::parse_modeline;
+use crate::text::terminal::escape_terminal_controls;
 use log::{debug, warn};
 use path_clean::PathClean;
 use std::fmt::Write;
@@ -77,6 +78,8 @@ struct ResolvedQuery {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum QueryLoadError {
+    #[error("Refused query lookup for language '{}': not a single path component", escape_terminal_controls(.0))]
+    RefusedLanguage(String),
     #[error("query file not found")]
     NotFound,
     #[error(transparent)]
@@ -159,6 +162,9 @@ impl QueryLoader {
         visited: &mut std::collections::HashSet<String>,
         emitted: &mut std::collections::HashSet<String>,
     ) -> Result<ResolvedQuery, QueryLoadError> {
+        if !is_single_path_component(lang_name) {
+            return Err(QueryLoadError::RefusedLanguage(lang_name.to_string()));
+        }
         if visited.contains(lang_name) {
             return Err(LspError::query(format!(
                 "Circular inheritance detected for language '{}'",
@@ -567,8 +573,26 @@ mod tests {
         .map(|resolved| resolved.content)
         .map_err(|e| match e {
             QueryLoadError::Other(e) => e,
-            not_found @ QueryLoadError::NotFound => LspError::query(not_found.to_string()),
+            other => LspError::query(other.to_string()),
         })
+    }
+
+    #[test]
+    fn rejected_query_name_reports_refusal_with_escaped_identifier() {
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let error = QueryLoader::load_query_with_inheritance(
+            &language,
+            NO_SEARCH_PATHS,
+            "../bad\n\u{1b}[31m",
+            "highlights.scm",
+        )
+        .err()
+        .expect("path-shaped names must be refused");
+        let message = error.to_string();
+        assert!(message.contains("not a single path component"), "{message}");
+        assert!(message.contains(r"../bad\n\u{1b}[31m"), "{message:?}");
+        assert!(!message.chars().any(char::is_control));
+        assert!(!matches!(error, QueryLoadError::NotFound));
     }
 
     #[test]

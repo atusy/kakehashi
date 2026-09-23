@@ -424,6 +424,10 @@ fn load_kind_query(
         file_name,
     ) {
         Ok(parsed) => parsed,
+        Err(err @ QueryLoadError::RefusedLanguage(_)) => {
+            log::debug!(target: "kakehashi::captures", "{err}");
+            return KindQueryLoad::Unavailable;
+        }
         Err(QueryLoadError::NotFound) => {
             log::debug!(
                 target: "kakehashi::captures",
