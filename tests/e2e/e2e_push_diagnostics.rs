@@ -2232,3 +2232,52 @@ fn e2e_respawn_reopen_does_not_undo_a_retraction() {
     client.send_request("shutdown", json!(null));
     client.send_notification("exit", json!(null));
 }
+
+/// #917: a pull-only server leaves no pushed slot to evict, yet a pull-mode
+/// editor still shows what it pulled from it — so retracting its regions must
+/// nudge the editor to pull again all the same.
+#[test]
+fn e2e_disabling_a_pull_only_bridged_language_refreshes_pull_clients() {
+    let wire_dir = tempfile::TempDir::new().expect("wire log dir");
+    let wire_log = wire_dir.path().join("wire.log");
+    let config_dir = tempfile::TempDir::new().expect("temp dir");
+    let config_path = config_dir.path().join("push_diagnostics.toml");
+    std::fs::write(&config_path, "").expect("write config");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("utf8 path"))
+        .env("MOCK_LSP_WIRE_LOG", wire_log.to_string_lossy())
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": refresh_capable_caps(),
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-pull": { "cmd": [mock_bin(), "diagnostics"], "languages": ["lua"] }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    open_host(&mut client);
+    wait_for_wire_count(&wire_log, "textDocument/didOpen", 1);
+
+    set_markdown_lua_bridge(&mut client, false);
+    wait_for_wire_count(&wire_log, "textDocument/didClose", 1);
+    let (refresh_id, _, _) = client
+        .wait_for_server_request_watching(
+            "workspace/diagnostic/refresh",
+            Duration::from_secs(10),
+            &["textDocument/publishDiagnostics"],
+        )
+        .expect("retracting a pull-only server's regions must nudge pull-mode clients");
+    client.send_response(refresh_id, json!(null));
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
