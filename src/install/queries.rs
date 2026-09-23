@@ -197,8 +197,8 @@ fn inherited_languages_in(
             Err(e) => {
                 log::debug!(
                     target: "kakehashi::install",
-                    "Ignoring unreadable runtime query {} while collecting dependencies: {e}",
-                    path.display()
+                    "Ignoring unreadable runtime query {:?} while collecting dependencies: {e}",
+                    path
                 );
                 continue;
             }
