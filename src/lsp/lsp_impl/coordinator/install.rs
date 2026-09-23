@@ -904,6 +904,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_repair_dropped_for_a_closed_document_rearms_the_check() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .apply_settings(auto_install_settings());
+        let install = server.install_coordinator();
+        // An edit pass found the chain in need of repair...
+        assert!(install.decide_query_repair("rust", false, || QueryChainState::NeedsRepair));
+        // ...but its document closed before the install could start.
+        let closed = Url::parse("file:///closed-before-repair.rs").unwrap();
+        install
+            .maybe_auto_install_language("rust", closed, true, Some(1), InstallRequest::new(true))
+            .await;
+        assert!(
+            install.decide_query_repair("rust", false, || QueryChainState::NeedsRepair),
+            "another document's edit pass must still be able to repair"
+        );
+    }
+
+    #[tokio::test]
     async fn query_repair_leaves_the_first_snapshot_to_the_inline_parse() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
