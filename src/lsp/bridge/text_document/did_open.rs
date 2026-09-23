@@ -14,9 +14,6 @@ use super::super::pool::{
 use super::super::protocol::VirtualDocumentUri;
 use super::super::protocol::{RoutingLanguageServer, RoutingParams, RoutingTextDocument};
 
-/// What the caller requires to STILL hold by the time an eager open actually
-/// runs. Both fields are preconditions checked inside the open, not inputs to
-/// it, which is why they travel together.
 /// Whether an eager open did what the caller asked for.
 ///
 /// Only a caller that named a `connection` can act on the difference, but the
@@ -43,6 +40,7 @@ pub(crate) enum OpenOutcome {
     NotOpened,
 }
 
+/// Preconditions that must still hold when an eager open reaches enqueue.
 pub(crate) struct OpenExpectation<'a> {
     /// The document lifetime the injections were resolved under; a close+reopen
     /// in between invalidates them.
@@ -65,6 +63,17 @@ pub(crate) struct OpenExpectation<'a> {
     /// not force a ready-only repair; it rejects a race that reacquires a
     /// different key after the group was formed.
     pub(crate) expected_connection: Option<ConnectionKey>,
+    /// A respawn repair must still describe the revision it resolved. Ordinary
+    /// deferred opens instead take their content from the latest-content cache.
+    pub(crate) revision: Option<OpenRevision<'a>>,
+}
+
+/// Caller-owned document access for a revision-bound repair. Routing and
+/// connection acquisition happen before the edit lock is taken.
+pub(crate) struct OpenRevision<'a> {
+    pub(crate) content_version: u64,
+    pub(crate) edit_lock: &'a tokio::sync::Mutex<()>,
+    pub(crate) read: &'a (dyn Fn() -> Option<super::super::HostRevision> + Send + Sync),
 }
 
 struct LifecycleCleanup<'a> {
@@ -206,6 +215,7 @@ impl LanguageServerPool {
             incarnation: expected_incarnation,
             connection: expected_key,
             expected_connection,
+            revision,
         } = expect;
         // Routing decisions for injected documents are cached by virtual URI.
         // Use one of those URIs for connection acquisition; resolving from the
@@ -356,6 +366,19 @@ impl LanguageServerPool {
             lifecycle: &lifecycle,
         };
         for injection in injections {
+            let _edit_guard = match revision.as_ref() {
+                Some(revision) => Some(revision.edit_lock.lock().await),
+                None => None,
+            };
+            if let Some(revision) = &revision
+                && (revision.read)()
+                    != Some(super::super::HostRevision {
+                        incarnation: expected_incarnation,
+                        content_version: revision.content_version,
+                    })
+            {
+                return OpenOutcome::NotOpened;
+            }
             // Hold the host cache guard through didOpen. didClose/reopen replaces
             // this entry, so it either linearizes after this open (and closes the
             // tracked virtual document) or wins first and makes this stale batch
@@ -895,6 +918,56 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn repair_rejects_content_superseded_before_open() {
+        let pool = LanguageServerPool::new();
+        let key = crate::lsp::bridge::ConnectionKey::for_server("test-server");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        pool.insert_connection(handle).await;
+        let host_uri = test_host_uri("revision_repair");
+        let uri = url_to_uri(&host_uri);
+        pool.open_host_incarnation(&host_uri, 1).await;
+        let edit_lock = tokio::sync::Mutex::new(());
+        let read = || {
+            Some(crate::lsp::bridge::HostRevision {
+                incarnation: 1,
+                content_version: 2,
+            })
+        };
+        let outcome = pool
+            .eager_open_virtual_documents(
+                "test-server",
+                &devnull_config(),
+                &host_uri,
+                &uri,
+                OpenExpectation {
+                    incarnation: 1,
+                    connection: Some(&key),
+                    expected_connection: None,
+                    revision: Some(super::OpenRevision {
+                        content_version: 1,
+                        edit_lock: &edit_lock,
+                        read: &read,
+                    }),
+                },
+                vec![super::super::super::coordinator::BridgeInjection {
+                    language: "lua".into(),
+                    region_id: TEST_ULID_LUA_0.into(),
+                    content: "print('old')".into(),
+                }],
+            )
+            .await;
+        assert_eq!(
+            outcome,
+            OpenOutcome::NotOpened,
+            "an edit superseded the resolved content"
+        );
+        assert!(!pool.is_document_opened_on_connection(
+            &VirtualDocumentUri::new(&uri, "lua", TEST_ULID_LUA_0),
+            &key,
+        ));
+    }
+
     /// Test that eager_open_virtual_documents marks virtual documents as opened.
     ///
     /// Given a ready server and injection data, calling eager_open_virtual_documents
@@ -941,6 +1014,7 @@ mod tests {
                     incarnation: 1,
                     connection: None,
                     expected_connection: None,
+                    revision: None,
                 },
                 injections,
             )
@@ -1004,6 +1078,7 @@ mod tests {
                     incarnation: 1,
                     connection: Some(&claimed),
                     expected_connection: None,
+                    revision: None,
                 },
                 vec![BridgeInjection {
                     language: "lua".to_string(),
@@ -1061,6 +1136,7 @@ mod tests {
                     incarnation: 1,
                     connection: Some(&shared_key),
                     expected_connection: None,
+                    revision: None,
                 },
                 vec![BridgeInjection {
                     language: "lua".to_string(),
@@ -1118,6 +1194,7 @@ mod tests {
                     incarnation: 1,
                     connection: Some(&gone),
                     expected_connection: None,
+                    revision: None,
                 },
                 injections,
             )
@@ -1173,6 +1250,7 @@ mod tests {
                     incarnation: 1,
                     connection: Some(&elsewhere),
                     expected_connection: None,
+                    revision: None,
                 },
                 vec![BridgeInjection {
                     language: "lua".to_string(),
@@ -1220,6 +1298,7 @@ mod tests {
                     incarnation: 1,
                     connection: Some(&routed_key),
                     expected_connection: None,
+                    revision: None,
                 },
                 vec![BridgeInjection {
                     language: "lua".to_string(),
@@ -1277,6 +1356,7 @@ mod tests {
                     incarnation: 1,
                     connection: None,
                     expected_connection: None,
+                    revision: None,
                 },
                 injections.clone(),
             )
@@ -1300,6 +1380,7 @@ mod tests {
                     incarnation: 1,
                     connection: None,
                     expected_connection: None,
+                    revision: None,
                 },
                 injections,
             )

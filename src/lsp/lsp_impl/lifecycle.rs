@@ -1867,21 +1867,13 @@ fn spawn_upstream_request(
                         // connection, so fanning out would only contend on the
                         // single-writer outbound queue.
                         let outcome = injection
-                            .bridge()
-                            .ensure_server_documents_open(
+                            .reopen_server_documents(
                                 &settings,
                                 &host_language,
                                 &host,
-                                crate::lsp::bridge::OpenExpectation {
-                                    incarnation: revision.incarnation,
-                                    // Both the filter and the target: only hosts
-                                    // that route here are opened, and they are
-                                    // opened HERE.
-                                    connection: Some(&key),
-                                    expected_connection: None,
-                                },
+                                revision,
+                                &key,
                                 injections,
-                                &reopen_server,
                             )
                             .await;
                         match outcome {

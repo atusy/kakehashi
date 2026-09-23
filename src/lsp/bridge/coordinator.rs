@@ -1799,6 +1799,7 @@ impl BridgeCoordinator {
                                 // The eager batch opens wherever the host routes now.
                                 connection: None,
                                 expected_connection: Some(connection_key.clone()),
+                                revision: None,
                             },
                             group_injections,
                         ) => {}
@@ -3515,6 +3516,7 @@ mod tests {
                     incarnation: 1,
                     connection: None,
                     expected_connection: None,
+                    revision: None,
                 },
                 injections,
                 "other-server",

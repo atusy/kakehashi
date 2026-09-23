@@ -989,6 +989,43 @@ impl InjectionCoordinator {
         }
     }
 
+    pub(crate) async fn reopen_server_documents(
+        &self,
+        settings: &std::sync::Arc<crate::config::WorkspaceSettings>,
+        host_language: &str,
+        uri: &Url,
+        revision: crate::lsp::bridge::HostRevision,
+        key: &crate::lsp::bridge::ConnectionKey,
+        injections: Vec<BridgeInjection>,
+    ) -> crate::lsp::bridge::OpenOutcome {
+        let edit_lock = self.documents.edit_lock(uri);
+        let read = || self.document_revision(uri);
+        let outcome = self
+            .bridge
+            .ensure_server_documents_open(
+                settings,
+                host_language,
+                uri,
+                crate::lsp::bridge::OpenExpectation {
+                    incarnation: revision.incarnation,
+                    connection: Some(key),
+                    expected_connection: None,
+                    revision: Some(crate::lsp::bridge::OpenRevision {
+                        content_version: revision.content_version,
+                        edit_lock: &edit_lock,
+                        read: &read,
+                    }),
+                },
+                injections,
+                key.server(),
+            )
+            .await;
+        if self.documents.get(uri).is_none() {
+            self.documents.remove_edit_lock_if_unshared(uri, &edit_lock);
+        }
+        outcome
+    }
+
     /// The host language and resolved bridge injections for `uri`, or `None`
     /// when the document has no detectable language. Lets a caller re-derive the
     /// injected regions on demand (the respawn re-open), mirroring the

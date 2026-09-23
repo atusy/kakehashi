@@ -8149,6 +8149,7 @@ mod tests {
                     incarnation: 1,
                     connection: None,
                     expected_connection: None,
+                    revision: None,
                 },
                 vec![super::super::coordinator::BridgeInjection {
                     language: "lua".to_string(),
@@ -8195,6 +8196,7 @@ mod tests {
                     incarnation: 1,
                     connection: None,
                     expected_connection: None,
+                    revision: None,
                 },
                 vec![super::super::coordinator::BridgeInjection {
                     language: "lua".to_string(),
