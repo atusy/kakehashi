@@ -494,10 +494,12 @@ impl InstallCoordinator {
             if let Some(data_dir) = terminal.data_dir()
                 && self.same_document_incarnation(&uri, expected_incarnation)
             {
-                if query_repair {
+                if query_repair && !completion_token.owner_settled() {
                     // A cancelled owner may publish its successful install
                     // outcome before reloading. Refresh explicitly rather than
                     // treating a terminal artifact outcome as a query-store ack.
+                    // An owner that completed the claim itself already
+                    // reloaded; repeating it would refresh every document again.
                     parsed = self
                         .reload_language_after_install(
                             language,

@@ -12,7 +12,10 @@ use std::{
     future::Future,
     io::Write,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tower_lsp_server::ls_types::MessageType;
 
@@ -37,12 +40,23 @@ pub(crate) struct InstallResult {
 #[derive(Clone)]
 pub(crate) struct InstallCompletion {
     pub(crate) receiver: tokio::sync::watch::Receiver<Option<InstallOutcome>>,
+    settled: Arc<AtomicBool>,
+}
+
+impl InstallCompletion {
+    /// Whether the owner completed the claim itself, which it does only after
+    /// the post-install reload it owes. A cancelled owner's outcome is
+    /// published without that reload. Meaningful once a terminal is observed.
+    pub(crate) fn owner_settled(&self) -> bool {
+        self.settled.load(Ordering::Acquire)
+    }
 }
 
 struct ClaimState {
     /// Immutable inputs: only callers with the same paths can reuse the outcome.
     search_paths: Vec<PathBuf>,
     completion: tokio::sync::watch::Sender<Option<InstallOutcome>>,
+    settled: Arc<AtomicBool>,
 }
 
 #[cfg(test)]
@@ -213,6 +227,8 @@ struct InstallMarkerGuard {
     installing: InstallingLanguages,
     claims: Arc<Mutex<HashMap<String, ClaimState>>>,
     completion: tokio::sync::watch::Sender<Option<InstallOutcome>>,
+    /// Set by an explicit [`Self::complete`], before the terminal is sent.
+    settled: Arc<AtomicBool>,
     language: String,
     terminal: Option<InstallOutcome>,
 }
@@ -224,6 +240,8 @@ impl InstallMarkerGuard {
 
     fn complete(mut self, outcome: InstallOutcome) {
         self.terminal = Some(outcome);
+        // Published by the watch send in Drop, which follows.
+        self.settled.store(true, Ordering::Release);
     }
 }
 
@@ -308,11 +326,13 @@ impl AutoInstallManager {
             .recover_poison("AutoInstallManager::begin_test_claim");
         assert!(!claims.contains_key(language));
         let (completion, _) = tokio::sync::watch::channel(None);
+        let settled = Arc::new(AtomicBool::new(false));
         claims.insert(
             language.to_string(),
             ClaimState {
                 search_paths,
                 completion: completion.clone(),
+                settled: Arc::clone(&settled),
             },
         );
         assert!(self.installing_languages.try_start_install(language));
@@ -321,6 +341,7 @@ impl AutoInstallManager {
                 installing: self.installing_languages.clone(),
                 claims: Arc::clone(&self.claims),
                 completion,
+                settled,
                 language: language.to_string(),
                 terminal: None,
             }),
@@ -432,6 +453,7 @@ impl AutoInstallManager {
                             events,
                             completion: Some(InstallCompletion {
                                 receiver: claim.completion.subscribe(),
+                                settled: Arc::clone(&claim.settled),
                             }),
                             claim: None,
                         };
@@ -441,11 +463,13 @@ impl AutoInstallManager {
                     claim.completion.subscribe()
                 } else {
                     let (completion, _) = tokio::sync::watch::channel(None);
+                    let settled = Arc::new(AtomicBool::new(false));
                     claims.insert(
                         language.to_string(),
                         ClaimState {
                             search_paths: search_paths.clone(),
                             completion: completion.clone(),
+                            settled: Arc::clone(&settled),
                         },
                     );
                     if !self.installing_languages.try_start_install(language) {
@@ -476,6 +500,7 @@ impl AutoInstallManager {
                         installing: self.installing_languages.clone(),
                         claims: Arc::clone(&self.claims),
                         completion,
+                        settled,
                         language: language.to_string(),
                         terminal: None,
                     };
@@ -908,6 +933,7 @@ mod tests {
             ClaimState {
                 search_paths: Vec::new(),
                 completion: completion.clone(),
+                settled: Arc::new(AtomicBool::new(false)),
             },
         );
 
@@ -915,6 +941,7 @@ mod tests {
             installing: installing.clone(),
             claims,
             completion,
+            settled: Arc::new(AtomicBool::new(false)),
             language: "lua".to_string(),
             terminal: None,
         };
