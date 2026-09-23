@@ -344,6 +344,12 @@ before this lock is acquired because it may wait on downstream queries.
 Query currency is rechecked after acquiring the connection and after the open
 completes. The connection guard orders content sends; the completion check
 prevents a reload during enqueue from reporting the old query set caught up.
+When that rejection follows successful enqueues, an incarnation-bound
+retry re-resolves current injections and forwards their contents to every opened
+region, refreshing the deferred-open cache too. This forwarding retry cannot be
+absorbed by a weaker eager-only retry, and repeats if another query reload spans
+its downstream pass. Each settlement wait is bounded; recovery does not report
+the rejected repair as successful.
 
 A required open uses the verified snapshot text directly: the latest forwarded
 virtual-content cache may still lag the completed parse. If another request
