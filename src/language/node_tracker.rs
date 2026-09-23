@@ -641,13 +641,13 @@ impl NodeTracker {
         Some((entries.scoped_node(first)?, entries.scoped_node(second)?))
     }
 
-    /// A new scope can leave old boundary geometries behind. Existing scopes
-    /// and the first injected tree need no whole-document reconciliation unless
-    /// a previous attempt was incomplete or lost its final admission race.
-    pub(crate) fn tree_scope_needs_reconciliation(&self, uri: &Url, scope: &NodeTreeScope) -> bool {
+    /// Edited or reconfigured injection topology needs one current full walk.
+    /// Repeated requests on reconciled snapshots and host-only tracking avoid it.
+    pub(crate) fn tree_scope_needs_reconciliation(&self, uri: &Url, generation: u64) -> bool {
         self.entries.get(uri).is_some_and(|entry| {
-            entry.tree_scopes.reconciliation_pending
-                || (!entry.tree_scopes.is_empty() && entry.tree_scopes.get(scope).is_none())
+            !entry.tree_scopes.is_empty()
+                && (entry.tree_scopes.reconciliation_pending
+                    || entry.tree_scopes.reconciled_query_generation != Some(generation))
         })
     }
 
@@ -1052,6 +1052,7 @@ impl NodeTracker {
         incarnation: u64,
         current: &std::collections::HashSet<NodeTreeScope>,
         unresolved: &[UnresolvedTreeScope],
+        generation: u64,
     ) {
         let Some(mut entry) = self.entries.get_mut(uri) else {
             return;
@@ -1066,6 +1067,7 @@ impl NodeTracker {
             return;
         }
         let retired = entry.tree_scopes.retire_absent(current, unresolved);
+        entry.tree_scopes.reconciled_query_generation = Some(generation);
         if retired.is_empty() {
             return;
         }
@@ -1389,20 +1391,19 @@ mod tests {
         tracker
             .mint_tree_batch(&uri, epoch, 0, Some(&old), [(5, 8, "identifier")])
             .unwrap();
-        assert!(!tracker.tree_scope_needs_reconciliation(&uri, &old));
-        assert!(tracker.tree_scope_needs_reconciliation(&uri, &current));
+        assert!(tracker.tree_scope_needs_reconciliation(&uri, 0));
         tracker
             .mint_tree_batch(&uri, epoch, 0, Some(&current), [(5, 8, "identifier")])
             .unwrap();
         assert!(
-            tracker.tree_scope_needs_reconciliation(&uri, &current),
+            tracker.tree_scope_needs_reconciliation(&uri, 0),
             "an incomplete walk must leave debt for even a known scope"
         );
         tracker.apply_input_edits(&uri, &[EditInfo::new(10, 10, 11)]);
         let shifted = scope(&[(0, 22)]);
-        tracker.retain_tree_scopes(&uri, epoch, 0, &Default::default(), &[]);
+        tracker.retain_tree_scopes(&uri, epoch, 0, &Default::default(), &[], 0);
         assert!(
-            tracker.tree_scope_needs_reconciliation(&uri, &shifted),
+            tracker.tree_scope_needs_reconciliation(&uri, 0),
             "a raced edit must not clear reconciliation debt"
         );
         tracker.retain_tree_scopes(
@@ -1411,11 +1412,35 @@ mod tests {
             0,
             &std::collections::HashSet::from([shifted.clone(), scope(&[(0, 21)])]),
             &[],
+            0,
         );
         assert!(
-            !tracker.tree_scope_needs_reconciliation(&uri, &shifted),
+            !tracker.tree_scope_needs_reconciliation(&uri, 0),
             "a complete current walk clears debt even when no scopes retire"
         );
+        assert!(
+            tracker.tree_scope_needs_reconciliation(&uri, 1),
+            "a new query generation must reconcile without a document edit"
+        );
+    }
+
+    #[test]
+    fn late_scope_mint_after_empty_reconciliation_keeps_debt() {
+        let tracker = NodeTracker::new();
+        let uri = test_uri("late_scope");
+        let old = scope(&[(0, 20)]);
+        let epoch = tracker.mint_epoch(&uri);
+        tracker
+            .mint_tree_batch(&uri, epoch, 0, Some(&old), [(5, 8, "identifier")])
+            .unwrap();
+        tracker.retain_tree_scopes(&uri, epoch, 0, &Default::default(), &[], 1);
+        assert!(!tracker.tree_scope_needs_reconciliation(&uri, 1));
+        // A pre-reload compute can mint after the new generation's admitted
+        // empty walk. The edit epoch is unchanged by a query-only reload.
+        tracker
+            .mint_tree_batch(&uri, epoch, 0, Some(&old), [(5, 8, "identifier")])
+            .unwrap();
+        assert!(tracker.tree_scope_needs_reconciliation(&uri, 1));
     }
 
     #[test]
@@ -1440,6 +1465,7 @@ mod tests {
                 0,
                 &std::collections::HashSet::from([current]),
                 &[],
+                0,
             );
             if let Some(old) = previous {
                 assert!(
@@ -1464,7 +1490,7 @@ mod tests {
             .mint_tree_batch(&uri, old_epoch, 1, Some(&current), [(12, 15, "identifier")])
             .unwrap()[0];
         tracker.apply_input_edits(&uri, &[EditInfo::new(0, 0, 1)]);
-        tracker.retain_tree_scopes(&uri, old_epoch, 1, &Default::default(), &[]);
+        tracker.retain_tree_scopes(&uri, old_epoch, 1, &Default::default(), &[], 0);
         assert!(tracker.lookup_node(&uri, &id).is_some());
         tracker.cleanup(&uri, 1);
         tracker.open_incarnation(&uri, 2);
@@ -1477,7 +1503,14 @@ mod tests {
                 [(12, 15, "identifier")],
             )
             .unwrap()[0];
-        tracker.retain_tree_scopes(&uri, tracker.mint_epoch(&uri), 1, &Default::default(), &[]);
+        tracker.retain_tree_scopes(
+            &uri,
+            tracker.mint_epoch(&uri),
+            1,
+            &Default::default(),
+            &[],
+            0,
+        );
         assert!(tracker.lookup_node(&uri, &newer).is_some());
     }
 

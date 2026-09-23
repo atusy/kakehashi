@@ -294,50 +294,11 @@ impl Kakehashi {
                 let uri = uri_for_walk;
                 let stack = injection_stack_at(&language, &host_language, &text, &tree, byte);
 
-                let layer_index = match selector {
-                    InjectionSelector::Host => unreachable!("handled above"),
-                    InjectionSelector::Invalid => unreachable!("handled above"),
-                    InjectionSelector::Saturating => {
-                        // `true` saturates to the deepest layer. The stack always
-                        // contains at least the host (layer 0), so this never
-                        // under-indexes.
-                        stack.len() - 1
-                    }
-                    InjectionSelector::Index(n) => {
-                        let Some(idx) = resolve_index(n, stack.len()) else {
-                            return (Value::Null, None);
-                        };
-                        idx
-                    }
-                };
-
-                let Some(layer) = stack.get(layer_index) else {
-                    return (Value::Null, None);
-                };
-
-                let Some(node) = smallest_containing_node(&layer.tree, byte, doc_len) else {
-                    return (Value::Null, None);
-                };
-
-                // Mint with the full tree scope so host and injected nodes
-                // sharing (start, end, kind) get distinct ULIDs and stay navigable
-                // in their own tree (lazy-node-identity-tracking §"Node Uniqueness
-                // Key", issue #313).
-                let scope = (layer_index > 0).then(|| {
-                    crate::language::node_tracker::NodeTreeScope::new(
-                        &layer.language,
-                        layer_index,
-                        &layer.tree,
-                    )
-                });
-                // Only a new geometry alongside existing scopes can accumulate
-                // obsolete boundary scopes. Reuse captures' snapshot geometry
-                // cache when possible; known scopes avoid this walk once
-                // any pending reconciliation has succeeded.
-                let scopes = scope
-                    .as_ref()
-                    .filter(|scope| tracker.tree_scope_needs_reconciliation(&uri, scope))
-                    .and_then(|_| {
+                // Reconcile before selecting a layer: removed injections can
+                // leave only the host or make an explicit index unavailable.
+                let scopes = tracker
+                    .tree_scope_needs_reconciliation(&uri, generation)
+                    .then(|| {
                         let cached = snapshot_for_layers.layer_trees.get_or_init(|| {
                             let layers = super::injection_stack::collect_document_layer_trees(
                                 &language,
@@ -373,7 +334,45 @@ impl Kakehashi {
                                 .collect::<std::collections::HashSet<_>>();
                             (scopes, layers.unresolved.clone())
                         })
-                    });
+                    })
+                    .flatten();
+
+                let layer_index = match selector {
+                    InjectionSelector::Host => unreachable!("handled above"),
+                    InjectionSelector::Invalid => unreachable!("handled above"),
+                    InjectionSelector::Saturating => {
+                        // `true` saturates to the deepest layer. The stack always
+                        // contains at least the host (layer 0), so this never
+                        // under-indexes.
+                        stack.len() - 1
+                    }
+                    InjectionSelector::Index(n) => {
+                        let Some(idx) = resolve_index(n, stack.len()) else {
+                            return (Value::Null, scopes);
+                        };
+                        idx
+                    }
+                };
+
+                let Some(layer) = stack.get(layer_index) else {
+                    return (Value::Null, scopes);
+                };
+
+                let Some(node) = smallest_containing_node(&layer.tree, byte, doc_len) else {
+                    return (Value::Null, scopes);
+                };
+
+                // Mint with the full tree scope so host and injected nodes
+                // sharing (start, end, kind) get distinct ULIDs and stay navigable
+                // in their own tree (lazy-node-identity-tracking §"Node Uniqueness
+                // Key", issue #313).
+                let scope = (layer_index > 0).then(|| {
+                    crate::language::node_tracker::NodeTreeScope::new(
+                        &layer.language,
+                        layer_index,
+                        &layer.tree,
+                    )
+                });
                 let ulid = tracker
                     .mint_tree_batch(
                         &uri,
@@ -384,7 +383,7 @@ impl Kakehashi {
                     )
                     .and_then(|mut ids| ids.pop());
                 let Some(ulid) = ulid else {
-                    return (Value::Null, None);
+                    return (Value::Null, scopes);
                 };
 
                 (
@@ -424,6 +423,7 @@ impl Kakehashi {
                     incarnation,
                     &scopes,
                     &unresolved,
+                    generation,
                 );
             }
             if self.documents.get(&uri).is_none() {
@@ -646,6 +646,151 @@ fn deepest_node_ending_at(node: tree_sitter::Node<'_>, target_end: usize) -> tre
 mod tests {
     use super::*;
     use tower_lsp_server::LspService;
+
+    #[rstest::rstest]
+    #[case::sibling(true, false, false)]
+    #[case::final_injection(false, false, false)]
+    #[case::missing_index(false, true, false)]
+    #[case::query_reload(false, false, true)]
+    #[tokio::test]
+    async fn node_only_removal_retires_scope(
+        #[case] sibling: bool,
+        #[case] missing_index: bool,
+        #[case] query_reload: bool,
+    ) {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        for name in ["rust", "scope_inner"] {
+            server
+                .language
+                .language_registry_for_parallel()
+                .register(name.into(), language.clone());
+        }
+        let install_query = |enabled: bool| {
+            let source = if enabled {
+                r#"((function_item name: (identifier) @_name body: (block) @injection.content) (#eq? @_name "live") (#set! injection.language "scope_inner") (#set! injection.include-children))"#
+            } else {
+                ""
+            };
+            let query = tree_sitter::Query::new(&language, source).unwrap();
+            server
+                .language
+                .query_store()
+                .insert_injection_query("rust".into(), std::sync::Arc::new(query));
+        };
+        install_query(true);
+        let uri = Url::parse("file:///node-only-removal.rs").unwrap();
+        let prefix = if sibling {
+            "fn live() { let a = 1; } "
+        } else {
+            ""
+        };
+        let original = format!("{prefix}fn live() {{ let b = 2; }}");
+        let removed = format!("{prefix}fn dead() {{ let b = 2; }}");
+        server
+            .documents
+            .insert(uri.clone(), original.clone(), Some("rust".into()), None);
+        let params = |byte: usize, injection| NodeParams {
+            text_document: TextDocumentIdentifier {
+                uri: uri.as_str().parse().unwrap(),
+            },
+            position: Position::new(0, byte as u32),
+            injection: Some(injection),
+        };
+        let target = original.find("b =").unwrap();
+        let probe = if sibling {
+            original.find("a =").unwrap()
+        } else {
+            target
+        };
+        server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("rust"), None, None)
+            .await
+            .unwrap();
+        let old = server
+            .kakehashi_node(params(target, Value::Bool(true)))
+            .await
+            .unwrap();
+        server
+            .kakehashi_node(params(probe, Value::Bool(true)))
+            .await
+            .unwrap();
+        server
+            .kakehashi_node(params(probe, Value::Bool(true)))
+            .await
+            .unwrap();
+        let old_id: ulid::Ulid = old["id"].as_str().unwrap().parse().unwrap();
+        let name = prefix.len() + 3;
+        if query_reload {
+            install_query(false);
+            server.cache.bump_semantic_token_generation();
+        } else {
+            server.bridge.node_tracker().apply_input_edits(
+                &uri,
+                &[crate::language::node_tracker::EditInfo::new(
+                    name,
+                    name + 4,
+                    name + 4,
+                )],
+            );
+            server.documents.update_document(uri.clone(), removed, None);
+            server
+                .parse_coordinator()
+                .parse_document(uri.clone(), Some("rust"), None, None)
+                .await
+                .unwrap();
+        }
+        server
+            .kakehashi_node(params(
+                probe,
+                if missing_index {
+                    json!(1)
+                } else {
+                    Value::Bool(true)
+                },
+            ))
+            .await
+            .unwrap();
+        assert!(
+            server
+                .bridge
+                .node_tracker()
+                .lookup_node(&uri, &old_id)
+                .is_none(),
+            "observed injection removal must retire the old ID"
+        );
+        if query_reload {
+            install_query(true);
+            server.cache.bump_semantic_token_generation();
+        } else {
+            server.bridge.node_tracker().apply_input_edits(
+                &uri,
+                &[crate::language::node_tracker::EditInfo::new(
+                    name,
+                    name + 4,
+                    name + 4,
+                )],
+            );
+            server
+                .documents
+                .update_document(uri.clone(), original, None);
+            server
+                .parse_coordinator()
+                .parse_document(uri.clone(), Some("rust"), None, None)
+                .await
+                .unwrap();
+        }
+        let restored = server
+            .kakehashi_node(params(target, Value::Bool(true)))
+            .await
+            .unwrap();
+        assert_ne!(
+            old["id"], restored["id"],
+            "restoring geometry must not resurrect a retired ID"
+        );
+    }
 
     #[rstest::rstest]
     #[case::complete(false)]

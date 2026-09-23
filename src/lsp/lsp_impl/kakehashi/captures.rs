@@ -1353,6 +1353,7 @@ impl Kakehashi {
                         incarnation,
                         &scopes,
                         &unresolved,
+                        generation,
                     );
                 }
             }

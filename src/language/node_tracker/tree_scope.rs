@@ -94,6 +94,7 @@ pub(super) struct TreeScopes {
     /// New scopes can coexist with obsolete boundary geometries until a
     /// complete, current walk is admitted. Edits/reloads cannot erase this debt.
     pub(super) reconciliation_pending: bool,
+    pub(super) reconciled_query_generation: Option<u64>,
 }
 
 pub(super) const TREE_SCOPE_BASE: usize = crate::language::injection::MAX_INJECTION_DEPTH + 1;
@@ -124,7 +125,9 @@ impl TreeScopes {
         if token >= crate::language::injection::REGION_IDENTITY_LAYER_BASE {
             return None;
         }
-        self.reconciliation_pending |= !self.by_token.is_empty();
+        // A pre-reload compute may register after a newer empty walk was
+        // admitted. Even the first new token must leave reconciliation debt.
+        self.reconciliation_pending = true;
         self.next += 1;
         let scope = Arc::new(scope.clone());
         self.by_scope.insert(Arc::clone(&scope), token);
@@ -133,6 +136,9 @@ impl TreeScopes {
     }
 
     pub(super) fn shift(&mut self, edit: &EditInfo) {
+        // Query predicates can remove a tree even when its content ranges do
+        // not move (for example, an edit to the enclosing function name).
+        self.reconciliation_pending |= !self.by_token.is_empty();
         self.by_token.retain(|_, scope| {
             if let Some(shifted) = scope.shifted(edit) {
                 *scope = Arc::new(shifted);

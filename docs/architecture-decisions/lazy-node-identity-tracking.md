@@ -167,13 +167,14 @@ requested kind query. Unavailable grammar/parse branches preserve scopes with
 matching root geometry and possible descendants whose included ranges lie fully
 within that branch; unrelated absent scopes can still be reclaimed. Range-only,
 cancelled, and stale walks cannot prune. Edit, incarnation, query-generation,
-and reload checks protect retirement. The node entry point also reconciles full geometry when it discovers
-a new scope alongside existing scopes, so node-only clients reclaim obsolete
-boundary geometries too. It reuses the snapshot layer cache; requests for an
-already-known scope keep their cursor-local walk after reconciliation succeeds.
-A pending flag preserves reconciliation while unknown branches retain otherwise
-absent scopes or a walk loses final admission, including later requests for an
-already-known scope. The cost is one scope record
+and reload checks protect retirement. For documents with tracked injected scopes,
+the node entry point also reconciles full geometry after edits or query-generation
+changes, including requests that now select the host or an unavailable layer.
+This reclaims removed trees even when their old ranges did not move. It reuses
+the snapshot layer cache; repeated requests keep their cursor-local walk after
+reconciliation succeeds for the current generation. A pending flag preserves
+reconciliation while unknown branches retain otherwise absent scopes or a walk
+loses final admission. The cost is one scope record
 per distinct retained parse scope and range adjustment alongside node adjustment.
 
 **Invalidation with composite keys**: node START-priority invalidation remains
