@@ -1313,6 +1313,16 @@ fn write_new_output_with(
 }
 
 fn write_forced_output(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    write_forced_output_with(path, |file| {
+        use std::io::Write as _;
+        file.write_all(content.as_bytes())
+    })
+}
+
+fn write_forced_output_with(
+    path: &std::path::Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -1321,7 +1331,6 @@ fn write_forced_output(path: &std::path::Path, content: &str) -> std::io::Result
     }
     #[cfg(unix)]
     {
-        use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -1329,13 +1338,12 @@ fn write_forced_output(path: &std::path::Path, content: &str) -> std::io::Result
             .truncate(true)
             .custom_flags(nix::libc::O_NOFOLLOW)
             .open(path)?;
-        file.write_all(content.as_bytes())
+        write(&mut file)
     }
     #[cfg(not(unix))]
     {
         #[cfg(windows)]
         {
-            use std::io::Write as _;
             use std::os::windows::fs::OpenOptionsExt as _;
             const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
             let mut file = std::fs::OpenOptions::new()
@@ -1344,10 +1352,13 @@ fn write_forced_output(path: &std::path::Path, content: &str) -> std::io::Result
                 .truncate(true)
                 .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
                 .open(path)?;
-            file.write_all(content.as_bytes())
+            write(&mut file)
         }
         #[cfg(not(windows))]
-        std::fs::write(path, content)
+        {
+            let mut file = std::fs::File::create(path)?;
+            write(&mut file)
+        }
     }
 }
 
