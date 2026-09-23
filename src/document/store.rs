@@ -557,17 +557,19 @@ impl DocumentStore {
         uri: &Url,
         current_generation: u64,
     ) -> Option<std::sync::Arc<Vec<crate::language::injection::ResolvedInjection>>> {
-        self.current_region_views(uri, current_generation)
+        self.current_region_views(uri, current_generation, None)
             .map(|regions| regions.whole_document)
     }
 
-    /// The same currency/generation gate for bridge lifecycle readers.
+    /// The same currency/generation gate for bridge lifecycle readers, also
+    /// bound to the host language the caller screened before resolution.
     pub(crate) fn current_bridge_regions(
         &self,
         uri: &Url,
+        host_language: &str,
         current_generation: u64,
     ) -> Option<Arc<Vec<super::DiscoveredBridgeRegion>>> {
-        self.current_region_views(uri, current_generation)
+        self.current_region_views(uri, current_generation, Some(host_language))
             .map(|regions| regions.bridge)
     }
 
@@ -575,11 +577,13 @@ impl DocumentStore {
         &self,
         uri: &Url,
         current_generation: u64,
+        host_language: Option<&str>,
     ) -> Option<super::snapshot::ResolvedRegions> {
         let view = self.latest_snapshot(uri)?;
         let snapshot = view.slot.snapshot?;
         if snapshot.incarnation != view.slot.current_incarnation
             || snapshot.parsed_version != view.content_version
+            || host_language.is_some_and(|language| snapshot.language.as_deref() != Some(language))
         {
             return None;
         }
@@ -1226,7 +1230,7 @@ mod tests {
                 .install_parse(&uri, LanguageCheck::Record, Arc::clone(&first))
                 .current
         );
-        assert!(store.current_bridge_regions(&uri, 1).is_none());
+        assert!(store.current_bridge_regions(&uri, "markdown", 1).is_none());
         assert!(store.current_resolved_regions(&uri, 1).is_none());
         assert!(store.complete_parse(
             &uri,
@@ -1234,13 +1238,18 @@ mod tests {
             &first,
             Some(super::super::snapshot::ResolvedRegions::empty(1))
         ));
-        assert!(store.current_bridge_regions(&uri, 1).unwrap().is_empty());
+        assert!(
+            store
+                .current_bridge_regions(&uri, "markdown", 1)
+                .unwrap()
+                .is_empty()
+        );
         assert!(store.current_resolved_regions(&uri, 1).unwrap().is_empty());
-        assert!(store.current_bridge_regions(&uri, 2).is_none());
+        assert!(store.current_bridge_regions(&uri, "markdown", 2).is_none());
         assert!(store.current_resolved_regions(&uri, 2).is_none());
         let bound = store.latest_snapshot(&uri).unwrap().slot.snapshot.unwrap();
         store.update_document(uri.clone(), "# edited\n".into(), None);
-        assert!(store.current_bridge_regions(&uri, 1).is_none());
+        assert!(store.current_bridge_regions(&uri, "markdown", 1).is_none());
         assert!(store.current_resolved_regions(&uri, 1).is_none());
         assert!(
             bound.regions_for_generation(1).is_some(),

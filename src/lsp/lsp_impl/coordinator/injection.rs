@@ -209,10 +209,11 @@ impl InjectionCoordinator {
         // downstream runs right after the publish, so it virtually always is;
         // a raced edit falls back to the inline resolution below (which reads
         // the live tree, exactly as before).
-        if let Some(regions) = self
-            .documents
-            .current_bridge_regions(uri, self.cache.semantic_token_generation())
-        {
+        if let Some(regions) = self.documents.current_bridge_regions(
+            uri,
+            host_language,
+            self.cache.semantic_token_generation(),
+        ) {
             let regions = regions
                 .iter()
                 .map(|region| BridgeInjection {
@@ -1711,6 +1712,62 @@ mod tests {
             assert_eq!(a.region_id, b.region_id, "region id must match");
             assert_eq!(a.content, b.content, "clean content must match");
         }
+    }
+
+    #[tokio::test]
+    async fn bridge_fast_path_rejects_a_language_from_before_redetection() {
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        // Both names have a published parser/query, so a stale language cannot
+        // be rejected merely because its parser has not finished loading.
+        for name in ["rust", "old-rust"] {
+            server
+                .language
+                .language_registry_for_parallel()
+                .register(name.into(), language.clone());
+            server.language.query_store().insert_injection_query(
+                name.into(),
+                std::sync::Arc::new(tree_sitter::Query::new(&language, "").unwrap()),
+            );
+        }
+        let uri = Url::parse("file:///redetected.rs").unwrap();
+        let text = "fn main() {}";
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        server.documents.insert(
+            uri.clone(),
+            text.into(),
+            Some("rust".into()),
+            parser.parse(text, None),
+        );
+        let snapshot = server
+            .documents
+            .latest_snapshot(&uri)
+            .unwrap()
+            .slot
+            .snapshot
+            .unwrap();
+        assert!(server.documents.complete_parse(
+            &uri,
+            crate::document::LanguageCheck::Expect(Some("rust")),
+            &snapshot,
+            Some(crate::document::snapshot::ResolvedRegions::empty(
+                server.cache.semantic_token_generation(),
+            )),
+        ));
+        let injection = server.injection_coordinator();
+        assert!(
+            injection
+                .resolve_injection_data(&uri, "rust")
+                .unwrap()
+                .is_empty(),
+            "precondition: the current language can consume the cached empty result"
+        );
+        assert!(
+            injection.resolve_injection_data(&uri, "old-rust").is_none(),
+            "a language screened before redetection must not validate the replacement snapshot's empty result"
+        );
     }
 
     /// A reload publishes a version-current placeholder with no tree while
