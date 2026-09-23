@@ -584,9 +584,9 @@ impl NodeTracker {
 
     /// Resolve a ULID back to its tracked `(start_byte, end_byte, kind)` triple.
     ///
-    /// Drops the layer discriminator — callers that need it (the navigation
-    /// handlers, to re-mint in the same layer) use
-    /// [`lookup_node`](Self::lookup_node) instead.
+    /// Drops the layer discriminator. Navigation uses
+    /// [`lookup_node_scope`](Self::lookup_node_scope) or its pair variant to
+    /// obtain the coordinates and complete tree scope atomically.
     ///
     /// Returns `None` if the ULID was never issued for this URI, if it was
     /// invalidated by an edit (START fell inside the edit range per lazy-node-identity-tracking),
@@ -603,10 +603,10 @@ impl NodeTracker {
 
     /// Resolve a ULID back to its tracked `(start_byte, end_byte, kind, layer)`.
     ///
-    /// Like [`lookup_position`](Self::lookup_position) but also returns the
-    /// injection `layer` that minted the node, so navigation handlers can
-    /// resolve it in the correct language tree and re-mint parent/children in
-    /// the same layer.
+    /// Like [`lookup_position`](Self::lookup_position), but includes the
+    /// identity token. The token alone does not locate an injected tree:
+    /// navigation must use [`lookup_node_scope`](Self::lookup_node_scope) or
+    /// [`lookup_node_scope_pair`](Self::lookup_node_scope_pair) instead.
     pub(crate) fn lookup_node(
         &self,
         uri: &Url,
