@@ -337,6 +337,10 @@ impl DiagnosticScheduler {
                     Err(DiagnosticLanguagePending) => {
                         // The subscription predates preparation, so a parser
                         // completion racing that read cannot be missed here.
+                        // There is no reliable terminal unsupported-language
+                        // signal. Preserve the existing open-ended Save wait;
+                        // ownership is bounded to one task per URI and aborted
+                        // on replacement, close, or shutdown.
                         if readiness.changed().await.is_err() {
                             return;
                         }
