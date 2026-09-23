@@ -11,12 +11,11 @@ use tokio::task::JoinSet;
 use url::Url;
 
 use crate::config::settings::ResolvedLayerConfig;
+use crate::lsp::aggregation::diagnostic::{PullContribution, PullLayerComponents};
 use crate::lsp::bridge::LanguageServerPool;
 use crate::lsp::lsp_impl::bridge_context::{DocumentRequestContext, HostRequestContext};
 
-use super::diagnostic::{
-    collect_host_diagnostics, collect_region_diagnostics, combine_layer_diagnostics,
-};
+use super::diagnostic::{collect_host_diagnostics, collect_region_diagnostics};
 use super::{RequestErrorSink, count_request_errors};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,6 +45,8 @@ pub(crate) struct DiagnosticSnapshot {
     /// Per-region virt contexts; empty when the virt layer is gated off or
     /// the document has no bridgeable injection regions.
     pub(crate) virt_contexts: Vec<DocumentRequestContext>,
+    /// Current virtual geometry has not been parsed yet.
+    pub(crate) virtual_geometry_pending: bool,
     /// Host-layer context (host-document-bridge); `None` unless the host layer
     /// is in `layers.aggregation` priorities AND `bridge._self` is opted in with
     /// a configured server. Present even when the host **pull** is gated off
@@ -94,7 +95,7 @@ pub(crate) enum PullLayerOutcome {
     /// so the clean result still suppresses a pull-driven server's stale push).
     Clear,
     /// A pull ran; publish its (possibly empty) result as the `PullLayer` blob.
-    Publish(Vec<tower_lsp_server::ls_types::Diagnostic>),
+    Publish(PullLayerComponents),
 }
 
 /// Collect diagnostics from every participating layer using priority-aware
@@ -124,7 +125,7 @@ pub(crate) async fn collect_push_diagnostics_with_error_sink(
         return PullLayerOutcome::Skip;
     };
 
-    if !snapshot.has_contributors() {
+    if !snapshot.has_contributors() && !snapshot.virtual_geometry_pending {
         log::debug!(
             target: log_target,
             "No pull contributors for {} (no pullable regions, and any host layer is \
@@ -143,11 +144,15 @@ pub(crate) async fn collect_push_diagnostics_with_error_sink(
     let DiagnosticSnapshot {
         lineage: _,
         mut virt_contexts,
+        virtual_geometry_pending,
         host,
         host_pull_enabled,
         narrower_than_editor_pull: _,
         layer_cfg,
     } = snapshot;
+
+    let virt_pull_enabled = !virt_contexts.is_empty();
+    let host_pull_enabled = host_pull_enabled && host.is_some();
 
     // Drop servers already known (a live, `Ready` connection) NOT to answer pull
     // diagnostics before spawning their per-region tasks
@@ -209,9 +214,21 @@ pub(crate) async fn collect_push_diagnostics_with_error_sink(
 
     let (virt_items, host_items) = tokio::join!(virt_fut, host_fut);
 
-    PullLayerOutcome::Publish(combine_layer_diagnostics(
-        &layer_cfg, virt_items, host_items,
-    ))
+    PullLayerOutcome::Publish(PullLayerComponents {
+        virt: if virtual_geometry_pending {
+            PullContribution::Pending
+        } else if virt_pull_enabled {
+            PullContribution::Pulled(virt_items.into())
+        } else {
+            PullContribution::NotPulled
+        },
+        host: if host_pull_enabled {
+            PullContribution::Pulled(host_items.into())
+        } else {
+            PullContribution::NotPulled
+        },
+        layer_cfg,
+    })
 }
 
 async fn collect_joined_region_diagnostics(
@@ -320,6 +337,7 @@ mod tests {
                 settings_generation: 0,
             },
             virt_contexts: vec![virt_ctx_for_server("test")],
+            virtual_geometry_pending: false,
             narrower_than_editor_pull: false,
             host: None,
             host_pull_enabled: false,
@@ -331,7 +349,7 @@ mod tests {
 
         match outcome {
             PullLayerOutcome::Publish(diags) => {
-                assert!(diags.is_empty(), "expected an empty publish");
+                assert!(diags.combine().is_empty(), "expected an empty publish");
             }
             PullLayerOutcome::Clear => {
                 panic!("all-incapable virt snapshot must Publish(empty), not Clear")

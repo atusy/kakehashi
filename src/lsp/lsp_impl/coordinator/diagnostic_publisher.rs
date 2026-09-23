@@ -21,6 +21,7 @@ use crate::config::WorkspaceSettings;
 use crate::document::DocumentStore;
 use crate::error::LockResultExt;
 use crate::language::{InjectionResolver, LanguageCoordinator};
+use crate::lsp::aggregation::diagnostic::PullLayerComponents;
 use crate::lsp::bridge::{
     BridgeCoordinator, ProgressConnectionId, RegionOffset, VirtualDocumentUri,
 };
@@ -615,7 +616,8 @@ impl DiagnosticPublisher {
                 self.aggregator.evict_pull_layer_nudgeless(uri);
             }
             PullLayerOutcome::Publish(diagnostics) => {
-                self.aggregator.set_pull_layer_nudgeless(uri, diagnostics);
+                self.aggregator
+                    .set_pull_components_nudgeless(uri, diagnostics);
             }
         }
         // The revision-stamped mutations above make this commit's change
@@ -903,7 +905,7 @@ impl DiagnosticPublisher {
     }
 
     /// Remove cached **push** slots (`Region`/`Host`) whose server is
-    /// **pull-driven** when a `PullLayer` blob is present, so a pull-driven
+    /// **pull-driven** when the cached pull covers that layer, so a pull-driven
     /// server that both answers the host-event pull (landing in `PullLayer`)
     /// AND spontaneously pushes `publishDiagnostics` is not counted twice —
     /// each server has exactly one native source
@@ -917,8 +919,7 @@ impl DiagnosticPublisher {
     /// later crash/edit eviction still clears the push slot.
     ///
     /// Interim limitation: `PullLayer` is one host-wide blob with no per-server
-    /// identity, so the trigger is "any PullLayer present", not "this exact
-    /// server was pulled". With a *mixed* per-region `pullFallback` (one
+    /// identity, so coverage is per layer rather than per server. With a *mixed* per-region `pullFallback` (one
     /// region's pull-driven server pulled, a sibling's not), a pull-driven
     /// server whose region set `pullFallback = false` can still have its push
     /// suppressed while the blob carries the sibling region. The deferred
@@ -1021,13 +1022,14 @@ impl DiagnosticPublisher {
     /// staleness class the deferred `content_epoch` version gate
     /// (push-propagation-diagnostic-forwarding) handles generally; until then it
     /// self-heals on the next completed pull.
-    pub(crate) async fn publish_pull_layer(&self, host: &Url, diagnostics: Vec<Diagnostic>) {
+    pub(crate) async fn publish_pull_layer(&self, host: &Url, diagnostics: PullLayerComponents) {
         // The nudge-less mutation stamps its pending pull-view-lag mark
         // atomically with the cache revision it produced; whichever republish
         // validates a covering revision settles it — Changed converts it into
         // the lag, Unchanged drops it (see `set_pull_layer_nudgeless`). A
         // racing didClose's forget removes the mark on either side.
-        self.aggregator.set_pull_layer_nudgeless(host, diagnostics);
+        self.aggregator
+            .set_pull_components_nudgeless(host, diagnostics);
         self.republish(host).await;
     }
 
@@ -2225,7 +2227,7 @@ struct RegionGeometry {
 }
 
 /// Remove `Region`/`Host` push slots whose server is in `pull_driven` when a
-/// `PullLayer` blob is present in `snapshot`, dropping any source left empty.
+/// `PullLayer` covers that layer in `snapshot`, dropping any source left empty.
 /// The pure core of [`DiagnosticPublisher::filter_pull_driven_push_slots`],
 /// split out so the dedup rule is testable without a live pool. A no-op when
 /// `pull_driven` is empty or there is no `PullLayer` to double-count against.
@@ -2236,8 +2238,17 @@ fn retain_non_pull_driven_push_slots(
     if pull_driven.is_empty() || !snapshot.contains_key(&DiagnosticSource::PullLayer) {
         return;
     }
+    let (virt_covered, host_covered) = snapshot[&DiagnosticSource::PullLayer]
+        .values()
+        .next()
+        .map_or((false, false), |slot| slot.pull_coverage());
     snapshot.retain(|source, servers| {
-        if matches!(source, DiagnosticSource::PullLayer) {
+        let covered = match source {
+            DiagnosticSource::Region(_) => virt_covered,
+            DiagnosticSource::Host => host_covered,
+            DiagnosticSource::PullLayer => false,
+        };
+        if !covered {
             return true;
         }
         servers.retain(|server, _| !pull_driven.contains(server));
@@ -2248,6 +2259,18 @@ fn retain_non_pull_driven_push_slots(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_pull_components(diagnostics: Vec<Diagnostic>) -> PullLayerComponents {
+        use crate::lsp::aggregation::diagnostic::PullContribution;
+        PullLayerComponents {
+            virt: PullContribution::Pulled(diagnostics.into()),
+            host: PullContribution::Pulled(Vec::new().into()),
+            layer_cfg: crate::config::settings::ResolvedLayerConfig::with_defaults(
+                "textDocument/publishDiagnostics",
+            ),
+        }
+    }
+
     use crate::config::settings::{
         BridgeLanguageConfig, BridgeServerConfig, HOST_BRIDGE_KEY, LanguageSettings,
         LayerAggregationConfig, LayersConfig, WorkspaceSettings,
@@ -2362,7 +2385,9 @@ mod tests {
             .await;
 
         let publisher = DiagnosticPublisher::new(server);
-        publisher.publish_pull_layer(&uri, Vec::new()).await;
+        publisher
+            .publish_pull_layer(&uri, test_pull_components(Vec::new()))
+            .await;
         // Clear the seed's own pull-view lag so the timing below measures the
         // narrower_than_editor_pull send path, like the other divergence pins.
         server.diagnostics.clear_pull_view_lag(&uri);
@@ -2484,7 +2509,9 @@ mod tests {
         let publisher = DiagnosticPublisher::new(server);
         // Establish a recorded set and clear the seed's lag so nothing but
         // the reload guards can force the send below.
-        publisher.publish_pull_layer(&uri, Vec::new()).await;
+        publisher
+            .publish_pull_layer(&uri, test_pull_components(Vec::new()))
+            .await;
         server.diagnostics.clear_pull_view_lag(&uri);
 
         // Park the commit on the edit lock, land the reload, release.
@@ -2559,7 +2586,7 @@ mod tests {
             .commit_refresh_prefetch(
                 &uri,
                 lineage,
-                PullLayerOutcome::Publish(vec![diag("old-surface")]),
+                PullLayerOutcome::Publish(test_pull_components(vec![diag("old-surface")])),
             )
             .await;
 
@@ -2610,7 +2637,9 @@ mod tests {
         // A committed non-empty pull layer records the lag (first commit is
         // Changed; nothing has nudged the editor).
         let publisher = DiagnosticPublisher::new(server);
-        publisher.publish_pull_layer(&uri, vec![diag("virt")]).await;
+        publisher
+            .publish_pull_layer(&uri, test_pull_components(vec![diag("virt")]))
+            .await;
         assert!(
             server.diagnostics.has_pull_view_lag(&uri),
             "precondition: the un-nudged commit recorded the lag"
@@ -2691,7 +2720,9 @@ mod tests {
             .parse_document(uri.clone(), Some("rust"), None, None)
             .await;
         let publisher = DiagnosticPublisher::new(server);
-        publisher.publish_pull_layer(&uri, Vec::new()).await;
+        publisher
+            .publish_pull_layer(&uri, test_pull_components(Vec::new()))
+            .await;
         server.diagnostics.clear_pull_view_lag(&uri);
 
         // Register the downstream activity, then simulate the intervening
@@ -2867,7 +2898,9 @@ mod tests {
         // a pull-view lag (it IS an un-nudged first commit) — clear it, as a
         // covering editor pull would, so the send below can only come from
         // the narrower_than_editor_pull flag.
-        publisher.publish_pull_layer(&uri, Vec::new()).await;
+        publisher
+            .publish_pull_layer(&uri, test_pull_components(Vec::new()))
+            .await;
         server.diagnostics.clear_pull_view_lag(&uri);
         publisher.request_forwarded_diagnostic_refresh();
 
@@ -2942,7 +2975,9 @@ mod tests {
         // Seed a recorded set so the cycle's republish can genuinely report
         // Unchanged, and clear the seed's own pull-view lag (see the seal
         // test above for why both steps are load-bearing).
-        publisher.publish_pull_layer(&uri, Vec::new()).await;
+        publisher
+            .publish_pull_layer(&uri, test_pull_components(Vec::new()))
+            .await;
         server.diagnostics.clear_pull_view_lag(&uri);
         publisher.request_forwarded_diagnostic_refresh();
 
@@ -3017,7 +3052,9 @@ mod tests {
         // Seed a recorded set so the send below can only come from the
         // narrower_than_editor_pull flag — not from a first-commit Changed,
         // and (after clearing the seed's own lag) not from pull-view lag.
-        publisher.publish_pull_layer(&uri, Vec::new()).await;
+        publisher
+            .publish_pull_layer(&uri, test_pull_components(Vec::new()))
+            .await;
         server.diagnostics.clear_pull_view_lag(&uri);
         publisher.request_forwarded_diagnostic_refresh();
 
@@ -3456,7 +3493,7 @@ mod tests {
         // An editor-originated pull-layer republish changes the merged set (it is
         // published) but must NOT re-dirty the host.
         publisher
-            .publish_pull_layer(&uri, vec![diag("from-pull-layer")])
+            .publish_pull_layer(&uri, test_pull_components(vec![diag("from-pull-layer")]))
             .await;
         assert!(
             !server.diagnostics.is_dirty(),
@@ -4489,6 +4526,31 @@ mod tests {
             vec![diag("linter-push")],
         );
         agg.snapshot(host)
+    }
+
+    #[test]
+    fn host_only_pull_does_not_suppress_pending_virtual_push() {
+        use crate::lsp::aggregation::diagnostic::PullContribution::{Pending, Pulled};
+        let host = Url::parse("file:///test/host.rs").unwrap();
+        let agg = DiagnosticAggregator::new();
+        let region = DiagnosticSource::Region("region".to_string());
+        for source in [DiagnosticSource::Host, region.clone()] {
+            agg.record(
+                &host,
+                source,
+                "ra".to_string(),
+                Some(ProgressConnectionId::for_test(1)),
+                vec![diag("push")],
+            );
+        }
+        let mut components = test_pull_components(Vec::new());
+        components.virt = Pending;
+        components.host = Pulled(Vec::new().into());
+        agg.set_pull_components_nudgeless(&host, components);
+        let mut snapshot = agg.snapshot(&host);
+        retain_non_pull_driven_push_slots(&mut snapshot, &HashSet::from(["ra".to_string()]));
+        assert!(!snapshot.contains_key(&DiagnosticSource::Host));
+        assert!(snapshot[&region].contains_key("ra"));
     }
 
     #[test]

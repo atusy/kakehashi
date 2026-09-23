@@ -671,6 +671,7 @@ impl DiagnosticSnapshotPreparer {
             },
             virt_contexts,
             host_pull_enabled,
+            virtual_geometry_pending: false,
             narrower_than_editor_pull,
             host,
             layer_cfg,

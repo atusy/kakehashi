@@ -1385,6 +1385,7 @@ print("hello")
                 },
             virt_contexts: vec![],
             host_pull_enabled: true,
+            virtual_geometry_pending: false,
             narrower_than_editor_pull: false,
             host: Some(HostRequestContext {
                 uri: uri.clone(),
@@ -1516,6 +1517,7 @@ print("hello")
                 },
             virt_contexts: vec![],
             host_pull_enabled: true,
+            virtual_geometry_pending: false,
             narrower_than_editor_pull: false,
             host: Some(HostRequestContext {
                 uri: uri.clone(),
