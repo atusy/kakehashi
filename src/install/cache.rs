@@ -4,7 +4,7 @@
 //! when fetching parser metadata from nvim-treesitter.
 
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -61,13 +61,18 @@ impl MetadataCache {
         fs::read_to_string(&cache_path).ok()
     }
 
-    /// Write content to cache.
+    /// Atomically replace the cache entry with complete content.
     pub fn write(&self, content: &str) -> io::Result<()> {
         // Ensure cache directory exists
         fs::create_dir_all(&self.cache_dir)?;
 
-        // Write content
-        fs::write(self.cache_path(), content)?;
+        // Keep partial writes away from readers and replace a leaf symlink
+        // itself rather than opening its target. The sibling stays on the same
+        // filesystem so publication can use an atomic replacement.
+        let mut temporary = tempfile::NamedTempFile::new_in(&self.cache_dir)?;
+        temporary.write_all(content.as_bytes())?;
+        temporary.as_file().sync_all()?;
+        temporary.persist(self.cache_path()).map_err(|e| e.error)?;
 
         Ok(())
     }
@@ -77,6 +82,23 @@ impl MetadataCache {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_write_replaces_symlink_without_modifying_target() {
+        let temp = tempdir().unwrap();
+        let cache = MetadataCache::with_default_ttl(temp.path());
+        fs::create_dir_all(&cache.cache_dir).unwrap();
+        let victim = temp.path().join("unrelated.lua");
+        fs::write(&victim, "keep this content").unwrap();
+        std::os::unix::fs::symlink(&victim, cache.cache_path()).unwrap();
+
+        cache.write("new metadata").unwrap();
+
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep this content");
+        assert!(fs::symlink_metadata(cache.cache_path()).unwrap().is_file());
+        assert_eq!(cache.read().as_deref(), Some("new metadata"));
+    }
 
     #[test]
     fn test_cache_write_and_read() {
