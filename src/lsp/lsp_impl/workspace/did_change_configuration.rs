@@ -750,13 +750,12 @@ mod tests {
             .await;
 
         let snapshot = server.settings_manager.load_settings_pair();
-        assert_eq!(
-            snapshot.settings.search_paths,
-            vec!["/workspace/runtime".to_string()]
-        );
+        // Anchoring cleans the joined path, which uses `\` on Windows.
+        let anchored = "/workspace/runtime".replace('/', std::path::MAIN_SEPARATOR_STR);
+        assert_eq!(snapshot.settings.search_paths, vec![anchored.clone()]);
         assert_eq!(
             snapshot.raw_settings.search_paths,
-            Some(vec!["/workspace/runtime".to_string()]),
+            Some(vec![anchored]),
             "the stored raw settings carry the anchored value, so a later push \
              merging onto them does not re-base it"
         );
