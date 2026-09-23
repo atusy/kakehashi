@@ -114,6 +114,15 @@ disable auto-install.
 No file watcher or automatic retry on overlay edits is introduced. An edit that
 races the last dependency check may require another installation attempt.
 
+Symbolic links between search paths and the data directory are judged by what
+they resolve to when checked: a runtime query file that resolves into the
+managed directory of its own language is that language's managed copy, and any
+other readable file is a runtime source. Links whose meaning the install itself
+changes are not modeled: a managed directory that is a link into a search path
+(publication replaces the link, not its target), or a runtime link to a managed
+file the same install is about to create. Such layouts may need another
+installation attempt, or the link removed.
+
 ## Confirmation
 
 Local HTTP fixtures cover external and transitive dependencies, optional
