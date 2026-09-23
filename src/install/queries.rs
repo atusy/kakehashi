@@ -322,8 +322,8 @@ pub(crate) enum ChainProbe {
     Complete(Vec<LanguageLock>),
     /// A language is missing, unreadable, or not installable by name.
     Incomplete,
-    /// A language's lock is held (an install or uninstall is mid-publish, or
-    /// another probe is reading it), so the chain cannot be judged right now.
+    /// A language's lock is held by an install or uninstall mid-publish, so
+    /// the chain cannot be judged right now. Other probes never cause this.
     Busy,
 }
 
@@ -1761,7 +1761,7 @@ pub fn lock_language(data_dir: &Path, language: &str) -> Result<LanguageLock, Qu
     })
 }
 
-/// [`lock_language`] without the wait.
+/// A shared [`lock_language`] without the wait.
 ///
 /// For callers that must not block — the LSP's async path — and that only need
 /// to know whether the language is settled. The guard is returned rather than
@@ -1791,7 +1791,9 @@ fn try_lock_language(data_dir: &Path, language: &str) -> LanguageLockProbe {
         // whether an install is in flight, so do not pretend it does.
         Err(_) => return LanguageLockProbe::Unavailable,
     };
-    match file.try_lock() {
+    // Shared: probes only read, so they must not see each other as busy.
+    // Installs and uninstalls lock exclusively and still exclude them.
+    match file.try_lock_shared() {
         Ok(()) => LanguageLockProbe::Idle(LanguageLock {
             _file: file,
             queries_parent,
@@ -1809,7 +1811,8 @@ fn try_lock_language(data_dir: &Path, language: &str) -> LanguageLockProbe {
 
 /// What [`try_lock_language`] found.
 enum LanguageLockProbe {
-    /// Nobody holds the lock, and nobody can take it while the guard lives.
+    /// No install holds the lock, and none can take it while this shared
+    /// guard lives; other probes may hold it too.
     Idle(LanguageLock),
     /// An install is mid-publish: what is on disk can still be rolled back.
     Busy,

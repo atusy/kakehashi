@@ -365,8 +365,8 @@ impl InstallCoordinator {
         match state {
             QueryChainState::NeedsRepair => true,
             QueryChainState::Settled => false,
-            // A held lock is an install mid-publish or another probe reading
-            // the chain, not evidence of a missing language. Leave the answer
+            // A held lock is an install or uninstall mid-publish, not
+            // evidence of a missing language. Leave the answer
             // to a later pass instead of spawning an install that would find
             // nothing to do and still reload every document's queries.
             QueryChainState::Busy => {
@@ -773,7 +773,7 @@ mod tests {
         assert!(server.settings_manager.is_auto_install_enabled("rust"));
         assert!(
             !install.decide_query_repair("rust", false, || QueryChainState::Busy),
-            "a held lock is another install or probe at work, not a missing language"
+            "a held lock is an install at work, not a missing language"
         );
         assert!(
             install.decide_query_repair("rust", false, || QueryChainState::NeedsRepair),
