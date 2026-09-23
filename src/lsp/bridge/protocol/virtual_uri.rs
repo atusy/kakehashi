@@ -1290,6 +1290,15 @@ mod properties {
         "[A-Za-z0-9_~-]{1,26}"
     }
 
+    fn rendered_segment(rendered: &str) -> String {
+        let url = url::Url::parse(rendered).unwrap();
+        url.path_segments()
+            .unwrap()
+            .next_back()
+            .unwrap()
+            .to_string()
+    }
+
     fn last_segment(rendered: &str) -> String {
         let url = url::Url::parse(rendered).unwrap();
         let segment = url.path_segments().unwrap().next_back().unwrap();
@@ -1322,6 +1331,18 @@ mod properties {
                 last_segment(&rendered),
                 format!("{VIRTUAL_URI_PREFIX}{region}.{extension}")
             );
+            // RFC 3986 section 2.3: unreserved characters stay literal, so every
+            // escape in the filename stands for some other byte.
+            let raw_segment = rendered_segment(&rendered);
+            for escape in raw_segment.split('%').skip(1) {
+                let byte = u8::from_str_radix(&escape[..2], 16).unwrap();
+                prop_assert!(
+                    !(byte.is_ascii_alphanumeric() || b"-._~".contains(&byte)),
+                    "{} encodes unreserved {:?}",
+                    raw_segment,
+                    byte as char
+                );
+            }
 
             let rendered_url = url::Url::parse(&rendered).unwrap();
             let host_url = url::Url::parse(host.as_str())
