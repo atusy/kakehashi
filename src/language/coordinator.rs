@@ -331,7 +331,8 @@ impl LanguageCoordinator {
                             LanguageLoadResult::failure_with(LanguageEvent::log(
                                 LanguageLogLevel::Error,
                                 format!(
-                                    "language load for '{language_id}' failed on the blocking pool: {join_error}"
+                                    "language load for '{}' failed on the blocking pool: {join_error}",
+                                    escape_terminal_controls(language_id),
                                 ),
                             ))
                         });
@@ -438,7 +439,7 @@ impl LanguageCoordinator {
             debug!(
                 target: "kakehashi::config",
                 "Skipping eager load for inheritance-only language root '{}'",
-                lang_name
+                escape_terminal_controls(lang_name)
             );
         }
 
@@ -517,7 +518,10 @@ impl LanguageCoordinator {
             None => {
                 return LanguageLoadResult::failure_with(LanguageEvent::log(
                     LanguageLogLevel::Error,
-                    format!("load_derived_language called for '{derived_name}' without base"),
+                    format!(
+                        "load_derived_language called for '{derived_name}' without base",
+                        derived_name = escape_terminal_controls(derived_name)
+                    ),
                 ));
             }
         };
@@ -550,7 +554,10 @@ impl LanguageCoordinator {
         let Some(language) = self.language_registry.get(base_name) else {
             return LanguageLoadResult::failure_with(LanguageEvent::log(
                 LanguageLogLevel::Error,
-                format!("Base language '{base_name}' was loaded but not found in registry"),
+                format!(
+                    "Base language '{base_name}' was loaded but not found in registry",
+                    base_name = escape_terminal_controls(base_name)
+                ),
             ));
         };
 
@@ -619,7 +626,11 @@ impl LanguageCoordinator {
 
         events.push(LanguageEvent::log(
             LanguageLogLevel::Info,
-            format!("Derived language '{derived_name}' loaded from base '{base_name}'"),
+            format!(
+                "Derived language '{derived_name}' loaded from base '{base_name}'",
+                derived_name = escape_terminal_controls(derived_name),
+                base_name = escape_terminal_controls(base_name)
+            ),
         ));
         if self.has_queries(derived_name) {
             events.push(LanguageEvent::semantic_tokens_refresh(
@@ -670,7 +681,9 @@ impl LanguageCoordinator {
                 LanguageLogLevel::Error,
                 format!(
                     "Cannot load derived language '{derived_name}': \
-                     base language '{base_name}' is part of a circular chain"
+                     base language '{base_name}' is part of a circular chain",
+                    derived_name = escape_terminal_controls(derived_name),
+                    base_name = escape_terminal_controls(base_name)
                 ),
             )),
             None => self.try_load_language_by_id(base_name, current_generation),
@@ -685,7 +698,9 @@ impl LanguageCoordinator {
                 LanguageLogLevel::Error,
                 format!(
                     "Cannot load derived language '{derived_name}': \
-                     base language '{base_name}' not found"
+                     base language '{base_name}' not found",
+                    derived_name = escape_terminal_controls(derived_name),
+                    base_name = escape_terminal_controls(base_name)
                 ),
             )))
         }
@@ -746,7 +761,7 @@ impl LanguageCoordinator {
                     log::debug!(
                         target: "kakehashi::config",
                         "Language '{}' has base='{}' (self-reference, chain terminator)",
-                        lang_name, base
+                        escape_terminal_controls(lang_name), escape_terminal_controls(base)
                     );
                 } else if config.parser.is_some()
                     && languages
@@ -756,15 +771,15 @@ impl LanguageCoordinator {
                     log::debug!(
                         target: "kakehashi::language_detection",
                         "Skipping base fallback for '{}' because it defines its own parser",
-                        lang_name
+                        escape_terminal_controls(lang_name)
                     );
                 } else {
                     base_map.insert(lang_name.clone(), base.clone());
                     log::debug!(
                         target: "kakehashi::language_detection",
                         "Registered base '{}' → '{}'",
-                        lang_name,
-                        base
+                        escape_terminal_controls(lang_name),
+                        escape_terminal_controls(base)
                     );
                 }
             }
@@ -846,7 +861,10 @@ impl LanguageCoordinator {
         if search_paths.is_empty() {
             return LanguageLoadResult::failure_with(LanguageEvent::log(
                 LanguageLogLevel::Warning,
-                format!("No search paths configured, cannot load language '{language_id}'"),
+                format!(
+                    "No search paths configured, cannot load language '{language_id}'",
+                    language_id = escape_terminal_controls(language_id)
+                ),
             ));
         }
 
@@ -874,7 +892,10 @@ impl LanguageCoordinator {
 
         events.push(LanguageEvent::log(
             LanguageLogLevel::Info,
-            format!("Dynamically loaded language {language_id} from search paths",),
+            format!(
+                "Dynamically loaded language {language_id} from search paths",
+                language_id = escape_terminal_controls(language_id)
+            ),
         ));
         if self.has_queries(language_id) {
             events.push(LanguageEvent::semantic_tokens_refresh(
@@ -1356,9 +1377,9 @@ impl LanguageCoordinator {
                     target: "kakehashi::language_detection",
                     level,
                     "Detected '{}' via {} for path='{}'",
-                    lang,
+                    escape_terminal_controls(lang),
                     method,
-                    path
+                    escape_terminal_controls(path)
                 );
             }
             None => {
@@ -1367,15 +1388,15 @@ impl LanguageCoordinator {
                         target: "kakehashi::language_detection",
                         level,
                         "Detected '{}' but no parser available for path='{}'",
-                        detected,
-                        path
+                        escape_terminal_controls(&detected),
+                        escape_terminal_controls(path)
                     );
                 } else {
                     log::log!(
                         target: "kakehashi::language_detection",
                         level,
                         "No language detected for path='{}'",
-                        path
+                        escape_terminal_controls(path)
                     );
                 }
             }
@@ -1476,7 +1497,7 @@ impl LanguageCoordinator {
         log::trace!(
             target: "kakehashi::language_detection",
             "Resolving injection language for identifier='{}', content_len={}",
-            identifier,
+            escape_terminal_controls(identifier),
             content.len()
         );
 
@@ -1489,7 +1510,7 @@ impl LanguageCoordinator {
             log::trace!(
                 target: "kakehashi::language_detection",
                 "Resolved injection '{}' -> '{}' via configured plaintext base",
-                identifier, found.0
+                escape_terminal_controls(identifier), escape_terminal_controls(&found.0)
             );
             return Some(found);
         }
@@ -1497,7 +1518,7 @@ impl LanguageCoordinator {
             log::trace!(
                 target: "kakehashi::language_detection",
                 "Resolved injection '{}' -> '{}' via identifier (direct or base)",
-                identifier, found.0
+                escape_terminal_controls(identifier), escape_terminal_controls(&found.0)
             );
             return Some(found);
         }
@@ -1509,7 +1530,7 @@ impl LanguageCoordinator {
             log::trace!(
                 target: "kakehashi::language_detection",
                 "Resolved injection '{}' -> '{}' via syntect token (direct or base)",
-                identifier, found.0
+                escape_terminal_controls(identifier), escape_terminal_controls(&found.0)
             );
             return Some(found);
         }
@@ -1521,7 +1542,7 @@ impl LanguageCoordinator {
             log::trace!(
                 target: "kakehashi::language_detection",
                 "Resolved injection '{}' -> '{}' via first-line detection (direct or base)",
-                identifier, found.0
+                escape_terminal_controls(identifier), escape_terminal_controls(&found.0)
             );
             return Some(found);
         }
@@ -1529,7 +1550,7 @@ impl LanguageCoordinator {
         log::trace!(
             target: "kakehashi::language_detection",
             "Failed to resolve injection language for identifier='{}'",
-            identifier
+            escape_terminal_controls(identifier)
         );
         None
     }
@@ -1700,7 +1721,10 @@ impl LanguageCoordinator {
         }
         events.push(LanguageEvent::log(
             LanguageLogLevel::Info,
-            format!("Language {lang_name} loaded."),
+            format!(
+                "Language {lang_name} loaded.",
+                lang_name = escape_terminal_controls(lang_name)
+            ),
         ));
         LanguageLoadResult::success_with(events)
     }
@@ -2145,6 +2169,19 @@ mod tests {
         let (resolved, load_result) = result.unwrap();
         assert_eq!(resolved, "bash");
         assert!(load_result.success);
+    }
+
+    #[test]
+    fn unavailable_dynamic_language_message_escapes_controls() {
+        let coordinator = LanguageCoordinator::new();
+        let result = coordinator.ensure_language_loaded("日本語\n\u{1b}[31m");
+        assert!(!result.success);
+        let LanguageEvent::Log { level, message } = &result.events[0] else {
+            panic!("expected language availability diagnostic");
+        };
+        assert_eq!(*level, LanguageLogLevel::Warning);
+        assert!(message.contains(r"日本語\n\u{1b}[31m"), "{message:?}");
+        assert!(!message.chars().any(char::is_control));
     }
 
     #[test]
