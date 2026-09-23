@@ -225,15 +225,25 @@ Clients that declare `workspace.configuration` support are also asked for the
 - after `workspace/didChangeWorkspaceFolders` moves the workspace root (see
   below).
 
-The request carries no `scopeUri`, because kakehashi keeps one effective
-configuration for the whole session. The answer is applied exactly like a
-pushed `settings.kakehashi`: it is one more layer on top of the ones already in
-effect, and keys it omits keep their current values. An answer of `null`, an
-error response, or no answer within 10 seconds leaves the settings in effect
-unchanged, and so does an answer to a request made before the workspace root
-moved — the root change asks again. Unlike a push, an answer containing keys
-kakehashi does not know (editors keep settings such as `trace.server` in the
-same section) is not rejected: those keys are ignored and the rest applies.
+The request's `scopeUri` is the workspace root (see below), exactly as the
+client named it, because kakehashi keeps one effective configuration for the
+whole session and resolves it for that root. When kakehashi fell back to its
+launch directory because the client named no workspace, the request carries
+no `scopeUri` and asks for the client's global configuration. Configuration an
+editor keeps for other workspace folders is not read.
+
+The answer is the client's configuration, one layer above the configuration
+files — but unlike pushes, which accumulate, each answer **replaces the
+previous answer**: a key the client stopped setting falls back to what the
+layers below say. The newest answer sits above every push that arrived before
+it. An answer holding nothing for kakehashi (`{}`, or only keys such as
+`trace.server`) withdraws the previous answer. An answer of `null`, an error
+response, or no answer within 10 seconds leaves the settings in effect
+unchanged, and so does an answer to a request made for a root the session has
+since left — the root change asks again. Unlike a push, an answer containing
+keys kakehashi does not know (editors keep settings such as `trace.server` in
+the same section) is not rejected: those keys are ignored and the rest
+applies.
 
 A field answered with an empty container (`{}` or `[]`) means what the same
 spelling means in a config file — for most settings, it clears the value below
@@ -270,6 +280,7 @@ user or give an absolute path.
 | A TOML config file (user, project, or `--config-file`) | that file's own directory |
 | `initializationOptions` | the workspace root |
 | `workspace/didChangeConfiguration` | the workspace root |
+| a `workspace/configuration` answer | the workspace root |
 
 Each `--config-file` layer uses its own directory, so two files that both say `./queries` mean two different directories.
 

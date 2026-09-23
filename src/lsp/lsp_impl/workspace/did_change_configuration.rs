@@ -170,10 +170,11 @@ impl Kakehashi {
     /// Editors that send `didChangeConfiguration` with no usable `settings`
     /// (VS Code most prominently) expect the server to pull instead. The
     /// answer is not a delta and not a snapshot of kakehashi's own state — it
-    /// is the client's configuration, which is one layer among the rest, so it
-    /// is applied exactly as a push of the same section would be. Nothing
-    /// supersedes anything: the layer is appended in arrival order like any
-    /// other (#734).
+    /// is the client's configuration for the scope asked, one layer among the
+    /// rest, and ingested exactly as a push of the same section would be. It
+    /// differs from a push in one respect: being the client's whole
+    /// configuration, it replaces the previous answer rather than accumulating
+    /// over it (pushes still accumulate, #734), and lands at its own arrival.
     ///
     /// The item's `scopeUri` is the selected configuration root — the one
     /// directory every client layer is anchored to and the project config is
