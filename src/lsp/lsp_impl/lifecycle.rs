@@ -1541,6 +1541,8 @@ fn spawn_upstream_request(
             }
             UpstreamRequest::ConsolidateSharedInstance { server } => {
                 let Some(context) = delivery_context else {
+                    // Unreachable in the wired server (the loop is spawned with a
+                    // context); logged rather than skipped silently.
                     log::warn!(
                         target: "kakehashi::bridge",
                         "Cannot consolidate {server:?}'s shared instance: no delivery context"
