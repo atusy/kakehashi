@@ -941,8 +941,15 @@ impl LanguageServerPool {
     pub(crate) async fn consolidate_shared_instance(&self, server_name: &str) {
         let shared_key = ConnectionKey::shared(server_name);
         let mut connections = self.connections.lock().await;
+        // Live, not necessarily Ready: `initialized` goes out before the
+        // handshake flips the state, so a server registering in its
+        // `initialized` handler can be heard while still Initializing — and
+        // acquisitions already route to an Initializing shared instance.
         if !connections.get(&shared_key).is_some_and(|shared| {
-            shared.state() == ConnectionState::Ready && shared.supports_workspace_folder_changes()
+            matches!(
+                shared.state(),
+                ConnectionState::Initializing | ConnectionState::Ready
+            ) && shared.supports_workspace_folder_changes()
         }) {
             return;
         }
@@ -4908,7 +4915,7 @@ mod tests {
     /// Only diverts are consolidated: a per-root connection launched without
     /// the preference is per-root by configuration (a reload flip can leave
     /// one beside a shared key launched under the old config), and a shared
-    /// handle that is no longer Ready cannot take anyone's roots.
+    /// handle that has failed cannot take anyone's roots.
     #[tokio::test]
     async fn consolidating_keeps_per_root_instances_that_are_not_diverts() {
         let pool = LanguageServerPool::new();
@@ -4935,8 +4942,30 @@ mod tests {
         pool.consolidate_shared_instance("srv").await;
         assert!(
             pool.connections.lock().await.contains_key(&diverted_key),
-            "a shared handle that is no longer Ready retires nothing"
+            "a failed shared handle retires nothing"
         );
+    }
+
+    /// `initialized` is sent before the handshake flips the state to Ready, so
+    /// a server that registers from its `initialized` handler is heard while
+    /// the shared handle is still Initializing — consolidation must act then.
+    #[tokio::test]
+    async fn consolidating_acts_on_a_shared_instance_still_finishing_its_handshake() {
+        let pool = LanguageServerPool::new();
+        let shared =
+            create_handle_with_key(ConnectionState::Initializing, ConnectionKey::shared("srv"))
+                .await;
+        register_folder_changes(&shared);
+        let diverted_key = ConnectionKey::new("srv", Some("file:///repo/b".to_string()));
+        pool.insert_connection(shared).await;
+        pool.insert_connection(
+            create_handle_with_key(ConnectionState::Ready, diverted_key.clone()).await,
+        )
+        .await;
+
+        pool.consolidate_shared_instance("srv").await;
+
+        assert!(!pool.connections.lock().await.contains_key(&diverted_key));
     }
 
     #[tokio::test]
