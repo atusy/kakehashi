@@ -15,6 +15,20 @@ use std::str::FromStr;
 /// This distinctive prefix identifies virtual URIs and prevents collisions with real files.
 const VIRTUAL_URI_PREFIX: &str = "kakehashi-virtual-uri-";
 
+/// Characters left literal in a virtual filename: RFC 3986 unreserved only.
+/// Everything else, including `%`, is percent-encoded, so the filename stays
+/// one path segment that both `url::Url` and `ls_types::Uri` accept.
+const FILENAME_ENCODE_SET: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+/// Percent-encode a virtual filename as a single path segment.
+fn encode_filename(filename: &str) -> percent_encoding::PercentEncode<'_> {
+    percent_encoding::utf8_percent_encode(filename, FILENAME_ENCODE_SET)
+}
+
 /// Virtual document URI for injection regions.
 ///
 /// Encodes host URI + injection language + region ID into a URI that
@@ -282,16 +296,7 @@ impl VirtualDocumentUri {
             self.host_uri.as_str(),
             percent_encoding::NON_ALPHANUMERIC,
         );
-        // Keep only RFC 3986 unreserved characters literal. Url's path-segment
-        // writer allows a backslash in non-special schemes, which ls_types::Uri
-        // rejects; encoding here also preserves controls instead of dropping them.
-        const SEGMENT_ENCODE_SET: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
-            .remove(b'-')
-            .remove(b'.')
-            .remove(b'_')
-            .remove(b'~');
-        let encoded_filename =
-            percent_encoding::utf8_percent_encode(&virtual_filename, SEGMENT_ENCODE_SET);
+        let encoded_filename = encode_filename(&virtual_filename);
         format!("kakehashi:///virtual/{encoded_host}/{encoded_filename}")
     }
 
