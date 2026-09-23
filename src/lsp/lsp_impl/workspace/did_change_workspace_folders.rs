@@ -855,4 +855,33 @@ mod tests {
             "the project file read at the root change must stay in effect"
         );
     }
+
+    /// An answer holding only keys the editor keeps in the same section, with
+    /// no earlier answer to withdraw, changes nothing — so nothing is rebuilt
+    /// or republished, however the emptiness is spelled.
+    #[rstest::rstest]
+    #[case::empty_section(serde_json::json!({}))]
+    #[case::editor_keys_only(serde_json::json!({ "trace": { "server": "off" } }))]
+    #[tokio::test]
+    #[serial(xdg_env)]
+    async fn an_answer_with_nothing_to_withdraw_changes_nothing(#[case] answer: serde_json::Value) {
+        let xdg_scratch = tempfile::tempdir().expect("failed to create scratch XDG_CONFIG_HOME");
+        let _xdg_guard = XdgConfigHomeGuard::set(xdg_scratch.path());
+        let first = tempfile::tempdir().expect("failed to create workspace dir");
+
+        let (service, _pulls) = initialized_server_answering(
+            serde_json::json!([folder(first.path(), "first")]),
+            vec![answer],
+        )
+        .await;
+        let server = service.inner();
+        let before = server.settings_manager.load_settings_pair();
+
+        pull_now(server).await;
+
+        assert!(
+            Arc::ptr_eq(&before, &server.settings_manager.load_settings_pair()),
+            "an answer that changes no layer must not republish the settings"
+        );
+    }
 }
