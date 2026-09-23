@@ -2145,6 +2145,66 @@ mod tests {
         assert!(result.is_err(), "archive links must be refused");
     }
 
+    #[test]
+    fn parser_archive_rejects_links_and_special_entries_before_unpacking() {
+        for entry_type in [
+            tar::EntryType::Symlink,
+            tar::EntryType::Link,
+            tar::EntryType::Fifo,
+            tar::EntryType::Char,
+            tar::EntryType::Block,
+        ] {
+            let temp = tempdir().unwrap();
+            let dest = temp.path().join("source");
+            let mut archive = tar::Builder::new(Vec::new());
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(entry_type);
+            header.set_mode(0o644);
+            header.set_size(0);
+            if entry_type.is_symlink() || entry_type.is_hard_link() {
+                header.set_link_name("target").unwrap();
+            }
+            archive
+                .append_data(&mut header, "repo-rev/entry", std::io::empty())
+                .unwrap();
+            let bytes = archive.into_inner().unwrap();
+
+            let error = extract_parser_archive(&bytes[..], "repo-rev", &dest).unwrap_err();
+            assert!(
+                error.to_string().contains("Unsupported entry type"),
+                "{entry_type:?}: {error}"
+            );
+            assert!(fs::symlink_metadata(dest.join("entry")).is_err());
+        }
+    }
+
+    #[test]
+    fn parser_archive_extracts_files_directories_and_long_paths() {
+        let temp = tempdir().unwrap();
+        let dest = temp.path().join("source");
+        let mut archive = tar::Builder::new(Vec::new());
+        let mut directory = tar::Header::new_gnu();
+        directory.set_entry_type(tar::EntryType::Directory);
+        directory.set_mode(0o755);
+        directory.set_size(0);
+        archive
+            .append_data(&mut directory, "repo-rev/src", std::io::empty())
+            .unwrap();
+        // GNU long-name metadata must remain supported by the entry iterator.
+        let relative = format!("src/{}/parser.c", "long".repeat(30));
+        let mut file = tar::Header::new_gnu();
+        file.set_mode(0o644);
+        file.set_size(6);
+        archive
+            .append_data(&mut file, format!("repo-rev/{relative}"), &b"parser"[..])
+            .unwrap();
+        let bytes = archive.into_inner().unwrap();
+
+        extract_parser_archive(&bytes[..], "repo-rev", &dest).unwrap();
+        assert_eq!(fs::read(dest.join(relative)).unwrap(), b"parser");
+        assert!(!dest.join("repo-rev").exists());
+    }
+
     /// Test that download_and_extract_archive downloads and extracts a GitHub archive.
     #[test]
     fn test_download_and_extract_archive_for_json_parser() {
