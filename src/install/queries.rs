@@ -305,7 +305,7 @@ fn required_parents(
         .map(|parent| parent.name)
 }
 
-/// Hold every managed language in an inheritance chain still, and report
+/// Hold every language in an inheritance chain still, and report
 /// whether the chain is complete: every language installed, or, for an
 /// inherited parent with no complete managed copy, provided as a base query by
 /// a search path outside the data directory.
@@ -336,7 +336,7 @@ pub(crate) fn lock_complete_chain(
 /// What [`probe_chain`] found for an inheritance chain.
 pub(crate) enum ChainProbe {
     /// Every language is installed or provided by a search path; the guards
-    /// hold the managed ones still.
+    /// keep installs from replacing any of them while they live.
     Complete(Vec<LanguageLock>),
     /// A language is missing, unreadable, or not installable by name.
     Incomplete,
@@ -367,21 +367,9 @@ pub(crate) fn probe_chain(data_dir: &Path, language: &str, search_paths: &[PathB
         }
         seen.push(language.to_string());
         let queries_dir = data_dir.join("queries").join(language);
-        // A parent the loader resolves from a search path needs no managed
-        // copy, and nothing here publishes it, so there is nothing to lock.
-        // Its own declarations are still part of the chain.
-        if is_included
-            && is_safe_language_name(language)
-            && !query_install_is_complete(&queries_dir)
-            && provided_outside_data_dir(&data_dir.join("queries"), language, search_paths)
-        {
-            return inherited_languages_with_search_paths(&queries_dir, language, search_paths)
-                .is_some_and(|parents| {
-                    required_parents(parents, true).all(|parent| {
-                        walk(data_dir, &parent, true, search_paths, seen, guards, busy)
-                    })
-                });
-        }
+        // Locked before anything is read, a provided parent included: a
+        // forced install of it removes its managed copy between two renames,
+        // and that transient absence must read as busy, not as "provided".
         match try_lock_language(data_dir, language) {
             LanguageLockProbe::Idle(guard) => guards.push(guard),
             // Nothing can publish into a data directory nothing can write, so
@@ -392,6 +380,19 @@ pub(crate) fn probe_chain(data_dir: &Path, language: &str, search_paths: &[PathB
                 return false;
             }
             LanguageLockProbe::UnusableName | LanguageLockProbe::Unavailable => return false,
+        }
+        // A parent the loader resolves from a search path needs no managed
+        // copy; its own declarations are still part of the chain.
+        if is_included
+            && !query_install_is_complete(&queries_dir)
+            && provided_outside_data_dir(&data_dir.join("queries"), language, search_paths)
+        {
+            return inherited_languages_with_search_paths(&queries_dir, language, search_paths)
+                .is_some_and(|parents| {
+                    required_parents(parents, true).all(|parent| {
+                        walk(data_dir, &parent, true, search_paths, seen, guards, busy)
+                    })
+                });
         }
         query_install_is_complete(&queries_dir)
             && inherited_languages_with_search_paths(&queries_dir, language, search_paths)
