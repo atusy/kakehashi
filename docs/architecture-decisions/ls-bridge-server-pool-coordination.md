@@ -248,7 +248,20 @@ Multiple downstream servers initialize in parallel since each is independent:
 | Some servers fail | Continue with working servers, respawn failed |
 | All servers fail | Bridge reports errors, continues respawning |
 
-**Future Extension (Phase 2)**: Rate-limited respawn to prevent respawn storms.
+**Crash recovery (Phase 2 rate-limited respawn, #977)**: a connection that
+crashes after start-up is respawned proactively rather than on the next
+request that needs it — otherwise the diagnostics its crash evicted stay gone
+on a document nobody edits. Only a crash qualifies: the exited handle must
+still be mapped and `Failed`, which a graceful shutdown (`Closing`), a
+settings eviction and a replacement all rule out. The respawn is an ordinary
+acquire by key, so its purge arms the re-open that
+respawn-reopen-derives-its-targets describes and the replacement is brought
+up to date the same way as any other. It is rate-limited per key: 2 s,
+doubling, at most five consecutive attempts, reset after 60 s of health; past
+that only the next request respawns the server. It is skipped when settings no
+longer start the server, when no open document could bridge to it, and for a
+shared-instance key, whose marker roots cannot be recovered without a
+document.
 
 **Malformed Initialize Capability Recovery:**
 
