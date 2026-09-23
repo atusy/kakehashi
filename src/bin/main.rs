@@ -1303,10 +1303,13 @@ fn write_new_output_with(
 fn native_output_path(path: &std::path::Path) -> std::io::Result<PathBuf> {
     // Rust's filesystem wrappers support extended-length paths, but tempfile's
     // native publication and our security APIs need the prefix explicitly.
+    // First apply Win32 lexical normalization (including ordinary trailing dots
+    // and spaces). absolute preserves explicitly verbatim input as-is.
+    let path = std::path::absolute(path)?;
     // Canonicalize only the existing parent: the output leaf may be absent and
     // must still be inspected without following a symlink/reparse point.
     match path.file_name() {
-        Some(name) => Ok(output_parent(path).canonicalize()?.join(name)),
+        Some(name) => Ok(output_parent(&path).canonicalize()?.join(name)),
         None => Ok(path.to_owned()),
     }
 }
@@ -2350,6 +2353,30 @@ mod tests {
             std::fs::read_to_string(&output).unwrap(),
             "previous configuration"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_output_preserves_ordinary_and_verbatim_leaf_names() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("config.toml");
+        std::fs::write(&output, "previous").unwrap();
+        // TempDir may itself have a verbatim prefix; construct ordinary paths
+        // to exercise Win32 normalization before our extended-path conversion.
+        let parent = temp.path().canonicalize().unwrap();
+        let ordinary_parent = parent.to_str().unwrap().strip_prefix(r"\\?\").unwrap();
+        for name in ["config.toml.", "config.toml ", "config.toml. "] {
+            let alias = std::path::Path::new(ordinary_parent).join(name);
+            write_forced_output(&alias, name).unwrap();
+            assert_eq!(std::fs::read_to_string(&output).unwrap(), name);
+            let error = write_new_output_with(&alias, |_| Ok(())).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        }
+        // An explicitly verbatim dot remains literal, separate from config.toml.
+        let literal = parent.join("config.toml.");
+        write_forced_output(&literal, "literal").unwrap();
+        assert_eq!(std::fs::read_to_string(&literal).unwrap(), "literal");
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), "config.toml. ");
     }
 
     #[cfg(windows)]
