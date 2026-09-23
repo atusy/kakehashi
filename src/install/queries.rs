@@ -3739,6 +3739,25 @@ mod tests {
         assert!(lock_complete_chain(&data, "child", std::slice::from_ref(&runtime)).is_none());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn an_alias_of_the_data_directory_does_not_provide_a_parent() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let alias = temp.path().join("alias");
+        let child = data.join("queries/child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(child.join("highlights.scm"), "; inherits: parent\n").unwrap();
+        write_install_marker(&child).unwrap();
+        // An interrupted install left the parent incomplete in the data
+        // directory; seen through the alias it must not count as provided.
+        let parent = data.join("queries/parent");
+        fs::create_dir_all(&parent).unwrap();
+        fs::write(parent.join("highlights.scm"), "").unwrap();
+        std::os::unix::fs::symlink(&data, &alias).unwrap();
+        assert!(lock_complete_chain(&data, "child", &[alias]).is_none());
+    }
+
     #[test]
     fn an_overlay_alone_does_not_provide_a_parent() {
         let temp = TempDir::new().unwrap();
