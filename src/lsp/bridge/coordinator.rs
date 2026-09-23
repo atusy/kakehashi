@@ -753,7 +753,10 @@ impl BridgeCoordinator {
     }
 
     /// Whether one of `host_uri`'s injections routes to exactly `connection`.
-    /// Read-only, like the routing it asks: nothing is opened or spawned.
+    /// Opens nothing. Routing is normally answered from the decisions already
+    /// cached for the document; only a region with no cached decision makes
+    /// routing ask its candidate servers, which acquires (and may spawn) them —
+    /// the same cost the respawn re-open pays for such a region.
     pub(crate) async fn host_routes_to_connection(
         &self,
         settings: &Arc<WorkspaceSettings>,
@@ -809,8 +812,10 @@ impl BridgeCoordinator {
     /// is named. `None` when nothing is left: this host supplies nothing for
     /// that server (or that connection).
     ///
-    /// Read-only: routing is resolved, never acquired, so asking about a host
-    /// that belongs to another root cannot spawn that root's server.
+    /// Opens nothing, and the per-connection filter resolves keys without
+    /// acquiring. Routing itself is answered from cached decisions; a region
+    /// with no cached decision makes it ask the candidate servers, which
+    /// acquires them.
     #[allow(clippy::too_many_arguments)]
     async fn injections_routed_to_server(
         &self,
@@ -853,10 +858,9 @@ impl BridgeCoordinator {
             return None;
         };
         // A repair is for one concrete connection. The same host can have
-        // injections routed to several keys, so do not pass the whole server
-        // batch to `eager_open_virtual_documents` and let its first injection
-        // represent the rest. The normal eager path is partitioned earlier;
-        // this filters the respawn path to the key being repaired.
+        // injections routed to several keys, so a caller naming a connection
+        // gets only that key's injections — not a whole server batch whose
+        // first injection would stand for the rest.
         let for_server = if let Some(expected_key) = connection {
             let mut matching = Vec::new();
             for injection in for_server {
