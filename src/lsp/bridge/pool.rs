@@ -2130,11 +2130,15 @@ impl LanguageServerPool {
                     // Registered while still handshaking (it can consolidate
                     // then): wait it out rather than revive the retired key,
                     // whose documents already route to the shared instance.
+                    // Re-check the launch config after the wait: a reload can
+                    // land while it runs, and the handshake can finish before
+                    // `propagate_settings` evicts this handle.
                     ConnectionState::Initializing => {
                         return shared
                             .wait_for_ready(Duration::from_secs(INIT_TIMEOUT_SECS))
                             .await
                             .ok()
+                            .filter(|()| shared.matches_launch_config(config))
                             .map(|()| shared);
                     }
                     _ => {}
