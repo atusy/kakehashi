@@ -952,10 +952,18 @@ impl LanguageServerPool {
         let Some(shared) = connections.get(&shared_key).map(Arc::clone) else {
             return;
         };
+        // A shared key is not proof of the opt-in: a routing answer of
+        // `workspaceFolders: []` puts an ordinary per-root server's rootless
+        // documents there too, and that server's marker-rooted connections
+        // are its configuration, not diverts. (Production handles record
+        // their launch config before they are inserted.)
         if !(matches!(
             shared.state(),
             ConnectionState::Initializing | ConnectionState::Ready
-        ) && shared.supports_workspace_folder_changes())
+        ) && shared.supports_workspace_folder_changes()
+            && shared
+                .launch_config()
+                .is_none_or(|config| config.prefers_shared_instance()))
         {
             return;
         }
@@ -5200,6 +5208,28 @@ mod tests {
         pool.consolidate_shared_instance("srv").await;
 
         assert!(!pool.connections.lock().await.contains_key(&diverted_key));
+    }
+
+    /// A rootless routing answer (`workspaceFolders: []`) puts a server that
+    /// did not opt in on the shared key too; its registration must not retire
+    /// that server's per-root connections, which are its configuration.
+    #[tokio::test]
+    async fn consolidating_ignores_a_rootless_shared_key_of_a_server_that_did_not_opt_in() {
+        let pool = LanguageServerPool::new();
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("srv")).await;
+        shared.record_launch_config(&devnull_config());
+        register_folder_changes(&shared);
+        let per_root_key = ConnectionKey::new("srv", Some("file:///repo/b".to_string()));
+        pool.insert_connection(shared).await;
+        pool.insert_connection(
+            create_handle_with_key(ConnectionState::Ready, per_root_key.clone()).await,
+        )
+        .await;
+
+        pool.consolidate_shared_instance("srv").await;
+
+        assert!(pool.connections.lock().await.contains_key(&per_root_key));
     }
 
     #[tokio::test]
