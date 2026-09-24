@@ -2350,9 +2350,10 @@ async fn crashed_connection_document(
 ) -> Option<Url> {
     let server = key.server();
     for host in injection.open_host_uris() {
-        // A declared host label may intentionally differ from its grammar
-        // (custom-rust -> rust). Host routing uses that label, injections the tree.
-        if let Some(host_snapshot) = injection.host_reopen_snapshot(&host)
+        // Host dispatch may use a detected grammar or retain a declared alias
+        // (custom-rust -> rust). Check the server's host role independently of
+        // the settled tree required for injection demand.
+        if let Some(host_snapshot) = injection.host_reopen_snapshot(&host, settings, key.server())
             && bridge
                 .host_layer_routes_to_connection(settings, &host_snapshot.language_id, &host, key)
                 .await
@@ -2389,7 +2390,7 @@ async fn crashed_shared_documents(
     let mut documents = Vec::new();
     let pool = bridge.pool();
     for host in injection.open_host_uris() {
-        if let Some(snapshot) = injection.host_reopen_snapshot(&host)
+        if let Some(snapshot) = injection.host_reopen_snapshot(&host, settings, key.server())
             && bridge
                 .host_layer_routes_to_connection(settings, &snapshot.language_id, &host, key)
                 .await
@@ -2631,12 +2632,14 @@ async fn attempt_crash_recovery(
                         break;
                     }
                     // Re-derive each layer's demand after the handshake:
-                    // hosts need their declared label, regions a current tree.
+                    // hosts need their dispatch language, regions a current tree.
                     let destination = pool
                         .resolved_connection_key(server, &config, &document)
                         .await;
                     let host_is_wanted = if document == host {
-                        if let Some(snapshot) = injection.host_reopen_snapshot(&host) {
+                        if let Some(snapshot) =
+                            injection.host_reopen_snapshot(&host, settings, key.server())
+                        {
                             bridge
                                 .host_layer_routes_to_connection(
                                     settings,
@@ -5236,8 +5239,13 @@ mod reopen_order_tests {
         assert!(pool.is_host_document_opened_on_connection(&uri, &key).await);
     }
 
+    #[rstest::rstest]
+    #[case("custom-rust")]
+    #[case("rust")]
     #[tokio::test]
-    async fn crash_demand_uses_the_host_label_instead_of_its_parser_language() {
+    async fn crash_demand_includes_declared_and_dispatched_host_languages(
+        #[case] server_language: &str,
+    ) {
         use super::*;
         use crate::config::settings::{BridgeLanguageConfig, BridgeServerConfig, LanguageSettings};
         use std::collections::HashMap;
@@ -5271,13 +5279,18 @@ mod reopen_order_tests {
                     "alias-server".into(),
                     BridgeServerConfig {
                         cmd: Some(vec!["must-not-be-spawned".into()]),
-                        languages: Some(vec!["custom-rust".into()]),
+                        languages: Some(vec![server_language.into()]),
                         workspace_markers: Some(Vec::new()),
                         ..Default::default()
                     },
                 )]),
                 ..Default::default()
             });
+        let mut settings = (*server.settings_manager.load_settings()).clone();
+        let mut grammar_settings = settings.languages["custom-rust"].clone();
+        grammar_settings.base = None;
+        settings.languages.insert("rust".into(), grammar_settings);
+        server.settings_manager.apply_settings(settings);
         let uri = Url::parse("file:///host-alias.rs").unwrap();
         server.documents.insert(
             uri.clone(),
@@ -5294,6 +5307,10 @@ mod reopen_order_tests {
         assert_eq!(
             server.documents.get(&uri).unwrap().language_id(),
             Some("custom-rust")
+        );
+        assert_eq!(
+            server.host_resolve_snapshot(&uri).unwrap().language_id,
+            "rust"
         );
         let key = crate::lsp::bridge::ConnectionKey::for_server("alias-server");
         assert!(

@@ -793,16 +793,33 @@ impl InjectionCoordinator {
         self.documents.open_uris()
     }
 
-    /// Read host language, content and revision together, without requiring a tree.
+    /// Read this server's host language, content and revision together.
+    /// Requests use detected grammar names; initial eager opens can retain a
+    /// declared alias or parserless label. Recover either target, preferring
+    /// ordinary request dispatch when this server supports both languages.
     pub(crate) fn host_reopen_snapshot(
         &self,
         uri: &Url,
+        settings: &std::sync::Arc<crate::config::WorkspaceSettings>,
+        server: &str,
     ) -> Option<crate::lsp::bridge::HostResolveSnapshot> {
         let document = self.documents.get(uri)?;
-        let language_id = document.language_id().map(str::to_owned).or_else(|| {
-            self.language
-                .detect_language(uri.path(), document.text(), None, None)
-        })?;
+        let selected = |language: &str| {
+            self.bridge
+                .cached_host_configs_for_language(settings, language)
+                .iter()
+                .any(|config| config.server_name == server)
+        };
+        let language_id = self
+            .language
+            .detect_language(uri.path(), document.text(), None, document.language_id())
+            .filter(|language| selected(language))
+            .or_else(|| {
+                document
+                    .language_id()
+                    .filter(|language| selected(language))
+                    .map(str::to_owned)
+            })?;
         Some(crate::lsp::bridge::HostResolveSnapshot {
             text: document.text_arc(),
             language_id,
@@ -821,10 +838,10 @@ impl InjectionCoordinator {
         key: &crate::lsp::bridge::ConnectionKey,
     ) -> crate::lsp::bridge::OpenOutcome {
         use crate::lsp::bridge::OpenOutcome;
-        let Some(host) = self.host_reopen_snapshot(uri) else {
+        let settings = self.settings_manager.load_settings_pair();
+        let Some(host) = self.host_reopen_snapshot(uri, &settings.settings, key.server()) else {
             return OpenOutcome::NotApplicable;
         };
-        let settings = self.settings_manager.load_settings_pair();
         let Some(config) = self
             .bridge
             .cached_host_configs_for_language(&settings.settings, &host.language_id)
@@ -844,7 +861,7 @@ impl InjectionCoordinator {
                     text: &host.text,
                     revision: Some(host.revision),
                 },
-                &|uri| self.host_reopen_snapshot(uri),
+                &|uri| self.host_reopen_snapshot(uri, &settings.settings, key.server()),
                 &|| self.settings_manager.settings_generation() == settings.generation,
             )
             .await
