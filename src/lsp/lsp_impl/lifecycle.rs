@@ -1658,16 +1658,6 @@ fn spawn_upstream_request(
                     let sweep_deadline = std::time::Instant::now() + REOPEN_WAIT;
                     let mut budget_spent = false;
                     for host in hosts {
-                        // Settings are read per host, not once per sweep, and
-                        // read again for the open below: the sweep can outlive
-                        // a settings change (it waits on the parses that
-                        // change invalidates), and opening under a copy taken
-                        // before it would reopen a region the change's
-                        // injection pass just retracted from a server it no
-                        // longer selects (#917). This read only screens. The
-                        // selection memo is per snapshot, so each read is a
-                        // pointer load unless the snapshot really changed.
-                        let settings = settings_manager.load_settings();
                         // Stop if nobody can hear the answer. `rearm` and a
                         // later `claim` both drop the registry's receiver, so a
                         // closed channel means this re-open has been superseded
@@ -1690,6 +1680,14 @@ fn spawn_upstream_request(
                         {
                             repaired = false;
                         }
+                        // Host synchronization can await routing and lifecycle
+                        // locks. Read the screening settings only afterwards,
+                        // together with their generation: a rejection from an
+                        // expired snapshot must not hide a newly enabled region.
+                        // The actual open below reads settings again after any
+                        // parse wait, so it also honors later retractions (#917).
+                        let screen = settings_manager.load_settings_pair();
+                        let settings = &screen.settings;
                         // Cheapest question first. Deriving means asking about
                         // every open document, and for most of them the answer
                         // is "this host bridges nowhere near that server" —
@@ -1733,7 +1731,7 @@ fn spawn_upstream_request(
                             .map(|(candidate_language, settled_tree)| {
                                 (
                                     injection.bridge().host_language_can_reach_server(
-                                        &settings,
+                                        settings,
                                         &candidate_language,
                                         &reopen_server,
                                     ),
@@ -1756,11 +1754,12 @@ fn spawn_upstream_request(
                         if !reachable
                             && (settled_tree
                                 || injection.unsettled_injections_are_excluded(
-                                    &settings,
+                                    settings,
                                     &host,
                                     &reopen_server,
                                 ))
                             && injection.document_incarnation(&host) == screened_at
+                            && settings_manager.settings_generation() == screen.generation
                         {
                             continue;
                         }
@@ -5290,6 +5289,166 @@ fn order_reopen_candidates(
 mod reopen_order_tests {
     use super::order_reopen_candidates;
     use url::Url;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn host_sync_wait_does_not_hide_newly_enabled_injections() {
+        use super::*;
+        use crate::config::settings::{BridgeLanguageConfig, BridgeServerConfig, LanguageSettings};
+        use crate::lsp::bridge::{
+            ConnectionKey, ConnectionState, UpstreamRequest, VirtualDocumentUri,
+        };
+        use std::collections::HashMap;
+        use std::time::Duration;
+        use tower_lsp_server::LspService;
+
+        let (service, mut socket) = LspService::new(Kakehashi::new);
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            while socket.next().await.is_some() {}
+        });
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), language.clone());
+        server.language.query_store().insert_injection_query(
+            "rust".into(),
+            Arc::new(
+                tree_sitter::Query::new(
+                    &language,
+                    r#"((string_literal (string_content) @injection.content)
+                (#set! injection.language "html"))"#,
+                )
+                .unwrap(),
+            ),
+        );
+        let mut settings = crate::config::WorkspaceSettings {
+            auto_install: false,
+            languages: HashMap::from([(
+                "rust".into(),
+                LanguageSettings {
+                    bridge: Some(HashMap::from([
+                        (
+                            "_self".into(),
+                            BridgeLanguageConfig {
+                                enabled: Some(true),
+                                ..Default::default()
+                            },
+                        ),
+                        (
+                            "html".into(),
+                            BridgeLanguageConfig {
+                                enabled: Some(false),
+                                ..Default::default()
+                            },
+                        ),
+                    ])),
+                    ..Default::default()
+                },
+            )]),
+            language_servers: HashMap::from([(
+                "test".into(),
+                BridgeServerConfig {
+                    cmd: Some(vec!["sh".into(), "-c".into(), "cat >/dev/null".into()]),
+                    languages: Some(vec!["rust".into(), "html".into()]),
+                    workspace_markers: Some(Vec::new()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        server.settings_manager.apply_settings(settings.clone());
+        let uri = Url::parse("file:///host-sync-settings.rs").unwrap();
+        let text = r#"fn main() { let content = "<div>"; }"#;
+        let incarnation =
+            server
+                .documents
+                .insert(uri.clone(), text.into(), Some("rust".into()), None);
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        {
+            let document = server.documents.get(&uri).unwrap();
+            assert!(document.publish_snapshot(&Arc::new(
+                crate::document::snapshot::ParseSnapshot {
+                    text: Arc::from(text),
+                    tree: parser.parse(text, None),
+                    language: Some("rust".into()),
+                    parsed_version: document.content_version(),
+                    incarnation,
+                    injection_regions: None,
+                    regions: None,
+                    layer_trees: Arc::new(std::sync::OnceLock::new()),
+                }
+            )));
+        }
+        let pool = server.bridge.pool();
+        pool.open_host_incarnation(&uri, incarnation).await;
+        pool.insert_connection(
+            crate::lsp::bridge::test_helpers::create_handle_with_state(ConnectionState::Ready)
+                .await,
+        )
+        .await;
+        let injection = server.injection_coordinator();
+        let (_, Some(regions)) = injection.bridge_injections(&uri).unwrap() else {
+            panic!("settled injections")
+        };
+        assert_eq!(regions.len(), 1);
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&uri).unwrap(),
+            "html",
+            &regions[0].region_id,
+        );
+        let lifecycle = pool.host_lifecycle_lock(&uri);
+        let blocked = lifecycle.write().await;
+        let context = Arc::new(UpstreamDeliveryContext {
+            diagnostic_publisher: Arc::new(
+                crate::lsp::lsp_impl::coordinator::DiagnosticPublisher::new(server),
+            ),
+            settings_manager: Arc::clone(&server.settings_manager),
+            injection,
+        });
+        let (done, mut completion) = tokio::sync::watch::channel(false);
+        spawn_upstream_request(
+            pool.inbound_request_registry(),
+            None,
+            &server.client,
+            UpstreamRequest::ReopenDocuments {
+                key: ConnectionKey::for_server("test"),
+                done,
+            },
+            false,
+            Some(context),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), completion.changed())
+                .await
+                .is_err()
+        );
+        // Publish without scheduling another parse: this sweep is responsible
+        // for the already-current region that the new settings now select.
+        settings
+            .languages
+            .get_mut("rust")
+            .unwrap()
+            .bridge
+            .as_mut()
+            .unwrap()
+            .get_mut("html")
+            .unwrap()
+            .enabled = Some(true);
+        server.settings_manager.apply_settings(settings);
+        drop(blocked);
+        tokio::time::timeout(Duration::from_secs(15), completion.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            pool.is_document_opened(&virtual_uri),
+            "a settings change during host synchronization must not skip the newly enabled region"
+        );
+    }
 
     /// The handshake-owned re-open must await a host didOpen even without a
     /// parser. Cancelling eager batches cannot settle this independent repair.
