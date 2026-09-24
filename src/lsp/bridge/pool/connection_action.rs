@@ -44,6 +44,14 @@ pub(crate) enum BridgeError {
     /// This indicates a bug in the caller (e.g., an invalid `Serialize` impl).
     /// It is distinct from channel errors and should not trigger reconnection.
     SerializationFailed,
+    /// A shared instance unregistered `workspace/didChangeWorkspaceFolders`
+    /// before a root its routing chose could be announced (#968).
+    ///
+    /// Carried as `io::ErrorKind::Interrupted`: the acquisition was overtaken
+    /// by the server, not failed by it. Unlike the other interrupted
+    /// acquisitions (shutdown, supersession), re-resolving now diverts the
+    /// root, so acquisition entry points retry exactly this one.
+    FolderSupportWithdrawn,
 }
 
 impl BridgeError {
@@ -59,6 +67,23 @@ impl BridgeError {
     /// caller races rather than a failure it caused.
     pub(crate) fn is_closing(&self) -> bool {
         matches!(self, BridgeError::Closing)
+    }
+
+    /// Whether `error` is [`BridgeError::FolderSupportWithdrawn`].
+    pub(crate) fn is_folder_support_withdrawn(error: &io::Error) -> bool {
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<BridgeError>())
+            .is_some_and(|inner| *inner == BridgeError::FolderSupportWithdrawn)
+    }
+
+    /// [`BridgeError::FolderSupportWithdrawn`] as the `Interrupted` error it
+    /// travels as.
+    pub(crate) fn folder_support_withdrawn() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::Interrupted,
+            BridgeError::FolderSupportWithdrawn,
+        )
     }
 
     /// Get the LSP error code for this error.
@@ -92,6 +117,11 @@ impl std::fmt::Display for BridgeError {
             BridgeError::SerializationFailed => {
                 write!(f, "bridge: failed to serialize request payload")
             }
+            BridgeError::FolderSupportWithdrawn => write!(
+                f,
+                "bridge: shared instance withdrew folder-change support before \
+                 this root was announced"
+            ),
         }
     }
 }

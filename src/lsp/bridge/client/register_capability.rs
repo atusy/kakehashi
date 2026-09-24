@@ -2,9 +2,13 @@
 //!
 //! Inbound (downstream → bridge). A downstream server registers a dynamic
 //! capability; the bridge records it in the shared [`DynamicCapabilityRegistry`]
-//! and acks with `null`. Param-parse failures (or a missing `params` field)
-//! reply with InvalidParams (-32602): a server that can't form its own request
-//! is buggy, and the LSP spec allows an error response to any request.
+//! and acks with `null`. A shared instance registering
+//! `workspace/didChangeWorkspaceFolders` also asks the pool to consolidate the
+//! roots diverted away from it while it looked incapable (#968).
+//!
+//! Param-parse failures (or a missing `params` field) reply with
+//! InvalidParams (-32602): a server that can't form its own request is buggy,
+//! and the LSP spec allows an error response to any request.
 //!
 //! [`DynamicCapabilityRegistry`]: crate::lsp::bridge::pool::DynamicCapabilityRegistry
 
@@ -13,7 +17,8 @@ use serde::Deserialize;
 use tower_lsp_server::jsonrpc;
 use tower_lsp_server::ls_types::RegistrationParams;
 
-use crate::lsp::bridge::actor::ServerRequestDeps;
+use crate::lsp::bridge::actor::{ServerRequestDeps, UpstreamRequest};
+use crate::lsp::bridge::protocol::DID_CHANGE_WORKSPACE_FOLDERS_METHOD;
 
 /// Handle a `client/registerCapability` request, returning the JSON-RPC body
 /// the dispatcher wraps in a response.
@@ -44,7 +49,31 @@ pub(in crate::lsp::bridge) fn handle(
                     server_prefix, reg.method, reg.id
                 );
             }
+            let folder_changes_on_shared = deps.connection_key.is_shared()
+                && reg_params
+                    .registrations
+                    .iter()
+                    .any(|reg| reg.method == DID_CHANGE_WORKSPACE_FOLDERS_METHOD);
             deps.dynamic_capabilities.register(reg_params.registrations);
+            // Registered BEFORE signalling, so the pool's capability re-check
+            // sees it. Only the shared key's registration changes where roots
+            // route; any other key signals nothing — a divert is what the
+            // consolidation retires, and a client-root fallback or a plain
+            // per-root server has no shared instance to consolidate into (#968).
+            if folder_changes_on_shared
+                && deps
+                    .upstream_request_tx
+                    .send(UpstreamRequest::ConsolidateSharedInstance {
+                        server: deps.connection_key.server().to_owned(),
+                    })
+                    .is_err()
+            {
+                warn!(
+                    target: "kakehashi::bridge::reader",
+                    "{}Shared-instance consolidation not queued (forwarding loop gone)",
+                    server_prefix
+                );
+            }
             Ok(serde_json::Value::Null)
         }
         Err(e) => {

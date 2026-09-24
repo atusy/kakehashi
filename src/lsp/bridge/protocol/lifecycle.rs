@@ -94,6 +94,11 @@ pub(crate) fn build_didclose_notification(
     Some(JsonRpcNotification::new("textDocument/didClose", params))
 }
 
+/// The folder-change notification's method. A server may register it
+/// dynamically instead of declaring
+/// `workspace.workspaceFolders.changeNotifications` statically (#968).
+pub(crate) const DID_CHANGE_WORKSPACE_FOLDERS_METHOD: &str = "workspace/didChangeWorkspaceFolders";
+
 /// Build a `workspace/didChangeWorkspaceFolders` notification announcing newly
 /// added workspace folders (#391). Removal is not modeled — the shared-instance
 /// opt-in only ever grows a connection's folder set; idle eviction is a
@@ -105,7 +110,7 @@ pub(crate) fn build_did_change_workspace_folders_notification(
     let params = DidChangeWorkspaceFoldersParams {
         event: WorkspaceFoldersChangeEvent { added, removed },
     };
-    JsonRpcNotification::new("workspace/didChangeWorkspaceFolders", params)
+    JsonRpcNotification::new(DID_CHANGE_WORKSPACE_FOLDERS_METHOD, params)
 }
 
 /// Build a `workspace/didChangeConfiguration` notification carrying this

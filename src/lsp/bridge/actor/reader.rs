@@ -209,6 +209,17 @@ pub(crate) enum UpstreamRequest {
     /// back and retiring there would churn the palette on each respawn.
     /// Fire-and-forget for the same reason as its sibling.
     UnregisterCommands { commands: Vec<String> },
+    /// `server`'s shared instance just registered
+    /// `workspace/didChangeWorkspaceFolders` dynamically (#968): retire the
+    /// per-root processes its roots were diverted to while it looked
+    /// incapable. Routed upward only because the reader holds no pool
+    /// reference; the pool re-checks the capability before acting.
+    ConsolidateSharedInstance { server: String },
+    /// Re-sync the open host documents `server` host-bridges onto wherever
+    /// they now route: a consolidation retired the per-root connections that
+    /// held them (#968). Routed upward because the document text lives on the
+    /// server side; injected regions are re-opened through `ReopenDocuments`.
+    ResyncHostDocuments { server: String },
     /// Bring `key`'s virtual documents up to date: its previous connection was
     /// purged and has now been replaced by a `Ready` process
     /// (respawn-reopen-derives-its-targets).
@@ -232,6 +243,12 @@ pub(crate) enum UpstreamRequest {
         /// stopped being true — documents close, hosts re-root, and a
         /// connection that died young held nothing to capture at all.
         key: ConnectionKey,
+        /// Also re-sync, before `done` is signalled, the open host documents
+        /// this server host-bridges. Set only by a shared-instance
+        /// consolidation (#968), which moves host documents as well as
+        /// injected regions onto a live connection; a respawn re-open keeps
+        /// its injection-only scope.
+        host_documents: bool,
         done: tokio::sync::watch::Sender<bool>,
     },
 }
@@ -2048,6 +2065,65 @@ mod tests {
                 assert!(val["result"].is_null());
             }
             _ => panic!("Expected Untracked variant"),
+        }
+    }
+
+    /// Only a shared instance registering folder-change support asks the pool
+    /// to consolidate (#968): a per-root registration comes from a process a
+    /// consolidation would retire, and other methods say nothing about roots.
+    #[tokio::test]
+    async fn register_capability_requests_consolidation_only_for_shared_folder_changes() {
+        let cases = [
+            (
+                ConnectionKey::shared("srv"),
+                "workspace/didChangeWorkspaceFolders",
+                true,
+            ),
+            (
+                ConnectionKey::new("srv", Some("file:///b".to_string())),
+                "workspace/didChangeWorkspaceFolders",
+                false,
+            ),
+            (
+                ConnectionKey::for_server("srv"),
+                "workspace/didChangeWorkspaceFolders",
+                false,
+            ),
+            (
+                ConnectionKey::shared("srv"),
+                "textDocument/diagnostic",
+                false,
+            ),
+        ];
+        for (key, method, expected) in cases {
+            let router = ResponseRouter::new();
+            let (mut deps, _window_rx, _keep) = server_request_deps_for(Some("srv"));
+            let (upstream_request_tx, mut upstream_request_rx) = mpsc::unbounded_channel();
+            deps.connection_key = key.clone();
+            deps.upstream_request_tx = upstream_request_tx;
+
+            handle_message(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "client/registerCapability",
+                    "params": { "registrations": [{ "id": "r", "method": method }] }
+                }),
+                &router,
+                "",
+                &deps,
+            )
+            .await;
+
+            assert!(deps.dynamic_capabilities.has_registration(method));
+            match upstream_request_rx.try_recv() {
+                Ok(UpstreamRequest::ConsolidateSharedInstance { server }) => {
+                    assert!(expected, "{key} registering {method} must not consolidate");
+                    assert_eq!(server, "srv");
+                }
+                Ok(_) => panic!("unexpected upstream request for {key} / {method}"),
+                Err(_) => assert!(!expected, "{key} registering {method} must consolidate"),
+            }
         }
     }
 

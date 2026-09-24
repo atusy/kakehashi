@@ -31,6 +31,7 @@ pub(crate) use connection_action::BridgeError;
 use connection_action::{ConnectionAction, decide_connection_action};
 use handshake::perform_lsp_handshake;
 
+use super::protocol::DID_CHANGE_WORKSPACE_FOLDERS_METHOD;
 pub(in crate::lsp::bridge) use connection_handle::REQUEST_TIMEOUT;
 pub(crate) use connection_handle::{ConnectionHandle, NotificationSendResult};
 pub(crate) use connection_key::ConnectionKey;
@@ -382,6 +383,10 @@ pub struct LanguageServerPool {
     /// workspace root (issue #382); documents sharing a root (or the
     /// client-root fallback) still share one process.
     connections: Mutex<HashMap<ConnectionKey, Arc<ConnectionHandle>>>,
+    /// Test-only hook run once at the next shared-root announcement, to place
+    /// an event between an acquisition's routing and its announce.
+    #[cfg(test)]
+    before_announce: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Weak directory exposed to downstream `kakehashi/bridge/peer*` requests.
     peer_directory: Arc<super::peer::PeerDirectory>,
     /// Gate that rejects **new** connection spawns once shutdown has begun.
@@ -569,6 +574,8 @@ impl LanguageServerPool {
         let host_documents = Arc::new(Mutex::new(HashMap::new()));
         Self {
             connections: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            before_announce: std::sync::Mutex::new(None),
             peer_directory: Arc::new(super::peer::PeerDirectory::new(
                 Arc::clone(&document_tracker),
                 Arc::clone(&host_documents),
@@ -860,16 +867,48 @@ impl LanguageServerPool {
                 invalidated.push(key.clone());
                 continue;
             }
-            let notification =
-                build_did_change_workspace_folders_notification(added.clone(), removed.to_vec());
-            if handle.send_notification(notification) == NotificationSendResult::Queued {
+            // Queue and commit under the handle's folder-set lock, so a server
+            // pulling `workspace/workspaceFolders` on the notification's heels
+            // cannot read the pre-change set; and under the registration's
+            // lease, so an unregistration since the check above is recycled
+            // like any incapable connection rather than sent to (#968).
+            let queued =
                 handle
                     .workspace_folders()
-                    .apply_change(added.clone(), removed);
-            } else {
+                    .change_and_announce(added.clone(), removed, || {
+                        handle.send_folder_change(build_did_change_workspace_folders_notification(
+                            added.clone(),
+                            removed.to_vec(),
+                        )) == Some(NotificationSendResult::Queued)
+                    });
+            if !queued {
                 invalidated.push(key.clone());
             }
         }
+        let stale_handles = self
+            .retire_invalidated_connections(&mut connections, invalidated)
+            .await;
+        drop(connections);
+        for (key, handle) in stale_handles {
+            shutdown_invalidated_connection(key, handle);
+        }
+        true
+    }
+
+    /// Remove each of `invalidated` from the held `connections` map and purge
+    /// everything keyed on it — host routing, tracked documents, open-transition
+    /// locks — arming each key for a re-open by its eventual replacement (a
+    /// consolidated divert expects none: its debt stays armed, unclaimed,
+    /// until some later spawn under that key).
+    ///
+    /// Returns the removed handles, already marked shutting down, for the
+    /// caller to [`shutdown_invalidated_connection`] once it has released
+    /// `connections`.
+    async fn retire_invalidated_connections(
+        &self,
+        connections: &mut HashMap<ConnectionKey, Arc<ConnectionHandle>>,
+        invalidated: Vec<ConnectionKey>,
+    ) -> Vec<(ConnectionKey, Arc<ConnectionHandle>)> {
         let mut stale_handles = Vec::new();
         for key in invalidated {
             if let Some(handle) = connections.get(&key) {
@@ -891,11 +930,177 @@ impl LanguageServerPool {
                 stale_handles.push((key, handle));
             }
         }
+        stale_handles
+    }
+
+    /// Retire `server_name`'s diverted per-root connections once its shared
+    /// instance has become folder-change capable (#968).
+    ///
+    /// A shared instance whose server registers `didChangeWorkspaceFolders`
+    /// dynamically looks incapable between Ready and that registration, so
+    /// roots acquired in that window (a session-restore burst, typically) are
+    /// diverted to per-root processes. Once it registers, routing already
+    /// resolves those roots to the shared key; retiring their processes is
+    /// what stops them serving what they already hold. Nothing is migrated:
+    /// injected-region documents are re-opened on the shared instance by the
+    /// respawn repair requested below, and host-bridged ones by an upstream
+    /// re-sync (their text lives there); both acquire the shared instance
+    /// through paths that announce the root ahead of the `didOpen`.
+    ///
+    /// Only marker-rooted keys launched under the preference are diverts — the
+    /// shared routing never mints a client-root key for this server. The
+    /// capability is re-checked on the live shared connection under
+    /// `connections`, so a request that outlived an unregistration (or a
+    /// replacement that never registered) retires nothing. A divert racing
+    /// this sweep can still land after it; the next acquisition of its root
+    /// (`resolve_acquire`) queues another consolidation, and a divert the sweep
+    /// retires mid-handshake falls back to the shared instance (both
+    /// `get_or_create_connection_wait_ready` and the fast-fail
+    /// `get_or_create_connection_with_timeout`).
+    pub(crate) async fn consolidate_shared_instance(&self, server_name: &str) {
+        let shared_key = ConnectionKey::shared(server_name);
+        let mut connections = self.connections.lock().await;
+        // Live, not necessarily Ready: `initialized` goes out before the
+        // handshake flips the state, so a server registering in its
+        // `initialized` handler can be heard while still Initializing — and
+        // acquisitions already route to an Initializing shared instance.
+        let Some(shared) = connections.get(&shared_key).map(Arc::clone) else {
+            return;
+        };
+        // A shared key is not proof of the opt-in: a routing answer of
+        // `workspaceFolders: []` puts an ordinary per-root server's rootless
+        // documents there too, and that server's marker-rooted connections
+        // are its configuration, not diverts. (Production handles record
+        // their launch config before they are inserted.)
+        if !(matches!(
+            shared.state(),
+            ConnectionState::Initializing | ConnectionState::Ready
+        ) && shared.supports_workspace_folder_changes()
+            && shared
+                .launch_config()
+                .is_none_or(|config| config.prefers_shared_instance()))
+        {
+            return;
+        }
+        // A marker-rooted connection launched WITHOUT the preference is a
+        // per-root instance by configuration, not a divert — possible only
+        // across a reload flipping the preference, where a caller still
+        // holding the old config can spawn under it while the reload's purge
+        // runs. A handle with no recorded launch config (still handshaking,
+        // or test-built) is taken as launched under the current preference.
+        let diverted: Vec<ConnectionKey> = connections
+            .iter()
+            .filter(|(key, handle)| {
+                key.server() == server_name
+                    && !key.is_shared()
+                    && !key.is_client_fallback()
+                    && handle
+                        .launch_config()
+                        .is_none_or(|config| config.prefers_shared_instance())
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        if diverted.is_empty() {
+            return;
+        }
+        // A retired key's pull lineage must not outlive it: were the root
+        // diverted again (after an unregistration), its new process would be
+        // sent a `previousResultId` minted by the old one.
+        self.invalidate_diagnostic_connections(&diverted);
+        log::info!(
+            target: "kakehashi::bridge",
+            "[{server_name}] shared instance now accepts workspace-folder changes; \
+             retiring {} per-root instance(s)",
+            diverted.len()
+        );
+        let stale_handles = self
+            .retire_invalidated_connections(&mut connections, diverted)
+            .await;
+        // Their documents now route to the shared key, but nothing would open
+        // them there until something touches each one — an idle tab's pushed
+        // diagnostics died with the retired process and would stay gone. Run
+        // the respawn repair against the LIVE shared connection: it derives
+        // what routes to that key from the documents open now, and opening one
+        // that is already open there is a no-op. The retired keys stay armed
+        // too, but nothing routes to them any more, so no replacement claims
+        // that debt.
+        //
+        // The barrier is installed BEFORE `connections` is released: from that
+        // moment a command whose token names a retired divert is redirected to
+        // the shared connection (`reconnect_by_key`), and it must find the
+        // re-open pending rather than overtake the didOpens it depends on.
+        //
+        // A shared instance still handshaking cannot take a sweep yet — it
+        // would find no Ready connection and spend the debt (the respawn's own
+        // included) on nothing. Its handshake claims just before flipping
+        // Ready and re-opens after, so arm now and let it; if it claimed
+        // before our arm (finding nothing), wait for Ready below and claim
+        // the debt ourselves — a claim the handshake beat returns `None`.
+        // This runs on the upstream loop's own task, so the wait holds up no
+        // request.
+        self.pending_reopen.arm(&shared_key);
+        let handshaking = shared.state() == ConnectionState::Initializing;
+        let reopen = (shared.state() == ConnectionState::Ready)
+            .then(|| self.pending_reopen.claim(&shared_key))
+            .flatten();
         drop(connections);
         for (key, handle) in stale_handles {
             shutdown_invalidated_connection(key, handle);
         }
-        true
+        let reopen = match reopen {
+            None if handshaking => shared
+                .wait_for_ready(Duration::from_secs(INIT_TIMEOUT_SECS))
+                .await
+                .ok()
+                .and_then(|()| self.pending_reopen.claim(&shared_key)),
+            reopen => reopen,
+        };
+        // Host-bridged documents are re-synced upstream, which holds their
+        // text — inside the re-open when there is one, so its barrier also
+        // covers them; on their own otherwise (the handshake's re-open took
+        // the debt and settles the injected regions).
+        //
+        // Deliberately not closed further: two windows remain in which a
+        // command kept from a retired divert can reach the shared instance
+        // before the host document it names — a debounced host sync that
+        // supersedes the consolidation's batch releases the wait before the
+        // replacement batch's didOpen, and a handshaking shared instance's own
+        // injection-only re-open does not wait for the standalone re-sync.
+        // Both are the general gap that no respawn re-open covers host
+        // documents, present on every recycle before #968 (#1116); the fix
+        // belongs to the re-open protocol, not to consolidation.
+        let Some(done) = reopen else {
+            if let Err(e) = self
+                .upstream_request_tx
+                .send(UpstreamRequest::ResyncHostDocuments {
+                    server: server_name.to_owned(),
+                })
+            {
+                log::warn!(
+                    target: "kakehashi::bridge",
+                    "Failed to queue host-document re-sync for {server_name} \
+                     (forwarding loop gone): {e}"
+                );
+            }
+            return;
+        };
+        if let Err(e) = self
+            .upstream_request_tx
+            .send(UpstreamRequest::ReopenDocuments {
+                key: shared_key.clone(),
+                host_documents: true,
+                done,
+            })
+        {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "Failed to queue re-open of consolidated documents on {shared_key} \
+                 (forwarding loop gone): {e}"
+            );
+            if let UpstreamRequest::ReopenDocuments { done, .. } = e.0 {
+                self.pending_reopen.rearm(&shared_key, &done);
+            }
+        }
     }
 
     /// Set the upstream client capabilities.
@@ -964,6 +1169,15 @@ impl LanguageServerPool {
         &self.cancel_metrics
     }
 
+    /// Run `hook` once at the next shared-root announcement.
+    #[cfg(test)]
+    pub(crate) fn set_before_announce(&self, hook: impl FnOnce() + Send + 'static) {
+        *self
+            .before_announce
+            .lock()
+            .recover_poison("LanguageServerPool::set_before_announce") = Some(Box::new(hook));
+    }
+
     /// How many connections the pool holds, for tests outside this module
     /// that need to observe a spawn without reaching into the map.
     #[cfg(test)]
@@ -1028,25 +1242,9 @@ impl LanguageServerPool {
         }));
         self.invalidate_diagnostic_connections(&affected_connections);
 
-        let mut stale_handles = Vec::new();
-        for key in invalidated {
-            if let Some(handle) = connections.get(&key) {
-                handle.begin_shutdown();
-            }
-            self.host_documents.lock().await.retain(|_, connections| {
-                connections.remove(&key);
-                !connections.is_empty()
-            });
-            self.clear_host_routing_for_connection(&key);
-            self.document_tracker.purge_connection(&key).await;
-            // Arm before the replacement can claim: what this connection held
-            // is irrelevant, only that it owes a re-open.
-            self.pending_reopen.arm(&key);
-            self.purge_open_transition_locks(&key).await;
-            if let Some(handle) = connections.remove(&key) {
-                stale_handles.push((key, handle));
-            }
-        }
+        let stale_handles = self
+            .retire_invalidated_connections(&mut connections, invalidated)
+            .await;
 
         let mut pushed = 0;
         for (key, handle) in connections.iter() {
@@ -1537,7 +1735,14 @@ impl LanguageServerPool {
             let Some(marker) = super::root_markers::workspace_at_root(folder_uri) else {
                 continue;
             };
-            self.announce_shared_root(handle, &Some(marker)).await?;
+            match self.announce_shared_root(handle, &Some(marker)).await {
+                // Routing named this handle, so re-resolving cannot divert the
+                // document elsewhere: refusing would refuse it on every
+                // attempt. A withdrawn server gets the best-effort treatment
+                // of any incapable one (#968).
+                Err(error) if BridgeError::is_folder_support_withdrawn(&error) => {}
+                result => result?,
+            }
         }
         Ok(())
     }
@@ -1926,12 +2131,51 @@ impl LanguageServerPool {
     /// roots a dead shared instance was serving died with its folder set, and
     /// this path has no document to re-derive any root from. Routing to a
     /// *live* shared connection works; only reviving a dead one is refused.
+    ///
+    /// A dead MARKER key of a `preferSharedInstance` server whose shared
+    /// instance is now folder-change capable is a divert that consolidation
+    /// retired (#968): its root now routes to the shared instance, which is
+    /// where its documents were re-opened, so the command goes there instead
+    /// of reviving a per-root process that holds nothing. The command then
+    /// waits on the shared key's re-open barrier, which covers host-bridged
+    /// documents only as far as consolidation's re-sync does (#1116).
     pub(super) async fn reconnect_by_key(
         &self,
         key: &ConnectionKey,
         config: &crate::config::settings::BridgeServerConfig,
     ) -> Option<Arc<ConnectionHandle>> {
         let server = key.server();
+        if config.prefers_shared_instance() && !key.is_shared() && !key.is_client_fallback() {
+            let shared = {
+                let connections = self.connections.lock().await;
+                connections
+                    .get(&ConnectionKey::shared(server))
+                    .map(Arc::clone)
+            };
+            if let Some(shared) = shared
+                && shared.supports_workspace_folder_changes()
+                && shared.matches_launch_config(config)
+            {
+                match shared.state() {
+                    ConnectionState::Ready => return Some(shared),
+                    // Registered while still handshaking (it can consolidate
+                    // then): wait it out rather than revive the retired key,
+                    // whose documents already route to the shared instance.
+                    // Re-check the launch config after the wait: a reload can
+                    // land while it runs, and the handshake can finish before
+                    // `propagate_settings` evicts this handle.
+                    ConnectionState::Initializing => {
+                        return shared
+                            .wait_for_ready(Duration::from_secs(INIT_TIMEOUT_SECS))
+                            .await
+                            .ok()
+                            .filter(|()| shared.matches_launch_config(config))
+                            .map(|()| shared);
+                    }
+                    _ => {}
+                }
+            }
+        }
         // A connection can exist under this key and simply not be Ready yet —
         // `ready_connection_by_key_for_config` filters on Ready, so a respawn mid-handshake
         // lands here. Wait it out rather than spawn a second process: this is the
@@ -2035,6 +2279,27 @@ impl LanguageServerPool {
                 None
             }
         }
+    }
+
+    /// [`resolved_connection_key`](Self::resolved_connection_key) plus the
+    /// marker workspace an acquisition on the shared key must announce — `None`
+    /// for a rootless routing, which announces nothing.
+    pub(super) async fn resolved_connection_key_and_marker(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        document_uri: &Url,
+    ) -> (
+        ConnectionKey,
+        Option<Option<(Url, tower_lsp_server::ls_types::WorkspaceFolder)>>,
+    ) {
+        if self.host_routing_rootless(document_uri, server_name) {
+            return (ConnectionKey::shared(server_name), None);
+        }
+        let (marker, key) = self
+            .resolve_acquire(server_name, server_config, Some(document_uri))
+            .await;
+        (key, Some(marker))
     }
 
     /// Resolve the exact `(server, root)` connection a document currently
@@ -2596,6 +2861,41 @@ impl LanguageServerPool {
         document_uri: Option<&Url>,
         timeout: Duration,
     ) -> io::Result<Arc<ConnectionHandle>> {
+        let start = std::time::Instant::now();
+        match self
+            .get_or_create_connection_wait_ready_once(
+                server_name,
+                server_config,
+                document_uri,
+                timeout,
+            )
+            .await
+        {
+            // Routing chose the shared instance and it withdrew folder-change
+            // support before this root was announced. Re-resolving now diverts
+            // the root; do it here rather than fail an acquisition a one-shot
+            // caller (eager didOpen) would not repeat (#968). Once: a second
+            // withdrawal needs a second registration in between.
+            Err(error) if BridgeError::is_folder_support_withdrawn(&error) => {
+                self.get_or_create_connection_wait_ready_once(
+                    server_name,
+                    server_config,
+                    document_uri,
+                    timeout.saturating_sub(start.elapsed()),
+                )
+                .await
+            }
+            result => result,
+        }
+    }
+
+    async fn get_or_create_connection_wait_ready_once(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        document_uri: Option<&Url>,
+        timeout: Duration,
+    ) -> io::Result<Arc<ConnectionHandle>> {
         // `timeout` is the caller's overall budget; the incapable-shared divert
         // below acquires a second connection, so track elapsed time and hand it
         // only the remaining budget rather than a fresh full `timeout`.
@@ -2612,7 +2912,10 @@ impl LanguageServerPool {
         }
 
         // Acquire and wait through initialization for the resolved key.
-        let handle = self
+        let diverted_up_front = server_config.prefers_shared_instance()
+            && !connection_key.is_shared()
+            && !connection_key.is_client_fallback();
+        let handle = match self
             .acquire_resolved_wait_ready(
                 server_name,
                 server_config,
@@ -2621,7 +2924,32 @@ impl LanguageServerPool {
                 timeout,
                 rootless,
             )
-            .await?;
+            .await
+        {
+            Ok(handle) => handle,
+            // `resolve_acquire` already diverted (the shared instance was
+            // Ready and not yet registered), and consolidation retired that
+            // divert mid-handshake: same race, same fallback as the late
+            // divert below.
+            Err(_)
+                if diverted_up_front && self.shared_accepts_folder_changes(server_name).await =>
+            {
+                let remaining = timeout.saturating_sub(start.elapsed());
+                let shared = self
+                    .acquire_resolved_wait_ready(
+                        server_name,
+                        server_config,
+                        ConnectionKey::shared(server_name),
+                        marker.clone(),
+                        remaining,
+                        false,
+                    )
+                    .await?;
+                self.announce_shared_root(&shared, &marker).await?;
+                return Ok(shared);
+            }
+            Err(e) => return Err(e),
+        };
 
         // The shared connection's capability is only known now that it is Ready.
         // If it came up incapable and does not already serve this root, the
@@ -2659,16 +2987,27 @@ impl LanguageServerPool {
                         .as_ref()
                         .map(|(root, _folder)| root.as_str().to_owned()),
                 );
-                return self
+                let diverted = self
                     .acquire_resolved_wait_ready(
                         server_name,
                         server_config,
                         per_root_key,
-                        marker,
+                        marker.clone(),
                         remaining,
                         false,
                     )
                     .await;
+                // A dynamically registering server makes this divert race its
+                // own registration: the per-root spawn above is usually still
+                // handshaking when the shared instance registers, and the
+                // consolidation that follows retires it mid-wait. Its failure
+                // then means "no longer needed", not "unavailable" — take the
+                // shared instance that just became able to serve this root.
+                if diverted.is_err() && handle.supports_workspace_folder_changes() {
+                    self.announce_shared_root(&handle, &marker).await?;
+                    return Ok(handle);
+                }
+                return diverted;
             }
         }
 
@@ -2894,8 +3233,9 @@ impl LanguageServerPool {
     /// For a server without `preferSharedInstance`, this is exactly
     /// [`resolve_marker_and_key`](Self::resolve_marker_and_key) (per-root/#382).
     /// For an opt-in server it returns the shared-instance key — UNLESS a shared
-    /// connection already exists, is `Ready`, and did NOT advertise the
-    /// folder-change capability. In that case kakehashi logs once and degrades
+    /// connection already exists, is `Ready`, and is not (yet) folder-change
+    /// capable — neither declared statically nor registered dynamically. In
+    /// that case kakehashi logs once and degrades
     /// to per-root instances, so a misconfigured opt-in never wedges the 2nd+
     /// root on a server that ignores `didChangeWorkspaceFolders`. The fallback
     /// keeps every root the connection is already serving on the shared key —
@@ -2914,6 +3254,12 @@ impl LanguageServerPool {
     /// per-root connection if the shared one came up incapable — so no document
     /// is ever opened on an incapable shared connection for a root it does not
     /// already serve.
+    ///
+    /// A server that registers the capability dynamically is incapable between
+    /// Ready and its registration, so roots acquired in that window divert;
+    /// the registration then routes them back here and
+    /// [`consolidate_shared_instance`](Self::consolidate_shared_instance)
+    /// retires the diverted processes (#968).
     ///
     /// Briefly locks `connections` for the capability probe; the marker is still
     /// resolved with a single filesystem walk.
@@ -2945,14 +3291,34 @@ impl LanguageServerPool {
         let shared_key = ConnectionKey::shared(server_name);
         // Clone the shared handle out under the lock, then probe its capability
         // and folder set without nesting the folder-set lock under `connections`.
-        let shared_handle = {
+        // Also note whether this root still has a per-root connection of its
+        // own — one diverted after consolidation already swept, a divert that
+        // raced the registration. Match consolidation's launch-config filter:
+        // a configured per-root instance is retained there and must not trigger
+        // cleanup on every acquisition. Probed under the same guard.
+        let (shared_handle, diverted_root_live) = {
             let connections = self.connections.lock().await;
-            connections.get(&shared_key).map(Arc::clone)
+            (
+                connections.get(&shared_key).map(Arc::clone),
+                marker.is_some()
+                    && connections.get(&per_root_key).is_some_and(|handle| {
+                        handle
+                            .launch_config()
+                            .is_none_or(|config| config.prefers_shared_instance())
+                    }),
+            )
         };
+        // Such a straggler on a capable shared instance is a split nothing else
+        // would ever retire — consolidation runs once, on registration — and
+        // this root's documents are about to open on the shared key beside it.
+        let heal_straggler = diverted_root_live
+            && shared_handle
+                .as_ref()
+                .is_some_and(|handle| handle.supports_workspace_folder_changes());
 
         let key = match shared_handle {
-            // A Ready shared connection that never advertised the
-            // folder-CHANGE capability can't take on new roots via
+            // A Ready shared connection without the folder-CHANGE
+            // capability (static or, so far, dynamic) can't take on new roots via
             // didChangeWorkspaceFolders (it may still serve its
             // initialize-listed folders; the divert proof below accounts
             // for both).
@@ -2987,13 +3353,32 @@ impl LanguageServerPool {
             // route to the shared instance.
             _ => shared_key,
         };
+        // Handed to the upstream loop rather than awaited here: this runs in
+        // request futures a `$/cancelRequest` can drop, and retirement marks
+        // connections Closing before its cleanup awaits — a cancelled inline
+        // consolidation could strand a half-retired process. The loop runs it
+        // on a task of its own, moments after this acquisition.
+        if heal_straggler
+            && let Err(e) =
+                self.upstream_request_tx
+                    .send(UpstreamRequest::ConsolidateSharedInstance {
+                        server: server_name.to_owned(),
+                    })
+        {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "Failed to queue consolidation of {server_name}'s straggling divert \
+                 (forwarding loop gone): {e}"
+            );
+        }
 
         (marker, key)
     }
 
     /// For a shared-instance connection (#391), record this acquisition's marker
     /// root in the connection's folder set and, when it is newly added and the
-    /// downstream server advertised the `workspaceFolders` capability, announce
+    /// downstream server is folder-change capable (declared or dynamically
+    /// registered, [`ConnectionHandle::supports_workspace_folder_changes`]), announce
     /// it with `workspace/didChangeWorkspaceFolders`. The notification is queued
     /// through the single-writer loop, so a `didOpen` the caller sends next on
     /// the same connection follows it on the wire (FIFO), satisfying "announce
@@ -3020,13 +3405,22 @@ impl LanguageServerPool {
     /// name), capability-less servers, or a root already in the set —
     /// including a connection's own initialize-time root, so the first root
     /// never re-announces.
-    async fn announce_shared_root(
+    pub(super) async fn announce_shared_root(
         &self,
         handle: &Arc<ConnectionHandle>,
         marker: &Option<(Url, tower_lsp_server::ls_types::WorkspaceFolder)>,
     ) -> io::Result<()> {
         if !handle.key().is_shared() {
             return Ok(());
+        }
+        #[cfg(test)]
+        if let Some(hook) = self
+            .before_announce
+            .lock()
+            .recover_poison("LanguageServerPool::announce_shared_root")
+            .take()
+        {
+            hook();
         }
         // A marker-less acquisition still has a workspace to name: the
         // CLIENT workspace. A real file with no marker up its tree (or the
@@ -3063,6 +3457,20 @@ impl LanguageServerPool {
             }
         };
         if !handle.supports_workspace_folder_changes() {
+            // Routing chose this connection while it was capable and an
+            // unregistration landed since (#968's rare reverse transition).
+            // A marker root it does not serve must not be opened here
+            // unannounced: refuse, so the acquisition re-resolves and diverts.
+            // Only that transition: a server that never registered was never
+            // told of any root, and announcing to it stays a no-op.
+            if let Some((root, _folder)) = marker
+                && handle
+                    .dynamic_capabilities()
+                    .ever_registered(DID_CHANGE_WORKSPACE_FOLDERS_METHOD)
+                && !incapable_shared_serves(handle, root)
+            {
+                return Err(BridgeError::folder_support_withdrawn());
+            }
             return Ok(());
         }
         // The closure runs under the folder-set lock and reports its send
@@ -3098,16 +3506,25 @@ impl LanguageServerPool {
         // already-committed prefix simply dedups on the retry, so partial
         // progress is kept, never repeated.
         let mut announced = true;
+        let mut withdrawn = false;
         let mut failed_folder = None;
         for folder in &folders {
             announced = handle
                 .workspace_folders()
                 .add_and_announce(folder.clone(), || {
-                    let result =
-                        handle.send_notification(build_did_change_workspace_folders_notification(
+                    // Sent under the registration's lease: the capability
+                    // check above ran before this task waited for
+                    // `connections`, and an unregistration may have landed
+                    // since (#968).
+                    let Some(result) =
+                        handle.send_folder_change(build_did_change_workspace_folders_notification(
                             vec![folder.clone()],
                             Vec::new(),
-                        ));
+                        ))
+                    else {
+                        withdrawn = true;
+                        return false;
+                    };
                     send_outcome = result;
                     if result == NotificationSendResult::Queued {
                         log::debug!(
@@ -3137,6 +3554,9 @@ impl LanguageServerPool {
 
         if announced {
             return Ok(());
+        }
+        if withdrawn {
+            return Err(BridgeError::folder_support_withdrawn());
         }
         // Map the send failure to a faithful error kind so callers recover
         // correctly: queue-full is retryable backpressure, but a closed channel
@@ -3171,6 +3591,40 @@ impl LanguageServerPool {
         timeout: Duration,
         admit: Option<&(dyn Fn() -> bool + Sync)>,
     ) -> io::Result<Arc<ConnectionHandle>> {
+        let start = std::time::Instant::now();
+        match self
+            .get_or_create_connection_with_timeout_once(
+                server_name,
+                server_config,
+                document_uri,
+                timeout,
+                admit,
+            )
+            .await
+        {
+            // Same re-resolve as `get_or_create_connection_wait_ready` (#968).
+            Err(error) if BridgeError::is_folder_support_withdrawn(&error) => {
+                self.get_or_create_connection_with_timeout_once(
+                    server_name,
+                    server_config,
+                    document_uri,
+                    timeout.saturating_sub(start.elapsed()),
+                    admit,
+                )
+                .await
+            }
+            result => result,
+        }
+    }
+
+    async fn get_or_create_connection_with_timeout_once(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        document_uri: Option<&Url>,
+        timeout: Duration,
+        admit: Option<&(dyn Fn() -> bool + Sync)>,
+    ) -> io::Result<Arc<ConnectionHandle>> {
         let (marker, mut connection_key) = self
             .resolve_acquire(server_name, server_config, document_uri)
             .await;
@@ -3179,16 +3633,58 @@ impl LanguageServerPool {
         if rootless {
             connection_key = ConnectionKey::shared(server_name);
         }
-        self.get_or_create_connection_resolved(
-            server_name,
-            server_config,
-            connection_key,
-            marker,
-            timeout,
-            rootless,
-            admit,
-        )
-        .await
+        let diverted = server_config.prefers_shared_instance()
+            && !connection_key.is_shared()
+            && !connection_key.is_client_fallback();
+        let start = std::time::Instant::now();
+        let acquired = self
+            .get_or_create_connection_resolved(
+                server_name,
+                server_config,
+                connection_key,
+                marker.clone(),
+                timeout,
+                rootless,
+                admit,
+            )
+            .await;
+        // The spawner awaits the divert's handshake, which a dynamically
+        // registering shared instance's consolidation can retire midway (the
+        // same race `get_or_create_connection_wait_ready` absorbs): the
+        // failure then means the divert is no longer needed. Take the shared
+        // instance, whose reuse path announces this root first.
+        if acquired.is_err() && diverted && self.shared_accepts_folder_changes(server_name).await {
+            return self
+                .get_or_create_connection_resolved(
+                    server_name,
+                    server_config,
+                    ConnectionKey::shared(server_name),
+                    marker,
+                    // One budget for the acquisition, not one per attempt.
+                    timeout.saturating_sub(start.elapsed()),
+                    false,
+                    admit,
+                )
+                .await;
+        }
+        acquired
+    }
+
+    /// Whether `server_name`'s shared instance is live and folder-change
+    /// capable — the condition under which a divert of it is no longer needed.
+    async fn shared_accepts_folder_changes(&self, server_name: &str) -> bool {
+        let shared = {
+            let connections = self.connections.lock().await;
+            connections
+                .get(&ConnectionKey::shared(server_name))
+                .map(Arc::clone)
+        };
+        shared.is_some_and(|shared| {
+            matches!(
+                shared.state(),
+                ConnectionState::Initializing | ConnectionState::Ready
+            ) && shared.supports_workspace_folder_changes()
+        })
     }
 
     /// Get-or-spawn against an ALREADY-resolved `(connection_key, marker)` pair
@@ -3693,6 +4189,7 @@ impl LanguageServerPool {
                     if let Some(done) = pending_reopen_handoff
                         && let Err(e) = upstream_request_tx.send(UpstreamRequest::ReopenDocuments {
                             key: command_registration_key.clone(),
+                            host_documents: false,
                             done,
                         })
                     {
@@ -4271,7 +4768,13 @@ fn incapable_shared_serves(handle: &ConnectionHandle, root: &Url) -> bool {
     {
         return true;
     }
-    handle.supports_initial_workspace_folders()
+    // A server that once registered folder changes was told of every folder
+    // it holds (announced, or listed at initialize to a server that asked for
+    // changes), so an unregistration does not unserve them (#968).
+    (handle.supports_initial_workspace_folders()
+        || handle
+            .dynamic_capabilities()
+            .ever_registered(DID_CHANGE_WORKSPACE_FOLDERS_METHOD))
         && handle
             .workspace_folders()
             .snapshot()
@@ -4488,6 +4991,67 @@ mod tests {
         );
     }
 
+    /// A fallback whose server registered `didChangeWorkspaceFolders`
+    /// dynamically (Pyright-style) takes the notification like a statically
+    /// capable one: recycling it would restart the server, re-index, and drop
+    /// its open documents on every upstream folder change (#968).
+    #[tokio::test]
+    async fn workspace_folder_change_forwards_to_dynamically_registered_fallback() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("dynamic");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        handle.set_server_capabilities(Default::default());
+        register_folder_changes(&handle);
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let added = tower_lsp_server::ls_types::WorkspaceFolder {
+            uri: "file:///added".parse().unwrap(),
+            name: "added".to_string(),
+        };
+
+        pool.apply_workspace_folder_change(vec![added.clone()], &[])
+            .await;
+
+        assert!(
+            pool.connections.lock().await.contains_key(&key),
+            "a dynamically registered server must be told, not restarted"
+        );
+        assert_eq!(handle.workspace_folders().snapshot(), Some(vec![added]));
+        assert!(pool.pending_reopen.claim(&key).is_none());
+    }
+
+    /// The dynamic capability is read live, not latched: a server that
+    /// unregisters the notification is no longer sent it. Nothing reacts to
+    /// the unregistration itself — the next upstream folder change finds the
+    /// connection incapable and recycles it like any other, so the respawn
+    /// handshakes with the current folders (#968).
+    #[tokio::test]
+    async fn workspace_folder_change_recycles_a_fallback_that_unregistered() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("dynamic");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        handle.set_server_capabilities(Default::default());
+        register_folder_changes(&handle);
+        handle.dynamic_capabilities().unregister(vec![
+            tower_lsp_server::ls_types::Unregistration {
+                id: "folders".to_string(),
+                method: "workspace/didChangeWorkspaceFolders".to_string(),
+            },
+        ]);
+        pool.insert_connection(handle).await;
+
+        pool.apply_workspace_folder_change(
+            vec![tower_lsp_server::ls_types::WorkspaceFolder {
+                uri: "file:///added".parse().unwrap(),
+                name: "added".to_string(),
+            }],
+            &[],
+        )
+        .await;
+
+        assert!(!pool.connections.lock().await.contains_key(&key));
+        assert!(pool.pending_reopen.claim(&key).is_some());
+    }
+
     #[tokio::test]
     async fn workspace_folder_change_recycles_initializing_connection() {
         let pool = LanguageServerPool::new();
@@ -4608,6 +5172,336 @@ mod tests {
 
         assert!(pool.connections.lock().await.contains_key(&key));
         assert_eq!(handle.workspace_folders().snapshot(), None);
+    }
+
+    fn register_folder_changes(handle: &ConnectionHandle) {
+        handle
+            .dynamic_capabilities()
+            .register(vec![tower_lsp_server::ls_types::Registration {
+                id: "folders".to_string(),
+                method: "workspace/didChangeWorkspaceFolders".to_string(),
+                register_options: None,
+            }]);
+    }
+
+    /// Roots diverted to per-root processes while the shared instance looked
+    /// incapable — deterministic in the window between `initialized` and a
+    /// dynamic registration — are consolidated once it registers (#968):
+    /// their connections are retired through the ordinary invalidate path
+    /// instead of a redundant process serving them for the rest of the
+    /// session.
+    #[tokio::test]
+    async fn consolidating_a_capable_shared_instance_retires_its_diverted_roots() {
+        let pool = LanguageServerPool::new();
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("srv")).await;
+        shared.set_server_capabilities(Default::default());
+        register_folder_changes(&shared);
+        let diverted_key = ConnectionKey::new("srv", Some("file:///repo/b".to_string()));
+        let diverted = create_handle_with_key(ConnectionState::Ready, diverted_key.clone()).await;
+        let fallback_key = ConnectionKey::for_server("srv");
+        let fallback = create_handle_with_key(ConnectionState::Ready, fallback_key.clone()).await;
+        let other_key = ConnectionKey::new("other", Some("file:///repo/b".to_string()));
+        let other = create_handle_with_key(ConnectionState::Ready, other_key.clone()).await;
+        for handle in [&shared, &diverted, &fallback, &other] {
+            pool.insert_connection(Arc::clone(handle)).await;
+        }
+
+        pool.consolidate_shared_instance("srv").await;
+
+        let connections = pool.connections.lock().await;
+        assert!(
+            !connections.contains_key(&diverted_key),
+            "a diverted root must be retired once the shared instance can take it"
+        );
+        assert!(connections.contains_key(shared.key()));
+        assert!(
+            connections.contains_key(&fallback_key),
+            "only marker roots are diverts; a client-root connection is not one"
+        );
+        assert!(
+            connections.contains_key(&other_key),
+            "another server's per-root connection is not this shared instance's"
+        );
+        drop(connections);
+        assert!(
+            pool.pending_reopen.claim(&diverted_key).is_some(),
+            "the retirement goes through the shared invalidate path"
+        );
+    }
+
+    /// The documents a retired divert held route to the shared key now, but
+    /// nothing would open them there until each is touched again — so the
+    /// consolidation asks for the same derive-from-open-documents repair a
+    /// respawn gets, against the live shared connection.
+    #[tokio::test]
+    async fn consolidating_reopens_the_moved_documents_on_the_shared_instance() {
+        let pool = LanguageServerPool::new();
+        let mut upstream_requests = pool.take_upstream_request_rx().expect("receiver");
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("srv")).await;
+        shared.set_server_capabilities(Default::default());
+        register_folder_changes(&shared);
+        let diverted_key = ConnectionKey::new("srv", Some("file:///repo/b".to_string()));
+        pool.insert_connection(Arc::clone(&shared)).await;
+        pool.insert_connection(create_handle_with_key(ConnectionState::Ready, diverted_key).await)
+            .await;
+
+        pool.consolidate_shared_instance("srv").await;
+
+        match upstream_requests.try_recv() {
+            Ok(UpstreamRequest::ReopenDocuments {
+                key,
+                host_documents,
+                ..
+            }) => {
+                assert_eq!(&key, shared.key(), "re-opened on the shared instance");
+                assert!(
+                    host_documents,
+                    "host documents are re-synced inside the same barrier"
+                );
+            }
+            _ => panic!("expected a re-open of the shared instance"),
+        }
+        assert!(
+            upstream_requests.try_recv().is_err(),
+            "one request covers both"
+        );
+    }
+
+    /// A shared instance still handshaking cannot take a sweep yet. When its
+    /// handshake claims the debt consolidation armed (the usual order), the
+    /// handshake's own re-open settles the injected regions and consolidation
+    /// only re-syncs host documents.
+    #[tokio::test]
+    async fn consolidating_leaves_an_initializing_shared_instances_reopen_to_its_handshake() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let mut upstream_requests = pool.take_upstream_request_rx().expect("receiver");
+        let shared =
+            create_handle_with_key(ConnectionState::Initializing, ConnectionKey::shared("srv"))
+                .await;
+        register_folder_changes(&shared);
+        let diverted_key = ConnectionKey::new("srv", Some("file:///repo/b".to_string()));
+        pool.insert_connection(Arc::clone(&shared)).await;
+        pool.insert_connection(create_handle_with_key(ConnectionState::Ready, diverted_key).await)
+            .await;
+        let (handshake_pool, handshake) = (Arc::clone(&pool), Arc::clone(&shared));
+        let handshake = tokio::spawn(async move {
+            // The handshake claims just before flipping Ready.
+            loop {
+                if handshake_pool
+                    .pending_reopen
+                    .claim(handshake.key())
+                    .is_some()
+                {
+                    handshake.set_state(ConnectionState::Ready);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            pool.consolidate_shared_instance("srv"),
+        )
+        .await
+        .expect("consolidation finishes once the handshake turns Ready");
+        handshake.await.unwrap();
+
+        match upstream_requests.try_recv() {
+            Ok(UpstreamRequest::ResyncHostDocuments { server }) => assert_eq!(server, "srv"),
+            _ => panic!("the handshake owns the sweep; host documents are re-synced on their own"),
+        }
+        assert!(upstream_requests.try_recv().is_err());
+    }
+
+    /// The other order: the handshake claimed (finding nothing) before
+    /// consolidation armed, then turned Ready. Nobody would claim the debt,
+    /// so consolidation waits for Ready and runs the re-open itself.
+    #[tokio::test]
+    async fn consolidating_claims_the_reopen_when_the_handshake_claimed_first() {
+        let pool = LanguageServerPool::new();
+        let mut upstream_requests = pool.take_upstream_request_rx().expect("receiver");
+        let shared =
+            create_handle_with_key(ConnectionState::Initializing, ConnectionKey::shared("srv"))
+                .await;
+        register_folder_changes(&shared);
+        let diverted_key = ConnectionKey::new("srv", Some("file:///repo/b".to_string()));
+        pool.insert_connection(Arc::clone(&shared)).await;
+        pool.insert_connection(create_handle_with_key(ConnectionState::Ready, diverted_key).await)
+            .await;
+        assert!(pool.pending_reopen.claim(shared.key()).is_none());
+        let flip = Arc::clone(&shared);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            flip.set_state(ConnectionState::Ready);
+        });
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            pool.consolidate_shared_instance("srv"),
+        )
+        .await
+        .expect("consolidation finishes once the shared instance is Ready");
+
+        match upstream_requests.try_recv() {
+            Ok(UpstreamRequest::ReopenDocuments {
+                key,
+                host_documents,
+                ..
+            }) => {
+                assert_eq!(&key, shared.key());
+                assert!(host_documents);
+            }
+            _ => panic!("the stranded debt must be claimed and re-opened"),
+        }
+    }
+
+    /// Nothing was retired, so nothing moved: no repair is asked for.
+    #[tokio::test]
+    async fn consolidating_without_diverts_reopens_nothing() {
+        let pool = LanguageServerPool::new();
+        let mut upstream_requests = pool.take_upstream_request_rx().expect("receiver");
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("srv")).await;
+        shared.set_server_capabilities(Default::default());
+        register_folder_changes(&shared);
+        pool.insert_connection(shared).await;
+
+        pool.consolidate_shared_instance("srv").await;
+
+        assert!(upstream_requests.try_recv().is_err());
+    }
+
+    /// Only diverts are consolidated: a per-root connection launched without
+    /// the preference is per-root by configuration (a reload flip can leave
+    /// one beside a shared key launched under the old config), and a shared
+    /// handle that has failed cannot take anyone's roots.
+    #[tokio::test]
+    async fn consolidating_keeps_per_root_instances_that_are_not_diverts() {
+        let pool = LanguageServerPool::new();
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("srv")).await;
+        shared.set_server_capabilities(Default::default());
+        register_folder_changes(&shared);
+        let configured_key = ConnectionKey::new("srv", Some("file:///repo/b".to_string()));
+        let configured =
+            create_handle_with_key(ConnectionState::Ready, configured_key.clone()).await;
+        configured.record_launch_config(&devnull_config());
+        pool.insert_connection(Arc::clone(&shared)).await;
+        pool.insert_connection(configured).await;
+
+        pool.consolidate_shared_instance("srv").await;
+        assert!(pool.connections.lock().await.contains_key(&configured_key));
+
+        let diverted_key = ConnectionKey::new("srv", Some("file:///repo/c".to_string()));
+        let diverted = create_handle_with_key(ConnectionState::Ready, diverted_key.clone()).await;
+        diverted.record_launch_config(&shared_config());
+        pool.insert_connection(diverted).await;
+        shared.set_state(ConnectionState::Failed);
+
+        pool.consolidate_shared_instance("srv").await;
+        assert!(
+            pool.connections.lock().await.contains_key(&diverted_key),
+            "a failed shared handle retires nothing"
+        );
+    }
+
+    /// `initialized` is sent before the handshake flips the state to Ready, so
+    /// a server that registers from its `initialized` handler is heard while
+    /// the shared handle is still Initializing — consolidation must act then.
+    #[tokio::test]
+    async fn consolidating_acts_on_a_shared_instance_still_finishing_its_handshake() {
+        let pool = LanguageServerPool::new();
+        let shared =
+            create_handle_with_key(ConnectionState::Initializing, ConnectionKey::shared("srv"))
+                .await;
+        register_folder_changes(&shared);
+        let diverted_key = ConnectionKey::new("srv", Some("file:///repo/b".to_string()));
+        pool.insert_connection(shared).await;
+        pool.insert_connection(
+            create_handle_with_key(ConnectionState::Ready, diverted_key.clone()).await,
+        )
+        .await;
+
+        // Retirement happens before consolidation waits out the handshake.
+        let consolidation = pool.consolidate_shared_instance("srv");
+        let _ = tokio::time::timeout(Duration::from_millis(200), consolidation).await;
+
+        assert!(!pool.connections.lock().await.contains_key(&diverted_key));
+    }
+
+    /// A rootless routing answer (`workspaceFolders: []`) puts a server that
+    /// did not opt in on the shared key too; its registration must not retire
+    /// that server's per-root connections, which are its configuration.
+    #[tokio::test]
+    async fn consolidating_ignores_a_rootless_shared_key_of_a_server_that_did_not_opt_in() {
+        let pool = LanguageServerPool::new();
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("srv")).await;
+        shared.record_launch_config(&devnull_config());
+        register_folder_changes(&shared);
+        let per_root_key = ConnectionKey::new("srv", Some("file:///repo/b".to_string()));
+        pool.insert_connection(shared).await;
+        pool.insert_connection(
+            create_handle_with_key(ConnectionState::Ready, per_root_key.clone()).await,
+        )
+        .await;
+
+        pool.consolidate_shared_instance("srv").await;
+
+        assert!(pool.connections.lock().await.contains_key(&per_root_key));
+    }
+
+    #[tokio::test]
+    async fn consolidating_drops_the_diverted_roots_pull_lineage() {
+        let pool = LanguageServerPool::new();
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("srv")).await;
+        shared.set_server_capabilities(Default::default());
+        register_folder_changes(&shared);
+        let diverted_key = ConnectionKey::new("srv", Some("file:///repo/b".to_string()));
+        let diverted = create_handle_with_key(ConnectionState::Ready, diverted_key.clone()).await;
+        pool.insert_connection(shared).await;
+        pool.insert_connection(diverted).await;
+        pool.diagnostic_pull_baselines.insert(
+            (diverted_key.clone(), "file:///repo/b/doc.md".to_string()),
+            DiagnosticPullBaseline {
+                result_id: "r1".to_string(),
+                diagnostics: Arc::new(Vec::new()),
+                request_sequence: 1,
+            },
+        );
+
+        pool.consolidate_shared_instance("srv").await;
+
+        assert!(
+            !pool
+                .diagnostic_pull_baselines
+                .contains_key(&(diverted_key, "file:///repo/b/doc.md".to_string())),
+            "a retired divert's resultId must not seed a later process under its key"
+        );
+    }
+
+    /// A consolidation request that finds the shared instance incapable — its
+    /// registration withdrawn again, or the connection replaced by one that
+    /// never registered — retires nothing: those roots still need their own
+    /// processes.
+    #[tokio::test]
+    async fn consolidating_an_incapable_shared_instance_keeps_diverted_roots() {
+        let pool = LanguageServerPool::new();
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("srv")).await;
+        shared.set_server_capabilities(Default::default());
+        let diverted_key = ConnectionKey::new("srv", Some("file:///repo/b".to_string()));
+        let diverted = create_handle_with_key(ConnectionState::Ready, diverted_key.clone()).await;
+        pool.insert_connection(Arc::clone(&shared)).await;
+        pool.insert_connection(diverted).await;
+
+        pool.consolidate_shared_instance("srv").await;
+
+        assert!(pool.connections.lock().await.contains_key(&diverted_key));
     }
 
     #[tokio::test]
@@ -4848,6 +5742,113 @@ mod tests {
             Arc::ptr_eq(&result, &per_root),
             "a root the incapable shared connection does not serve must divert to its per-root connection"
         );
+    }
+
+    /// A dynamically registering server makes the post-Ready divert race its
+    /// own registration: the per-root spawn is still handshaking when the
+    /// shared instance registers, and consolidation retires it mid-wait. That
+    /// failure means the divert is no longer needed, so the acquisition takes
+    /// the now-capable shared instance instead of failing (#968).
+    #[tokio::test]
+    async fn wait_ready_takes_the_shared_instance_when_consolidation_retires_its_divert() {
+        let (_tmp, doc) = marker_rooted_doc();
+        let pool = Arc::new(LanguageServerPool::new());
+        let config = shared_config();
+
+        let per_root_key = pool.connection_key("lua", &config, Some(&doc));
+        let per_root = create_handle_with_key(ConnectionState::Initializing, per_root_key).await;
+        pool.insert_connection(Arc::clone(&per_root)).await;
+        let shared =
+            create_handle_with_key(ConnectionState::Initializing, ConnectionKey::shared("lua"))
+                .await;
+        pool.insert_connection(Arc::clone(&shared)).await;
+        let (shared_clone, pool_clone) = (Arc::clone(&shared), Arc::clone(&pool));
+        tokio::spawn(async move {
+            // Ready but not yet registered: the waiter diverts...
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            shared_clone
+                .set_server_capabilities(tower_lsp_server::ls_types::ServerCapabilities::default());
+            shared_clone.set_state(ConnectionState::Ready);
+            // ...then the registration arrives while the divert still waits.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            register_folder_changes(&shared_clone);
+            pool_clone.consolidate_shared_instance("lua").await;
+        });
+
+        let result = pool
+            .get_or_create_connection_wait_ready("lua", &config, Some(&doc), Duration::from_secs(2))
+            .await
+            .expect("a divert retired by consolidation must fall back to the shared instance");
+        assert!(Arc::ptr_eq(&result, &shared));
+        assert!(!Arc::ptr_eq(&result, &per_root));
+    }
+
+    /// The divert `resolve_acquire` picks up front (shared instance Ready but
+    /// not yet registered) races consolidation exactly like the late one, and
+    /// falls back to the now-capable shared instance the same way (#968).
+    #[tokio::test]
+    async fn wait_ready_takes_the_shared_instance_when_its_up_front_divert_is_retired() {
+        let (_tmp, doc) = marker_rooted_doc();
+        let pool = Arc::new(LanguageServerPool::new());
+        let config = shared_config();
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
+        shared.set_server_capabilities(Default::default());
+        pool.insert_connection(Arc::clone(&shared)).await;
+        let per_root_key = pool.connection_key("lua", &config, Some(&doc));
+        pool.insert_connection(
+            create_handle_with_key(ConnectionState::Initializing, per_root_key).await,
+        )
+        .await;
+        let (shared_clone, pool_clone) = (Arc::clone(&shared), Arc::clone(&pool));
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            register_folder_changes(&shared_clone);
+            pool_clone.consolidate_shared_instance("lua").await;
+        });
+
+        let handle = pool
+            .get_or_create_connection_wait_ready("lua", &config, Some(&doc), Duration::from_secs(2))
+            .await
+            .expect("falls back to the shared instance");
+        assert!(Arc::ptr_eq(&handle, &shared));
+    }
+
+    /// The fast-fail spawner awaits its divert's handshake too, so the same
+    /// consolidation race must not fail it: a divert retired mid-handshake
+    /// falls back to the now-capable shared instance (#968).
+    #[tokio::test]
+    async fn fast_fail_acquire_takes_the_shared_instance_when_its_divert_is_retired() {
+        let (_tmp, doc) = marker_rooted_doc();
+        let pool = Arc::new(LanguageServerPool::new());
+        let config = shared_config();
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
+        shared.set_server_capabilities(Default::default());
+        pool.insert_connection(Arc::clone(&shared)).await;
+        let (shared_clone, pool_clone) = (Arc::clone(&shared), Arc::clone(&pool));
+        tokio::spawn(async move {
+            // The divert has spawned (its `cat` never answers `initialize`)
+            // when the shared instance registers and consolidates.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            register_folder_changes(&shared_clone);
+            pool_clone.consolidate_shared_instance("lua").await;
+        });
+
+        let handle = tokio::time::timeout(
+            Duration::from_secs(10),
+            pool.get_or_create_connection_with_timeout(
+                "lua",
+                &config,
+                Some(&doc),
+                Duration::from_secs(8),
+                None,
+            ),
+        )
+        .await
+        .expect("the retired divert's handshake must end promptly")
+        .expect("falls back to the shared instance");
+        assert!(Arc::ptr_eq(&handle, &shared));
     }
 
     /// The incapable-shared divert proves served-ness against the SPAWN root,
@@ -5225,6 +6226,56 @@ mod tests {
     /// naming a DEAD shared connection is refused rather than revived (which
     /// marker roots it was serving died with its folder set). The next document
     /// acquisition revives the instance; commands fail soft until then.
+    /// A routing token minted by a divert that consolidation has since
+    /// retired names a dead per-root key; its root now routes to the capable
+    /// shared instance, so the command goes there rather than reviving an
+    /// empty per-root process nothing would ever retire again (#968).
+    #[tokio::test]
+    async fn reconnect_by_key_routes_a_consolidated_divert_to_the_shared_instance() {
+        let pool = LanguageServerPool::new();
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
+        shared.set_server_capabilities(Default::default());
+        register_folder_changes(&shared);
+        pool.insert_connection(Arc::clone(&shared)).await;
+        let retired = ConnectionKey::new("lua", Some("file:///repo/b".to_string()));
+
+        let handle = pool
+            .reconnect_by_key(&retired, &shared_config())
+            .await
+            .expect("the shared instance serves the consolidated root");
+
+        assert!(Arc::ptr_eq(&handle, &shared));
+        assert!(!pool.connections.lock().await.contains_key(&retired));
+    }
+
+    /// The same redirect waits out a shared instance that registered (and so
+    /// consolidated) while still handshaking, instead of reviving the retired
+    /// per-root key whose documents already route to the shared instance.
+    #[tokio::test]
+    async fn reconnect_by_key_waits_for_a_handshaking_shared_instance_that_registered() {
+        let pool = LanguageServerPool::new();
+        let shared =
+            create_handle_with_key(ConnectionState::Initializing, ConnectionKey::shared("lua"))
+                .await;
+        register_folder_changes(&shared);
+        pool.insert_connection(Arc::clone(&shared)).await;
+        let shared_clone = Arc::clone(&shared);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            shared_clone.set_state(ConnectionState::Ready);
+        });
+        let retired = ConnectionKey::new("lua", Some("file:///repo/b".to_string()));
+
+        let handle = pool
+            .reconnect_by_key(&retired, &shared_config())
+            .await
+            .expect("the shared instance serves the consolidated root once Ready");
+
+        assert!(Arc::ptr_eq(&handle, &shared));
+        assert!(!pool.connections.lock().await.contains_key(&retired));
+    }
+
     #[tokio::test]
     async fn reconnect_by_key_refuses_a_dead_shared_key() {
         let pool = LanguageServerPool::new();
@@ -5252,6 +6303,290 @@ mod tests {
 
         let (_marker, key) = pool.resolve_acquire("lua", &config, Some(&doc)).await;
         assert_eq!(key, ConnectionKey::shared("lua"));
+    }
+
+    /// A per-root connection that outlived consolidation — a divert that
+    /// raced the registration — is handed to a consolidation by the next
+    /// acquisition of its root, which itself already routes to the shared
+    /// instance (#968).
+    #[tokio::test]
+    async fn resolve_acquire_retires_a_straggling_divert_of_a_capable_shared() {
+        let (_tmp, doc) = marker_rooted_doc();
+        let pool = LanguageServerPool::new();
+        let config = shared_config();
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
+        shared.set_server_capabilities(Default::default());
+        register_folder_changes(&shared);
+        pool.insert_connection(shared).await;
+        let straggler_key = pool.connection_key("lua", &devnull_config(), Some(&doc));
+        assert!(!straggler_key.is_shared() && !straggler_key.is_client_fallback());
+        pool.insert_connection(
+            create_handle_with_key(ConnectionState::Ready, straggler_key.clone()).await,
+        )
+        .await;
+
+        let mut upstream_requests = pool.take_upstream_request_rx().expect("receiver");
+        let (_marker, key) = pool.resolve_acquire("lua", &config, Some(&doc)).await;
+
+        assert_eq!(key, ConnectionKey::shared("lua"));
+        match upstream_requests.try_recv() {
+            Ok(UpstreamRequest::ConsolidateSharedInstance { server }) => {
+                assert_eq!(server, "lua");
+            }
+            _ => panic!("the straggler must be handed to a consolidation"),
+        }
+        pool.consolidate_shared_instance("lua").await;
+        assert!(
+            !pool.connections.lock().await.contains_key(&straggler_key),
+            "the root's own per-root process must not keep serving beside the shared one"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_acquire_does_not_consolidate_a_configured_per_root_instance() {
+        let (_tmp, doc) = marker_rooted_doc();
+        let pool = LanguageServerPool::new();
+        let config = shared_config();
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
+        shared.record_launch_config(&config);
+        register_folder_changes(&shared);
+        pool.insert_connection(shared).await;
+
+        // A spawn holding the old non-shared config can finish after a reload's purge.
+        let old_config = devnull_config();
+        let per_root_key = pool.connection_key("lua", &old_config, Some(&doc));
+        let per_root = create_handle_with_key(ConnectionState::Ready, per_root_key).await;
+        per_root.record_launch_config(&old_config);
+        pool.insert_connection(per_root).await;
+
+        let mut upstream_requests = pool.take_upstream_request_rx().expect("receiver");
+        for _ in 0..2 {
+            let (_marker, key) = pool.resolve_acquire("lua", &config, Some(&doc)).await;
+            assert_eq!(key, ConnectionKey::shared("lua"));
+            assert!(
+                matches!(
+                    upstream_requests.try_recv(),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                ),
+                "a connection excluded from consolidation must not trigger cleanup"
+            );
+        }
+    }
+
+    fn unregister_folder_changes(handle: &ConnectionHandle) {
+        handle.dynamic_capabilities().unregister(vec![
+            tower_lsp_server::ls_types::Unregistration {
+                id: "folders".to_string(),
+                method: "workspace/didChangeWorkspaceFolders".to_string(),
+            },
+        ]);
+    }
+
+    /// A root announced to a dynamically registering server stays on the
+    /// shared instance after the server unregisters: it was told of the root
+    /// and holds its documents, so diverting it would split the root across
+    /// two processes (#968).
+    #[tokio::test]
+    async fn an_announced_root_stays_shared_after_the_server_unregisters() {
+        let (_tmp, doc) = marker_rooted_doc();
+        let pool = LanguageServerPool::new();
+        let config = shared_config();
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
+        shared.set_server_capabilities(Default::default());
+        register_folder_changes(&shared);
+        let (marker, _) = pool.resolve_marker_and_key("lua", &config, Some(&doc));
+        let (_root, folder) = marker.expect("marker-rooted");
+        shared.workspace_folders().replace(Some(vec![folder]));
+        unregister_folder_changes(&shared);
+        pool.insert_connection(shared).await;
+
+        let (_marker, key) = pool.resolve_acquire("lua", &config, Some(&doc)).await;
+
+        assert_eq!(key, ConnectionKey::shared("lua"));
+    }
+
+    /// Routing picked the shared instance while it was capable; an
+    /// unregistration before the announce must not let the root's document
+    /// open there unannounced — the acquisition fails and the next one
+    /// re-resolves (#968).
+    #[tokio::test]
+    async fn announce_refuses_an_unserved_root_after_the_server_unregisters() {
+        let (_tmp, doc) = marker_rooted_doc();
+        let pool = LanguageServerPool::new();
+        let config = shared_config();
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
+        shared.set_server_capabilities(Default::default());
+        register_folder_changes(&shared);
+        unregister_folder_changes(&shared);
+        pool.insert_connection(Arc::clone(&shared)).await;
+        let (marker, _) = pool.resolve_marker_and_key("lua", &config, Some(&doc));
+
+        let error = pool
+            .announce_shared_root(&shared, &marker)
+            .await
+            .expect_err("an unserved root must not be opened unannounced");
+
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    /// The refusal above is for the reverse transition only. A server that
+    /// never registered folder changes was never told of any root, so
+    /// announcing to it stays the documented capability-less no-op.
+    #[tokio::test]
+    async fn announce_is_a_noop_on_a_shared_root_that_never_registered() {
+        let (_tmp, doc) = marker_rooted_doc();
+        let pool = LanguageServerPool::new();
+        let config = shared_config();
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
+        shared.set_server_capabilities(Default::default());
+        pool.insert_connection(Arc::clone(&shared)).await;
+        let (marker, _) = pool.resolve_marker_and_key("lua", &config, Some(&doc));
+
+        pool.announce_shared_root(&shared, &marker)
+            .await
+            .expect("a server never told of any root is not refused one");
+    }
+
+    /// Routing resolved to the capable shared instance, and it withdrew
+    /// folder-change support before the root was announced. Re-resolving now
+    /// diverts the root, so the same acquisition must take the per-root
+    /// connection instead of failing and leaving a one-shot open (eager
+    /// didOpen) unsent until something else acquires again (#968).
+    #[rstest::rstest]
+    #[case::wait_ready(true)]
+    #[case::fast_fail(false)]
+    #[tokio::test]
+    async fn an_acquisition_diverts_when_support_is_withdrawn_before_its_announce(
+        #[case] wait_ready: bool,
+    ) {
+        let (_tmp, doc) = marker_rooted_doc();
+        let pool = LanguageServerPool::new();
+        let config = shared_config();
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
+        shared.set_server_capabilities(Default::default());
+        register_folder_changes(&shared);
+        pool.insert_connection(Arc::clone(&shared)).await;
+        let (marker, key) = pool.resolve_marker_and_key("lua", &config, Some(&doc));
+        let (root, _folder) = marker.expect("marker-rooted");
+        assert_eq!(
+            pool.resolve_acquire("lua", &config, Some(&doc)).await.1,
+            ConnectionKey::shared("lua"),
+            "routing starts on the capable shared instance"
+        );
+        pool.set_before_announce({
+            let shared = Arc::clone(&shared);
+            move || unregister_folder_changes(&shared)
+        });
+
+        // The per-root divert spawns a sink that never handshakes; a short
+        // budget is enough to see where the acquisition went.
+        let budget = Duration::from_millis(200);
+        let result = if wait_ready {
+            pool.get_or_create_connection_wait_ready("lua", &config, Some(&doc), budget)
+                .await
+        } else {
+            pool.get_or_create_connection_with_timeout("lua", &config, Some(&doc), budget, None)
+                .await
+        };
+
+        if let Err(error) = &result {
+            assert!(
+                !BridgeError::is_folder_support_withdrawn(error),
+                "the withdrawal must be absorbed by re-resolving: {error}"
+            );
+        }
+        let per_root = ConnectionKey::new("lua", Some(root.as_str().to_owned()));
+        assert_eq!(key, per_root, "the per-root key the divert should use");
+        assert!(
+            pool.connections.lock().await.contains_key(&per_root),
+            "the acquisition should have diverted to the per-root connection"
+        );
+    }
+
+    /// The capability check and the send are separated by the `connections`
+    /// lock. An unregistration landing in that gap must not see the folder
+    /// announced after its acknowledgement and recorded as served: the send
+    /// runs under the registration's lease, and a lost lease refuses the
+    /// root instead (#968).
+    #[tokio::test]
+    async fn announce_refuses_when_the_server_unregisters_while_it_waits_for_the_pool() {
+        let (_tmp, doc) = marker_rooted_doc();
+        let pool = Arc::new(LanguageServerPool::new());
+        let config = shared_config();
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
+        shared.set_server_capabilities(Default::default());
+        register_folder_changes(&shared);
+        pool.insert_connection(Arc::clone(&shared)).await;
+        let (marker, _) = pool.resolve_marker_and_key("lua", &config, Some(&doc));
+
+        let held = pool.connections.lock().await;
+        let announce = tokio::spawn({
+            let pool = Arc::clone(&pool);
+            let shared = Arc::clone(&shared);
+            async move { pool.announce_shared_root(&shared, &marker).await }
+        });
+        // Current-thread runtime: the task runs until it parks on the lock,
+        // past its capability check.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !announce.is_finished(),
+            "the announce must be parked on the pool"
+        );
+        unregister_folder_changes(&shared);
+        drop(held);
+
+        let error = announce
+            .await
+            .unwrap()
+            .expect_err("a root announced after unregistration was never accepted");
+        assert!(BridgeError::is_folder_support_withdrawn(&error), "{error}");
+        assert!(
+            shared
+                .workspace_folders()
+                .snapshot()
+                .unwrap_or_default()
+                .is_empty(),
+            "the root must not be recorded as served"
+        );
+    }
+
+    /// Host routing names its connection explicitly, so re-resolving cannot
+    /// divert it: refusing its folders would refuse the same handle on every
+    /// attempt and the document would never open. Its announcements stay
+    /// best-effort on an incapable connection, whether or not the server
+    /// ever registered folder changes (#968).
+    #[rstest::rstest]
+    #[case::never_registered(false)]
+    #[case::registered_then_withdrawn(true)]
+    #[tokio::test]
+    async fn host_routing_folders_are_best_effort_on_an_incapable_shared_instance(
+        #[case] withdrawn: bool,
+    ) {
+        let (tmp, doc) = marker_rooted_doc();
+        let pool = LanguageServerPool::new();
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
+        shared.set_server_capabilities(Default::default());
+        if withdrawn {
+            register_folder_changes(&shared);
+            unregister_folder_changes(&shared);
+        }
+        pool.insert_connection(Arc::clone(&shared)).await;
+        let folder = Url::from_file_path(tmp.path()).unwrap();
+        pool.set_host_routing_workspace_folders(&doc, "lua", Some(Some(vec![folder.to_string()])));
+
+        pool.apply_host_routing_workspace_folders(&doc, "lua", &shared)
+            .await
+            .expect("routing chose this handle; its folders must not block the open");
     }
 
     /// A Ready shared connection whose server never advertised the

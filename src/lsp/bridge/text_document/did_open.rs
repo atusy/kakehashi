@@ -133,8 +133,8 @@ impl LanguageServerPool {
                 // compare. Read-only — unlike the `None` arm below it never
                 // spawns, so asking about a host that belongs to some other
                 // root cannot bring that root's server up.
-                let routes_to = self
-                    .resolved_connection_key(server_name, server_config, &routing_uri)
+                let (routes_to, announce) = self
+                    .resolved_connection_key_and_marker(server_name, server_config, &routing_uri)
                     .await;
                 if &routes_to != key {
                     log::debug!(
@@ -148,7 +148,24 @@ impl LanguageServerPool {
                     .ready_connection_by_key_for_config(key, Some(server_config))
                     .await
                 {
-                    Some(handle) => handle,
+                    // A shared connection may not know this host's root yet —
+                    // a respawned one regrows its folders, and a consolidated
+                    // divert's root was never announced to it. The ordinary
+                    // acquire announces before the caller's didOpen; a repair
+                    // by key must do the same, or the server analyzes the
+                    // region outside every workspace folder it knows.
+                    Some(handle) => {
+                        if let Some(marker) = announce
+                            && let Err(e) = self.announce_shared_root(&handle, &marker).await
+                        {
+                            log::debug!(
+                                target: "kakehashi::bridge",
+                                "Eager open: could not announce {host_uri}'s root on {key}: {e}"
+                            );
+                            return OpenOutcome::NotOpened;
+                        }
+                        handle
+                    }
                     None => {
                         log::debug!(
                             target: "kakehashi::bridge",
@@ -655,6 +672,69 @@ mod tests {
         assert!(
             !pool.is_document_opened_on_connection(&vuri, &claimed),
             "a host that routes elsewhere must not be opened here"
+        );
+    }
+
+    /// A repair BY KEY on a shared connection announces the host's root
+    /// before opening, as the ordinary acquire does: a consolidated divert's
+    /// root, or one a respawned shared instance has not regrown, is otherwise
+    /// opened outside every folder the server knows (#968).
+    #[tokio::test]
+    async fn a_repair_on_the_shared_connection_announces_the_hosts_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let host_uri = url::Url::from_file_path(root.join("doc.md")).unwrap();
+        let host_uri_lsp = url_to_uri(&host_uri);
+        let pool = LanguageServerPool::new();
+        let server_name = "lua_ls";
+        let config = crate::config::settings::BridgeServerConfig {
+            prefer_shared_instance: Some(true),
+            ..crate::lsp::bridge::pool::test_helpers::devnull_config_for_language("lua")
+        };
+        let shared_key = crate::lsp::bridge::ConnectionKey::shared(server_name);
+        let handle = create_handle_with_key(ConnectionState::Ready, shared_key.clone()).await;
+        handle
+            .dynamic_capabilities()
+            .register(vec![tower_lsp_server::ls_types::Registration {
+                id: "folders".to_string(),
+                method: "workspace/didChangeWorkspaceFolders".to_string(),
+                register_options: None,
+            }]);
+        pool.insert_connection(std::sync::Arc::clone(&handle)).await;
+        pool.open_host_incarnation(&host_uri, 1).await;
+
+        use super::super::super::coordinator::BridgeInjection;
+        let outcome = pool
+            .eager_open_virtual_documents(
+                server_name,
+                &config,
+                &host_uri,
+                &host_uri_lsp,
+                OpenExpectation {
+                    incarnation: 1,
+                    connection: Some(&shared_key),
+                    expected_connection: None,
+                },
+                vec![BridgeInjection {
+                    language: "lua".to_string(),
+                    region_id: TEST_ULID_LUA_0.to_string(),
+                    content: "print('hello')".to_string(),
+                }],
+            )
+            .await;
+
+        assert_eq!(outcome, OpenOutcome::Opened);
+        let root_uri = url::Url::from_directory_path(&root).unwrap();
+        let folders = handle.workspace_folders().snapshot().unwrap_or_default();
+        assert!(
+            folders.iter().any(|folder| {
+                crate::lsp::bridge::root_markers::same_root_uri(
+                    folder.uri.as_str(),
+                    root_uri.as_str(),
+                )
+            }),
+            "the host's marker root must be announced before its didOpen; got {folders:?}"
         );
     }
 

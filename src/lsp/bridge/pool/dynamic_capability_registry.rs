@@ -18,6 +18,10 @@ use crate::error::LockResultExt;
 /// with different document selectors).
 pub(crate) struct DynamicCapabilityRegistry {
     registrations: RwLock<HashMap<String, Registration>>,
+    /// Every method this connection has ever registered, never cleared by an
+    /// unregistration: some facts outlive the registration that established
+    /// them (a server that registered folder changes was told of its folders).
+    ever_registered: RwLock<std::collections::HashSet<String>>,
     /// Live workspace policy copied into every connection. The reader checks
     /// it before a suppressed log can consume bounded window-queue capacity.
     log_message_level: AtomicU8,
@@ -27,6 +31,7 @@ impl DynamicCapabilityRegistry {
     pub(crate) fn new() -> Self {
         Self {
             registrations: RwLock::new(HashMap::new()),
+            ever_registered: RwLock::new(std::collections::HashSet::new()),
             log_message_level: AtomicU8::new(
                 crate::config::settings::LogMessageLevel::Info.as_u8(),
             ),
@@ -34,6 +39,17 @@ impl DynamicCapabilityRegistry {
     }
 
     pub(crate) fn register(&self, registrations: Vec<Registration>) {
+        {
+            let mut ever = self
+                .ever_registered
+                .write()
+                .recover_poison("DynamicCapabilityRegistry::register(ever)");
+            for reg in &registrations {
+                if !ever.contains(&reg.method) {
+                    ever.insert(reg.method.clone());
+                }
+            }
+        }
         let mut guard = self
             .registrations
             .write()
@@ -51,6 +67,15 @@ impl DynamicCapabilityRegistry {
         for unreg in unregistrations {
             guard.remove(&unreg.id);
         }
+    }
+
+    /// Whether `method` was ever registered on this connection, even if it
+    /// has since been unregistered.
+    pub(crate) fn ever_registered(&self, method: &str) -> bool {
+        self.ever_registered
+            .read()
+            .recover_poison("DynamicCapabilityRegistry::ever_registered")
+            .contains(method)
     }
 
     pub(crate) fn has_registration(&self, method: &str) -> bool {

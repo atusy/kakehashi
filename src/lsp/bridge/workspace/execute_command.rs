@@ -231,7 +231,9 @@ impl LanguageServerPool {
         // Drop the command if the wait did not settle. Sending anyway would
         // waive the exact guarantee this barrier exists for and surface as a
         // downstream error; a fail-soft null the user can re-fire is better.
-        if !self.wait_for_pending_reopen(&key).await {
+        // The handle's own key, not the token's: a consolidated divert's token
+        // is answered by the shared instance, whose re-open is the one to wait on.
+        if !self.wait_for_pending_reopen(handle.key()).await {
             warn!(
                 target: "kakehashi::bridge",
                 "executeCommand: {origin:?} is still re-opening its documents; \
