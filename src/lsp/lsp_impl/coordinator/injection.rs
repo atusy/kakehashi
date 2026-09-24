@@ -896,8 +896,8 @@ impl InjectionCoordinator {
     /// snapshot view, so a reload invalidating the parse (or a replacement
     /// parse landing) between two reads cannot pair a settled tree with a
     /// language that is not that tree's. The sweep's screen trusts a
-    /// rejection when the flag is set. A repaired host without a settled parse
-    /// additionally needs a parser-independent exclusion of every candidate.
+    /// rejection when the flag is set. Without a settled parse it additionally
+    /// needs a parser-independent exclusion of every candidate.
     pub(crate) fn screen_language(&self, uri: &Url) -> Option<(String, bool)> {
         let settled = self.documents.latest_snapshot(uri).and_then(|view| {
             view.slot.snapshot.as_ref().and_then(|snapshot| {

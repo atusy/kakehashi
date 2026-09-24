@@ -1741,12 +1741,11 @@ fn spawn_upstream_request(
                         // when every possible grammar is excluded by configuration.
                         if !reachable
                             && (settled_tree
-                                || (host_outcome == OpenOutcome::Opened
-                                    && injection.unsettled_injections_are_excluded(
-                                        &settings,
-                                        &host,
-                                        &reopen_server,
-                                    )))
+                                || injection.unsettled_injections_are_excluded(
+                                    &settings,
+                                    &host,
+                                    &reopen_server,
+                                ))
                             && injection.document_incarnation(&host) == screened_at
                         {
                             continue;
@@ -5208,7 +5207,7 @@ mod reopen_order_tests {
         });
         let server = service.inner();
         let language = "host-without-parser";
-        let settings = crate::config::WorkspaceSettings {
+        let mut settings = crate::config::WorkspaceSettings {
             auto_install: false,
             languages: HashMap::from([(
                 language.to_string(),
@@ -5235,6 +5234,11 @@ mod reopen_order_tests {
             )]),
             ..Default::default()
         };
+        let mut unrelated_settings = settings.languages[language].clone();
+        unrelated_settings.base = None;
+        settings
+            .languages
+            .insert("unrelated-host".into(), unrelated_settings);
         server
             .apply_raw_settings(Default::default(), settings)
             .await;
@@ -5249,6 +5253,17 @@ mod reopen_order_tests {
         );
         let pool = server.bridge.pool();
         pool.open_host_incarnation(&uri, incarnation).await;
+        // This parserless host has no role on an exact-language server. Its
+        // absence must not turn the target connection's completed repair false.
+        let unrelated = Url::parse("file:///unrelated.unrelated-host").unwrap();
+        let unrelated_incarnation = server.documents.insert(
+            unrelated.clone(),
+            "other contents".into(),
+            Some("unrelated-host".into()),
+            None,
+        );
+        pool.open_host_incarnation(&unrelated, unrelated_incarnation)
+            .await;
         let handle = create_handle_with_state(ConnectionState::Ready).await;
         let key = ConnectionKey::for_server("test");
         pool.insert_connection(handle).await;
