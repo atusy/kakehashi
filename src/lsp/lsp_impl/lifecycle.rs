@@ -2616,20 +2616,23 @@ async fn attempt_crash_recovery(
         let generation = snapshot.generation;
         let admit = || settings_manager.settings_generation() == generation;
         pool.commit_crash_recovery_attempt(key, reservation);
-        let error = match pool
+        let seed = pool
             .revive_crashed_connection(key, &config, &document, &admit)
-            .await
-        {
+            .await;
+        let seed =
+            recover_diverted_seed(injection, settings_manager, key, &config, &document, seed).await;
+        let error = match seed {
             // Whether this call spawned the replacement or an edit's respawn
             // got there first, the key was restarted during this crash
             // streak, and the streak's budget counts restarts.
-            Ok(replacement) => {
+            Ok((replacement, failed_seed)) => {
                 log::info!(
                     target: "kakehashi::bridge",
                     "Crashed downstream {key} is back up"
                 );
                 let mut acquired =
                     std::collections::HashSet::from([replacement.key().clone(), key.clone()]);
+                acquired.extend(failed_seed);
                 for (host, document) in shared_documents {
                     if !admit() || replacement.state() != crate::lsp::bridge::ConnectionState::Ready
                     {
@@ -2702,6 +2705,46 @@ async fn attempt_crash_recovery(
             after_own_failure: !pool.holds_connection(key).await,
         };
     }
+}
+
+/// Preserve a live shared replacement after a diverted seed fails, so sibling
+/// roots can still be recovered without immediately retrying the failed root.
+async fn recover_diverted_seed(
+    injection: &crate::lsp::lsp_impl::coordinator::InjectionCoordinator,
+    settings_manager: &Arc<crate::lsp::settings_manager::SettingsManager>,
+    key: &crate::lsp::bridge::ConnectionKey,
+    config: &crate::config::settings::BridgeServerConfig,
+    document: &Url,
+    seed: std::io::Result<Arc<crate::lsp::bridge::ConnectionHandle>>,
+) -> std::io::Result<(
+    Arc<crate::lsp::bridge::ConnectionHandle>,
+    Option<crate::lsp::bridge::ConnectionKey>,
+)> {
+    let error = match seed {
+        Ok(replacement) => return Ok((replacement, None)),
+        Err(error) => error,
+    };
+    if !key.is_shared() || error.kind() == std::io::ErrorKind::Interrupted {
+        return Err(error);
+    }
+    let pool = injection.bridge().pool();
+    let Some(shared) = pool
+        .ready_connection_by_key_for_config(key, Some(config))
+        .await
+    else {
+        return Err(error);
+    };
+    let destination = pool
+        .resolved_connection_key(key.server(), config, document)
+        .await;
+    if destination == *key {
+        return Err(error);
+    }
+    // The shared process is already up; only this diverted root failed.
+    // Continue the original shared sweep, but give that root its own backoff
+    // and skip it in the sweep rather than immediately attempting it again.
+    retry_failed_divert(injection, settings_manager, destination.clone(), error).await;
+    Ok((shared, Some(destination)))
 }
 
 /// A failed diverted spawn may have no reader to report its crash. Give that
@@ -5091,6 +5134,68 @@ mod reopen_order_tests {
         assert!(
             *completion.borrow(),
             "a completed repair must report success"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_diverted_seed_retries_its_root_and_keeps_the_shared_sweep_alive() {
+        use super::*;
+        use crate::lsp::bridge::{ConnectionKey, RecoveryDecision};
+        use tower_lsp_server::LspService;
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let injection = server.injection_coordinator();
+        let pool = server.bridge.pool();
+        let shared_key = ConnectionKey::shared("test");
+        // A concurrent ordinary acquisition replaced the shared process and
+        // its replacement cannot add another root. The seed now diverts.
+        let shared = crate::lsp::bridge::test_helpers::create_ready_handle_with_capabilities(
+            shared_key.clone(),
+            Default::default(),
+        )
+        .await;
+        pool.insert_connection(Arc::clone(&shared)).await;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        let document = Url::from_file_path(root.path().join("doc.md")).unwrap();
+        let config = crate::config::settings::BridgeServerConfig {
+            prefer_shared_instance: Some(true),
+            ..Default::default()
+        };
+        let destination = pool
+            .resolved_connection_key("test", &config, &document)
+            .await;
+        assert_ne!(destination, shared_key);
+        let (continuation, failed_seed) = recover_diverted_seed(
+            &injection,
+            &server.settings_manager,
+            &shared_key,
+            &config,
+            &document,
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "seed executable disappeared",
+            )),
+        )
+        .await
+        .expect("other roots must still be recovered through the live shared replacement");
+        assert!(Arc::ptr_eq(&continuation, &shared));
+        assert_eq!(
+            failed_seed,
+            Some(destination.clone()),
+            "the sweep must skip the root already waiting for retry"
+        );
+        assert_eq!(
+            pool.schedule_crash_retry(&destination),
+            RecoveryDecision::AlreadyScheduled
+        );
+        assert!(
+            matches!(
+                pool.schedule_crash_retry(&shared_key),
+                RecoveryDecision::Retry { .. }
+            ),
+            "the live shared key must not own the failed per-root retry"
         );
     }
 
