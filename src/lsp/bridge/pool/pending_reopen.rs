@@ -86,10 +86,12 @@ impl PendingReopenRegistry {
     /// completion sender. `None` when nothing was armed — a first-ever spawn,
     /// which has no predecessor's state to restore.
     ///
-    /// MUST be called before the connection is published as `Ready`. A request
+    /// A handshake MUST claim existing debt before publishing `Ready`. A request
     /// unblocked by that transition checks [`wait_for_reopen`](Self::wait_for_reopen),
     /// so registering afterwards would leave a window where the re-open is
     /// pending but invisible — exactly the overtaking this exists to prevent.
+    /// Newly inherited recovery debt on an already Ready connection is claimed
+    /// explicitly when it is handed off; it cannot await another handshake.
     ///
     /// Dropping the returned sender completes the wait, so a handler that dies
     /// or is never serviced releases waiters instead of stranding them until the
