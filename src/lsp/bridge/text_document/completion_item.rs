@@ -458,8 +458,8 @@ impl LanguageServerPool {
                 }
                 let transition = self.open_transition_lock(&virtual_uri, connection_key);
                 let _transition = transition.lock().await;
-                // A restarted origin cannot interpret the old item's opaque
-                // data. Do not reopen it merely to resolve that old item.
+                // Synchronization requires an open virtual document. If its
+                // lifecycle changed after acquisition, leave the item unresolved.
                 if !self.is_document_opened_on_connection(&virtual_uri, connection_key) {
                     return Err(io::Error::other("completion document is no longer open"));
                 }
