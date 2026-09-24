@@ -993,13 +993,13 @@ fn code_action_over_fence(client: &mut LspClient) -> Vec<Value> {
 }
 
 #[test]
-fn resolve_fails_soft_when_envelope_offset_diverges_from_live() {
+fn resolve_reports_failure_when_envelope_offset_diverges_from_live() {
     // The resolve path translates using the envelope's SNAPSHOT offset. If the
     // live region offset has diverged (e.g. an interior blockquote-prefix edit
     // changed a per-line column offset while the start held), translating with
     // the stale offset would bind the edit to wrong host columns. The freshness
     // gate re-resolves the live offset and compares the WHOLE thing, so a
-    // divergence must fail soft (action returned unresolved, envelope intact).
+    // divergence must reject resolve and let the client request fresh actions.
     //
     // Simulated by tampering the envelope's `line_column_offsets` to a vector
     // that can't match the live single-line region (whose offset is `[0]`): a
@@ -1015,26 +1015,19 @@ fn resolve_fails_soft_when_envelope_offset_diverges_from_live() {
     // interior line the start-only check never looked at.
     tampered["data"]["kakehashi"]["offset"]["line_column_offsets"] = json!([0, 99]);
 
-    let resolved = client.send_request("codeAction/resolve", tampered.clone());
-    let resolved = &resolved["result"];
-    assert!(
-        resolved["edit"].is_null(),
-        "a diverged snapshot offset must fail soft (no edit), got: {resolved:?}"
-    );
-    assert_eq!(
-        resolved["data"]["kakehashi"]["origin"], "mock-codeaction",
-        "the routing envelope is kept intact for a re-request, got: {resolved:?}"
-    );
+    let response = client.send_request("codeAction/resolve", tampered);
+    assert_eq!(response["error"]["code"], -32803, "{response}");
+    assert!(response.get("result").is_none(), "{response}");
 
     shutdown(&mut client);
 }
 
 /// A same-shape edit inside the fence leaves the region's geometry intact
 /// but changes the content the lazy action was computed against; resolving
-/// it afterwards must fail soft (no edit, envelope intact) rather than bind
-/// an edit computed on the old text to the new one.
+/// it afterwards must fail rather than bind an edit computed on the old text
+/// to the new one.
 #[test]
-fn resolve_fails_soft_after_a_same_shape_edit() {
+fn resolve_reports_failure_after_a_same_shape_edit() {
     let (mut client, init_response, _config_dir) =
         init_client_mode("code-action-lazy", resolve_support_caps());
     assert_advertised(&init_response);
@@ -1050,16 +1043,9 @@ fn resolve_fails_soft_after_a_same_shape_edit() {
         }),
     );
 
-    let resolved = client.send_request("codeAction/resolve", lazy.clone());
-    let resolved = &resolved["result"];
-    assert!(
-        resolved["edit"].is_null(),
-        "an action computed against the previous text must fail soft (no edit), got: {resolved:?}"
-    );
-    assert_eq!(
-        resolved["data"]["kakehashi"]["origin"], "mock-codeaction",
-        "the routing envelope is kept intact for a re-request, got: {resolved:?}"
-    );
+    let response = client.send_request("codeAction/resolve", lazy);
+    assert_eq!(response["error"]["code"], -32803, "{response}");
+    assert!(response.get("result").is_none(), "{response}");
 
     shutdown(&mut client);
 }
@@ -1088,11 +1074,9 @@ fn resolve_reply_after_an_edit_during_the_wait_is_discarded() {
             "contentChanges": [{ "text": "# Test\n\n```lua\nlocal y = 1\n```\n" }]
         }),
     );
-    let resolved = client.receive_response_for_id_public(request_id);
-    assert_eq!(
-        resolved["result"], lazy,
-        "a reply that lands after an edit must leave the action unresolved: {resolved:?}"
-    );
+    let response = client.receive_response_for_id_public(request_id);
+    assert_eq!(response["error"]["code"], -32803, "{response}");
+    assert!(response.get("result").is_none(), "{response}");
 
     shutdown(&mut client);
 }

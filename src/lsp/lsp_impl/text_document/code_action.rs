@@ -159,10 +159,10 @@ impl Kakehashi {
 
     /// `codeAction/resolve`: route the action back to the downstream server
     /// that produced it, identified by the envelope in `action.data` (#568
-    /// PR 4). An action without an envelope passes through unchanged. A stale
-    /// region returns the action unresolved; a dispatched resolve that cannot
-    /// produce an edit, command, or disabled reason reports request failure so
-    /// the client does not mistake an unusable action for successful execution.
+    /// PR 4). Foreign actions pass through unchanged. Unavailable/stale actions
+    /// and replies without an edit, command, or disabled reason report request
+    /// failure, so clients can request fresh actions instead of silently doing
+    /// nothing. Cancellation remains RequestCancelled.
     pub(crate) async fn code_action_resolve_impl(&self, action: CodeAction) -> Result<CodeAction> {
         let Some(envelope) = extract_code_action_envelope(&action) else {
             return Ok(action);
@@ -173,7 +173,7 @@ impl Kakehashi {
                 "codeAction/resolve: envelope host_uri {:?} is not a valid URL",
                 envelope.host_uri
             );
-            return Ok(action);
+            return Err(code_action_resolve_failed());
         };
         // Both layers: the action was computed against one text revision, and
         // a lazily materialized edit for another must not be applied to this
@@ -181,10 +181,10 @@ impl Kakehashi {
         if !self.document_revision_is_current(&host_url, envelope.content_version) {
             log::debug!(
                 target: "kakehashi::bridge",
-                "codeAction/resolve: {} was revised since the action was produced; returning action unresolved",
+                "codeAction/resolve: {} was revised since the action was produced; refusing resolve",
                 envelope.host_uri
             );
-            return Ok(action);
+            return Err(code_action_resolve_failed());
         }
         // Before the region gate waits for a parse: an action from a closed
         // and reopened document would otherwise park on the reopened
@@ -192,13 +192,13 @@ impl Kakehashi {
         if !self.host_incarnation_is_current(&host_url, envelope.incarnation) {
             log::debug!(
                 target: "kakehashi::bridge",
-                "codeAction/resolve: {} was reopened since the action was produced; returning action unresolved",
+                "codeAction/resolve: {} was reopened since the action was produced; refusing resolve",
                 envelope.host_uri
             );
-            return Ok(action);
+            return Err(code_action_resolve_failed());
         }
 
-        // Fail-soft staleness gate: resolving against a moved or invalidated
+        // Staleness gate: resolving against a moved or invalidated
         // region would translate a resolved edit with a stale offset and bind
         // it to content the user has since edited. The same live lookup yields
         // the region's current host-document end, which bounds the resolved
@@ -221,25 +221,22 @@ impl Kakehashi {
                 Ok(region_end) => region_end,
                 Err(RegionEndUnavailable::MalformedEnvelope) => {
                     // Already warned with the malformed field; no stale-debug.
-                    return Ok(action);
+                    return Err(code_action_resolve_failed());
                 }
                 Err(RegionEndUnavailable::Stale) => {
                     log::debug!(
                         target: "kakehashi::bridge",
                         "codeAction/resolve: region {} of {} (origin {:?}) is stale; \
-                         returning action unresolved",
+                         refusing resolve",
                         envelope.region_id,
                         envelope.host_uri,
                         envelope.origin
                     );
-                    return Ok(action);
+                    return Err(code_action_resolve_failed());
                 }
             }
         };
 
-        // Kept for the post-response check; the gates above return `action`
-        // itself, so only a resolve that is actually dispatched pays for it.
-        let unresolved = action.clone();
         let settings = self.settings_manager.load_settings();
         let upstream_caps = self.upstream_code_action_caps();
         let upstream_id = crate::lsp::current_upstream_id();
@@ -287,10 +284,10 @@ impl Kakehashi {
         {
             log::debug!(
                 target: "kakehashi::bridge",
-                "codeAction/resolve: {} was revised or reopened while resolving; returning action unresolved",
+                "codeAction/resolve: {} was revised or reopened while resolving; refusing resolve",
                 envelope.host_uri
             );
-            return Ok(unresolved);
+            return Err(code_action_resolve_failed());
         }
         // A lazy response cannot execute. Returning it as a successful resolve
         // makes a selected action silently do nothing. Completion can keep its
@@ -689,8 +686,12 @@ mod tests {
     use super::*;
     use tower_lsp_server::ls_types::Command;
 
+    #[rstest::rstest]
+    #[case::removed_server("server")]
+    #[case::edited_document("edit")]
+    #[case::reopened_document("reopen")]
     #[tokio::test]
-    async fn lazy_resolve_failure_is_reported_to_the_client() {
+    async fn lazy_resolve_failure_is_reported_to_the_client(#[case] failure: &str) {
         let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
         let server = service.inner();
         let uri = Url::parse("file:///resolve-failure.rs").unwrap();
@@ -717,6 +718,23 @@ mod tests {
         }))
         .unwrap();
         assert!(extract_code_action_envelope(&action).is_some());
+        if failure == "edit" {
+            server
+                .documents
+                .update_document(uri.clone(), "fn updated() {}".into(), None);
+        } else if failure == "reopen" {
+            let newer = server.documents.insert(
+                uri.clone(),
+                "fn main() {}".into(),
+                Some("rust".into()),
+                None,
+            );
+            server
+                .bridge
+                .pool_arc()
+                .open_host_incarnation(&uri, newer)
+                .await;
+        }
         let error = server
             .code_action_resolve_impl(action)
             .await
