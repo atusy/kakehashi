@@ -752,6 +752,21 @@ impl BridgeCoordinator {
             .await
     }
 
+    fn host_recovery_config(
+        &self,
+        settings: &Arc<WorkspaceSettings>,
+        host_language: &str,
+        host_uri: &Url,
+        server: &str,
+    ) -> Option<ResolvedServerConfig> {
+        if self.pool.host_routing_by_server(host_uri, server) == Some(false) {
+            return None;
+        }
+        self.cached_host_configs_for_language(settings, host_language)
+            .into_iter()
+            .find(|config| config.server_name == server)
+    }
+
     /// Whether the host layer itself needs this connection, without acquiring
     /// candidates or asking a routing provider. Parser availability is irrelevant.
     pub(crate) async fn host_layer_routes_to_connection(
@@ -761,24 +776,36 @@ impl BridgeCoordinator {
         host_uri: &Url,
         connection: &super::pool::ConnectionKey,
     ) -> bool {
-        let Some(resolved) = self
-            .cached_host_configs_for_language(settings, host_language)
-            .into_iter()
-            .find(|config| config.server_name == connection.server())
+        let Some(resolved) =
+            self.host_recovery_config(settings, host_language, host_uri, connection.server())
         else {
             return false;
         };
-        if self
-            .pool
-            .host_routing_by_server(host_uri, connection.server())
-            == Some(false)
-        {
-            return false;
-        }
         self.pool
             .resolved_connection_key(connection.server(), &resolved.config, host_uri)
             .await
             == *connection
+    }
+
+    /// Recovery demand must defer a negative verdict while a shared handshake
+    /// can still route this host back to its failed per-root connection.
+    pub(crate) async fn host_layer_recovery_demand(
+        &self,
+        settings: &Arc<WorkspaceSettings>,
+        host_language: &str,
+        host_uri: &Url,
+        connection: &super::pool::ConnectionKey,
+    ) -> Result<bool, Arc<super::pool::ConnectionHandle>> {
+        let Some(resolved) =
+            self.host_recovery_config(settings, host_language, host_uri, connection.server())
+        else {
+            return Ok(false);
+        };
+        Ok(self
+            .pool
+            .recovery_connection_key(connection.server(), &resolved.config, host_uri)
+            .await?
+            == *connection)
     }
 
     /// A current injection URI routing to exactly `connection`, suitable for
@@ -798,22 +825,24 @@ impl BridgeCoordinator {
         host_uri: &Url,
         injections: Vec<BridgeInjection>,
         connection: &super::pool::ConnectionKey,
-    ) -> Option<Url> {
+    ) -> Result<Option<Url>, Arc<super::pool::ConnectionHandle>> {
         let server = connection.server();
-        let config = self.respawnable_server_config(settings, server)?;
+        let Some(config) = self.respawnable_server_config(settings, server) else {
+            return Ok(None);
+        };
         for document in
             self.recovery_injection_documents(settings, host_language, host_uri, injections, server)
         {
             if &self
                 .pool
-                .resolved_connection_key(server, &config, &document)
-                .await
+                .recovery_connection_key(server, &config, &document)
+                .await?
                 == connection
             {
-                return Some(document);
+                return Ok(Some(document));
             }
         }
-        None
+        Ok(None)
     }
 
     /// Current injection routing units configured for this server. This reads
@@ -2731,6 +2760,7 @@ mod tests {
                 )
                 .await
                 .expect("routing must not ask a candidate server")
+                .unwrap_or_else(|_| panic!("unexpected pending route"))
             }
         };
         assert!(routes_to(fallback).await.is_some());
@@ -2779,7 +2809,8 @@ mod tests {
             ),
         )
         .await
-        .expect("the check must not acquire a server");
+        .expect("the check must not acquire a server")
+        .unwrap_or_else(|_| panic!("unexpected pending route"));
         assert!(
             routed.is_some(),
             "an undecided region counts as routed (fail-open)"
@@ -2806,6 +2837,7 @@ mod tests {
                     &key
                 )
                 .await
+                .unwrap_or_else(|_| panic!("unexpected pending route"))
                 .is_none(),
             "a region routing suppressed for this server does not keep it wanted"
         );

@@ -2346,7 +2346,7 @@ async fn crashed_connection_document(
     bridge: &crate::lsp::bridge::BridgeCoordinator,
     settings: &Arc<crate::config::WorkspaceSettings>,
     key: &crate::lsp::bridge::ConnectionKey,
-) -> Option<Url> {
+) -> std::result::Result<Option<Url>, Arc<crate::lsp::bridge::ConnectionHandle>> {
     let server = key.server();
     for host in injection.open_host_uris() {
         // Host dispatch may use a detected grammar or retain a declared alias
@@ -2354,10 +2354,10 @@ async fn crashed_connection_document(
         // the settled tree required for injection demand.
         if let Some(host_snapshot) = injection.host_reopen_snapshot(&host, settings, key.server())
             && bridge
-                .host_layer_routes_to_connection(settings, &host_snapshot.language_id, &host, key)
-                .await
+                .host_layer_recovery_demand(settings, &host_snapshot.language_id, &host, key)
+                .await?
         {
-            return Some(host);
+            return Ok(Some(host));
         }
         let Some((language, _)) = injection.screen_language(&host) else {
             continue;
@@ -2368,12 +2368,12 @@ async fn crashed_connection_document(
         if let Some((host_language, Some(injections))) = injection.bridge_injections(&host)
             && let Some(document) = bridge
                 .injection_routed_to_connection(settings, &host_language, &host, injections, key)
-                .await
+                .await?
         {
-            return Some(document);
+            return Ok(Some(document));
         }
     }
-    None
+    Ok(None)
 }
 
 /// Revalidate either layer against its current destination after an acquire.
@@ -2620,7 +2620,26 @@ async fn attempt_crash_recovery(
                 .first()
                 .map(|(_, document)| document.clone())
         } else {
-            crashed_connection_document(injection, bridge, settings, key).await
+            match crashed_connection_document(injection, bridge, settings, key).await {
+                Ok(document) => document,
+                Err(pending) => {
+                    // An optimistic shared route during initialization is not
+                    // evidence that this failed fallback lost its documents.
+                    // Keep this reservation uncommitted and recheck everything
+                    // (including settings and shutdown) after a bounded wait.
+                    let _ = pending
+                        .wait_for_ready(std::time::Duration::from_secs(
+                            crate::lsp::bridge::INIT_TIMEOUT_SECS,
+                        ))
+                        .await;
+                    if pending.state() == crate::lsp::bridge::ConnectionState::Initializing {
+                        // A terminal reader can wake wait_for_ready before the
+                        // handshake task publishes Failed. Avoid a busy retry.
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    continue;
+                }
+            }
         };
         let Some(document) = document else {
             log::debug!(
@@ -5410,11 +5429,97 @@ mod reopen_order_tests {
                 &key
             )
             .await
+            .unwrap_or_else(|_| panic!("unexpected pending route"))
             .is_some()
         );
         assert!(
             !server.bridge.pool().holds_connection(&key).await,
             "demand must not spawn"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn host_only_fallback_demand_waits_for_shared_initialization() {
+        use super::*;
+        use crate::config::settings::{BridgeLanguageConfig, BridgeServerConfig, LanguageSettings};
+        use crate::lsp::bridge::test_helpers::create_handle_with_key;
+        use crate::lsp::bridge::{ConnectionKey, ConnectionState};
+        use std::collections::HashMap;
+        use tower_lsp_server::LspService;
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let root = tempfile::TempDir::new().unwrap();
+        std::fs::write(root.path().join(".root"), "").unwrap();
+        let uri = Url::from_file_path(root.path().join("host.unparsed")).unwrap();
+        let config = BridgeServerConfig {
+            cmd: Some(vec!["must-not-be-spawned".into()]),
+            languages: Some(vec!["unparsed".into()]),
+            workspace_markers: Some(vec![crate::config::settings::RootMarker::Single(
+                ".root".into(),
+            )]),
+            prefer_shared_instance: Some(true),
+            ..Default::default()
+        };
+        server
+            .settings_manager
+            .apply_settings(crate::config::WorkspaceSettings {
+                auto_install: false,
+                languages: HashMap::from([(
+                    "unparsed".into(),
+                    LanguageSettings {
+                        bridge: Some(HashMap::from([(
+                            "_self".into(),
+                            BridgeLanguageConfig {
+                                enabled: Some(true),
+                                ..Default::default()
+                            },
+                        )])),
+                        ..Default::default()
+                    },
+                )]),
+                language_servers: HashMap::from([("host".into(), config.clone())]),
+                ..Default::default()
+            });
+        server
+            .documents
+            .insert(uri.clone(), "text".into(), Some("unparsed".into()), None);
+        let pool = server.bridge.pool();
+        let fallback_config = BridgeServerConfig {
+            prefer_shared_instance: Some(false),
+            ..config
+        };
+        let fallback = pool
+            .resolved_connection_key("host", &fallback_config, &uri)
+            .await;
+        let shared =
+            create_handle_with_key(ConnectionState::Initializing, ConnectionKey::shared("host"))
+                .await;
+        pool.insert_connection(Arc::clone(&shared)).await;
+        pool.insert_connection(
+            create_handle_with_key(ConnectionState::Failed, fallback.clone()).await,
+        )
+        .await;
+        let injection = server.injection_coordinator();
+        let settings = server.settings_manager.load_settings();
+        let demand =
+            crashed_connection_document(&injection, &server.bridge, &settings, &fallback).await;
+        assert!(
+            demand.is_err(),
+            "a parserless host's fallback must retain retry ownership while routing is pending"
+        );
+        assert!(Arc::ptr_eq(&demand.err().unwrap(), &shared));
+        let ready = crate::lsp::bridge::test_helpers::create_ready_handle_with_capabilities(
+            ConnectionKey::shared("host"),
+            Default::default(),
+        )
+        .await;
+        pool.insert_connection(ready).await;
+        assert_eq!(
+            crashed_connection_document(&injection, &server.bridge, &settings, &fallback)
+                .await
+                .unwrap_or_else(|_| panic!("route settled")),
+            Some(uri)
         );
     }
 
@@ -5628,6 +5733,7 @@ mod reopen_order_tests {
         assert!(
             crashed_connection_document(&injection, &server.bridge, &settings, &key)
                 .await
+                .unwrap_or_else(|_| panic!("unexpected pending route"))
                 .is_none()
         );
     }

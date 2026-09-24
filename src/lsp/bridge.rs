@@ -35,7 +35,7 @@ pub(crate) mod envelope;
 mod inbound_request_registry;
 mod peer;
 mod pool;
-pub(crate) use pool::HostLanguageAdmission;
+pub(crate) use pool::{HostLanguageAdmission, INIT_TIMEOUT_SECS};
 mod progress_registry;
 mod protocol;
 mod root_markers;
