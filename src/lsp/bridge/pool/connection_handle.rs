@@ -756,6 +756,31 @@ impl ConnectionHandle {
                 .has_registration(DID_CHANGE_WORKSPACE_FOLDERS_METHOD)
     }
 
+    /// Queue a `workspace/didChangeWorkspaceFolders` notification only while
+    /// the server accepts one, or `None` when it no longer does.
+    ///
+    /// A dynamically registered capability is held under the registration's
+    /// read lease across the send: an unregistration cannot land between
+    /// "still registered" and "queued", and its acknowledgement shares this
+    /// writer FIFO, so the server always receives the notification before it
+    /// learns the unregistration was accepted. A static declaration cannot be
+    /// withdrawn and needs no lease.
+    pub(crate) fn send_folder_change<P: serde::Serialize>(
+        &self,
+        notification: JsonRpcNotification<P>,
+    ) -> Option<NotificationSendResult> {
+        if self
+            .server_capabilities()
+            .is_some_and(supports_workspace_folder_changes)
+        {
+            return Some(self.send_notification(notification));
+        }
+        self.dynamic_capabilities
+            .with_registration(DID_CHANGE_WORKSPACE_FOLDERS_METHOD, || {
+                self.send_notification(notification)
+            })
+    }
+
     /// Whether the server declared `workspace.workspaceFolders.supported`,
     /// accepting the folders supplied at `initialize` even if it ignores later
     /// change notifications. See [`supports_initial_workspace_folders`].

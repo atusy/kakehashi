@@ -3439,16 +3439,25 @@ impl LanguageServerPool {
         // already-committed prefix simply dedups on the retry, so partial
         // progress is kept, never repeated.
         let mut announced = true;
+        let mut withdrawn = false;
         let mut failed_folder = None;
         for folder in &folders {
             announced = handle
                 .workspace_folders()
                 .add_and_announce(folder.clone(), || {
-                    let result =
-                        handle.send_notification(build_did_change_workspace_folders_notification(
+                    // Sent under the registration's lease: the capability
+                    // check above ran before this task waited for
+                    // `connections`, and an unregistration may have landed
+                    // since (#968).
+                    let Some(result) =
+                        handle.send_folder_change(build_did_change_workspace_folders_notification(
                             vec![folder.clone()],
                             Vec::new(),
-                        ));
+                        ))
+                    else {
+                        withdrawn = true;
+                        return false;
+                    };
                     send_outcome = result;
                     if result == NotificationSendResult::Queued {
                         log::debug!(
@@ -3478,6 +3487,9 @@ impl LanguageServerPool {
 
         if announced {
             return Ok(());
+        }
+        if withdrawn {
+            return Err(BridgeError::folder_support_withdrawn());
         }
         // Map the send failure to a faithful error kind so callers recover
         // correctly: queue-full is retryable backpressure, but a closed channel
@@ -6337,6 +6349,56 @@ mod tests {
         pool.announce_shared_root(&shared, &marker)
             .await
             .expect("a server never told of any root is not refused one");
+    }
+
+    /// The capability check and the send are separated by the `connections`
+    /// lock. An unregistration landing in that gap must not see the folder
+    /// announced after its acknowledgement and recorded as served: the send
+    /// runs under the registration's lease, and a lost lease refuses the
+    /// root instead (#968).
+    #[tokio::test]
+    async fn announce_refuses_when_the_server_unregisters_while_it_waits_for_the_pool() {
+        let (_tmp, doc) = marker_rooted_doc();
+        let pool = Arc::new(LanguageServerPool::new());
+        let config = shared_config();
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
+        shared.set_server_capabilities(Default::default());
+        register_folder_changes(&shared);
+        pool.insert_connection(Arc::clone(&shared)).await;
+        let (marker, _) = pool.resolve_marker_and_key("lua", &config, Some(&doc));
+
+        let held = pool.connections.lock().await;
+        let announce = tokio::spawn({
+            let pool = Arc::clone(&pool);
+            let shared = Arc::clone(&shared);
+            async move { pool.announce_shared_root(&shared, &marker).await }
+        });
+        // Current-thread runtime: the task runs until it parks on the lock,
+        // past its capability check.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !announce.is_finished(),
+            "the announce must be parked on the pool"
+        );
+        unregister_folder_changes(&shared);
+        drop(held);
+
+        let error = announce
+            .await
+            .unwrap()
+            .expect_err("a root announced after unregistration was never accepted");
+        assert!(BridgeError::is_folder_support_withdrawn(&error), "{error}");
+        assert!(
+            shared
+                .workspace_folders()
+                .snapshot()
+                .unwrap_or_default()
+                .is_empty(),
+            "the root must not be recorded as served"
+        );
     }
 
     /// Host routing names its connection explicitly, so re-resolving cannot
