@@ -1735,12 +1735,18 @@ fn spawn_upstream_request(
                         // since a skip is indistinguishable from "nothing to
                         // repair". On a mismatch fall through and let the
                         // authoritative path, which re-reads both, decide.
-                        // Without a current tree, trust the screen only after
-                        // the host layer was synchronized from a live snapshot.
-                        // A parserless host-only document needs no injection
-                        // repair and must not fail its successful host barrier.
+                        // Host synchronization does not settle the injection grammar:
+                        // aliases and path fallbacks can choose another language.
+                        // A parserless host-only document may skip the wait only
+                        // when every possible grammar is excluded by configuration.
                         if !reachable
-                            && (settled_tree || host_outcome == OpenOutcome::Opened)
+                            && (settled_tree
+                                || (host_outcome == OpenOutcome::Opened
+                                    && injection.unsettled_injections_are_excluded(
+                                        &settings,
+                                        &host,
+                                        &reopen_server,
+                                    )))
                             && injection.document_incarnation(&host) == screened_at
                         {
                             continue;
@@ -4910,10 +4916,14 @@ mod reopen_order_tests {
     /// parser. Cancelling eager batches cannot settle this independent repair.
     #[cfg(unix)]
     #[rstest::rstest]
-    #[case("host-without-parser")]
-    #[case("*")]
+    #[case("host-without-parser", None)]
+    #[case("*", None)]
+    #[case("*", Some("rust"))]
     #[tokio::test]
-    async fn host_reopen_barrier_waits_for_the_actual_open(#[case] server_language: &str) {
+    async fn host_reopen_barrier_waits_for_the_actual_open(
+        #[case] server_language: &str,
+        #[case] pending_base: Option<&str>,
+    ) {
         use super::*;
         use crate::config::settings::{BridgeLanguageConfig, BridgeServerConfig, LanguageSettings};
         use crate::lsp::bridge::test_helpers::create_handle_with_state;
@@ -4934,6 +4944,7 @@ mod reopen_order_tests {
             languages: HashMap::from([(
                 language.to_string(),
                 LanguageSettings {
+                    base: pending_base.map(str::to_string),
                     bridge: Some(HashMap::from([(
                         "_self".to_string(),
                         BridgeLanguageConfig {
@@ -4958,7 +4969,7 @@ mod reopen_order_tests {
         server
             .apply_raw_settings(Default::default(), settings)
             .await;
-        let uri = Url::parse("file:///host-reopen.no-parser").unwrap();
+        let uri = Url::parse("file:///host-reopen.host-without-parser").unwrap();
         // Register the host directly so no initial eager task can perform the
         // open on behalf of the re-open producer under test.
         let incarnation = server.documents.insert(
@@ -5025,7 +5036,11 @@ mod reopen_order_tests {
             .await
             .expect("re-open must finish after the lifecycle lock is released")
             .expect("re-open must report completion");
-        assert!(*completion.borrow(), "host-only repair must report success");
+        assert_eq!(
+            *completion.borrow(),
+            pending_base.is_none(),
+            "host repair cannot settle a possible injection grammar before its parse"
+        );
         assert!(pool.is_host_document_opened_on_connection(&uri, &key).await);
     }
 

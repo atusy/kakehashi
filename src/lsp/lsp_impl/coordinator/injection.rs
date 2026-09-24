@@ -879,8 +879,8 @@ impl InjectionCoordinator {
     /// snapshot view, so a reload invalidating the parse (or a replacement
     /// parse landing) between two reads cannot pair a settled tree with a
     /// language that is not that tree's. The sweep's screen trusts a
-    /// rejection when the flag is set or the host layer was successfully
-    /// repaired from a live snapshot, subject to its incarnation check.
+    /// rejection when the flag is set. A repaired host without a settled parse
+    /// additionally needs a parser-independent exclusion of every candidate.
     pub(crate) fn screen_language(&self, uri: &Url) -> Option<(String, bool)> {
         let settled = self.documents.latest_snapshot(uri).and_then(|view| {
             view.slot.snapshot.as_ref().and_then(|snapshot| {
@@ -899,6 +899,29 @@ impl InjectionCoordinator {
         stored
             .or_else(|| self.get_language_for_document(uri))
             .map(|language| (language, false))
+    }
+
+    /// Prove injection non-applicability without trusting an unsettled label.
+    /// Host routing keeps declared aliases; parsing can instead choose their
+    /// base grammar or a path/first-line fallback, including parsers still
+    /// loading. Every such candidate must be excluded before skipping its wait.
+    pub(crate) fn unsettled_injections_are_excluded(
+        &self,
+        settings: &std::sync::Arc<crate::config::WorkspaceSettings>,
+        uri: &Url,
+        server: &str,
+    ) -> bool {
+        let Some(document) = self.documents.get(uri) else {
+            return false;
+        };
+        self.language
+            .document_language_candidates(uri.path(), document.text(), document.language_id())
+            .iter()
+            .all(|language| {
+                !self
+                    .bridge
+                    .host_language_can_reach_server(settings, language, server)
+            })
     }
 
     /// `uri`'s reopen generation, which scopes a downstream `didOpen` to the
