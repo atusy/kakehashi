@@ -1241,56 +1241,23 @@ fn lazy_action_resolve_surfaces_server_changed_title() {
 }
 
 #[test]
-fn multistep_resolve_forwards_the_server_changed_title() {
-    // A still-lazy resolve (no edit) that CHANGES the title must carry the new
-    // title into the routing envelope, so a SECOND resolve forwards the title
-    // the server last advertised — the match-by-title contract. The mock's
-    // second resolve only materializes an edit when it receives the "(step2)"
-    // title; if the bridge dropped the tracked title, the action stays lazy
-    // forever and no edit ever appears.
+fn resolve_reports_failure_when_the_server_returns_a_still_lazy_action() {
+    // A transport-successful response without an edit or command still cannot
+    // run. Do not require the client to invent a multi-step resolve loop.
     let (mut client, init_response, _config_dir) =
         init_client_mode("code-action-lazy-multistep", resolve_support_caps());
     assert_advertised(&init_response);
     open_markdown(&mut client);
-
     let actions = code_action_over_fence(&mut client);
-    assert_eq!(actions.len(), 1, "one lazy action, got: {actions:?}");
-    let lazy = &actions[0];
-    assert_eq!(lazy["title"], "Lazy organize imports — mock-codeaction");
-
-    // First resolve: the server stays lazy (no edit) but renames the action.
-    let step1 = client.send_request("codeAction/resolve", lazy.clone());
-    let step1 = &step1["result"];
-    assert_eq!(
-        step1["title"], "Lazy organize imports (step2) — mock-codeaction",
-        "the server's step-1 title change must be surfaced"
-    );
+    let response = client.send_request("codeAction/resolve", actions[0].clone());
+    assert_eq!(response["error"]["code"], -32803, "{response}");
     assert!(
-        step1["edit"].is_null(),
-        "still lazy after step 1 (no edit yet), got: {step1:?}"
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Request code actions again")
     );
-    // The envelope must still be present so a second resolve routes back.
-    assert_eq!(step1["data"]["kakehashi"]["origin"], "mock-codeaction");
-    assert_eq!(
-        step1["data"]["kakehashi"]["original_title"], "Lazy organize imports (step2)",
-        "the envelope must track the server-changed title for the next resolve"
-    );
-
-    // Second resolve: the bridge must forward the tracked "(step2)" title, so
-    // the mock now materializes the edit.
-    let step2 = client.send_request("codeAction/resolve", step1.clone());
-    let step2 = &step2["result"];
-    let edits = &step2["edit"]["changes"][MARKDOWN_URI];
-    assert!(
-        edits.is_array(),
-        "the second resolve must materialize the edit — proves the tracked \
-         title reached the server, got: {step2:?}"
-    );
-    assert_eq!(
-        edits[0]["newText"],
-        "organized:Lazy organize imports (step2)"
-    );
-
+    assert!(response.get("result").is_none(), "{response}");
     shutdown(&mut client);
 }
 

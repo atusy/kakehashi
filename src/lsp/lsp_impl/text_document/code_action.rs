@@ -159,10 +159,10 @@ impl Kakehashi {
 
     /// `codeAction/resolve`: route the action back to the downstream server
     /// that produced it, identified by the envelope in `action.data` (#568
-    /// PR 4). Fails soft at every step: an action without an envelope
-    /// (host-layer or foreign) passes through unchanged, and a stale region
-    /// returns the action unresolved with its envelope intact — clients
-    /// re-request actions on change, so the staleness window is short.
+    /// PR 4). An action without an envelope passes through unchanged. A stale
+    /// region returns the action unresolved; a dispatched resolve that cannot
+    /// produce an edit, command, or disabled reason reports request failure so
+    /// the client does not mistake an unusable action for successful execution.
     pub(crate) async fn code_action_resolve_impl(&self, action: CodeAction) -> Result<CodeAction> {
         let Some(envelope) = extract_code_action_envelope(&action) else {
             return Ok(action);
@@ -291,6 +291,14 @@ impl Kakehashi {
                 envelope.host_uri
             );
             return Ok(unresolved);
+        }
+        // A lazy response cannot execute. Returning it as a successful resolve
+        // makes a selected action silently do nothing. Completion can keep its
+        // basic insertion on resolve failure; an action needs an edit/command
+        // or an explicit disabled reason. Let the client present request failure
+        // when appropriate instead of emitting an unsolicited notification.
+        if resolved.edit.is_none() && resolved.command.is_none() && resolved.disabled.is_none() {
+            return Err(code_action_resolve_failed());
         }
         Ok(resolved)
     }
@@ -666,10 +674,59 @@ impl Kakehashi {
     }
 }
 
+fn code_action_resolve_failed() -> tower_lsp_server::jsonrpc::Error {
+    tower_lsp_server::jsonrpc::Error {
+        code: tower_lsp_server::jsonrpc::ErrorCode::ServerError(
+            tower_lsp_server::ls_types::error_codes::REQUEST_FAILED,
+        ),
+        message: "Could not resolve this code action. Request code actions again.".into(),
+        data: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tower_lsp_server::ls_types::Command;
+
+    #[tokio::test]
+    async fn lazy_resolve_failure_is_reported_to_the_client() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///resolve-failure.rs").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "fn main() {}".into(),
+            Some("rust".into()),
+            None,
+        );
+        server
+            .bridge
+            .pool_arc()
+            .open_host_incarnation(&uri, incarnation)
+            .await;
+        let action: CodeAction = serde_json::from_value(serde_json::json!({
+            "title": "Fix it — removed-server",
+            "data": { "kakehashi": {
+                "origin": "removed-server", "host_uri": uri.as_str(),
+                "region_id": "", "injection_language": "",
+                "offset": { "line": 0, "column": 0, "line_column_offsets": [] },
+                "original_title": "Fix it", "inner": { "id": 7 },
+                "content_version": 0, "incarnation": incarnation, "host_layer": true
+            }}
+        }))
+        .unwrap();
+        assert!(extract_code_action_envelope(&action).is_some());
+        let error = server
+            .code_action_resolve_impl(action)
+            .await
+            .expect_err("an unavailable action must not be returned as a successful no-op");
+        assert_eq!(
+            error.code,
+            tower_lsp_server::jsonrpc::ErrorCode::ServerError(-32803)
+        );
+        assert!(error.message.contains("Request code actions again"));
+    }
 
     fn action(title: &str, preferred: Option<bool>) -> CodeActionOrCommand {
         CodeActionOrCommand::CodeAction(CodeAction {
