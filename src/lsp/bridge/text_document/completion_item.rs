@@ -517,13 +517,9 @@ impl LanguageServerPool {
         }
 
         match response {
-            Ok(response) => {
-                let connections = self.connections().await;
-                let producer_is_live = connections.get(connection_key).is_some_and(|current| {
-                    Arc::ptr_eq(current, handle) && current.state() == ConnectionState::Ready
-                });
-                producer_is_live.then(|| parse_completion_resolve_response(response))?
-            }
+            // A matched reply remains usable even if its connection retired.
+            // The handler still checks document freshness before returning it.
+            Ok(response) => parse_completion_resolve_response(response),
             Err(e) => {
                 warn!(
                     target: "kakehashi::bridge",
@@ -686,12 +682,10 @@ mod tests {
         assert!(edit_lock.try_lock().is_ok());
     }
 
-    /// A producer that retires while its resolve is in flight must not have
-    /// its late reply surfaced: the opaque data the reply was computed from
-    /// belongs to a process the pool is already tearing down.
+    /// A matched reply remains usable when the connection retires after send.
     #[cfg(unix)]
     #[tokio::test]
-    async fn resolve_response_rejects_a_retired_producer_after_send() {
+    async fn resolve_response_accepts_a_retired_producer_after_send() {
         use crate::lsp::bridge::pool::test_helpers::create_handle_with_command;
         use crate::lsp::bridge::{ConnectionKey, ConnectionState};
         let output = tempfile::NamedTempFile::new().unwrap();
@@ -786,13 +780,10 @@ mod tests {
         let _ = handle.router().route(json!({
             "jsonrpc": "2.0",
             "id": downstream_id.as_i64(),
-            "result": { "label": "stale" }
+            "result": { "label": "resolved" }
         }));
 
-        assert!(
-            request.await.unwrap().is_none(),
-            "a response from a no-longer-Ready completion producer must be discarded"
-        );
+        assert_eq!(request.await.unwrap().unwrap().label, "resolved");
     }
 
     /// The parse may already be current while deferred forwarding has not

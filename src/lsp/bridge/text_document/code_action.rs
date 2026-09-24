@@ -1166,15 +1166,8 @@ impl LanguageServerPool {
                 return None;
             }
         };
-        let producer_is_still_live = {
-            let connections = self.connections().await;
-            connections.get(connection_key).is_some_and(|current| {
-                Arc::ptr_eq(current, handle) && current.state() == ConnectionState::Ready
-            })
-        };
-        if !producer_is_still_live {
-            return None;
-        }
+        // Retirement alone does not invalidate a matched reply. Callers retain
+        // their document freshness and edit translation checks.
         parse_code_action_resolve_response(response)
     }
 }
@@ -1722,7 +1715,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_response_rejects_a_retired_producer_after_send() {
+    async fn resolve_response_accepts_a_retired_producer_after_send() {
         let pool = Arc::new(LanguageServerPool::new());
         let key = ConnectionKey::for_server("ruff");
         let handle = create_handle_with_key(ConnectionState::Ready, key).await;
@@ -1772,13 +1765,10 @@ mod tests {
         let _ = handle.router().route(json!({
             "jsonrpc": "2.0",
             "id": downstream_id.as_i64(),
-            "result": { "title": "stale" }
+            "result": { "title": "resolved" }
         }));
 
-        assert!(
-            request.await.unwrap().is_none(),
-            "a response from a no-longer-Ready code-action producer must be discarded"
-        );
+        assert_eq!(request.await.unwrap().unwrap().title, "resolved");
     }
 
     #[tokio::test]
