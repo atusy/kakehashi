@@ -2110,9 +2110,9 @@ impl LanguageServerPool {
     /// derive-from-current-open-documents repair ahead of the command, the
     /// same heal a same-key respawn gets. A no-op when the keys match (the
     /// ordinary case: same-key respawns arm at invalidation). Idempotent, and
-    /// harmless when the resolved key's connection is already live: an
-    /// armed-but-unclaimed key is invisible to the wait, and the next respawn
-    /// under it claims the debt.
+    /// recovery also calls `handoff_ready_reopen` after acquisition: an ordinary
+    /// acquisition may have finished the destination's handshake before this
+    /// new debt was armed.
     pub(crate) fn arm_reopen_if_key_changed(
         &self,
         registry_key: &ConnectionKey,
@@ -2120,6 +2120,36 @@ impl LanguageServerPool {
     ) {
         if resolved_key != registry_key {
             self.pending_reopen.arm(resolved_key);
+        }
+    }
+
+    /// Hand off debt armed after this destination's handshake already claimed
+    /// its initial work. Calling after acquisition also closes the interval
+    /// between the handshake's claim and its Ready publication.
+    pub(crate) async fn handoff_ready_reopen(&self, handle: &Arc<ConnectionHandle>) {
+        let connections = self.connections.lock().await;
+        let key = handle.key();
+        if handle.state() != ConnectionState::Ready
+            || !connections
+                .get(key)
+                .is_some_and(|live| Arc::ptr_eq(live, handle))
+        {
+            return;
+        }
+        let Some(done) = self.pending_reopen.claim(key) else {
+            return;
+        };
+        if let Err(error) = self
+            .upstream_request_tx
+            .send(UpstreamRequest::ReopenDocuments {
+                key: key.clone(),
+                done,
+            })
+        {
+            log::warn!(target: "kakehashi::bridge", "Failed to queue recovered documents on {key}: {error}");
+            if let UpstreamRequest::ReopenDocuments { done, .. } = error.0 {
+                self.pending_reopen.rearm(key, &done);
+            }
         }
     }
 
@@ -3054,7 +3084,7 @@ impl LanguageServerPool {
         reopen_from: Option<&ConnectionKey>,
     ) -> io::Result<Arc<ConnectionHandle>> {
         let start = std::time::Instant::now();
-        match self
+        let result = match self
             .get_or_create_connection_wait_ready_once(
                 server_name,
                 server_config,
@@ -3082,7 +3112,13 @@ impl LanguageServerPool {
                 .await
             }
             result => result,
+        };
+        if let Ok(handle) = &result
+            && reopen_from.is_some_and(|origin| origin != handle.key())
+        {
+            self.handoff_ready_reopen(handle).await;
         }
+        result
     }
 
     async fn get_or_create_connection_wait_ready_once(
@@ -4430,7 +4466,11 @@ impl LanguageServerPool {
                     // what this connection should hold from the documents open
                     // at the time it runs, which is the only set that is still
                     // true by then.
+                    // Recovery may arm new debt between the pre-Ready claim
+                    // and the Ready transition. A recovering caller that saw
+                    // Initializing leaves that handoff to this task.
                     if let Some(done) = pending_reopen_handoff
+                        .or_else(|| pending_reopen.claim(&command_registration_key))
                         && let Err(e) = upstream_request_tx.send(UpstreamRequest::ReopenDocuments {
                             key: command_registration_key.clone(),
                             done,
@@ -6302,6 +6342,42 @@ mod tests {
             Arc::ptr_eq(&result, &shared),
             "the spawn root's own document must stay aboard through the post-Ready check"
         );
+    }
+
+    #[tokio::test]
+    async fn recovery_reopens_a_diverted_destination_already_ready() {
+        let (_root, document) = marker_rooted_doc();
+        let pool = LanguageServerPool::new();
+        let config = shared_config();
+        let origin = ConnectionKey::shared("lua");
+        let shared = create_handle_with_key(ConnectionState::Ready, origin.clone()).await;
+        shared.set_server_capabilities(Default::default());
+        shared.record_launch_config(&config);
+        pool.insert_connection(shared).await;
+        let destination = pool.connection_key("lua", &config, Some(&document));
+        let ready = create_handle_with_key(ConnectionState::Ready, destination.clone()).await;
+        ready.record_launch_config(&config);
+        pool.insert_connection(Arc::clone(&ready)).await;
+        let mut upstream = pool.take_upstream_request_rx().unwrap();
+        let recovered = pool
+            .revive_crashed_connection(&origin, &config, &document, &|| true)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&recovered, &ready));
+        let request = upstream
+            .try_recv()
+            .expect("Ready destination must reopen quiet documents");
+        let UpstreamRequest::ReopenDocuments { key, done, .. } = request else {
+            panic!("expected the derived reopen");
+        };
+        assert_eq!(key, destination);
+        assert!(!*done.borrow(), "the command barrier remains pending");
+        assert!(
+            pool.pending_reopen.claim(&destination).is_none(),
+            "debt was handed off"
+        );
+        done.send(true).unwrap();
+        assert!(pool.wait_for_pending_reopen(&destination).await);
     }
 
     /// The palette flip branch arms re-open debt under the RESOLVED key, not

@@ -2882,16 +2882,17 @@ async fn defer_diverted_destination(
     destination: crate::lsp::bridge::ConnectionKey,
 ) {
     let pool = injection.bridge().pool();
-    if destination == *source
-        || destination.is_shared()
-        || pool
-            .ready_connection_by_key_for_config(&destination, None)
-            .await
-            .is_some()
-    {
+    if destination == *source || destination.is_shared() {
         return;
     }
     pool.arm_reopen_if_key_changed(source, &destination);
+    if let Some(ready) = pool
+        .ready_connection_by_key_for_config(&destination, None)
+        .await
+    {
+        pool.handoff_ready_reopen(&ready).await;
+        return;
+    }
     retry_failed_divert(
         injection,
         settings_manager,
