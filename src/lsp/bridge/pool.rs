@@ -3439,9 +3439,9 @@ impl LanguageServerPool {
     /// For a server without `preferSharedInstance`, this is exactly
     /// [`resolve_marker_and_key`](Self::resolve_marker_and_key) (per-root/#382).
     /// For an opt-in server it returns the shared-instance key — UNLESS a shared
-    /// connection already exists, is `Ready`, and is not (yet) folder-change
-    /// capable — neither declared statically nor registered dynamically. In
-    /// that case kakehashi logs once and degrades
+    /// connection already initialized (even if it later failed), and is not
+    /// folder-change capable — neither declared statically nor registered
+    /// dynamically. In that case kakehashi logs once and degrades
     /// to per-root instances, so a misconfigured opt-in never wedges the 2nd+
     /// root on a server that ignores `didChangeWorkspaceFolders`. The fallback
     /// keeps every root the connection is already serving on the shared key —
@@ -3523,13 +3523,20 @@ impl LanguageServerPool {
                 .is_some_and(|handle| handle.supports_workspace_folder_changes());
 
         let key = match shared_handle {
-            // A Ready shared connection without the folder-CHANGE
+            // An initialized shared connection without the folder-CHANGE
             // capability (static or, so far, dynamic) can't take on new roots via
             // didChangeWorkspaceFolders (it may still serve its
             // initialize-listed folders; the divert proof below accounts
             // for both).
+            // Keep a failed probe's known root partition until it is replaced:
+            // forgetting it would move a crashed fallback's demand to the
+            // shared key and make both recovery and its re-open skip the root.
+            // A failed handshake with no capabilities established no partition.
             Some(handle)
-                if handle.state() == ConnectionState::Ready
+                if (handle.state() == ConnectionState::Ready
+                    || (handle.state() == ConnectionState::Failed
+                        && handle.server_capabilities().is_some()
+                        && handle.matches_launch_config(server_config)))
                     && !handle.supports_workspace_folder_changes() =>
             {
                 // Divert only a root the connection is not already serving,
@@ -6812,7 +6819,7 @@ mod tests {
         // Capabilities set, but WITHOUT workspaceFolders support. Its folder set
         // is empty, so it serves no root yet.
         handle.set_server_capabilities(tower_lsp_server::ls_types::ServerCapabilities::default());
-        pool.insert_connection(handle).await;
+        pool.insert_connection(Arc::clone(&handle)).await;
 
         let (_marker, key) = pool.resolve_acquire("lua", &config, Some(&doc)).await;
         assert!(
@@ -6822,6 +6829,13 @@ mod tests {
         // And it is the same per-root key the non-opt-in path would pick.
         let per_root = pool.connection_key("lua", &devnull_config(), Some(&doc));
         assert_eq!(key, per_root);
+
+        handle.set_state(ConnectionState::Failed);
+        assert_eq!(
+            pool.resolved_connection_key("lua", &config, &doc).await,
+            per_root,
+            "a crashed initialized probe must not erase the fallback's document demand"
+        );
     }
 
     /// The incapable-fallback must not split a single root across two processes:
