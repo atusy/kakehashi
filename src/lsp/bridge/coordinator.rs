@@ -1136,6 +1136,14 @@ impl BridgeCoordinator {
         let Some(config) = settings.language_servers.get(server_name) else {
             return false;
         };
+        // A wildcard language list cannot make a disabled or commandless
+        // server reachable. Match the authoritative resolver before spending
+        // the reopen barrier on a parse this server cannot receive.
+        if !config
+            .is_spawnable_with_wildcard(settings.language_servers.get(crate::config::WILDCARD_KEY))
+        {
+            return false;
+        }
         // `_self` names a separate host layer, not an injectable language.
         // Even a wildcard server supplies no injections when the host permits
         // only that layer. Otherwise a parserless host that was successfully
@@ -3248,6 +3256,55 @@ mod tests {
         });
         assert_eq!(
             coordinator.host_language_can_reach_server(&settings, "unlisted-host", "any"),
+            reachable
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::disabled(Some(false), Some("server"), None, None, false)]
+    #[case::commandless(None, None, None, None, false)]
+    #[case::inherited_disabled(None, Some("server"), Some(false), None, false)]
+    #[case::inherited_command(None, None, None, Some("server"), true)]
+    #[case::override_disabled(Some(true), Some("server"), Some(false), None, true)]
+    fn wildcard_server_screen_requires_spawnable_configuration(
+        #[case] enabled: Option<bool>,
+        #[case] command: Option<&str>,
+        #[case] inherited_enabled: Option<bool>,
+        #[case] inherited_command: Option<&str>,
+        #[case] reachable: bool,
+    ) {
+        let coordinator = BridgeCoordinator::new();
+        let settings = Arc::new(WorkspaceSettings {
+            language_servers: HashMap::from([
+                (
+                    "_".into(),
+                    BridgeServerConfig {
+                        languages: Some(vec!["*".into()]),
+                        enabled: inherited_enabled,
+                        cmd: inherited_command.map(|cmd| vec![cmd.into()]),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "any".into(),
+                    BridgeServerConfig {
+                        enabled,
+                        cmd: command.map(|cmd| vec![cmd.into()]),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        });
+        assert_eq!(
+            !coordinator
+                .get_all_configs_for_language(&settings, "markdown", "python")
+                .is_empty(),
+            reachable,
+            "authoritative resolution must agree with the recovery screen"
+        );
+        assert_eq!(
+            coordinator.host_language_can_reach_server(&settings, "markdown", "any"),
             reachable
         );
     }
