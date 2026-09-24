@@ -279,6 +279,10 @@ bounded retry loop. A new crash of the seed stops immediate acquisition, leaving
 that connection's next restart to its own backoff. Still-current diverted roots
 not yet acquired receive re-open debt and their own bounded retries, including
 when the seed establishes an incapable partition but fails before Ready.
+A failed fallback does not lose its retry while a shared replacement is still
+initializing: routing returns a pending verdict from the same handle snapshot,
+and recovery waits for that handshake before rechecking current demand and
+settings. The reservation remains uncommitted throughout that read-only wait.
 A recovered shared process with folder-change support queues consolidation
 explicitly, so static capability upgrades retire existing fallback roots even
 when those roots were outside the crashed process's demand.

@@ -2318,7 +2318,7 @@ impl LanguageServerPool {
         if self.host_routing_rootless(document_uri, server_name) {
             return (ConnectionKey::shared(server_name), None);
         }
-        let (marker, key, _) = self
+        let (marker, key, _, _) = self
             .resolve_connection_route(server_name, server_config, Some(document_uri))
             .await;
         (key, Some(marker))
@@ -2509,6 +2509,26 @@ impl LanguageServerPool {
         self.resolved_connection_key_and_marker(server_name, server_config, document_uri)
             .await
             .0
+    }
+
+    /// Recovery must not treat an initializing shared route as final: it may
+    /// divert this document again as soon as capabilities are established.
+    pub(crate) async fn recovery_connection_key(
+        &self,
+        server_name: &str,
+        config: &crate::config::settings::BridgeServerConfig,
+        document: &Url,
+    ) -> Result<ConnectionKey, Arc<ConnectionHandle>> {
+        if self.host_routing_rootless(document, server_name) {
+            return Ok(ConnectionKey::shared(server_name));
+        }
+        let (_, key, _, pending) = self
+            .resolve_connection_route(server_name, config, Some(document))
+            .await;
+        match pending {
+            Some(handle) => Err(handle),
+            None => Ok(key),
+        }
     }
 
     /// Membership check for the save fan-out liveness recheck (avoids the
@@ -3504,7 +3524,7 @@ impl LanguageServerPool {
         Option<(Url, tower_lsp_server::ls_types::WorkspaceFolder)>,
         ConnectionKey,
     ) {
-        let (marker, key, heal_straggler) = self
+        let (marker, key, heal_straggler, _) = self
             .resolve_connection_route(server_name, server_config, document_uri)
             .await;
         // Handed to the upstream loop rather than awaited here: this runs in
@@ -3541,11 +3561,12 @@ impl LanguageServerPool {
         Option<(Url, tower_lsp_server::ls_types::WorkspaceFolder)>,
         ConnectionKey,
         bool,
+        Option<Arc<ConnectionHandle>>,
     ) {
         let (marker, per_root_key) =
             self.resolve_marker_and_key(server_name, server_config, document_uri);
         if !server_config.prefers_shared_instance() {
-            return (marker, per_root_key, false);
+            return (marker, per_root_key, false, None);
         }
         // A marker-less document (no marker root, non-file URI, no document
         // hint, or the `[]` kill switch) joins the shared instance too: it has
@@ -3586,6 +3607,10 @@ impl LanguageServerPool {
                 .as_ref()
                 .is_some_and(|handle| handle.supports_workspace_folder_changes());
 
+        let pending = shared_handle
+            .as_ref()
+            .filter(|handle| handle.state() == ConnectionState::Initializing)
+            .map(Arc::clone);
         let key = match shared_handle {
             // An initialized shared connection without the folder-CHANGE
             // capability (static or, so far, dynamic) can't take on new roots via
@@ -3630,7 +3655,7 @@ impl LanguageServerPool {
             // route to the shared instance.
             _ => shared_key,
         };
-        (marker, key, heal_straggler)
+        (marker, key, heal_straggler, pending)
     }
 
     /// For a shared-instance connection (#391), record this acquisition's marker
@@ -6563,6 +6588,36 @@ mod tests {
 
         let (_marker, key) = pool.resolve_acquire("lua", &config, Some(&doc)).await;
         assert_eq!(key, ConnectionKey::shared("lua"));
+    }
+
+    #[tokio::test]
+    async fn recovery_defers_a_failed_fallbacks_verdict_during_shared_initialization() {
+        let (_tmp, document) = marker_rooted_doc();
+        let pool = LanguageServerPool::new();
+        let config = shared_config();
+        let shared =
+            create_handle_with_key(ConnectionState::Initializing, ConnectionKey::shared("lua"))
+                .await;
+        let fallback = pool.connection_key("lua", &devnull_config(), Some(&document));
+        pool.insert_connection(Arc::clone(&shared)).await;
+        pool.insert_connection(
+            create_handle_with_key(ConnectionState::Failed, fallback.clone()).await,
+        )
+        .await;
+        let pending = pool
+            .recovery_connection_key("lua", &config, &document)
+            .await;
+        assert!(
+            pending.is_err(),
+            "optimistic shared routing cannot discard the fallback's retry"
+        );
+        assert!(Arc::ptr_eq(&pending.err().unwrap(), &shared));
+        shared.set_server_capabilities(Default::default());
+        shared.set_state(ConnectionState::Ready);
+        assert!(
+            matches!(pool.recovery_connection_key("lua", &config, &document).await,
+            Ok(key) if key == fallback)
+        );
     }
 
     #[tokio::test]
