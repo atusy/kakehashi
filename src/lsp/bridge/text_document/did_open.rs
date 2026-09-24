@@ -94,6 +94,19 @@ impl LanguageServerPool {
         read: super::host::HostResolveReader<'_>,
         admit: &(dyn Fn() -> bool + Sync),
     ) -> OpenOutcome {
+        // Another root's eager open can hold its host lifecycle lock for an
+        // entire handshake. Exclude that document before waiting, so its
+        // unrelated initialization cannot consume this connection's barrier.
+        // This is read-only; repeat the routing check under the lifecycle lock
+        // below before sending, because a route can change while we wait.
+        if self.host_routing_by_server(doc.uri, key.server()) == Some(false)
+            || self
+                .resolved_connection_key(key.server(), config, doc.uri)
+                .await
+                != *key
+        {
+            return OpenOutcome::NotApplicable;
+        }
         let lifecycle = self.host_lifecycle_lock(doc.uri);
         let _cleanup = LifecycleCleanup {
             pool: self,
@@ -684,6 +697,43 @@ mod tests {
                     content_version: version,
                 },
             }
+        }
+
+        #[tokio::test]
+        async fn unrelated_host_lifecycle_does_not_delay_connection_repair() {
+            let (pool, routed, config, uri) = fixture().await;
+            let other = ConnectionKey::new("host-server", Some("file:///other-root".into()));
+            pool.insert_connection(
+                create_handle_with_key(ConnectionState::Ready, other.clone()).await,
+            )
+            .await;
+            // An eager open on this host holds the lifecycle lock throughout
+            // its handshake. Repairing another root must not wait for it.
+            let lifecycle = pool.host_lifecycle_lock(&uri);
+            let _blocked = lifecycle.write().await;
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                pool.reopen_host_document(
+                    &other,
+                    &config,
+                    &document(&uri, 1),
+                    &|_| Some(snapshot(1, 1, "original text")),
+                    &|| true,
+                ),
+            )
+            .await
+            .expect("an unrelated lifecycle must not consume the repair barrier's wait");
+            assert_eq!(outcome, OpenOutcome::NotApplicable);
+            assert!(
+                !pool
+                    .is_host_document_opened_on_connection(&uri, &other)
+                    .await
+            );
+            assert!(
+                !pool
+                    .is_host_document_opened_on_connection(&uri, &routed)
+                    .await
+            );
         }
 
         #[tokio::test]
