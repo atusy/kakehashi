@@ -769,22 +769,24 @@ impl BridgeCoordinator {
         host_uri: &Url,
         injections: Vec<BridgeInjection>,
         connection: &super::pool::ConnectionKey,
-    ) -> Option<Url> {
+    ) -> Result<Option<Url>, Arc<super::pool::ConnectionHandle>> {
         let server = connection.server();
-        let config = self.respawnable_server_config(settings, server)?;
+        let Some(config) = self.respawnable_server_config(settings, server) else {
+            return Ok(None);
+        };
         for document in
             self.recovery_injection_documents(settings, host_language, host_uri, injections, server)
         {
             if &self
                 .pool
-                .resolved_connection_key(server, &config, &document)
-                .await
+                .recovery_connection_key(server, &config, &document)
+                .await?
                 == connection
             {
-                return Some(document);
+                return Ok(Some(document));
             }
         }
-        None
+        Ok(None)
     }
 
     /// Current injection routing units configured for this server. This reads
@@ -2738,6 +2740,7 @@ mod tests {
                 )
                 .await
                 .expect("routing must not ask a candidate server")
+                .unwrap_or_else(|_| panic!("unexpected pending route"))
             }
         };
         assert!(routes_to(fallback).await.is_some());
@@ -2786,7 +2789,8 @@ mod tests {
             ),
         )
         .await
-        .expect("the check must not acquire a server");
+        .expect("the check must not acquire a server")
+        .unwrap_or_else(|_| panic!("unexpected pending route"));
         assert!(
             routed.is_some(),
             "an undecided region counts as routed (fail-open)"
@@ -2813,6 +2817,7 @@ mod tests {
                     &key
                 )
                 .await
+                .unwrap_or_else(|_| panic!("unexpected pending route"))
                 .is_none(),
             "a region routing suppressed for this server does not keep it wanted"
         );

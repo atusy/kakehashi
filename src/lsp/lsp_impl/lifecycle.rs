@@ -2371,7 +2371,7 @@ async fn crashed_connection_document(
     bridge: &crate::lsp::bridge::BridgeCoordinator,
     settings: &Arc<crate::config::WorkspaceSettings>,
     key: &crate::lsp::bridge::ConnectionKey,
-) -> Option<Url> {
+) -> std::result::Result<Option<Url>, Arc<crate::lsp::bridge::ConnectionHandle>> {
     let server = key.server();
     for host in injection.open_host_uris() {
         let Some((language, _)) = injection.screen_language(&host) else {
@@ -2383,12 +2383,12 @@ async fn crashed_connection_document(
         if let Some((host_language, Some(injections))) = injection.bridge_injections(&host)
             && let Some(document) = bridge
                 .injection_routed_to_connection(settings, &host_language, &host, injections, key)
-                .await
+                .await?
         {
-            return Some(document);
+            return Ok(Some(document));
         }
     }
-    None
+    Ok(None)
 }
 
 /// Current units belonging to the shared connection, collected only for this
@@ -2601,7 +2601,26 @@ async fn attempt_crash_recovery(
                 .first()
                 .map(|(_, document)| document.clone())
         } else {
-            crashed_connection_document(injection, bridge, settings, key).await
+            match crashed_connection_document(injection, bridge, settings, key).await {
+                Ok(document) => document,
+                Err(pending) => {
+                    // An optimistic shared route during initialization is not
+                    // evidence that this failed fallback lost its documents.
+                    // Keep this reservation uncommitted and recheck everything
+                    // (including settings and shutdown) after a bounded wait.
+                    let _ = pending
+                        .wait_for_ready(std::time::Duration::from_secs(
+                            crate::lsp::bridge::INIT_TIMEOUT_SECS,
+                        ))
+                        .await;
+                    if pending.state() == crate::lsp::bridge::ConnectionState::Initializing {
+                        // A terminal reader can wake wait_for_ready before the
+                        // handshake task publishes Failed. Avoid a busy retry.
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    continue;
+                }
+            }
         };
         let Some(document) = document else {
             log::debug!(
@@ -5369,6 +5388,7 @@ mod reopen_order_tests {
         assert!(
             crashed_connection_document(&injection, &server.bridge, &settings, &key)
                 .await
+                .unwrap_or_else(|_| panic!("unexpected pending route"))
                 .is_none()
         );
     }
