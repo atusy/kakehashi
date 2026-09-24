@@ -1,6 +1,7 @@
 use crate::document::DocumentStore;
 use crate::language::{DocumentParserPool, LanguageCoordinator};
 use crate::lsp::auto_install::AutoInstallManager;
+use crate::text::terminal::escape_terminal_controls;
 use url::Url;
 
 use crate::config::WorkspaceSettings;
@@ -283,9 +284,11 @@ impl InstallCoordinator {
     pub(crate) async fn notify_parser_missing(&self, language: &str, reason: &str) {
         self.notifier()
             .log_warning(format!(
-                "Parser for '{}' not found. Auto-install is disabled because {}. \
+                "Parser for '{}' is unavailable. Auto-install is disabled because {}. \
                  Please install the parser manually using: kakehashi language install {}",
-                language, reason, language
+                escape_terminal_controls(language),
+                escape_terminal_controls(reason),
+                escape_terminal_controls(language)
             ))
             .await;
     }

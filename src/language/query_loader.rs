@@ -1,5 +1,6 @@
 use crate::error::{LspError, LspResult};
 use crate::language::query_modeline::parse_modeline;
+use crate::text::terminal::escape_terminal_controls;
 use log::{debug, warn};
 use path_clean::PathClean;
 use std::fmt::Write;
@@ -77,6 +78,8 @@ struct ResolvedQuery {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum QueryLoadError {
+    #[error("Refused query lookup for language '{}': not a single path component", escape_terminal_controls(.0))]
+    RefusedLanguage(String),
     #[error("query file not found")]
     NotFound,
     #[error(transparent)]
@@ -93,7 +96,11 @@ pub(crate) fn format_search_paths<P: AsRef<Path>>(paths: &[P]) -> String {
             if i > 0 {
                 buf.push_str(", ");
             }
-            let _ = write!(buf, "{}", p.as_ref().display());
+            let _ = write!(
+                buf,
+                "{}",
+                escape_terminal_controls(&p.as_ref().to_string_lossy())
+            );
         }
         buf.push(']');
         buf
@@ -159,10 +166,13 @@ impl QueryLoader {
         visited: &mut std::collections::HashSet<String>,
         emitted: &mut std::collections::HashSet<String>,
     ) -> Result<ResolvedQuery, QueryLoadError> {
+        if !is_single_path_component(lang_name) {
+            return Err(QueryLoadError::RefusedLanguage(lang_name.to_string()));
+        }
         if visited.contains(lang_name) {
             return Err(LspError::query(format!(
                 "Circular inheritance detected for language '{}'",
-                lang_name
+                escape_terminal_controls(lang_name)
             ))
             .into());
         }
@@ -182,7 +192,7 @@ impl QueryLoader {
             let content = fs::read_to_string(path).map_err(|e| {
                 LspError::query(format!(
                     "Failed to read query file {}: {}",
-                    path.display(),
+                    escape_terminal_controls(&path.to_string_lossy()),
                     e
                 ))
             })?;
@@ -211,7 +221,7 @@ impl QueryLoader {
             } else {
                 debug!(
                     "Query file {} is shadowed by an earlier search path (mark it `;; extends` to merge it)",
-                    path.display()
+                    escape_terminal_controls(&path.to_string_lossy())
                 );
             }
         }
@@ -236,9 +246,9 @@ impl QueryLoader {
                     return Err(LspError::query(format!(
                         "Query file {} not found for language {} (inherited by {} in {}) in search paths: {}",
                         file_name,
-                        parent,
-                        lang_name,
-                        declared_in.display(),
+                        escape_terminal_controls(parent),
+                        escape_terminal_controls(lang_name),
+                        escape_terminal_controls(&declared_in.to_string_lossy()),
                         format_search_paths(runtime_bases)
                     ))
                     .into());
@@ -271,7 +281,7 @@ impl QueryLoader {
                 Err(e) => {
                     return Err(LspError::query(format!(
                         "Failed to read query file {}: {e}",
-                        normalized_path.display()
+                        escape_terminal_controls(&normalized_path.to_string_lossy())
                     )));
                 }
             }
@@ -501,6 +511,19 @@ impl QueryLoader {
     }
 }
 
+/// Append one file's text so the next file starts on a fresh line and no
+/// line is added that the file did not have: a file's line numbers in the
+/// combined text are then its own plus the lines of what precedes it, which
+/// is what a skipped-pattern warning quotes. An empty file has no lines and
+/// contributes none. `pub(crate)` so the asset tests join sources the same
+/// way and count lines the loader would.
+pub(crate) fn append_file(combined: &mut String, content: &str) {
+    combined.push_str(content);
+    if !content.is_empty() && !content.ends_with('\n') {
+        combined.push('\n');
+    }
+}
+
 /// Whether `value` names exactly one ordinary path component.
 ///
 /// Gates the language half of implicit asset lookup so a document-controlled
@@ -521,20 +544,7 @@ impl QueryLoader {
 /// stay readable, whereas the write side may be stricter because the name also
 /// becomes a URL segment. Rejection here is a path-shape decision only; it is
 /// not a charset filter and must not be relied on as one.
-/// Append one file's text so the next file starts on a fresh line and no
-/// line is added that the file did not have: a file's line numbers in the
-/// combined text are then its own plus the lines of what precedes it, which
-/// is what a skipped-pattern warning quotes. An empty file has no lines and
-/// contributes none. `pub(crate)` so the asset tests join sources the same
-/// way and count lines the loader would.
-pub(crate) fn append_file(combined: &mut String, content: &str) {
-    combined.push_str(content);
-    if !content.is_empty() && !content.ends_with('\n') {
-        combined.push('\n');
-    }
-}
-
-fn is_single_path_component(value: &str) -> bool {
+pub(crate) fn is_single_path_component(value: &str) -> bool {
     let mut components = Path::new(value).components();
     matches!(components.next(), Some(Component::Normal(name)) if name == value)
         && components.next().is_none()
@@ -567,8 +577,26 @@ mod tests {
         .map(|resolved| resolved.content)
         .map_err(|e| match e {
             QueryLoadError::Other(e) => e,
-            not_found @ QueryLoadError::NotFound => LspError::query(not_found.to_string()),
+            other => LspError::query(other.to_string()),
         })
+    }
+
+    #[test]
+    fn rejected_query_name_reports_refusal_with_escaped_identifier() {
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let error = QueryLoader::load_query_with_inheritance(
+            &language,
+            NO_SEARCH_PATHS,
+            "../bad\n\u{1b}[31m",
+            "highlights.scm",
+        )
+        .err()
+        .expect("path-shaped names must be refused");
+        let message = error.to_string();
+        assert!(message.contains("not a single path component"), "{message}");
+        assert!(message.contains(r"../bad\n\u{1b}[31m"), "{message:?}");
+        assert!(!message.chars().any(char::is_control));
+        assert!(!matches!(error, QueryLoadError::NotFound));
     }
 
     #[test]

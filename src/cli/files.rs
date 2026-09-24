@@ -16,7 +16,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::cli::terminal::escape_terminal_controls;
+use crate::text::terminal::escape_terminal_controls;
 
 fn format_walk_error(error: &str) -> String {
     let error = escape_terminal_controls(error);

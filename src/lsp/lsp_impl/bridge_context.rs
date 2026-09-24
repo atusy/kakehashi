@@ -5,6 +5,7 @@
 //! of resolving injection context before sending requests. This module extracts
 //! that shared preamble into a reusable method: `resolve_bridge_contexts`.
 
+use crate::text::terminal::escape_terminal_controls;
 use tower_lsp_server::ls_types::{Position, Range, Uri, WorkspaceEdit};
 use url::Url;
 
@@ -1226,7 +1227,7 @@ impl Kakehashi {
             log::debug!(
                 "{}: virt layer disabled for {} via layers.aggregation priorities",
                 method_name,
-                preamble.language_name
+                escape_terminal_controls(&preamble.language_name)
             );
             return None;
         }
@@ -1239,8 +1240,8 @@ impl Kakehashi {
         if configs.is_empty() {
             log::debug!(
                 "No bridge server configured for language: {} (host: {})",
-                preamble.resolved.injection_language,
-                preamble.language_name
+                escape_terminal_controls(&preamble.resolved.injection_language),
+                escape_terminal_controls(&preamble.language_name)
             );
             return None;
         }
@@ -1262,7 +1263,7 @@ impl Kakehashi {
                 log::debug!(
                     "{}: all configured servers for {} are known-incapable; skipping virt layer",
                     method_name,
-                    preamble.resolved.injection_language
+                    escape_terminal_controls(&preamble.resolved.injection_language)
                 );
                 return None;
             }
@@ -1391,7 +1392,7 @@ impl Kakehashi {
             log::debug!(
                 "{}: host bridging not opted in for {} (bridge._self.enabled)",
                 method_name,
-                language_name
+                escape_terminal_controls(language_name)
             );
             return None;
         }
@@ -1403,7 +1404,7 @@ impl Kakehashi {
             log::debug!(
                 "{}: no host-capable server configured for {}",
                 method_name,
-                language_name
+                escape_terminal_controls(language_name)
             );
             return None;
         }

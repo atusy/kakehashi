@@ -25,6 +25,7 @@
 //! a single sorted edit vector. Both are `pub(super)` so the sibling range
 //! handler in [`super::range_formatting`] reuses them verbatim.
 
+use crate::text::terminal::escape_terminal_controls;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::oneshot;
@@ -331,8 +332,8 @@ impl Kakehashi {
                          server(s) {:?}; none are configured for this region, so it \
                          is left unformatted (priorities is an allowlist — \
                          non-listed servers are not run)",
-                        language_name,
-                        resolved.injection_language,
+                        escape_terminal_controls(language_name),
+                        escape_terminal_controls(&resolved.injection_language),
                         agg.priorities,
                     );
                     continue;
@@ -341,8 +342,8 @@ impl Kakehashi {
                     log::debug!(
                         target: "kakehashi::formatting",
                         "formatting disabled for {}->{} (priorities = [])",
-                        language_name,
-                        resolved.injection_language,
+                        escape_terminal_controls(language_name),
+                        escape_terminal_controls(&resolved.injection_language),
                     );
                     continue;
                 }
@@ -392,8 +393,8 @@ impl Kakehashi {
                     "concatenated formatting for {}->{} lists '{}' in priorities; \
                      the wildcard is ignored by the sequential pipeline (explicit \
                      order required) and only the named servers run",
-                    language_name,
-                    region_ctx.resolved.injection_language,
+                    escape_terminal_controls(language_name),
+                    escape_terminal_controls(&region_ctx.resolved.injection_language),
                     PRIORITIES_WILDCARD,
                 );
             }

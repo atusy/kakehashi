@@ -23,6 +23,7 @@ use crate::error::LockResultExt;
 use crate::install::support_check::{
     TrackedSupportCheck, should_skip_unsupported_language_tracked,
 };
+use crate::text::terminal::escape_terminal_controls;
 
 use super::{InstallingLanguages, InstallingLanguagesExt};
 
@@ -481,7 +482,7 @@ impl AutoInstallManager {
                             level: MessageType::INFO,
                             message: format!(
                                 "Language '{}' support is already being checked or installed",
-                                language
+                                escape_terminal_controls(language)
                             ),
                         });
                         return InstallResult {
@@ -512,13 +513,13 @@ impl AutoInstallManager {
                         let _ = writeln!(
                             std::io::stderr(),
                             "Auto-install state mismatch for '{}': repairing a stale installing marker",
-                            language
+                            escape_terminal_controls(language)
                         );
                         events.push(InstallEvent::Log {
                             level: MessageType::WARNING,
                             message: format!(
                                 "Auto-install state for '{}' was inconsistent; retrying with repaired state",
-                                language
+                                escape_terminal_controls(language)
                             ),
                         });
                         self.installing_languages.finish_install(language);
@@ -595,7 +596,8 @@ impl AutoInstallManager {
                     level: MessageType::ERROR,
                     message: format!(
                         "Support check task for '{}' failed: {}",
-                        language, join_error
+                        escape_terminal_controls(language),
+                        join_error
                     ),
                 });
                 return InstallResult {
@@ -637,7 +639,7 @@ impl AutoInstallManager {
                 level: MessageType::ERROR,
                 message: format!(
                     "Support check for '{}' completed without its install claim",
-                    language
+                    escape_terminal_controls(language)
                 ),
             });
             return InstallResult {
@@ -680,7 +682,7 @@ impl AutoInstallManager {
                 level: MessageType::INFO,
                 message: format!(
                     "Parser and queries for '{}' already exist. Loading without reinstall...",
-                    language
+                    escape_terminal_controls(language)
                 ),
             });
             events.push(InstallEvent::ProgressEnd { success: true });
@@ -693,7 +695,10 @@ impl AutoInstallManager {
         // Log installation start
         events.push(InstallEvent::Log {
             level: MessageType::INFO,
-            message: format!("Auto-installing language '{}' in background...", language),
+            message: format!(
+                "Auto-installing language '{}' in background...",
+                escape_terminal_controls(language)
+            ),
         });
 
         // Run the actual installation in its own task that owns the marker:
@@ -731,7 +736,11 @@ impl AutoInstallManager {
                 events.push(InstallEvent::ProgressEnd { success: false });
                 events.push(InstallEvent::Log {
                     level: MessageType::ERROR,
-                    message: format!("Install task for '{}' failed: {}", lang, join_error),
+                    message: format!(
+                        "Install task for '{}' failed: {}",
+                        escape_terminal_controls(&lang),
+                        join_error
+                    ),
                 });
                 return InstallResult {
                     outcome: InstallOutcome::Failed,
@@ -747,7 +756,10 @@ impl AutoInstallManager {
             events.push(InstallEvent::ProgressEnd { success: true });
             events.push(InstallEvent::Log {
                 level: MessageType::INFO,
-                message: format!("Successfully installed language '{}'. Reloading...", lang),
+                message: format!(
+                    "Successfully installed language '{}'. Reloading...",
+                    escape_terminal_controls(&lang)
+                ),
             });
             InstallResult::with_claim(outcome, events, install_marker)
         } else if matches!(outcome, InstallOutcome::SuccessWithWarnings { .. }) {
@@ -767,7 +779,7 @@ impl AutoInstallManager {
                 message: format!(
                     "Language '{}' was not installed by this attempt ({}), but another install \
                      completed it. Reloading...",
-                    lang,
+                    escape_terminal_controls(&lang),
                     warnings.join("; ")
                 ),
             });
@@ -788,7 +800,7 @@ impl AutoInstallManager {
                 level: MessageType::ERROR,
                 message: format!(
                     "Failed to install language '{}': {}",
-                    lang,
+                    escape_terminal_controls(&lang),
                     errors.join("; ")
                 ),
             });
@@ -1028,6 +1040,28 @@ mod tests {
         manager.record_query_repair_failure("python", 11);
         assert!(!manager.begin_query_dependency_check("python", 11, true));
         assert!(manager.begin_query_dependency_check("python", 12, true));
+    }
+
+    #[tokio::test]
+    async fn duplicate_install_message_escapes_name_without_changing_claim_identity() {
+        let manager = create_test_manager();
+        let language = "日本語\n\u{1b}[31m\u{202e}";
+        let _owner = manager.begin_test_claim(language, Vec::new());
+        let result = manager
+            .try_install_with_support_check(language, Vec::new(), |_, _| async {
+                panic!("must join the raw-name claim")
+            })
+            .await;
+        assert_eq!(result.outcome, InstallOutcome::AlreadyInstalling);
+        let InstallEvent::Log { level, message } = &result.events[0] else {
+            panic!("expected duplicate-install log");
+        };
+        assert_eq!(*level, MessageType::INFO);
+        assert!(
+            message.contains(r"日本語\n\u{1b}[31m\u{202e}"),
+            "{message:?}"
+        );
+        assert!(!message.chars().any(char::is_control));
     }
 
     #[tokio::test]

@@ -7,6 +7,7 @@
 //! `JoinSet` aborts all downstream tasks, and cancels are also forwarded
 //! downstream fire-and-forget via middleware.
 
+use crate::text::terminal::escape_terminal_controls;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -193,7 +194,7 @@ impl Kakehashi {
             log::debug!(
                 target: "kakehashi::diagnostic",
                 "no diagnostic layer enabled for {} (layers.aggregation priorities / bridge._self)",
-                language_name
+                escape_terminal_controls(language_name)
             );
             self.mark_pull_covered(&uri, coverage_stamp, pull_view_lag_stamp, true);
             return Ok(empty_diagnostic_report());

@@ -4,6 +4,7 @@
 //! wrapping the synchronous `is_language_supported` with timeout handling
 //! to keep the LSP responsive.
 
+use crate::text::terminal::escape_terminal_controls;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -29,11 +30,12 @@ impl SkipReason {
         match self {
             SkipReason::UnsupportedLanguage { language } => format!(
                 "Language '{}' is not supported by nvim-treesitter. Skipping auto-install.",
-                language
+                escape_terminal_controls(language)
             ),
             SkipReason::MetadataUnavailable { language, error } => format!(
                 "Could not verify support for '{}' due to metadata error: {}. Skipping auto-install.",
-                language, error
+                escape_terminal_controls(language),
+                escape_terminal_controls(&error.to_string())
             ),
         }
     }

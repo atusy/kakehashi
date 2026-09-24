@@ -23,8 +23,8 @@ use std::time::Duration;
 use tower_lsp_server::LspService;
 
 use crate::cli::files::{collect_files, read_regular_file_to_string};
-use crate::cli::terminal::{escape_terminal_controls, escape_terminal_controls_keeping_newlines};
 use crate::lsp::Kakehashi;
+use crate::text::terminal::{escape_terminal_controls, escape_terminal_controls_keeping_newlines};
 
 /// Write one diagnostic line without turning a closed stderr pipe into panic
 /// exit 101. Format mode deliberately ignores SIGPIPE, so a consumer that

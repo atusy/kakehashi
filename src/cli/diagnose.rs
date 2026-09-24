@@ -41,8 +41,8 @@ use tower_lsp_server::LspService;
 use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString};
 
 use crate::cli::files::{collect_files, read_regular_file_to_string};
-use crate::cli::terminal::{escape_terminal_controls, is_bidi_control, is_line_separator};
 use crate::lsp::Kakehashi;
+use crate::text::terminal::{escape_terminal_controls, is_bidi_control, is_line_separator};
 
 /// Write one line to stderr, tolerating a closed pipe.
 ///

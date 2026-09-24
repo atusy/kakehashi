@@ -108,4 +108,44 @@ mod tests {
             vec!["WARN:kakehashi::bridge:codeLens/resolve: own warning"]
         );
     }
+
+    #[test]
+    fn injected_parse_warnings_escape_language_controls() {
+        use crate::language::injection::parse_with_ranges;
+        let mut parser = tree_sitter::Parser::new();
+        let name = "日本語\n\u{1b}[31m\u{202e}";
+        let warnings = captured_warnings_for(|| {
+            let invalid = tree_sitter::Range {
+                start_byte: 2,
+                end_byte: 1,
+                start_point: tree_sitter::Point::new(0, 2),
+                end_point: tree_sitter::Point::new(0, 1),
+            };
+            assert!(
+                parse_with_ranges(
+                    &mut parser,
+                    "abc",
+                    Some(&[invalid]),
+                    "kakehashi::bridge",
+                    name
+                )
+                .is_none()
+            );
+            // Without a language, parsing fails immediately instead of waiting
+            // for the native parse budget to expire.
+            assert!(
+                parse_with_ranges(&mut parser, "abc", None, "kakehashi::bridge", name).is_none()
+            );
+        });
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("Failed to set included ranges"));
+        assert!(warnings[1].contains("yielded no tree"));
+        for message in warnings {
+            assert!(
+                message.contains(r"日本語\n\u{1b}[31m\u{202e}"),
+                "{message:?}"
+            );
+            assert!(!message.chars().any(char::is_control));
+        }
+    }
 }

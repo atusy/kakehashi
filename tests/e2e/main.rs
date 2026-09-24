@@ -34,6 +34,7 @@ mod e2e_incremental_sync;
 mod e2e_kakehashi_captures;
 mod e2e_kakehashi_node;
 mod e2e_kakehashi_node_accessors;
+mod e2e_language_messages;
 mod e2e_layers_and_allowlist;
 mod e2e_lsp_capability;
 mod e2e_lsp_init_supersede;

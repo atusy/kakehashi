@@ -4,6 +4,7 @@ use crate::language::{DocumentParserPool, LanguageCoordinator};
 use crate::lsp::bridge::BridgeCoordinator;
 use crate::lsp::cache::{CacheCoordinator, PopulatedInjections};
 use crate::lsp::client::ClientNotifier;
+use crate::text::terminal::escape_terminal_controls;
 use tower_lsp_server::Client;
 use url::Url;
 
@@ -483,7 +484,7 @@ impl ParseCoordinator {
                             value.is_some(),
                             attempt,
                             text_len,
-                            language_name_owned,
+                            escape_terminal_controls(&language_name_owned),
                             uri,
                         );
                     }
@@ -510,7 +511,7 @@ impl ParseCoordinator {
                 start.elapsed().as_micros(),
                 matches!(&result, Ok(Some(Some(_)))),
                 text_len,
-                language_name,
+                escape_terminal_controls(language_name),
                 uri,
             );
         }
@@ -524,7 +525,7 @@ impl ParseCoordinator {
                 log::warn!(
                     "Parse await backstop hit after {:?} for language '{}' on document {} ({} bytes)",
                     PARSE_AWAIT_BACKSTOP,
-                    language_name,
+                    escape_terminal_controls(language_name),
                     uri,
                     text_len
                 );

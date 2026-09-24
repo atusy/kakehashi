@@ -2,6 +2,7 @@
 //! selection-range paths: clean-content extraction, per-line column offsets,
 //! parsing with included ranges, and byte→`Point` coordinate conversion.
 
+use crate::text::terminal::escape_terminal_controls;
 use crate::text::{clamped_slice, floor_char_boundary};
 
 /// Extract clean injection content, stripping child node bytes when `included_ranges` present.
@@ -188,7 +189,7 @@ pub(crate) fn parse_with_ranges(
         log::warn!(
             target: log_target,
             "Failed to set included ranges for {}: {}. Skipping parse.",
-            lang_name, e
+            escape_terminal_controls(lang_name), e
         );
         let _ = parser.set_included_ranges(&[]);
         return None;
@@ -200,7 +201,7 @@ pub(crate) fn parse_with_ranges(
         log::warn!(
             target: log_target,
             "Injected parse for {} yielded no tree (aborted at the {}s budget or failed)",
-            lang_name,
+            escape_terminal_controls(lang_name),
             NATIVE_PARSE_BUDGET.as_secs()
         );
     }
