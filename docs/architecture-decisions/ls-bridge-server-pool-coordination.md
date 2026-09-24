@@ -265,8 +265,11 @@ Multiple downstream servers initialize in parallel since each is independent:
 having initiated it (crash, framing error, liveness timeout) is respawned
 proactively rather than on the next request that needs it — otherwise the
 diagnostics its exit evicted stay gone on a document nobody edits. The
-respawn is an ordinary acquire by key, so the replacement is brought up to
-date by the same re-open as any other (respawn-reopen-derives-its-targets).
+respawn is an ordinary acquire, so the replacement is brought up to date by
+the same re-open as any other (respawn-reopen-derives-its-targets). Per-root
+connections acquire by key. Shared connections acquire using a currently open
+region's routing URI, reconstructing their initial workspace (or rootless
+route); the re-open announces each additional root before its documents.
 What must hold:
 
 - Recovery is bounded: a server that dies on every start must not be
@@ -274,8 +277,8 @@ What must hold:
 - It never revives a server settings no longer start, nor a connection that
   no open document's injected region routes to (per connection, not per
   server; host-layer documents do not count because the re-open restores
-  only injected regions). A shared instance is left to its next document,
-  which alone can re-root it.
+  only injected regions). Shared recovery derives its document after the
+  backoff, rather than retaining the dead instance's workspace-folder set.
 - It never stalls the forwarding loop that delivers every server's
   diagnostics.
 

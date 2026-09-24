@@ -622,8 +622,10 @@ keeps dying is left down until the next edit or request needs it. A server
 that configuration no longer starts is never restarted. Host documents
 (`bridge._self`) are not re-opened by the restart, so their diagnostics return
 on the next request for that document — and a server serving only host
-documents, like a `preferSharedInstance` instance, is left for the next request
-to restart.
+documents is left for the next request to restart. Shared instances recover
+using a currently open region to reconstruct their workspace; the re-open
+announces other regions' workspace roots before sending their documents.
+Explicit rootless routing (`workspaceFolders: []`) stays rootless.
 
 **Servers for any language (`languages = ["*"]`)**
 

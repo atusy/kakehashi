@@ -2440,22 +2440,27 @@ impl LanguageServerPool {
     /// hold are derived and opened the ordinary way
     /// (respawn-reopen-derives-its-targets).
     ///
-    /// Refused for a shared-instance key: the marker roots a dead shared
-    /// instance served died with its folder set, and nothing here can re-root
-    /// it — the next document acquisition revives it with its roots intact.
+    /// A shared key needs a current routing document to reconstruct its spawn
+    /// workspace (including an explicitly rootless route). The ordinary
+    /// document-aware acquire also handles capability fallback and root
+    /// announcement; every possible spawn retains the settings admission gate.
     pub(crate) async fn revive_crashed_connection(
         &self,
         key: &ConnectionKey,
         config: &crate::config::settings::BridgeServerConfig,
+        document_uri: &Url,
         admit: &(dyn Fn() -> bool + Sync),
     ) -> io::Result<Arc<ConnectionHandle>> {
         if key.is_shared() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!(
-                    "bridge: shared-instance connection {key} cannot be re-rooted without a document"
-                ),
-            ));
+            return self
+                .get_or_create_connection_wait_ready_admitted(
+                    key.server(),
+                    config,
+                    Some(document_uri),
+                    Duration::from_secs(INIT_TIMEOUT_SECS),
+                    Some(admit),
+                )
+                .await;
         }
         let marker = marker_for_key(key).ok_or_else(|| {
             io::Error::new(
@@ -3034,6 +3039,24 @@ impl LanguageServerPool {
         document_uri: Option<&Url>,
         timeout: Duration,
     ) -> io::Result<Arc<ConnectionHandle>> {
+        self.get_or_create_connection_wait_ready_admitted(
+            server_name,
+            server_config,
+            document_uri,
+            timeout,
+            None,
+        )
+        .await
+    }
+
+    async fn get_or_create_connection_wait_ready_admitted(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        document_uri: Option<&Url>,
+        timeout: Duration,
+        admit: Option<&(dyn Fn() -> bool + Sync)>,
+    ) -> io::Result<Arc<ConnectionHandle>> {
         let start = std::time::Instant::now();
         match self
             .get_or_create_connection_wait_ready_once(
@@ -3041,6 +3064,7 @@ impl LanguageServerPool {
                 server_config,
                 document_uri,
                 timeout,
+                admit,
             )
             .await
         {
@@ -3055,6 +3079,7 @@ impl LanguageServerPool {
                     server_config,
                     document_uri,
                     timeout.saturating_sub(start.elapsed()),
+                    admit,
                 )
                 .await
             }
@@ -3068,6 +3093,7 @@ impl LanguageServerPool {
         server_config: &crate::config::settings::BridgeServerConfig,
         document_uri: Option<&Url>,
         timeout: Duration,
+        admit: Option<&(dyn Fn() -> bool + Sync)>,
     ) -> io::Result<Arc<ConnectionHandle>> {
         // `timeout` is the caller's overall budget; the incapable-shared divert
         // below acquires a second connection, so track elapsed time and hand it
@@ -3096,7 +3122,7 @@ impl LanguageServerPool {
                 marker.clone(),
                 timeout,
                 rootless,
-                None,
+                admit,
             )
             .await
         {
@@ -3117,7 +3143,7 @@ impl LanguageServerPool {
                         marker.clone(),
                         remaining,
                         false,
-                        None,
+                        admit,
                     )
                     .await?;
                 self.announce_shared_root(&shared, &marker).await?;
@@ -3170,7 +3196,7 @@ impl LanguageServerPool {
                         marker.clone(),
                         remaining,
                         false,
-                        None,
+                        admit,
                     )
                     .await;
                 // A dynamically registering server makes this divert race its
@@ -11508,16 +11534,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_shared_instance_is_not_revived_by_crash_recovery() {
+    async fn a_shared_recovery_cannot_spawn_after_admission_expires() {
         let pool = LanguageServerPool::new();
         let result = pool
-            .revive_crashed_connection(&ConnectionKey::shared("crashy"), &devnull_config(), &|| {
-                true
-            })
+            .revive_crashed_connection(
+                &ConnectionKey::shared("crashy"),
+                &devnull_config(),
+                &Url::parse("file:///doc.lua").unwrap(),
+                &|| false,
+            )
             .await;
         assert_eq!(
             result.map(|_| ()).unwrap_err().kind(),
-            io::ErrorKind::Unsupported
+            io::ErrorKind::Interrupted
         );
         assert!(pool.connections().await.is_empty());
     }
