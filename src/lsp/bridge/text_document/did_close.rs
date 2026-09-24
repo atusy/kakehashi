@@ -583,8 +583,10 @@ mod tests {
         pool.insert_connection(Arc::clone(&failed)).await;
         failed.cancel_writer_for_test().await;
         let host_documents = pool.host_documents().await;
+        // Boxed rather than `pin!`: dropping a stack-pinned `Pin<&mut _>` would
+        // leave the future alive until scope end, so it would never be cancelled.
         let mut invalidation =
-            std::pin::pin!(pool.invalidate_connection_after_didclose_failure(&key, &failed));
+            Box::pin(pool.invalidate_connection_after_didclose_failure(&key, &failed));
 
         assert!(invalidation.as_mut().now_or_never().is_none());
         assert_eq!(failed.state(), ConnectionState::Failed);

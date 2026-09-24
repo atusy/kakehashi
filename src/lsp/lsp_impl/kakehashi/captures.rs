@@ -21,7 +21,7 @@
 //! With `injection: true` the kind query runs across **every** layer — the
 //! host, then each injection region in document-order DFS — each layer
 //! resolving its own language's kind file, with result nodes minted in their
-//! layer's depth so they compose with `kakehashi/node/*` under the per-layer
+//! layer's tree scope so they compose with `kakehashi/node/*` under the per-layer
 //! Scope rule. Every match carries the producing layer's `language`. Deltas
 //! carry no `injection` parameter: the mode is **lineage state**, inherited
 //! from the most recent `full` for that `(uri, kind)`.
@@ -838,7 +838,7 @@ impl Kakehashi {
     /// Shared pipeline: validate `kind`, resolve the document, load + compile
     /// `queries/<lang>/<kind>.scm` per visited layer language, execute, and
     /// shape the wire JSON (matches tagged with their layer's `language` and
-    /// minted in their layer's depth).
+    /// minted in their layer's tree scope).
     ///
     /// `Err` only for a malformed `kind` (client bug); every "not currently
     /// resolvable" case — unknown document, no visited language with a kind
@@ -1227,7 +1227,7 @@ impl Kakehashi {
                     // parser landed. On mismatch walk fresh, uncached — the
                     // pre-cache per-request cost — until the next snapshot.
                     if cached.0 == generation {
-                        Some(cached.1.as_slice())
+                        Some(cached.1.as_ref())
                     } else {
                         fresh_layers =
                             crate::lsp::lsp_impl::kakehashi::node::injection_stack::collect_document_layer_trees(
@@ -1236,7 +1236,7 @@ impl Kakehashi {
                                 &text,
                                 &tree,
                             );
-                        Some(fresh_layers.as_slice())
+                        Some(&fresh_layers)
                     }
                 } else {
                     None
@@ -1251,7 +1251,7 @@ impl Kakehashi {
                     &language_id,
                     &text,
                     &tree,
-                    layers,
+                    layers.map(|set| set.layers.as_slice()),
                     &language,
                     &tracker,
                     &documents,
@@ -1270,7 +1270,11 @@ impl Kakehashi {
                     walk_start.elapsed().as_millis(),
                     walked.as_ref().map_or(0, |(m, _)| m.len()),
                 );
-                walked
+                let scopes = layers.filter(|set| (set.complete || !set.unresolved.is_empty()) && lsp_range.is_none() && mint_into_tracker && !inner_cancel.is_cancelled())
+                    .map(|set| (set.layers.iter().map(|layer|
+                        crate::language::node_tracker::NodeTreeScope::new(
+                            &layer.language, layer.depth, &layer.tree)).collect::<HashSet<_>>(), set.unresolved.clone()));
+                (walked, scopes)
             });
         let walked = if let Some(cancel_rx) = cancel_rx {
             tokio::pin!(cancel_rx);
@@ -1300,7 +1304,7 @@ impl Kakehashi {
                 walked = walk_future => walked,
             }
         };
-        let Some(walked) = walked else {
+        let Some((walked, scopes)) = walked else {
             // A pool-skip of an already-cancelled unit (or a work-unit panic).
             return Ok(None);
         };
@@ -1331,6 +1335,27 @@ impl Kakehashi {
             );
             if !current {
                 return Ok(None);
+            }
+            if let Some((scopes, unresolved)) = scopes {
+                // Keep reload publication out of the final generation check
+                // and retirement, just as the edit guard excludes didChange.
+                let pool = self
+                    .parser_pool
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if !walk_cancel.is_cancelled()
+                    && !pool.reload_in_progress()
+                    && self.cache.semantic_token_generation() == generation
+                {
+                    self.bridge.node_tracker().retain_tree_scopes(
+                        &uri,
+                        entry_mint_epoch,
+                        incarnation,
+                        &scopes,
+                        &unresolved,
+                        generation,
+                    );
+                }
             }
             self.captures_walk_cache.insert(
                 key,
@@ -1562,7 +1587,7 @@ fn execute_captures_walk(
         // Per-layer id reconciliation (the §3 walk lever): resolve every
         // capture's ULID in ONE tracker entry-lock acquisition instead of
         // one per capture (~20k on an injection-heavy document). Minted in
-        // the layer's depth, so the id resolves in its minting layer via
+        // the layer's tree scope, so the id resolves in its minting layer via
         // kakehashi/node/* (per-layer Scope rule). The batch is keyed on the
         // walk's entry latch: a mid-walk edit refuses it wholesale (nothing
         // minted — no wrong-space entries, no purge), and the layer degrades
@@ -1572,44 +1597,29 @@ fn execute_captures_walk(
         // snapshot every span maps by construction, so the difference is
         // theoretical; the alignment (one id per capture, match order) is
         // what the shaping loop indexes by.
+        let scope = (depth > 0).then(|| {
+            crate::language::node_tracker::NodeTreeScope::new(layer_language, depth, layer_tree)
+        });
         let capture_keys = || {
             layer_matches.iter().flat_map(|m| {
                 m.captures
                     .iter()
-                    .map(|c| (c.start_byte + anchor, c.end_byte + anchor, c.kind, depth))
+                    .map(|c| (c.start_byte + anchor, c.end_byte + anchor, c.kind))
             })
         };
         let layer_ulids: Vec<ulid::Ulid> = if mint_into_tracker {
-            tracker.mint_batch_if_unshifted_for_incarnation(
+            tracker.mint_tree_batch(
                 uri,
                 entry_mint_epoch,
                 incarnation,
+                scope.as_ref(),
                 capture_keys(),
             )
         } else {
             None
         }
         .unwrap_or_else(|| {
-            // Read-only resolution (stale-at-entry serve, or a mid-walk edit
-            // refusing the batch): a position the intervening edits did not
-            // shift reuses its live id; an unknown position gets a fresh
-            // UNREGISTERED id — NOT Ulid::default() (the nil id), since
-            // unregistered ids must still be unique per capture.
-            capture_keys()
-                .map(|(start, end, kind, layer)| {
-                    match tracker.lookup_in_layer_for_incarnation(
-                        uri,
-                        start,
-                        end,
-                        kind,
-                        layer,
-                        incarnation,
-                    ) {
-                        Some(live) => live,
-                        None => ulid::Ulid::generate(),
-                    }
-                })
-                .collect()
+            tracker.lookup_tree_batch(uri, incarnation, scope.as_ref(), capture_keys())
         });
         let mut capture_idx = 0usize;
         for m in layer_matches.iter() {
@@ -1869,6 +1879,109 @@ mod tests {
             "skipped": [],
         });
         assert_eq!(serde_json::to_value(&response).unwrap(), expected);
+    }
+
+    #[rstest::rstest]
+    #[case::complete_full(true, false, true, true)]
+    #[case::range(true, true, true, false)]
+    #[case::host_only(false, false, true, false)]
+    #[case::missing_grammar(true, false, false, true)]
+    #[tokio::test]
+    async fn full_geometry_retires_provably_absent_scopes(
+        #[case] injection: bool,
+        #[case] ranged: bool,
+        #[case] grammar_available: bool,
+        #[case] retires: bool,
+    ) {
+        use tower_lsp_server::ls_types::Position;
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), language.clone());
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("scope_inner".into(), language.clone());
+        let query = tree_sitter::Query::new(
+            &language,
+            r#"((block) @injection.content
+            (#set! injection.language "scope_inner") (#set! injection.include-children))"#,
+        )
+        .unwrap();
+        server
+            .language
+            .query_store()
+            .insert_injection_query("rust".into(), Arc::new(query));
+        let uri = Url::parse("file:///scope-retention.rs").unwrap();
+        let text = "fn main() { let name = 1; }";
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(text, None).unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            text.into(),
+            Some("rust".into()),
+            Some(tree.clone()),
+        );
+        let layers = super::super::node::injection_stack::collect_document_layer_trees(
+            &server.language,
+            "rust",
+            text,
+            &tree,
+        );
+        assert!(layers.complete);
+        assert_eq!(layers.layers.len(), 1);
+        let layer = &layers.layers[0];
+        let current = crate::language::node_tracker::NodeTreeScope::new(
+            &layer.language,
+            layer.depth,
+            &layer.tree,
+        );
+        let mut obsolete = current.clone();
+        obsolete.ranges[0].1 -= 1;
+        let tracker = server.bridge.node_tracker();
+        let start = text.find("name").unwrap();
+        let mint = |scope: &crate::language::node_tracker::NodeTreeScope| {
+            tracker
+                .mint_tree_batch(
+                    &uri,
+                    tracker.mint_epoch(&uri),
+                    incarnation,
+                    Some(scope),
+                    [(start, start + 4, "identifier")],
+                )
+                .unwrap()[0]
+        };
+        let current_id = mint(&current);
+        let obsolete_id = mint(&obsolete);
+        if !grammar_available {
+            // The current root geometry is known even without its parser.
+            // Preserve that scope, but a different same-depth range is absent.
+            server
+                .language
+                .language_registry_for_parallel()
+                .unregister("scope_inner");
+        }
+        let range = ranged.then_some(Range::new(Position::new(0, 0), Position::new(0, 1)));
+        // This kind has no query file: geometry retention must not depend on
+        // whether this particular captures request can produce any matches.
+        let _ = server
+            .compute_captures(
+                &crate::lsp::lsp_impl::url_to_uri(&uri).unwrap(),
+                "scope-retention-no-query",
+                range,
+                injection,
+            )
+            .await
+            .unwrap();
+        assert!(
+            tracker.lookup_node(&uri, &current_id).is_some(),
+            "a current tree without a kind query keeps its IDs"
+        );
+        assert_eq!(tracker.lookup_node(&uri, &obsolete_id).is_none(), retires);
     }
 
     /// Serve-current (ADR §3, revised): a captures request arriving while the
@@ -3050,6 +3163,30 @@ mod tests {
                 cancel,
             )
         }
+    }
+
+    #[test]
+    fn overlapping_sibling_layers_mint_distinct_node_ids() {
+        let text = "fn outer() { let name = 1; }";
+        let rig = MatchCacheRig::new("file:///overlapping_node_layers.rs", text);
+        let layers = [
+            rust_layer(text, 0, text.len()),
+            rust_layer(text, text.find("let").unwrap(), text.find(';').unwrap() + 1),
+        ];
+        let (matches, _) = rig.walk(text, &layers, 0, None).unwrap();
+        let name_start = text.find("name").unwrap() as u64;
+        let ids: Vec<_> = matches
+            .iter()
+            .flat_map(|m| m["captures"].as_array().unwrap())
+            .filter(|c| c["range"]["start"]["character"].as_u64() == Some(name_start))
+            .map(|c| c["node"]["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 3, "host and both sibling trees capture name");
+        assert_eq!(
+            ids.iter().collect::<std::collections::HashSet<_>>().len(),
+            3,
+            "each minting tree must have its own node identity"
+        );
     }
 
     /// Batch id reconciliation alignment: every capture in a current serve

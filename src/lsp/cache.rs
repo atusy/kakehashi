@@ -397,7 +397,7 @@ impl CacheCoordinator {
                 region_keys.push((
                     info.content_node.start_byte(),
                     info.content_node.end_byte(),
-                    info.content_node.kind(),
+                    crate::language::loader::static_node_kind(&info.content_node),
                     info.pattern_index,
                     info.language.as_str(),
                 ));

@@ -108,10 +108,34 @@ fn e2e_format_invalid_explicit_config_exits_error() {
     );
 }
 
-/// The mirror image: an explicit config file that is merely absent is an
-/// optional layer, so the run proceeds on defaults.
+/// A discovered file the CLI cannot use aborts the run like a named one, so an
+/// unattended run never formats on defaults.
 #[test]
-fn e2e_format_missing_explicit_config_still_runs() {
+fn e2e_format_invalid_discovered_config_exits_error() {
+    let ws = tempfile::tempdir().expect("create workspace tempdir");
+    let xdg = tempfile::tempdir().expect("create XDG_CONFIG_HOME");
+    std::fs::write(ws.path().join("doc.md"), MARKDOWN).expect("write document");
+    std::fs::write(ws.path().join("kakehashi.toml"), "autoInstall = \n")
+        .expect("write malformed config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args(["format", "--check", "doc.md"])
+        .current_dir(ws.path())
+        .env("KAKEHASHI_DATA_DIR", data_dir())
+        .env("XDG_CONFIG_HOME", xdg.path())
+        .output()
+        .expect("spawn kakehashi format");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
+    assert!(output.stdout.is_empty());
+    assert!(stderr.contains("Failed to parse"), "{stderr}");
+    assert_eq!(read(ws.path(), "doc.md"), MARKDOWN);
+}
+
+/// An explicitly selected missing file must fail before producing output.
+#[test]
+fn e2e_format_missing_explicit_config_fails() {
     let ws = tempfile::tempdir().expect("create workspace tempdir");
     std::fs::write(ws.path().join("doc.md"), MARKDOWN).expect("write document");
 
@@ -119,10 +143,12 @@ fn e2e_format_missing_explicit_config_still_runs() {
 
     assert_eq!(
         output.status.code(),
-        Some(0),
-        "a missing explicit config must be skipped, not fatal; stderr: {}",
+        Some(2),
+        "a missing explicit config must fail; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("kakehashi.toml"));
 }
 
 #[test]

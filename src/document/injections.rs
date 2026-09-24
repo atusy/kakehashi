@@ -146,3 +146,11 @@ pub(crate) struct SnapshotLayerTree {
     /// the layer's query yield nothing for the clipped range).
     pub span: std::ops::Range<usize>,
 }
+
+/// The parsed injection layers and whether discovery reached every branch.
+/// Unavailable branches preserve only scopes their geometry could contain.
+pub(crate) struct SnapshotLayerTrees {
+    pub layers: Vec<SnapshotLayerTree>,
+    pub complete: bool,
+    pub unresolved: Vec<crate::language::node_tracker::UnresolvedTreeScope>,
+}

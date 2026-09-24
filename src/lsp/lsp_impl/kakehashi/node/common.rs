@@ -23,9 +23,9 @@ use crate::lsp::lsp_impl::kakehashi::node::injection_stack::{
 use crate::lsp::lsp_impl::{Kakehashi, uri_to_url};
 
 /// A tracked node's `(start_byte, end_byte, kind)` triple, as produced by a
-/// navigation closure and consumed by the re-minting helpers below. `kind` is
-/// `&'static str` because tree-sitter interns node kinds in the grammar's
-/// static data, so it outlives the borrowed tree.
+/// navigation closure and consumed by the re-minting helpers below. `kind`
+/// comes from [`static_node_kind`](crate::language::loader::static_node_kind),
+/// so it outlives the borrowed tree.
 type NodeTriple = (usize, usize, &'static str);
 
 /// Request parameters for the id-only accessors (`kind`, `byteRange`,
@@ -196,8 +196,10 @@ impl Kakehashi {
 
         // Tracked `(start, end, kind, layer)`. `layer` pins resolution to the
         // language tree that minted the node so navigation stays in-layer.
-        let (start, end, kind, layer, tracked_incarnation) =
-            self.bridge.node_tracker().lookup_node(&uri, &ulid)?;
+        let crate::language::node_tracker::ScopedNode {
+            position: (start, end, kind, layer, tracked_incarnation),
+            scope,
+        } = self.bridge.node_tracker().lookup_node_scope(&uri, &ulid)?;
 
         // Resolve a CURRENT snapshot (parse-snapshot ADR §3): the tracked
         // `(start, end)` lives at the current `content_version` (the tracker
@@ -238,6 +240,7 @@ impl Kakehashi {
                     end,
                     kind,
                     layer,
+                    scope.as_deref(),
                     |node, ranges| f(node, &host_text, ranges),
                 )
             })
@@ -363,18 +366,17 @@ impl Kakehashi {
         };
 
         let tracker = self.bridge.node_tracker();
-        let Some((start, end, kind, layer, tracked_incarnation)) = tracker.lookup_node(&uri, &ulid)
+        let Some((first, second)) = tracker.lookup_node_scope_pair(&uri, &ulid, &descendant_ulid)
         else {
             return Value::Null;
         };
-        let Some((desc_start, desc_end, desc_kind, desc_layer, desc_incarnation)) =
-            tracker.lookup_node(&uri, &descendant_ulid)
-        else {
-            return Value::Null;
-        };
-        // Two-id same-layer contract: ids minted in different layers never
-        // share a tree, so the relation is undefined — null, not an error.
-        if layer != desc_layer || tracked_incarnation != desc_incarnation {
+        let (start, end, kind, layer, tracked_incarnation) = first.position;
+        let (desc_start, desc_end, desc_kind, desc_layer, desc_incarnation) = second.position;
+        // Require the same current scope. An edit can merge two scopes while
+        // their old tokens remain valid, so equal scopes also admit the pair.
+        if tracked_incarnation != desc_incarnation
+            || (layer != desc_layer && (first.scope.is_none() || first.scope != second.scope))
+        {
             return Value::Null;
         }
 
@@ -413,14 +415,11 @@ impl Kakehashi {
             (start, end, kind),
             (desc_start, desc_end, desc_kind),
             layer,
+            first.scope.as_deref(),
             f,
         ) else {
-            // Unlike the single-id drift warning, pair-resolution failure is
-            // an expected outcome, not just drift: ids minted at the same
-            // depth in *different* regions (two separate code blocks, or the
-            // #350 overlap caveat) legitimately fail to share a tree and
-            // collapse to the contract's null. debug, not warn — a normal
-            // cross-region query must not look like document drift in logs.
+            // A scope or either node can disappear after an edit. Report the
+            // contract's null; an unavailable pair is not a server failure.
             log::debug!(
                 target: "kakehashi::node",
                 "pair did not resolve in one minting-layer tree (layer {}) for uri={} self=[{},{}) {} descendant=[{},{}) {}",

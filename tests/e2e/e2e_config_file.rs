@@ -190,11 +190,50 @@ fn test_config_file_entry_loads_base_config_files() {
     );
 }
 
-/// An absent explicit config file is an optional layer, not a startup failure:
-/// layered invocations rely on the overlay being allowed to not exist, and a
-/// relative path resolves against the editor's working directory.
+/// Send `initialize` and collect the notifications the server emits while
+/// answering it, which is where startup configuration failures are reported.
+fn initialize_watching(client: &mut LspClient, root_uri: Value) -> (Value, Vec<(String, Value)>) {
+    let id = client.send_request_async(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": root_uri,
+            "capabilities": {}
+        }),
+    );
+    client.receive_response_for_id_watching_notifications(
+        id,
+        &["window/showMessage", "window/logMessage"],
+    )
+}
+
+/// Messages of `window/showMessage` ERROR popups among `watched`. A startup
+/// configuration failure must reach the user this way: a `logMessage` sits in a
+/// log nobody opens, which is how a broken file used to go unnoticed (#731).
+fn error_popups(watched: &[(String, Value)]) -> Vec<String> {
+    watched
+        .iter()
+        .filter(|(method, params)| method == "window/showMessage" && params["type"] == json!(1))
+        .filter_map(|(_, params)| params["message"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Assert that exactly one error popup reports the failure, and that it names
+/// both `path` and `reason`. One, because a mistake reported twice reads as two.
+fn assert_single_error_popup(watched: &[(String, Value)], path: &std::path::Path, reason: &str) {
+    let popups = error_popups(watched);
+    assert_eq!(popups.len(), 1, "expected one error popup: {popups:?}");
+    assert!(
+        popups[0].contains(&path.display().to_string()) && popups[0].contains(reason),
+        "the popup must name {} and {reason:?}: {popups:?}",
+        path.display()
+    );
+}
+
+/// The LSP server keeps serving when a listed file is missing: the other
+/// entries still apply, and the missing one is reported where the user sees it.
 #[test]
-fn test_config_file_nonexistent_is_optional() {
+fn test_config_file_nonexistent_is_skipped_with_an_error() {
     let dir = TempDir::new().unwrap();
     let present = dir.path().join("present.toml");
     let missing = dir.path().join("missing.toml");
@@ -207,57 +246,16 @@ fn test_config_file_nonexistent_is_optional() {
         .env_remove("KAKEHASHI_DATA_DIR")
         .build();
 
-    let id = client.send_request_async(
-        "initialize",
-        json!({
-            "processId": std::process::id(),
-            "rootUri": null,
-            "capabilities": {}
-        }),
-    );
-    let (response, watched) = client.receive_response_for_id_watching_notifications(
-        id,
-        &["window/showMessage", "window/logMessage"],
-    );
+    let (response, watched) = initialize_watching(&mut client, Value::Null);
 
-    assert!(
-        response.get("result").is_some(),
-        "a missing explicit layer must be skipped, not fatal: {response}"
-    );
-    // The skip has to be visible, and visible as a warning rather than the
-    // error popup a genuinely unusable file gets. MessageType: 1 = Error,
-    // 2 = Warning.
-    let reports: Vec<_> = watched
-        .iter()
-        .filter(|(_, params)| {
-            params["message"]
-                .as_str()
-                .is_some_and(|message| message.contains(missing.to_str().unwrap()))
-        })
-        .collect();
-    assert!(
-        !reports.is_empty(),
-        "the skipped layer must be reported: {watched:?}"
-    );
-    assert!(
-        reports
-            .iter()
-            .all(|(method, params)| method == "window/logMessage" && params["type"] == json!(2)),
-        "a skipped optional layer is a warning, not an error popup: {reports:?}"
-    );
-    // The surviving layer must still apply, so the skip is a skip and not a
-    // wholesale fallback to programmed defaults.
+    assert!(response.get("result").is_some(), "{response}");
+    assert_single_error_popup(&watched, &missing, "not found");
     client.send_notification("initialized", json!({}));
-    let settings = query_effective_settings(&mut client);
-    assert_eq!(
-        settings["autoInstall"],
-        json!(false),
-        "the layer that does exist must still apply: {settings}"
-    );
+    assert_eq!(query_effective_settings(&mut client)["autoInstall"], false);
 }
 
 #[test]
-fn test_config_file_invalid_toml_fails_initialization() {
+fn test_config_file_invalid_toml_is_skipped_with_an_error() {
     let dir = TempDir::new().unwrap();
     let config_path = dir.path().join("invalid.toml");
     std::fs::write(&config_path, "searchPaths = [\"/unterminated\"\n").unwrap();
@@ -267,35 +265,19 @@ fn test_config_file_invalid_toml_fails_initialization() {
         .env_remove("KAKEHASHI_DATA_DIR")
         .build();
 
-    let response = client.send_request(
-        "initialize",
-        json!({
-            "processId": std::process::id(),
-            "rootUri": null,
-            "capabilities": {}
-        }),
-    );
+    let (response, watched) = initialize_watching(&mut client, Value::Null);
 
-    let error = response
-        .get("error")
-        .expect("invalid explicit config file should reject initialize");
-    assert_eq!(error["code"], json!(-32803));
-    assert!(
-        error["message"].as_str().is_some_and(|message| {
-            message.contains("Failed to parse")
-                && message.contains(&config_path.display().to_string())
-        }),
-        "initialize error should identify the parse failure: {error}"
-    );
+    assert!(response.get("result").is_some(), "{response}");
+    assert_single_error_popup(&watched, &config_path, "Failed to parse");
 }
 
 #[test]
-fn test_config_file_invalid_path_expansion_fails_initialization() {
+fn test_config_file_invalid_path_expansion_is_skipped_with_an_error() {
     let dir = TempDir::new().unwrap();
     let config_path = dir.path().join("invalid-path.toml");
     std::fs::write(
         &config_path,
-        "searchPaths = [\"$KAKEHASHI_TEST_UNDEFINED/path\"]\n",
+        "autoInstall = false\nsearchPaths = [\"$KAKEHASHI_TEST_UNDEFINED/path\"]\n",
     )
     .unwrap();
     let mut client = LspClient::builder()
@@ -305,30 +287,26 @@ fn test_config_file_invalid_path_expansion_fails_initialization() {
         .env_remove("KAKEHASHI_DATA_DIR")
         .build();
 
-    let response = client.send_request(
-        "initialize",
-        json!({
-            "processId": std::process::id(),
-            "rootUri": null,
-            "capabilities": {}
-        }),
-    );
+    let (response, watched) = initialize_watching(&mut client, Value::Null);
 
-    let error = response
-        .get("error")
-        .expect("invalid explicit path expansion should reject initialize");
-    assert_eq!(error["code"], json!(-32803));
+    assert!(response.get("result").is_some(), "{response}");
+    assert_single_error_popup(&watched, &config_path, "Path expansion failed");
+    // The whole file is skipped, not just its unusable key: a half-applied file
+    // is a configuration nobody wrote.
+    client.send_notification("initialized", json!({}));
+    let settings = query_effective_settings(&mut client);
+    assert_eq!(settings["autoInstall"], true, "{settings}");
     assert!(
-        error["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("Path expansion failed")
-                && message.contains(config_path.to_str().unwrap())),
-        "initialize error should identify the expansion failure and file: {error}"
+        !settings.to_string().contains("KAKEHASHI_TEST_UNDEFINED"),
+        "no unexpanded value may leak into the effective configuration: {settings}"
     );
 }
 
+/// Skipping an unusable entry keeps the entries after it. Without this, an
+/// implementation that discards every file on the first failure would pass the
+/// tests above.
 #[test]
-fn test_config_file_masked_invalid_path_expansion_fails_initialization() {
+fn test_config_file_later_layers_survive_an_unusable_one() {
     let dir = TempDir::new().unwrap();
     let invalid = dir.path().join("invalid.toml");
     let valid = dir.path().join("valid.toml");
@@ -347,31 +325,17 @@ fn test_config_file_masked_invalid_path_expansion_fails_initialization() {
         .env_remove("KAKEHASHI_DATA_DIR")
         .build();
 
-    let response = client.send_request(
-        "initialize",
-        json!({
-            "processId": std::process::id(),
-            "rootUri": null,
-            "capabilities": {}
-        }),
-    );
+    let (response, watched) = initialize_watching(&mut client, Value::Null);
 
-    let error = response
-        .get("error")
-        .expect("a later explicit layer must not mask an earlier layer's invalid path");
-    assert_eq!(error["code"], json!(-32803));
-    assert!(
-        error["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("Path expansion failed")
-                && message.contains(invalid.to_str().unwrap())),
-        "the masked failure, not some other error, must be reported — and it must \
-         name the file the bad path came from: {error}"
-    );
+    assert!(response.get("result").is_some(), "{response}");
+    assert_single_error_popup(&watched, &invalid, "Path expansion failed");
+    client.send_notification("initialized", json!({}));
+    let settings = query_effective_settings(&mut client);
+    assert_eq!(settings["searchPaths"], json!(["/valid"]), "{settings}");
 }
 
 /// Every explicit layer is validated, not just the first: a failure in the
-/// second file must be reported and must name that file.
+/// second file is reported against that file, and the first still applies.
 #[test]
 fn test_config_file_validates_every_explicit_layer() {
     let dir = TempDir::new().unwrap();
@@ -387,24 +351,12 @@ fn test_config_file_validates_every_explicit_layer() {
         .env_remove("KAKEHASHI_DATA_DIR")
         .build();
 
-    let response = client.send_request(
-        "initialize",
-        json!({
-            "processId": std::process::id(),
-            "rootUri": null,
-            "capabilities": {}
-        }),
-    );
+    let (response, watched) = initialize_watching(&mut client, Value::Null);
 
-    let error = response
-        .get("error")
-        .expect("a failure in a later explicit layer must reject initialize");
-    assert!(
-        error["message"].as_str().is_some_and(|message| {
-            message.contains("Failed to parse") && message.contains(second.to_str().unwrap())
-        }),
-        "the error must name the second file, not stop at the first: {error}"
-    );
+    assert!(response.get("result").is_some(), "{response}");
+    assert_single_error_popup(&watched, &second, "Failed to parse");
+    client.send_notification("initialized", json!({}));
+    assert_eq!(query_effective_settings(&mut client)["autoInstall"], false);
 }
 
 /// A cross-field invariant whose operands are split across two explicit layers
@@ -455,10 +407,10 @@ fn test_config_file_split_cross_field_invariant_is_not_fatal() {
 }
 
 /// The mirror image: layers that are each valid alone but invalid once merged
-/// must still abort, rather than silently discarding the explicit configuration
-/// and starting on programmed defaults.
+/// cannot be repaired by skipping one of them, so the file configuration is
+/// discarded — reported once, where the user sees it.
 #[test]
-fn test_config_file_merged_only_invalid_fails_initialization() {
+fn test_config_file_merged_only_invalid_is_reported_once() {
     let dir = TempDir::new().unwrap();
     let max_wait = dir.path().join("max-wait.toml");
     let debounce = dir.path().join("debounce.toml");
@@ -482,113 +434,74 @@ fn test_config_file_merged_only_invalid_fails_initialization() {
         .env_remove("KAKEHASHI_DATA_DIR")
         .build();
 
-    let response = client.send_request(
-        "initialize",
-        json!({
-            "processId": std::process::id(),
-            "rootUri": null,
-            "capabilities": {}
-        }),
-    );
+    let (response, watched) = initialize_watching(&mut client, Value::Null);
 
-    let error = response
-        .get("error")
-        .expect("an explicit configuration that is invalid only once merged must abort");
-    assert_eq!(error["code"], json!(-32803));
-    assert!(
-        error["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("Invalid configuration")),
-        "initialize error should describe the invalid merged configuration: {error}"
-    );
+    assert!(response.get("result").is_some(), "{response}");
+    let popups = error_popups(&watched);
+    assert_eq!(popups.len(), 1, "expected one error popup: {popups:?}");
+    assert!(popups[0].contains("Invalid configuration"), "{popups:?}");
 }
 
-/// A rejected `initialize` does not poison the session: correcting the file and
-/// sending `initialize` again is served from the corrected file. `tower-lsp`
-/// resets to `Uninitialized` after an error response, so this is a path clients
-/// can genuinely take, and it is why the configuration verdict is reached
-/// before `initialize` stores anything from the request.
-///
-/// What this cannot observe is the state that a stale latch would corrupt —
-/// downstream servers keeping the failed attempt's capabilities and workspace
-/// folders — which needs a mock downstream server to see.
-#[test]
-fn test_config_file_retry_after_repair_uses_the_corrected_file() {
+/// A broken discovered file does not cost the user their server, nor the
+/// layer that is fine: an invalid user config leaves the project config in
+/// force, and an invalid project config leaves the user config in force.
+#[rstest::rstest]
+#[case::user(true)]
+#[case::project(false)]
+fn test_implicit_config_parse_failure_skips_only_that_file(#[case] broken_user_config: bool) {
     let dir = TempDir::new().unwrap();
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(&config_path, "searchPaths = [\"/unterminated\"\n").unwrap();
+    let xdg = TempDir::new().unwrap();
+    let user_parent = xdg.path().join("kakehashi");
+    std::fs::create_dir(&user_parent).unwrap();
+    let user = user_parent.join("kakehashi.toml");
+    let project = dir.path().join("kakehashi.toml");
+    let (broken, valid) = if broken_user_config {
+        (&user, &project)
+    } else {
+        (&project, &user)
+    };
+    std::fs::write(broken, "autoInstall = \n").unwrap();
+    std::fs::write(valid, "searchPaths = [\"/valid\"]\n").unwrap();
     let mut client = LspClient::builder()
-        .arg("--config-file")
-        .arg(config_path.to_str().unwrap())
+        .env("XDG_CONFIG_HOME", xdg.path().to_str().unwrap())
         .env_remove("KAKEHASHI_DATA_DIR")
         .build();
 
-    let rejected = client.send_request(
-        "initialize",
-        json!({
-            "processId": std::process::id(),
-            "rootUri": null,
-            "capabilities": {}
-        }),
-    );
-    assert!(
-        rejected.get("error").is_some(),
-        "the malformed file should reject the first attempt: {rejected}"
+    let (response, watched) = initialize_watching(
+        &mut client,
+        json!(url::Url::from_directory_path(dir.path()).unwrap().as_str()),
     );
 
-    std::fs::write(&config_path, "autoInstall = false\n").unwrap();
-    let accepted = client.send_request(
-        "initialize",
-        json!({
-            "processId": std::process::id(),
-            "rootUri": null,
-            "capabilities": {}
-        }),
-    );
-    assert!(
-        accepted.get("result").is_some(),
-        "a retry after repairing the file must be accepted: {accepted}"
-    );
-
+    assert!(response.get("result").is_some(), "{response}");
+    assert_single_error_popup(&watched, broken, "Failed to parse");
     client.send_notification("initialized", json!({}));
     let settings = query_effective_settings(&mut client);
-    assert_eq!(
-        settings["autoInstall"],
-        json!(false),
-        "the retry must read the corrected file, not the rejected one: {settings}"
-    );
+    assert_eq!(settings["searchPaths"], json!(["/valid"]), "{settings}");
 }
 
-/// Implicitly discovered configuration keeps its optional, warning-only policy:
-/// only paths the user named explicitly are strict. Pinning this stops a future
-/// unification of the two loaders from turning a typo in a project
-/// `kakehashi.toml` into a server that refuses to start.
 #[test]
-fn test_implicit_project_config_parse_failure_is_not_fatal() {
-    let dir = TempDir::new().unwrap();
-    std::fs::write(dir.path().join("kakehashi.toml"), "autoInstall = \n").unwrap();
+fn test_absent_discovered_files_keep_zero_config_startup() {
+    let project = TempDir::new().unwrap();
+    let xdg = TempDir::new().unwrap();
     let mut client = LspClient::builder()
+        .env("XDG_CONFIG_HOME", xdg.path().to_str().unwrap())
         .env_remove("KAKEHASHI_DATA_DIR")
         .build();
-
-    let root_uri = format!("file://{}", dir.path().display());
     let response = client.send_request(
         "initialize",
         json!({
             "processId": std::process::id(),
-            "rootUri": root_uri,
+            "rootUri": url::Url::from_directory_path(project.path()).unwrap().as_str(),
             "capabilities": {}
         }),
     );
-
-    assert!(
-        response.get("result").is_some(),
-        "a malformed implicit project config must not reject initialize: {response}"
-    );
+    assert!(response.get("result").is_some(), "{response}");
 }
 
+/// A failing base costs only itself in the editor: the entry that names it
+/// still applies, and the failure is shown as an error naming the base.
 #[test]
-fn test_implicit_base_path_failure_is_shown_as_a_warning() {
+fn test_implicit_base_path_failure_skips_only_the_base() {
     let dir = TempDir::new().unwrap();
     let base = dir.path().join("base.toml");
     std::fs::write(
@@ -606,30 +519,43 @@ fn test_implicit_base_path_failure_is_shown_as_a_warning() {
         .env_remove("MISSING_KAKEHASHI_TEST_VAR")
         .build();
 
-    let initialize_id = client.send_request_async(
-        "initialize",
-        json!({
-            "processId": std::process::id(),
-            "rootUri": format!("file://{}", dir.path().display()),
-            "capabilities": {}
-        }),
-    );
-    let (response, watched) = client.receive_response_for_id_watching_notifications(
-        initialize_id,
-        &["window/showMessage", "window/logMessage"],
+    let (response, watched) = initialize_watching(
+        &mut client,
+        json!(url::Url::from_directory_path(dir.path()).unwrap().as_str()),
     );
 
-    assert!(response.get("result").is_some(), "initialize: {response}");
-    let report = watched
-        .iter()
-        .find(|(_, params)| {
-            params["message"]
+    assert!(response.get("result").is_some(), "{response}");
+    assert_single_error_popup(&watched, &base, "MISSING_KAKEHASHI_TEST_VAR");
+    client.send_notification("initialized", json!({}));
+    assert_eq!(query_effective_settings(&mut client)["autoInstall"], false);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_implicit_broken_symlink_is_reported_as_an_error() {
+    let project = TempDir::new().unwrap();
+    let xdg = TempDir::new().unwrap();
+    std::os::unix::fs::symlink(xdg.path().join("absent"), xdg.path().join("kakehashi")).unwrap();
+    let mut client = LspClient::builder()
+        .env("XDG_CONFIG_HOME", xdg.path().to_str().unwrap())
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let (response, watched) = initialize_watching(
+        &mut client,
+        json!(
+            url::Url::from_directory_path(project.path())
+                .unwrap()
                 .as_str()
-                .is_some_and(|message| message.contains("MISSING_KAKEHASHI_TEST_VAR"))
-        })
-        .expect("the skipped base must be reported");
-    assert_eq!(report.0, "window/showMessage", "report: {report:?}");
-    assert_eq!(report.1["type"], json!(2), "report: {report:?}");
+        ),
+    );
+
+    assert!(response.get("result").is_some(), "{response}");
+    assert_single_error_popup(
+        &watched,
+        &xdg.path().join("kakehashi/kakehashi.toml"),
+        "broken symbolic link",
+    );
 }
 
 #[test]
@@ -649,7 +575,7 @@ fn test_implicit_missing_base_is_shown_as_a_warning() {
         "initialize",
         json!({
             "processId": std::process::id(),
-            "rootUri": format!("file://{}", dir.path().display()),
+            "rootUri": url::Url::from_directory_path(dir.path()).unwrap().as_str(),
             "capabilities": {}
         }),
     );
@@ -677,52 +603,6 @@ fn test_implicit_missing_base_is_shown_as_a_warning() {
             dir.path().join("kakehashi.toml").display()
         )),
         "report: {report:?}"
-    );
-}
-
-/// The initialize error is the *only* client-facing report of a fatal config
-/// failure. Without this the early return in `initialize_impl` could drift back
-/// below `log_settings_events` and the user would get a `window/showMessage`
-/// popup on top of a failed handshake, with nothing failing in CI.
-#[test]
-fn test_config_file_fatal_error_is_not_also_shown_as_a_message() {
-    let dir = TempDir::new().unwrap();
-    let config_path = dir.path().join("invalid.toml");
-    std::fs::write(&config_path, "searchPaths = [\"/unterminated\"\n").unwrap();
-    let mut client = LspClient::builder()
-        .arg("--config-file")
-        .arg(config_path.to_str().unwrap())
-        .env_remove("KAKEHASHI_DATA_DIR")
-        .build();
-
-    let id = client.send_request_async(
-        "initialize",
-        json!({
-            "processId": std::process::id(),
-            "rootUri": null,
-            "capabilities": {}
-        }),
-    );
-    let (response, watched) = client.receive_response_for_id_watching_notifications(
-        id,
-        &["window/showMessage", "window/logMessage"],
-    );
-
-    assert!(
-        response.get("error").is_some(),
-        "invalid explicit config file should reject initialize: {response}"
-    );
-    let duplicated: Vec<_> = watched
-        .iter()
-        .filter(|(_, params)| {
-            params["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("Failed to parse"))
-        })
-        .collect();
-    assert!(
-        duplicated.is_empty(),
-        "the initialize error must be the sole report of the failure: {duplicated:?}"
     );
 }
 

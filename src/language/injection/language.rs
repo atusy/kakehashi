@@ -47,7 +47,7 @@ fn extract_static_language(query: &Query, match_: &QueryMatch) -> Option<String>
 /// Extracts language from @injection.language capture
 fn extract_dynamic_language(query: &Query, match_: &QueryMatch, text: &str) -> Option<String> {
     let cardinalities = query_directives::CaptureCardinalities::default();
-    for capture in match_.captures {
+    for capture in match_.captures() {
         if let Some(capture_name) = query.capture_names().get(capture.index as usize)
             && *capture_name == "injection.language"
         {
@@ -99,7 +99,7 @@ fn extract_language_from_info_string(
             // The predicate takes a capture reference as argument
             if let Some(tree_sitter::QueryPredicateArg::Capture(capture_id)) = pred.args.first() {
                 // Find the capture in the match
-                for capture in match_.captures {
+                for capture in match_.captures() {
                     if capture.index == *capture_id {
                         // Extract the text from the captured node as the language
                         let lang_text = clamped_slice(text, capture.node.byte_range());

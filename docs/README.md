@@ -37,7 +37,7 @@ Current bridge-backed requests include:
 - On Type Formatting (config-driven; see `onTypeFormattingTriggers`)
 
 **Limitations:**
-- **No cross-region results within the host document**: on the goto/references/rename transforms, a result addressed to a *different* region's virtual URI is filtered out (that URI would be meaningless to the editor; document-link targets are the exception — they pass through untouched). A code action touching another region keeps a visible-but-disabled entry for `disabledSupport` clients (payload stripped); without that capability it is dropped from the initial response, or returned unresolved on `codeAction/resolve` (a response cannot be dropped). Results in real files — an external definition, a cross-file rename edit — pass through unchanged; for navigation/references/rename, host-URI results are not containment-checked (injection-layer code actions, and applyEdit requests that also touch a virtual document, constrain host-URI edits to the region).
+- **No cross-region results within the host document**: on the goto/references/rename transforms, a result addressed to a *different* region's virtual URI is filtered out (that URI would be meaningless to the editor; document-link targets are the exception — they pass through untouched). A code action touching another region keeps a visible-but-disabled entry for `disabledSupport` clients (payload stripped); without that capability it is dropped from the initial response, or reports `RequestFailed` on `codeAction/resolve`. Results in real files — an external definition, a cross-file rename edit — pass through unchanged; for navigation/references/rename, host-URI results are not containment-checked (injection-layer code actions, and applyEdit requests that also touch a virtual document, constrain host-URI edits to the region).
 
 See [Bridge Configuration](#bridge-configuration) for setup instructions.
 
@@ -269,7 +269,15 @@ Two related fields are deliberately **not** covered, because neither is expanded
 
 `kakehashi/internal/effectiveConfiguration` reports settings after anchoring but before variable expansion, so relative values appear there already resolved while `$VAR` and `~` appear as written.
 
-**Behavior on undefined variables:** If a referenced environment variable is not defined during ordinary startup loading, the merged configuration is discarded and programmed defaults are used. A runtime `workspace/didChangeConfiguration` update is discarded while the previous settings remain active. Explicit `--config-file` inputs are stricter: an expansion failure in one of them rejects LSP initialization or makes the CLI command exit with status 2, rather than falling back to defaults. `initializationOptions` sent by the client keep the ordinary non-fatal behavior even in a `--config-file` session. The exception is `KAKEHASHI_DATA_DIR`, which automatically falls back to the platform-specific default when unset (see [Default Data Directories](#default-data-directories)).
+**Behavior on undefined variables:** An expansion failure in a startup
+configuration file — discovered user/project or explicit `--config-file` —
+makes `format` and `diagnose` exit with status 2. The LSP server instead shows
+the failure as an error message and starts without that file. A runtime `workspace/didChangeConfiguration` update is
+discarded while the previous settings remain active. Client
+`initializationOptions` remain nonfatal: if their merged result fails expansion,
+programmed defaults are used. The exception is `KAKEHASHI_DATA_DIR`, which
+falls back to the platform-specific default when unset (see
+[Default Data Directories](#default-data-directories)).
 
 ### Option Reference
 
@@ -881,6 +889,12 @@ queries = [
 
 Configuration files are merged with LSP initialization options (which take highest precedence).
 
+The project file is loaded automatically. Like user configuration, it can
+select programs to launch through `languageServers.<server>.cmd` and native
+parser libraries to load through `languages.<language>.parser` or
+`searchPaths`. Settings imported through `baseConfigFiles` have the same
+capabilities; kakehashi does not prompt before using these settings.
+
 A relative path such as `./queries/highlights.scm` above resolves against the directory of the file that contains it — see [Environment Variable Expansion](#environment-variable-expansion) for the full rule.
 
 You can override the default locations with `--config-file`:
@@ -929,40 +943,31 @@ against the entry file's directory. Each base file's own relative setting
 paths resolve against that base file's directory.
 
 Composition is intentionally one level deep: a base file cannot contain
-`baseConfigFiles`. For an explicit `--config-file` entry that mistake rejects
-startup; for an implicitly discovered user or project entry it is warned about
-and that base file is skipped, following the owning entry's existing strict or
-tolerant loading policy. An entry can name at most 64 base files; an explicit
-entry above the limit rejects startup, while an implicit entry warns and loads
-only the first 64. A missing base file is skipped without aborting startup, but
-the skip is surfaced as a visible warning. Files are re-read only when their
-entry normally is:
-an explicit stack is retained for the session, while implicit user/project
-entries and their bases are reloaded after a workspace-root change.
+`baseConfigFiles`, and an entry can name at most 64 base files. At startup a
+nested base or an entry over the limit is an unusable configuration, whether
+discovered or explicitly selected; see
+[Unusable startup configuration](#unusable-startup-configuration) for what
+that means for the CLI and for the LSP server. A missing base file is skipped
+with a visible warning. Explicit stacks
+are retained for the session; implicit user/project entries and their bases are
+reloaded after a workspace-root change. These later reloads retain tolerant
+loading: invalid bases are warned about and skipped, and overflow loads only
+the first 64.
 
 When `--config-file` is specified:
 - Default user config (`~/.config/kakehashi/kakehashi.toml`) is **skipped**
 - Default project config (`./kakehashi.toml`) is **skipped**
-- A file that is **present but unusable** aborts startup: unreadable, malformed
+- A file that is **absent** or **present but unusable** — unreadable, malformed
   TOML, larger than 8 MiB, carrying a path that cannot be expanded, or sitting
-  somewhere whose own directory cannot be resolved. LSP initialization returns a
-  `RequestFailed` error naming the first such file; `format` and `diagnose`
-  print it to stderr and exit with status 2. Nothing is re-read while the
-  session runs, so correcting the file means restarting the server
-  (`:LspRestart`, or reloading the window). A client that responds to the
-  rejected handshake by sending `initialize` again is also served correctly —
-  the retry re-reads the files and is not contaminated by the failed attempt —
-  but most editors do not, so treat restart as the recovery path.
+  somewhere whose own directory cannot be resolved — is handled as described in
+  [Unusable startup configuration](#unusable-startup-configuration). Nothing is
+  re-read while the session runs, so correcting the file means restarting the
+  server (`:LspRestart`, or reloading the window).
 - A path that expands badly is judged **per file**, so a later layer cannot mask
   an earlier layer's undefined variable — the merged result would never mention
   the mistake, because a later layer replaces path fields wholesale.
-- A file that is **absent** is skipped rather than treated as an error, so
-  `--config-file base.toml --config-file overrides.toml` works in a repository
-  that has no overlay. Note that a relative path resolves against the process
-  working directory, which for an editor-spawned server is the editor's rather
-  than the workspace root. The skip is reported to the LSP client as a warning;
-  `format` and `diagnose` report only the hard errors above, so a mistyped path
-  is silent there.
+- Relative paths resolve against the process working directory, which for an
+  editor-spawned server is the editor's rather than the workspace root.
 - A path whose metadata cannot be read at all — an ancestor directory denying
   traversal, say — counts as unusable, not absent. So does a symlink whose
   target is gone: the path you named exists, it just does not lead to a config.
@@ -978,8 +983,10 @@ When `--config-file` is specified:
   still and rejects the whole pushed update — that one is a live edit, not a
   file you may share across versions.)
 - Cross-field invariants (e.g. `debounceMs` ≤ `maxWaitMs`) are judged on the
-  merged explicit configuration, so splitting the two halves across two files is
-  fine — but a combination that is invalid only once merged still aborts.
+  merged configuration, so splitting the two halves across two files is fine —
+  but a combination that is invalid only once merged still fails: the CLI exits
+  with status 2, and the LSP server shows an error and discards the merged file
+  configuration in favour of programmed defaults.
 - `initializationOptions` from the LSP client still apply on top, and keep their
   ordinary non-fatal behavior — but "non-fatal" covers two different outcomes.
   An override that fails to *parse* is warned about and dropped, leaving the
@@ -988,11 +995,27 @@ When `--config-file` is specified:
   the *whole* merge in favour of programmed defaults, so the config files do not
   survive it either. Only the abort is avoided, not the loss.
 
-Implicitly discovered configuration is deliberately laxer. A
-`~/.config/kakehashi/kakehashi.toml` or `./kakehashi.toml` that fails to parse
-is reported as a warning and skipped, so a stray file cannot stop the server
-from starting. Only directly selected `--config-file` entries and the bases
-they name use the strict policy.
+Implicitly discovered user and project files may be absent. If present, they
+are validated like explicitly selected files.
+
+#### Unusable startup configuration
+
+What happens to a configuration file that cannot be used depends on who is
+running kakehashi, not on how the file was selected:
+
+- **`format` and `diagnose` stop.** A missing `--config-file` entry, a present
+  but unusable file (explicit or discovered, including a base file it names),
+  or a broken symbolic link on the way to a discovered file prints the path and
+  reason to stderr and exits with status 2 before producing any output. These
+  commands run unattended in CI, where a clean result computed on programmed
+  defaults would be believed.
+- **The LSP server keeps running.** It shows each such failure as an error
+  message (`window/showMessage`) naming the path and starts with what did load.
+  An unusable entry file is skipped; an unusable base file is skipped on its
+  own, so the entry that names it still applies (an entry over the 64-base
+  limit loads its first 64). An editor
+  is better served by a server running on part of its configuration than by
+  none at all; fix the file and restart the server.
 
 ## CLI Commands
 

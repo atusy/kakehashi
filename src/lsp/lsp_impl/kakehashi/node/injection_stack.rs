@@ -8,12 +8,11 @@
 //! Trees within each layer are parsed against the **full host text** with
 //! tree-sitter's `set_included_ranges`, which means every node's
 //! `start_byte` / `end_byte` is already in original-document coordinates.
-//! That property is load-bearing: the entry-point handler issues ULIDs via
-//! `NodeTracker::get_or_create_in_layer(uri, start_byte, end_byte, kind, layer)`,
-//! and the tracker keys must stay in the host's byte space so subsequent
-//! `parent` / `children` / `text` calls and `didChange` adjustments line
-//! up across layers. The `layer` index distinguishes a host node from an
-//! injected node sharing the same span and kind (lazy-node-identity-tracking).
+//! NodeTracker coordinates must stay in the host's byte space so navigation
+//! and didChange adjustments agree across layers. The stack index selects a
+//! layer for a cursor request; mint_tree_batch records that layer's full tree
+//! scope and assigns its identity token. Overlapping siblings at one depth
+//! therefore remain distinguishable during later node resolution.
 
 use crate::analysis::offset_calculator::{ByteRange, calculate_effective_range};
 use crate::language::LanguageCoordinator;
@@ -33,6 +32,7 @@ use crate::lsp::lsp_impl::kakehashi::node::lookup::find_node_at;
 pub(super) struct InjectionLayer {
     /// Tree-sitter syntax tree for this layer.
     pub(super) tree: tree_sitter::Tree,
+    pub(super) language: String,
     /// Absolute ranges in host coordinates that this layer's tree was parsed
     /// against. The host layer spans the whole document; each deeper layer's
     /// ranges are the intersection of its own effective ranges with its
@@ -80,6 +80,7 @@ pub(super) fn injection_stack_at(
     let mut stack: Vec<InjectionLayer> = Vec::new();
     stack.push(InjectionLayer {
         tree: host_tree.clone(),
+        language: host_language.to_owned(),
         ranges: vec![whole_document_range(host_text)],
     });
 
@@ -146,6 +147,7 @@ pub(super) fn injection_stack_at(
 
         stack.push(InjectionLayer {
             tree: injected_tree,
+            language: resolved_lang.clone(),
             ranges: absolute_ranges,
         });
         current_language = resolved_lang;
@@ -158,26 +160,10 @@ pub(super) fn injection_stack_at(
 /// minted it**, identified by the `layer` discriminator recorded in its
 /// identity key (lazy-node-identity-tracking §"Node Uniqueness Key").
 ///
-/// `layer == 0` resolves against the host tree directly (the common case, no
-/// stack walk). A deeper `layer` rebuilds the injection stack at `start` and
-/// searches `stack[layer]` only. We deliberately do **not** fall back to other
-/// layers: a node carries the layer it was created in, and resolving it in a
-/// different layer would violate node-reference-protocol's per-layer Scope rule.
-/// Within a single parse this is exactly the host-vs-injected collision the
-/// `layer` key prevents — a host and injected node sharing `(start, end, kind)`
-/// would otherwise be indistinguishable here (issue #313).
-///
-/// Across edits the depth index is a weaker guarantee. If an edit makes the
-/// stack shallower than `layer`, `stack.get(layer)` is `None` and we return
-/// `None` — a safe "re-acquire" signal. But `layer` is only a depth, not a tree
-/// identity: an edit that restructures the nesting while keeping
-/// `stack.len() > layer` can leave a *different* tree at that depth. Resolution
-/// then succeeds only if that tree happens to hold a node at the identical
-/// `(start, end, kind)`, and otherwise returns `None`. We do not (and with a
-/// depth index cannot) detect that case, so the "re-acquire on `null`" contract
-/// — not a wrong-tree guarantee — is what protects clients. See the
-/// layer-discriminator options in lazy-node-identity-tracking for the
-/// region-ULID alternative that would close this gap.
+/// `layer == 0` resolves directly against the host tree. Injected IDs carry
+/// a scope with the resolved language, depth, and all included byte ranges.
+/// Resolution searches current candidates for that exact scope, including
+/// overlapping siblings; a missing or changed scope returns `None`.
 ///
 /// `f` is invoked at most once, with the matching `Node`. Returning `None`
 /// from `f` is distinguishable from the "no match" outcome only by
@@ -195,6 +181,7 @@ pub(super) fn with_resolved_node<R>(
     end: usize,
     kind: &'static str,
     layer: usize,
+    scope: Option<&crate::language::node_tracker::NodeTreeScope>,
     mut f: impl FnMut(tree_sitter::Node<'_>) -> R,
 ) -> Option<R> {
     with_resolved_node_ranges(
@@ -206,6 +193,7 @@ pub(super) fn with_resolved_node<R>(
         end,
         kind,
         layer,
+        scope,
         |node, _ranges| f(node),
     )
 }
@@ -231,6 +219,7 @@ pub(super) fn with_resolved_node_ranges<R>(
     end: usize,
     kind: &'static str,
     layer: usize,
+    scope: Option<&crate::language::node_tracker::NodeTreeScope>,
     mut f: impl FnMut(tree_sitter::Node<'_>, &[tree_sitter::Range]) -> R,
 ) -> Option<R> {
     // Reject obviously-invalid ranges up front — same guard `find_node_at`
@@ -259,10 +248,8 @@ pub(super) fn with_resolved_node_ranges<R>(
         return Some(f(node, &ranges));
     }
 
-    // Deeper layer: rebuild the stack at `start` and search the minting layer
-    // only. `stack.get(layer)` is None when the nesting is now shallower.
-    let stack = injection_stack_at(coordinator, host_language, host_text, host_tree, start);
-    let layer_entry = stack.get(layer)?;
+    // An injected node must resolve in its exact current parse scope.
+    let layer_entry = resolve_tree_scope(coordinator, host_language, host_text, host_tree, scope?)?;
     let node = find_node_at(&layer_entry.tree, start, end, kind)?;
     Some(f(node, &layer_entry.ranges))
 }
@@ -272,13 +259,8 @@ pub(super) fn with_resolved_node_ranges<R>(
 ///
 /// Both `(start, end, kind)` triples must name nodes in one tree: the layer's
 /// tree is materialised once and both lookups run against it, so the pair can
-/// never straddle two layers. The stack walk is anchored at the *descendant's*
-/// start byte — the method's contract requires the descendant to lie inside
-/// `node`, so when the pair is genuinely related the smallest-region path at
-/// that byte reaches the layer that minted both. An unrelated pair (descendant
-/// outside `node`, or minted from a different same-depth region — the #350
-/// overlap caveat applies here too) simply fails one of the lookups and
-/// collapses to `None`, the protocol's re-acquire signal.
+/// never straddle two layers. Both lookups use the recorded parse scope;
+/// finding an identical tuple in an overlapping sibling is not sufficient.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn with_resolved_node_pair<R>(
     coordinator: &LanguageCoordinator,
@@ -288,6 +270,7 @@ pub(super) fn with_resolved_node_pair<R>(
     node: (usize, usize, &'static str),
     descendant: (usize, usize, &'static str),
     layer: usize,
+    scope: Option<&crate::language::node_tracker::NodeTreeScope>,
     mut f: impl FnMut(tree_sitter::Node<'_>, tree_sitter::Node<'_>) -> R,
 ) -> Option<R> {
     let (node_start, node_end, node_kind) = node;
@@ -309,11 +292,120 @@ pub(super) fn with_resolved_node_pair<R>(
         return Some(f(resolved_node, resolved_desc));
     }
 
-    let stack = injection_stack_at(coordinator, host_language, host_text, host_tree, desc_start);
-    let layer_entry = stack.get(layer)?;
+    let layer_entry = resolve_tree_scope(coordinator, host_language, host_text, host_tree, scope?)?;
     let resolved_node = find_node_at(&layer_entry.tree, node_start, node_end, node_kind)?;
     let resolved_desc = find_node_at(&layer_entry.tree, desc_start, desc_end, desc_kind)?;
     Some(f(resolved_node, resolved_desc))
+}
+
+/// Follow every candidate at the scope's first included byte, stopping at the
+/// exact parse inputs. Overlapping siblings must not be narrowed to one cursor
+/// path. Unrelated regions are pruned before parsing their trees.
+fn resolve_tree_scope(
+    coordinator: &LanguageCoordinator,
+    host_language: &str,
+    host_text: &str,
+    host_tree: &tree_sitter::Tree,
+    scope: &crate::language::node_tracker::NodeTreeScope,
+) -> Option<InjectionLayer> {
+    if scope.depth == 0 || scope.depth > MAX_INJECTION_DEPTH {
+        return None;
+    }
+    resolve_child_scope(
+        coordinator,
+        host_language,
+        host_text,
+        host_tree,
+        &[whole_document_range(host_text)],
+        1,
+        scope,
+        &mut std::collections::HashSet::new(),
+        &mut parse_with_absolute_ranges,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_child_scope(
+    coordinator: &LanguageCoordinator,
+    parent_language: &str,
+    host_text: &str,
+    parent_tree: &tree_sitter::Tree,
+    parent_ranges: &[tree_sitter::Range],
+    depth: usize,
+    scope: &crate::language::node_tracker::NodeTreeScope,
+    visited: &mut std::collections::HashSet<crate::language::node_tracker::NodeTreeScope>,
+    parse: &mut impl FnMut(
+        &tree_sitter::Language,
+        &str,
+        &[tree_sitter::Range],
+    ) -> Option<tree_sitter::Tree>,
+) -> Option<InjectionLayer> {
+    let byte = scope.ranges.first()?.0;
+    let filter = byte..byte;
+    for (region, ranges) in effective_child_regions(
+        coordinator,
+        parent_language,
+        parent_tree,
+        parent_ranges,
+        host_text,
+        Some(&filter),
+    ) {
+        let content = &host_text[effective_content_range(&region, host_text)];
+        let Some((language_name, _)) =
+            coordinator.resolve_injection_language(&region.language, content)
+        else {
+            continue;
+        };
+        if depth == scope.depth
+            && (language_name.as_str() != scope.language.as_ref()
+                || !ranges
+                    .iter()
+                    .map(|r| (r.start_byte, r.end_byte))
+                    .eq(scope.ranges.iter().copied()))
+        {
+            continue;
+        }
+        let Some(language) = coordinator
+            .language_registry_for_parallel()
+            .get(&language_name)
+        else {
+            continue;
+        };
+        // Distinct query patterns can produce identical recursive scopes.
+        // Their parse and descendants are identical, so revisit neither when
+        // another branch reaches the same inputs at this depth.
+        if !visited.insert(crate::language::node_tracker::NodeTreeScope {
+            language: language_name.as_str().into(),
+            depth,
+            ranges: ranges.iter().map(|r| (r.start_byte, r.end_byte)).collect(),
+        }) {
+            continue;
+        }
+        let Some(tree) = parse(&language, host_text, &ranges) else {
+            continue;
+        };
+        if depth == scope.depth {
+            return Some(InjectionLayer {
+                tree,
+                language: language_name,
+                ranges,
+            });
+        }
+        if let Some(found) = resolve_child_scope(
+            coordinator,
+            &language_name,
+            host_text,
+            &tree,
+            &ranges,
+            depth + 1,
+            scope,
+            visited,
+            parse,
+        ) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 /// Collect the injection languages along the cursor's injection path at
@@ -710,21 +802,27 @@ fn ranges_intersect(
 /// snapshot calls this lazily and the result rides the `ParseSnapshot`, so
 /// subsequent per-keystroke walks iterate pre-parsed layers instead of
 /// re-running the walk. Byte-identical to the inline walk by construction —
-/// it IS the inline walk, with a collecting visitor.
+/// it IS the inline walk, with a collecting visitor. Unresolved branch geometry
+/// distinguishes absent scopes from scopes an unavailable parser might hide.
 pub(crate) fn collect_document_layer_trees(
     coordinator: &LanguageCoordinator,
     host_language: &str,
     host_text: &str,
     host_tree: &tree_sitter::Tree,
-) -> Vec<crate::document::SnapshotLayerTree> {
+) -> crate::document::SnapshotLayerTrees {
     let mut layers = Vec::new();
-    walk_document_layers(
+    let mut unresolved = Vec::new();
+    let complete = walk_child_layers(
         coordinator,
         host_language,
-        host_text,
         host_tree,
+        &[whole_document_range(host_text)],
+        host_text,
+        1,
         None,
         None,
+        &mut std::collections::HashSet::new(),
+        &mut unresolved,
         &mut |language, tree, depth| {
             // The host layer (depth 0) already lives on the snapshot as
             // `ParseSnapshot::tree`; store only the injected layers.
@@ -744,7 +842,11 @@ pub(crate) fn collect_document_layer_trees(
             });
         },
     );
-    layers
+    crate::document::SnapshotLayerTrees {
+        layers,
+        complete,
+        unresolved,
+    }
 }
 
 /// Visit every injection layer of the document in **document-order DFS**: the
@@ -755,22 +857,16 @@ pub(crate) fn collect_document_layer_trees(
 /// `visit` receives the layer's resolved language, its tree (parsed against
 /// the full host text via `set_included_ranges`, so byte coordinates are in
 /// host space), and its depth — the same depth index `injection_stack_at`
-/// assigns, so nodes minted with it resolve through the per-layer Scope rule.
+/// assigns. Node identity also includes the language and included ranges.
 ///
 /// Regions whose grammar is not loaded (or fails to parse) are skipped
 /// silently — discovery and auto-install are the caller's job, via
 /// [`collect_injection_languages_in_document`]. `byte_filter` prunes regions
 /// (and their entire subtrees) that don't intersect the given host-byte range.
 ///
-/// Known limitation (#350): when two injection regions at the same depth
-/// **overlap**, the walker visits both, but [`with_resolved_node`] resolves a
-/// minted id by rebuilding the cursor-path stack, which keeps only the
-/// smallest region containing the byte — so an id minted from the larger
-/// sibling may resolve in the **wrong same-depth region** (if that region's
-/// tree happens to hold a node with the identical `(start, end, kind)`) or
-/// return `null` (the protocol's re-acquire signal). Same depth-as-identity
-/// weakness documented in lazy-node-identity-tracking; disjoint same-depth
-/// regions (the norm) are unaffected.
+/// Overlapping siblings are all visited. Consumers that mint node IDs must
+/// identify each tree by its language, depth, and full included ranges, rather
+/// than using depth alone (#350).
 pub(in crate::lsp::lsp_impl::kakehashi) fn walk_document_layers(
     coordinator: &LanguageCoordinator,
     host_language: &str,
@@ -779,7 +875,7 @@ pub(in crate::lsp::lsp_impl::kakehashi) fn walk_document_layers(
     byte_filter: Option<&std::ops::Range<usize>>,
     cancel: Option<&crate::cancel::CancelToken>,
     visit: &mut dyn FnMut(&str, &tree_sitter::Tree, usize),
-) {
+) -> bool {
     visit(host_language, host_tree, 0);
     walk_child_layers(
         coordinator,
@@ -790,8 +886,10 @@ pub(in crate::lsp::lsp_impl::kakehashi) fn walk_document_layers(
         1,
         byte_filter,
         cancel,
+        &mut std::collections::HashSet::new(),
+        &mut Vec::new(),
         visit,
-    );
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -804,22 +902,21 @@ fn walk_child_layers(
     depth: usize,
     byte_filter: Option<&std::ops::Range<usize>>,
     cancel: Option<&crate::cancel::CancelToken>,
+    visited: &mut std::collections::HashSet<crate::language::node_tracker::NodeTreeScope>,
+    unresolved: &mut Vec<crate::language::node_tracker::UnresolvedTreeScope>,
     visit: &mut dyn FnMut(&str, &tree_sitter::Tree, usize),
-) {
-    // Allows injected depths 1..=MAX_INJECTION_DEPTH — deliberately matching
-    // `injection_stack_at` (`for _depth in 0..MAX` pushes up to MAX injected
-    // layers), because minted node ids must resolve through that stack's
-    // depth indexing. The semantic-tokens collector caps one layer shallower
-    // (`depth >= MAX` with a different base); resolution does not depend on
-    // it, so the cursor-path stack is the convention that matters here.
+) -> bool {
+    // Match cursor selection and scope resolution's injected depth bound.
+    // All three paths must agree on which parse scopes are reachable.
     if depth > MAX_INJECTION_DEPTH {
-        return;
+        return true;
     }
     // Cancellation checkpoint before the per-depth injection query and the
     // per-region resolve+parse below — the walk's expensive units.
     if crate::cancel::is_cancelled(cancel) {
-        return;
+        return false;
     }
+    let mut complete = true;
     for (region, absolute_ranges) in effective_child_regions(
         coordinator,
         parent_language,
@@ -834,25 +931,52 @@ fn walk_child_layers(
         // for the remaining siblings before the per-depth check above sees
         // it on the next recursion.
         if crate::cancel::is_cancelled(cancel) {
-            return;
+            return false;
         }
+        let gap = |language: Option<&str>| crate::language::node_tracker::UnresolvedTreeScope {
+            language: language.map(Into::into),
+            depth,
+            ranges: absolute_ranges
+                .iter()
+                .map(|range| (range.start_byte, range.end_byte))
+                .collect(),
+        };
         let content = &host_text[effective_content_range(&region, host_text)];
         let Some((resolved_lang, _)) =
             coordinator.resolve_injection_language(&region.language, content)
         else {
+            unresolved.push(gap(None));
+            complete = false;
             continue;
         };
+        let scope = crate::language::node_tracker::NodeTreeScope {
+            language: resolved_lang.as_str().into(),
+            depth,
+            ranges: absolute_ranges
+                .iter()
+                .map(|range| (range.start_byte, range.end_byte))
+                .collect(),
+        };
+        // Equal parse inputs produce the same tree and descendants. Deduplicate
+        // before parsing so recursive duplicate patterns cannot multiply work.
+        if !visited.insert(scope) {
+            continue;
+        }
         let Some(language) = coordinator
             .language_registry_for_parallel()
             .get(&resolved_lang)
         else {
+            unresolved.push(gap(Some(&resolved_lang)));
+            complete = false;
             continue;
         };
         let Some(tree) = parse_with_absolute_ranges(&language, host_text, &absolute_ranges) else {
+            unresolved.push(gap(Some(&resolved_lang)));
+            complete = false;
             continue;
         };
         visit(&resolved_lang, &tree, depth);
-        walk_child_layers(
+        complete &= walk_child_layers(
             coordinator,
             &resolved_lang,
             &tree,
@@ -861,14 +985,174 @@ fn walk_child_layers(
             depth + 1,
             byte_filter,
             cancel,
+            visited,
+            unresolved,
             visit,
         );
     }
+    complete
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unavailable_recursive_scope_parses_each_distinct_scope_once() {
+        let coordinator = LanguageCoordinator::new();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        coordinator
+            .language_registry_for_parallel()
+            .register("rust".into(), language.clone());
+        let pattern = r#"((source_file) @injection.content
+            (#set! injection.language "rust") (#set! injection.include-children))"#;
+        let query = tree_sitter::Query::new(&language, &format!("{pattern}\n{pattern}")).unwrap();
+        coordinator
+            .query_store()
+            .insert_injection_query("rust".into(), std::sync::Arc::new(query));
+        let text = "fn main() {}\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(text, None).unwrap();
+        // An EOF append can leave an interior node and its old scope tracked,
+        // while both recursive patterns now cover a larger range at each level.
+        let scope = crate::language::node_tracker::NodeTreeScope {
+            language: "rust".into(),
+            depth: MAX_INJECTION_DEPTH,
+            ranges: vec![(0, text.len() - 1)],
+        };
+        let mut parses = 0;
+        let found = resolve_child_scope(
+            &coordinator,
+            "rust",
+            text,
+            &tree,
+            &[whole_document_range(text)],
+            1,
+            &scope,
+            &mut std::collections::HashSet::new(),
+            &mut |language, text, ranges| {
+                parses += 1;
+                parse_with_absolute_ranges(language, text, ranges)
+            },
+        );
+        assert!(found.is_none());
+        assert_eq!(
+            parses,
+            MAX_INJECTION_DEPTH - 1,
+            "identical recursive candidates must not multiply full-region parsing"
+        );
+        let collected = collect_document_layer_trees(&coordinator, "rust", text, &tree);
+        assert!(collected.complete);
+        assert_eq!(
+            collected.layers.len(),
+            MAX_INJECTION_DEPTH,
+            "reconciliation must collect each distinct recursive tree only once"
+        );
+    }
+
+    #[test]
+    fn overlapping_siblings_resolve_their_own_tree_and_node_pair() {
+        let coordinator = LanguageCoordinator::new();
+        let query = tree_sitter::Query::new(&tree_sitter_rust::LANGUAGE.into(), r#"
+            ((block) @injection.content (#set! injection.language "rust_inner") (#set! injection.include-children))
+            ((let_declaration) @injection.content (#set! injection.language "rust_inner") (#set! injection.include-children))
+        "#).unwrap();
+        coordinator
+            .query_store()
+            .insert_injection_query("rust".into(), std::sync::Arc::new(query));
+        for name in ["rust", "rust_inner"] {
+            coordinator
+                .language_registry_for_parallel()
+                .register(name.into(), tree_sitter_rust::LANGUAGE.into());
+        }
+        let text = "fn outer() { let name = 1; }";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let host = parser.parse(text, None).unwrap();
+        let layers = collect_document_layer_trees(&coordinator, "rust", text, &host).layers;
+        assert_eq!(
+            layers.len(),
+            2,
+            "broad block and narrow declaration are siblings"
+        );
+        let start = text.find("name").unwrap();
+        let tracker = crate::language::NodeTracker::new();
+        let uri = url::Url::parse("file:///overlap.rs").unwrap();
+        let mut ids = Vec::new();
+        for layer in &layers {
+            let scope = crate::language::node_tracker::NodeTreeScope::new(
+                &layer.language,
+                layer.depth,
+                &layer.tree,
+            );
+            let root = layer.tree.root_node();
+            let minted = tracker
+                .mint_tree_batch(
+                    &uri,
+                    tracker.mint_epoch(&uri),
+                    0,
+                    Some(&scope),
+                    [
+                        (start, start + 4, "identifier"),
+                        (
+                            root.start_byte(),
+                            root.end_byte(),
+                            crate::language::loader::static_node_kind(&root),
+                        ),
+                    ],
+                )
+                .unwrap();
+            ids.push(minted[0]);
+            let tracked = tracker.lookup_node_scope(&uri, &minted[0]).unwrap();
+            let resolved_root = with_resolved_node(
+                &coordinator,
+                "rust",
+                text,
+                &host,
+                start,
+                start + 4,
+                "identifier",
+                tracked.position.3,
+                tracked.scope.as_deref(),
+                |mut node| {
+                    while let Some(parent) = node.parent() {
+                        node = parent;
+                    }
+                    (node.start_byte(), node.end_byte())
+                },
+            )
+            .unwrap();
+            assert_eq!(resolved_root, (root.start_byte(), root.end_byte()));
+            assert_eq!(
+                with_resolved_node_pair(
+                    &coordinator,
+                    "rust",
+                    text,
+                    &host,
+                    (
+                        root.start_byte(),
+                        root.end_byte(),
+                        crate::language::loader::static_node_kind(&root),
+                    ),
+                    (start, start + 4, "identifier"),
+                    tracked.position.3,
+                    tracked.scope.as_deref(),
+                    |root, descendant| {
+                        let mut node = descendant;
+                        while let Some(parent) = node.parent() {
+                            node = parent;
+                        }
+                        root.id() == node.id()
+                    }
+                ),
+                Some(true)
+            );
+        }
+        assert_ne!(ids[0], ids[1]);
+    }
 
     /// The stored layer trees must be exactly what the inline walk would
     /// visit over the same (text, tree): same (language, depth) sequence and
@@ -929,7 +1213,7 @@ mod tests {
             "sanity: the document has injected layers"
         );
 
-        let stored = collect_document_layer_trees(&coordinator, "markdown", text, &tree);
+        let stored = collect_document_layer_trees(&coordinator, "markdown", text, &tree).layers;
         let stored_shape: Vec<LayerShape> = stored
             .iter()
             .map(|l| {

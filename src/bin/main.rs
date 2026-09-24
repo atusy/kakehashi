@@ -18,12 +18,10 @@ struct Cli {
     /// specified multiple times; files merge in order.
     /// Skips both default locations: the user config under $XDG_CONFIG_HOME
     /// (~/.config/kakehashi/kakehashi.toml when unset) and ./kakehashi.toml.
-    /// For those commands, a file that is present but unreadable, malformed,
-    /// larger than 8 MiB, or carrying an unexpandable path is a hard error:
-    /// format and diagnose exit 2, and LSP initialization is rejected with
-    /// RequestFailed. A file that is absent is skipped (warned about over LSP;
-    /// the CLI reports only hard errors). Relative paths resolve against the
-    /// working directory of the kakehashi process.
+    /// A listed file that is absent, unreadable, malformed, larger than 8 MiB,
+    /// or carrying an unexpandable path makes format and diagnose exit 2; the
+    /// LSP server shows it as an error and starts without that file. Relative
+    /// paths resolve against the working directory of the kakehashi process.
     #[arg(long, global = true)]
     config_file: Vec<PathBuf>,
 

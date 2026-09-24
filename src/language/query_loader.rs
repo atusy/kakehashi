@@ -590,8 +590,7 @@ mod tests {
             "../bad\n\u{1b}[31m",
             "highlights.scm",
         )
-        .err()
-        .expect("path-shaped names must be refused");
+        .expect_err("path-shaped names must be refused");
         let message = error.to_string();
         assert!(message.contains("not a single path component"), "{message}");
         assert!(message.contains(r"../bad\n\u{1b}[31m"), "{message:?}");

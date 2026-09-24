@@ -2,8 +2,8 @@
 //! selection-range paths: clean-content extraction, per-line column offsets,
 //! parsing with included ranges, and byte→`Point` coordinate conversion.
 
+use crate::text::clamped_slice;
 use crate::text::terminal::escape_terminal_controls;
-use crate::text::{clamped_slice, floor_char_boundary};
 
 /// Extract clean injection content, stripping child node bytes when `included_ranges` present.
 ///
@@ -219,7 +219,7 @@ pub(crate) fn parse_with_ranges(
 pub(crate) fn byte_to_point(text: &str, byte: usize) -> tree_sitter::Point {
     // Align first — slicing `&text[..clamped]` on a mid-character byte would
     // panic and crash the LSP server.
-    let clamped = floor_char_boundary(text, byte);
+    let clamped = text.floor_char_boundary(byte);
     let prefix = &text[..clamped];
     let row = prefix.bytes().filter(|b| *b == b'\n').count();
     let last_nl = prefix.rfind('\n');
@@ -243,7 +243,7 @@ pub(crate) fn byte_to_point_anchored(
     anchor_byte: usize,
     anchor_point: tree_sitter::Point,
 ) -> tree_sitter::Point {
-    let clamped = floor_char_boundary(text, byte);
+    let clamped = text.floor_char_boundary(byte);
     // Reuse the cached `anchor_point` only when `anchor_byte` is a real position
     // in the current text: if it's past the target, out of bounds, or
     // mid-codepoint (a stale tree), `anchor_point` no longer matches it and the
@@ -533,7 +533,7 @@ mod tests {
 
         let mut let_columns: Vec<usize> = Vec::new();
         while let Some(m) = matches.next() {
-            for c in m.captures {
+            for c in m.captures() {
                 let node = c.node;
                 let mut walk = node.walk();
                 for child in node.children(&mut walk) {

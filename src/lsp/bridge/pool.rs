@@ -2423,6 +2423,11 @@ impl LanguageServerPool {
         }
     }
 
+    /// Recovery must not transfer demand after pool shutdown has started.
+    pub(crate) fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::Relaxed)
+    }
+
     /// Whether the pool holds any connection under `key`, in any state.
     pub(crate) async fn holds_connection(&self, key: &ConnectionKey) -> bool {
         self.connections.lock().await.contains_key(key)

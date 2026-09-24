@@ -2,10 +2,10 @@
 name = "kakehashi"
 version = "1.0.0"
 edition = "2024"
-# std's inherent `File::lock` (src/install/queries.rs) is stable from 1.89; the
-# 2024 edition alone would only require 1.85. Declared so an older toolchain
-# fails with a clear MSRV message instead of a missing-method error.
-rust-version = "1.89"
+# Tracks the latest stable toolchain (the Nix dev shell and CI both build with
+# it). Declared so an older toolchain fails with a clear MSRV message instead of
+# a missing-method error.
+rust-version = "1.98"
 default-run = "kakehashi"
 
 [[bin]]
@@ -64,7 +64,7 @@ opt-level = 3
 arc-swap = "1"
 clap = { version = "4", features = ["derive"] }
 dashmap = "6"
-dirs = "6"
+dirs = "7"
 # Strips Windows verbatim `\\?\` prefixes only when the plain form means the
 # same path (long paths, reserved names, and UNC edge cases stay verbatim);
 # a hand-rolled prefix strip would get those wrong. No-op elsewhere.
@@ -108,8 +108,8 @@ tokio-util = "0.7"
 toml = "1"
 tower = { version = "0.5", default-features = false }
 tower-lsp-server = "0.23"
-tree-sitter = "0.26"
-tree-sitter-loader = "0.26"
+tree-sitter = "0.27"
+tree-sitter-loader = "0.27"
 tree-sitter-tsquery = "0.8"
 ulid = "3"
 url = "2"
@@ -145,7 +145,7 @@ streaming-iterator = "0.1"
 filetime = "0.2"
 insta = { version = "1", features = ["json", "redactions"] }
 serial_test = "4"
-rstest = "0.26"
+rstest = "0.27"
 
 # A/B performance comparison of the semantic-tokens hot path across two server
 # binaries (e.g. HEAD vs origin/main). Custom harness (no criterion): it drives

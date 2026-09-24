@@ -16,6 +16,7 @@
 use serde_json::Value;
 use tower_lsp_server::jsonrpc::Result;
 
+use crate::language::loader::static_node_kind;
 use crate::lsp::lsp_impl::Kakehashi;
 use crate::lsp::lsp_impl::kakehashi::node::common::{
     NodeByteParams, NodeByteRangeParams, NodeDescendantParams, NodeIdParams, NodeIndexParams,
@@ -25,7 +26,7 @@ use crate::lsp::lsp_impl::kakehashi::node::injection_stack::ranges_contain_byte;
 /// Map a tree-sitter node to the `(start, end, kind)` triple the navigation
 /// helpers re-mint from.
 fn triple(node: tree_sitter::Node<'_>) -> (usize, usize, &'static str) {
-    (node.start_byte(), node.end_byte(), node.kind())
+    (node.start_byte(), node.end_byte(), static_node_kind(&node))
 }
 
 impl Kakehashi {

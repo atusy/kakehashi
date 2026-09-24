@@ -159,10 +159,10 @@ impl Kakehashi {
 
     /// `codeAction/resolve`: route the action back to the downstream server
     /// that produced it, identified by the envelope in `action.data` (#568
-    /// PR 4). Fails soft at every step: an action without an envelope
-    /// (host-layer or foreign) passes through unchanged, and a stale region
-    /// returns the action unresolved with its envelope intact — clients
-    /// re-request actions on change, so the staleness window is short.
+    /// PR 4). Foreign actions pass through unchanged. Unavailable/stale actions
+    /// and replies without an edit, command, or disabled reason report request
+    /// failure, so clients can request fresh actions instead of silently doing
+    /// nothing. Cancellation remains RequestCancelled.
     pub(crate) async fn code_action_resolve_impl(&self, action: CodeAction) -> Result<CodeAction> {
         let Some(envelope) = extract_code_action_envelope(&action) else {
             return Ok(action);
@@ -173,7 +173,7 @@ impl Kakehashi {
                 "codeAction/resolve: envelope host_uri {:?} is not a valid URL",
                 envelope.host_uri
             );
-            return Ok(action);
+            return Err(code_action_resolve_failed());
         };
         // Both layers: the action was computed against one text revision, and
         // a lazily materialized edit for another must not be applied to this
@@ -181,10 +181,10 @@ impl Kakehashi {
         if !self.document_revision_is_current(&host_url, envelope.content_version) {
             log::debug!(
                 target: "kakehashi::bridge",
-                "codeAction/resolve: {} was revised since the action was produced; returning action unresolved",
+                "codeAction/resolve: {} was revised since the action was produced; refusing resolve",
                 envelope.host_uri
             );
-            return Ok(action);
+            return Err(code_action_resolve_failed());
         }
         // Before the region gate waits for a parse: an action from a closed
         // and reopened document would otherwise park on the reopened
@@ -192,13 +192,13 @@ impl Kakehashi {
         if !self.host_incarnation_is_current(&host_url, envelope.incarnation) {
             log::debug!(
                 target: "kakehashi::bridge",
-                "codeAction/resolve: {} was reopened since the action was produced; returning action unresolved",
+                "codeAction/resolve: {} was reopened since the action was produced; refusing resolve",
                 envelope.host_uri
             );
-            return Ok(action);
+            return Err(code_action_resolve_failed());
         }
 
-        // Fail-soft staleness gate: resolving against a moved or invalidated
+        // Staleness gate: resolving against a moved or invalidated
         // region would translate a resolved edit with a stale offset and bind
         // it to content the user has since edited. The same live lookup yields
         // the region's current host-document end, which bounds the resolved
@@ -221,25 +221,22 @@ impl Kakehashi {
                 Ok(region_end) => region_end,
                 Err(RegionEndUnavailable::MalformedEnvelope) => {
                     // Already warned with the malformed field; no stale-debug.
-                    return Ok(action);
+                    return Err(code_action_resolve_failed());
                 }
                 Err(RegionEndUnavailable::Stale) => {
                     log::debug!(
                         target: "kakehashi::bridge",
                         "codeAction/resolve: region {} of {} (origin {:?}) is stale; \
-                         returning action unresolved",
+                         refusing resolve",
                         envelope.region_id,
                         envelope.host_uri,
                         envelope.origin
                     );
-                    return Ok(action);
+                    return Err(code_action_resolve_failed());
                 }
             }
         };
 
-        // Kept for the post-response check; the gates above return `action`
-        // itself, so only a resolve that is actually dispatched pays for it.
-        let unresolved = action.clone();
         let settings = self.settings_manager.load_settings();
         let upstream_caps = self.upstream_code_action_caps();
         let upstream_id = crate::lsp::current_upstream_id();
@@ -287,25 +284,33 @@ impl Kakehashi {
         {
             log::debug!(
                 target: "kakehashi::bridge",
-                "codeAction/resolve: {} was revised or reopened while resolving; returning action unresolved",
+                "codeAction/resolve: {} was revised or reopened while resolving; refusing resolve",
                 envelope.host_uri
             );
-            return Ok(unresolved);
+            return Err(code_action_resolve_failed());
+        }
+        // A lazy response cannot execute. Returning it as a successful resolve
+        // makes a selected action silently do nothing. Completion can keep its
+        // basic insertion on resolve failure; an action needs an edit/command
+        // or an explicit disabled reason. Let the client present request failure
+        // when appropriate instead of emitting an unsolicited notification.
+        if resolved.edit.is_none() && resolved.command.is_none() && resolved.disabled.is_none() {
+            return Err(code_action_resolve_failed());
         }
         Ok(resolved)
     }
 
     /// The region's current content-precise host-document END position if the
     /// region is still FRESH — i.e. re-resolving it from the live parse yields
-    /// the SAME offset the action was minted with — else `None`.
+    /// the SAME offset the action was minted with — else `RegionEndUnavailable`.
     ///
     /// The resolve path translates the resolved edit using the envelope's
     /// SNAPSHOT offset (`RegionOffset::from(&envelope.offset)`). Re-resolve the
     /// live offset and compare the WHOLE thing, not just the start: if any
     /// per-line column offset diverged (e.g. an interior blockquote-prefix edit
     /// left the start line intact) translating with the stale offset would bind
-    /// the edit to wrong host columns — corruption. On any divergence fail soft
-    /// (the client re-requests fresh actions), mirroring the stale-region case.
+    /// the edit to wrong host columns — corruption. On any divergence reject
+    /// resolve so the client can request fresh actions, as for a stale region.
     /// The same live resolution yields the content-precise region end used to
     /// bound the edit (the exact virtual-content end mapped through the live
     /// per-line offset, matching applyEdit).
@@ -405,9 +410,8 @@ impl Kakehashi {
         // count); the common case is a range within a single fence.
         // Read before the preamble snapshots the document, so the stamp can
         // only be older than the content the actions were computed on, never
-        // newer: an edit landing in between makes the actions fail soft on
-        // resolve until the editor's next request, which follows an edit
-        // anyway.
+        // newer: an edit landing in between makes resolve reject these actions,
+        // so the editor must request fresh ones.
         let Some(revision) = url::Url::parse(lsp_uri.as_str()).ok().and_then(|uri| {
             self.documents
                 .get(&uri)
@@ -666,10 +670,80 @@ impl Kakehashi {
     }
 }
 
+fn code_action_resolve_failed() -> tower_lsp_server::jsonrpc::Error {
+    tower_lsp_server::jsonrpc::Error {
+        code: tower_lsp_server::jsonrpc::ErrorCode::ServerError(
+            tower_lsp_server::ls_types::error_codes::REQUEST_FAILED,
+        ),
+        message: "Could not resolve this code action. Request code actions again.".into(),
+        data: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tower_lsp_server::ls_types::Command;
+
+    #[rstest::rstest]
+    #[case::removed_server("server")]
+    #[case::edited_document("edit")]
+    #[case::reopened_document("reopen")]
+    #[tokio::test]
+    async fn lazy_resolve_failure_is_reported_to_the_client(#[case] failure: &str) {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///resolve-failure.rs").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "fn main() {}".into(),
+            Some("rust".into()),
+            None,
+        );
+        server
+            .bridge
+            .pool_arc()
+            .open_host_incarnation(&uri, incarnation)
+            .await;
+        let action: CodeAction = serde_json::from_value(serde_json::json!({
+            "title": "Fix it — removed-server",
+            "data": { "kakehashi": {
+                "origin": "removed-server", "host_uri": uri.as_str(),
+                "region_id": "", "injection_language": "",
+                "offset": { "line": 0, "column": 0, "line_column_offsets": [] },
+                "original_title": "Fix it", "inner": { "id": 7 },
+                "content_version": 0, "incarnation": incarnation, "host_layer": true
+            }}
+        }))
+        .unwrap();
+        assert!(extract_code_action_envelope(&action).is_some());
+        if failure == "edit" {
+            server
+                .documents
+                .update_document(uri.clone(), "fn updated() {}".into(), None);
+        } else if failure == "reopen" {
+            let newer = server.documents.insert(
+                uri.clone(),
+                "fn main() {}".into(),
+                Some("rust".into()),
+                None,
+            );
+            server
+                .bridge
+                .pool_arc()
+                .open_host_incarnation(&uri, newer)
+                .await;
+        }
+        let error = server
+            .code_action_resolve_impl(action)
+            .await
+            .expect_err("an unavailable action must not be returned as a successful no-op");
+        assert_eq!(
+            error.code,
+            tower_lsp_server::jsonrpc::ErrorCode::ServerError(-32803)
+        );
+        assert!(error.message.contains("Request code actions again"));
+    }
 
     fn action(title: &str, preferred: Option<bool>) -> CodeActionOrCommand {
         CodeActionOrCommand::CodeAction(CodeAction {

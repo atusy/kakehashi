@@ -271,37 +271,54 @@ impl Kakehashi {
         &self,
         params: InitializeParams,
     ) -> Result<InitializeResult> {
-        // Reject an unusable `--config-file` before anything from `params` is
-        // latched. Several of the stores below are first-write-wins
-        // (`set_capabilities`, `set_folderless_root_path`), and
-        // tower-lsp-server resets to `Uninitialized` after an error response,
-        // so a client may fix the file and retry: without this, the retry would
-        // load the corrected settings while downstream servers kept the failed
-        // attempt's capabilities, root URI, and workspace folders.
+        // Startup files are judged by the frontend's policy. The one-shot CLI
+        // (`format`, `diagnose`) runs unattended, often in CI, where a clean
+        // result computed on defaults would be believed: any file it cannot use
+        // rejects the run. An editor session is better served running on the
+        // layers that do work, so it reports each unusable entry as an error
+        // popup (via the settings events) and skips it.
+        //
+        // A rejection happens before anything from `params` is latched.
+        // Several of the stores below are first-write-wins
+        // (`set_capabilities`, `set_folderless_root_path`), and a rejected
+        // handshake must not leave them holding the failed attempt's values.
         //
         // Reported only through this response — the settings events carrying
-        // the same text are never sent, so the client does not also get a
-        // `window/showMessage` popup on top of a handshake it already failed.
-        // Pinned by `test_config_file_fatal_error_is_not_also_shown_as_a_message`.
+        // the same text are never sent, so the CLI's single stderr report is
+        // the only one.
         //
         // The files are read here and the result carried into `load_settings`
         // below, never re-read: a `--config-file` may name a stream, and a file
         // swapped between two reads would slip past whichever check ran first.
+        let policy = if self.is_cli_mode() {
+            crate::lsp::settings::StartupFilePolicy::Strict
+        } else {
+            crate::lsp::settings::StartupFilePolicy::Tolerant
+        };
+        let (root_path, source) = config_root_path(client_root(&params));
         let explicit_config =
-            crate::lsp::settings::load_explicit_config(self.home_dir.as_deref(), |var| {
+            crate::lsp::settings::load_explicit_config(policy, self.home_dir.as_deref(), |var| {
                 std::env::var(var).ok()
             });
-        if let Some(error) = explicit_config
-            .as_ref()
-            .and_then(|config| config.fatal_error.clone())
-        {
+        let explicit_selected = explicit_config.is_some();
+        let startup_config = explicit_config.unwrap_or_else(|| {
+            crate::lsp::settings::load_discovered_startup_config(
+                root_path.as_deref(),
+                policy,
+                self.home_dir.as_deref(),
+                |var| std::env::var(var).ok(),
+            )
+        });
+        if let Some(error) = startup_config.fatal_error.clone() {
             return Err(configuration_load_error(error));
         }
-        let _ = self.explicit_config.set(
-            explicit_config
-                .as_ref()
-                .map(crate::lsp::settings::ExplicitConfig::for_replay),
-        );
+        // Explicit stacks replay for the whole session — under the tolerant
+        // policy, only the entries that loaded; repairing a skipped one takes a
+        // restart. Discovered files are preloaded only for startup; later root
+        // changes still discover anew.
+        let _ = self
+            .explicit_config
+            .set(explicit_selected.then(|| startup_config.for_replay()));
 
         let position_encoding = host_position_encoding(&params.capabilities);
         // Store client capabilities for LSP compliance checks (e.g., refresh support).
@@ -327,9 +344,6 @@ impl Kakehashi {
         // separate internal root path below may still fall back to the CWD.
         let root_uri_for_bridge = bridge_root_uri(&params);
 
-        // Resolved here, into owned values, because `params.capabilities` is
-        // moved into the pool below and that ends any borrow of `params`.
-        let (root_path, source) = config_root_path(client_root(&params));
         // The root a later `didChangeWorkspaceFolders` falls back to once it
         // empties the folder list. Resolved here because `params` does not
         // outlive this request, and deliberately without `config_root_path`'s
@@ -387,11 +401,11 @@ impl Kakehashi {
                 .map(|options| (SettingsSource::InitializationOptions, options)),
             self.home_dir.as_deref(),
             |var| std::env::var(var).ok(),
-            explicit_config,
+            Some(startup_config),
         );
 
         // There is deliberately no second fatal check here. Every verdict on
-        // the explicit configuration was reached above, before any of the
+        // startup file configuration was reached above, before any of the
         // stores in between — and the files must not be read again to reach
         // one, since a `--config-file` may name a stream.
         let settings_events = settings_outcome.events;
@@ -2414,38 +2428,49 @@ async fn crashed_shared_documents(
     config: &crate::config::settings::BridgeServerConfig,
 ) -> Vec<(Url, Url)> {
     let mut documents = Vec::new();
-    let pool = bridge.pool();
+    for (host, document) in server_recovery_documents(injection, bridge, settings, key.server()) {
+        if bridge
+            .pool()
+            .resolved_connection_key(key.server(), config, &document)
+            .await
+            == *key
+        {
+            documents.push((host, document));
+        }
+    }
+    documents
+}
+
+/// Current configured units, before a shared capability partition narrows
+/// them. A live replacement may have been started by an ordinary request.
+fn server_recovery_documents(
+    injection: &crate::lsp::lsp_impl::coordinator::InjectionCoordinator,
+    bridge: &crate::lsp::bridge::BridgeCoordinator,
+    settings: &Arc<crate::config::WorkspaceSettings>,
+    server: &str,
+) -> Vec<(Url, Url)> {
+    let mut documents = Vec::new();
     for host in injection.open_host_uris() {
-        if let Some(snapshot) = injection.host_reopen_snapshot(&host, settings, key.server())
-            && bridge
-                .host_layer_routes_to_connection(settings, &snapshot.language_id, &host, key)
-                .await
+        if injection
+            .host_reopen_snapshot(&host, settings, server)
+            .is_some()
+            && bridge.pool().host_routing_by_server(&host, server) != Some(false)
         {
             documents.push((host.clone(), host.clone()));
         }
         let Some((language, _)) = injection.screen_language(&host) else {
             continue;
         };
-        if !bridge.host_language_can_reach_server(settings, &language, key.server()) {
+        if !bridge.host_language_can_reach_server(settings, &language, server) {
             continue;
         }
         let Some((language, Some(injections))) = injection.bridge_injections(&host) else {
             continue;
         };
-        for document in bridge.recovery_injection_documents(
-            settings,
-            &language,
-            &host,
-            injections,
-            key.server(),
-        ) {
-            if pool
-                .resolved_connection_key(key.server(), config, &document)
-                .await
-                == *key
-            {
-                documents.push((host.clone(), document));
-            }
+        for document in
+            bridge.recovery_injection_documents(settings, &language, &host, injections, server)
+        {
+            documents.push((host.clone(), document));
         }
     }
     documents
@@ -2598,6 +2623,20 @@ async fn attempt_crash_recovery(
             .begin_crash_recovery_attempt(key, after_own_failure)
             .await
         {
+            // An ordinary acquisition can win the shared restart during
+            // backoff. Its new capability partition must not erase quiet
+            // sibling demand before this task transfers missing destinations.
+            let settings = settings_manager.load_settings();
+            if key.is_shared()
+                && !pool.is_shutting_down()
+                && bridge
+                    .respawnable_server_config(&settings, key.server())
+                    .is_some_and(|config| config.prefers_shared_instance())
+            {
+                let documents =
+                    server_recovery_documents(injection, bridge, &settings, key.server());
+                defer_current_shared_documents(injection, settings_manager, key, &documents).await;
+            }
             return stand_down();
         }
         let snapshot = settings_manager.load_settings_pair();
@@ -2829,6 +2868,9 @@ async fn defer_current_shared_documents(
     let mut deferred = std::collections::HashSet::new();
     for (host, document) in documents {
         loop {
+            if pool.is_shutting_down() {
+                return;
+            }
             let settings = settings_manager.load_settings();
             let Some(config) = bridge.respawnable_server_config(&settings, source.server()) else {
                 return;
@@ -5621,6 +5663,22 @@ mod reopen_order_tests {
     #[case(true)]
     #[tokio::test]
     async fn expired_recovery_settings_transfer_quiet_diverted_documents(#[case] host_layer: bool) {
+        shared_recovery_retains_quiet_sibling(false, host_layer).await;
+    }
+
+    #[cfg(unix)]
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn an_ordinary_shared_restart_transfers_quiet_diverted_documents(
+        #[case] host_layer: bool,
+    ) {
+        shared_recovery_retains_quiet_sibling(true, host_layer).await;
+    }
+
+    #[cfg(unix)]
+    async fn shared_recovery_retains_quiet_sibling(ordinary_restart_wins: bool, host_layer: bool) {
         use super::*;
         use crate::lsp::bridge::{ConnectionKey, RecoveryDecision};
         use tower_lsp_server::LspService;
@@ -5753,31 +5811,57 @@ mod reopen_order_tests {
         else {
             panic!("first retry");
         };
-        let publish = async {
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                while !started.exists() {
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                }
-            })
-            .await
-            .expect("shared replacement started");
-            // The seed has already committed its settings snapshot. Auto-install
-            // publishes another generation without invalidating either tree.
-            server.settings_manager.apply_settings(settings);
-            assert_ne!(generation, server.settings_manager.settings_generation());
+        let outcome = if ordinary_restart_wins {
             std::fs::write(&release, b"go").unwrap();
-        };
-        let (outcome, ()) = tokio::join!(
+            let replacement = server
+                .bridge
+                .pool()
+                .get_or_create_connection_wait_ready(
+                    "test",
+                    &config,
+                    Some(&captured[0].1),
+                    std::time::Duration::from_secs(2),
+                )
+                .await
+                .unwrap();
+            assert_eq!(replacement.key(), &key);
             attempt_crash_recovery(
                 &injection,
                 &server.bridge,
                 &server.settings_manager,
                 &key,
                 reservation,
-                false
-            ),
-            publish
-        );
+                false,
+            )
+            .await
+        } else {
+            let publish = async {
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while !started.exists() {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect("shared replacement started");
+                // The seed has already committed its settings snapshot. Auto-install
+                // publishes another generation without invalidating either tree.
+                server.settings_manager.apply_settings(settings);
+                assert_ne!(generation, server.settings_manager.settings_generation());
+                std::fs::write(&release, b"go").unwrap();
+            };
+            let (outcome, ()) = tokio::join!(
+                attempt_crash_recovery(
+                    &injection,
+                    &server.bridge,
+                    &server.settings_manager,
+                    &key,
+                    reservation,
+                    false
+                ),
+                publish
+            );
+            outcome
+        };
         assert!(matches!(outcome, RecoveryAttempt::Done));
         let mut diverted = 0;
         for (_, document) in captured {
@@ -5791,7 +5875,7 @@ mod reopen_order_tests {
                 assert_eq!(
                     server.bridge.pool().schedule_crash_retry(&destination),
                     RecoveryDecision::AlreadyScheduled,
-                    "the actual expired sweep must transfer its quiet sibling root"
+                    "the actual recovery attempt must transfer its quiet sibling root"
                 );
             }
         }
