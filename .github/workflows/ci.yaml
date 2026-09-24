@@ -9,34 +9,6 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  cli-output:
-    name: CLI output (${{ matrix.os }})
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v7
-      - name: Prepare fs-verity fixture
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends fsverity
-          mkdir -p "$RUNNER_TEMP/kakehashi-verity"
-          truncate -s 64M "$RUNNER_TEMP/kakehashi-verity.img"
-          # Match fsverity's default 4096-byte Merkle blocks even on a small image.
-          mkfs.ext4 -q -b 4096 -O verity "$RUNNER_TEMP/kakehashi-verity.img"
-          sudo mount -o loop "$RUNNER_TEMP/kakehashi-verity.img" "$RUNNER_TEMP/kakehashi-verity"
-          sudo chown "$(id -u):$(id -g)" "$RUNNER_TEMP/kakehashi-verity"
-          echo "KAKEHASHI_TEST_VERITY_ROOT=$RUNNER_TEMP/kakehashi-verity" >> "$GITHUB_ENV"
-      - run: cargo test --bin kakehashi
-      - name: Unmount fs-verity fixture
-        if: always() && runner.os == 'Linux'
-        run: |
-          if mountpoint -q "$RUNNER_TEMP/kakehashi-verity"; then
-            sudo umount "$RUNNER_TEMP/kakehashi-verity"
-          fi
-
   check:
     name: Check
     runs-on: ubuntu-latest
@@ -61,9 +33,27 @@ jobs:
       - uses: actions/checkout@v7
       - run: rustup component add rust-analyzer
       - run: make deps/tree-sitter
+      - name: Prepare fs-verity fixture
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fsverity
+          mkdir -p "$RUNNER_TEMP/kakehashi-verity"
+          truncate -s 64M "$RUNNER_TEMP/kakehashi-verity.img"
+          # Match fsverity's default 4096-byte Merkle blocks even on a small image.
+          mkfs.ext4 -q -b 4096 -O verity "$RUNNER_TEMP/kakehashi-verity.img"
+          sudo mount -o loop "$RUNNER_TEMP/kakehashi-verity.img" "$RUNNER_TEMP/kakehashi-verity"
+          sudo chown "$(id -u):$(id -g)" "$RUNNER_TEMP/kakehashi-verity"
+          echo "KAKEHASHI_TEST_VERITY_ROOT=$RUNNER_TEMP/kakehashi-verity" >> "$GITHUB_ENV"
       - run: cargo test
       - run: "cargo test --features e2e --test e2e e2e_type_hierarchy::"
       - run: "cargo test --features e2e --test e2e e2e_bridge_peer::"
+      - name: Unmount fs-verity fixture
+        if: always() && runner.os == 'Linux'
+        run: |
+          if mountpoint -q "$RUNNER_TEMP/kakehashi-verity"; then
+            sudo umount "$RUNNER_TEMP/kakehashi-verity"
+          fi
 
   resolve-e2e:
     name: Resolve E2E
