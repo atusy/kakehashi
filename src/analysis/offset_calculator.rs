@@ -1,5 +1,4 @@
 use crate::language::injection::InjectionOffset;
-use crate::text::{ceil_char_boundary, floor_char_boundary};
 
 /// Represents a byte range with start and end positions
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,8 +59,8 @@ pub fn calculate_effective_range(
     };
 
     // Clamp to valid range [0, text.len()] and snap inward to char boundaries
-    let snapped_start = ceil_char_boundary(text, raw_start.min(text_len));
-    let snapped_end = floor_char_boundary(text, raw_end.min(text_len));
+    let snapped_start = text.ceil_char_boundary(raw_start.min(text_len));
+    let snapped_end = text.floor_char_boundary(raw_end.min(text_len));
 
     // Ensure start <= end invariant
     let (final_start, final_end) = if snapped_start <= snapped_end {
@@ -98,7 +97,7 @@ fn apply_offset_to_position(
     // slicing at a raw byte_pos panics if it lands mid-codepoint (e.g. a
     // stale tree-sitter offset) — the caller's later clamp/snap only applies
     // to the *returned* value, not this internal slice.
-    let snapped_byte_pos = floor_char_boundary(text, byte_pos);
+    let snapped_byte_pos = text.floor_char_boundary(byte_pos);
     let current_line_start = text[..snapped_byte_pos]
         .rfind('\n')
         .map(|i| i + 1)

@@ -148,7 +148,7 @@ pub(crate) fn check_match_predicates(query: &Query, match_: &QueryMatch, text: &
         };
         let nodes = || {
             match_
-                .captures
+                .captures()
                 .iter()
                 .filter(|c| Some(c.index) == capture_id)
                 .map(|c| c.node)
@@ -484,7 +484,7 @@ pub(crate) fn filter_captures<'a>(
     text: &'a str,
 ) -> impl Iterator<Item = QueryCapture<'a>> + 'a {
     match_
-        .captures
+        .captures()
         .iter()
         .filter(move |capture| check_predicate(query, match_, capture, text))
         .copied()

@@ -17,7 +17,7 @@ use super::ranges::{
 use crate::language::LanguageCoordinator;
 use crate::language::node_tracker::NodeTracker;
 use crate::language::query_predicates::check_match_predicates;
-use crate::text::{ceil_char_boundary, clamped_slice, floor_char_boundary, fnv1a_hash};
+use crate::text::{clamped_slice, fnv1a_hash};
 
 // Keep bridge-region identities in a namespace disjoint from real parse-tree
 // injection depths (0..=MAX_INJECTION_DEPTH). The per-range slot then gives
@@ -29,7 +29,7 @@ fn iter_injection_content_captures<'a, 'b>(
     match_: &'b QueryMatch<'_, 'a>,
     query: &'b Query,
 ) -> impl Iterator<Item = QueryCapture<'a>> + 'b {
-    match_.captures.iter().copied().filter(|capture| {
+    match_.captures().iter().copied().filter(|capture| {
         query
             .capture_names()
             .get(capture.index as usize)
@@ -150,8 +150,8 @@ fn position_of_byte(
 ) -> (u32, u32) {
     // Snap both offsets to in-bounds char boundaries: on a stale tree they can
     // be out of range or mid-codepoint, which would panic the slices below.
-    let byte_pos = floor_char_boundary(text, byte_pos);
-    let anchor_byte = floor_char_boundary(text, anchor_byte);
+    let byte_pos = text.floor_char_boundary(byte_pos);
+    let anchor_byte = text.floor_char_boundary(anchor_byte);
     let (lo, hi) = (byte_pos.min(anchor_byte), byte_pos.max(anchor_byte));
     let newlines = text[lo..hi].bytes().filter(|&b| b == b'\n').count();
     let row = if byte_pos >= anchor_byte {
@@ -218,8 +218,8 @@ pub(crate) fn effective_content_range(info: &InjectionRegionInfo<'_>, text: &str
     // Snap to valid in-bounds char boundaries (ceil start / floor end) so the
     // range is always safe to slice — a stale node can't leave an
     // out-of-bounds range for downstream consumers.
-    let start = ceil_char_boundary(text, start);
-    let end = floor_char_boundary(text, end).max(start);
+    let start = text.ceil_char_boundary(start);
+    let end = text.floor_char_boundary(end).max(start);
     start..end
 }
 
@@ -426,7 +426,7 @@ fn try_collect_partitioned<'a>(
     // Bound each query's fan-out so concurrent documents can share the pool.
     // Wider fan-out regressed four-document latency in the discovery experiment.
     const MAX_DISCOVERY_WINDOWS: usize = 2;
-    let chunk_size = root.child_count().div_ceil(MAX_DISCOVERY_WINDOWS);
+    let chunk_size = (root.child_count() as usize).div_ceil(MAX_DISCOVERY_WINDOWS);
     let mut walk = root.walk();
     let mut ranges = Vec::new();
     let mut start = root.start_byte();
@@ -1035,7 +1035,7 @@ impl InjectionResolver {
             uri,
             injection.content_node.start_byte(),
             injection.content_node.end_byte(),
-            injection.content_node.kind(),
+            crate::language::loader::static_node_kind(&injection.content_node),
             identity_layer,
             incarnation,
         )
@@ -1526,7 +1526,7 @@ fn build_combined_virtual_content(
     // Tree-sitter byte ranges are only valid for the exact parsed text. A
     // stale tree must not turn a combined-document rebuild into an invalid
     // UTF-8 slice or an oversized allocation.
-    let span = ceil_char_boundary(text, span.start)..floor_char_boundary(text, span.end);
+    let span = text.ceil_char_boundary(span.start)..text.floor_char_boundary(span.end);
     if span.start >= span.end {
         return (String::new(), Vec::new());
     }
@@ -1558,7 +1558,7 @@ fn build_combined_virtual_content(
             range_index += 1;
         }
         let first_included = included.get(range_index).and_then(|range| {
-            let start = ceil_char_boundary(text, range.start.max(line_start));
+            let start = text.ceil_char_boundary(range.start.max(line_start));
             let end = range.end.min(content_end);
             let includes_line_break =
                 content_end < line_end && start == content_end && range.end > content_end;
@@ -1670,7 +1670,7 @@ mod tests {
                         let mut cursor = QueryCursor::new();
                         let mut matches = cursor.matches(&query, tree.root_node(), text.as_bytes());
                         while let Some(m) = matches.next() {
-                            count += std::hint::black_box(m.captures.len());
+                            count += std::hint::black_box(m.captures().len());
                         }
                     }
                 }
@@ -2023,7 +2023,7 @@ mod tests {
         // take the collision fallback rather than picking an arbitrary copy.
         let middle = tree
             .root_node()
-            .child((tree.root_node().child_count() / 2).try_into().unwrap())
+            .child(tree.root_node().child_count() / 2)
             .unwrap()
             .start_byte();
         for range in [0..middle, middle..text.len()] {
@@ -3359,7 +3359,7 @@ mod tests {
         let mut matches_iter = cursor.matches(&query_all, tree.root_node(), text.as_bytes());
         let mut byte_offsets = Vec::new();
         while let Some(m) = matches_iter.next() {
-            byte_offsets.push(m.captures[0].node.start_byte() + 1);
+            byte_offsets.push(m.captures()[0].node.start_byte() + 1);
         }
         assert_eq!(byte_offsets.len(), 3, "Should find 3 strings");
 
@@ -3474,7 +3474,7 @@ mod tests {
         let mut matches_iter = cursor.matches(&query, root, text.as_bytes());
         let mut nodes = Vec::new();
         while let Some(m) = matches_iter.next() {
-            nodes.push(m.captures[0].node);
+            nodes.push(m.captures()[0].node);
         }
         assert_eq!(nodes.len(), 3, "Should find 3 strings");
 
@@ -3564,7 +3564,7 @@ mod tests {
         let mut matches_iter = cursor.matches(&query, root, text.as_bytes());
         let mut nodes = Vec::new();
         while let Some(m) = matches_iter.next() {
-            nodes.push(m.captures[0].node);
+            nodes.push(m.captures()[0].node);
         }
 
         assert_eq!(nodes.len(), 3, "Should find 3 strings");
@@ -4119,7 +4119,7 @@ mod tests {
         let node = matches
             .next()
             .expect("fixture has a string literal")
-            .captures[0]
+            .captures()[0]
             .node;
         (
             vec![InjectionRegionInfo {

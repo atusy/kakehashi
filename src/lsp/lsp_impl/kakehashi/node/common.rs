@@ -23,9 +23,9 @@ use crate::lsp::lsp_impl::kakehashi::node::injection_stack::{
 use crate::lsp::lsp_impl::{Kakehashi, uri_to_url};
 
 /// A tracked node's `(start_byte, end_byte, kind)` triple, as produced by a
-/// navigation closure and consumed by the re-minting helpers below. `kind` is
-/// `&'static str` because tree-sitter interns node kinds in the grammar's
-/// static data, so it outlives the borrowed tree.
+/// navigation closure and consumed by the re-minting helpers below. `kind`
+/// comes from [`static_node_kind`](crate::language::loader::static_node_kind),
+/// so it outlives the borrowed tree.
 type NodeTriple = (usize, usize, &'static str);
 
 /// Request parameters for the id-only accessors (`kind`, `byteRange`,

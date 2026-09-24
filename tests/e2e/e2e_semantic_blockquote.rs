@@ -26,12 +26,7 @@ fn decode_semantic_tokens(data: &[u32]) -> Vec<DecodedToken> {
     let mut current_line = 0u32;
     let mut current_col = 0u32;
 
-    for chunk in data.chunks_exact(5) {
-        let delta_line = chunk[0];
-        let delta_start = chunk[1];
-        let length = chunk[2];
-        let token_type = chunk[3];
-
+    for &[delta_line, delta_start, length, token_type, _] in data.as_chunks::<5>().0 {
         current_line += delta_line;
         if delta_line > 0 {
             current_col = delta_start;

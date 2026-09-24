@@ -245,10 +245,11 @@ impl UriEntries {
 struct PositionKey {
     start_byte: usize,
     end_byte: usize,
-    /// tree-sitter node kinds are interned in the grammar's static data, so
-    /// every call site we accept input from (`Node::kind()`) returns a
-    /// `&'static str`. Storing the static slice avoids an allocation per
-    /// tracker entry without losing any genuinely owned data.
+    /// tree-sitter node kinds are interned in the grammar's data, which is
+    /// never unmapped, so call sites pass
+    /// [`static_node_kind`](crate::language::loader::static_node_kind).
+    /// Storing the static slice avoids an allocation per tracker entry without
+    /// losing any genuinely owned data.
     kind: &'static str,
     /// Injection depth that minted the node (`0` = host). Preserved by position
     /// adjustment: a depth index does not move with byte positions, so it is

@@ -29,6 +29,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::TextDocumentIdentifier;
 use ulid::Ulid;
 
+use crate::language::loader::static_node_kind;
 use crate::lsp::lsp_impl::kakehashi::node::injection_stack::with_resolved_node;
 use crate::lsp::lsp_impl::{Kakehashi, uri_to_url};
 
@@ -110,7 +111,7 @@ impl Kakehashi {
             layer,
             |node| {
                 node.parent()
-                    .map(|p| (p.start_byte(), p.end_byte(), p.kind()))
+                    .map(|p| (p.start_byte(), p.end_byte(), static_node_kind(&p)))
             },
         );
         let Some(Some((p_start, p_end, p_kind))) = parent_info else {

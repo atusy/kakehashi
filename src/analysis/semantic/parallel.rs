@@ -754,7 +754,7 @@ fn discover_single_region(
                         uri,
                         injection.content_node.start_byte(),
                         injection.content_node.end_byte(),
-                        injection.content_node.kind(),
+                        crate::language::loader::static_node_kind(&injection.content_node),
                         incarnation,
                     )?
                 } else {
@@ -762,7 +762,7 @@ fn discover_single_region(
                         uri,
                         injection.content_node.start_byte(),
                         injection.content_node.end_byte(),
-                        injection.content_node.kind(),
+                        crate::language::loader::static_node_kind(&injection.content_node),
                         0,
                         incarnation,
                     )?
@@ -3181,7 +3181,7 @@ local b = 2
                         uri,
                         info.content_node.start_byte(),
                         info.content_node.end_byte(),
-                        info.content_node.kind(),
+                        crate::language::loader::static_node_kind(&info.content_node),
                     )
                     .to_string();
                 CacheableInjectionRegion::from_region_info(info, &id, text)

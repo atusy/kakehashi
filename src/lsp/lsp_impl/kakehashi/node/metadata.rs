@@ -41,13 +41,13 @@ macro_rules! scalar_accessor {
 impl Kakehashi {
     /// `kakehashi/node/kind` — the node's grammar symbol name (`Node::kind`).
     pub async fn kakehashi_node_kind(&self, params: NodeIdParams) -> Result<Value> {
-        scalar_accessor!(self, params, "kind", |n| n.kind())
+        scalar_accessor!(self, params, "kind", |n| n.kind().to_owned())
     }
 
     /// `kakehashi/node/grammarName` — the node's grammar name, which differs
     /// from `kind` for nodes aliased by the grammar (`Node::grammar_name`).
     pub async fn kakehashi_node_grammar_name(&self, params: NodeIdParams) -> Result<Value> {
-        scalar_accessor!(self, params, "grammarName", |n| n.grammar_name())
+        scalar_accessor!(self, params, "grammarName", |n| n.grammar_name().to_owned())
     }
 
     /// `kakehashi/node/isNamed` — whether the node is *named* (vs an anonymous

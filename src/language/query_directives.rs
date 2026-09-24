@@ -17,7 +17,7 @@ pub(crate) struct CaptureCardinalities {
 
 impl CaptureCardinalities {
     fn is_single(&self, query: &Query, match_: &QueryMatch, capture_id: u32) -> bool {
-        if match_.captures.len() == 1
+        if match_.captures().len() == 1
             || matches!(
                 query.capture_quantifiers(match_.pattern_index)[capture_id as usize],
                 CaptureQuantifier::One | CaptureQuantifier::ZeroOrOne
@@ -27,7 +27,7 @@ impl CaptureCardinalities {
         }
         let counts = self.counts.get_or_init(|| {
             let mut counts = HashMap::<u32, u8>::new();
-            for capture in match_.captures {
+            for capture in match_.captures() {
                 let count = counts.entry(capture.index).or_default();
                 *count = count.saturating_add(1).min(2);
             }
@@ -212,7 +212,7 @@ fn capture_range_for_directives(
         if directive.operator.as_ref() == "trim!" {
             let is_single_capture = *is_single_capture.get_or_insert_with(|| {
                 match_
-                    .captures
+                    .captures()
                     .iter()
                     .filter(|capture| capture.index == capture_id)
                     .take(2)

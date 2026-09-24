@@ -287,7 +287,7 @@ pub(crate) fn collect_cancellable(
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             return None;
         }
-        if m.captures.is_empty() {
+        if m.captures().is_empty() {
             continue;
         }
         if !check_match_predicates(query, m, text) {
@@ -299,7 +299,7 @@ pub(crate) fn collect_cancellable(
         // The match extent: largest end byte among ALL captured nodes,
         // vocabulary and throwaway (`@_`) captures alike.
         let match_end = m
-            .captures
+            .captures()
             .iter()
             .map(|c| c.node.end_byte())
             .max()
@@ -308,7 +308,7 @@ pub(crate) fn collect_cancellable(
         // `@scope.<label>` captures in this match, for label targeting.
         // A duplicated label is an authoring error recorded as `None`.
         let mut labeled_scopes: HashMap<String, Option<Range<usize>>> = HashMap::new();
-        for capture in m.captures {
+        for capture in m.captures() {
             let (base, label) = split_capture_name(capture_names[capture.index as usize]);
             if base == "scope"
                 && let Some(label) = label
@@ -320,7 +320,7 @@ pub(crate) fn collect_cancellable(
             }
         }
 
-        for capture in m.captures {
+        for capture in m.captures() {
             let (base, label) = split_capture_name(capture_names[capture.index as usize]);
             let byte_range = capture.node.byte_range();
             let node_text = || text.get(byte_range.clone()).map(str::to_string);

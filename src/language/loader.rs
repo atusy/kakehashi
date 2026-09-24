@@ -20,7 +20,24 @@ use crate::error::LockResultExt;
 /// compute pool's thread-local parsers still referenced its grammars. In
 /// production the coordinator (and thus every loaded library) already lives
 /// for the process lifetime, so immortality changes nothing there.
+/// [`static_node_kind`] also relies on it: node-kind strings live in the
+/// grammar's data, so unmapping a library would dangle them too.
 static LOADED_LIBRARIES: OnceLock<Mutex<HashMap<PathBuf, &'static Library>>> = OnceLock::new();
+
+/// `node.kind()` as `&'static str`, so node identities can key on the
+/// grammar's interned symbol name without allocating per node.
+///
+/// tree-sitter 0.27 ties the name to the tree's lifetime because a wasm
+/// language can be freed. Every `Language` kakehashi parses with is either
+/// compiled into the binary (grammar crates in tests) or comes from an
+/// [`immortal_library`], and the `wasm` feature is off, so the symbol table
+/// outlives every tree.
+pub(crate) fn static_node_kind(node: &tree_sitter::Node<'_>) -> &'static str {
+    let kind = node.kind();
+    // SAFETY: `kind` points into the language's symbol table, which is never
+    // unmapped (see `LOADED_LIBRARIES`); only the borrow's lifetime is widened.
+    unsafe { &*std::ptr::from_ref::<str>(kind) }
+}
 
 fn resolved_library_path(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())

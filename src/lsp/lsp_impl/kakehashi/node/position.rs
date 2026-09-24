@@ -27,6 +27,7 @@
 use serde_json::{Value, json};
 use tower_lsp_server::jsonrpc::Result;
 
+use crate::language::loader::static_node_kind;
 use crate::lsp::lsp_impl::Kakehashi;
 use crate::lsp::lsp_impl::kakehashi::node::common::{NodeIdParams, NodePointRangeParams};
 use crate::lsp::lsp_impl::kakehashi::node::navigation::range_bounds_in_ranges;
@@ -146,7 +147,7 @@ impl Kakehashi {
                     } else {
                         n.descendant_for_byte_range(start_byte, end_byte)
                     };
-                    descendant.map(|d| (d.start_byte(), d.end_byte(), d.kind()))
+                    descendant.map(|d| (d.start_byte(), d.end_byte(), static_node_kind(&d)))
                 },
             )
             .await;
