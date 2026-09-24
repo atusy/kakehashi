@@ -302,15 +302,15 @@ impl Kakehashi {
 
     /// The region's current content-precise host-document END position if the
     /// region is still FRESH — i.e. re-resolving it from the live parse yields
-    /// the SAME offset the action was minted with — else `None`.
+    /// the SAME offset the action was minted with — else `RegionEndUnavailable`.
     ///
     /// The resolve path translates the resolved edit using the envelope's
     /// SNAPSHOT offset (`RegionOffset::from(&envelope.offset)`). Re-resolve the
     /// live offset and compare the WHOLE thing, not just the start: if any
     /// per-line column offset diverged (e.g. an interior blockquote-prefix edit
     /// left the start line intact) translating with the stale offset would bind
-    /// the edit to wrong host columns — corruption. On any divergence fail soft
-    /// (the client re-requests fresh actions), mirroring the stale-region case.
+    /// the edit to wrong host columns — corruption. On any divergence reject
+    /// resolve so the client can request fresh actions, as for a stale region.
     /// The same live resolution yields the content-precise region end used to
     /// bound the edit (the exact virtual-content end mapped through the live
     /// per-line offset, matching applyEdit).
@@ -410,9 +410,8 @@ impl Kakehashi {
         // count); the common case is a range within a single fence.
         // Read before the preamble snapshots the document, so the stamp can
         // only be older than the content the actions were computed on, never
-        // newer: an edit landing in between makes the actions fail soft on
-        // resolve until the editor's next request, which follows an edit
-        // anyway.
+        // newer: an edit landing in between makes resolve reject these actions,
+        // so the editor must request fresh ones.
         let Some(revision) = url::Url::parse(lsp_uri.as_str()).ok().and_then(|uri| {
             self.documents
                 .get(&uri)
