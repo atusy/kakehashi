@@ -283,9 +283,10 @@ A failed fallback does not lose its retry while a shared replacement is still
 initializing: routing returns a pending verdict from the same handle snapshot,
 and recovery waits for that handshake before rechecking current demand and
 settings. The reservation remains uncommitted throughout that read-only wait.
-A recovered shared process with folder-change support queues consolidation
-explicitly, so static capability upgrades retire existing fallback roots even
-when those roots were outside the crashed process's demand.
+Every shared handshake that reaches Ready with folder-change support queues
+consolidation, whether an ordinary acquisition or proactive recovery started it.
+Thus static capability upgrades retire existing fallback roots even when those
+roots were outside the crashed process's demand.
 What must hold:
 
 - Recovery is bounded: a server that dies on every start must not be
