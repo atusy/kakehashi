@@ -270,6 +270,13 @@ the same re-open as any other (respawn-reopen-derives-its-targets). Per-root
 connections acquire by key. Shared connections acquire using a currently open
 region's routing URI, reconstructing their initial workspace (or rootless
 route); the re-open announces each additional root before its documents.
+If the replacement lacks folder-change support, current regions previously
+routed to the shared connection may now need per-root instances. Recovery
+rechecks those units after the handshake and acquires their current routes,
+arming ordinary re-open debt before spawning a new diverted key. Each distinct
+destination is acquired once; a failed spawn without a reader enters that key's
+bounded retry loop. A new crash of the seed ends this sweep, leaving that
+connection's next restart to its own backoff.
 What must hold:
 
 - Recovery is bounded: a server that dies on every start must not be

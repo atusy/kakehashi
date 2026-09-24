@@ -626,6 +626,8 @@ documents is left for the next request to restart. Shared instances recover
 using a currently open region to reconstruct their workspace; the re-open
 announces other regions' workspace roots before sending their documents.
 Explicit rootless routing (`workspaceFolders: []`) stays rootless.
+If the replacement cannot accept additional roots, those regions recover on
+per-root instances instead, using the same bounded retry policy on failure.
 
 **Servers for any language (`languages = ["*"]`)**
 
