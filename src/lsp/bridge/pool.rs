@@ -1712,7 +1712,14 @@ impl LanguageServerPool {
             let Some(marker) = super::root_markers::workspace_at_root(folder_uri) else {
                 continue;
             };
-            self.announce_shared_root(handle, &Some(marker)).await?;
+            match self.announce_shared_root(handle, &Some(marker)).await {
+                // Routing named this handle, so re-resolving cannot divert the
+                // document elsewhere: refusing would refuse it on every
+                // attempt. A withdrawn server gets the best-effort treatment
+                // of any incapable one (#968).
+                Err(error) if BridgeError::is_folder_support_withdrawn(&error) => {}
+                result => result?,
+            }
         }
         Ok(())
     }
@@ -3386,16 +3393,16 @@ impl LanguageServerPool {
             // Routing chose this connection while it was capable and an
             // unregistration landed since (#968's rare reverse transition).
             // A marker root it does not serve must not be opened here
-            // unannounced: fail this acquisition so the next one re-resolves
-            // and diverts.
+            // unannounced: refuse, so the acquisition re-resolves and diverts.
+            // Only that transition: a server that never registered was never
+            // told of any root, and announcing to it stays a no-op.
             if let Some((root, _folder)) = marker
+                && handle
+                    .dynamic_capabilities()
+                    .ever_registered(DID_CHANGE_WORKSPACE_FOLDERS_METHOD)
                 && !incapable_shared_serves(handle, root)
             {
-                return Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    "bridge: shared instance withdrew folder-change support before \
-                     this root was announced",
-                ));
+                return Err(BridgeError::folder_support_withdrawn());
             }
             return Ok(());
         }
@@ -6311,6 +6318,55 @@ mod tests {
             .expect_err("an unserved root must not be opened unannounced");
 
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    /// The refusal above is for the reverse transition only. A server that
+    /// never registered folder changes was never told of any root, so
+    /// announcing to it stays the documented capability-less no-op.
+    #[tokio::test]
+    async fn announce_is_a_noop_on_a_shared_root_that_never_registered() {
+        let (_tmp, doc) = marker_rooted_doc();
+        let pool = LanguageServerPool::new();
+        let config = shared_config();
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
+        shared.set_server_capabilities(Default::default());
+        pool.insert_connection(Arc::clone(&shared)).await;
+        let (marker, _) = pool.resolve_marker_and_key("lua", &config, Some(&doc));
+
+        pool.announce_shared_root(&shared, &marker)
+            .await
+            .expect("a server never told of any root is not refused one");
+    }
+
+    /// Host routing names its connection explicitly, so re-resolving cannot
+    /// divert it: refusing its folders would refuse the same handle on every
+    /// attempt and the document would never open. Its announcements stay
+    /// best-effort on an incapable connection, whether or not the server
+    /// ever registered folder changes (#968).
+    #[rstest::rstest]
+    #[case::never_registered(false)]
+    #[case::registered_then_withdrawn(true)]
+    #[tokio::test]
+    async fn host_routing_folders_are_best_effort_on_an_incapable_shared_instance(
+        #[case] withdrawn: bool,
+    ) {
+        let (tmp, doc) = marker_rooted_doc();
+        let pool = LanguageServerPool::new();
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
+        shared.set_server_capabilities(Default::default());
+        if withdrawn {
+            register_folder_changes(&shared);
+            unregister_folder_changes(&shared);
+        }
+        pool.insert_connection(Arc::clone(&shared)).await;
+        let folder = Url::from_file_path(tmp.path()).unwrap();
+        pool.set_host_routing_workspace_folders(&doc, "lua", Some(Some(vec![folder.to_string()])));
+
+        pool.apply_host_routing_workspace_folders(&doc, "lua", &shared)
+            .await
+            .expect("routing chose this handle; its folders must not block the open");
     }
 
     /// A Ready shared connection whose server never advertised the
