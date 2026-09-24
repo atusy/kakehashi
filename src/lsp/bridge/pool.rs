@@ -3228,19 +3228,25 @@ impl LanguageServerPool {
         // and folder set without nesting the folder-set lock under `connections`.
         // Also note whether this root still has a per-root connection of its
         // own — one diverted after consolidation already swept, a divert that
-        // raced the registration. Probed under the same guard, so it costs one
-        // lookup, not another lock.
-        let (shared_handle, per_root_live) = {
+        // raced the registration. Match consolidation's launch-config filter:
+        // a configured per-root instance is retained there and must not trigger
+        // cleanup on every acquisition. Probed under the same guard.
+        let (shared_handle, diverted_root_live) = {
             let connections = self.connections.lock().await;
             (
                 connections.get(&shared_key).map(Arc::clone),
-                marker.is_some() && connections.contains_key(&per_root_key),
+                marker.is_some()
+                    && connections.get(&per_root_key).is_some_and(|handle| {
+                        handle
+                            .launch_config()
+                            .is_none_or(|config| config.prefers_shared_instance())
+                    }),
             )
         };
         // Such a straggler on a capable shared instance is a split nothing else
         // would ever retire — consolidation runs once, on registration — and
         // this root's documents are about to open on the shared key beside it.
-        let heal_straggler = per_root_live
+        let heal_straggler = diverted_root_live
             && shared_handle
                 .as_ref()
                 .is_some_and(|handle| handle.supports_workspace_folder_changes());
@@ -6215,6 +6221,38 @@ mod tests {
             !pool.connections.lock().await.contains_key(&straggler_key),
             "the root's own per-root process must not keep serving beside the shared one"
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_acquire_does_not_consolidate_a_configured_per_root_instance() {
+        let (_tmp, doc) = marker_rooted_doc();
+        let pool = LanguageServerPool::new();
+        let config = shared_config();
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
+        shared.record_launch_config(&config);
+        register_folder_changes(&shared);
+        pool.insert_connection(shared).await;
+
+        // A spawn holding the old non-shared config can finish after a reload's purge.
+        let old_config = devnull_config();
+        let per_root_key = pool.connection_key("lua", &old_config, Some(&doc));
+        let per_root = create_handle_with_key(ConnectionState::Ready, per_root_key).await;
+        per_root.record_launch_config(&old_config);
+        pool.insert_connection(per_root).await;
+
+        let mut upstream_requests = pool.take_upstream_request_rx().expect("receiver");
+        for _ in 0..2 {
+            let (_marker, key) = pool.resolve_acquire("lua", &config, Some(&doc)).await;
+            assert_eq!(key, ConnectionKey::shared("lua"));
+            assert!(
+                matches!(
+                    upstream_requests.try_recv(),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                ),
+                "a connection excluded from consolidation must not trigger cleanup"
+            );
+        }
     }
 
     fn unregister_folder_changes(handle: &ConnectionHandle) {
