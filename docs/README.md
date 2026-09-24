@@ -879,6 +879,12 @@ queries = [
 
 Configuration files are merged with LSP initialization options (which take highest precedence).
 
+The project file is loaded automatically. Like user configuration, it can
+select programs to launch through `languageServers.<server>.cmd` and native
+parser libraries to load through `languages.<language>.parser` or
+`searchPaths`. Settings imported through `baseConfigFiles` have the same
+capabilities; kakehashi does not prompt before using these settings.
+
 A relative path such as `./queries/highlights.scm` above resolves against the directory of the file that contains it — see [Environment Variable Expansion](#environment-variable-expansion) for the full rule.
 
 You can override the default locations with `--config-file`:

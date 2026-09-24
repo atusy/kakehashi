@@ -107,7 +107,7 @@ These constraints mean bridging is not simply "forward request, return response"
 
 **Only explicitly configured servers are spawned.** kakehashi does not auto-discover or execute arbitrary language servers based on injection content. A malicious code block cannot trigger execution of unregistered commands.
 
-- Servers must be listed in user configuration with explicit `cmd` field
+- Servers must be listed as concrete entries in the merged configuration and resolve to a non-empty `cmd`, which may be inherited from `languageServers._`; project files can supply either setting
 - No shell expansion or command interpolation in server commands
 - Injection content reaches servers as in-memory virtual documents on the
   ordinary path, so no data-at-rest surface is created for it. A server that
