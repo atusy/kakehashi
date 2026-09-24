@@ -4909,8 +4909,11 @@ mod reopen_order_tests {
     /// The handshake-owned re-open must await a host didOpen even without a
     /// parser. Cancelling eager batches cannot settle this independent repair.
     #[cfg(unix)]
+    #[rstest::rstest]
+    #[case("host-without-parser")]
+    #[case("*")]
     #[tokio::test]
-    async fn host_reopen_barrier_waits_for_the_actual_open() {
+    async fn host_reopen_barrier_waits_for_the_actual_open(#[case] server_language: &str) {
         use super::*;
         use crate::config::settings::{BridgeLanguageConfig, BridgeServerConfig, LanguageSettings};
         use crate::lsp::bridge::test_helpers::create_handle_with_state;
@@ -4945,7 +4948,7 @@ mod reopen_order_tests {
                 "test".to_string(),
                 BridgeServerConfig {
                     cmd: Some(vec!["sh".into(), "-c".into(), "cat >/dev/null".into()]),
-                    languages: Some(vec![language.to_string()]),
+                    languages: Some(vec![server_language.to_string()]),
                     workspace_markers: Some(Vec::new()),
                     ..Default::default()
                 },

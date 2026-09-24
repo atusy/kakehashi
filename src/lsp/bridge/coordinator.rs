@@ -1076,8 +1076,8 @@ impl BridgeCoordinator {
     /// spent in proportion to workspace size rather than to the work that
     /// belongs to the connection (respawn-reopen-derives-its-targets).
     ///
-    /// Conservative in the safe direction: a server declaring the `*` wildcard
-    /// could serve any injection language, so it is never pre-rejected.
+    /// A server declaring the `*` wildcard could serve any injection language,
+    /// but still needs the host's bridge filter to permit an injection.
     pub(crate) fn host_language_can_reach_server(
         &self,
         settings: &Arc<WorkspaceSettings>,
@@ -1087,6 +1087,21 @@ impl BridgeCoordinator {
         let Some(config) = settings.language_servers.get(server_name) else {
             return false;
         };
+        // `_self` names a separate host layer, not an injectable language.
+        // Even a wildcard server supplies no injections when the host permits
+        // only that layer. Otherwise a parserless host that was successfully
+        // repaired would still fail the barrier waiting for a needless parse.
+        // Resolve each entry's enabled flag through the ordinary filter so a
+        // named entry inherits `_`, and an explicit true can override false.
+        if let Some(host) = settings.resolve_host_language_settings(host_language)
+            && let Some(bridge) = &host.bridge
+            && !bridge.keys().any(|language| {
+                language != crate::config::settings::HOST_BRIDGE_KEY
+                    && host.is_language_bridgeable(language)
+            })
+        {
+            return false;
+        }
         // Resolve `_` inheritance: `languages` is `#[serde(default)]`, so a
         // server that omits it reads as declaring NOTHING until the wildcard
         // template is merged in — and the authoritative resolver merges before
@@ -3110,6 +3125,68 @@ mod tests {
         assert!(
             !coordinator.host_language_can_reach_server(&settings, "markdown", "ruff"),
             "markdown blocks python, so ruff can receive nothing from it"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::unrestricted(None, true)]
+    #[case::empty(Some(vec![]), false)]
+    #[case::host_only(Some(vec![("_self", Some(true))]), false)]
+    #[case::implicit_enabled(Some(vec![("python", None)]), true)]
+    #[case::wildcard_enabled(Some(vec![("_", None)]), true)]
+    #[case::wildcard_disabled(Some(vec![("_", Some(false)), ("_self", Some(true))]), false)]
+    #[case::inherited_disabled(Some(vec![("_", Some(false)), ("python", None)]), false)]
+    #[case::explicit_override(Some(vec![("_", Some(false)), ("python", Some(true))]), true)]
+    #[case::specific_disabled(Some(vec![("python", Some(false))]), false)]
+    fn wildcard_server_screen_obeys_injection_filter(
+        #[case] entries: Option<Vec<(&str, Option<bool>)>>,
+        #[case] reachable: bool,
+    ) {
+        let coordinator = BridgeCoordinator::new();
+        // An unlisted host inherits the language wildcard entry. The server
+        // also inherits its language list from the server wildcard entry.
+        let settings = Arc::new(WorkspaceSettings {
+            languages: HashMap::from([(
+                "_".into(),
+                LanguageSettings {
+                    bridge: entries.map(|entries| {
+                        entries
+                            .into_iter()
+                            .map(|(language, enabled)| {
+                                (
+                                    language.to_string(),
+                                    BridgeLanguageConfig {
+                                        enabled,
+                                        ..Default::default()
+                                    },
+                                )
+                            })
+                            .collect()
+                    }),
+                    ..Default::default()
+                },
+            )]),
+            language_servers: HashMap::from([
+                (
+                    "_".into(),
+                    BridgeServerConfig {
+                        languages: Some(vec!["*".into()]),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "any".into(),
+                    BridgeServerConfig {
+                        cmd: Some(vec!["any-server".into()]),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        });
+        assert_eq!(
+            coordinator.host_language_can_reach_server(&settings, "unlisted-host", "any"),
+            reachable
         );
     }
 
