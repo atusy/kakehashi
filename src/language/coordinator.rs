@@ -2215,8 +2215,7 @@ mod tests {
         let coordinator = LanguageCoordinator::new();
         let failure = coordinator
             .load_parser("../bad\n", None, &[], LanguageLogLevel::Error)
-            .err()
-            .expect("implicit lookup must reject traversal");
+            .expect_err("implicit lookup must reject traversal");
         let LanguageEvent::Log { level, message } = &failure.events[0] else {
             panic!("expected parser diagnostic");
         };
@@ -2232,8 +2231,7 @@ mod tests {
         let language = "日本語\n\u{1b}[31m\u{202e}";
         let failure = coordinator
             .load_parser(language, None, &[], LanguageLogLevel::Warning)
-            .err()
-            .expect("no parser exists");
+            .expect_err("no parser exists");
         let LanguageEvent::Log { level, message } = &failure.events[0] else {
             panic!("expected parser diagnostic");
         };
