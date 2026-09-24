@@ -3117,6 +3117,7 @@ impl LanguageServerPool {
                         marker.clone(),
                         remaining,
                         false,
+                        None,
                     )
                     .await?;
                 self.announce_shared_root(&shared, &marker).await?;
