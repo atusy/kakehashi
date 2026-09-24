@@ -794,7 +794,10 @@ impl InjectionCoordinator {
     }
 
     /// Read host language, content and revision together, without requiring a tree.
-    fn host_reopen_snapshot(&self, uri: &Url) -> Option<crate::lsp::bridge::HostResolveSnapshot> {
+    pub(crate) fn host_reopen_snapshot(
+        &self,
+        uri: &Url,
+    ) -> Option<crate::lsp::bridge::HostResolveSnapshot> {
         let document = self.documents.get(uri)?;
         let language_id = document.language_id().map(str::to_owned).or_else(|| {
             self.language

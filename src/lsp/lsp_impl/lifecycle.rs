@@ -2343,15 +2343,18 @@ async fn crashed_connection_is_wanted(
 ) -> bool {
     let server = key.server();
     for host in injection.open_host_uris() {
-        let Some((language, _)) = injection.screen_language(&host) else {
-            continue;
-        };
-        if bridge
-            .host_layer_routes_to_connection(settings, &language, &host, key)
-            .await
+        // A declared host label may intentionally differ from its grammar
+        // (custom-rust -> rust). Host routing uses that label, injections the tree.
+        if let Some(host_snapshot) = injection.host_reopen_snapshot(&host)
+            && bridge
+                .host_layer_routes_to_connection(settings, &host_snapshot.language_id, &host, key)
+                .await
         {
             return true;
         }
+        let Some((language, _)) = injection.screen_language(&host) else {
+            continue;
+        };
         if !bridge.host_language_can_reach_server(settings, &language, server) {
             continue;
         }
@@ -5021,6 +5024,81 @@ mod reopen_order_tests {
             .expect("re-open must report completion");
         assert!(*completion.borrow(), "host-only repair must report success");
         assert!(pool.is_host_document_opened_on_connection(&uri, &key).await);
+    }
+
+    #[tokio::test]
+    async fn crash_demand_uses_the_host_label_instead_of_its_parser_language() {
+        use super::*;
+        use crate::config::settings::{BridgeLanguageConfig, BridgeServerConfig, LanguageSettings};
+        use std::collections::HashMap;
+        use tower_lsp_server::LspService;
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), tree_sitter_rust::LANGUAGE.into());
+        server.language.set_base_mapping("custom-rust", "rust");
+        server
+            .settings_manager
+            .apply_settings(crate::config::WorkspaceSettings {
+                auto_install: false,
+                languages: HashMap::from([(
+                    "custom-rust".into(),
+                    LanguageSettings {
+                        base: Some("rust".into()),
+                        bridge: Some(HashMap::from([(
+                            "_self".into(),
+                            BridgeLanguageConfig {
+                                enabled: Some(true),
+                                ..Default::default()
+                            },
+                        )])),
+                        ..Default::default()
+                    },
+                )]),
+                language_servers: HashMap::from([(
+                    "alias-server".into(),
+                    BridgeServerConfig {
+                        cmd: Some(vec!["must-not-be-spawned".into()]),
+                        languages: Some(vec!["custom-rust".into()]),
+                        workspace_markers: Some(Vec::new()),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            });
+        let uri = Url::parse("file:///host-alias.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".into(),
+            Some("custom-rust".into()),
+            None,
+        );
+        server
+            .parse_coordinator()
+            .reparse_latest(&uri, Some(1))
+            .await;
+        let injection = server.injection_coordinator();
+        assert_eq!(injection.screen_language(&uri), Some(("rust".into(), true)));
+        assert_eq!(
+            server.documents.get(&uri).unwrap().language_id(),
+            Some("custom-rust")
+        );
+        let key = crate::lsp::bridge::ConnectionKey::for_server("alias-server");
+        assert!(
+            crashed_connection_is_wanted(
+                &injection,
+                &server.bridge,
+                &server.settings_manager.load_settings(),
+                &key
+            )
+            .await
+        );
+        assert!(
+            !server.bridge.pool().holds_connection(&key).await,
+            "demand must not spawn"
+        );
     }
 
     /// Exercise the actual producer, not a test that supplies `done=true` by
