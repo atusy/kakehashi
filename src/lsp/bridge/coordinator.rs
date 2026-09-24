@@ -752,7 +752,8 @@ impl BridgeCoordinator {
             .await
     }
 
-    /// Whether one of `host_uri`'s injections routes to exactly `connection`.
+    /// A current injection URI routing to exactly `connection`, suitable for
+    /// reconstructing that connection's workspace during crash recovery.
     ///
     /// Never acquires or spawns anything, unlike the routing an open performs:
     /// crash recovery asks this BEFORE its settings-guarded respawn, and an
@@ -761,16 +762,16 @@ impl BridgeCoordinator {
     /// a routing provider suppressed for this server does not count, and one
     /// with no decision yet counts as enabled, the fail-open reading routing
     /// itself gives an undecided server.
-    pub(crate) async fn host_routes_to_connection(
+    pub(crate) async fn injection_routed_to_connection(
         &self,
         settings: &Arc<WorkspaceSettings>,
         host_language: &str,
         host_uri: &Url,
         injections: Vec<BridgeInjection>,
         connection: &super::pool::ConnectionKey,
-    ) -> bool {
+    ) -> Option<Url> {
         let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
-            return false;
+            return None;
         };
         let server = connection.server();
         for injection in injections {
@@ -803,10 +804,10 @@ impl BridgeCoordinator {
                 .await
                 == connection
             {
-                return true;
+                return Some(routing_uri);
             }
         }
-        false
+        None
     }
 
     /// `host_uri`'s injections that bridge to `server_name`, with that server's
@@ -2712,7 +2713,7 @@ mod tests {
             async move {
                 tokio::time::timeout(
                     std::time::Duration::from_secs(2),
-                    coordinator.host_routes_to_connection(
+                    coordinator.injection_routed_to_connection(
                         settings, "markdown", host_uri, injections, &key,
                     ),
                 )
@@ -2720,9 +2721,9 @@ mod tests {
                 .expect("routing must not ask a candidate server")
             }
         };
-        assert!(routes_to(fallback).await);
+        assert!(routes_to(fallback).await.is_some());
         assert!(
-            !routes_to(elsewhere).await,
+            routes_to(elsewhere).await.is_none(),
             "another root's key of the same server is not this host's"
         );
     }
@@ -2757,7 +2758,7 @@ mod tests {
         // would hold an acquisition in its handshake past the timeout).
         let routed = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            coordinator.host_routes_to_connection(
+            coordinator.injection_routed_to_connection(
                 &settings,
                 "markdown",
                 &host_uri,
@@ -2767,7 +2768,10 @@ mod tests {
         )
         .await
         .expect("the check must not acquire a server");
-        assert!(routed, "an undecided region counts as routed (fail-open)");
+        assert!(
+            routed.is_some(),
+            "an undecided region counts as routed (fail-open)"
+        );
         assert!(coordinator.pool().connections().await.is_empty());
 
         let virtual_uri = super::super::protocol::VirtualDocumentUri::new(
@@ -2781,9 +2785,16 @@ mod tests {
             false,
         );
         assert!(
-            !coordinator
-                .host_routes_to_connection(&settings, "markdown", &host_uri, injections(), &key)
-                .await,
+            coordinator
+                .injection_routed_to_connection(
+                    &settings,
+                    "markdown",
+                    &host_uri,
+                    injections(),
+                    &key
+                )
+                .await
+                .is_none(),
             "a region routing suppressed for this server does not keep it wanted"
         );
     }

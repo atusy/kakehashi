@@ -535,6 +535,12 @@ fn e2e_downstream_crash_evicts_its_pushed_diagnostics() {
 /// (`diagnostics-push-crash-once`). Returns the wire-log path the mock derives
 /// its `.died` / `.replacement` markers from.
 fn init_crash_once_client() -> (LspClient, tempfile::TempDir, std::path::PathBuf) {
+    init_crash_once_client_shared(false)
+}
+
+fn init_crash_once_client_shared(
+    shared: bool,
+) -> (LspClient, tempfile::TempDir, std::path::PathBuf) {
     let config_dir = tempfile::TempDir::new().expect("temp dir");
     let config_path = config_dir.path().join("push_diagnostics.toml");
     std::fs::write(&config_path, "").expect("write config");
@@ -556,7 +562,8 @@ fn init_crash_once_client() -> (LspClient, tempfile::TempDir, std::path::PathBuf
                 "languageServers": {
                     "mock-push": {
                         "cmd": [mock_bin(), "diagnostics-push-crash-once"],
-                        "languages": ["lua"]
+                        "languages": ["lua"],
+                        "preferSharedInstance": shared
                     }
                 }
             }
@@ -617,13 +624,22 @@ fn e2e_crashed_downstream_stays_down_once_its_documents_are_closed() {
 
 #[test]
 fn e2e_crashed_downstream_is_respawned_and_its_diagnostics_return() {
+    assert_crashed_downstream_recovers(false);
+}
+
+#[test]
+fn e2e_crashed_shared_downstream_recovers_without_editor_activity() {
+    assert_crashed_downstream_recovers(true);
+}
+
+fn assert_crashed_downstream_recovers(shared: bool) {
     // #977: a crash evicts the dead server's diagnostics (#469), but nothing
     // brought the server back — on a quiet document the diagnostics stayed gone
     // until some unrelated edit happened to respawn it. The mock dies on a timer
     // after its first push, with NO client input, so no edit or request can be
     // what respawns it; the replacement tags its push, so the returning
     // diagnostic can only come from a respawned, re-opened server.
-    let (mut client, _config_dir, wire_log) = init_crash_once_client();
+    let (mut client, _config_dir, wire_log) = init_crash_once_client_shared(shared);
     open_host(&mut client);
 
     wait_for_crash_once(&mut client, &wire_log);

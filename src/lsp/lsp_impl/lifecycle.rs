@@ -2348,8 +2348,10 @@ async fn deliver_upstream_notification(
     }
 }
 
-/// Whether some open document has an injected region that routes to `key` — a
-/// connection is only worth its process while one does (#977).
+/// An open document's injection URI that routes to `key` — a connection is
+/// only worth its process while one exists (#977). Shared recovery uses this
+/// current document to reconstruct its workspace instead of remembering the
+/// dead process's folder set.
 ///
 /// Per connection, not per server: under per-root pooling a server can have
 /// open documents under another root only, and respawning this key for them
@@ -2364,12 +2366,12 @@ async fn deliver_upstream_notification(
 /// Injected regions only: the re-open that follows the respawn re-opens only
 /// injected regions, so a host-layer (`_self`) document would not bring the
 /// server's diagnostics back and is left to its next request.
-async fn crashed_connection_is_wanted(
+async fn crashed_connection_document(
     injection: &crate::lsp::lsp_impl::coordinator::InjectionCoordinator,
     bridge: &crate::lsp::bridge::BridgeCoordinator,
     settings: &Arc<crate::config::WorkspaceSettings>,
     key: &crate::lsp::bridge::ConnectionKey,
-) -> bool {
+) -> Option<Url> {
     let server = key.server();
     for host in injection.open_host_uris() {
         let Some((language, _)) = injection.screen_language(&host) else {
@@ -2379,14 +2381,14 @@ async fn crashed_connection_is_wanted(
             continue;
         }
         if let Some((host_language, Some(injections))) = injection.bridge_injections(&host)
-            && bridge
-                .host_routes_to_connection(settings, &host_language, &host, injections, key)
+            && let Some(document) = bridge
+                .injection_routed_to_connection(settings, &host_language, &host, injections, key)
                 .await
         {
-            return true;
+            return Some(document);
         }
     }
-    false
+    None
 }
 
 /// Proactively respawn a downstream connection whose reader just exited, when
@@ -2394,8 +2396,9 @@ async fn crashed_connection_is_wanted(
 ///
 /// Without this, nothing respawned a crashed server until an edit or request
 /// happened to acquire it again, so on a document nobody touched its evicted
-/// diagnostics stayed gone. The respawn is an ordinary acquire by key: its
-/// purge arms a re-open that the replacement's handshake claims, the re-open
+/// diagnostics stayed gone. The respawn uses an ordinary acquire (by key for
+/// per-root connections, by a current document for shared ones): its purge
+/// arms a re-open that the replacement's handshake claims, and the re-open
 /// derives and opens the documents the connection should hold, and the
 /// server's pushes for them flow back through the usual publish and refresh
 /// paths. A pull-driven server needs nothing more — its pull layer is not
@@ -2417,16 +2420,6 @@ fn spawn_crash_recovery(
             return;
         };
         let key = crashed.key.clone();
-        if key.is_shared() {
-            // Nothing here can re-root a dead shared instance: the marker roots
-            // it served died with its folder set. The next document that routes
-            // to it revives it with its roots intact.
-            log::debug!(
-                target: "kakehashi::bridge",
-                "Not respawning shared-instance {key}; the next document routed to it will"
-            );
-            return;
-        }
         let Some((mut delay, mut reservation)) =
             recovery_delay(&key, pool.schedule_crash_recovery(&crashed))
         else {
@@ -2545,20 +2538,24 @@ async fn attempt_crash_recovery(
             );
             return stand_down();
         };
-        if !crashed_connection_is_wanted(injection, bridge, settings, key).await {
+        let Some(document) = crashed_connection_document(injection, bridge, settings, key).await
+        else {
             log::debug!(
                 target: "kakehashi::bridge",
                 "Not respawning {key}: no open document routes to it"
             );
             return stand_down();
-        }
+        };
         // Stand down if settings change before the spawn commits: the config
         // in hand would then be history, and spawning from it would start a
         // server the new settings do not describe.
         let generation = snapshot.generation;
         let admit = || settings_manager.settings_generation() == generation;
         pool.commit_crash_recovery_attempt(key, reservation);
-        let error = match pool.revive_crashed_connection(key, &config, &admit).await {
+        let error = match pool
+            .revive_crashed_connection(key, &config, &document, &admit)
+            .await
+        {
             // Whether this call spawned the replacement or an edit's respawn
             // got there first, the key was restarted during this crash
             // streak, and the streak's budget counts restarts.
@@ -5023,7 +5020,11 @@ mod reopen_order_tests {
 
         let settings = server.settings_manager.load_settings();
         let key = crate::lsp::bridge::ConnectionKey::for_server("anything");
-        assert!(!crashed_connection_is_wanted(&injection, &server.bridge, &settings, &key).await);
+        assert!(
+            crashed_connection_document(&injection, &server.bridge, &settings, &key)
+                .await
+                .is_none()
+        );
     }
 
     #[test]
