@@ -2452,7 +2452,7 @@ impl LanguageServerPool {
         admit: &(dyn Fn() -> bool + Sync),
     ) -> io::Result<Arc<ConnectionHandle>> {
         if key.is_shared() {
-            let replacement = self
+            return self
                 .get_or_create_connection_wait_ready_admitted(
                     key.server(),
                     config,
@@ -2461,24 +2461,7 @@ impl LanguageServerPool {
                     Some(admit),
                     Some(key),
                 )
-                .await?;
-            // A static capability upgrade has no dynamic-registration event
-            // to retire fallback roots outside this crash's captured demand.
-            // Route inspection stays pure; this acquiring recovery owns the
-            // explicit handoff to cancellation-safe consolidation.
-            if replacement.key().is_shared()
-                && replacement.state() == ConnectionState::Ready
-                && replacement.supports_workspace_folder_changes()
-                && let Err(error) =
-                    self.upstream_request_tx
-                        .send(UpstreamRequest::ConsolidateSharedInstance {
-                            server: key.server().to_owned(),
-                        })
-            {
-                log::warn!(target: "kakehashi::bridge",
-                    "Failed to queue consolidation after recovering {key}: {error}");
-            }
-            return Ok(replacement);
+                .await;
         }
         let marker = marker_for_key(key).ok_or_else(|| {
             io::Error::new(
@@ -4376,6 +4359,23 @@ impl LanguageServerPool {
                             io::ErrorKind::Interrupted,
                             "bridge: connection was invalidated during initialization",
                         ));
+                    }
+                    // Ordinary acquisitions can win a shared restart before
+                    // proactive recovery wakes. Static capability upgrades
+                    // emit no registration event, so every capable shared
+                    // handshake must hand off consolidation here.
+                    if command_registration_key.is_shared()
+                        && handle_for_handshake.supports_workspace_folder_changes()
+                        && handle_for_handshake
+                            .launch_config()
+                            .is_some_and(|config| config.prefers_shared_instance())
+                        && let Err(error) =
+                            upstream_request_tx.send(UpstreamRequest::ConsolidateSharedInstance {
+                                server: server_name_for_log.clone(),
+                            })
+                    {
+                        log::warn!(target: "kakehashi::bridge",
+                            "Failed to queue consolidation after initializing {command_registration_key}: {error}");
                     }
                     // Record advertised palette command names AFTER Ready, so a
                     // command fired without an action context (raw name) routes
@@ -6620,15 +6620,32 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn recovering_a_statically_capable_shared_instance_consolidates_other_roots() {
+    async fn an_ordinary_shared_restart_consolidates_statically_upgraded_roots() {
         let (_seed_root, seed_document) = marker_rooted_doc();
         let (_other_root, other_document) = marker_rooted_doc();
         let pool = LanguageServerPool::new();
-        let config = shared_config();
+        let response = serde_json::json!({"jsonrpc":"2.0", "id":1,
+            "result":{"capabilities":capable_workspace_folders_caps()}})
+        .to_string();
+        let config = crate::config::settings::BridgeServerConfig {
+            cmd: Some(vec![
+                "sh".into(),
+                "-c".into(),
+                format!(
+                    "printf 'Content-Length: {}\\r\\n\\r\\n%s' '{}'; cat >/dev/null",
+                    response.len(),
+                    response
+                ),
+            ]),
+            ..shared_config()
+        };
         let shared_key = ConnectionKey::shared("lua");
-        let shared = create_handle_with_key(ConnectionState::Ready, shared_key.clone()).await;
-        shared.set_server_capabilities(capable_workspace_folders_caps());
+        let shared = create_handle_with_key(ConnectionState::Failed, shared_key.clone()).await;
+        shared.set_server_capabilities(Default::default());
+        let (seed_marker, _) = pool.resolve_marker_and_key("lua", &config, Some(&seed_document));
+        shared.record_spawn_root(Some(seed_marker.unwrap().0.to_string()));
         pool.insert_connection(shared).await;
         let fallback = pool.connection_key("lua", &devnull_config(), Some(&other_document));
         pool.insert_connection(
@@ -6636,9 +6653,21 @@ mod tests {
         )
         .await;
         let mut upstream = pool.take_upstream_request_rx().unwrap();
-        pool.revive_crashed_connection(&shared_key, &config, &seed_document, &|| true)
+        // An ordinary acquisition wins the restart during recovery backoff:
+        // it never calls revive_crashed_connection.
+        let replacement = pool
+            .get_or_create_connection_wait_ready(
+                "lua",
+                &config,
+                Some(&seed_document),
+                Duration::from_secs(2),
+            )
             .await
             .unwrap();
+        assert!(
+            replacement.key().is_shared(),
+            "fixture must restart the shared key"
+        );
         assert!(
             matches!(upstream.try_recv(), Ok(UpstreamRequest::ConsolidateSharedInstance { server }) if server == "lua"),
             "a static upgrade must retire fallback roots outside the seed's captured partition"
