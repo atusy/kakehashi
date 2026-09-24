@@ -25,6 +25,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{Position, TextDocumentIdentifier};
 use url::Url;
 
+use crate::language::loader::static_node_kind;
 use crate::lsp::lsp_impl::kakehashi::node::injection_stack::injection_stack_at;
 use crate::lsp::lsp_impl::{Kakehashi, uri_to_url};
 use crate::text::PositionMapper;
@@ -316,7 +317,7 @@ impl Kakehashi {
                     &uri,
                     node.start_byte(),
                     node.end_byte(),
-                    node.kind(),
+                    static_node_kind(&node),
                     layer_index,
                     incarnation,
                 );
@@ -353,7 +354,7 @@ impl Kakehashi {
             uri,
             node.start_byte(),
             node.end_byte(),
-            node.kind(),
+            static_node_kind(&node),
             incarnation,
         );
         let Some(ulid) = ulid else {

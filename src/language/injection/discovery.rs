@@ -29,7 +29,7 @@ fn iter_injection_content_captures<'a, 'b>(
     match_: &'b QueryMatch<'_, 'a>,
     query: &'b Query,
 ) -> impl Iterator<Item = QueryCapture<'a>> + 'b {
-    match_.captures.iter().copied().filter(|capture| {
+    match_.captures().iter().copied().filter(|capture| {
         query
             .capture_names()
             .get(capture.index as usize)
@@ -426,7 +426,7 @@ fn try_collect_partitioned<'a>(
     // Bound each query's fan-out so concurrent documents can share the pool.
     // Wider fan-out regressed four-document latency in the discovery experiment.
     const MAX_DISCOVERY_WINDOWS: usize = 2;
-    let chunk_size = root.child_count().div_ceil(MAX_DISCOVERY_WINDOWS);
+    let chunk_size = (root.child_count() as usize).div_ceil(MAX_DISCOVERY_WINDOWS);
     let mut walk = root.walk();
     let mut ranges = Vec::new();
     let mut start = root.start_byte();
@@ -1035,7 +1035,7 @@ impl InjectionResolver {
             uri,
             injection.content_node.start_byte(),
             injection.content_node.end_byte(),
-            injection.content_node.kind(),
+            crate::language::loader::static_node_kind(&injection.content_node),
             identity_layer,
             incarnation,
         )
@@ -1670,7 +1670,7 @@ mod tests {
                         let mut cursor = QueryCursor::new();
                         let mut matches = cursor.matches(&query, tree.root_node(), text.as_bytes());
                         while let Some(m) = matches.next() {
-                            count += std::hint::black_box(m.captures.len());
+                            count += std::hint::black_box(m.captures().len());
                         }
                     }
                 }
@@ -2023,7 +2023,7 @@ mod tests {
         // take the collision fallback rather than picking an arbitrary copy.
         let middle = tree
             .root_node()
-            .child((tree.root_node().child_count() / 2).try_into().unwrap())
+            .child(tree.root_node().child_count() / 2)
             .unwrap()
             .start_byte();
         for range in [0..middle, middle..text.len()] {
@@ -3359,7 +3359,7 @@ mod tests {
         let mut matches_iter = cursor.matches(&query_all, tree.root_node(), text.as_bytes());
         let mut byte_offsets = Vec::new();
         while let Some(m) = matches_iter.next() {
-            byte_offsets.push(m.captures[0].node.start_byte() + 1);
+            byte_offsets.push(m.captures()[0].node.start_byte() + 1);
         }
         assert_eq!(byte_offsets.len(), 3, "Should find 3 strings");
 
@@ -3474,7 +3474,7 @@ mod tests {
         let mut matches_iter = cursor.matches(&query, root, text.as_bytes());
         let mut nodes = Vec::new();
         while let Some(m) = matches_iter.next() {
-            nodes.push(m.captures[0].node);
+            nodes.push(m.captures()[0].node);
         }
         assert_eq!(nodes.len(), 3, "Should find 3 strings");
 
@@ -3564,7 +3564,7 @@ mod tests {
         let mut matches_iter = cursor.matches(&query, root, text.as_bytes());
         let mut nodes = Vec::new();
         while let Some(m) = matches_iter.next() {
-            nodes.push(m.captures[0].node);
+            nodes.push(m.captures()[0].node);
         }
 
         assert_eq!(nodes.len(), 3, "Should find 3 strings");
@@ -4119,7 +4119,7 @@ mod tests {
         let node = matches
             .next()
             .expect("fixture has a string literal")
-            .captures[0]
+            .captures()[0]
             .node;
         (
             vec![InjectionRegionInfo {

@@ -505,7 +505,7 @@ mod tests {
         let close = root
             .named_child(0)
             .and_then(|function| function.child_by_field_name("body"))
-            .and_then(|body| body.child(body.child_count().saturating_sub(1) as u32));
+            .and_then(|body| body.child(body.child_count().saturating_sub(1)));
         root.end_byte() == text.len()
             && close.is_some_and(|close| {
                 close.kind() == "}" && Some(close.start_byte()) == text.rfind('}')

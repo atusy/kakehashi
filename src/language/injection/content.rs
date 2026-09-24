@@ -533,7 +533,7 @@ mod tests {
 
         let mut let_columns: Vec<usize> = Vec::new();
         while let Some(m) = matches.next() {
-            for c in m.captures {
+            for c in m.captures() {
                 let node = c.node;
                 let mut walk = node.walk();
                 for child in node.children(&mut walk) {

@@ -25,9 +25,10 @@ use crate::language::query_predicates::check_match_predicates;
 
 /// One capture within a match: the capture name and the captured node's span.
 ///
-/// `kind` is `&'static str` because tree-sitter interns node kinds in the
-/// grammar's static data, matching the `(start, end, kind)` triple the node
-/// tracker keys on (lazy-node-identity-tracking).
+/// `kind` is `&'static str` (via
+/// [`static_node_kind`](crate::language::loader::static_node_kind)) to match
+/// the `(start, end, kind)` triple the node tracker keys on
+/// (lazy-node-identity-tracking).
 ///
 /// `metadata` holds capture-scoped properties and runtime `#gsub!` text as
 /// `(key, value)` pairs. Neither changes the raw node or capture geometry.
@@ -103,7 +104,7 @@ pub(crate) fn execute_query(
 
         let cardinalities = crate::language::query_directives::CaptureCardinalities::default();
         let captures: Vec<CapturedNode> = m
-            .captures
+            .captures()
             .iter()
             .map(|c| {
                 let node = c.node;
@@ -123,7 +124,7 @@ pub(crate) fn execute_query(
                     end_byte: node.end_byte(),
                     range_start_byte: range.start_byte,
                     range_end_byte: range.end_byte,
-                    kind: node.kind(),
+                    kind: crate::language::loader::static_node_kind(&node),
                     metadata,
                 }
             })
