@@ -619,39 +619,14 @@ impl Kakehashi {
                 code_lens_provider: Some(CodeLensOptions {
                     resolve_provider: Some(true),
                 }),
-                // Bridged commands (a `Command` surfaced in a code action) are
-                // executed via `workspace/executeCommand`, routed back to their
-                // origin server by the encoded command name (#568 PR 6). Gated
-                // on the same literal-support condition as `code_action_provider`.
-                // No STATIC `commands` here: downstream servers connect lazily so
-                // their command names aren't known at initialize. Routed names
-                // are now per-CONNECTION rather than per-document
-                // (execute-command-routing-token), so the set IS finite — but
-                // roots are still discovered lazily, so advertising them remains
-                // a deferred follow-up (see that record's Gap section). Each
-                // server's RAW command
-                // names — those from its static initialize result; a
-                // downstream's later dynamic command registrations are not
-                // collected — are dynamically registered as it reaches Ready
-                // (`UpstreamRequest::RegisterCommands` below, gated on client
-                // `dynamicRegistration`), which serves palette-fired commands
-                // — via a session-global registry keyed by raw command id. That
-                // id carries no workspace context, so when several LIVE
-                // connections advertise the same one the dispatcher refuses
-                // rather than picking by handshake order (#823); the refusal is
-                // reported to the editor, not just logged.
-                // Action-embedded commands carry ENCODED per-connection names that
-                // are never registered: a client that dispatches an action's
-                // command on provider PRESENCE (Neovim's built-in client)
-                // executes them regardless; one that only dispatches command ids
-                // from registered lists (VS Code's vscode-languageclient) still
-                // shows such an action without running its command — a known
-                // limitation.
-                execute_command_provider: client_supports_code_action_literals.then(|| {
-                    ExecuteCommandOptions {
-                        commands: vec![],
-                        work_done_progress_options: Default::default(),
-                    }
+                // Commands also arrive through inlay-hint label parts and the
+                // palette, so execution must not depend on code-action support.
+                // Lazy downstream handshakes supply the names later: both raw
+                // and connection-encoded names are dynamically registered when
+                // the client supports workspace.executeCommand.dynamicRegistration.
+                execute_command_provider: Some(ExecuteCommandOptions {
+                    commands: vec![],
+                    work_done_progress_options: Default::default(),
                 }),
                 rename_provider: Some(OneOf::Right(RenameOptions {
                     prepare_provider: Some(true),
