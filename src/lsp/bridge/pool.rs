@@ -2112,7 +2112,7 @@ impl LanguageServerPool {
     /// harmless when the resolved key's connection is already live: an
     /// armed-but-unclaimed key is invisible to the wait, and the next respawn
     /// under it claims the debt.
-    pub(super) fn arm_reopen_if_key_changed(
+    pub(crate) fn arm_reopen_if_key_changed(
         &self,
         registry_key: &ConnectionKey,
         resolved_key: &ConnectionKey,
@@ -2427,7 +2427,7 @@ impl LanguageServerPool {
         admit: &(dyn Fn() -> bool + Sync),
     ) -> io::Result<Arc<ConnectionHandle>> {
         if key.is_shared() {
-            return self
+            let replacement = self
                 .get_or_create_connection_wait_ready_admitted(
                     key.server(),
                     config,
@@ -2436,7 +2436,24 @@ impl LanguageServerPool {
                     Some(admit),
                     Some(key),
                 )
-                .await;
+                .await?;
+            // A static capability upgrade has no dynamic-registration event
+            // to retire fallback roots outside this crash's captured demand.
+            // Route inspection stays pure; this acquiring recovery owns the
+            // explicit handoff to cancellation-safe consolidation.
+            if replacement.key().is_shared()
+                && replacement.state() == ConnectionState::Ready
+                && replacement.supports_workspace_folder_changes()
+                && let Err(error) =
+                    self.upstream_request_tx
+                        .send(UpstreamRequest::ConsolidateSharedInstance {
+                            server: key.server().to_owned(),
+                        })
+            {
+                log::warn!(target: "kakehashi::bridge",
+                    "Failed to queue consolidation after recovering {key}: {error}");
+            }
+            return Ok(replacement);
         }
         let marker = marker_for_key(key).ok_or_else(|| {
             io::Error::new(
@@ -6502,6 +6519,33 @@ mod tests {
 
         let (_marker, key) = pool.resolve_acquire("lua", &config, Some(&doc)).await;
         assert_eq!(key, ConnectionKey::shared("lua"));
+    }
+
+    #[tokio::test]
+    async fn recovering_a_statically_capable_shared_instance_consolidates_other_roots() {
+        let (_seed_root, seed_document) = marker_rooted_doc();
+        let (_other_root, other_document) = marker_rooted_doc();
+        let pool = LanguageServerPool::new();
+        let config = shared_config();
+        let shared_key = ConnectionKey::shared("lua");
+        let shared = create_handle_with_key(ConnectionState::Ready, shared_key.clone()).await;
+        shared.set_server_capabilities(capable_workspace_folders_caps());
+        pool.insert_connection(shared).await;
+        let fallback = pool.connection_key("lua", &devnull_config(), Some(&other_document));
+        pool.insert_connection(
+            create_handle_with_key(ConnectionState::Ready, fallback.clone()).await,
+        )
+        .await;
+        let mut upstream = pool.take_upstream_request_rx().unwrap();
+        pool.revive_crashed_connection(&shared_key, &config, &seed_document, &|| true)
+            .await
+            .unwrap();
+        assert!(
+            matches!(upstream.try_recv(), Ok(UpstreamRequest::ConsolidateSharedInstance { server }) if server == "lua"),
+            "a static upgrade must retire fallback roots outside the seed's captured partition"
+        );
+        pool.consolidate_shared_instance("lua").await;
+        assert!(!pool.holds_connection(&fallback).await);
     }
 
     /// A per-root connection that outlived consolidation — a divert that

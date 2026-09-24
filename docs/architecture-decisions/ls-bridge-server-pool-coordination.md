@@ -262,8 +262,13 @@ routed to the shared connection may now need per-root instances. Recovery
 rechecks those units after the handshake and acquires their current routes,
 arming ordinary re-open debt before spawning a new diverted key. Each distinct
 destination is acquired once; a failed spawn without a reader enters that key's
-bounded retry loop. A new crash of the seed ends this sweep, leaving that
-connection's next restart to its own backoff.
+bounded retry loop. A new crash of the seed stops immediate acquisition, leaving
+that connection's next restart to its own backoff. Still-current diverted roots
+not yet acquired receive re-open debt and their own bounded retries, including
+when the seed establishes an incapable partition but fails before Ready.
+A recovered shared process with folder-change support queues consolidation
+explicitly, so static capability upgrades retire existing fallback roots even
+when those roots were outside the crashed process's demand.
 What must hold:
 
 - Recovery is bounded: a server that dies on every start must not be
