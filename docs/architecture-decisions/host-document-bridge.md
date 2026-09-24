@@ -99,6 +99,10 @@ Partially implemented:
   same all-or-nothing edit guard as initial hint retrieval.
   `codeAction/resolve` carries and checks the same revision stamp before
   dispatch and after the reply, and the incarnation after the reply as well.
+  A stale owned action, or a resolve that cannot produce an edit, command, or
+  disabled reason, reports `RequestFailed` with a suggestion to request fresh
+  actions. Actions without a recognized routing envelope pass through;
+  disabled results remain disabled, and cancellation remains `RequestCancelled`.
   `completionItem/resolve` carries no revision stamp: a completion list is
   meant to outlive ordinary edits — the editor filters it locally while the
   user keeps typing and resolves on accept — so before dispatch it checks the
