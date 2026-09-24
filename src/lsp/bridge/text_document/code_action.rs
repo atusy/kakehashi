@@ -229,9 +229,9 @@ fn re_envelope_action(action: &mut CodeAction, envelope: &CodeActionEnvelope) {
 /// Policy (mirrors the virt path): a disabled resolve is surfaced disabled; a
 /// materialized command is name-encoded for `executeCommand` routing; a result
 /// with no command and an empty edit is a no-op and is disabled
-/// (`REASON_RESOLVE`); a still-lazy result is re-enveloped for a further
-/// resolve. Without `disabledSupport` every disable path fails soft to the
-/// unresolved action instead.
+/// (`REASON_RESOLVE`); a still-lazy result remains an internal unresolved
+/// fallback. Without `disabledSupport` every disable path returns that fallback
+/// too. The public resolve handler reports RequestFailed for unusable fallbacks.
 fn finalize_host_resolved_action(
     mut resolved: CodeAction,
     mut action: CodeAction,
@@ -3304,7 +3304,8 @@ mod tests {
             out.disabled.is_none(),
             "a still-lazy (no-command, no-edit) resolve must be re-enveloped, not disabled"
         );
-        let env = extract_code_action_envelope(&out).expect("re-enveloped for a further resolve");
+        let env = extract_code_action_envelope(&out)
+            .expect("internal unresolved fallback keeps its envelope");
         assert!(env.host_layer);
     }
 
