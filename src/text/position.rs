@@ -3,8 +3,6 @@ use std::borrow::Cow;
 use line_index::{LineIndex, WideEncoding, WideLineCol};
 use tower_lsp_server::ls_types::Position;
 
-use super::char_boundary::floor_char_boundary;
-
 /// Position mapper for converting between LSP positions and byte offsets
 pub struct PositionMapper<'text> {
     /// LSP line index, including lone-CR line boundaries.
@@ -105,7 +103,7 @@ impl PositionMapper<'_> {
                     .position_to_byte(position)
                     .unwrap_or(line_end)
                     .min(line_end);
-                floor_char_boundary(self.text, byte)
+                self.text.floor_char_boundary(byte)
             }
             // The line itself is past EOF: clamp to the document end.
             None => self.line_index.len().into(),

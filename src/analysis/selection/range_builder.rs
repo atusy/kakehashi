@@ -22,7 +22,7 @@ use crate::language::injection::{
     self, InjectionOffset, compute_included_ranges, compute_included_ranges_clipped,
     has_include_children_for_pattern, parse_with_ranges,
 };
-use crate::text::{PositionMapper, ceil_char_boundary, floor_char_boundary};
+use crate::text::PositionMapper;
 
 /// Convert tree-sitter Node to LSP Range with proper UTF-16 encoding.
 ///
@@ -107,8 +107,8 @@ fn effective_window_for(
         Some(off) => {
             let byte_range = ByteRange::new(content_node.start_byte(), content_node.end_byte());
             let effective = calculate_effective_range(text, byte_range, off);
-            let start = ceil_char_boundary(text, effective.start);
-            let end = floor_char_boundary(text, effective.end);
+            let start = text.ceil_char_boundary(effective.start);
+            let end = text.floor_char_boundary(effective.end);
             start.min(end)..end
         }
         None => content_node.byte_range(),
