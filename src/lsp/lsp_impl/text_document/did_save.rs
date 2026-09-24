@@ -18,12 +18,26 @@ async fn saved_parse_is_current(
         server.wait_for_current_snapshot(uri, VIRTUAL_SAVE_SETTLE_BUDGET),
     )
     .await;
-    matches!(
-        settle,
+    let outcome = match settle {
         Ok(SnapshotWait::Current(snapshot))
             if snapshot.incarnation == incarnation
-                && snapshot.parsed_version == content_version
-    )
+                && snapshot.parsed_version == content_version =>
+        {
+            return true;
+        }
+        Ok(SnapshotWait::Current(_)) => "saved-lineage-mismatch",
+        Ok(SnapshotWait::Stale) => "stale",
+        Ok(SnapshotWait::Unparsed) => "unparsed",
+        Ok(SnapshotWait::Gone) => "gone",
+        Err(_) => "timeout",
+    };
+    log::debug!(
+        target: "kakehashi::synthetic_diag",
+        "virtual didSave skipped: uri={uri} saved_incarnation={incarnation} \
+         saved_content_version={content_version} settle_budget_ms={} outcome={outcome}",
+        VIRTUAL_SAVE_SETTLE_BUDGET.as_millis(),
+    );
+    false
 }
 
 impl Kakehashi {
