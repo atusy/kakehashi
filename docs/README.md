@@ -621,8 +621,11 @@ starting over only when a crash ends a run of at least five minutes; a server th
 keeps dying is left down until the next edit or request needs it. A server
 that configuration no longer starts is never restarted. Host documents are
 synchronized before the re-open barrier completes, independently of edit
-debouncing. Shared connections remain left to the next request to restart
-(#1126).
+debouncing. Shared instances recover using a current document to reconstruct
+their workspace; the re-open announces other documents' workspace roots before
+sending them. Explicit rootless routing (`workspaceFolders: []`) stays rootless.
+If the replacement cannot accept additional roots, those documents recover on
+per-root instances instead, using the same bounded retry policy on failure.
 
 **Servers for any language (`languages = ["*"]`)**
 

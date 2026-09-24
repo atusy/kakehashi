@@ -2293,8 +2293,8 @@ impl LanguageServerPool {
         if self.host_routing_rootless(document_uri, server_name) {
             return (ConnectionKey::shared(server_name), None);
         }
-        let (marker, key) = self
-            .resolve_acquire(server_name, server_config, Some(document_uri))
+        let (marker, key, _) = self
+            .resolve_connection_route(server_name, server_config, Some(document_uri))
             .await;
         (key, Some(marker))
     }
@@ -2415,22 +2415,28 @@ impl LanguageServerPool {
     /// hold are derived and opened the ordinary way
     /// (respawn-reopen-derives-its-targets).
     ///
-    /// Refused for a shared-instance key: the marker roots a dead shared
-    /// instance served died with its folder set, and nothing here can re-root
-    /// it — the next document acquisition revives it with its roots intact.
+    /// A shared key needs a current routing document to reconstruct its spawn
+    /// workspace (including an explicitly rootless route). The ordinary
+    /// document-aware acquire also handles capability fallback and root
+    /// announcement; every possible spawn retains the settings admission gate.
     pub(crate) async fn revive_crashed_connection(
         &self,
         key: &ConnectionKey,
         config: &crate::config::settings::BridgeServerConfig,
+        document_uri: &Url,
         admit: &(dyn Fn() -> bool + Sync),
     ) -> io::Result<Arc<ConnectionHandle>> {
         if key.is_shared() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!(
-                    "bridge: shared-instance connection {key} cannot be re-rooted without a document"
-                ),
-            ));
+            return self
+                .get_or_create_connection_wait_ready_admitted(
+                    key.server(),
+                    config,
+                    Some(document_uri),
+                    Duration::from_secs(INIT_TIMEOUT_SECS),
+                    Some(admit),
+                    Some(key),
+                )
+                .await;
         }
         let marker = marker_for_key(key).ok_or_else(|| {
             io::Error::new(
@@ -2452,18 +2458,15 @@ impl LanguageServerPool {
 
     /// Resolve the exact `(server, root)` connection a document currently
     /// routes to, including shared-instance capability fallback.
-    pub(super) async fn resolved_connection_key(
+    pub(crate) async fn resolved_connection_key(
         &self,
         server_name: &str,
         server_config: &crate::config::settings::BridgeServerConfig,
         document_uri: &Url,
     ) -> ConnectionKey {
-        if self.host_routing_rootless(document_uri, server_name) {
-            return ConnectionKey::shared(server_name);
-        }
-        self.resolve_acquire(server_name, server_config, Some(document_uri))
+        self.resolved_connection_key_and_marker(server_name, server_config, document_uri)
             .await
-            .1
+            .0
     }
 
     /// Membership check for the save fan-out liveness recheck (avoids the
@@ -3009,6 +3012,26 @@ impl LanguageServerPool {
         document_uri: Option<&Url>,
         timeout: Duration,
     ) -> io::Result<Arc<ConnectionHandle>> {
+        self.get_or_create_connection_wait_ready_admitted(
+            server_name,
+            server_config,
+            document_uri,
+            timeout,
+            None,
+            None,
+        )
+        .await
+    }
+
+    async fn get_or_create_connection_wait_ready_admitted(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        document_uri: Option<&Url>,
+        timeout: Duration,
+        admit: Option<&(dyn Fn() -> bool + Sync)>,
+        reopen_from: Option<&ConnectionKey>,
+    ) -> io::Result<Arc<ConnectionHandle>> {
         let start = std::time::Instant::now();
         match self
             .get_or_create_connection_wait_ready_once(
@@ -3016,6 +3039,8 @@ impl LanguageServerPool {
                 server_config,
                 document_uri,
                 timeout,
+                admit,
+                reopen_from,
             )
             .await
         {
@@ -3030,6 +3055,8 @@ impl LanguageServerPool {
                     server_config,
                     document_uri,
                     timeout.saturating_sub(start.elapsed()),
+                    admit,
+                    reopen_from,
                 )
                 .await
             }
@@ -3043,6 +3070,8 @@ impl LanguageServerPool {
         server_config: &crate::config::settings::BridgeServerConfig,
         document_uri: Option<&Url>,
         timeout: Duration,
+        admit: Option<&(dyn Fn() -> bool + Sync)>,
+        reopen_from: Option<&ConnectionKey>,
     ) -> io::Result<Arc<ConnectionHandle>> {
         // `timeout` is the caller's overall budget; the incapable-shared divert
         // below acquires a second connection, so track elapsed time and hand it
@@ -3063,6 +3092,9 @@ impl LanguageServerPool {
         let diverted_up_front = server_config.prefers_shared_instance()
             && !connection_key.is_shared()
             && !connection_key.is_client_fallback();
+        if let Some(origin) = reopen_from {
+            self.arm_reopen_if_key_changed(origin, &connection_key);
+        }
         let handle = match self
             .acquire_resolved_wait_ready(
                 server_name,
@@ -3071,7 +3103,7 @@ impl LanguageServerPool {
                 marker.clone(),
                 timeout,
                 rootless,
-                None,
+                admit,
             )
             .await
         {
@@ -3092,7 +3124,7 @@ impl LanguageServerPool {
                         marker.clone(),
                         remaining,
                         false,
-                        None,
+                        admit,
                     )
                     .await?;
                 self.announce_shared_root(&shared, &marker).await?;
@@ -3137,6 +3169,9 @@ impl LanguageServerPool {
                         .as_ref()
                         .map(|(root, _folder)| root.as_str().to_owned()),
                 );
+                if let Some(origin) = reopen_from {
+                    self.arm_reopen_if_key_changed(origin, &per_root_key);
+                }
                 let diverted = self
                     .acquire_resolved_wait_ready(
                         server_name,
@@ -3145,7 +3180,7 @@ impl LanguageServerPool {
                         marker.clone(),
                         remaining,
                         false,
-                        None,
+                        admit,
                     )
                     .await;
                 // A dynamically registering server makes this divert race its
@@ -3388,9 +3423,9 @@ impl LanguageServerPool {
     /// For a server without `preferSharedInstance`, this is exactly
     /// [`resolve_marker_and_key`](Self::resolve_marker_and_key) (per-root/#382).
     /// For an opt-in server it returns the shared-instance key — UNLESS a shared
-    /// connection already exists, is `Ready`, and is not (yet) folder-change
-    /// capable — neither declared statically nor registered dynamically. In
-    /// that case kakehashi logs once and degrades
+    /// connection already initialized (even if it later failed), and is not
+    /// folder-change capable — neither declared statically nor registered
+    /// dynamically. In that case kakehashi logs once and degrades
     /// to per-root instances, so a misconfigured opt-in never wedges the 2nd+
     /// root on a server that ignores `didChangeWorkspaceFolders`. The fallback
     /// keeps every root the connection is already serving on the shared key —
@@ -3427,10 +3462,48 @@ impl LanguageServerPool {
         Option<(Url, tower_lsp_server::ls_types::WorkspaceFolder)>,
         ConnectionKey,
     ) {
+        let (marker, key, heal_straggler) = self
+            .resolve_connection_route(server_name, server_config, document_uri)
+            .await;
+        // Handed to the upstream loop rather than awaited here: this runs in
+        // request futures a `$/cancelRequest` can drop, and retirement marks
+        // connections Closing before its cleanup awaits — a cancelled inline
+        // consolidation could strand a half-retired process. The loop runs it
+        // on a task of its own, moments after this acquisition.
+        if heal_straggler
+            && let Err(e) =
+                self.upstream_request_tx
+                    .send(UpstreamRequest::ConsolidateSharedInstance {
+                        server: server_name.to_owned(),
+                    })
+        {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "Failed to queue consolidation of {server_name}'s straggling divert \
+                 (forwarding loop gone): {e}"
+            );
+        }
+
+        (marker, key)
+    }
+
+    /// Resolve routing without scheduling pool changes. The third result tells
+    /// an acquiring caller to consolidate a straggler; inspection callers (crash
+    /// demand and named re-open) must leave that work to an actual acquisition.
+    async fn resolve_connection_route(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        document_uri: Option<&Url>,
+    ) -> (
+        Option<(Url, tower_lsp_server::ls_types::WorkspaceFolder)>,
+        ConnectionKey,
+        bool,
+    ) {
         let (marker, per_root_key) =
             self.resolve_marker_and_key(server_name, server_config, document_uri);
         if !server_config.prefers_shared_instance() {
-            return (marker, per_root_key);
+            return (marker, per_root_key, false);
         }
         // A marker-less document (no marker root, non-file URI, no document
         // hint, or the `[]` kill switch) joins the shared instance too: it has
@@ -3472,13 +3545,20 @@ impl LanguageServerPool {
                 .is_some_and(|handle| handle.supports_workspace_folder_changes());
 
         let key = match shared_handle {
-            // A Ready shared connection without the folder-CHANGE
+            // An initialized shared connection without the folder-CHANGE
             // capability (static or, so far, dynamic) can't take on new roots via
             // didChangeWorkspaceFolders (it may still serve its
             // initialize-listed folders; the divert proof below accounts
             // for both).
+            // Keep a failed probe's known root partition until it is replaced:
+            // forgetting it would move a crashed fallback's demand to the
+            // shared key and make both recovery and its re-open skip the root.
+            // A failed handshake with no capabilities established no partition.
             Some(handle)
-                if handle.state() == ConnectionState::Ready
+                if (handle.state() == ConnectionState::Ready
+                    || (handle.state() == ConnectionState::Failed
+                        && handle.server_capabilities().is_some()
+                        && handle.matches_launch_config(server_config)))
                     && !handle.supports_workspace_folder_changes() =>
             {
                 // Divert only a root the connection is not already serving,
@@ -3508,26 +3588,7 @@ impl LanguageServerPool {
             // route to the shared instance.
             _ => shared_key,
         };
-        // Handed to the upstream loop rather than awaited here: this runs in
-        // request futures a `$/cancelRequest` can drop, and retirement marks
-        // connections Closing before its cleanup awaits — a cancelled inline
-        // consolidation could strand a half-retired process. The loop runs it
-        // on a task of its own, moments after this acquisition.
-        if heal_straggler
-            && let Err(e) =
-                self.upstream_request_tx
-                    .send(UpstreamRequest::ConsolidateSharedInstance {
-                        server: server_name.to_owned(),
-                    })
-        {
-            log::warn!(
-                target: "kakehashi::bridge",
-                "Failed to queue consolidation of {server_name}'s straggling divert \
-                 (forwarding loop gone): {e}"
-            );
-        }
-
-        (marker, key)
+        (marker, key, heal_straggler)
     }
 
     /// For a shared-instance connection (#391), record this acquisition's marker
@@ -6465,6 +6526,14 @@ mod tests {
         .await;
 
         let mut upstream_requests = pool.take_upstream_request_rx().expect("receiver");
+        assert_eq!(
+            pool.resolved_connection_key("lua", &config, &doc).await,
+            ConnectionKey::shared("lua")
+        );
+        assert!(
+            upstream_requests.try_recv().is_err(),
+            "a read-only recovery eligibility check must not schedule consolidation"
+        );
         let (_marker, key) = pool.resolve_acquire("lua", &config, Some(&doc)).await;
 
         assert_eq!(key, ConnectionKey::shared("lua"));
@@ -6742,7 +6811,7 @@ mod tests {
         // Capabilities set, but WITHOUT workspaceFolders support. Its folder set
         // is empty, so it serves no root yet.
         handle.set_server_capabilities(tower_lsp_server::ls_types::ServerCapabilities::default());
-        pool.insert_connection(handle).await;
+        pool.insert_connection(Arc::clone(&handle)).await;
 
         let (_marker, key) = pool.resolve_acquire("lua", &config, Some(&doc)).await;
         assert!(
@@ -6752,6 +6821,13 @@ mod tests {
         // And it is the same per-root key the non-opt-in path would pick.
         let per_root = pool.connection_key("lua", &devnull_config(), Some(&doc));
         assert_eq!(key, per_root);
+
+        handle.set_state(ConnectionState::Failed);
+        assert_eq!(
+            pool.resolved_connection_key("lua", &config, &doc).await,
+            per_root,
+            "a crashed initialized probe must not erase the fallback's document demand"
+        );
     }
 
     /// The incapable-fallback must not split a single root across two processes:
@@ -11464,18 +11540,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_shared_instance_is_not_revived_by_crash_recovery() {
+    async fn a_shared_recovery_cannot_spawn_after_admission_expires() {
         let pool = LanguageServerPool::new();
         let result = pool
-            .revive_crashed_connection(&ConnectionKey::shared("crashy"), &devnull_config(), &|| {
-                true
-            })
+            .revive_crashed_connection(
+                &ConnectionKey::shared("crashy"),
+                &devnull_config(),
+                &Url::parse("file:///doc.lua").unwrap(),
+                &|| false,
+            )
             .await;
         assert_eq!(
             result.map(|_| ()).unwrap_err().kind(),
-            io::ErrorKind::Unsupported
+            io::ErrorKind::Interrupted
         );
         assert!(pool.connections().await.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shared_crash_recovery_preserves_explicit_rootless_routing() {
+        let pool = LanguageServerPool::new();
+        let (workspace, document) = marker_rooted_doc();
+        let root = Url::from_file_path(workspace.path()).unwrap();
+        let folder = super::super::root_markers::workspace_at_root(root.clone())
+            .unwrap()
+            .1;
+        pool.set_root_uri(Some(root.to_string()));
+        pool.set_workspace_folders(Some(vec![folder]));
+        // Rootless routing uses a shared key even WITHOUT preferSharedInstance.
+        let config = devnull_config();
+        pool.set_host_routing_workspace_folders(&document, "lua", Some(Some(vec![])));
+        pool.set_host_routing_rootless(&document, "lua", true);
+        let key = ConnectionKey::shared("lua");
+        let (failed, _) = insert_spawned_connection(&pool, &key, ConnectionState::Failed).await;
+        failed.record_spawn_root(Some(root.to_string()));
+
+        // The sink never answers initialize. Inspect the spawned replacement
+        // while its handshake waits, rather than needing a second LSP mock.
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                pool.revive_crashed_connection(&key, &config, &document, &|| true),
+            )
+            .await
+            .is_err()
+        );
+        let connections = pool.connections().await;
+        let replacement = connections
+            .get(&key)
+            .expect("shared replacement was spawned");
+        assert!(!Arc::ptr_eq(replacement, &failed));
+        assert!(replacement.spawn_root().is_none());
+        assert!(
+            replacement
+                .workspace_folders()
+                .snapshot()
+                .unwrap_or_default()
+                .is_empty()
+        );
+        assert_eq!(
+            connections.len(),
+            1,
+            "no marker-root fallback may be spawned"
+        );
     }
 
     #[tokio::test]

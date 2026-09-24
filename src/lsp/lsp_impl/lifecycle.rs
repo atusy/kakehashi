@@ -2326,8 +2326,9 @@ async fn deliver_upstream_notification(
     }
 }
 
-/// Whether some open host document or injected region routes to `key` — a
-/// connection is only worth its process while one does (#977).
+/// An open host document or injection URI that routes to `key`. Shared
+/// recovery uses this current document to reconstruct its workspace instead
+/// of remembering the dead process's folder set.
 ///
 /// Per connection, not per server: under per-root pooling a server can have
 /// open documents under another root only, and respawning this key for them
@@ -2341,12 +2342,12 @@ async fn deliver_upstream_notification(
 ///
 /// Host-layer (`_self`) demand is checked independently of parsing: the
 /// awaited re-open restores the host text even when no parser exists.
-async fn crashed_connection_is_wanted(
+async fn crashed_connection_document(
     injection: &crate::lsp::lsp_impl::coordinator::InjectionCoordinator,
     bridge: &crate::lsp::bridge::BridgeCoordinator,
     settings: &Arc<crate::config::WorkspaceSettings>,
     key: &crate::lsp::bridge::ConnectionKey,
-) -> bool {
+) -> Option<Url> {
     let server = key.server();
     for host in injection.open_host_uris() {
         // A declared host label may intentionally differ from its grammar
@@ -2356,7 +2357,7 @@ async fn crashed_connection_is_wanted(
                 .host_layer_routes_to_connection(settings, &host_snapshot.language_id, &host, key)
                 .await
         {
-            return true;
+            return Some(host);
         }
         let Some((language, _)) = injection.screen_language(&host) else {
             continue;
@@ -2365,14 +2366,62 @@ async fn crashed_connection_is_wanted(
             continue;
         }
         if let Some((host_language, Some(injections))) = injection.bridge_injections(&host)
-            && bridge
-                .host_routes_to_connection(settings, &host_language, &host, injections, key)
+            && let Some(document) = bridge
+                .injection_routed_to_connection(settings, &host_language, &host, injections, key)
                 .await
         {
-            return true;
+            return Some(document);
         }
     }
-    false
+    None
+}
+
+/// Current units belonging to the shared connection, collected only for this
+/// attempt. A replacement can lose folder-change support, so some of these
+/// units may need a freshly created per-root connection after its handshake.
+async fn crashed_shared_documents(
+    injection: &crate::lsp::lsp_impl::coordinator::InjectionCoordinator,
+    bridge: &crate::lsp::bridge::BridgeCoordinator,
+    settings: &Arc<crate::config::WorkspaceSettings>,
+    key: &crate::lsp::bridge::ConnectionKey,
+    config: &crate::config::settings::BridgeServerConfig,
+) -> Vec<(Url, Url)> {
+    let mut documents = Vec::new();
+    let pool = bridge.pool();
+    for host in injection.open_host_uris() {
+        if let Some(snapshot) = injection.host_reopen_snapshot(&host)
+            && bridge
+                .host_layer_routes_to_connection(settings, &snapshot.language_id, &host, key)
+                .await
+        {
+            documents.push((host.clone(), host.clone()));
+        }
+        let Some((language, _)) = injection.screen_language(&host) else {
+            continue;
+        };
+        if !bridge.host_language_can_reach_server(settings, &language, key.server()) {
+            continue;
+        }
+        let Some((language, Some(injections))) = injection.bridge_injections(&host) else {
+            continue;
+        };
+        for document in bridge.recovery_injection_documents(
+            settings,
+            &language,
+            &host,
+            injections,
+            key.server(),
+        ) {
+            if pool
+                .resolved_connection_key(key.server(), config, &document)
+                .await
+                == *key
+            {
+                documents.push((host.clone(), document));
+            }
+        }
+    }
+    documents
 }
 
 /// Proactively respawn a downstream connection whose reader just exited, when
@@ -2380,8 +2429,9 @@ async fn crashed_connection_is_wanted(
 ///
 /// Without this, nothing respawned a crashed server until an edit or request
 /// happened to acquire it again, so on a document nobody touched its evicted
-/// diagnostics stayed gone. The respawn is an ordinary acquire by key: its
-/// purge arms a re-open that the replacement's handshake claims, the re-open
+/// diagnostics stayed gone. The respawn uses an ordinary acquire (by key for
+/// per-root connections, by a current document for shared ones): its purge
+/// arms a re-open that the replacement's handshake claims, and the re-open
 /// derives and opens the documents the connection should hold, and the
 /// server's pushes for them flow back through the usual publish and refresh
 /// paths. A pull-driven server needs nothing more — its pull layer is not
@@ -2402,23 +2452,25 @@ fn spawn_crash_recovery(
         let Some(crashed) = pool.crashed_connection(connection_id).await else {
             return;
         };
-        let key = crashed.key.clone();
-        if key.is_shared() {
-            // Nothing here can re-root a dead shared instance: the marker roots
-            // it served died with its folder set. The next document that routes
-            // to it revives it with its roots intact.
-            log::debug!(
-                target: "kakehashi::bridge",
-                "Not respawning shared-instance {key}; the next document routed to it will"
-            );
-            return;
-        }
-        let Some((mut delay, mut reservation)) =
-            recovery_delay(&key, pool.schedule_crash_recovery(&crashed))
-        else {
+        let decision = pool.schedule_crash_recovery(&crashed);
+        crash_recovery_loop(injection, settings_manager, crashed.key, decision, false).await;
+    });
+}
+
+/// A boxed task lets a failed new per-root divert use the same bounded retry
+/// loop without coupling its schedule to the now-live shared connection.
+fn crash_recovery_loop(
+    injection: crate::lsp::lsp_impl::coordinator::InjectionCoordinator,
+    settings_manager: Arc<crate::lsp::settings_manager::SettingsManager>,
+    key: crate::lsp::bridge::ConnectionKey,
+    decision: crate::lsp::bridge::RecoveryDecision,
+    mut after_own_failure: bool,
+) -> futures::future::BoxFuture<'static, ()> {
+    Box::pin(async move {
+        let bridge = Arc::clone(injection.bridge());
+        let Some((mut delay, mut reservation)) = recovery_delay(&key, decision) else {
             return;
         };
-        let mut after_own_failure = false;
         loop {
             tokio::time::sleep(delay).await;
             let next = match attempt_crash_recovery(
@@ -2448,7 +2500,7 @@ fn spawn_crash_recovery(
                 None => return,
             }
         }
-    });
+    })
 }
 
 /// What one crash-recovery attempt leaves to do.
@@ -2499,7 +2551,7 @@ fn recovery_delay(
 async fn attempt_crash_recovery(
     injection: &crate::lsp::lsp_impl::coordinator::InjectionCoordinator,
     bridge: &Arc<crate::lsp::bridge::BridgeCoordinator>,
-    settings_manager: &crate::lsp::settings_manager::SettingsManager,
+    settings_manager: &Arc<crate::lsp::settings_manager::SettingsManager>,
     key: &crate::lsp::bridge::ConnectionKey,
     reservation: crate::lsp::bridge::Reservation,
     after_own_failure: bool,
@@ -2531,28 +2583,103 @@ async fn attempt_crash_recovery(
             );
             return stand_down();
         };
-        if !crashed_connection_is_wanted(injection, bridge, settings, key).await {
+        let shared_documents = if key.is_shared() {
+            crashed_shared_documents(injection, bridge, settings, key, &config).await
+        } else {
+            Vec::new()
+        };
+        let document = if key.is_shared() {
+            shared_documents
+                .first()
+                .map(|(_, document)| document.clone())
+        } else {
+            crashed_connection_document(injection, bridge, settings, key).await
+        };
+        let Some(document) = document else {
             log::debug!(
                 target: "kakehashi::bridge",
                 "Not respawning {key}: no open document routes to it"
             );
             return stand_down();
-        }
+        };
         // Stand down if settings change before the spawn commits: the config
         // in hand would then be history, and spawning from it would start a
         // server the new settings do not describe.
         let generation = snapshot.generation;
         let admit = || settings_manager.settings_generation() == generation;
         pool.commit_crash_recovery_attempt(key, reservation);
-        let error = match pool.revive_crashed_connection(key, &config, &admit).await {
+        let seed = pool
+            .revive_crashed_connection(key, &config, &document, &admit)
+            .await;
+        let seed =
+            recover_diverted_seed(injection, settings_manager, key, &config, &document, seed).await;
+        let error = match seed {
             // Whether this call spawned the replacement or an edit's respawn
             // got there first, the key was restarted during this crash
             // streak, and the streak's budget counts restarts.
-            Ok(_) => {
+            Ok((replacement, failed_seed)) => {
                 log::info!(
                     target: "kakehashi::bridge",
                     "Crashed downstream {key} is back up"
                 );
+                let mut acquired =
+                    std::collections::HashSet::from([replacement.key().clone(), key.clone()]);
+                acquired.extend(failed_seed);
+                for (host, document) in shared_documents {
+                    if !admit() || replacement.state() != crate::lsp::bridge::ConnectionState::Ready
+                    {
+                        break;
+                    }
+                    // Re-derive each layer's demand after the handshake:
+                    // hosts need their declared label, regions a current tree.
+                    let destination = pool
+                        .resolved_connection_key(server, &config, &document)
+                        .await;
+                    let host_is_wanted = if document == host {
+                        if let Some(snapshot) = injection.host_reopen_snapshot(&host) {
+                            bridge
+                                .host_layer_routes_to_connection(
+                                    settings,
+                                    &snapshot.language_id,
+                                    &host,
+                                    &destination,
+                                )
+                                .await
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if !host_is_wanted {
+                        let Some((language, Some(injections))) = injection.bridge_injections(&host)
+                        else {
+                            continue;
+                        };
+                        if !bridge
+                            .recovery_injection_documents(
+                                settings, &language, &host, injections, server,
+                            )
+                            .contains(&document)
+                        {
+                            continue;
+                        }
+                    }
+                    if !acquired.insert(destination.clone()) {
+                        continue;
+                    }
+                    // Never turn this sweep into another immediate shared
+                    // restart if the seed dies again: its crash owns backoff.
+                    let admit_divert = || {
+                        admit() && replacement.state() == crate::lsp::bridge::ConnectionState::Ready
+                    };
+                    if let Err(error) = pool
+                        .revive_crashed_connection(key, &config, &document, &admit_divert)
+                        .await
+                    {
+                        retry_failed_divert(injection, settings_manager, destination, error).await;
+                    }
+                }
                 return RecoveryAttempt::Done;
             }
             Err(error) => error,
@@ -2588,6 +2715,71 @@ async fn attempt_crash_recovery(
             after_own_failure: !pool.holds_connection(key).await,
         };
     }
+}
+
+/// Preserve a live shared replacement after a diverted seed fails, so sibling
+/// roots can still be recovered without immediately retrying the failed root.
+async fn recover_diverted_seed(
+    injection: &crate::lsp::lsp_impl::coordinator::InjectionCoordinator,
+    settings_manager: &Arc<crate::lsp::settings_manager::SettingsManager>,
+    key: &crate::lsp::bridge::ConnectionKey,
+    config: &crate::config::settings::BridgeServerConfig,
+    document: &Url,
+    seed: std::io::Result<Arc<crate::lsp::bridge::ConnectionHandle>>,
+) -> std::io::Result<(
+    Arc<crate::lsp::bridge::ConnectionHandle>,
+    Option<crate::lsp::bridge::ConnectionKey>,
+)> {
+    let error = match seed {
+        Ok(replacement) => return Ok((replacement, None)),
+        Err(error) => error,
+    };
+    if !key.is_shared() || error.kind() == std::io::ErrorKind::Interrupted {
+        return Err(error);
+    }
+    let pool = injection.bridge().pool();
+    let Some(shared) = pool
+        .ready_connection_by_key_for_config(key, Some(config))
+        .await
+    else {
+        return Err(error);
+    };
+    let destination = pool
+        .resolved_connection_key(key.server(), config, document)
+        .await;
+    if destination == *key {
+        return Err(error);
+    }
+    // The shared process is already up; only this diverted root failed.
+    // Continue the original shared sweep, but give that root its own backoff
+    // and skip it in the sweep rather than immediately attempting it again.
+    retry_failed_divert(injection, settings_manager, destination.clone(), error).await;
+    Ok((shared, Some(destination)))
+}
+
+/// A failed diverted spawn may have no reader to report its crash. Give that
+/// actual destination the same bounded retry loop as a normal crashed key.
+async fn retry_failed_divert(
+    injection: &crate::lsp::lsp_impl::coordinator::InjectionCoordinator,
+    settings_manager: &Arc<crate::lsp::settings_manager::SettingsManager>,
+    destination: crate::lsp::bridge::ConnectionKey,
+    error: std::io::Error,
+) {
+    let pool = injection.bridge().pool();
+    if error.kind() == std::io::ErrorKind::Interrupted || pool.reports_crash_for(&destination).await
+    {
+        return;
+    }
+    log::warn!(target: "kakehashi::bridge", "Could not recover diverted downstream {destination}: {error}");
+    let decision = pool.schedule_crash_retry(&destination);
+    let emptied = !pool.holds_connection(&destination).await;
+    tokio::spawn(crash_recovery_loop(
+        injection.clone(),
+        Arc::clone(settings_manager),
+        destination,
+        decision,
+        emptied,
+    ));
 }
 
 /// Cancellable upstream forwarding loop without a Client (for testing).
@@ -5105,13 +5297,14 @@ mod reopen_order_tests {
         );
         let key = crate::lsp::bridge::ConnectionKey::for_server("alias-server");
         assert!(
-            crashed_connection_is_wanted(
+            crashed_connection_document(
                 &injection,
                 &server.bridge,
                 &server.settings_manager.load_settings(),
                 &key
             )
             .await
+            .is_some()
         );
         assert!(
             !server.bridge.pool().holds_connection(&key).await,
@@ -5158,6 +5351,68 @@ mod reopen_order_tests {
         assert!(
             *completion.borrow(),
             "a completed repair must report success"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_diverted_seed_retries_its_root_and_keeps_the_shared_sweep_alive() {
+        use super::*;
+        use crate::lsp::bridge::{ConnectionKey, RecoveryDecision};
+        use tower_lsp_server::LspService;
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let injection = server.injection_coordinator();
+        let pool = server.bridge.pool();
+        let shared_key = ConnectionKey::shared("test");
+        // A concurrent ordinary acquisition replaced the shared process and
+        // its replacement cannot add another root. The seed now diverts.
+        let shared = crate::lsp::bridge::test_helpers::create_ready_handle_with_capabilities(
+            shared_key.clone(),
+            Default::default(),
+        )
+        .await;
+        pool.insert_connection(Arc::clone(&shared)).await;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        let document = Url::from_file_path(root.path().join("doc.md")).unwrap();
+        let config = crate::config::settings::BridgeServerConfig {
+            prefer_shared_instance: Some(true),
+            ..Default::default()
+        };
+        let destination = pool
+            .resolved_connection_key("test", &config, &document)
+            .await;
+        assert_ne!(destination, shared_key);
+        let (continuation, failed_seed) = recover_diverted_seed(
+            &injection,
+            &server.settings_manager,
+            &shared_key,
+            &config,
+            &document,
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "seed executable disappeared",
+            )),
+        )
+        .await
+        .expect("other roots must still be recovered through the live shared replacement");
+        assert!(Arc::ptr_eq(&continuation, &shared));
+        assert_eq!(
+            failed_seed,
+            Some(destination.clone()),
+            "the sweep must skip the root already waiting for retry"
+        );
+        assert_eq!(
+            pool.schedule_crash_retry(&destination),
+            RecoveryDecision::AlreadyScheduled
+        );
+        assert!(
+            matches!(
+                pool.schedule_crash_retry(&shared_key),
+                RecoveryDecision::Retry { .. }
+            ),
+            "the live shared key must not own the failed per-root retry"
         );
     }
 
@@ -5215,7 +5470,11 @@ mod reopen_order_tests {
 
         let settings = server.settings_manager.load_settings();
         let key = crate::lsp::bridge::ConnectionKey::for_server("anything");
-        assert!(!crashed_connection_is_wanted(&injection, &server.bridge, &settings, &key).await);
+        assert!(
+            crashed_connection_document(&injection, &server.bridge, &settings, &key)
+                .await
+                .is_none()
+        );
     }
 
     #[test]

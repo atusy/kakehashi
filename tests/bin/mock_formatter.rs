@@ -132,6 +132,12 @@
 //!   `:replacement` and leaves a `.replacement` marker. Used to prove the bridge
 //!   respawns a crashed server and its diagnostics come back without any editor
 //!   action — and that it does not when nothing open needs the server (#977).
+//! - `diagnostics-push-crash-folders` — the same spontaneous one-time crash,
+//!   with workspace-folder support; each diagnostic reports the folders known
+//!   when that document was opened, including on the replacement process.
+//! - `diagnostics-push-crash-downgrade` — reports folders as above, but only
+//!   the first process supports folder changes; replacements require per-root
+//!   fallback, exposing quiet documents omitted by a shared-only re-open.
 //! - `diagnostics-refresh` — sends a `workspace/diagnostic/refresh` server→client
 //!   request on `didOpen`. The bridge forwards it upstream to the editor; used to
 //!   prove that forward is capability-gated (#521).
@@ -237,9 +243,13 @@ fn main() {
     // `diagnostics-push-crash-once`: a process started after the first one died
     // is the bridge's replacement; it tags its push so a test can tell the
     // re-published diagnostic from the original.
-    let crash_once_replacement = mode == "diagnostics-push-crash-once"
-        && std::env::var("MOCK_LSP_WIRE_LOG")
-            .is_ok_and(|path| Path::new(&format!("{path}.died")).exists());
+    let crash_once_replacement = matches!(
+        mode.as_str(),
+        "diagnostics-push-crash-once"
+            | "diagnostics-push-crash-folders"
+            | "diagnostics-push-crash-downgrade"
+    ) && std::env::var("MOCK_LSP_WIRE_LOG")
+        .is_ok_and(|path| Path::new(&format!("{path}.died")).exists());
     // ...and records that it started, so a test can tell no replacement came.
     if crash_once_replacement && let Ok(path) = std::env::var("MOCK_LSP_WIRE_LOG") {
         let _ = std::fs::write(format!("{path}.replacement"), b"");
@@ -499,16 +509,23 @@ fn main() {
                             "save": { "includeText": true }
                         }
                     }),
-                    "workspace-folders" => json!({
-                        "hoverProvider": true,
-                        "textDocumentSync": 1,
-                        "workspace": {
-                            "workspaceFolders": {
-                                "supported": true,
-                                "changeNotifications": true
+                    "workspace-folders"
+                    | "diagnostics-push-crash-folders"
+                    | "diagnostics-push-crash-downgrade"
+                        if mode != "diagnostics-push-crash-downgrade"
+                            || !crash_once_replacement =>
+                    {
+                        json!({
+                            "hoverProvider": true,
+                            "textDocumentSync": 1,
+                            "workspace": {
+                                "workspaceFolders": {
+                                    "supported": true,
+                                    "changeNotifications": true
+                                }
                             }
-                        }
-                    }),
+                        })
+                    }
                     // Declares `supported` but NOT `changeNotifications`:
                     // folder-change support arrives later, via a dynamic
                     // registration sent on `initialized` (#968).
@@ -616,8 +633,19 @@ fn main() {
                             "textDocument/publishDiagnostics",
                             push_diagnostics(uri, true),
                         );
-                    } else if mode == "diagnostics-push-crash-once" {
-                        let message = if crash_once_replacement {
+                    } else if matches!(
+                        mode.as_str(),
+                        "diagnostics-push-crash-once"
+                            | "diagnostics-push-crash-folders"
+                            | "diagnostics-push-crash-downgrade"
+                    ) {
+                        let message = if mode != "diagnostics-push-crash-once" {
+                            json!({
+                                "replacement": crash_once_replacement,
+                                "foldersAtOpen": workspace_folders,
+                            })
+                            .to_string()
+                        } else if crash_once_replacement {
                             format!("mock-push-diag:{uri}:replacement")
                         } else {
                             format!("mock-push-diag:{uri}")
@@ -833,6 +861,12 @@ fn main() {
                 respond(&mut writer, id, result);
             }
             "workspace/didChangeWorkspaceFolders" => {
+                if mode == "diagnostics-push-crash-downgrade" && crash_once_replacement {
+                    // This replacement cannot learn another root. Recording
+                    // the notification anyway would let a broken bridge pass
+                    // the fallback test by opening everything on one process.
+                    continue;
+                }
                 // Notification (no id): record every added folder URI so a
                 // later hover can prove the bridge announced the new root.
                 if let Some(added) = message

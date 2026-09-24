@@ -65,8 +65,12 @@ trade-off, not a captured-list resurrection.)
 The previous design armed only when the captured list was non-empty, which is
 what left a young connection's replacement unrepaired. Arming records that a
 connection was replaced — a fact about the connection, not about its contents —
-so there is nothing to be empty. A first-ever spawn is still free: no prior
-purge, no armed key, no re-open.
+so there is nothing to be empty. An ordinary first-ever spawn is still free:
+no prior purge, no armed key, no re-open. Crash recovery also arms a newly
+diverted per-root key before acquiring it when a replacement shared instance
+lacks folder-change support (#1126). That process has no predecessor under its
+own key, but inherits current document demand from the crashed shared instance;
+its handshake claims the debt and derives its documents in the same way.
 
 Symmetrically, a handshake that finds an armed key always emits the re-open
 request. Both halves must be unconditional; leaving either gated on a captured

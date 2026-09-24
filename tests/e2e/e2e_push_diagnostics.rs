@@ -535,6 +535,21 @@ fn e2e_downstream_crash_evicts_its_pushed_diagnostics() {
 /// (`diagnostics-push-crash-once`). Returns the wire-log path the mock derives
 /// its `.died` / `.replacement` markers from.
 fn init_crash_once_client() -> (LspClient, tempfile::TempDir, std::path::PathBuf) {
+    init_crash_once_client_shared(false)
+}
+
+fn init_crash_once_client_shared(
+    shared: bool,
+) -> (LspClient, tempfile::TempDir, std::path::PathBuf) {
+    init_crash_once_client_workspace(shared, "diagnostics-push-crash-once", Value::Null, false)
+}
+
+fn init_crash_once_client_workspace(
+    shared: bool,
+    mode: &str,
+    workspace_folders: Value,
+    host_layer: bool,
+) -> (LspClient, tempfile::TempDir, std::path::PathBuf) {
     let config_dir = tempfile::TempDir::new().expect("temp dir");
     let config_path = config_dir.path().join("push_diagnostics.toml");
     std::fs::write(&config_path, "").expect("write config");
@@ -551,12 +566,20 @@ fn init_crash_once_client() -> (LspClient, tempfile::TempDir, std::path::PathBuf
             "processId": std::process::id(),
             "rootUri": null,
             "capabilities": {},
-            "workspaceFolders": null,
+            "workspaceFolders": workspace_folders,
             "initializationOptions": {
+                "languages": if host_layer {
+                    json!({ "markdown": { "bridge": {
+                        "_": { "enabled": false }, "_self": { "enabled": true }
+                    }}})
+                } else {
+                    json!({})
+                },
                 "languageServers": {
                     "mock-push": {
-                        "cmd": [mock_bin(), "diagnostics-push-crash-once"],
-                        "languages": ["lua"]
+                        "cmd": [mock_bin(), mode],
+                        "languages": [if host_layer { "markdown" } else { "lua" }],
+                        "preferSharedInstance": shared
                     }
                 }
             }
@@ -568,15 +591,25 @@ fn init_crash_once_client() -> (LspClient, tempfile::TempDir, std::path::PathBuf
 
 #[test]
 fn e2e_crashed_host_only_server_restores_diagnostics_without_editor_activity() {
-    assert_crashed_host_server_recovers(false);
+    assert_crashed_host_server_recovers(false, false);
 }
 
 #[test]
 fn e2e_crashed_mixed_server_restores_host_and_injection_diagnostics() {
-    assert_crashed_host_server_recovers(true);
+    assert_crashed_host_server_recovers(true, false);
 }
 
-fn assert_crashed_host_server_recovers(with_injections: bool) {
+#[test]
+fn e2e_crashed_shared_host_only_server_restores_diagnostics() {
+    assert_crashed_host_server_recovers(false, true);
+}
+
+#[test]
+fn e2e_crashed_shared_mixed_server_restores_both_layers() {
+    assert_crashed_host_server_recovers(true, true);
+}
+
+fn assert_crashed_host_server_recovers(with_injections: bool, shared: bool) {
     let config_dir = tempfile::TempDir::new().unwrap();
     let config_path = config_dir.path().join("host-crash.toml");
     std::fs::write(&config_path, "").unwrap();
@@ -599,6 +632,7 @@ fn assert_crashed_host_server_recovers(with_injections: bool) {
                 }}},
                 "languageServers": { "mock-push": {
                     "cmd": [mock_bin(), "diagnostics-push-crash-once"],
+                    "preferSharedInstance": shared,
                     "languages": if with_injections { vec!["markdown", "lua"] } else { vec!["markdown"] }
                 }}
             }
@@ -686,13 +720,148 @@ fn e2e_crashed_downstream_stays_down_once_its_documents_are_closed() {
 
 #[test]
 fn e2e_crashed_downstream_is_respawned_and_its_diagnostics_return() {
+    assert_crashed_downstream_recovers(false);
+}
+
+#[test]
+fn e2e_crashed_shared_downstream_recovers_without_editor_activity() {
+    assert_crashed_downstream_recovers(true);
+}
+
+#[test]
+fn e2e_shared_crash_recovery_announces_marker_and_client_roots_before_open() {
+    assert_shared_crash_workspace_recovery("diagnostics-push-crash-folders", true, false);
+}
+
+#[test]
+fn e2e_shared_crash_recovery_reopens_new_per_root_fallbacks() {
+    assert_shared_crash_workspace_recovery("diagnostics-push-crash-downgrade", false, false);
+}
+
+#[test]
+fn e2e_shared_host_crash_recovery_reopens_new_per_root_fallbacks() {
+    assert_shared_crash_workspace_recovery("diagnostics-push-crash-downgrade", false, true);
+}
+
+fn assert_shared_crash_workspace_recovery(mode: &str, include_markerless: bool, host_layer: bool) {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let roots: Vec<_> = ["a", "b", "client"]
+        .into_iter()
+        .map(|name| workspace.path().join(name))
+        .collect();
+    for root in &roots {
+        std::fs::create_dir_all(root).unwrap();
+    }
+    for root in &roots[..2] {
+        std::fs::create_dir(root.join(".git")).unwrap();
+    }
+    let root_uris: Vec<_> = roots
+        .iter()
+        .map(|root| url::Url::from_file_path(root).unwrap().to_string())
+        .collect();
+    let documents: Vec<_> = roots
+        .iter()
+        .take(if include_markerless { 3 } else { 2 })
+        .map(|root| {
+            url::Url::from_file_path(root.join("doc.md"))
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    let (mut client, _config, wire_log) = init_crash_once_client_workspace(
+        true,
+        mode,
+        json!([{ "uri": root_uris[2], "name": "client" }]),
+        host_layer,
+    );
+    for uri in &documents {
+        client.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri, "languageId": "markdown", "version": 1, "text": MD_TEXT,
+                }
+            }),
+        );
+    }
+
+    // Each push reports the workspace known WHEN its didOpen arrived. Merely
+    // checking the eventual union would miss folders announced too late.
+    // No request or edit may be what causes the replacement to start.
+    let mut pending: std::collections::HashMap<_, _> = documents.iter().zip(&root_uris).collect();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !pending.is_empty() {
+        let (_, params) = client
+            .wait_for_notification_where(
+                &["textDocument/publishDiagnostics"],
+                deadline.saturating_duration_since(std::time::Instant::now()),
+                |params| {
+                    params["diagnostics"].as_array().is_some_and(|diagnostics| {
+                        diagnostics.iter().any(|diagnostic| {
+                            diagnostic["message"]
+                                .as_str()
+                                .and_then(|message| serde_json::from_str::<Value>(message).ok())
+                                .is_some_and(|report| report["replacement"] == true)
+                        })
+                    })
+                },
+            )
+            .unwrap_or_else(|| panic!("replacement diagnostics missing for {pending:?}"));
+        let uri = params["uri"].as_str().unwrap().to_owned();
+        let Some(root) = pending.remove(&uri) else {
+            continue;
+        };
+        assert!(
+            params["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| {
+                    diagnostic["message"]
+                        .as_str()
+                        .and_then(|message| serde_json::from_str::<Value>(message).ok())
+                        .is_some_and(|report| {
+                            report["replacement"] == true
+                                && report["foldersAtOpen"]
+                                    .as_array()
+                                    .is_some_and(|folders| folders.contains(&json!(root)))
+                        })
+                }),
+            "replacement must know {root} before reopening {uri}: {params}"
+        );
+    }
+    assert!(std::path::Path::new(&format!("{}.replacement", wire_log.display())).exists());
+    if host_layer {
+        let wire = std::fs::read_to_string(&wire_log).expect("mock wire log");
+        let opened: Vec<_> = wire
+            .lines()
+            .filter_map(|line| line.strip_prefix("textDocument/didOpen\t"))
+            .collect();
+        for uri in &documents {
+            assert!(
+                opened.contains(&uri.as_str()),
+                "real host URI was not opened: {uri}"
+            );
+        }
+        assert!(
+            opened
+                .iter()
+                .all(|uri| documents.iter().any(|host| host == uri)),
+            "host-only recovery must open real host documents: {opened:?}"
+        );
+    }
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+fn assert_crashed_downstream_recovers(shared: bool) {
     // #977: a crash evicts the dead server's diagnostics (#469), but nothing
     // brought the server back — on a quiet document the diagnostics stayed gone
     // until some unrelated edit happened to respawn it. The mock dies on a timer
     // after its first push, with NO client input, so no edit or request can be
     // what respawns it; the replacement tags its push, so the returning
     // diagnostic can only come from a respawned, re-opened server.
-    let (mut client, _config_dir, wire_log) = init_crash_once_client();
+    let (mut client, _config_dir, wire_log) = init_crash_once_client_shared(shared);
     open_host(&mut client);
 
     wait_for_crash_once(&mut client, &wire_log);

@@ -145,6 +145,18 @@ pub(in crate::lsp::bridge) async fn create_handle_with_key(
     create_handle_with_state_and_pid_keyed(state, key).await.0
 }
 
+/// A ready connection with explicit initialized capabilities, for server-layer
+/// tests that need to distinguish an incapable replacement from a cold probe.
+#[cfg(unix)]
+pub(crate) async fn create_ready_handle_with_capabilities(
+    key: ConnectionKey,
+    capabilities: tower_lsp_server::ls_types::ServerCapabilities,
+) -> Arc<ConnectionHandle> {
+    let handle = create_handle_with_key(ConnectionState::Ready, key).await;
+    handle.set_server_capabilities(capabilities);
+    handle
+}
+
 #[cfg(unix)]
 pub(crate) fn advertise_routing_for_test(handle: &ConnectionHandle) {
     handle.set_bridge_routing(true);
