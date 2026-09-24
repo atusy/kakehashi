@@ -383,6 +383,10 @@ pub struct LanguageServerPool {
     /// workspace root (issue #382); documents sharing a root (or the
     /// client-root fallback) still share one process.
     connections: Mutex<HashMap<ConnectionKey, Arc<ConnectionHandle>>>,
+    /// Test-only hook run once at the next shared-root announcement, to place
+    /// an event between an acquisition's routing and its announce.
+    #[cfg(test)]
+    before_announce: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Weak directory exposed to downstream `kakehashi/bridge/peer*` requests.
     peer_directory: Arc<super::peer::PeerDirectory>,
     /// Gate that rejects **new** connection spawns once shutdown has begun.
@@ -570,6 +574,8 @@ impl LanguageServerPool {
         let host_documents = Arc::new(Mutex::new(HashMap::new()));
         Self {
             connections: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            before_announce: std::sync::Mutex::new(None),
             peer_directory: Arc::new(super::peer::PeerDirectory::new(
                 Arc::clone(&document_tracker),
                 Arc::clone(&host_documents),
@@ -1161,6 +1167,15 @@ impl LanguageServerPool {
     #[cfg(test)]
     pub(crate) fn cancel_metrics(&self) -> &CancelForwardingMetrics {
         &self.cancel_metrics
+    }
+
+    /// Run `hook` once at the next shared-root announcement.
+    #[cfg(test)]
+    pub(crate) fn set_before_announce(&self, hook: impl FnOnce() + Send + 'static) {
+        *self
+            .before_announce
+            .lock()
+            .recover_poison("LanguageServerPool::set_before_announce") = Some(Box::new(hook));
     }
 
     /// How many connections the pool holds, for tests outside this module
@@ -2846,6 +2861,41 @@ impl LanguageServerPool {
         document_uri: Option<&Url>,
         timeout: Duration,
     ) -> io::Result<Arc<ConnectionHandle>> {
+        let start = std::time::Instant::now();
+        match self
+            .get_or_create_connection_wait_ready_once(
+                server_name,
+                server_config,
+                document_uri,
+                timeout,
+            )
+            .await
+        {
+            // Routing chose the shared instance and it withdrew folder-change
+            // support before this root was announced. Re-resolving now diverts
+            // the root; do it here rather than fail an acquisition a one-shot
+            // caller (eager didOpen) would not repeat (#968). Once: a second
+            // withdrawal needs a second registration in between.
+            Err(error) if BridgeError::is_folder_support_withdrawn(&error) => {
+                self.get_or_create_connection_wait_ready_once(
+                    server_name,
+                    server_config,
+                    document_uri,
+                    timeout.saturating_sub(start.elapsed()),
+                )
+                .await
+            }
+            result => result,
+        }
+    }
+
+    async fn get_or_create_connection_wait_ready_once(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        document_uri: Option<&Url>,
+        timeout: Duration,
+    ) -> io::Result<Arc<ConnectionHandle>> {
         // `timeout` is the caller's overall budget; the incapable-shared divert
         // below acquires a second connection, so track elapsed time and hand it
         // only the remaining budget rather than a fresh full `timeout`.
@@ -3363,6 +3413,15 @@ impl LanguageServerPool {
         if !handle.key().is_shared() {
             return Ok(());
         }
+        #[cfg(test)]
+        if let Some(hook) = self
+            .before_announce
+            .lock()
+            .recover_poison("LanguageServerPool::announce_shared_root")
+            .take()
+        {
+            hook();
+        }
         // A marker-less acquisition still has a workspace to name: the
         // CLIENT workspace. A real file with no marker up its tree (or the
         // `workspaceMarkers = []` kill switch) previously landed on a
@@ -3525,6 +3584,40 @@ impl LanguageServerPool {
     /// connection's `(marker, key)` from `document_uri`, then delegates to
     /// [`get_or_create_connection_resolved`](Self::get_or_create_connection_resolved).
     async fn get_or_create_connection_with_timeout(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        document_uri: Option<&Url>,
+        timeout: Duration,
+        admit: Option<&(dyn Fn() -> bool + Sync)>,
+    ) -> io::Result<Arc<ConnectionHandle>> {
+        let start = std::time::Instant::now();
+        match self
+            .get_or_create_connection_with_timeout_once(
+                server_name,
+                server_config,
+                document_uri,
+                timeout,
+                admit,
+            )
+            .await
+        {
+            // Same re-resolve as `get_or_create_connection_wait_ready` (#968).
+            Err(error) if BridgeError::is_folder_support_withdrawn(&error) => {
+                self.get_or_create_connection_with_timeout_once(
+                    server_name,
+                    server_config,
+                    document_uri,
+                    timeout.saturating_sub(start.elapsed()),
+                    admit,
+                )
+                .await
+            }
+            result => result,
+        }
+    }
+
+    async fn get_or_create_connection_with_timeout_once(
         &self,
         server_name: &str,
         server_config: &crate::config::settings::BridgeServerConfig,
@@ -6357,6 +6450,63 @@ mod tests {
         pool.announce_shared_root(&shared, &marker)
             .await
             .expect("a server never told of any root is not refused one");
+    }
+
+    /// Routing resolved to the capable shared instance, and it withdrew
+    /// folder-change support before the root was announced. Re-resolving now
+    /// diverts the root, so the same acquisition must take the per-root
+    /// connection instead of failing and leaving a one-shot open (eager
+    /// didOpen) unsent until something else acquires again (#968).
+    #[rstest::rstest]
+    #[case::wait_ready(true)]
+    #[case::fast_fail(false)]
+    #[tokio::test]
+    async fn an_acquisition_diverts_when_support_is_withdrawn_before_its_announce(
+        #[case] wait_ready: bool,
+    ) {
+        let (_tmp, doc) = marker_rooted_doc();
+        let pool = LanguageServerPool::new();
+        let config = shared_config();
+        let shared =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
+        shared.set_server_capabilities(Default::default());
+        register_folder_changes(&shared);
+        pool.insert_connection(Arc::clone(&shared)).await;
+        let (marker, key) = pool.resolve_marker_and_key("lua", &config, Some(&doc));
+        let (root, _folder) = marker.expect("marker-rooted");
+        assert_eq!(
+            pool.resolve_acquire("lua", &config, Some(&doc)).await.1,
+            ConnectionKey::shared("lua"),
+            "routing starts on the capable shared instance"
+        );
+        pool.set_before_announce({
+            let shared = Arc::clone(&shared);
+            move || unregister_folder_changes(&shared)
+        });
+
+        // The per-root divert spawns a sink that never handshakes; a short
+        // budget is enough to see where the acquisition went.
+        let budget = Duration::from_millis(200);
+        let result = if wait_ready {
+            pool.get_or_create_connection_wait_ready("lua", &config, Some(&doc), budget)
+                .await
+        } else {
+            pool.get_or_create_connection_with_timeout("lua", &config, Some(&doc), budget, None)
+                .await
+        };
+
+        if let Err(error) = &result {
+            assert!(
+                !BridgeError::is_folder_support_withdrawn(error),
+                "the withdrawal must be absorbed by re-resolving: {error}"
+            );
+        }
+        let per_root = ConnectionKey::new("lua", Some(root.as_str().to_owned()));
+        assert_eq!(key, per_root, "the per-root key the divert should use");
+        assert!(
+            pool.connections.lock().await.contains_key(&per_root),
+            "the acquisition should have diverted to the per-root connection"
+        );
     }
 
     /// The capability check and the send are separated by the `connections`
