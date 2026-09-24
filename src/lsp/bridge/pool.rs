@@ -861,13 +861,21 @@ impl LanguageServerPool {
                 invalidated.push(key.clone());
                 continue;
             }
-            let notification =
-                build_did_change_workspace_folders_notification(added.clone(), removed.to_vec());
-            if handle.send_notification(notification) == NotificationSendResult::Queued {
+            // Queue and commit under the handle's folder-set lock, so a server
+            // pulling `workspace/workspaceFolders` on the notification's heels
+            // cannot read the pre-change set; and under the registration's
+            // lease, so an unregistration since the check above is recycled
+            // like any incapable connection rather than sent to (#968).
+            let queued =
                 handle
                     .workspace_folders()
-                    .apply_change(added.clone(), removed);
-            } else {
+                    .change_and_announce(added.clone(), removed, || {
+                        handle.send_folder_change(build_did_change_workspace_folders_notification(
+                            added.clone(),
+                            removed.to_vec(),
+                        )) == Some(NotificationSendResult::Queued)
+                    });
+            if !queued {
                 invalidated.push(key.clone());
             }
         }
