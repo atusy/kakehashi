@@ -2137,7 +2137,7 @@ impl LanguageServerPool {
     /// harmless when the resolved key's connection is already live: an
     /// armed-but-unclaimed key is invisible to the wait, and the next respawn
     /// under it claims the debt.
-    pub(super) fn arm_reopen_if_key_changed(
+    pub(crate) fn arm_reopen_if_key_changed(
         &self,
         registry_key: &ConnectionKey,
         resolved_key: &ConnectionKey,
