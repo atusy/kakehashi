@@ -2,10 +2,10 @@
 name = "kakehashi"
 version = "1.0.0"
 edition = "2024"
-# std's inherent `File::lock` (src/install/queries.rs) is stable from 1.89; the
-# 2024 edition alone would only require 1.85. Declared so an older toolchain
-# fails with a clear MSRV message instead of a missing-method error.
-rust-version = "1.89"
+# Tracks the latest stable toolchain (the Nix dev shell and CI both build with
+# it). Declared so an older toolchain fails with a clear MSRV message instead of
+# a missing-method error.
+rust-version = "1.98"
 default-run = "kakehashi"
 
 [[bin]]
