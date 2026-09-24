@@ -2402,31 +2402,42 @@ async fn crashed_shared_documents(
     config: &crate::config::settings::BridgeServerConfig,
 ) -> Vec<(Url, Url)> {
     let mut documents = Vec::new();
-    let pool = bridge.pool();
+    for (host, document) in server_recovery_documents(injection, bridge, settings, key.server()) {
+        if bridge
+            .pool()
+            .resolved_connection_key(key.server(), config, &document)
+            .await
+            == *key
+        {
+            documents.push((host, document));
+        }
+    }
+    documents
+}
+
+/// Current configured units, before a shared capability partition narrows
+/// them. A live replacement may have been started by an ordinary request.
+fn server_recovery_documents(
+    injection: &crate::lsp::lsp_impl::coordinator::InjectionCoordinator,
+    bridge: &crate::lsp::bridge::BridgeCoordinator,
+    settings: &Arc<crate::config::WorkspaceSettings>,
+    server: &str,
+) -> Vec<(Url, Url)> {
+    let mut documents = Vec::new();
     for host in injection.open_host_uris() {
         let Some((language, _)) = injection.screen_language(&host) else {
             continue;
         };
-        if !bridge.host_language_can_reach_server(settings, &language, key.server()) {
+        if !bridge.host_language_can_reach_server(settings, &language, server) {
             continue;
         }
         let Some((language, Some(injections))) = injection.bridge_injections(&host) else {
             continue;
         };
-        for document in bridge.recovery_injection_documents(
-            settings,
-            &language,
-            &host,
-            injections,
-            key.server(),
-        ) {
-            if pool
-                .resolved_connection_key(key.server(), config, &document)
-                .await
-                == *key
-            {
-                documents.push((host.clone(), document));
-            }
+        for document in
+            bridge.recovery_injection_documents(settings, &language, &host, injections, server)
+        {
+            documents.push((host.clone(), document));
         }
     }
     documents
@@ -2579,6 +2590,20 @@ async fn attempt_crash_recovery(
             .begin_crash_recovery_attempt(key, after_own_failure)
             .await
         {
+            // An ordinary acquisition can win the shared restart during
+            // backoff. Its new capability partition must not erase quiet
+            // sibling demand before this task transfers missing destinations.
+            let settings = settings_manager.load_settings();
+            if key.is_shared()
+                && !pool.is_shutting_down()
+                && bridge
+                    .respawnable_server_config(&settings, key.server())
+                    .is_some_and(|config| config.prefers_shared_instance())
+            {
+                let documents =
+                    server_recovery_documents(injection, bridge, &settings, key.server());
+                defer_current_shared_documents(injection, settings_manager, key, &documents).await;
+            }
             return stand_down();
         }
         let snapshot = settings_manager.load_settings_pair();
@@ -2808,6 +2833,9 @@ async fn defer_current_shared_documents(
     let mut deferred = std::collections::HashSet::new();
     for (host, document) in documents {
         loop {
+            if pool.is_shutting_down() {
+                return;
+            }
             let settings = settings_manager.load_settings();
             let Some(config) = bridge.respawnable_server_config(&settings, source.server()) else {
                 return;
@@ -5274,6 +5302,17 @@ mod reopen_order_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn expired_recovery_settings_transfer_quiet_diverted_documents() {
+        shared_recovery_retains_quiet_sibling(false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_ordinary_shared_restart_transfers_quiet_diverted_documents() {
+        shared_recovery_retains_quiet_sibling(true).await;
+    }
+
+    #[cfg(unix)]
+    async fn shared_recovery_retains_quiet_sibling(ordinary_restart_wins: bool) {
         use super::*;
         use crate::lsp::bridge::{ConnectionKey, RecoveryDecision};
         use tower_lsp_server::LspService;
@@ -5375,31 +5414,57 @@ mod reopen_order_tests {
         else {
             panic!("first retry");
         };
-        let publish = async {
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                while !started.exists() {
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                }
-            })
-            .await
-            .expect("shared replacement started");
-            // The seed has already committed its settings snapshot. Auto-install
-            // publishes another generation without invalidating either tree.
-            server.settings_manager.apply_settings(settings);
-            assert_ne!(generation, server.settings_manager.settings_generation());
+        let outcome = if ordinary_restart_wins {
             std::fs::write(&release, b"go").unwrap();
-        };
-        let (outcome, ()) = tokio::join!(
+            let replacement = server
+                .bridge
+                .pool()
+                .get_or_create_connection_wait_ready(
+                    "test",
+                    &config,
+                    Some(&captured[0].1),
+                    std::time::Duration::from_secs(2),
+                )
+                .await
+                .unwrap();
+            assert_eq!(replacement.key(), &key);
             attempt_crash_recovery(
                 &injection,
                 &server.bridge,
                 &server.settings_manager,
                 &key,
                 reservation,
-                false
-            ),
-            publish
-        );
+                false,
+            )
+            .await
+        } else {
+            let publish = async {
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while !started.exists() {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect("shared replacement started");
+                // The seed has already committed its settings snapshot. Auto-install
+                // publishes another generation without invalidating either tree.
+                server.settings_manager.apply_settings(settings);
+                assert_ne!(generation, server.settings_manager.settings_generation());
+                std::fs::write(&release, b"go").unwrap();
+            };
+            let (outcome, ()) = tokio::join!(
+                attempt_crash_recovery(
+                    &injection,
+                    &server.bridge,
+                    &server.settings_manager,
+                    &key,
+                    reservation,
+                    false
+                ),
+                publish
+            );
+            outcome
+        };
         assert!(matches!(outcome, RecoveryAttempt::Done));
         let mut diverted = 0;
         for (_, document) in captured {
@@ -5413,7 +5478,7 @@ mod reopen_order_tests {
                 assert_eq!(
                     server.bridge.pool().schedule_crash_retry(&destination),
                     RecoveryDecision::AlreadyScheduled,
-                    "the actual expired sweep must transfer its quiet sibling root"
+                    "the actual recovery attempt must transfer its quiet sibling root"
                 );
             }
         }

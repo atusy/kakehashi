@@ -286,6 +286,10 @@ A failed fallback does not lose its retry while a shared replacement is still
 initializing: routing returns a pending verdict from the same handle snapshot,
 and recovery waits for that handshake before rechecking current demand and
 settings. The reservation remains uncommitted throughout that read-only wait.
+If an ordinary acquisition wins the shared restart during backoff, the recovery
+task still derives current configured units before standing down and transfers
+missing diverted destinations. The live shared process is not restarted, and
+the new capability partition cannot erase quiet sibling demand.
 Every shared handshake that reaches Ready with folder-change support queues
 consolidation, whether an ordinary acquisition or proactive recovery started it.
 Thus static capability upgrades retire existing fallback roots even when those
