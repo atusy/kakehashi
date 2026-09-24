@@ -275,10 +275,10 @@ fn finalize_host_resolved_action(
 
     // A resolved action with no command and a `Some`-but-empty edit is a no-op
     // — disable it rather than hand the client an enabled action that applies
-    // nothing (mirrors the virt path's empty-edit policy). A resolve that
-    // NEVER carried a command and has no edit is NOT a no-op — it is a
-    // still-lazy staged resolve, re-enveloped for a further pass below.
-    // Without `disabledSupport`, fail soft to the unresolved action.
+    // nothing (mirrors the virt path's empty-edit policy). A response without
+    // either payload remains an internal unresolved fallback below. The public
+    // resolve handler reports RequestFailed for an unusable fallback, including
+    // an empty edit when the client does not support disabled actions.
     let no_op_reason = if resolved.command.is_none()
         && resolved.edit.as_ref().is_some_and(workspace_edit_is_empty)
     {
@@ -318,8 +318,8 @@ fn finalize_host_resolved_action(
     let server_title = std::mem::take(&mut resolved.title);
     resolved.title = resuffix_resolved_title(server_title.clone(), suffixed_title, server_name);
 
-    // Materialized (edit or command) → strip the envelope; still lazy →
-    // re-envelope for a further resolve, syncing a server-changed title.
+    // Materialized (edit or command) → strip the envelope. Keep an internal
+    // lazy fallback self-consistent; the public handler rejects that fallback.
     if resolved.edit.is_some() || resolved.command.is_some() {
         resolved.data = None;
     } else {
@@ -1043,17 +1043,13 @@ fn finalize_virt_resolved_action(
     // complete (the edit is host-translated; the command name is routed).
     // Re-enveloping it would let a second resolve forward that host-
     // coordinate edit back downstream (no inverse transform) — so strip the
-    // data instead, mirroring the initial-response policy. Only a still-lazy
-    // resolved action (no edit, no command) keeps a routing envelope for a
-    // further resolve.
+    // data instead, mirroring the initial-response policy. A still-lazy
+    // result retains an internal envelope; the public handler rejects it.
     if resolved.edit.is_some() || resolved.command.is_some() {
         resolved.data = None;
     } else {
-        // Still lazy: a future resolve restores `envelope.original_title`
-        // and forwards it downstream. If the server changed the title on
-        // THIS resolve, track the new (unsuffixed) title so a title-matching
-        // server sees the title it last advertised, not the stale initial
-        // one. (The envelope exists precisely for match-by-title servers.)
+        // Keep the internal fallback's title and envelope consistent even
+        // though the public resolve handler rejects this unusable result.
         if !server_title.is_empty() {
             envelope.original_title = server_title;
         }
@@ -3274,11 +3270,9 @@ mod tests {
 
     #[test]
     fn host_resolve_re_envelopes_still_lazy_result_with_no_command_and_no_edit() {
-        // A resolve that returns NEITHER a command NOR an edit (but never carried
-        // a command to begin with) is a still-lazy staged resolve, NOT a no-op:
-        // it must be re-enveloped for a further resolve pass, not disabled. This
-        // pins the #615 title-only host-lazy path against the dropped-command
-        // no-op guard.
+        // The low-level helper preserves an internal unresolved fallback.
+        // The public handler turns this unusable result into RequestFailed;
+        // this test checks only the helper's envelope consistency.
         let resolved: CodeAction =
             serde_json::from_value(json!({ "title": "Organize imports" })).unwrap();
         let action: CodeAction = serde_json::from_value(json!({
