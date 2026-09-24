@@ -311,12 +311,53 @@ pub(in crate::lsp::bridge) async fn create_handle_with_state_and_pid_keyed(
     .await
 }
 
+/// Like [`create_handle_with_key`], but the reader side is an in-memory stream
+/// that never delivers a byte, for tests that let paused time run out a
+/// deadline. The sink child's own stdout can't serve: on Windows tokio reads
+/// child stdio on the blocking pool, and that pending read inhibits paused
+/// time's auto-advance forever. Keep the returned stream alive; dropping it
+/// is EOF.
+pub(in crate::lsp::bridge) async fn create_silent_handle_with_key(
+    state: ConnectionState,
+    key: ConnectionKey,
+) -> (Arc<ConnectionHandle>, tokio::io::DuplexStream) {
+    let (server, client) = tokio::io::duplex(64);
+    let (handle, _pid) = create_handle_with_command_reader(
+        state,
+        key,
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "cat > /dev/null".to_string(),
+        ],
+        None,
+        |_stdout_reader| crate::lsp::bridge::connection::BridgeReader::new(client),
+    )
+    .await;
+    (handle, server)
+}
+
 pub(in crate::lsp::bridge) async fn create_handle_with_command(
     state: ConnectionState,
     key: ConnectionKey,
     command: Vec<String>,
     capabilities: Option<tower_lsp_server::ls_types::ServerCapabilities>,
 ) -> (Arc<ConnectionHandle>, u32) {
+    create_handle_with_command_reader(state, key, command, capabilities, |reader| reader).await
+}
+
+async fn create_handle_with_command_reader<R>(
+    state: ConnectionState,
+    key: ConnectionKey,
+    command: Vec<String>,
+    capabilities: Option<tower_lsp_server::ls_types::ServerCapabilities>,
+    reader_source: impl FnOnce(
+        crate::lsp::bridge::connection::BridgeReader,
+    ) -> crate::lsp::bridge::connection::BridgeReader<R>,
+) -> (Arc<ConnectionHandle>, u32)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
     let mut conn = AsyncBridgeConnection::spawn(command)
         .await
         .expect("should spawn sink process");
@@ -325,7 +366,7 @@ pub(in crate::lsp::bridge) async fn create_handle_with_command(
     let (writer, reader) = conn.split();
     let pid = writer.child_id().expect("sink child should have a pid");
     let router = Arc::new(ResponseRouter::new());
-    let reader_handle = spawn_reader_task(reader, Arc::clone(&router));
+    let reader_handle = spawn_reader_task(reader_source(reader), Arc::clone(&router));
 
     let (tx, rx) = tokio::sync::mpsc::channel(crate::lsp::bridge::actor::OUTBOUND_QUEUE_CAPACITY);
     let dynamic_capabilities = Arc::new(crate::lsp::bridge::pool::DynamicCapabilityRegistry::new());

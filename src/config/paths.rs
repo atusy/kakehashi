@@ -257,6 +257,12 @@ mod tests {
         }
     }
 
+    /// `expected` spelled with the platform separator: anchoring cleans the
+    /// joined path, and on Windows that rewrites every `/` to `\`.
+    fn native(expected: &str) -> String {
+        expected.replace('/', std::path::MAIN_SEPARATOR_STR)
+    }
+
     fn anchor(value: &str, base: Option<&Path>) -> String {
         let mut settings = settings_with_path(value);
         let _ = anchor_settings_paths(&mut settings, base);
@@ -327,11 +333,11 @@ mod tests {
     fn relative_paths_are_anchored_to_the_base() {
         assert_eq!(
             anchor("./queries/highlights.scm", Some(Path::new("/workspace"))),
-            "/workspace/queries/highlights.scm"
+            native("/workspace/queries/highlights.scm")
         );
         assert_eq!(
             anchor("queries/highlights.scm", Some(Path::new("/workspace"))),
-            "/workspace/queries/highlights.scm"
+            native("/workspace/queries/highlights.scm")
         );
     }
 
@@ -339,7 +345,7 @@ mod tests {
     fn parent_traversal_is_normalized_away() {
         assert_eq!(
             anchor("../shared/parsers", Some(Path::new("/workspace/project"))),
-            "/workspace/shared/parsers"
+            native("/workspace/shared/parsers")
         );
     }
 
@@ -349,11 +355,11 @@ mod tests {
     fn variables_survive_anchoring_unexpanded() {
         assert_eq!(
             anchor("./queries/$LANG.scm", Some(Path::new("/workspace"))),
-            "/workspace/queries/$LANG.scm"
+            native("/workspace/queries/$LANG.scm")
         );
         assert_eq!(
             anchor("./$$literal", Some(Path::new("/workspace"))),
-            "/workspace/$$literal"
+            native("/workspace/$$literal")
         );
     }
 
@@ -365,12 +371,12 @@ mod tests {
     #[test]
     fn a_base_containing_a_dollar_survives_the_expansion_pass() {
         let anchored = anchor("./queries", Some(Path::new("/work/a$b")));
-        assert_eq!(anchored, "/work/a$$b/queries");
+        assert_eq!(anchored, native("/work/a$$b/queries"));
 
         let env = make_env(&[("b", "SHOULD NOT BE USED")]);
         assert_eq!(
             expand_path(&anchored, None, &env).expect("the escaped base must expand cleanly"),
-            "/work/a$b/queries",
+            native("/work/a$b/queries"),
             "expansion must give back the directory's real name"
         );
     }
@@ -385,11 +391,11 @@ mod tests {
     fn parent_traversal_after_a_variable_is_left_for_the_filesystem() {
         assert_eq!(
             anchor("./a/$VAR/../b", Some(Path::new("/base"))),
-            "/base/a/$VAR/../b"
+            native("/base/a/$VAR/../b")
         );
         assert_eq!(
             anchor("./a/$UNDEFINED/../b", Some(Path::new("/base"))),
-            "/base/a/$UNDEFINED/../b",
+            native("/base/a/$UNDEFINED/../b"),
             "the undefined variable must still reach expansion, which rejects it"
         );
     }
@@ -536,7 +542,7 @@ mod tests {
         assert_eq!(
             settings.search_paths,
             Some(vec![
-                "/workspace/runtime".to_string(),
+                native("/workspace/runtime"),
                 "/opt/kakehashi".to_string(),
                 "${KAKEHASHI_DATA_DIR}".to_string(),
             ])
@@ -548,8 +554,14 @@ mod tests {
     /// leaves an empty string empty, so the two passes disagree by design.
     #[test]
     fn empty_and_dot_resolve_to_the_base_itself() {
-        assert_eq!(anchor("", Some(Path::new("/workspace"))), "/workspace");
-        assert_eq!(anchor(".", Some(Path::new("/workspace"))), "/workspace");
+        assert_eq!(
+            anchor("", Some(Path::new("/workspace"))),
+            native("/workspace")
+        );
+        assert_eq!(
+            anchor(".", Some(Path::new("/workspace"))),
+            native("/workspace")
+        );
     }
 
     /// The programmed defaults have no source directory. Without a base every

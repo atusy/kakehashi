@@ -389,7 +389,10 @@ mod tests {
 
     #[test]
     fn initialize_request_includes_root_path_derived_from_root_uri() {
-        let root_uri = "file:///home/user/project";
+        // A platform-absolute path: `file:///home/...` has no drive letter, so
+        // on Windows it names no file path and rootPath is rightly null.
+        let project = std::env::temp_dir().join("project");
+        let root_uri = url::Url::from_file_path(&project).unwrap();
         let request = build_initialize_request(
             RequestId::new(1),
             None,
@@ -400,7 +403,10 @@ mod tests {
         );
 
         let json = serde_json::to_value(&request).unwrap();
-        assert_eq!(json["params"]["rootPath"], "/home/user/project");
+        assert_eq!(
+            json["params"]["rootPath"],
+            project.to_string_lossy().as_ref()
+        );
     }
 
     #[test]

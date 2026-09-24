@@ -120,7 +120,7 @@ target/debug/kakehashi: build-debug
 deps/tree-sitter/.installed: target/debug/kakehashi
 	@mkdir -p deps/tree-sitter
 	for lang in lua rust markdown markdown_inline yaml html; do \
-		./target/debug/kakehashi language install $$lang --data-dir deps/tree-sitter --force; \
+		./target/debug/kakehashi language install $$lang --data-dir deps/tree-sitter --force || exit 1; \
 	done
 	@touch $@
 

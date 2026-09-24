@@ -1297,6 +1297,7 @@ fn write_new_output_with(
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("."));
+    #[cfg_attr(not(unix), allow(unused_mut))] // only the cfg(unix) block mutates
     let mut builder = tempfile::Builder::new();
     #[cfg(unix)]
     {

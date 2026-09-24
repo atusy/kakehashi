@@ -795,8 +795,7 @@ mod tests {
         assert!(
             result
                 .unwrap()
-                .to_string_lossy()
-                .ends_with("parser/rust.so")
+                .ends_with(Path::new("parser").join("rust.so"))
         );
 
         // Empty search paths and no explicit library → None
@@ -820,8 +819,7 @@ mod tests {
         assert!(
             result
                 .unwrap()
-                .to_string_lossy()
-                .ends_with("parser/rust.so")
+                .ends_with(Path::new("parser").join("rust.so"))
         );
     }
 
@@ -1531,7 +1529,12 @@ mod tests {
         assert!(
             message.contains(&format!(
                 "inherited by rust in {}",
-                overlay.path().join("queries/rust/highlights.scm").display()
+                overlay
+                    .path()
+                    .join("queries")
+                    .join("rust")
+                    .join("highlights.scm")
+                    .display()
             )),
             "{message}"
         );

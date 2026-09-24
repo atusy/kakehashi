@@ -2393,11 +2393,14 @@ mod tests {
     fn config_root_after_folder_change_uses_the_current_first_folder() {
         use std::path::PathBuf;
         use std::str::FromStr as _;
-        let uri = Uri::from_str("file:///current").expect("a file URI");
+        // Platform-absolute: `file:///current` names no path on Windows.
+        let current = std::env::temp_dir().join("current");
+        let uri =
+            Uri::from_str(Url::from_file_path(&current).unwrap().as_str()).expect("a file URI");
 
         assert_eq!(
             config_root_after_folder_change(Some(&uri), Some(PathBuf::from("/folderless"))),
-            Some(PathBuf::from("/current")),
+            Some(current),
             "a folder outranks the folderless fallback",
         );
     }
