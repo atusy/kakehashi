@@ -279,10 +279,63 @@ impl Kakehashi {
         // together with the layer selection and the mint over its result.
         let language = std::sync::Arc::clone(&self.language);
         let tracker = self.bridge.node_tracker_arc();
+        let generation = self.cache.semantic_token_generation();
+        let snapshot_for_layers = std::sync::Arc::clone(&snapshot);
+        let uri_for_walk = uri.clone();
+        let Some(mint_epoch) = self
+            .node_mint_epoch(&uri, incarnation, snapshot.parsed_version)
+            .await
+        else {
+            return Ok(Value::Null);
+        };
         let result = self
             .compute_pool
             .run(None, move || {
+                let uri = uri_for_walk;
                 let stack = injection_stack_at(&language, &host_language, &text, &tree, byte);
+
+                // Reconcile before selecting a layer: removed injections can
+                // leave only the host or make an explicit index unavailable.
+                let scopes = tracker
+                    .tree_scope_needs_reconciliation(&uri, generation)
+                    .then(|| {
+                        let cached = snapshot_for_layers.layer_trees.get_or_init(|| {
+                            let layers = super::injection_stack::collect_document_layer_trees(
+                                &language,
+                                &host_language,
+                                &text,
+                                &tree,
+                            );
+                            (generation, std::sync::Arc::new(layers))
+                        });
+                        let fresh;
+                        let layers = if cached.0 == generation {
+                            cached.1.as_ref()
+                        } else {
+                            fresh = super::injection_stack::collect_document_layer_trees(
+                                &language,
+                                &host_language,
+                                &text,
+                                &tree,
+                            );
+                            &fresh
+                        };
+                        (layers.complete || !layers.unresolved.is_empty()).then(|| {
+                            let scopes = layers
+                                .layers
+                                .iter()
+                                .map(|layer| {
+                                    crate::language::node_tracker::NodeTreeScope::new(
+                                        &layer.language,
+                                        layer.depth,
+                                        &layer.tree,
+                                    )
+                                })
+                                .collect::<std::collections::HashSet<_>>();
+                            (scopes, layers.unresolved.clone())
+                        })
+                    })
+                    .flatten();
 
                 let layer_index = match selector {
                     InjectionSelector::Host => unreachable!("handled above"),
@@ -295,45 +348,111 @@ impl Kakehashi {
                     }
                     InjectionSelector::Index(n) => {
                         let Some(idx) = resolve_index(n, stack.len()) else {
-                            return Value::Null;
+                            return (Value::Null, scopes);
                         };
                         idx
                     }
                 };
 
                 let Some(layer) = stack.get(layer_index) else {
-                    return Value::Null;
+                    return (Value::Null, scopes);
                 };
 
                 let Some(node) = smallest_containing_node(&layer.tree, byte, doc_len) else {
-                    return Value::Null;
+                    return (Value::Null, scopes);
                 };
 
-                // Mint with the resolved layer index so a host and injected node
+                // Mint with the full tree scope so host and injected nodes
                 // sharing (start, end, kind) get distinct ULIDs and stay navigable
                 // in their own tree (lazy-node-identity-tracking §"Node Uniqueness
                 // Key", issue #313).
-                let ulid = tracker.get_or_create_in_layer_for_incarnation(
-                    &uri,
-                    node.start_byte(),
-                    node.end_byte(),
-                    static_node_kind(&node),
-                    layer_index,
-                    incarnation,
-                );
+                let scope = (layer_index > 0).then(|| {
+                    crate::language::node_tracker::NodeTreeScope::new(
+                        &layer.language,
+                        layer_index,
+                        &layer.tree,
+                    )
+                });
+                let ulid = tracker
+                    .mint_tree_batch(
+                        &uri,
+                        mint_epoch,
+                        incarnation,
+                        scope.as_ref(),
+                        [(node.start_byte(), node.end_byte(), static_node_kind(&node))],
+                    )
+                    .and_then(|mut ids| ids.pop());
                 let Some(ulid) = ulid else {
-                    return Value::Null;
+                    return (Value::Null, scopes);
                 };
 
-                json!({
-                    "id": ulid.to_string(),
-                    "kind": node.kind(),
-                })
+                (
+                    json!({
+                        "id": ulid.to_string(),
+                        "kind": node.kind(),
+                    }),
+                    scopes,
+                )
             })
             .await;
 
         // None = the work-unit panicked (logged by the pool) → protocol null.
-        Ok(result.unwrap_or(Value::Null))
+        let Some((result, scopes)) = result else {
+            return Ok(Value::Null);
+        };
+        if let Some((scopes, unresolved)) = scopes {
+            // Match captures' retirement discipline: neither an edit nor query
+            // publication may supersede the complete geometry before pruning.
+            let edit_lock = self.documents.edit_lock(&uri);
+            let _edit_guard = edit_lock.lock().await;
+            let current = self.documents.latest_snapshot(&uri).is_some_and(|view| {
+                view.slot.current_incarnation == incarnation
+                    && view.content_version == snapshot.parsed_version
+            });
+            let pool = self
+                .parser_pool
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if current
+                && !pool.reload_in_progress()
+                && self.cache.semantic_token_generation() == generation
+            {
+                self.bridge.node_tracker().retain_tree_scopes(
+                    &uri,
+                    mint_epoch,
+                    incarnation,
+                    &scopes,
+                    &unresolved,
+                    generation,
+                );
+            }
+            if self.documents.get(&uri).is_none() {
+                self.documents
+                    .remove_edit_lock_if_unshared(&uri, &edit_lock);
+            }
+        }
+        Ok(result)
+    }
+
+    /// Read the tracker epoch and document revision under the edit lock so
+    /// tracker shifting cannot admit coordinates from the pre-edit snapshot.
+    async fn node_mint_epoch(
+        &self,
+        uri: &Url,
+        incarnation: u64,
+        parsed_version: u64,
+    ) -> Option<(u64, u64)> {
+        let edit_lock = self.documents.edit_lock(uri);
+        let _edit_guard = edit_lock.lock().await;
+        let latch = self.bridge.node_tracker().mint_epoch(uri);
+        let latest = self.documents.latest_snapshot(uri);
+        let current = latest.as_ref().is_some_and(|view| {
+            view.slot.current_incarnation == incarnation && view.content_version == parsed_version
+        });
+        if latest.is_none() {
+            self.documents.remove_edit_lock_if_unshared(uri, &edit_lock);
+        }
+        current.then_some(latch)
     }
 
     /// Host-layer lookup, factored out so the no-injection request keeps
@@ -527,6 +646,265 @@ fn deepest_node_ending_at(node: tree_sitter::Node<'_>, target_end: usize) -> tre
 mod tests {
     use super::*;
     use tower_lsp_server::LspService;
+
+    #[rstest::rstest]
+    #[case::sibling(true, false, false)]
+    #[case::final_injection(false, false, false)]
+    #[case::missing_index(false, true, false)]
+    #[case::query_reload(false, false, true)]
+    #[tokio::test]
+    async fn node_only_removal_retires_scope(
+        #[case] sibling: bool,
+        #[case] missing_index: bool,
+        #[case] query_reload: bool,
+    ) {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        for name in ["rust", "scope_inner"] {
+            server
+                .language
+                .language_registry_for_parallel()
+                .register(name.into(), language.clone());
+        }
+        let install_query = |enabled: bool| {
+            let source = if enabled {
+                r#"((function_item name: (identifier) @_name body: (block) @injection.content) (#eq? @_name "live") (#set! injection.language "scope_inner") (#set! injection.include-children))"#
+            } else {
+                ""
+            };
+            let query = tree_sitter::Query::new(&language, source).unwrap();
+            server
+                .language
+                .query_store()
+                .insert_injection_query("rust".into(), std::sync::Arc::new(query));
+        };
+        install_query(true);
+        let uri = Url::parse("file:///node-only-removal.rs").unwrap();
+        let prefix = if sibling {
+            "fn live() { let a = 1; } "
+        } else {
+            ""
+        };
+        let original = format!("{prefix}fn live() {{ let b = 2; }}");
+        let removed = format!("{prefix}fn dead() {{ let b = 2; }}");
+        server
+            .documents
+            .insert(uri.clone(), original.clone(), Some("rust".into()), None);
+        let params = |byte: usize, injection| NodeParams {
+            text_document: TextDocumentIdentifier {
+                uri: uri.as_str().parse().unwrap(),
+            },
+            position: Position::new(0, byte as u32),
+            injection: Some(injection),
+        };
+        let target = original.find("b =").unwrap();
+        let probe = if sibling {
+            original.find("a =").unwrap()
+        } else {
+            target
+        };
+        server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("rust"), None, None)
+            .await
+            .unwrap();
+        let old = server
+            .kakehashi_node(params(target, Value::Bool(true)))
+            .await
+            .unwrap();
+        server
+            .kakehashi_node(params(probe, Value::Bool(true)))
+            .await
+            .unwrap();
+        server
+            .kakehashi_node(params(probe, Value::Bool(true)))
+            .await
+            .unwrap();
+        let old_id: ulid::Ulid = old["id"].as_str().unwrap().parse().unwrap();
+        let name = prefix.len() + 3;
+        if query_reload {
+            install_query(false);
+            server.cache.bump_semantic_token_generation();
+        } else {
+            server.bridge.node_tracker().apply_input_edits(
+                &uri,
+                &[crate::language::node_tracker::EditInfo::new(
+                    name,
+                    name + 4,
+                    name + 4,
+                )],
+            );
+            server.documents.update_document(uri.clone(), removed, None);
+            server
+                .parse_coordinator()
+                .parse_document(uri.clone(), Some("rust"), None, None)
+                .await
+                .unwrap();
+        }
+        server
+            .kakehashi_node(params(
+                probe,
+                if missing_index {
+                    json!(1)
+                } else {
+                    Value::Bool(true)
+                },
+            ))
+            .await
+            .unwrap();
+        assert!(
+            server
+                .bridge
+                .node_tracker()
+                .lookup_node(&uri, &old_id)
+                .is_none(),
+            "observed injection removal must retire the old ID"
+        );
+        if query_reload {
+            install_query(true);
+            server.cache.bump_semantic_token_generation();
+        } else {
+            server.bridge.node_tracker().apply_input_edits(
+                &uri,
+                &[crate::language::node_tracker::EditInfo::new(
+                    name,
+                    name + 4,
+                    name + 4,
+                )],
+            );
+            server
+                .documents
+                .update_document(uri.clone(), original, None);
+            server
+                .parse_coordinator()
+                .parse_document(uri.clone(), Some("rust"), None, None)
+                .await
+                .unwrap();
+        }
+        let restored = server
+            .kakehashi_node(params(target, Value::Bool(true)))
+            .await
+            .unwrap();
+        assert_ne!(
+            old["id"], restored["id"],
+            "restoring geometry must not resurrect a retired ID"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::complete(false)]
+    #[case::unrelated_missing_grammar(true)]
+    #[tokio::test]
+    async fn node_only_boundary_growth_retires_obsolete_scopes(#[case] missing_grammar: bool) {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        for name in ["rust", "scope_inner"] {
+            server
+                .language
+                .language_registry_for_parallel()
+                .register(name.into(), language.clone());
+        }
+        let mut query_text = r#"((source_file) @injection.content (#set! injection.language "scope_inner") (#set! injection.include-children))"#.to_string();
+        if missing_grammar {
+            query_text.push_str(r#" ((integer_literal) @injection.content (#set! injection.language "scope_missing"))"#);
+        }
+        let query = tree_sitter::Query::new(&language, &query_text).unwrap();
+        server
+            .language
+            .query_store()
+            .insert_injection_query("rust".into(), std::sync::Arc::new(query));
+        let uri = Url::parse("file:///node-only-growth.rs").unwrap();
+        let mut text = "fn name() { let value = 1; }".to_string();
+        server
+            .documents
+            .insert(uri.clone(), text.clone(), Some("rust".into()), None);
+        let mut previous = None;
+        for _ in 0..8 {
+            assert!(
+                server
+                    .parse_coordinator()
+                    .parse_document(uri.clone(), Some("rust"), None, None)
+                    .await
+                    .is_some()
+            );
+            let result = server
+                .kakehashi_node(NodeParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: uri.as_str().parse().unwrap(),
+                    },
+                    position: Position::new(0, 3),
+                    injection: Some(Value::Bool(true)),
+                })
+                .await
+                .unwrap();
+            assert_eq!(result["kind"], "identifier");
+            let id: ulid::Ulid = result["id"].as_str().unwrap().parse().unwrap();
+            if let Some(old) = previous {
+                assert!(
+                    server
+                        .bridge
+                        .node_tracker()
+                        .lookup_node(&uri, &old)
+                        .is_none(),
+                    "node-only clients must retire absent tree scopes after boundary growth"
+                );
+            }
+            assert!(
+                server
+                    .bridge
+                    .node_tracker()
+                    .lookup_node(&uri, &id)
+                    .is_some()
+            );
+            previous = Some(id);
+            let end = text.len();
+            text.push(' ');
+            server.bridge.node_tracker().apply_input_edits(
+                &uri,
+                &[crate::language::node_tracker::EditInfo::new(
+                    end,
+                    end,
+                    end + 1,
+                )],
+            );
+            server
+                .documents
+                .update_document(uri.clone(), text.clone(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn node_mint_epoch_waits_for_the_complete_document_edit() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///mint-gate.rs").unwrap();
+        let incarnation =
+            server
+                .documents
+                .insert(uri.clone(), "old".into(), Some("rust".into()), None);
+        let initial = server.node_mint_epoch(&uri, incarnation, 0).await;
+        assert!(initial.is_some());
+        let lock = server.documents.edit_lock(&uri);
+        let guard = lock.lock().await;
+        server.bridge.node_tracker().apply_input_edits(
+            &uri,
+            &[crate::language::node_tracker::EditInfo::new(0, 0, 1)],
+        );
+        // didChange has shifted the tracker but has not published its content
+        // version yet. A node request must not accept this intermediate pair.
+        let mut gate = Box::pin(server.node_mint_epoch(&uri, incarnation, 0));
+        assert!(futures::poll!(gate.as_mut()).is_pending());
+        server
+            .documents
+            .update_document(uri.clone(), "new".into(), None);
+        drop(guard);
+        assert!(
+            gate.await.is_none(),
+            "the completed edit supersedes the old snapshot"
+        );
+    }
 
     #[tokio::test]
     async fn injection_node_rejects_close_reopen_during_language_load() {

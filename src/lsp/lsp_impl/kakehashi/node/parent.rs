@@ -9,7 +9,7 @@
 //! language tree: calling `parent` on the root of an injected tree must **not**
 //! cross into the host node that contains the injection. To find the node in
 //! the correct tree we resolve it **only** in the layer that minted it —
-//! `stack[layer]` for the tracked `layer` (see
+//! the exact scope of the tracked `layer` (see
 //! [`with_resolved_node`](super::injection_stack::with_resolved_node)) — so a
 //! node minted by `kakehashi/node` against an injected layer is never re-matched
 //! against a different layer's tree.
@@ -63,8 +63,10 @@ impl Kakehashi {
         // has no entries. `layer` pins resolution to the language tree that
         // minted the node so navigation stays in-layer (node-reference-protocol
         // Scope rule).
-        let Some((start, end, kind, layer, tracked_incarnation)) =
-            self.bridge.node_tracker().lookup_node(&uri, &ulid)
+        let Some(crate::language::node_tracker::ScopedNode {
+            position: (start, end, kind, layer, tracked_incarnation),
+            scope,
+        }) = self.bridge.node_tracker().lookup_node_scope(&uri, &ulid)
         else {
             return Ok(Value::Null);
         };
@@ -95,7 +97,7 @@ impl Kakehashi {
             return Ok(Value::Null);
         };
 
-        // Resolve in the minting layer only (`stack[layer]`), never falling back
+        // Resolve in the minting layer only (its recorded tree scope), never falling back
         // to other layers. node-reference-protocol "Scope rule" applies per
         // layer: tree-sitter's `node.parent()` returns None for any tree root
         // (host root AND injected root), which is the intended semantics — do
@@ -109,6 +111,7 @@ impl Kakehashi {
             end,
             kind,
             layer,
+            scope.as_deref(),
             |node| {
                 node.parent()
                     .map(|p| (p.start_byte(), p.end_byte(), static_node_kind(&p)))

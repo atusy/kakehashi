@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use tree_sitter::Tree;
 
-use super::injections::{DiscoveredBridgeRegion, DiscoveredInjections, SnapshotLayerTree};
+use super::injections::{DiscoveredBridgeRegion, DiscoveredInjections, SnapshotLayerTrees};
 use crate::language::injection::ResolvedInjection;
 
 /// The reserved terminal incarnation `didClose` installs in a slot
@@ -86,7 +86,7 @@ pub(crate) struct ParseSnapshot {
     /// empty embedded layer for the rest of this snapshot's life. A walker
     /// seeing a generation mismatch bypasses the cell and walks fresh (the
     /// pre-cache per-request cost) until the next snapshot rebuilds it.
-    pub(crate) layer_trees: Arc<std::sync::OnceLock<(u64, Arc<Vec<SnapshotLayerTree>>)>>,
+    pub(crate) layer_trees: Arc<std::sync::OnceLock<(u64, Arc<SnapshotLayerTrees>)>>,
 }
 
 impl ParseSnapshot {
