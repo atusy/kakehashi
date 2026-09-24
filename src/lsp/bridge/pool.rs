@@ -2318,8 +2318,8 @@ impl LanguageServerPool {
         if self.host_routing_rootless(document_uri, server_name) {
             return (ConnectionKey::shared(server_name), None);
         }
-        let (marker, key) = self
-            .resolve_acquire(server_name, server_config, Some(document_uri))
+        let (marker, key, _) = self
+            .resolve_connection_route(server_name, server_config, Some(document_uri))
             .await;
         (key, Some(marker))
     }
@@ -2488,12 +2488,9 @@ impl LanguageServerPool {
         server_config: &crate::config::settings::BridgeServerConfig,
         document_uri: &Url,
     ) -> ConnectionKey {
-        if self.host_routing_rootless(document_uri, server_name) {
-            return ConnectionKey::shared(server_name);
-        }
-        self.resolve_acquire(server_name, server_config, Some(document_uri))
+        self.resolved_connection_key_and_marker(server_name, server_config, document_uri)
             .await
-            .1
+            .0
     }
 
     /// Membership check for the save fan-out liveness recheck (avoids the
@@ -3478,10 +3475,48 @@ impl LanguageServerPool {
         Option<(Url, tower_lsp_server::ls_types::WorkspaceFolder)>,
         ConnectionKey,
     ) {
+        let (marker, key, heal_straggler) = self
+            .resolve_connection_route(server_name, server_config, document_uri)
+            .await;
+        // Handed to the upstream loop rather than awaited here: this runs in
+        // request futures a `$/cancelRequest` can drop, and retirement marks
+        // connections Closing before its cleanup awaits — a cancelled inline
+        // consolidation could strand a half-retired process. The loop runs it
+        // on a task of its own, moments after this acquisition.
+        if heal_straggler
+            && let Err(e) =
+                self.upstream_request_tx
+                    .send(UpstreamRequest::ConsolidateSharedInstance {
+                        server: server_name.to_owned(),
+                    })
+        {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "Failed to queue consolidation of {server_name}'s straggling divert \
+                 (forwarding loop gone): {e}"
+            );
+        }
+
+        (marker, key)
+    }
+
+    /// Resolve routing without scheduling pool changes. The third result tells
+    /// an acquiring caller to consolidate a straggler; inspection callers (crash
+    /// demand and named re-open) must leave that work to an actual acquisition.
+    async fn resolve_connection_route(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        document_uri: Option<&Url>,
+    ) -> (
+        Option<(Url, tower_lsp_server::ls_types::WorkspaceFolder)>,
+        ConnectionKey,
+        bool,
+    ) {
         let (marker, per_root_key) =
             self.resolve_marker_and_key(server_name, server_config, document_uri);
         if !server_config.prefers_shared_instance() {
-            return (marker, per_root_key);
+            return (marker, per_root_key, false);
         }
         // A marker-less document (no marker root, non-file URI, no document
         // hint, or the `[]` kill switch) joins the shared instance too: it has
@@ -3566,26 +3601,7 @@ impl LanguageServerPool {
             // route to the shared instance.
             _ => shared_key,
         };
-        // Handed to the upstream loop rather than awaited here: this runs in
-        // request futures a `$/cancelRequest` can drop, and retirement marks
-        // connections Closing before its cleanup awaits — a cancelled inline
-        // consolidation could strand a half-retired process. The loop runs it
-        // on a task of its own, moments after this acquisition.
-        if heal_straggler
-            && let Err(e) =
-                self.upstream_request_tx
-                    .send(UpstreamRequest::ConsolidateSharedInstance {
-                        server: server_name.to_owned(),
-                    })
-        {
-            log::warn!(
-                target: "kakehashi::bridge",
-                "Failed to queue consolidation of {server_name}'s straggling divert \
-                 (forwarding loop gone): {e}"
-            );
-        }
-
-        (marker, key)
+        (marker, key, heal_straggler)
     }
 
     /// For a shared-instance connection (#391), record this acquisition's marker
@@ -6542,6 +6558,14 @@ mod tests {
         .await;
 
         let mut upstream_requests = pool.take_upstream_request_rx().expect("receiver");
+        assert_eq!(
+            pool.resolved_connection_key("lua", &config, &doc).await,
+            ConnectionKey::shared("lua")
+        );
+        assert!(
+            upstream_requests.try_recv().is_err(),
+            "a read-only recovery eligibility check must not schedule consolidation"
+        );
         let (_marker, key) = pool.resolve_acquire("lua", &config, Some(&doc)).await;
 
         assert_eq!(key, ConnectionKey::shared("lua"));
