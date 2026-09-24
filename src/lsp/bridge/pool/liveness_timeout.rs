@@ -13,7 +13,7 @@ pub(crate) struct LivenessTimeout(Duration);
 
 impl LivenessTimeout {
     /// Default timeout: 60 seconds (middle of ls-bridge-timeout-hierarchy recommended 30-120s range)
-    const DEFAULT_SECS: u64 = 60;
+    pub(super) const DEFAULT_SECS: u64 = 60;
 
     /// Get the inner Duration value.
     pub(crate) fn as_duration(&self) -> Duration {

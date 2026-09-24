@@ -14,6 +14,7 @@ mod connection_action;
 mod connection_handle;
 mod connection_key;
 mod connection_state;
+mod crash_recovery;
 mod document_tracker;
 mod dynamic_capability_registry;
 mod execute;
@@ -36,6 +37,17 @@ pub(in crate::lsp::bridge) use connection_handle::REQUEST_TIMEOUT;
 pub(crate) use connection_handle::{ConnectionHandle, NotificationSendResult};
 pub(crate) use connection_key::ConnectionKey;
 pub(crate) use connection_state::ConnectionState;
+use crash_recovery::CrashRecoveryRegistry;
+
+/// A connection whose reader exited while the pool still held it as failed
+/// (see [`LanguageServerPool::crashed_connection`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CrashedConnection {
+    pub(crate) key: ConnectionKey,
+    /// How long the connection had existed when it crashed.
+    pub(crate) uptime: Duration,
+}
+pub(crate) use crash_recovery::{RecoveryDecision, Reservation};
 pub(in crate::lsp::bridge) use document_tracker::DocumentTracker;
 pub(crate) use document_tracker::{OpenedVirtualDoc, VirtualUriObserver};
 pub(crate) use dynamic_capability_registry::DynamicCapabilityRegistry;
@@ -102,6 +114,22 @@ fn same_launch_config(
         && old_on_type_formatting_triggers == new_on_type_formatting_triggers
         && old.prefers_shared_instance() == new.prefers_shared_instance()
         && old.is_enabled() == new.is_enabled()
+}
+
+/// The marker workspace a key is rooted at, rebuilt from the key alone —
+/// `Some(None)` for a key with no marker root (the client-root fallback, whose
+/// rooting is exactly "no marker"), and `None` when the recorded root is not a
+/// usable workspace URI.
+fn marker_for_key(
+    key: &ConnectionKey,
+) -> Option<Option<(Url, tower_lsp_server::ls_types::WorkspaceFolder)>> {
+    match key.marker_root() {
+        Some(root) => Url::parse(root)
+            .ok()
+            .and_then(super::root_markers::workspace_at_root)
+            .map(Some),
+        None => Some(None),
+    }
 }
 
 fn shutdown_invalidated_connection(key: ConnectionKey, handle: Arc<ConnectionHandle>) {
@@ -445,6 +473,8 @@ pub struct LanguageServerPool {
     /// the barrier requests wait on (respawn-reopen-derives-its-targets).
     /// `Arc` because the claim runs inside the spawned handshake task.
     pending_reopen: Arc<PendingReopenRegistry>,
+    /// Backoff state for proactively recovering crashed connections (#977).
+    crash_recovery: CrashRecoveryRegistry,
     /// Last full downstream pull report per exact connection/document. Region
     /// diagnostics stay virtual-local and are re-anchored with the request's
     /// current offset when a server answers `unchanged`.
@@ -594,6 +624,7 @@ impl LanguageServerPool {
             host_routing_pending: DashMap::new(),
             virtual_routing_pending: DashMap::new(),
             pending_reopen: Arc::new(PendingReopenRegistry::default()),
+            crash_recovery: CrashRecoveryRegistry::default(),
             diagnostic_pull_baselines: DashMap::new(),
             diagnostic_document_generations: DashMap::new(),
             diagnostic_pull_generations: DashMap::new(),
@@ -2240,24 +2271,14 @@ impl LanguageServerPool {
             );
             return None;
         }
-        let marker = match key.marker_root() {
-            Some(root) => {
-                let Some(marker) = Url::parse(root)
-                    .ok()
-                    .and_then(super::root_markers::workspace_at_root)
-                else {
-                    log::warn!(
-                        target: "kakehashi::bridge",
-                        "executeCommand: routed root {root:?} for {server:?} is not a \
-                         usable workspace URI; ignoring"
-                    );
-                    return None;
-                };
-                Some(marker)
-            }
-            // Client-root fallback: no marker to restore, which is exactly the
-            // rooting this key means.
-            None => None,
+        let Some(marker) = marker_for_key(key) else {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "executeCommand: routed root {:?} for {server:?} is not a \
+                 usable workspace URI; ignoring",
+                key.marker_root()
+            );
+            return None;
         };
         match self
             .acquire_resolved_wait_ready(
@@ -2267,6 +2288,7 @@ impl LanguageServerPool {
                 marker,
                 Duration::from_secs(INIT_TIMEOUT_SECS),
                 false,
+                None,
             )
             .await
         {
@@ -2300,6 +2322,157 @@ impl LanguageServerPool {
             .resolve_acquire(server_name, server_config, Some(document_uri))
             .await;
         (key, Some(marker))
+    }
+
+    /// The connection whose reader exited under `connection_id`, when the pool
+    /// did not initiate that exit and still holds the connection (#977).
+    ///
+    /// That covers a crash, a framing error, a liveness timeout on a hung
+    /// server, a process that died during its handshake, and a writer wedge
+    /// the pool aborted (`fail_and_abort_writer`, which kills the process but
+    /// leaves the handle mapped) — every exit after which the connection is
+    /// down but still owed. A reader also exits on a deliberate shutdown, a
+    /// settings eviction or a replacement; none of those leaves the exited
+    /// handle both mapped and `Failed` — shutdown moves it to
+    /// `Closing`/`Closed`, and eviction or replacement unmaps it — so that one
+    /// check tells them apart.
+    pub(crate) async fn crashed_connection(
+        &self,
+        connection_id: super::ProgressConnectionId,
+    ) -> Option<CrashedConnection> {
+        if self.shutting_down.load(Ordering::Relaxed) {
+            return None;
+        }
+        let connections = self.connections.lock().await;
+        connections
+            .values()
+            .find(|handle| handle.connection_id() == Some(connection_id))
+            .filter(|handle| handle.state() == ConnectionState::Failed)
+            .map(|handle| CrashedConnection {
+                key: handle.key().clone(),
+                uptime: handle.uptime(),
+            })
+    }
+
+    /// Decide when to recover a crashed connection (see
+    /// [`CrashRecoveryRegistry::schedule`]).
+    pub(crate) fn schedule_crash_recovery(&self, crashed: &CrashedConnection) -> RecoveryDecision {
+        self.crash_recovery.schedule(&crashed.key, crashed.uptime)
+    }
+
+    /// Decide when to try `key` again after a respawn failed without starting
+    /// a process that could report its own crash — counted like a crash that
+    /// ended a start.
+    pub(crate) fn schedule_crash_retry(&self, key: &ConnectionKey) -> RecoveryDecision {
+        self.crash_recovery.schedule(key, Duration::ZERO)
+    }
+
+    /// Record that `key`'s scheduled recovery stood down without respawning
+    /// (see [`CrashRecoveryRegistry::stand_down`]).
+    pub(crate) fn stand_down_crash_recovery(
+        &self,
+        key: &ConnectionKey,
+        reservation: Reservation,
+    ) -> Option<RecoveryDecision> {
+        self.crash_recovery.stand_down(key, reservation)
+    }
+
+    /// Commit `key`'s scheduled recovery to respawning (see
+    /// [`CrashRecoveryRegistry::begin_attempt`]).
+    pub(crate) fn commit_crash_recovery_attempt(
+        &self,
+        key: &ConnectionKey,
+        reservation: Reservation,
+    ) {
+        self.crash_recovery.begin_attempt(key, reservation);
+    }
+
+    /// Start a scheduled recovery of `key`: whether the connection the pool
+    /// holds for it is still a failed one. Shutdown, a settings eviction, or an
+    /// edit or request that already brought up a live replacement leave nothing
+    /// for recovery to do.
+    ///
+    /// Asked of the KEY, not of the handle that crashed: when a replacement
+    /// spawned during the delay has crashed too, its own crash report found this
+    /// recovery already scheduled and stood down, so this recovery must now
+    /// serve it. Nor is the crashed handle held across the delay — holding it
+    /// would keep a hung (liveness-failed but running) process alive until the
+    /// attempt ends, next to its replacement.
+    ///
+    /// `after_own_failure` is for a retry of a respawn that itself failed
+    /// before inserting a replacement: that failure already removed the
+    /// crashed connection, so an empty key is expected and still owed.
+    pub(crate) async fn begin_crash_recovery_attempt(
+        &self,
+        key: &ConnectionKey,
+        after_own_failure: bool,
+    ) -> bool {
+        if self.shutting_down.load(Ordering::Relaxed) {
+            return false;
+        }
+        let connections = self.connections.lock().await;
+        match connections.get(key) {
+            Some(mapped) => mapped.state() == ConnectionState::Failed,
+            None => after_own_failure,
+        }
+    }
+
+    /// Whether the pool holds any connection under `key`, in any state.
+    pub(crate) async fn holds_connection(&self, key: &ConnectionKey) -> bool {
+        self.connections.lock().await.contains_key(key)
+    }
+
+    /// Whether the connection the pool holds under `key` has lost its reader,
+    /// so that reader's exit reports (or already reported) a crash. `false`
+    /// when nothing is mapped, or when the mapped connection failed with its
+    /// reader still running — a handshake refused or timed out on a live
+    /// process — which reports nothing.
+    pub(crate) async fn reports_crash_for(&self, key: &ConnectionKey) -> bool {
+        self.connections
+            .lock()
+            .await
+            .get(key)
+            .is_some_and(|handle| !handle.router().is_accepting())
+    }
+
+    /// Respawn the crashed connection under `key`. The replacement's
+    /// handshake claims the re-open its purge armed, so the documents it should
+    /// hold are derived and opened the ordinary way
+    /// (respawn-reopen-derives-its-targets).
+    ///
+    /// Refused for a shared-instance key: the marker roots a dead shared
+    /// instance served died with its folder set, and nothing here can re-root
+    /// it — the next document acquisition revives it with its roots intact.
+    pub(crate) async fn revive_crashed_connection(
+        &self,
+        key: &ConnectionKey,
+        config: &crate::config::settings::BridgeServerConfig,
+        admit: &(dyn Fn() -> bool + Sync),
+    ) -> io::Result<Arc<ConnectionHandle>> {
+        if key.is_shared() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "bridge: shared-instance connection {key} cannot be re-rooted without a document"
+                ),
+            ));
+        }
+        let marker = marker_for_key(key).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("bridge: root of {key} is not a usable workspace URI"),
+            )
+        })?;
+        self.acquire_resolved_wait_ready(
+            key.server(),
+            config,
+            key.clone(),
+            marker,
+            Duration::from_secs(INIT_TIMEOUT_SECS),
+            false,
+            Some(admit),
+        )
+        .await
     }
 
     /// Resolve the exact `(server, root)` connection a document currently
@@ -2923,6 +3096,7 @@ impl LanguageServerPool {
                 marker.clone(),
                 timeout,
                 rootless,
+                None,
             )
             .await
         {
@@ -2943,6 +3117,7 @@ impl LanguageServerPool {
                         marker.clone(),
                         remaining,
                         false,
+                        None,
                     )
                     .await?;
                 self.announce_shared_root(&shared, &marker).await?;
@@ -2995,6 +3170,7 @@ impl LanguageServerPool {
                         marker.clone(),
                         remaining,
                         false,
+                        None,
                     )
                     .await;
                 // A dynamically registering server makes this divert race its
@@ -3026,6 +3202,9 @@ impl LanguageServerPool {
     /// and wait (up to `timeout`) for it to reach Ready, transparently waiting
     /// through a concurrent spawn that returns `Initializing`. Does NOT apply
     /// shared-instance routing or announce — callers layer that on top.
+    /// `admit` is evaluated inside the acquire's critical section, as for
+    /// [`Self::get_or_create_connection_admitted`].
+    #[allow(clippy::too_many_arguments)]
     async fn acquire_resolved_wait_ready(
         &self,
         server_name: &str,
@@ -3034,6 +3213,7 @@ impl LanguageServerPool {
         marker: Option<(Url, tower_lsp_server::ls_types::WorkspaceFolder)>,
         timeout: Duration,
         rootless: bool,
+        admit: Option<&(dyn Fn() -> bool + Sync)>,
     ) -> io::Result<Arc<ConnectionHandle>> {
         match self
             .get_or_create_connection_resolved(
@@ -3047,7 +3227,7 @@ impl LanguageServerPool {
                 // stays within `timeout` overall.
                 timeout,
                 rootless,
-                None,
+                admit,
             )
             .await
         {
@@ -3925,6 +4105,7 @@ impl LanguageServerPool {
         ));
 
         let liveness_timeout = liveness_timeout::LivenessTimeout::default();
+        let progress_connection_id = self.progress_registry.new_connection_id();
         let reader_handle = spawn_reader_task_for_server(
             reader,
             Arc::clone(&router),
@@ -3947,7 +4128,7 @@ impl LanguageServerPool {
                 workspace_folders: workspace_folders.clone(),
                 progress_registry: Arc::clone(&self.progress_registry),
                 client_progress_registry: Arc::clone(&self.client_progress_registry),
-                progress_connection_id: self.progress_registry.new_connection_id(),
+                progress_connection_id,
                 settings: Arc::clone(&settings_cell),
             },
         );
@@ -3968,6 +4149,7 @@ impl LanguageServerPool {
             settings_cell,
         ));
         handle.record_launch_config(server_config);
+        handle.record_connection_id(progress_connection_id);
         // The incapable-shared divert's baseline proof: the spawn root always
         // counts as served, whatever the server declared about workspace
         // folders. Initialize-listed folders widen the proof only for servers
@@ -11242,5 +11424,131 @@ mod tests {
             ConnectionState::Closing | ConnectionState::Closed
         ));
         assert_eq!(unchanged.state(), ConnectionState::Ready);
+    }
+
+    /// Seed `key`'s connection as a spawned one: its reader reports exits
+    /// under the returned id.
+    async fn insert_spawned_connection(
+        pool: &LanguageServerPool,
+        key: &ConnectionKey,
+        state: ConnectionState,
+    ) -> (
+        Arc<ConnectionHandle>,
+        crate::lsp::bridge::ProgressConnectionId,
+    ) {
+        let handle = create_handle_with_key(state, key.clone()).await;
+        let id = pool.progress_registry.new_connection_id();
+        handle.record_connection_id(id);
+        pool.insert_connection(Arc::clone(&handle)).await;
+        (handle, id)
+    }
+
+    #[tokio::test]
+    async fn crashed_connection_is_the_mapped_failed_handle_its_reader_reported() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("crashy");
+        let (handle, id) = insert_spawned_connection(&pool, &key, ConnectionState::Ready).await;
+        assert!(
+            pool.crashed_connection(id).await.is_none(),
+            "a live connection has not crashed"
+        );
+
+        handle.set_state(ConnectionState::Failed);
+        assert_eq!(
+            pool.crashed_connection(id).await.map(|crashed| crashed.key),
+            Some(key.clone())
+        );
+        let other = pool.progress_registry.new_connection_id();
+        assert!(
+            pool.crashed_connection(other).await.is_none(),
+            "an exit reported under another id is not this connection's"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connection_shut_down_on_purpose_is_not_a_crash() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("crashy");
+        let (handle, id) = insert_spawned_connection(&pool, &key, ConnectionState::Ready).await;
+        handle.begin_shutdown();
+        assert!(pool.crashed_connection(id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn crash_recovery_stands_down_once_a_live_replacement_exists() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("crashy");
+        insert_spawned_connection(&pool, &key, ConnectionState::Failed).await;
+        assert!(pool.begin_crash_recovery_attempt(&key, false).await);
+
+        // An edit respawned it before the recovery got there.
+        insert_spawned_connection(&pool, &key, ConnectionState::Ready).await;
+        assert!(!pool.begin_crash_recovery_attempt(&key, false).await);
+    }
+
+    #[tokio::test]
+    async fn crash_recovery_serves_a_replacement_that_crashed_during_the_delay() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("crashy");
+        insert_spawned_connection(&pool, &key, ConnectionState::Failed).await;
+        // A lazy respawn replaced it, and the replacement died too; its own
+        // crash report found this recovery already scheduled.
+        insert_spawned_connection(&pool, &key, ConnectionState::Failed).await;
+        assert!(pool.begin_crash_recovery_attempt(&key, false).await);
+    }
+
+    #[tokio::test]
+    async fn crash_recovery_stands_down_during_shutdown() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("crashy");
+        let (_, id) = insert_spawned_connection(&pool, &key, ConnectionState::Failed).await;
+        pool.shutting_down.store(true, Ordering::Relaxed);
+        assert!(pool.crashed_connection(id).await.is_none());
+        assert!(!pool.begin_crash_recovery_attempt(&key, false).await);
+    }
+
+    #[tokio::test]
+    async fn a_shared_instance_is_not_revived_by_crash_recovery() {
+        let pool = LanguageServerPool::new();
+        let result = pool
+            .revive_crashed_connection(&ConnectionKey::shared("crashy"), &devnull_config(), &|| {
+                true
+            })
+            .await;
+        assert_eq!(
+            result.map(|_| ()).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert!(pool.connections().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn only_a_lost_reader_reports_a_crash() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("crashy");
+        assert!(!pool.reports_crash_for(&key).await, "nothing is mapped");
+
+        // A refused handshake fails the connection while its reader runs on.
+        let (handle, _) = insert_spawned_connection(&pool, &key, ConnectionState::Failed).await;
+        assert!(!pool.reports_crash_for(&key).await);
+
+        handle.router().fail_all("bridge: reader error: EOF");
+        assert!(pool.reports_crash_for(&key).await);
+    }
+
+    #[tokio::test]
+    async fn a_retry_after_a_failed_respawn_accepts_the_emptied_key() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("crashy");
+        assert!(
+            !pool.begin_crash_recovery_attempt(&key, false).await,
+            "a first attempt finds its crashed connection gone: settings evicted it"
+        );
+        assert!(pool.begin_crash_recovery_attempt(&key, true).await);
+        insert_spawned_connection(&pool, &key, ConnectionState::Ready).await;
+        assert!(
+            !pool.begin_crash_recovery_attempt(&key, true).await,
+            "a live replacement still ends the retry"
+        );
     }
 }

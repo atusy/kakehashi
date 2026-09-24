@@ -531,6 +531,128 @@ fn e2e_downstream_crash_evicts_its_pushed_diagnostics() {
     client.send_notification("exit", json!(null));
 }
 
+/// A push client whose mock server crashes once, ~300 ms after its first push
+/// (`diagnostics-push-crash-once`). Returns the wire-log path the mock derives
+/// its `.died` / `.replacement` markers from.
+fn init_crash_once_client() -> (LspClient, tempfile::TempDir, std::path::PathBuf) {
+    let config_dir = tempfile::TempDir::new().expect("temp dir");
+    let config_path = config_dir.path().join("push_diagnostics.toml");
+    std::fs::write(&config_path, "").expect("write config");
+    let wire_log = config_dir.path().join("mock-wire.log");
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("utf8 path"))
+        .env("MOCK_LSP_WIRE_LOG", wire_log.to_string_lossy())
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-push": {
+                        "cmd": [mock_bin(), "diagnostics-push-crash-once"],
+                        "languages": ["lua"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    (client, config_dir, wire_log)
+}
+
+/// Wait for the first process's push, then for the crash that clears it.
+fn wait_for_crash_once(client: &mut LspClient, wire_log: &std::path::Path) {
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            has_pushed_diag,
+        )
+        .expect("editor should receive the first process's pushed diagnostic");
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            cleared_host_diag,
+        )
+        .expect("the crash must evict the dead server's diagnostic and republish cleared");
+    assert!(
+        std::path::Path::new(&format!("{}.died", wire_log.display())).exists(),
+        "the first mock process must have crashed"
+    );
+}
+
+#[test]
+fn e2e_crashed_downstream_stays_down_once_its_documents_are_closed() {
+    // #977: recovery brings a crashed server back only while an open document
+    // could use it. Close the only document before the first retry is due;
+    // no replacement process may start.
+    let (mut client, _config_dir, wire_log) = init_crash_once_client();
+    open_host(&mut client);
+    wait_for_crash_once(&mut client, &wire_log);
+    client.send_notification(
+        "textDocument/didClose",
+        json!({ "textDocument": { "uri": MD_URI } }),
+    );
+
+    // Past the first retry (2 s) with margin. A negative wait: under load it
+    // can pass falsely (the retry has not run yet), and it fails falsely only
+    // if the server processes the didClose above more than ~2 s after the
+    // crash, which would let the retry still see the document open.
+    std::thread::sleep(Duration::from_secs(5));
+    assert!(
+        !std::path::Path::new(&format!("{}.replacement", wire_log.display())).exists(),
+        "a crashed server must not be respawned for documents that are all closed"
+    );
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+#[test]
+fn e2e_crashed_downstream_is_respawned_and_its_diagnostics_return() {
+    // #977: a crash evicts the dead server's diagnostics (#469), but nothing
+    // brought the server back — on a quiet document the diagnostics stayed gone
+    // until some unrelated edit happened to respawn it. The mock dies on a timer
+    // after its first push, with NO client input, so no edit or request can be
+    // what respawns it; the replacement tags its push, so the returning
+    // diagnostic can only come from a respawned, re-opened server.
+    let (mut client, _config_dir, wire_log) = init_crash_once_client();
+    open_host(&mut client);
+
+    wait_for_crash_once(&mut client, &wire_log);
+
+    let is_replacement = |d: &Value| {
+        d["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("mock-push-diag") && m.ends_with(":replacement"))
+    };
+
+    // No further client action: the bridge itself must respawn the server and
+    // re-open the document, whose push brings the diagnostic back.
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(20),
+            |params| {
+                params["uri"] == json!(MD_URI)
+                    && params["diagnostics"]
+                        .as_array()
+                        .is_some_and(|ds| ds.iter().any(is_replacement))
+            },
+        )
+        .expect("a crashed server must be respawned and its diagnostics re-published (#977)");
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
 /// Client capabilities advertising pull-diagnostic refresh support, so the bridge
 /// will send `workspace/diagnostic/refresh` (it's gated on this; an editor that
 /// doesn't advertise it is never sent the request).

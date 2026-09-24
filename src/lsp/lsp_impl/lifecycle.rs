@@ -2333,13 +2333,274 @@ async fn deliver_upstream_notification(
             // A downstream connection's reader exited (crash/respawn): drop the
             // diagnostic slots it produced and republish the affected hosts so a
             // dead server's diagnostics don't linger until didClose (#469). A
-            // `None` publisher (test loop) has no cache to evict.
-            if let Some(publisher) =
-                delivery_context.map(|context| context.diagnostic_publisher.as_ref())
-            {
-                publisher.evict_connection_diagnostics(connection_id).await;
+            // `None` context (test loop) has no cache to evict and nothing to
+            // respawn.
+            if let Some(context) = delivery_context {
+                context
+                    .diagnostic_publisher
+                    .evict_connection_diagnostics(connection_id)
+                    .await;
+                // The eviction cleared what the dead server said; bring it back
+                // so it can say it again (#977).
+                spawn_crash_recovery(context, connection_id);
             }
         }
+    }
+}
+
+/// Whether some open document has an injected region that routes to `key` — a
+/// connection is only worth its process while one does (#977).
+///
+/// Per connection, not per server: under per-root pooling a server can have
+/// open documents under another root only, and respawning this key for them
+/// would start a process that holds nothing. The cheap configuration screen
+/// runs first, as in the respawn re-open; only its survivors pay for injection
+/// resolution and a routing lookup. A document that cannot be looked at —
+/// no settled tree — does not count: if a parse is pending, that parse's own
+/// eager open acquires the connection (respawning it) when it lands; if none
+/// ever will (no parser for its language), it has no regions to route, and
+/// counting it would let any such buffer revive every crashed connection.
+///
+/// Injected regions only: the re-open that follows the respawn re-opens only
+/// injected regions, so a host-layer (`_self`) document would not bring the
+/// server's diagnostics back and is left to its next request.
+async fn crashed_connection_is_wanted(
+    injection: &crate::lsp::lsp_impl::coordinator::InjectionCoordinator,
+    bridge: &crate::lsp::bridge::BridgeCoordinator,
+    settings: &Arc<crate::config::WorkspaceSettings>,
+    key: &crate::lsp::bridge::ConnectionKey,
+) -> bool {
+    let server = key.server();
+    for host in injection.open_host_uris() {
+        let Some((language, _)) = injection.screen_language(&host) else {
+            continue;
+        };
+        if !bridge.host_language_can_reach_server(settings, &language, server) {
+            continue;
+        }
+        if let Some((host_language, Some(injections))) = injection.bridge_injections(&host)
+            && bridge
+                .host_routes_to_connection(settings, &host_language, &host, injections, key)
+                .await
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Proactively respawn a downstream connection whose reader just exited, when
+/// that exit was a crash (#977).
+///
+/// Without this, nothing respawned a crashed server until an edit or request
+/// happened to acquire it again, so on a document nobody touched its evicted
+/// diagnostics stayed gone. The respawn is an ordinary acquire by key: its
+/// purge arms a re-open that the replacement's handshake claims, the re-open
+/// derives and opens the documents the connection should hold, and the
+/// server's pushes for them flow back through the usual publish and refresh
+/// paths. A pull-driven server needs nothing more — its pull layer is not
+/// connection-scoped, so the crash evicted none of it.
+///
+/// Detached: the backoff delay and the handshake must not stall the forwarding
+/// loop, which carries every server's diagnostics and progress. The pool's
+/// backoff bounds a server that dies on every start.
+fn spawn_crash_recovery(
+    context: &UpstreamDeliveryContext,
+    connection_id: crate::lsp::bridge::ProgressConnectionId,
+) {
+    let settings_manager = Arc::clone(&context.settings_manager);
+    let injection = context.injection.clone();
+    tokio::spawn(async move {
+        let bridge = Arc::clone(injection.bridge());
+        let pool = bridge.pool();
+        let Some(crashed) = pool.crashed_connection(connection_id).await else {
+            return;
+        };
+        let key = crashed.key.clone();
+        if key.is_shared() {
+            // Nothing here can re-root a dead shared instance: the marker roots
+            // it served died with its folder set. The next document that routes
+            // to it revives it with its roots intact.
+            log::debug!(
+                target: "kakehashi::bridge",
+                "Not respawning shared-instance {key}; the next document routed to it will"
+            );
+            return;
+        }
+        let Some((mut delay, mut reservation)) =
+            recovery_delay(&key, pool.schedule_crash_recovery(&crashed))
+        else {
+            return;
+        };
+        let mut after_own_failure = false;
+        loop {
+            tokio::time::sleep(delay).await;
+            let next = match attempt_crash_recovery(
+                &injection,
+                &bridge,
+                &settings_manager,
+                &key,
+                reservation,
+                after_own_failure,
+            )
+            .await
+            {
+                RecoveryAttempt::Done => return,
+                RecoveryAttempt::Again {
+                    decision,
+                    after_own_failure: own,
+                } => {
+                    after_own_failure = own;
+                    decision
+                }
+            };
+            match recovery_delay(&key, next) {
+                Some((next, next_reservation)) => {
+                    delay = next;
+                    reservation = next_reservation;
+                }
+                None => return,
+            }
+        }
+    });
+}
+
+/// What one crash-recovery attempt leaves to do.
+enum RecoveryAttempt {
+    /// Nothing more for this task: respawned, stood down with nothing owed,
+    /// or a replacement's own crash report takes over.
+    Done,
+    /// Try again as `decision` says; `after_own_failure` when this attempt's
+    /// own failed spawn emptied the key.
+    Again {
+        decision: crate::lsp::bridge::RecoveryDecision,
+        after_own_failure: bool,
+    },
+}
+
+/// The delay (and schedule reservation) of the next attempt `decision`
+/// allows, logging a give-up.
+fn recovery_delay(
+    key: &crate::lsp::bridge::ConnectionKey,
+    decision: crate::lsp::bridge::RecoveryDecision,
+) -> Option<(std::time::Duration, crate::lsp::bridge::Reservation)> {
+    use crate::lsp::bridge::RecoveryDecision;
+    match decision {
+        RecoveryDecision::Retry {
+            attempt,
+            delay,
+            reservation,
+        } => {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "Downstream {key} is down; considering a respawn in {delay:?} (attempt {attempt})"
+            );
+            Some((delay, reservation))
+        }
+        RecoveryDecision::AlreadyScheduled | RecoveryDecision::Exhausted => None,
+        RecoveryDecision::GiveUp { attempts } => {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "Downstream {key} kept failing ({attempts} respawns); not respawning it \
+                 again until the next edit or request needs it"
+            );
+            None
+        }
+    }
+}
+
+/// One crash-recovery attempt for `key`, after its delay.
+async fn attempt_crash_recovery(
+    injection: &crate::lsp::lsp_impl::coordinator::InjectionCoordinator,
+    bridge: &Arc<crate::lsp::bridge::BridgeCoordinator>,
+    settings_manager: &crate::lsp::settings_manager::SettingsManager,
+    key: &crate::lsp::bridge::ConnectionKey,
+    reservation: crate::lsp::bridge::Reservation,
+    after_own_failure: bool,
+) -> RecoveryAttempt {
+    let pool = bridge.pool();
+    // Standing down gives the attempt back, and hands on any crash this
+    // recovery absorbed while it was scheduled.
+    let stand_down = || match pool.stand_down_crash_recovery(key, reservation) {
+        Some(decision) => RecoveryAttempt::Again {
+            decision,
+            after_own_failure: false,
+        },
+        None => RecoveryAttempt::Done,
+    };
+    loop {
+        if !pool
+            .begin_crash_recovery_attempt(key, after_own_failure)
+            .await
+        {
+            return stand_down();
+        }
+        let snapshot = settings_manager.load_settings_pair();
+        let settings = &snapshot.settings;
+        let server = key.server();
+        let Some(config) = bridge.respawnable_server_config(settings, server) else {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "Not respawning {key}: settings no longer start {server:?}"
+            );
+            return stand_down();
+        };
+        if !crashed_connection_is_wanted(injection, bridge, settings, key).await {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "Not respawning {key}: no open document routes to it"
+            );
+            return stand_down();
+        }
+        // Stand down if settings change before the spawn commits: the config
+        // in hand would then be history, and spawning from it would start a
+        // server the new settings do not describe.
+        let generation = snapshot.generation;
+        let admit = || settings_manager.settings_generation() == generation;
+        pool.commit_crash_recovery_attempt(key, reservation);
+        let error = match pool.revive_crashed_connection(key, &config, &admit).await {
+            // Whether this call spawned the replacement or an edit's respawn
+            // got there first, the key was restarted during this crash
+            // streak, and the streak's budget counts restarts.
+            Ok(_) => {
+                log::info!(
+                    target: "kakehashi::bridge",
+                    "Crashed downstream {key} is back up"
+                );
+                return RecoveryAttempt::Done;
+            }
+            Err(error) => error,
+        };
+        if error.kind() == std::io::ErrorKind::Interrupted
+            && settings_manager.settings_generation() != generation
+        {
+            // Refused because settings moved on. Nothing was spawned, so no
+            // crash will come to reschedule this: decide again under the new
+            // settings. Each pass needs another settings change, so this
+            // cannot spin on its own.
+            continue;
+        }
+        if error.kind() == std::io::ErrorKind::Interrupted || pool.reports_crash_for(key).await {
+            // Shutdown, or a process that started and died again: its reader
+            // reports that crash, which schedules the next attempt.
+            log::debug!(
+                target: "kakehashi::bridge",
+                "Respawning crashed downstream {key} did not complete: {error}"
+            );
+            return RecoveryAttempt::Done;
+        }
+        // No reader exit is coming to schedule another attempt: the command
+        // failed to start, the handshake was refused or timed out on a process
+        // that is still running, or the key is disabled. Schedule it here,
+        // under the same backoff and cap.
+        log::warn!(
+            target: "kakehashi::bridge",
+            "Could not respawn crashed downstream {key}: {error}"
+        );
+        return RecoveryAttempt::Again {
+            decision: pool.schedule_crash_retry(key),
+            after_own_failure: !pool.holds_connection(key).await,
+        };
     }
 }
 
@@ -4706,6 +4967,63 @@ mod reopen_order_tests {
             *completion.borrow(),
             "a completed repair must report success"
         );
+    }
+
+    /// A document with no tree to resolve regions from — here, one whose
+    /// language has no parser — must not keep a crashed connection wanted,
+    /// even for a server that bridges every language (#977).
+    #[tokio::test]
+    async fn an_unparsed_document_does_not_keep_a_crashed_connection_wanted() {
+        use super::*;
+        use crate::config::settings::BridgeServerConfig;
+        use tower_lsp_server::LspService;
+        use tower_lsp_server::ls_types::{DidOpenTextDocumentParams, TextDocumentItem};
+
+        let (service, mut socket) = LspService::new(Kakehashi::new);
+        // Drain what the server sends the editor, so its notifications never
+        // block on a full client channel.
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            while socket.next().await.is_some() {}
+        });
+        let server = service.inner();
+        let settings = crate::config::WorkspaceSettings {
+            auto_install: false,
+            language_servers: std::collections::HashMap::from([(
+                "anything".to_string(),
+                BridgeServerConfig {
+                    cmd: Some(vec!["true".to_string()]),
+                    languages: Some(vec![
+                        crate::config::settings::LANGUAGES_WILDCARD.to_string(),
+                    ]),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        server
+            .apply_raw_settings(Default::default(), settings)
+            .await;
+        let uri = Url::parse("file:///notes.no-such-language").unwrap();
+        server
+            .did_open_impl(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: crate::lsp::lsp_impl::url_to_uri(&uri).unwrap(),
+                    language_id: "no-such-language".into(),
+                    version: 1,
+                    text: "anything\n".into(),
+                },
+            })
+            .await;
+        let injection = server.injection_coordinator();
+        assert!(
+            injection.open_host_uris().contains(&uri),
+            "the document must be open for the check to mean anything"
+        );
+
+        let settings = server.settings_manager.load_settings();
+        let key = crate::lsp::bridge::ConnectionKey::for_server("anything");
+        assert!(!crashed_connection_is_wanted(&injection, &server.bridge, &settings, &key).await);
     }
 
     #[test]

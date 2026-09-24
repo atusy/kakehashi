@@ -248,7 +248,26 @@ Multiple downstream servers initialize in parallel since each is independent:
 | Some servers fail | Continue with working servers, respawn failed |
 | All servers fail | Bridge reports errors, continues respawning |
 
-**Future Extension (Phase 2)**: Rate-limited respawn to prevent respawn storms.
+**Crash recovery (#977)**: a connection whose reader exits without the pool
+having initiated it (crash, framing error, liveness timeout) is respawned
+proactively rather than on the next request that needs it — otherwise the
+diagnostics its exit evicted stay gone on a document nobody edits. The
+respawn is an ordinary acquire by key, so the replacement is brought up to
+date by the same re-open as any other (respawn-reopen-derives-its-targets).
+What must hold:
+
+- Recovery is bounded: a server that dies on every start must not be
+  respawned in a loop, and giving up only stops the proactive path.
+- It never revives a server settings no longer start, nor a connection that
+  no open document's injected region routes to (per connection, not per
+  server; host-layer documents do not count because the re-open restores
+  only injected regions). A shared instance is left to its next document,
+  which alone can re-root it.
+- It never stalls the forwarding loop that delivers every server's
+  diagnostics.
+
+This is not the implementation-phasing ADR's Phase 2 respawn rate limit:
+request-driven respawns are still unthrottled.
 
 **Malformed Initialize Capability Recovery:**
 
@@ -588,6 +607,9 @@ languageServers:
   per-root connections. Chosen over #751's (closed) ordering-lock design,
   which bought exactness for capable→incapable transitions that practically
   never occur.
+- **2026-09-23**: Added proactive, bounded crash recovery (#977): a
+  connection whose reader exits unrequested is respawned without waiting for
+  a request, so evicted diagnostics return on untouched documents.
 - **2026-07-18**: Added field-level recovery for malformed downstream
   initialize capabilities (#860). Structurally unusable envelopes and global
   position-encoding violations still fail initialization; independent malformed

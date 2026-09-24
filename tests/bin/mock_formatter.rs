@@ -126,6 +126,12 @@
 //!   the process on the next `didChange` to simulate a downstream crash while the
 //!   host stays open. Used to prove the bridge evicts the dead connection's slots
 //!   and republishes the host cleared (#469).
+//! - `diagnostics-push-crash-once` — pushes a diagnostic on `didOpen`; the FIRST
+//!   process (per `MOCK_LSP_WIRE_LOG`, via its `.died` marker) exits ~300 ms after
+//!   that push with no client input, and every later process tags its push
+//!   `:replacement` and leaves a `.replacement` marker. Used to prove the bridge
+//!   respawns a crashed server and its diagnostics come back without any editor
+//!   action — and that it does not when nothing open needs the server (#977).
 //! - `diagnostics-refresh` — sends a `workspace/diagnostic/refresh` server→client
 //!   request on `didOpen`. The bridge forwards it upstream to the editor; used to
 //!   prove that forward is capability-gated (#521).
@@ -228,6 +234,16 @@ fn main() {
     let mut last_did_save_text: Option<String> = None;
     let mut last_did_save_document_text: Option<String> = None;
     let mut diagnostic_generation: u64 = 0;
+    // `diagnostics-push-crash-once`: a process started after the first one died
+    // is the bridge's replacement; it tags its push so a test can tell the
+    // re-published diagnostic from the original.
+    let crash_once_replacement = mode == "diagnostics-push-crash-once"
+        && std::env::var("MOCK_LSP_WIRE_LOG")
+            .is_ok_and(|path| Path::new(&format!("{path}.died")).exists());
+    // ...and records that it started, so a test can tell no replacement came.
+    if crash_once_replacement && let Ok(path) = std::env::var("MOCK_LSP_WIRE_LOG") {
+        let _ = std::fs::write(format!("{path}.replacement"), b"");
+    }
     // `diagnostics-refresh-prefetch-unchanged`: once ANY unchanged report was
     // answered, the baseline demonstrably exists — a later baseline-less full
     // request means a pull LOST it and is re-fetching.
@@ -600,6 +616,27 @@ fn main() {
                             "textDocument/publishDiagnostics",
                             push_diagnostics(uri, true),
                         );
+                    } else if mode == "diagnostics-push-crash-once" {
+                        let message = if crash_once_replacement {
+                            format!("mock-push-diag:{uri}:replacement")
+                        } else {
+                            format!("mock-push-diag:{uri}")
+                        };
+                        notify(
+                            &mut writer,
+                            "textDocument/publishDiagnostics",
+                            push_diagnostics_with_message(uri, message),
+                        );
+                        // Die on a timer, not on client input: a crash driven
+                        // by an edit would let that edit's own reparse respawn
+                        // the server, hiding whether anything recovers it
+                        // proactively.
+                        if !crash_once_replacement && crash_once() {
+                            std::thread::spawn(|| {
+                                std::thread::sleep(std::time::Duration::from_millis(300));
+                                std::process::exit(0);
+                            });
+                        }
                     } else if mode == "diagnostics-push-burst" {
                         for generation in 1..=4 {
                             notify(

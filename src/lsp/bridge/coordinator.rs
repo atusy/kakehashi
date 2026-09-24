@@ -391,6 +391,19 @@ impl BridgeCoordinator {
         Arc::clone(&self.pool)
     }
 
+    /// `server_name`'s resolved config under `settings`, when that server could
+    /// still be started: configured, enabled, with a command. A crashed server
+    /// that settings no longer name — or name but disable — must not be
+    /// brought back by crash recovery (#977).
+    pub(crate) fn respawnable_server_config(
+        &self,
+        settings: &WorkspaceSettings,
+        server_name: &str,
+    ) -> Option<BridgeServerConfig> {
+        resolve_reload_server_config(settings, server_name)
+            .filter(|config| config.is_spawnable_with_wildcard(None))
+    }
+
     /// Apply merged server-config changes to live downstream connections.
     /// Runtime `settings` changes are pushed in place; removed servers and
     /// spawn-time config changes evict and shut down their connections so the
@@ -713,12 +726,115 @@ impl BridgeCoordinator {
         let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
             return OpenOutcome::NotOpened;
         };
+        let Some((config, for_server)) = self
+            .injections_routed_to_server(
+                settings,
+                host_language,
+                host_uri,
+                &host_uri_lsp,
+                injections,
+                server_name,
+                expect.connection,
+            )
+            .await
+        else {
+            return OpenOutcome::NotApplicable;
+        };
+        self.pool
+            .eager_open_virtual_documents(
+                server_name,
+                &config,
+                host_uri,
+                &host_uri_lsp,
+                expect,
+                for_server,
+            )
+            .await
+    }
+
+    /// Whether one of `host_uri`'s injections routes to exactly `connection`.
+    ///
+    /// Never acquires or spawns anything, unlike the routing an open performs:
+    /// crash recovery asks this BEFORE its settings-guarded respawn, and an
+    /// acquisition here would start a server outside that guard — possibly one
+    /// settings have just removed. So a routing decision is only READ: a region
+    /// a routing provider suppressed for this server does not count, and one
+    /// with no decision yet counts as enabled, the fail-open reading routing
+    /// itself gives an undecided server.
+    pub(crate) async fn host_routes_to_connection(
+        &self,
+        settings: &Arc<WorkspaceSettings>,
+        host_language: &str,
+        host_uri: &Url,
+        injections: Vec<BridgeInjection>,
+        connection: &super::pool::ConnectionKey,
+    ) -> bool {
+        let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
+            return false;
+        };
+        let server = connection.server();
+        for injection in injections {
+            let Some(resolved) = self
+                .cached_configs_for_injection_language(settings, host_language, &injection.language)
+                .into_iter()
+                .find(|resolved| resolved.server_name == server)
+            else {
+                continue;
+            };
+            let virtual_uri = super::protocol::VirtualDocumentUri::new(
+                &host_uri_lsp,
+                &injection.language,
+                &injection.region_id,
+            );
+            let Ok(routing_uri) = Url::parse(&virtual_uri.to_uri_string()) else {
+                continue;
+            };
+            if self
+                .pool
+                .host_routing_by_server(&routing_uri, server)
+                .is_some_and(|enabled| !enabled)
+            {
+                continue;
+            }
+            // Resolution only walks markers; it never acquires.
+            if &self
+                .pool
+                .resolved_connection_key(server, &resolved.config, &routing_uri)
+                .await
+                == connection
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `host_uri`'s injections that bridge to `server_name`, with that server's
+    /// resolved config — narrowed to those that route to `connection` when one
+    /// is named. `None` when nothing is left: this host supplies nothing for
+    /// that server (or that connection).
+    ///
+    /// Opens nothing, and the per-connection filter resolves keys without
+    /// acquiring. Routing itself is answered from cached decisions; a region
+    /// with no cached decision makes it ask the candidate servers, which
+    /// acquires them.
+    #[allow(clippy::too_many_arguments)]
+    async fn injections_routed_to_server(
+        &self,
+        settings: &Arc<WorkspaceSettings>,
+        host_language: &str,
+        host_uri: &Url,
+        host_uri_lsp: &tower_lsp_server::ls_types::Uri,
+        injections: Vec<BridgeInjection>,
+        server_name: &str,
+        connection: Option<&super::pool::ConnectionKey>,
+    ) -> Option<(Arc<BridgeServerConfig>, Vec<BridgeInjection>)> {
         let (routed, _) = self
             .route_virtual_injections(
                 settings,
                 host_language,
                 host_uri,
-                &host_uri_lsp,
+                host_uri_lsp,
                 injections,
                 Some(server_name),
                 None,
@@ -741,18 +857,17 @@ impl BridgeCoordinator {
             // config — resolved from the memo, before any pool lookup or marker
             // walk, so the hosts that bridge nowhere near this server cost
             // nothing to reject.
-            return OpenOutcome::NotApplicable;
+            return None;
         };
         // A repair is for one concrete connection. The same host can have
-        // injections routed to several keys, so do not pass the whole server
-        // batch to `eager_open_virtual_documents` and let its first injection
-        // represent the rest. The normal eager path is partitioned earlier;
-        // this filters the respawn path to the key being repaired.
-        let for_server = if let Some(expected_key) = expect.connection {
+        // injections routed to several keys, so a caller naming a connection
+        // gets only that key's injections — not a whole server batch whose
+        // first injection would stand for the rest.
+        let for_server = if let Some(expected_key) = connection {
             let mut matching = Vec::new();
             for injection in for_server {
                 let virtual_uri = super::protocol::VirtualDocumentUri::new(
-                    &host_uri_lsp,
+                    host_uri_lsp,
                     &injection.language,
                     &injection.region_id,
                 );
@@ -772,18 +887,9 @@ impl BridgeCoordinator {
             for_server
         };
         if for_server.is_empty() {
-            return OpenOutcome::NotApplicable;
+            return None;
         }
-        self.pool
-            .eager_open_virtual_documents(
-                server_name,
-                &config,
-                host_uri,
-                &host_uri_lsp,
-                expect,
-                for_server,
-            )
-            .await
+        Some((config, for_server))
     }
 
     fn injection_open_on_connection(
@@ -2503,6 +2609,183 @@ mod tests {
 
         assert_eq!(coordinator.force_start_servers(&settings), 0);
         assert!(coordinator.pool().connections().await.is_empty());
+    }
+
+    /// Crash recovery (#977) brings back only a server current settings would
+    /// still start: one they deleted, disabled — directly or through the
+    /// wildcard — or left without a command stays down.
+    #[tokio::test]
+    async fn crash_recovery_respawns_only_a_server_settings_still_start() {
+        let coordinator = BridgeCoordinator::new();
+        let mut settings = force_start_settings(&[
+            ("live", idle_server(false, vec![])),
+            (
+                "disabled",
+                BridgeServerConfig {
+                    enabled: Some(false),
+                    ..idle_server(false, vec![])
+                },
+            ),
+            (
+                "no-cmd",
+                BridgeServerConfig {
+                    cmd: None,
+                    ..idle_server(false, vec![])
+                },
+            ),
+        ]);
+
+        assert!(
+            coordinator
+                .respawnable_server_config(&settings, "live")
+                .is_some()
+        );
+        for server in ["disabled", "no-cmd", "deleted"] {
+            assert!(
+                coordinator
+                    .respawnable_server_config(&settings, server)
+                    .is_none(),
+                "{server} must not be respawned"
+            );
+        }
+
+        settings.language_servers.insert(
+            crate::config::WILDCARD_KEY.to_string(),
+            BridgeServerConfig {
+                enabled: Some(false),
+                ..Default::default()
+            },
+        );
+        assert!(
+            coordinator
+                .respawnable_server_config(&settings, "live")
+                .is_none(),
+            "a wildcard disable reaches a server that does not opt back in"
+        );
+    }
+
+    /// Crash recovery asks per connection (#977): a host whose region resolves
+    /// to one root's key must not keep another root's crashed connection of
+    /// the same server wanted.
+    #[tokio::test]
+    async fn a_host_routes_only_to_the_connection_its_regions_resolve_to() {
+        let coordinator = BridgeCoordinator::new();
+        let mut servers = HashMap::new();
+        servers.insert(
+            "test-server".to_string(),
+            crate::lsp::bridge::pool::test_helpers::devnull_config_for_language("lua"),
+        );
+        let settings = Arc::new(WorkspaceSettings {
+            auto_install: false,
+            language_servers: servers,
+            ..Default::default()
+        });
+        let host_uri = Url::parse("file:///doc.md").unwrap();
+        let injections = || {
+            vec![BridgeInjection {
+                language: "lua".to_string(),
+                region_id: "region-0".to_string(),
+                content: "print(1)\n".to_string(),
+            }]
+        };
+        // Decide routing up front, so no candidate server is asked (the
+        // devnull command would never answer a handshake).
+        let virtual_uri = super::super::protocol::VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap(),
+            "lua",
+            "region-0",
+        );
+        coordinator.pool().set_host_routing_by_server(
+            &Url::parse(&virtual_uri.to_uri_string()).unwrap(),
+            "test-server",
+            true,
+        );
+
+        // Under no marker root, the region resolves to the client fallback.
+        let fallback = ConnectionKey::new("test-server", None);
+        let elsewhere = ConnectionKey::new("test-server", Some("file:///elsewhere".to_string()));
+        let routes_to = |key: ConnectionKey| {
+            let coordinator = &coordinator;
+            let settings = &settings;
+            let host_uri = &host_uri;
+            let injections = injections();
+            async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    coordinator.host_routes_to_connection(
+                        settings, "markdown", host_uri, injections, &key,
+                    ),
+                )
+                .await
+                .expect("routing must not ask a candidate server")
+            }
+        };
+        assert!(routes_to(fallback).await);
+        assert!(
+            !routes_to(elsewhere).await,
+            "another root's key of the same server is not this host's"
+        );
+    }
+
+    /// Crash recovery's routing check runs before its settings-guarded
+    /// respawn, so it must never start a server itself — not even for a region
+    /// whose routing is undecided, which an open would resolve by asking (and
+    /// so acquiring) the candidate servers. A routing provider's suppression is
+    /// still honoured.
+    #[tokio::test]
+    async fn the_crash_routing_check_never_starts_a_server() {
+        let coordinator = BridgeCoordinator::new();
+        let settings = Arc::new(WorkspaceSettings {
+            auto_install: false,
+            language_servers: HashMap::from([(
+                "test-server".to_string(),
+                crate::lsp::bridge::pool::test_helpers::devnull_config_for_language("lua"),
+            )]),
+            ..Default::default()
+        });
+        let host_uri = Url::parse("file:///doc.md").unwrap();
+        let injections = || {
+            vec![BridgeInjection {
+                language: "lua".to_string(),
+                region_id: "region-0".to_string(),
+                content: "print(1)\n".to_string(),
+            }]
+        };
+        let key = ConnectionKey::new("test-server", None);
+
+        // Undecided routing: answered without acquiring (the devnull command
+        // would hold an acquisition in its handshake past the timeout).
+        let routed = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            coordinator.host_routes_to_connection(
+                &settings,
+                "markdown",
+                &host_uri,
+                injections(),
+                &key,
+            ),
+        )
+        .await
+        .expect("the check must not acquire a server");
+        assert!(routed, "an undecided region counts as routed (fail-open)");
+        assert!(coordinator.pool().connections().await.is_empty());
+
+        let virtual_uri = super::super::protocol::VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap(),
+            "lua",
+            "region-0",
+        );
+        coordinator.pool().set_host_routing_by_server(
+            &Url::parse(&virtual_uri.to_uri_string()).unwrap(),
+            "test-server",
+            false,
+        );
+        assert!(
+            !coordinator
+                .host_routes_to_connection(&settings, "markdown", &host_uri, injections(), &key)
+                .await,
+            "a region routing suppressed for this server does not keep it wanted"
+        );
     }
 
     /// The wildcard supplies the flag like any other field, and — as with
