@@ -568,6 +568,15 @@ fn init_crash_once_client() -> (LspClient, tempfile::TempDir, std::path::PathBuf
 
 #[test]
 fn e2e_crashed_host_only_server_restores_diagnostics_without_editor_activity() {
+    assert_crashed_host_server_recovers(false);
+}
+
+#[test]
+fn e2e_crashed_mixed_server_restores_host_and_injection_diagnostics() {
+    assert_crashed_host_server_recovers(true);
+}
+
+fn assert_crashed_host_server_recovers(with_injections: bool) {
     let config_dir = tempfile::TempDir::new().unwrap();
     let config_path = config_dir.path().join("host-crash.toml");
     std::fs::write(&config_path, "").unwrap();
@@ -586,11 +595,11 @@ fn e2e_crashed_host_only_server_restores_diagnostics_without_editor_activity() {
             "initializationOptions": {
                 "autoInstall": false,
                 "languages": { "markdown": { "bridge": {
-                    "_": { "enabled": false }, "_self": { "enabled": true }
+                    "_": { "enabled": with_injections }, "_self": { "enabled": true }
                 }}},
                 "languageServers": { "mock-push": {
                     "cmd": [mock_bin(), "diagnostics-push-crash-once"],
-                    "languages": ["markdown"]
+                    "languages": if with_injections { vec!["markdown", "lua"] } else { vec!["markdown"] }
                 }}
             }
         }),
@@ -598,20 +607,30 @@ fn e2e_crashed_host_only_server_restores_diagnostics_without_editor_activity() {
     client.send_notification("initialized", json!({}));
     open_host(&mut client);
     wait_for_crash_once(&mut client, &wire_log);
+    let host_message = format!("mock-push-diag:{MD_URI}:replacement");
     client
         .wait_for_notification_where(
             &["textDocument/publishDiagnostics"],
             Duration::from_secs(15),
             |params| {
-                params["uri"] == json!(MD_URI)
-                    && params["diagnostics"].as_array().is_some_and(|ds| {
-                        ds.iter().any(|d| {
-                            d["message"] == json!(format!("mock-push-diag:{MD_URI}:replacement"))
-                        })
+                if params["uri"] != json!(MD_URI) {
+                    return false;
+                }
+                let Some(diagnostics) = params["diagnostics"].as_array() else {
+                    return false;
+                };
+                let host_returned = diagnostics.iter().any(|d| d["message"] == host_message);
+                let injection_returned = diagnostics.iter().any(|d| {
+                    d["message"].as_str().is_some_and(|m| {
+                        m != host_message
+                            && m.starts_with("mock-push-diag:")
+                            && m.ends_with(":replacement")
                     })
+                });
+                host_returned && (!with_injections || injection_returned)
             },
         )
-        .expect("a host-only server must recover without any edit or request");
+        .expect("every layer must recover without an edit or request");
     client.send_request("shutdown", json!(null));
     client.send_notification("exit", json!(null));
 }
