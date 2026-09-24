@@ -254,7 +254,7 @@ the request's own) — dropping just the op would misdirect the ordered
 |--------|----------|
 | Input | Range + context (in-region diagnostics, translated) |
 | Output | (CodeAction \| Command)[] — bare Commands are bridged too, their names encoded for executeCommand routing |
-| Cross-file | Real-file edits and file operations are PRESERVED; rejected are: edits touching a foreign injection region, virtual-URI file operations, and host-document edits escaping the source region — surfaced as a disabled action for `disabledSupport` clients; without that capability, dropped in the initial response, and returned unresolved (re-enveloped) on `codeAction/resolve` |
+| Cross-file | Real-file edits and file operations are PRESERVED; rejected are: edits touching a foreign injection region, virtual-URI file operations, and host-document edits escaping the source region — surfaced as a disabled action for `disabledSupport` clients; without that capability, dropped in the initial response, and reported as `RequestFailed` on `codeAction/resolve` |
 | Position mapping | Action edit ranges (shared WorkspaceEdit transform: own virtual URI translated, real URIs pass unchanged, foreign virtual entries filtered/rejected) and diagnostics' primary ranges — diagnostic `relatedInformation` locations are NOT translated (known gap) |
 
 #### textDocument/formatting / rangeFormatting / onTypeFormatting

@@ -102,7 +102,8 @@ Partially implemented:
   A stale owned action, or a resolve that cannot produce an edit, command, or
   disabled reason, reports `RequestFailed` with a suggestion to request fresh
   actions. Actions without a recognized routing envelope pass through;
-  disabled results remain disabled, and cancellation remains `RequestCancelled`.
+  disabled results are preserved when the client supports them, and
+  cancellation remains `RequestCancelled`.
   `completionItem/resolve` carries no revision stamp: a completion list is
   meant to outlive ordinary edits — the editor filters it locally while the
   user keeps typing and resolves on accept — so before dispatch it checks the
@@ -128,8 +129,10 @@ Partially implemented:
   incarnation, then waits for the document's current parse — bounded by the
   same short budget the request handlers use before their preamble — before
   rebuilding the region, so a resolve issued during an ordinary post-edit
-  reparse is judged by its stamps; a reparse that outlasts that budget still
-  fails soft as a stale region. Code lens and document link, whose envelopes
+  reparse is judged by its stamps; a reparse that outlasts that budget
+  is treated as a stale region: owned code actions report `RequestFailed`,
+  while the other resolve methods retain their unresolved fallback.
+  Code lens and document link, whose envelopes
   carry no revision, rebuild the region again after the reply for a virtual
   item (a host item re-checks the lifetime). Completion carries no revision
   either — a completion list outlives edits — but rebuilds the region before

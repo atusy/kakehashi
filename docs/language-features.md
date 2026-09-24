@@ -305,9 +305,9 @@ host-layer ones are disabled or dropped. Runtime-range-adjusted regions
 any other: the freshness check rebuilds the same adjusted geometry the
 action was minted from.
 Command-carrying actions execute through the bridged
-`workspace/executeCommand`. A resolve is refused, and the action returned
-unchanged, when the host document was edited (even a same-size edit inside
-the block) or reopened since the action was produced.
+`workspace/executeCommand`. Resolve reports `RequestFailed` when the host
+document was edited (even a same-size edit inside the block) or reopened
+since the action was produced. Request fresh actions to recover.
 
 Edit safety differs by layer and direction. An INJECTION-layer action edit
 that cannot be represented in the host document (touching another injection
@@ -316,7 +316,7 @@ rejected: in the initial response it surfaces as a disabled action where the
 client declares `disabledSupport` and is dropped otherwise; during `codeAction/resolve`
 (where a response cannot be dropped) the unsafe payload is removed and the
 action comes back disabled — or, for clients without `disabledSupport`,
-unresolved. HOST-layer (`bridge._self`) action edits already target the
+resolve reports `RequestFailed`. HOST-layer (`bridge._self`) action edits already target the
 real document and pass through as-is. A downstream server's own
 `workspace/applyEdit` request has its own policy built on the same
 underlying transform: virtual-document edits are translated (real-file-only
@@ -697,7 +697,7 @@ goto/references/rename transforms, results addressed to another block's
 virtual URI are filtered out (document-link targets are the exception and
 pass through untouched), and a code action touching another region stays
 visible as a disabled entry for `disabledSupport` clients (without that
-capability: dropped from the initial response, returned unresolved on
+capability: dropped from the initial response, `RequestFailed` on
 `codeAction/resolve`). One `applyEdit` nuance: the translator picks its
 target region from the edit itself, so a request touching exactly one live
 virtual URI is translated against that region even if it differs from the
