@@ -273,7 +273,11 @@ settings. The reservation remains uncommitted throughout that read-only wait.
 Every shared handshake that reaches Ready with folder-change support queues
 consolidation, whether an ordinary acquisition or proactive recovery started it.
 Thus static capability upgrades retire existing fallback roots even when those
-roots were outside the crashed process's demand.
+roots were outside the crashed process's demand. A newly Ready fallback also
+queues this check after finishing startup bookkeeping, so an acquisition that
+lands after the preceding consolidation sweep cannot leave an empty process
+behind. The consolidation handler rechecks the shared capability under the
+pool lock and leaves fallbacks intact while the shared process is incapable.
 What must hold:
 
 - Recovery is bounded: a server that dies on every start must not be
