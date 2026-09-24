@@ -265,8 +265,39 @@ Multiple downstream servers initialize in parallel since each is independent:
 having initiated it (crash, framing error, liveness timeout) is respawned
 proactively rather than on the next request that needs it — otherwise the
 diagnostics its exit evicted stay gone on a document nobody edits. The
-respawn is an ordinary acquire by key, so the replacement is brought up to
-date by the same re-open as any other (respawn-reopen-derives-its-targets).
+respawn is an ordinary acquire, so the replacement is brought up to date by
+the same re-open as any other (respawn-reopen-derives-its-targets). Per-root
+connections acquire by key. Shared connections acquire using a currently open
+region's routing URI, reconstructing their initial workspace (or rootless
+route); the re-open announces each additional root before its documents.
+If the replacement lacks folder-change support, current regions previously
+routed to the shared connection may now need per-root instances. Recovery
+rechecks those units after the handshake and acquires their current routes,
+arming ordinary re-open debt before spawning a new diverted key. Each distinct
+destination is acquired once; a failed spawn without a reader enters that key's
+bounded retry loop. A new crash of the seed stops immediate acquisition, leaving
+that connection's next restart to its own backoff. Still-current diverted roots
+not yet acquired receive re-open debt and their own bounded retries, including
+when the seed establishes an incapable partition but fails before Ready.
+If a settings publication expires the spawn snapshot, captured units are
+rechecked under current settings and transferred to bounded retries; quiet
+documents cannot depend on the publication invalidating or reparsing them.
+A failed fallback does not lose its retry while a shared replacement is still
+initializing: routing returns a pending verdict from the same handle snapshot,
+and recovery waits for that handshake before rechecking current demand and
+settings. The reservation remains uncommitted throughout that read-only wait.
+If an ordinary acquisition wins the shared restart during backoff, the recovery
+task still derives current configured units before standing down and transfers
+missing diverted destinations. The live shared process is not restarted, and
+the new capability partition cannot erase quiet sibling demand.
+Every shared handshake that reaches Ready with folder-change support queues
+consolidation, whether an ordinary acquisition or proactive recovery started it.
+Thus static capability upgrades retire existing fallback roots even when those
+roots were outside the crashed process's demand. A newly Ready fallback also
+queues this check after finishing startup bookkeeping, so an acquisition that
+lands after the preceding consolidation sweep cannot leave an empty process
+behind. The consolidation handler rechecks the shared capability under the
+pool lock and leaves fallbacks intact while the shared process is incapable.
 What must hold:
 
 - Recovery is bounded: a server that dies on every start must not be
@@ -274,8 +305,8 @@ What must hold:
 - It never revives a server settings no longer start, nor a connection that
   no open document's injected region routes to (per connection, not per
   server; host-layer documents do not count because the re-open restores
-  only injected regions). A shared instance is left to its next document,
-  which alone can re-root it.
+  only injected regions). Shared recovery derives its document after the
+  backoff, rather than retaining the dead instance's workspace-folder set.
 - It never stalls the forwarding loop that delivers every server's
   diagnostics.
 
