@@ -1097,7 +1097,11 @@ mod tests {
                     Some(&scope),
                     [
                         (start, start + 4, "identifier"),
-                        (root.start_byte(), root.end_byte(), root.kind()),
+                        (
+                            root.start_byte(),
+                            root.end_byte(),
+                            crate::language::loader::static_node_kind(&root),
+                        ),
                     ],
                 )
                 .unwrap();
@@ -1128,7 +1132,11 @@ mod tests {
                     "rust",
                     text,
                     &host,
-                    (root.start_byte(), root.end_byte(), root.kind()),
+                    (
+                        root.start_byte(),
+                        root.end_byte(),
+                        crate::language::loader::static_node_kind(&root),
+                    ),
                     (start, start + 4, "identifier"),
                     tracked.position.3,
                     tracked.scope.as_deref(),
