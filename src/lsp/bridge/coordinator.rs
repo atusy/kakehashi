@@ -770,12 +770,39 @@ impl BridgeCoordinator {
         injections: Vec<BridgeInjection>,
         connection: &super::pool::ConnectionKey,
     ) -> Option<Url> {
-        let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
-            return None;
-        };
         let server = connection.server();
+        let config = self.respawnable_server_config(settings, server)?;
+        for document in
+            self.recovery_injection_documents(settings, host_language, host_uri, injections, server)
+        {
+            if &self
+                .pool
+                .resolved_connection_key(server, &config, &document)
+                .await
+                == connection
+            {
+                return Some(document);
+            }
+        }
+        None
+    }
+
+    /// Current injection routing units configured for this server. This reads
+    /// cached suppression only; it neither asks routing providers nor acquires.
+    pub(crate) fn recovery_injection_documents(
+        &self,
+        settings: &Arc<WorkspaceSettings>,
+        host_language: &str,
+        host_uri: &Url,
+        injections: Vec<BridgeInjection>,
+        server: &str,
+    ) -> Vec<Url> {
+        let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
+            return Vec::new();
+        };
+        let mut documents = Vec::new();
         for injection in injections {
-            let Some(resolved) = self
+            let Some(_resolved) = self
                 .cached_configs_for_injection_language(settings, host_language, &injection.language)
                 .into_iter()
                 .find(|resolved| resolved.server_name == server)
@@ -797,17 +824,9 @@ impl BridgeCoordinator {
             {
                 continue;
             }
-            // Resolution only walks markers; it never acquires.
-            if &self
-                .pool
-                .resolved_connection_key(server, &resolved.config, &routing_uri)
-                .await
-                == connection
-            {
-                return Some(routing_uri);
-            }
+            documents.push(routing_uri);
         }
-        None
+        documents
     }
 
     /// `host_uri`'s injections that bridge to `server_name`, with that server's
