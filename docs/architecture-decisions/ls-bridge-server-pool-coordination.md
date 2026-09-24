@@ -279,6 +279,9 @@ bounded retry loop. A new crash of the seed stops immediate acquisition, leaving
 that connection's next restart to its own backoff. Still-current diverted roots
 not yet acquired receive re-open debt and their own bounded retries, including
 when the seed establishes an incapable partition but fails before Ready.
+If a settings publication expires the spawn snapshot, captured units are
+rechecked under current settings and transferred to bounded retries; quiet
+documents cannot depend on the publication invalidating or reparsing them.
 A failed fallback does not lose its retry while a shared replacement is still
 initializing: routing returns a pending verdict from the same handle snapshot,
 and recovery waits for that handshake before rechecking current demand and

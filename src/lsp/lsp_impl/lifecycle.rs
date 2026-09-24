@@ -2702,6 +2702,18 @@ async fn attempt_crash_recovery(
                         }
                     }
                 }
+                if !admit() {
+                    // A settings publication need not reparse quiet documents
+                    // (auto-install does not). Transfer remaining current
+                    // roots instead of abandoning the expired sweep.
+                    defer_current_shared_documents(
+                        injection,
+                        settings_manager,
+                        key,
+                        &shared_documents,
+                    )
+                    .await;
+                }
                 return RecoveryAttempt::Done;
             }
             Err(error) => error,
@@ -2709,26 +2721,7 @@ async fn attempt_crash_recovery(
         // A handshake can establish an incapable root partition and then
         // fail before returning Ready. Transfer outside roots before a later
         // shared retry derives only the replacement's narrower partition.
-        if admit() {
-            let mut deferred = std::collections::HashSet::new();
-            for (host, document) in shared_documents {
-                let Some((language, Some(injections))) = injection.bridge_injections(&host) else {
-                    continue;
-                };
-                if bridge
-                    .recovery_injection_documents(settings, &language, &host, injections, server)
-                    .contains(&document)
-                {
-                    let destination = pool
-                        .resolved_connection_key(server, &config, &document)
-                        .await;
-                    if deferred.insert(destination.clone()) {
-                        defer_diverted_destination(injection, settings_manager, key, destination)
-                            .await;
-                    }
-                }
-            }
-        }
+        defer_current_shared_documents(injection, settings_manager, key, &shared_documents).await;
         if error.kind() == std::io::ErrorKind::Interrupted
             && settings_manager.settings_generation() != generation
         {
@@ -2802,6 +2795,63 @@ async fn recover_diverted_seed(
     Ok((shared, Some(destination)))
 }
 
+/// Transfer captured demand using current settings after its spawn snapshot
+/// expires. Only bounded retries are scheduled; each retry rechecks demand.
+async fn defer_current_shared_documents(
+    injection: &crate::lsp::lsp_impl::coordinator::InjectionCoordinator,
+    settings_manager: &Arc<crate::lsp::settings_manager::SettingsManager>,
+    source: &crate::lsp::bridge::ConnectionKey,
+    documents: &[(Url, Url)],
+) {
+    let bridge = injection.bridge();
+    let pool = bridge.pool();
+    let mut deferred = std::collections::HashSet::new();
+    for (host, document) in documents {
+        loop {
+            let settings = settings_manager.load_settings();
+            let Some(config) = bridge.respawnable_server_config(&settings, source.server()) else {
+                return;
+            };
+            let Some((language, Some(injections))) = injection.bridge_injections(host) else {
+                break;
+            };
+            if !bridge
+                .recovery_injection_documents(
+                    &settings,
+                    &language,
+                    host,
+                    injections,
+                    source.server(),
+                )
+                .contains(document)
+            {
+                break;
+            }
+            let destination = match pool
+                .recovery_connection_key(source.server(), &config, document)
+                .await
+            {
+                Ok(destination) => destination,
+                Err(pending) => {
+                    let _ = pending
+                        .wait_for_ready(std::time::Duration::from_secs(
+                            crate::lsp::bridge::INIT_TIMEOUT_SECS,
+                        ))
+                        .await;
+                    if pending.state() == crate::lsp::bridge::ConnectionState::Initializing {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    continue;
+                }
+            };
+            if deferred.insert(destination.clone()) {
+                defer_diverted_destination(injection, settings_manager, source, destination).await;
+            }
+            break;
+        }
+    }
+}
+
 /// Preserve demand diverted by a replacement that failed before its sweep
 /// completed. Its own shared retry cannot see these roots anymore.
 async fn defer_diverted_destination(
@@ -2825,7 +2875,7 @@ async fn defer_diverted_destination(
         injection,
         settings_manager,
         destination,
-        std::io::Error::other("shared replacement failed before recovering this root"),
+        std::io::Error::other("recovery stopped before serving this root"),
     )
     .await;
 }
@@ -5218,6 +5268,155 @@ mod reopen_order_tests {
             *completion.borrow(),
             "a completed repair must report success"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn expired_recovery_settings_transfer_quiet_diverted_documents() {
+        use super::*;
+        use crate::lsp::bridge::{ConnectionKey, RecoveryDecision};
+        use tower_lsp_server::LspService;
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), language.clone());
+        server.language.query_store().insert_injection_query(
+            "rust".into(),
+            Arc::new(
+                tree_sitter::Query::new(
+                    &language,
+                    r#"((string_literal (string_content) @injection.content)
+                (#set! injection.language "html"))"#,
+                )
+                .unwrap(),
+            ),
+        );
+        let roots = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let mut hosts = Vec::new();
+        for root in &roots {
+            std::fs::create_dir(root.path().join(".git")).unwrap();
+            let host = Url::from_file_path(root.path().join("doc.rs")).unwrap();
+            let text = r#"fn main() { let content = "<div>"; }"#;
+            server
+                .documents
+                .insert(host.clone(), text.into(), Some("rust".into()), None);
+            let mut parser = tree_sitter::Parser::new();
+            parser.set_language(&language).unwrap();
+            let doc = server.documents.get(&host).unwrap();
+            assert!(
+                doc.publish_snapshot(&Arc::new(crate::document::snapshot::ParseSnapshot {
+                    text: Arc::from(text),
+                    tree: parser.parse(text, None),
+                    language: Some("rust".into()),
+                    parsed_version: doc.content_version(),
+                    incarnation: doc.incarnation(),
+                    injection_regions: None,
+                    regions: None,
+                    layer_trees: Arc::new(std::sync::OnceLock::new()),
+                }))
+            );
+            hosts.push(host);
+        }
+        let signals = tempfile::tempdir().unwrap();
+        let started = signals.path().join("started");
+        let release = signals.path().join("release");
+        let response =
+            serde_json::json!({"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}).to_string();
+        let config = crate::config::settings::BridgeServerConfig {
+            cmd: Some(vec![
+                "sh".into(),
+                "-c".into(),
+                format!(
+                    "touch '{}'; while [ ! -e '{}' ]; do sleep 0.01; done; printf 'Content-Length: {}\\r\\n\\r\\n%s' '{}'; cat >/dev/null",
+                    started.display(),
+                    release.display(),
+                    response.len(),
+                    response
+                ),
+            ]),
+            languages: Some(vec!["html".into()]),
+            prefer_shared_instance: Some(true),
+            ..Default::default()
+        };
+        let settings = crate::config::WorkspaceSettings {
+            auto_install: false,
+            language_servers: std::collections::HashMap::from([("test".into(), config.clone())]),
+            ..Default::default()
+        };
+        server.settings_manager.apply_settings(settings.clone());
+        let generation = server.settings_manager.settings_generation();
+        let injection = server.injection_coordinator();
+        let key = ConnectionKey::shared("test");
+        let capabilities = serde_json::from_value(serde_json::json!({
+            "workspace":{"workspaceFolders":{"supported":true,"changeNotifications":true}}}))
+        .unwrap();
+        let shared = crate::lsp::bridge::test_helpers::create_ready_handle_with_capabilities(
+            key.clone(),
+            capabilities,
+        )
+        .await;
+        crate::lsp::bridge::test_helpers::fail_test_handle(&shared);
+        server.bridge.pool().insert_connection(shared).await;
+        let captured = crashed_shared_documents(
+            &injection,
+            &server.bridge,
+            &Arc::new(settings.clone()),
+            &key,
+            &config,
+        )
+        .await;
+        assert_eq!(captured.len(), 2);
+        let RecoveryDecision::Retry { reservation, .. } =
+            server.bridge.pool().schedule_crash_retry(&key)
+        else {
+            panic!("first retry");
+        };
+        let publish = async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !started.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("shared replacement started");
+            // The seed has already committed its settings snapshot. Auto-install
+            // publishes another generation without invalidating either tree.
+            server.settings_manager.apply_settings(settings);
+            assert_ne!(generation, server.settings_manager.settings_generation());
+            std::fs::write(&release, b"go").unwrap();
+        };
+        let (outcome, ()) = tokio::join!(
+            attempt_crash_recovery(
+                &injection,
+                &server.bridge,
+                &server.settings_manager,
+                &key,
+                reservation,
+                false
+            ),
+            publish
+        );
+        assert!(matches!(outcome, RecoveryAttempt::Done));
+        let mut diverted = 0;
+        for (_, document) in captured {
+            let destination = server
+                .bridge
+                .pool()
+                .resolved_connection_key("test", &config, &document)
+                .await;
+            if destination != key {
+                diverted += 1;
+                assert_eq!(
+                    server.bridge.pool().schedule_crash_retry(&destination),
+                    RecoveryDecision::AlreadyScheduled,
+                    "the actual expired sweep must transfer its quiet sibling root"
+                );
+            }
+        }
+        assert_eq!(diverted, 1);
     }
 
     #[cfg(unix)]
