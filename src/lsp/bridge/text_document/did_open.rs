@@ -83,6 +83,98 @@ impl Drop for LifecycleCleanup<'_> {
 }
 
 impl LanguageServerPool {
+    /// Await host synchronization on an existing, exact connection. Unlike an
+    /// eager batch this work is not cancelled by a debounced edit, and its result
+    /// can therefore complete the connection's re-open barrier (#1116).
+    pub(crate) async fn reopen_host_document(
+        &self,
+        key: &ConnectionKey,
+        config: &crate::config::settings::BridgeServerConfig,
+        doc: &super::host::HostDocument<'_>,
+        read: super::host::HostResolveReader<'_>,
+        admit: &(dyn Fn() -> bool + Sync),
+    ) -> OpenOutcome {
+        let lifecycle = self.host_lifecycle_lock(doc.uri);
+        let _cleanup = LifecycleCleanup {
+            pool: self,
+            host_uri: doc.uri,
+            lifecycle: &lifecycle,
+        };
+        let _guard = lifecycle.write().await;
+        if !admit()
+            || self.current_host_incarnation(doc.uri) != doc.revision.map(|r| r.incarnation)
+            || !self.accepts_host_language(doc.uri, doc.language_id)
+        {
+            return OpenOutcome::NotOpened;
+        }
+        if self.host_routing_by_server(doc.uri, key.server()) == Some(false) {
+            return OpenOutcome::NotApplicable;
+        }
+        let (routed, announce) = self
+            .resolved_connection_key_and_marker(key.server(), config, doc.uri)
+            .await;
+        if &routed != key {
+            return OpenOutcome::NotApplicable;
+        }
+        let Some(handle) = self
+            .ready_connection_by_key_for_config(key, Some(config))
+            .await
+        else {
+            return OpenOutcome::NotOpened;
+        };
+        if let Some(marker) = announce
+            && self.announce_shared_root(&handle, &marker).await.is_err()
+        {
+            return OpenOutcome::NotOpened;
+        }
+        if self
+            .apply_host_routing_workspace_folders(doc.uri, key.server(), &handle)
+            .await
+            .is_err()
+        {
+            return OpenOutcome::NotOpened;
+        }
+        let connections = self.connections().await;
+        if !connections.get(key).is_some_and(|current| {
+            Arc::ptr_eq(current, &handle) && current.state() == ConnectionState::Ready
+        }) {
+            return OpenOutcome::NotOpened;
+        }
+        let mut docs = self.host_documents().await;
+        let Some(current) = read(doc.uri) else {
+            return OpenOutcome::NotApplicable;
+        };
+        if !admit()
+            || Some(current.revision.incarnation) != doc.revision.map(|r| r.incarnation)
+            || current.language_id != doc.language_id
+        {
+            return OpenOutcome::NotOpened;
+        }
+        if self.host_routing_by_server(doc.uri, key.server()) == Some(false)
+            || self.is_host_routing_suppressed(doc.uri, key)
+        {
+            return OpenOutcome::NotApplicable;
+        }
+        let current = super::host::HostDocument {
+            uri: doc.uri,
+            language_id: &current.language_id,
+            text: &current.text,
+            revision: Some(current.revision),
+        };
+        match super::host::sync_host_document(
+            &mut ConnectionHandleSender(&handle),
+            &mut docs,
+            &current,
+            None,
+            key,
+        )
+        .await
+        {
+            Ok(()) => OpenOutcome::Opened,
+            Err(_) => OpenOutcome::NotOpened,
+        }
+    }
+
     /// Fire `didOpen` for every resolved bridge virtual URI so the downstream
     /// server starts analyzing immediately instead of waiting for the first
     /// user request. Fire-and-forget: per-document failures are logged at

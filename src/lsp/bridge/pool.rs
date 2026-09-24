@@ -1086,40 +1086,15 @@ impl LanguageServerPool {
                 .and_then(|()| self.pending_reopen.claim(&shared_key)),
             reopen => reopen,
         };
-        // Host-bridged documents are re-synced upstream, which holds their
-        // text — inside the re-open when there is one, so its barrier also
-        // covers them; on their own otherwise (the handshake's re-open took
-        // the debt and settles the injected regions).
-        //
-        // Deliberately not closed further: two windows remain in which a
-        // command kept from a retired divert can reach the shared instance
-        // before the host document it names — a debounced host sync that
-        // supersedes the consolidation's batch releases the wait before the
-        // replacement batch's didOpen, and a handshaking shared instance's own
-        // injection-only re-open does not wait for the standalone re-sync.
-        // Both are the general gap that no respawn re-open covers host
-        // documents, present on every recycle before #968 (#1116); the fix
-        // belongs to the re-open protocol, not to consolidation.
+        // Every re-open includes hosts and injections. If the handshake
+        // claimed this debt, it owns both layers and their completion barrier.
         let Some(done) = reopen else {
-            if let Err(e) = self
-                .upstream_request_tx
-                .send(UpstreamRequest::ResyncHostDocuments {
-                    server: server_name.to_owned(),
-                })
-            {
-                log::warn!(
-                    target: "kakehashi::bridge",
-                    "Failed to queue host-document re-sync for {server_name} \
-                     (forwarding loop gone): {e}"
-                );
-            }
             return;
         };
         if let Err(e) = self
             .upstream_request_tx
             .send(UpstreamRequest::ReopenDocuments {
                 key: shared_key.clone(),
-                host_documents: true,
                 done,
             })
         {
@@ -4371,7 +4346,6 @@ impl LanguageServerPool {
                     if let Some(done) = pending_reopen_handoff
                         && let Err(e) = upstream_request_tx.send(UpstreamRequest::ReopenDocuments {
                             key: command_registration_key.clone(),
-                            host_documents: false,
                             done,
                         })
                     {
@@ -5432,16 +5406,8 @@ mod tests {
         pool.consolidate_shared_instance("srv").await;
 
         match upstream_requests.try_recv() {
-            Ok(UpstreamRequest::ReopenDocuments {
-                key,
-                host_documents,
-                ..
-            }) => {
+            Ok(UpstreamRequest::ReopenDocuments { key, .. }) => {
                 assert_eq!(&key, shared.key(), "re-opened on the shared instance");
-                assert!(
-                    host_documents,
-                    "host documents are re-synced inside the same barrier"
-                );
             }
             _ => panic!("expected a re-open of the shared instance"),
         }
@@ -5453,8 +5419,7 @@ mod tests {
 
     /// A shared instance still handshaking cannot take a sweep yet. When its
     /// handshake claims the debt consolidation armed (the usual order), the
-    /// handshake's own re-open settles the injected regions and consolidation
-    /// only re-syncs host documents.
+    /// handshake's own re-open settles both host and injected documents.
     #[tokio::test]
     async fn consolidating_leaves_an_initializing_shared_instances_reopen_to_its_handshake() {
         let pool = Arc::new(LanguageServerPool::new());
@@ -5491,10 +5456,6 @@ mod tests {
         .expect("consolidation finishes once the handshake turns Ready");
         handshake.await.unwrap();
 
-        match upstream_requests.try_recv() {
-            Ok(UpstreamRequest::ResyncHostDocuments { server }) => assert_eq!(server, "srv"),
-            _ => panic!("the handshake owns the sweep; host documents are re-synced on their own"),
-        }
         assert!(upstream_requests.try_recv().is_err());
     }
 
@@ -5528,13 +5489,8 @@ mod tests {
         .expect("consolidation finishes once the shared instance is Ready");
 
         match upstream_requests.try_recv() {
-            Ok(UpstreamRequest::ReopenDocuments {
-                key,
-                host_documents,
-                ..
-            }) => {
+            Ok(UpstreamRequest::ReopenDocuments { key, .. }) => {
                 assert_eq!(&key, shared.key());
-                assert!(host_documents);
             }
             _ => panic!("the stranded debt must be claimed and re-opened"),
         }

@@ -259,9 +259,9 @@ What must hold:
 - Recovery is bounded: a server that dies on every start must not be
   respawned in a loop, and giving up only stops the proactive path.
 - It never revives a server settings no longer start, nor a connection that
-  no open document's injected region routes to (per connection, not per
-  server; host-layer documents do not count because the re-open restores
-  only injected regions). A shared instance is left to its next document,
+  no open host document or injected region routes to (per connection, not
+  per server). Host-layer demand does not require a parser. A shared instance
+  is left to its next document,
   which alone can re-root it.
 - It never stalls the forwarding loop that delivers every server's
   diagnostics.

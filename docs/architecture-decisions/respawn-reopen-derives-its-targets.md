@@ -157,6 +157,21 @@ lookup succeeds whichever host asked, so without the routing question a sweep
 over every open document would cross-open one root's documents onto another
 root's process.
 
+### Host synchronization is part of every re-open
+
+The host layer is restored before waiting for the host's injection parse. It
+uses the real URI and current text, read together with its language and
+revision, and only an existing Ready connection under the named key. Shared
+workspace announcements precede its `didOpen`, as for injected regions.
+
+This work is awaited directly rather than delegated to edit-driven eager
+batches. Superseding or cancelling an eager batch therefore cannot release the
+re-open barrier before its host `didOpen` is enqueued. This also applies when a
+replacement's handshake claims a consolidation's debt (#1116). An applicable
+host sync failure contributes `false` to the barrier; a closed or differently
+routed host supplies nothing for that key. Host-only demand can trigger crash
+recovery without a tree or an editor request (#1127).
+
 ### The third outcome is "not applicable", not "wrong"
 
 An open reports one of three things: it happened; it was not this connection's

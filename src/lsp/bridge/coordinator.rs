@@ -702,8 +702,8 @@ impl BridgeCoordinator {
     /// ready, outbound queue full), in which case no `didOpen` is queued and the
     /// command simply proceeds without it (handled fail-soft by dispatch). A
     /// no-op when the docs are already open (idempotent claim), and when no
-    /// injection maps to `server_name` (e.g. a host-layer command — host-layer
-    /// sync is a separate follow-up).
+    /// injection maps to `server_name`; the re-open sweep synchronizes the
+    /// host layer separately before calling this injection-only helper.
     ///
     /// This heals MISSING document state (a purged tracker), not stale content —
     /// it never sends `didChange` (that is the edit path's job). And it is
@@ -750,6 +750,35 @@ impl BridgeCoordinator {
                 for_server,
             )
             .await
+    }
+
+    /// Whether the host layer itself needs this connection, without acquiring
+    /// candidates or asking a routing provider. Parser availability is irrelevant.
+    pub(crate) async fn host_layer_routes_to_connection(
+        &self,
+        settings: &Arc<WorkspaceSettings>,
+        host_language: &str,
+        host_uri: &Url,
+        connection: &super::pool::ConnectionKey,
+    ) -> bool {
+        let Some(resolved) = self
+            .cached_host_configs_for_language(settings, host_language)
+            .into_iter()
+            .find(|config| config.server_name == connection.server())
+        else {
+            return false;
+        };
+        if self
+            .pool
+            .host_routing_by_server(host_uri, connection.server())
+            == Some(false)
+        {
+            return false;
+        }
+        self.pool
+            .resolved_connection_key(connection.server(), &resolved.config, host_uri)
+            .await
+            == *connection
     }
 
     /// Whether one of `host_uri`'s injections routes to exactly `connection`.
@@ -1928,54 +1957,6 @@ impl BridgeCoordinator {
         configs: Vec<ResolvedServerConfig>,
         live_text_reader: Option<crate::lsp::bridge::HostTextReader>,
     ) {
-        self.eager_sync_host_document_on_servers_notifying(
-            host_uri,
-            language_id,
-            text,
-            revision,
-            configs,
-            live_text_reader,
-            None,
-        );
-    }
-
-    /// [`Self::eager_open_host_document_on_servers`], dropping `finished` once
-    /// the batch has run (or was superseded or cancelled), so a caller can
-    /// wait until every server's sync has been attempted.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn eager_open_host_document_on_servers_notifying(
-        &self,
-        settings: &WorkspaceSettings,
-        host_language: &str,
-        host_uri: &Url,
-        text: &str,
-        revision: crate::lsp::bridge::HostRevision,
-        live_text_reader: crate::lsp::bridge::HostTextReader,
-        finished: tokio::sync::oneshot::Sender<()>,
-    ) {
-        let configs = self.get_host_configs_for_language(settings, host_language);
-        self.eager_sync_host_document_on_servers_notifying(
-            host_uri,
-            host_language,
-            Arc::from(text),
-            revision,
-            configs,
-            Some(live_text_reader),
-            Some(finished),
-        );
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn eager_sync_host_document_on_servers_notifying(
-        &self,
-        host_uri: &Url,
-        language_id: &str,
-        text: Arc<str>,
-        revision: crate::lsp::bridge::HostRevision,
-        configs: Vec<ResolvedServerConfig>,
-        live_text_reader: Option<crate::lsp::bridge::HostTextReader>,
-        finished: Option<tokio::sync::oneshot::Sender<()>>,
-    ) {
         if configs.is_empty() {
             // Host bridging off / no host server for this language — drop any
             // prior batch so a stale sync can't fire.
@@ -2068,9 +2049,6 @@ impl BridgeCoordinator {
             for open in opens {
                 let _ = open.await;
             }
-            // Dropped, not sent: an aborted batch drops it just the same, and
-            // the waiter only needs to know the batch is over.
-            drop(finished);
         });
         self.push_or_abort_host_eager_open_handle(host_uri, task.abort_handle(), generation);
     }

@@ -566,6 +566,56 @@ fn init_crash_once_client() -> (LspClient, tempfile::TempDir, std::path::PathBuf
     (client, config_dir, wire_log)
 }
 
+#[test]
+fn e2e_crashed_host_only_server_restores_diagnostics_without_editor_activity() {
+    let config_dir = tempfile::TempDir::new().unwrap();
+    let config_path = config_dir.path().join("host-crash.toml");
+    std::fs::write(&config_path, "").unwrap();
+    let wire_log = config_dir.path().join("mock-wire.log");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().unwrap())
+        .env("MOCK_LSP_WIRE_LOG", wire_log.to_string_lossy())
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "initializationOptions": {
+                "autoInstall": false,
+                "languages": { "markdown": { "bridge": {
+                    "_": { "enabled": false }, "_self": { "enabled": true }
+                }}},
+                "languageServers": { "mock-push": {
+                    "cmd": [mock_bin(), "diagnostics-push-crash-once"],
+                    "languages": ["markdown"]
+                }}
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    open_host(&mut client);
+    wait_for_crash_once(&mut client, &wire_log);
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            |params| {
+                params["uri"] == json!(MD_URI)
+                    && params["diagnostics"].as_array().is_some_and(|ds| {
+                        ds.iter().any(|d| {
+                            d["message"] == json!(format!("mock-push-diag:{MD_URI}:replacement"))
+                        })
+                    })
+            },
+        )
+        .expect("a host-only server must recover without any edit or request");
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
 /// Wait for the first process's push, then for the crash that clears it.
 fn wait_for_crash_once(client: &mut LspClient, wire_log: &std::path::Path) {
     client

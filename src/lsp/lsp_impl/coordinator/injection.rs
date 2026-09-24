@@ -793,79 +793,58 @@ impl InjectionCoordinator {
         self.documents.open_uris()
     }
 
-    /// Re-sync every open host document that `server` host-bridges, onto
-    /// wherever each now routes (#968: a shared-instance consolidation retired
-    /// the per-root connections that held them).
-    ///
-    /// The respawn re-open covers injected regions only; a host document is
-    /// otherwise re-opened by its next edit or request, so an idle tab would
-    /// sit without the diagnostics its retired connection had pushed. The
-    /// sync goes to ALL of the host's servers, not just `server`: a host's
-    /// eager sync is one batch that supersedes the previous one, so a batch
-    /// naming one server would abort an in-flight re-sync to the others. For
-    /// connections that already hold the document at its current text the
-    /// sync is a no-op, and each send reads the live text.
-    ///
-    /// Returns once every started sync has run (or been superseded), so a
-    /// re-open barrier can hold commands until the documents they name are
-    /// open on their new connection.
-    pub(crate) async fn resync_host_documents_for_server(
+    /// Read host language, content and revision together, without requiring a tree.
+    fn host_reopen_snapshot(&self, uri: &Url) -> Option<crate::lsp::bridge::HostResolveSnapshot> {
+        let document = self.documents.get(uri)?;
+        let language_id = document.language_id().map(str::to_owned).or_else(|| {
+            self.language
+                .detect_language(uri.path(), document.text(), None, None)
+        })?;
+        Some(crate::lsp::bridge::HostResolveSnapshot {
+            text: document.text_arc(),
+            language_id,
+            revision: crate::lsp::bridge::HostRevision {
+                incarnation: document.incarnation(),
+                content_version: document.content_version(),
+            },
+        })
+    }
+
+    /// Restore the host layer independently of edit-driven eager batches. A
+    /// failed applicable open must keep the connection's barrier unsuccessful.
+    pub(crate) async fn reopen_host_document(
         &self,
-        settings: &crate::config::WorkspaceSettings,
-        server: &str,
-    ) {
-        let mut batches = Vec::new();
-        for uri in self.documents.open_uris() {
-            let Some(language) = self.document_language(&uri) else {
-                continue;
-            };
-            if !self
-                .bridge
-                .get_host_configs_for_language(settings, &language)
-                .iter()
-                .any(|config| config.server_name == server)
-            {
-                continue;
-            }
-            let Some((text, incarnation, content_version)) =
-                self.documents.get(&uri).map(|document| {
-                    (
-                        document.text_arc(),
-                        document.incarnation(),
-                        document.content_version(),
-                    )
-                })
-            else {
-                continue;
-            };
-            let documents = std::sync::Arc::clone(&self.documents);
-            let host_uri = uri.clone();
-            let live_text_reader: crate::lsp::bridge::HostTextReader =
-                std::sync::Arc::new(move || {
-                    documents
-                        .get(&host_uri)
-                        .filter(|doc| doc.incarnation() == incarnation)
-                        .map(|doc| (doc.text_arc(), doc.content_version()))
-                });
-            let (finished, batch) = tokio::sync::oneshot::channel();
-            self.bridge.eager_open_host_document_on_servers_notifying(
-                settings,
-                &language,
-                &uri,
-                &text,
-                crate::lsp::bridge::HostRevision {
-                    incarnation,
-                    content_version,
+        uri: &Url,
+        key: &crate::lsp::bridge::ConnectionKey,
+    ) -> crate::lsp::bridge::OpenOutcome {
+        use crate::lsp::bridge::OpenOutcome;
+        let Some(host) = self.host_reopen_snapshot(uri) else {
+            return OpenOutcome::NotApplicable;
+        };
+        let settings = self.settings_manager.load_settings_pair();
+        let Some(config) = self
+            .bridge
+            .cached_host_configs_for_language(&settings.settings, &host.language_id)
+            .into_iter()
+            .find(|config| config.server_name == key.server())
+        else {
+            return OpenOutcome::NotApplicable;
+        };
+        self.bridge
+            .pool()
+            .reopen_host_document(
+                key,
+                &config.config,
+                &crate::lsp::bridge::HostDocument {
+                    uri,
+                    language_id: &host.language_id,
+                    text: &host.text,
+                    revision: Some(host.revision),
                 },
-                live_text_reader,
-                finished,
-            );
-            batches.push(batch);
-        }
-        for batch in batches {
-            // Err is the only outcome: the sender is dropped when the batch ends.
-            let _ = batch.await;
-        }
+                &|uri| self.host_reopen_snapshot(uri),
+                &|| self.settings_manager.settings_generation() == settings.generation,
+            )
+            .await
     }
 
     /// `uri`'s host language, without parsing or resolving anything.
