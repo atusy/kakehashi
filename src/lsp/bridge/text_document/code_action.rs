@@ -1163,7 +1163,10 @@ impl LanguageServerPool {
             }
         };
         // Retirement alone does not invalidate a matched reply. Callers retain
-        // their document freshness and edit translation checks.
+        // their document freshness and edit translation checks. Returned commands
+        // retain ConnectionKey-based reconnect routing: checking liveness here
+        // cannot pin the process through the later client execute request, and
+        // downstream servers own validation of their opaque command arguments.
         parse_code_action_resolve_response(response)
     }
 }
