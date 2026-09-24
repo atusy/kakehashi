@@ -47,7 +47,8 @@ jobs:
       - run: >-
           cargo test --features e2e --test e2e --
           e2e_completion_envelope:: e2e_host_bridge:: e2e_code_action::
-          e2e_code_lens_resolve:: e2e_lsp_lua_document_link:: --test-threads=2
+          e2e_code_lens_resolve:: e2e_lsp_lua_document_link:: e2e_resolve_reconnect::
+          --test-threads=2
 
   fmt:
     name: Format

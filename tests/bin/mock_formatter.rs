@@ -198,6 +198,9 @@
 //!   registers on the first `textDocument/hover` this process receives, so a
 //!   test can let other roots divert before the capability appears.
 //!
+//! `--stamp-resolve-process` tags completion/action data and resolved output with
+//! the process ID; `--reject-old-resolve` rejects data from another process.
+//!
 //! Only built for E2E runs (`required-features = ["e2e"]` in Cargo.toml).
 
 use std::collections::HashMap;
@@ -210,6 +213,8 @@ fn main() {
     let mode = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "upper".to_string());
+    let stamp_resolve_process = std::env::args().any(|arg| arg == "--stamp-resolve-process");
+    let reject_old_resolve = std::env::args().any(|arg| arg == "--reject-old-resolve");
     let stdin = std::io::stdin();
     let mut reader = BufReader::new(stdin.lock());
     let stdout = std::io::stdout();
@@ -975,6 +980,9 @@ fn main() {
                                 "data": { "mockPath": uri }
                             }]
                         });
+                        if stamp_resolve_process {
+                            result["items"][0]["data"]["mockPid"] = json!(std::process::id());
+                        }
                         if mode == "completion-resolve-echo-edit" {
                             let position = &message["params"]["position"];
                             result["items"][0]["textEdit"] = json!({
@@ -1003,12 +1011,27 @@ fn main() {
                     .pointer("/params")
                     .cloned()
                     .unwrap_or_else(|| json!({}));
+                if reject_old_resolve && item["data"]["mockPid"] != json!(std::process::id()) {
+                    respond_error(
+                        &mut writer,
+                        id,
+                        -32603,
+                        "data belongs to a previous process",
+                    );
+                    continue;
+                }
                 let path = item
                     .pointer("/data/mockPath")
                     .and_then(Value::as_str)
                     .unwrap_or("?")
                     .to_string();
-                item["detail"] = if mode == "completion-resolve-text" {
+                item["detail"] = if stamp_resolve_process {
+                    json!(format!(
+                        "resolved-pid:{};data-pid:{}",
+                        std::process::id(),
+                        item["data"]["mockPid"]
+                    ))
+                } else if mode == "completion-resolve-text" {
                     json!(documents.get(&path))
                 } else {
                     json!(format!("mock-resolved:{path}"))
@@ -1078,11 +1101,15 @@ fn main() {
                         {
                             // One LAZY action: data only, no edit. The payload is
                             // materialized on codeAction/resolve (below).
-                            json!([{
+                            let mut actions = json!([{
                                 "title": "Lazy organize imports",
                                 "kind": "source.organizeImports",
                                 "data": { "mock": "lazy-1" }
-                            }])
+                            }]);
+                            if stamp_resolve_process {
+                                actions[0]["data"]["mockPid"] = json!(std::process::id());
+                            }
+                            actions
                         } else if mode == "code-action-preferred" {
                             // One isPreferred quickfix — two of these servers let
                             // a test prove the cross-source isPreferred collapse
@@ -1173,6 +1200,15 @@ fn main() {
                     .pointer("/params/data")
                     .cloned()
                     .unwrap_or(Value::Null);
+                if reject_old_resolve && data["mockPid"] != json!(std::process::id()) {
+                    respond_error(
+                        &mut writer,
+                        id,
+                        -32603,
+                        "data belongs to a previous process",
+                    );
+                    continue;
+                }
                 // Resolve against the virtual document the action came from —
                 // the mock received its URI via didOpen (single-doc tests).
                 let target_uri = documents.keys().next().cloned().unwrap_or_default();
@@ -1290,7 +1326,7 @@ fn main() {
                                             "start": { "line": 0, "character": 0 },
                                             "end": { "line": 0, "character": 5 }
                                         },
-                                        "newText": format!("organized:{title}")
+                                        "newText": if stamp_resolve_process { format!("resolved-pid:{};data-pid:{}", std::process::id(), data["mockPid"]) } else { format!("organized:{title}") }
                                     }]
                                 }
                             }
@@ -1325,7 +1361,7 @@ fn main() {
                                     "start": { "line": 0, "character": 0 },
                                     "end": { "line": 0, "character": 5 }
                                 },
-                                "newText": format!("organized:{title}")
+                                "newText": if stamp_resolve_process { format!("resolved-pid:{};data-pid:{}", std::process::id(), data["mockPid"]) } else { format!("organized:{title}") }
                             }]
                         }
                     }

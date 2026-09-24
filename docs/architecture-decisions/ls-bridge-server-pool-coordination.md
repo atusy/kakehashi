@@ -74,6 +74,19 @@ than falling back to marker or
 client-root resolution, which under a root override would reach the
 config-root process instead of the one that produced the item.
 
+For `completionItem/resolve` and `codeAction/resolve`, the originating server
+name selects the current connection for the document; it need not be the
+process that produced the item. The downstream server owns validation of its
+opaque `data` and may reject data from an earlier process. Kakehashi does not
+interpret that data or add a retry loop to resolve. A matched successful reply
+is not discarded solely because its connection retired after dispatch;
+document freshness and edit-translation checks still apply. Completion keeps
+the original item on resolve failure. An owned code action that cannot be
+resolved to an edit, command, or disabled reason reports `RequestFailed`, so
+the client can request fresh actions instead of treating a no-op as success.
+This connection policy is scoped to completion and code actions; it does not
+relax the producer checks for code lenses, document links, or inlay hints.
+
 **Shared-instance opt-in** (#391): a per-server `preferSharedInstance` boolean
 (default `false`) routes a server's documents to one shared connection
 (`ConnectionKey::shared`, kept distinct from the client-root fallback) instead
