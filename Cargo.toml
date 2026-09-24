@@ -64,7 +64,7 @@ opt-level = 3
 arc-swap = "1"
 clap = { version = "4", features = ["derive"] }
 dashmap = "6"
-dirs = "6"
+dirs = "7"
 # Strips Windows verbatim `\\?\` prefixes only when the plain form means the
 # same path (long paths, reserved names, and UNC edge cases stay verbatim);
 # a hand-rolled prefix strip would get those wrong. No-op elsewhere.
@@ -145,7 +145,7 @@ streaming-iterator = "0.1"
 filetime = "0.2"
 insta = { version = "1", features = ["json", "redactions"] }
 serial_test = "4"
-rstest = "0.26"
+rstest = "0.27"
 
 # A/B performance comparison of the semantic-tokens hot path across two server
 # binaries (e.g. HEAD vs origin/main). Custom harness (no criterion): it drives
