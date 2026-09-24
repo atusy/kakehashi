@@ -145,6 +145,11 @@ pub(in crate::lsp::bridge) async fn create_handle_with_key(
     create_handle_with_state_and_pid_keyed(state, key).await.0
 }
 
+#[cfg(unix)]
+pub(crate) fn fail_test_handle(handle: &ConnectionHandle) {
+    handle.set_state(ConnectionState::Failed);
+}
+
 /// A ready connection with explicit initialized capabilities, for server-layer
 /// tests that need to distinguish an incapable replacement from a cold probe.
 #[cfg(unix)]
