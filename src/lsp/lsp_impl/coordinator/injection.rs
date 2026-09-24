@@ -842,19 +842,10 @@ impl InjectionCoordinator {
         let Some(host) = self.host_reopen_snapshot(uri, &settings.settings, key.server()) else {
             return OpenOutcome::NotApplicable;
         };
-        let Some(config) = self
-            .bridge
-            .cached_host_configs_for_language(&settings.settings, &host.language_id)
-            .into_iter()
-            .find(|config| config.server_name == key.server())
-        else {
-            return OpenOutcome::NotApplicable;
-        };
         self.bridge
-            .pool()
             .reopen_host_document(
+                &settings.settings,
                 key,
-                &config.config,
                 &crate::lsp::bridge::HostDocument {
                     uri,
                     language_id: &host.language_id,
@@ -862,7 +853,15 @@ impl InjectionCoordinator {
                     revision: Some(host.revision),
                 },
                 &|uri| self.host_reopen_snapshot(uri, &settings.settings, key.server()),
-                &|| self.settings_manager.settings_generation() == settings.generation,
+                &|| {
+                    self.settings_manager.settings_generation() == settings.generation
+                        && self
+                            .host_reopen_snapshot(uri, &settings.settings, key.server())
+                            .is_some_and(|current| {
+                                current.revision.incarnation == host.revision.incarnation
+                                    && current.language_id == host.language_id
+                            })
+                },
             )
             .await
     }
@@ -1193,6 +1192,122 @@ mod tests {
                 .await,
             super::ParseWait::Current
         ));
+    }
+
+    #[cfg(unix)]
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn host_reopen_resolves_missing_sibling_provider_decision(#[case] settings_change: bool) {
+        use crate::config::settings::{BridgeLanguageConfig, BridgeServerConfig, LanguageSettings};
+        use crate::lsp::bridge::test_helpers::{
+            advertise_routing_for_test, create_ready_handle_with_capabilities,
+        };
+        use crate::lsp::bridge::{ConnectionKey, OpenOutcome};
+        use std::collections::HashMap;
+
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let settings = crate::config::WorkspaceSettings {
+            auto_install: false,
+            languages: HashMap::from([(
+                "host-language".into(),
+                LanguageSettings {
+                    bridge: Some(HashMap::from([(
+                        "_self".into(),
+                        BridgeLanguageConfig {
+                            enabled: Some(true),
+                            ..Default::default()
+                        },
+                    )])),
+                    ..Default::default()
+                },
+            )]),
+            language_servers: ["provider", "target"]
+                .into_iter()
+                .map(|name| {
+                    (
+                        name.into(),
+                        BridgeServerConfig {
+                            cmd: Some(vec!["sh".into(), "-c".into(), "cat >/dev/null".into()]),
+                            languages: Some(vec!["host-language".into()]),
+                            workspace_markers: Some(Vec::new()),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        };
+        server.settings_manager.apply_settings(settings);
+        let uri = Url::parse("file:///host-routing-missing.host-language").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "contents".into(),
+            Some("host-language".into()),
+            None,
+        );
+        let pool = server.bridge.pool();
+        pool.open_host_incarnation(&uri, incarnation).await;
+        let target_key = ConnectionKey::for_server("target");
+        let provider = create_ready_handle_with_capabilities(
+            ConnectionKey::for_server("provider"),
+            Default::default(),
+        )
+        .await;
+        advertise_routing_for_test(&provider);
+        pool.insert_connection(Arc::clone(&provider)).await;
+        pool.insert_connection(
+            create_ready_handle_with_capabilities(target_key.clone(), Default::default()).await,
+        )
+        .await;
+        assert_eq!(pool.host_routing_by_server(&uri, "target"), None);
+        // An eager batch cancelled before deciding leaves this state. Only
+        // the sibling provider can suppress this otherwise eligible target.
+        let settings_manager = Arc::clone(&server.settings_manager);
+        let answer = tokio::spawn(async move {
+            loop {
+                if let Some(id) = provider.router().pending_ids().first().copied() {
+                    if settings_change {
+                        settings_manager
+                            .apply_settings((*settings_manager.load_settings()).clone());
+                    }
+                    let _ = provider.router().route(serde_json::json!({
+                        "jsonrpc": "2.0", "id": id.as_i64(),
+                        "result": { "routing": { "target": { "enabled": false } } }
+                    }));
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            server
+                .injection_coordinator()
+                .reopen_host_document(&uri, &target_key),
+        )
+        .await
+        .expect("host routing should finish");
+        answer.abort();
+        assert_eq!(
+            outcome,
+            if settings_change {
+                OpenOutcome::NotOpened
+            } else {
+                OpenOutcome::NotApplicable
+            }
+        );
+        assert_eq!(
+            pool.host_routing_by_server(&uri, "target"),
+            if settings_change { None } else { Some(false) }
+        );
+        assert!(
+            !pool
+                .is_host_document_opened_on_connection(&uri, &target_key)
+                .await
+        );
     }
 
     #[tokio::test]

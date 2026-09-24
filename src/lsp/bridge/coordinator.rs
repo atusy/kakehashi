@@ -1520,6 +1520,7 @@ impl BridgeCoordinator {
                 }),
                 configs,
                 routing_guard,
+                None,
             )
             .await;
             if let Some(token) = routing_tokens.and_then(|tokens| tokens.get(&document_uri)) {
@@ -1846,6 +1847,74 @@ impl BridgeCoordinator {
         );
     }
 
+    /// Complete routing left unfinished by a cancelled eager batch before
+    /// repairing the host. Provider selection still sees every host candidate,
+    /// so a sibling provider can suppress the connection being repaired.
+    pub(crate) async fn reopen_host_document(
+        &self,
+        settings: &Arc<WorkspaceSettings>,
+        key: &super::ConnectionKey,
+        doc: &super::HostDocument<'_>,
+        read: super::text_document::host::HostResolveReader<'_>,
+        admit: &(dyn Fn() -> bool + Sync),
+    ) -> super::OpenOutcome {
+        use super::OpenOutcome;
+        let configs = self.cached_host_configs_for_language(settings, doc.language_id);
+        let Some(config) = configs
+            .iter()
+            .find(|config| config.server_name == key.server())
+            .map(|config| Arc::clone(&config.config))
+        else {
+            return OpenOutcome::NotApplicable;
+        };
+        if self
+            .pool
+            .host_routing_by_server(doc.uri, key.server())
+            .is_none()
+        {
+            // Exclude other roots before waiting for their lifecycle lock.
+            if self
+                .pool
+                .resolved_connection_key(key.server(), &config, doc.uri)
+                .await
+                != *key
+            {
+                return OpenOutcome::NotApplicable;
+            }
+            let lifecycle = self.pool.host_lifecycle_lock(doc.uri);
+            let _guard = lifecycle.write().await;
+            if !admit()
+                || self.pool.current_host_incarnation(doc.uri)
+                    != doc.revision.map(|r| r.incarnation)
+                || !self.pool.accepts_host_language(doc.uri, doc.language_id)
+            {
+                return OpenOutcome::NotOpened;
+            }
+            if self
+                .pool
+                .host_routing_by_server(doc.uri, key.server())
+                .is_none()
+            {
+                Self::resolve_document_routing(
+                    &self.pool,
+                    doc.uri,
+                    doc.language_id,
+                    None,
+                    configs,
+                    None,
+                    Some(admit),
+                )
+                .await;
+            }
+            if !admit() {
+                return OpenOutcome::NotOpened;
+            }
+        }
+        self.pool
+            .reopen_host_document(key, &config, doc, read, admit)
+            .await
+    }
+
     /// Ask one advertising host bridge for a routing decision over the full
     /// candidate set, then mark every candidate connection with that decision
     /// before any host `didOpen` is sent. This is deliberately one orchestration
@@ -1858,10 +1927,13 @@ impl BridgeCoordinator {
         host: Option<super::protocol::RoutingHostDocument>,
         configs: Vec<ResolvedServerConfig>,
         routing_guard: Option<(&Url, &Url, &Arc<tokio::sync::watch::Sender<bool>>)>,
+        admit: Option<&(dyn Fn() -> bool + Sync)>,
     ) -> Vec<ResolvedServerConfig> {
-        if routing_guard.is_some_and(|(host_uri, virtual_uri, token)| {
-            !pool.is_virtual_routing_current(host_uri, virtual_uri, token)
-        }) {
+        if admit.is_some_and(|admit| !admit())
+            || routing_guard.is_some_and(|(host_uri, virtual_uri, token)| {
+                !pool.is_virtual_routing_current(host_uri, virtual_uri, token)
+            })
+        {
             return Vec::new();
         }
         if configs.iter().all(|config| {
@@ -1916,11 +1988,13 @@ impl BridgeCoordinator {
             let document_uri = document_uri.clone();
             candidates.push(async move {
                 let result = pool
-                    .get_or_create_connection_wait_ready(
+                    .get_or_create_connection_wait_ready_admitted(
                         &server_name,
                         &server_config,
                         Some(&document_uri),
                         std::time::Duration::from_secs(INIT_TIMEOUT_SECS),
+                        admit,
+                        None,
                     )
                     .await;
                 (server_name, result)
@@ -1930,6 +2004,9 @@ impl BridgeCoordinator {
         let mut handles = Vec::with_capacity(configs.len());
         let mut answer: Option<RoutingAnswer> = None;
         while let Some((server_name, result)) = candidates.next().await {
+            if admit.is_some_and(|admit| !admit()) {
+                return Vec::new();
+            }
             let handle = match result {
                 Ok(handle) => handle,
                 Err(error) => {
@@ -1961,9 +2038,11 @@ impl BridgeCoordinator {
 
         let mut selected = Vec::new();
         for config in configs {
-            if routing_guard.is_some_and(|(host_uri, virtual_uri, token)| {
-                !pool.is_virtual_routing_current(host_uri, virtual_uri, token)
-            }) {
+            if admit.is_some_and(|admit| !admit())
+                || routing_guard.is_some_and(|(host_uri, virtual_uri, token)| {
+                    !pool.is_virtual_routing_current(host_uri, virtual_uri, token)
+                })
+            {
                 return Vec::new();
             }
             let enabled = answer
@@ -2085,6 +2164,7 @@ impl BridgeCoordinator {
                         &language_id,
                         None,
                         configs_for_routing,
+                        None,
                         None,
                     ).await
                 } => configs,

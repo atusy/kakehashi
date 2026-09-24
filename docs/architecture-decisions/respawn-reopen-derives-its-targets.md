@@ -138,8 +138,9 @@ that belongs to the connection.
    sweep's bounded wait is applicable-but-unsettled, not "not
    applicable": the barrier's fail-soft path applies, never a
    successful omission; a sibling entry's state never decides this
-   server's applicability. The stage stays
-   read-only either way: the sweep never issues a routing query.
+   server's applicability. This membership check stays read-only;
+   completing an absent host routing decision before synchronization is the
+   separate exception described below.
 
 Stage 1 is deliberately conservative — a server declaring the `*` wildcard is
 never pre-rejected, and inheritance from the `_` template is resolved before the
@@ -167,6 +168,15 @@ The host layer is restored before waiting for the host's injection parse. It
 uses the real URI and current text, read together with its language and
 revision, and only an existing Ready connection under the named key. Shared
 workspace announcements precede its `didOpen`, as for injected regions.
+
+If a cancelled eager batch left the host's routing decision absent, the
+re-open first finishes ordinary provider selection over the full host-server
+candidate set. That step may acquire candidates: a sibling provider must still
+be able to suppress the target. It is serialized by the host lifecycle lock
+and guarded by the current settings and document lifetime, including before
+acquisition and before recording the answer. Hosts already routed elsewhere
+are excluded before waiting for that lock. The subsequent exact-key sync still
+uses only an existing Ready connection and rechecks routing before `didOpen`.
 
 This work is awaited directly rather than delegated to edit-driven eager
 batches. Superseding or cancelling an eager batch therefore cannot release the

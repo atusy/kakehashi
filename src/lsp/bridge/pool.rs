@@ -3079,7 +3079,7 @@ impl LanguageServerPool {
         .await
     }
 
-    async fn get_or_create_connection_wait_ready_admitted(
+    pub(super) async fn get_or_create_connection_wait_ready_admitted(
         &self,
         server_name: &str,
         server_config: &crate::config::settings::BridgeServerConfig,
