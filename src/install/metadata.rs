@@ -740,8 +740,11 @@ sub dir]],
             "    --[[ oops",
         ] {
             assert!(
-                matches!(parse_lua_entry(fields), Err(MetadataError::ParseError(_))),
-                "{fields:?} must be a parse error"
+                matches!(
+                    parse_lua_entry(fields),
+                    Err(MetadataError::ParseError(msg)) if msg.contains("unterminated")
+                ),
+                "{fields:?} must be an unterminated-literal parse error"
             );
         }
     }
@@ -779,6 +782,29 @@ return {
     #[test]
     fn non_string_field_values_are_skipped() {
         assert_lua_entry_parses("    url = nil,\n    revision = 42,");
+    }
+
+    #[test]
+    fn comments_after_the_returned_table_are_accepted() {
+        let content = format!("{VALID_METADATA}-- trailer\n--[[ block\n]]\n");
+
+        let parsers = parse_parsers_lua(&content).expect("should parse");
+
+        assert_eq!(parsers["lua"].revision, "abc123");
+    }
+
+    #[test]
+    fn empty_required_values_drop_the_language() {
+        for install_info in ["revision = '', url = 'u'", "revision = 'r', url = [[]]"] {
+            let content = format!(
+                "return {{\n  lua = {{\n    install_info = {{ {install_info} }},\n  }},\n  rust = {{\n    install_info = {{ revision = 'r', url = 'u' }},\n  }},\n}}\n"
+            );
+
+            let parsers = parse_parsers_lua(&content).expect("should parse");
+
+            assert!(!parsers.contains_key("lua"), "{install_info:?}");
+            assert!(parsers.contains_key("rust"));
+        }
     }
 
     #[test]
