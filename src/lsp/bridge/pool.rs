@@ -4206,15 +4206,16 @@ impl LanguageServerPool {
                         }
                     }
                     // Drop the dead connection's document state with it: the
-                    // replacement process has nothing open, so the host sync
-                    // (the re-open armed below, or a request's lazy sync) must
-                    // re-send didOpen and the virt tracker must let that re-open
-                    // or the next request re-claim and re-open instead of
-                    // trusting stale entries (host-document-bridge). Both purges are
-                    // scoped to this exact `(server, root)` key so sibling roots
-                    // sharing the server name keep their state. Lock order:
-                    // connections → host_documents / document tracker,
-                    // consistent with close_host_bridge_document's prefetch.
+                    // replacement process has nothing open, so every host sync
+                    // (the re-open armed below, an eager re-sync, or a
+                    // request's lazy sync) must re-send didOpen, and the virt
+                    // tracker must let the re-open (or the next request)
+                    // re-claim and re-open instead of trusting stale entries
+                    // (host-document-bridge). Both purges are scoped to this
+                    // exact `(server, root)` key so sibling roots sharing the
+                    // server name keep their state. Lock order: connections →
+                    // host_documents / document tracker, consistent with
+                    // close_host_bridge_document's prefetch.
                     self.host_documents.lock().await.retain(|_, connections| {
                         connections.remove(&connection_key);
                         !connections.is_empty()
