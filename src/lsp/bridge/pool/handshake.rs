@@ -282,7 +282,14 @@ mod tests {
             false,
         );
 
-        let (result, _permits) = tokio::join!(handshake, respond);
+        // `biased` polls the handshake first, so `initialize` is queued before
+        // `respond` starts reserving; the timeout turns a handshake that would
+        // wait for a slot (instead of failing on a full queue) into a failure.
+        let (result, _permits) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(biased; handshake, respond)
+        })
+        .await
+        .expect("the handshake must fail fast on a full queue, not wait");
 
         assert_eq!(
             result.expect_err("initialized must not fit").kind(),
