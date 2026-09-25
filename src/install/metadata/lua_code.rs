@@ -14,7 +14,7 @@ use super::MetadataError;
 /// Lua source with comments and string contents blanked out.
 pub(super) struct LuaCode {
     /// Same length as the source. Comments and string contents are spaces,
-    /// newlines kept; string delimiters and all code are unchanged.
+    /// LF kept; string delimiters and all code are unchanged.
     pub(super) code: String,
     /// Decoded value of each string literal, keyed by the offset of its
     /// opening delimiter.
@@ -279,7 +279,7 @@ fn long_string_value(body: &[u8]) -> String {
 }
 
 /// Copy `source`, replacing every character inside `ranges` except
-/// newlines with as many spaces as its UTF-8 length.
+/// LF with as many spaces as its UTF-8 length.
 fn blank(source: &str, ranges: &[Range<usize>]) -> String {
     let mut code = String::with_capacity(source.len());
     let mut ranges = ranges.iter().peekable();
