@@ -624,6 +624,30 @@ impl BridgeCoordinator {
     }
 
     #[cfg(all(test, unix))]
+    pub(crate) async fn insert_diagnostic_test_connection(
+        &self,
+        server_name: &str,
+    ) -> Arc<super::pool::ConnectionHandle> {
+        use super::pool::{ConnectionKey, ConnectionState};
+        let (handle, _) = super::pool::test_helpers::create_handle_with_command(
+            ConnectionState::Ready,
+            ConnectionKey::for_server(server_name),
+            vec!["sh".into(), "-c".into(), "cat > /dev/null".into()],
+            Some(tower_lsp_server::ls_types::ServerCapabilities {
+                diagnostic_provider: Some(
+                    tower_lsp_server::ls_types::DiagnosticServerCapabilities::Options(
+                        tower_lsp_server::ls_types::DiagnosticOptions::default(),
+                    ),
+                ),
+                ..Default::default()
+            }),
+        )
+        .await;
+        self.pool.insert_connection(handle.clone()).await;
+        handle
+    }
+
+    #[cfg(all(test, unix))]
     pub(crate) fn has_host_eager_batch_for_test(&self, uri: &Url) -> bool {
         self.host_eager_open_tasks.contains_key(uri)
     }

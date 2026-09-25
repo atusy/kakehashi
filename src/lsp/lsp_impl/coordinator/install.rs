@@ -398,7 +398,8 @@ impl InstallCoordinator {
     /// reloads on success. An `AlreadyInstalling` caller waits for the shared
     /// install claim, then reloads its own document when the parser artifact exists.
     /// `parsed` names only a parse published by this call; successful recovery
-    /// through a sibling's tree does not authorize open downstream work.
+    /// through a sibling's tree does not authorize tree-dependent open work.
+    /// Host diagnostics use `same_lifetime` even when parsing gives up.
     pub(crate) async fn maybe_auto_install_language(
         &self,
         language: &str,
@@ -480,7 +481,11 @@ impl InstallCoordinator {
                 };
             }
             drop(result);
-            return InstallCompletion::default();
+            return InstallCompletion {
+                same_lifetime: self.same_document_incarnation(&uri, expected_incarnation),
+                parsed,
+                queries_reloaded: true,
+            };
         }
 
         // Every no-reparse outcome lands here — Failed/Unsupported/NoDataDir as
@@ -577,7 +582,11 @@ impl InstallCoordinator {
                     retried.queries_reloaded |= query_repair;
                     return retried;
                 }
-                return InstallCompletion::default();
+                return InstallCompletion {
+                    same_lifetime: self.same_document_incarnation(&uri, expected_incarnation),
+                    parsed,
+                    queries_reloaded: query_repair,
+                };
             }
             // A shared failure is the owner's to record, in the generation
             // its attempt started in: a waiter joining after a reload must
@@ -1642,6 +1651,57 @@ mod tests {
         );
         assert!(server.documents.get(&first).unwrap().tree().is_some());
         assert!(server.documents.get(&second).unwrap().tree().is_some());
+    }
+
+    #[tokio::test]
+    async fn completed_install_preserves_lifetime_when_reparse_gives_up() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///workspace/no-language").unwrap();
+        let incarnation = server
+            .documents
+            .insert(uri.clone(), String::new(), None, None);
+        let claim = server.auto_install.begin_test_claim("rust", Vec::new());
+        let install = server.install_coordinator();
+        let mut waiter = Box::pin(install.maybe_auto_install_language(
+            "rust",
+            uri.clone(),
+            false,
+            Some(incarnation),
+            InstallRequest {
+                allow_recovery: false,
+                ..InstallRequest::new(false)
+            },
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(waiter.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        claim.complete(crate::lsp::auto_install::InstallOutcome::Success {
+            data_dir: std::path::PathBuf::from("/installed"),
+        });
+        let completion = waiter.await;
+        assert!(
+            completion.same_lifetime,
+            "parse failure does not close the document"
+        );
+        assert!(completion.parsed.is_none());
+        assert!(
+            server
+                .documents
+                .latest_snapshot(&uri)
+                .unwrap()
+                .slot
+                .snapshot
+                .unwrap()
+                .tree
+                .is_none()
+        );
     }
 
     #[tokio::test]
