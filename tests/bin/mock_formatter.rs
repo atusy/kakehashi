@@ -206,9 +206,10 @@
 //!
 //! `--stamp-resolve-process` tags completion/action data and resolved output with
 //! the process ID; `--reject-old-resolve` rejects data from another process.
-//! `--exit-after-resolve-once` exits right after answering the first
-//! `codeAction/resolve` of the whole test (the `MOCK_LSP_WIRE_LOG` crash marker
-//! makes it once across incarnations), so the next resolve needs a replacement.
+//! `--exit-after-resolve-once` exits right after the first `codeAction/resolve`
+//! answered by the plain `code-action-lazy` / `code-action-lazy-retitle` path,
+//! so the next resolve needs a replacement. "Once" is per `MOCK_LSP_WIRE_LOG`:
+//! it shares that log's crash marker with the other crash-once modes.
 //!
 //! Only built for E2E runs (`required-features = ["e2e"]` in Cargo.toml).
 
