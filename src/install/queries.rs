@@ -3415,6 +3415,38 @@ mod tests {
         );
     }
 
+    /// A backup of a regular file that sat in the slot is a regular file. When
+    /// it is the only thing an interrupted install stranded, recovery must still
+    /// find it and collect it once complete queries have taken its place.
+    #[test]
+    #[cfg(unix)]
+    fn recover_interrupted_query_installs_collects_a_lone_regular_file_backup() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        let live = queries_parent.join("lua");
+        fs::create_dir_all(&live).unwrap();
+        fs::write(live.join("highlights.scm"), "published").unwrap();
+        write_install_marker(&live).unwrap();
+        let backup = queries_parent.join(format!(".lua.{}.0.backup", dead_test_pid()));
+        fs::write(&backup, "a file that sat in the query slot").unwrap();
+        write_backup_ownership_marker(&backup).unwrap();
+
+        recover_interrupted_query_installs(&queries_parent).unwrap();
+
+        assert!(
+            fs::symlink_metadata(&backup).is_err(),
+            "a superseded file backup must be collected"
+        );
+        assert!(
+            fs::symlink_metadata(backup_ownership_sidecar(&backup)).is_err(),
+            "its ownership sidecar must go with it"
+        );
+        assert_eq!(
+            fs::read_to_string(live.join("highlights.scm")).unwrap(),
+            "published"
+        );
+    }
+
     /// The language lock is what keeps an install from publishing over a
     /// language the user removed while it was compiling.
     #[test]
