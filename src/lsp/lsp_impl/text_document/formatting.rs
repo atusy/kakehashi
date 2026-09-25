@@ -100,11 +100,12 @@ impl Kakehashi {
         // user-triggered and infrequent, so it may briefly wait for the
         // in-flight parse; a still-stale snapshot after the wait rejects with
         // ContentModified rather than silently no-opping an action the user
-        // consciously triggered. Never-parsed/gone falls through to the
-        // existing empty fallbacks below.
-        if let crate::lsp::lsp_impl::snapshot_read::SnapshotWait::Stale = self
-            .wait_for_current_snapshot(&uri, std::time::Duration::from_millis(500))
-            .await
+        // consciously triggered. A settings reload's placeholder is waited
+        // past like a trailing snapshot, but one still standing at the
+        // deadline falls through with never-parsed/gone to the existing empty
+        // fallbacks below.
+        if let crate::lsp::lsp_impl::snapshot_read::SnapshotWait::Stale =
+            self.wait_for_explicit_action_snapshot(&uri).await
         {
             return Err(crate::error::content_modified_error());
         }
@@ -2858,5 +2859,141 @@ mod tests {
         // with the surrounding pre-existing tests, this guards the intent
         // of the fix.
         baseline_token.cancel();
+    }
+
+    mod reload_placeholder {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        use tower_lsp_server::LspService;
+        use tower_lsp_server::ls_types::{
+            DocumentFormattingParams, DocumentRangeFormattingParams, FormattingOptions, Position,
+            Range, TextDocumentIdentifier,
+        };
+        use url::Url;
+
+        use crate::document::LanguageCheck;
+        use crate::document::snapshot::ParseSnapshot;
+        use crate::lsp::lsp_impl::Kakehashi;
+
+        const TEXT: &str = "fn main() {}";
+
+        fn rust_tree() -> tree_sitter::Tree {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_rust::LANGUAGE.into())
+                .unwrap();
+            parser.parse(TEXT, None).unwrap()
+        }
+
+        /// A parsed rust document whose settings reload is still reparsing.
+        fn reloading_server(uri: &Url) -> LspService<Kakehashi> {
+            let (service, _socket) = LspService::new(Kakehashi::new);
+            let server = service.inner();
+            server
+                .language
+                .language_registry_for_parallel()
+                .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+            server.documents.insert(
+                uri.clone(),
+                TEXT.to_string(),
+                Some("rust".to_string()),
+                Some(rust_tree()),
+            );
+            server.documents.invalidate_all_parses();
+            service
+        }
+
+        /// The reload's reparse, landing after the request started waiting.
+        async fn reparse(server: &Kakehashi, uri: &Url, landed: &AtomicBool) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let view = server.documents.latest_snapshot(uri).unwrap();
+            let installed = server.documents.install_parse(
+                uri,
+                LanguageCheck::Record,
+                std::sync::Arc::new(ParseSnapshot {
+                    text: std::sync::Arc::from(TEXT),
+                    tree: Some(rust_tree()),
+                    language: Some("rust".to_string()),
+                    parsed_version: view.content_version,
+                    incarnation: view.slot.current_incarnation,
+                    injection_regions: None,
+                    regions: None,
+                    layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
+                    awaiting_reparse: false,
+                }),
+            );
+            assert!(installed.published, "the reparse must land");
+            landed.store(true, Ordering::SeqCst);
+        }
+
+        fn document(uri: &Url) -> TextDocumentIdentifier {
+            TextDocumentIdentifier {
+                uri: crate::lsp::lsp_impl::url_to_uri(uri).unwrap(),
+            }
+        }
+
+        fn options() -> FormattingOptions {
+            FormattingOptions {
+                tab_size: 4,
+                insert_spaces: true,
+                ..Default::default()
+            }
+        }
+
+        /// Formatting in a reload window settles for the reparse instead of
+        /// reading the placeholder's missing tree and no-opping at once.
+        #[tokio::test]
+        async fn formatting_waits_for_the_reparse_behind_a_reload_placeholder() {
+            let uri = Url::parse("file:///format_reload.rs").unwrap();
+            let service = reloading_server(&uri);
+            let server = service.inner();
+            let landed = AtomicBool::new(false);
+
+            let params = DocumentFormattingParams {
+                text_document: document(&uri),
+                options: options(),
+                work_done_progress_params: Default::default(),
+            };
+            let request = async {
+                let result = server.formatting_impl(params).await;
+                (result, landed.load(Ordering::SeqCst))
+            };
+            let ((result, landed_first), ()) =
+                tokio::join!(request, reparse(server, &uri, &landed));
+
+            assert!(result.is_ok(), "{result:?}");
+            assert!(
+                landed_first,
+                "formatting answered before the reparse it waits for landed"
+            );
+        }
+
+        #[tokio::test]
+        async fn range_formatting_waits_for_the_reparse_behind_a_reload_placeholder() {
+            let uri = Url::parse("file:///range_format_reload.rs").unwrap();
+            let service = reloading_server(&uri);
+            let server = service.inner();
+            let landed = AtomicBool::new(false);
+
+            let params = DocumentRangeFormattingParams {
+                text_document: document(&uri),
+                range: Range::new(Position::new(0, 0), Position::new(0, 12)),
+                options: options(),
+                work_done_progress_params: Default::default(),
+            };
+            let request = async {
+                let result = server.range_formatting_impl(params).await;
+                (result, landed.load(Ordering::SeqCst))
+            };
+            let ((result, landed_first), ()) =
+                tokio::join!(request, reparse(server, &uri, &landed));
+
+            assert!(result.is_ok(), "{result:?}");
+            assert!(
+                landed_first,
+                "range formatting answered before the reparse it waits for landed"
+            );
+        }
     }
 }

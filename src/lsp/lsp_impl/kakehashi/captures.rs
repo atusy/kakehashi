@@ -2023,6 +2023,7 @@ mod tests {
                             injection_regions: None,
                             regions: None,
                             layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
+                            awaiting_reparse: false,
                         },
                     ))
                 })
@@ -2114,6 +2115,7 @@ mod tests {
                         injection_regions: None,
                         regions: None,
                         layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
+                        awaiting_reparse: false,
                     },
                 ))
             })
@@ -2191,6 +2193,7 @@ mod tests {
                         injection_regions: None,
                         regions: None,
                         layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
+                        awaiting_reparse: false,
                     },
                 ))
             })
@@ -2375,6 +2378,7 @@ mod tests {
                         injection_regions: None,
                         regions: None,
                         layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
+                        awaiting_reparse: false,
                     },
                 ))
         };
@@ -2491,6 +2495,7 @@ mod tests {
                         injection_regions: None,
                         regions: None,
                         layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
+                        awaiting_reparse: false,
                     },
                 ))
         );
