@@ -787,9 +787,10 @@ impl ConnectionHandle {
     /// counts: the static `InitializeResult` shape
     /// ([`supports_workspace_folder_changes`]) or a live registration of the
     /// notification — dynamic (Pyright-style, #968) or a static
-    /// `changeNotifications` id the handshake recorded (#1117). Returns `false` until the
-    /// initialize handshake stores capabilities or a registration arrives, so
-    /// a still-initializing connection is treated as not-yet-capable.
+    /// `changeNotifications` id the handshake recorded (#1117). Returns
+    /// `false` until the initialize handshake stores capabilities or a
+    /// registration arrives, so a still-initializing connection is treated as
+    /// not-yet-capable.
     ///
     /// The registry is read live rather than latched, even though the
     /// capability is treated as effectively monotone: an `unregisterCapability`
