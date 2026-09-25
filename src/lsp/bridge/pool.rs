@@ -2117,6 +2117,19 @@ impl LanguageServerPool {
         self.pending_reopen.wait_for_reopen(key).await
     }
 
+    /// Test seam: stand in for a replacement's handshake that claimed a
+    /// re-open which has not run yet. The caller settles it through `done`.
+    #[cfg(test)]
+    pub(in crate::lsp::bridge) fn claim_reopen_for_test(
+        &self,
+        key: &ConnectionKey,
+    ) -> tokio::sync::watch::Sender<bool> {
+        self.pending_reopen.arm(key);
+        self.pending_reopen
+            .claim(key)
+            .expect("an armed key can be claimed")
+    }
+
     /// Arm re-open debt for the RESOLVED key of a key-CHANGING palette
     /// reconnect (`preferSharedInstance` flipped since registration): the
     /// spawn about to happen claims debt under ITS OWN key, and that key never

@@ -682,6 +682,113 @@ mod tests {
         assert!(edit_lock.try_lock().is_ok());
     }
 
+    /// A resolve that arrives while a replaced origin is still re-opening its
+    /// virtual documents must wait for that re-open instead of finding the
+    /// document "not open" and returning the item unresolved.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn virtual_completion_resolve_waits_for_the_pending_reopen() {
+        use crate::lsp::bridge::ConnectionState;
+        use crate::lsp::bridge::pool::test_helpers::{
+            create_handle_with_command, devnull_config, wait_for_sent_request,
+        };
+        use tower_lsp_server::ls_types::{CompletionOptions, ServerCapabilities};
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let pool = Arc::new(LanguageServerPool::new());
+        let envelope = test_envelope();
+        let uri = Url::parse(&envelope.host_uri).unwrap();
+        let config = devnull_config();
+        let (_marker, key) = pool
+            .resolve_acquire(&envelope.origin, &config, Some(&uri))
+            .await;
+        let (handle, _) = create_handle_with_command(
+            ConnectionState::Ready,
+            key.clone(),
+            vec![
+                "sh".into(),
+                "-c".into(),
+                "cat > \"$1\"".into(),
+                "sh".into(),
+                output.path().to_str().unwrap().into(),
+            ],
+            Some(ServerCapabilities {
+                completion_provider: Some(CompletionOptions {
+                    resolve_provider: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        )
+        .await;
+        pool.insert_connection(Arc::clone(&handle)).await;
+        pool.open_host_incarnation(&uri, 1).await;
+        // The replacement's handshake claimed a re-open that has not run yet.
+        let done = pool.claim_reopen_for_test(&key);
+
+        let edit_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let document = CompletionResolveDocument {
+            host_uri: uri.clone(),
+            language_id: envelope.injection_language.clone(),
+            text: Arc::from("text"),
+            geometry: Some((RegionOffset::new(5, 0), Position::new(9, 0))),
+            revision: HostRevision {
+                incarnation: 1,
+                content_version: 1,
+            },
+            edit_guard: Arc::clone(&edit_lock).lock_owned().await,
+        };
+        let upstream_id = UpstreamId::Number(78);
+        let mut request = {
+            let pool = Arc::clone(&pool);
+            let envelope = envelope.clone();
+            let upstream_id = upstream_id.clone();
+            tokio::spawn(async move {
+                pool.send_completion_resolve_request(
+                    &config,
+                    CompletionItem {
+                        label: "old".into(),
+                        ..Default::default()
+                    },
+                    envelope,
+                    Some(upstream_id),
+                    std::future::ready(Some(document)),
+                )
+                .await
+            })
+        };
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), &mut request)
+                .await
+                .is_err(),
+            "resolve must wait for the outstanding re-open, not give up on it"
+        );
+
+        // The re-open lands: the document is open on the replacement again.
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&uri).unwrap(),
+            &envelope.injection_language,
+            &envelope.region_id,
+        );
+        pool.ensure_document_opened(
+            &mut ConnectionHandleSender(&handle),
+            &uri,
+            &virtual_uri,
+            "text",
+            &key,
+        )
+        .await
+        .unwrap();
+        done.send(true).unwrap();
+
+        let downstream_id = wait_for_sent_request(&handle, &upstream_id).await;
+        let _ = handle.router().route(json!({
+            "jsonrpc": "2.0",
+            "id": downstream_id.as_i64(),
+            "result": { "label": "resolved" }
+        }));
+        assert_eq!(request.await.unwrap().label, "resolved");
+    }
+
     /// A matched reply remains usable when the connection retires after send.
     #[cfg(unix)]
     #[tokio::test]
