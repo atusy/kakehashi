@@ -55,7 +55,9 @@ pub(crate) struct LanguageCoordinator {
     query_store: QueryStore,
     config_store: ConfigStore,
     language_registry: LanguageRegistry,
-    parser_loader: RwLock<ParserLoader>,
+    /// Shared with [`Self::scratch_sharing_caches`] copies, so a trial load
+    /// resolves the same grammar objects as the live one.
+    parser_loader: Arc<RwLock<ParserLoader>>,
     /// Maps derived languageId → base language name.
     /// Built from `languages.<name>.base` in configuration.
     /// Example: "rmd" → "markdown" (when rmd has `base = "markdown"`)
@@ -116,9 +118,12 @@ pub(crate) struct LanguageCoordinator {
     /// published back, so the query store's `Arc` identity tracks content: a
     /// reload can tell "re-read, unchanged" from "re-read, edited" without
     /// comparing sources. Holds `Weak`s, so it never keeps a replaced query
-    /// alive; dead entries are pruned on each settings load.
-    compiled_queries: Mutex<HashMap<(Language, String), std::sync::Weak<tree_sitter::Query>>>,
+    /// alive; dead entries are pruned on each settings load. Shared with
+    /// [`Self::scratch_sharing_caches`] copies.
+    compiled_queries: Arc<Mutex<CompiledQueries>>,
 }
+
+type CompiledQueries = HashMap<(Language, String), std::sync::Weak<tree_sitter::Query>>;
 
 /// A registered language as documents see it. Equality is identity: the
 /// grammar compares by its loaded library, and queries by `Arc`, which
@@ -157,7 +162,7 @@ impl LanguageCoordinator {
             query_store: QueryStore::new(),
             config_store: ConfigStore::new(),
             language_registry: LanguageRegistry::new(),
-            parser_loader: RwLock::new(ParserLoader::new()),
+            parser_loader: Arc::new(RwLock::new(ParserLoader::new())),
             base_map: RwLock::new(HashMap::new()),
             derived_languages: RwLock::new(HashSet::new()),
             failed_loads: dashmap::DashMap::new(),
@@ -169,7 +174,7 @@ impl LanguageCoordinator {
             load_generation: std::sync::atomic::AtomicU64::new(0),
             config_warnings: RwLock::new(Vec::new()),
             load_inflight: dashmap::DashMap::new(),
-            compiled_queries: Mutex::new(HashMap::new()),
+            compiled_queries: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -424,12 +429,6 @@ impl LanguageCoordinator {
 
     /// Initialize from workspace-level settings and return coordination events.
     ///
-    /// Re-reads every parser and query from disk — for the configured
-    /// languages and for the languages loaded or attempted on demand since the
-    /// previous load — and reports through
-    /// [`LanguageLoadSummary::language_state_changed`] whether any of them now
-    /// differs, so the caller can skip reparsing documents when nothing did.
-    ///
     /// Visibility: pub(crate) - called by LSP layer during initialization and
     /// settings updates to configure language support.
     pub(crate) fn load_settings(&self, settings: &WorkspaceSettings) -> LanguageLoadSummary {
@@ -438,22 +437,6 @@ impl LanguageCoordinator {
             .lock()
             .recover_poison("LanguageCoordinator::load_settings(reload)");
         self.prune_compiled_queries();
-        // What documents can be parsed and highlighted with before this load:
-        // every language registered under the current generation, and every
-        // language whose load failed under it. The load below marks both
-        // stale; re-attempting them at the end (instead of on the next
-        // document that needs them) is what lets the result say whether the
-        // reload changed anything a document depends on.
-        let previous_generation = self
-            .load_generation
-            .load(std::sync::atomic::Ordering::Acquire);
-        let previous_state = self.language_state(previous_generation);
-        let previously_failed: Vec<String> = self
-            .failed_loads
-            .iter()
-            .filter(|entry| *entry.value() == previous_generation)
-            .map(|entry| entry.key().clone())
-            .collect();
         self.config_store.update_from_settings(settings);
         self.clear_derived_languages();
         // A reload (new search paths, or the post-install reload) is the only
@@ -523,35 +506,80 @@ impl LanguageCoordinator {
             summary.record(derived_name, result);
         }
 
-        // Re-read the languages documents were using (or waiting for) that
-        // the configured passes above did not settle. Their events surface
-        // only when their outcome changed: an unchanged re-read would
-        // otherwise repeat every "loaded" log and missing-parser warning on
-        // each reload.
+        summary
+    }
+
+    /// Whether applying `settings` would change any language a document can be
+    /// parsed or highlighted with — a parser or query appearing, disappearing,
+    /// or now resolving to a different grammar or query text — WITHOUT
+    /// touching this coordinator.
+    ///
+    /// Runs the whole reload on a scratch copy sharing only the grammar and
+    /// compiled-query caches: every parser and query file is re-read, for the
+    /// configured languages and for the languages loaded or attempted on
+    /// demand since the last load. The live registrations, generation and
+    /// caches stay as they are, so a caller that finds nothing changed can
+    /// skip the reload entirely. Blocking: reads files and compiles queries.
+    pub(crate) fn reload_would_change_languages(&self, settings: &WorkspaceSettings) -> bool {
+        // Snapshot before the trial: the held `Arc`s keep every currently
+        // published query interned, so an unchanged re-read resolves to it.
         let generation = self
             .load_generation
             .load(std::sync::atomic::Ordering::Acquire);
-        for language_id in previous_state
-            .keys()
-            .cloned()
-            .chain(previously_failed)
-            .collect::<HashSet<_>>()
-        {
-            if self.has_current_parser_registration(&language_id, generation)
-                || self.configured_load_failed(&language_id, generation)
+        let current = self.language_state(generation);
+        let failed: Vec<String> = self
+            .failed_loads
+            .iter()
+            .filter(|entry| *entry.value() == generation)
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        let scratch = self.scratch_sharing_caches();
+        let _ = scratch.load_settings(settings);
+        let scratch_generation = scratch
+            .load_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        for language_id in current.keys().chain(&failed) {
+            if !scratch.has_current_parser_registration(language_id, scratch_generation)
+                && !scratch.configured_load_failed(language_id, scratch_generation)
             {
-                continue;
-            }
-            let result = self.ensure_language_loaded(&language_id);
-            if previous_state.get(&language_id)
-                != self.language_state_entry(&language_id, generation).as_ref()
-            {
-                summary.events.extend(result.events);
+                let _ = scratch.ensure_language_loaded(language_id);
             }
         }
-        summary.language_state_changed = previous_state != self.language_state(generation);
+        current != scratch.language_state(scratch_generation)
+    }
 
-        summary
+    /// A fresh coordinator sharing this one's grammar and compiled-query
+    /// caches, carrying over the registrations no settings load produces
+    /// (built-in grammars, untagged) with their current and original queries.
+    fn scratch_sharing_caches(&self) -> Self {
+        let scratch = Self {
+            parser_loader: Arc::clone(&self.parser_loader),
+            compiled_queries: Arc::clone(&self.compiled_queries),
+            ..Self::new()
+        };
+        for language_id in self.language_registry.language_ids() {
+            if self.reload_scoped_registrations.contains_key(&language_id) {
+                continue;
+            }
+            let Some(language) = self.language_registry.get(&language_id) else {
+                continue;
+            };
+            for kind in QueryKind::ALL {
+                if let Some(query) = self.query_store.get_query(kind, &language_id) {
+                    scratch
+                        .query_store
+                        .insert_query(kind, language_id.clone(), query);
+                }
+            }
+            scratch.language_registry.register(language_id, language);
+        }
+        for entry in self.builtin_queries.iter() {
+            scratch
+                .builtin_queries
+                .insert(entry.key().clone(), Arc::clone(entry.value()));
+        }
+        scratch
     }
 
     /// Every language registered under `generation`, with the grammar and
@@ -560,21 +588,14 @@ impl LanguageCoordinator {
         self.language_registry
             .language_ids()
             .into_iter()
+            .filter(|language_id| self.has_current_parser_registration(language_id, generation))
             .filter_map(|language_id| {
-                let loaded = self.language_state_entry(&language_id, generation)?;
-                Some((language_id, loaded))
+                let language = self.language_registry.get(&language_id)?;
+                let queries =
+                    QueryKind::ALL.map(|kind| self.query_store.get_query(kind, &language_id));
+                Some((language_id, LoadedLanguage { language, queries }))
             })
             .collect()
-    }
-
-    fn language_state_entry(&self, language_id: &str, generation: u64) -> Option<LoadedLanguage> {
-        if !self.has_current_parser_registration(language_id, generation) {
-            return None;
-        }
-        Some(LoadedLanguage {
-            language: self.language_registry.get(language_id)?,
-            queries: QueryKind::ALL.map(|kind| self.query_store.get_query(kind, language_id)),
-        })
     }
 
     /// Load a derived language by copying parser and queries from its base.

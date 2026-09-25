@@ -103,93 +103,108 @@ pub(super) fn bridge_configs_for_injection_language(
 }
 
 pub(super) struct ReloadLanguageState<'a> {
-    language: &'a LanguageCoordinator,
+    language: &'a std::sync::Arc<LanguageCoordinator>,
     parser_pool: &'a std::sync::Mutex<DocumentParserPool>,
     documents: &'a DocumentStore,
     trigger: ReloadTrigger,
 }
 
-/// What caused a settings application. Each trigger owns a fixed answer to
-/// the two expensive follow-ups of a reload: invalidating every open
-/// document's parse (whose reparse loop also re-drives injection processing,
-/// eager bridge opens and diagnostics) and asking the client to refresh
-/// semantic tokens.
+/// What caused a settings application. Each trigger has its own answer to
+/// the two expensive follow-ups of a language reload: invalidating every
+/// open document's parse (whose reparse loop also re-drives injection
+/// processing, eager bridge opens and diagnostics) and asking the client to
+/// refresh semantic tokens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ReloadTrigger {
     /// `initialize`: no document is open and no client has consumed tokens,
     /// and a refresh request is not valid before `initialized`.
     Initialize,
-    /// A parser/query install finished: new files on disk under the same
-    /// settings. The install path reparses the documents that waited for it
-    /// itself, so only the refresh is requested here.
+    /// A parser/query install finished: new files on disk, and possibly the
+    /// install directory newly added to the search paths. The install path
+    /// reparses the documents that waited for it itself, so only the refresh
+    /// is requested here.
     Install,
-    /// A workspace-root change re-read the project configuration.
+    /// A workspace-root change re-read the project configuration. Always a
+    /// full reload: the root feeds bridge connection keying (the client-root
+    /// fallback), an input no settings comparison sees.
     WorkspaceFolders,
     /// A `workspace/didChangeConfiguration` push or a `workspace/configuration`
-    /// pull.
+    /// pull. Skips the language reload altogether when it would change
+    /// nothing (see [`settings_affect_documents`]).
     Configuration,
 }
 
 impl ReloadTrigger {
-    /// Whether this reload invalidates every open document's parse, and
-    /// whether it asks the client to refresh semantic tokens.
-    fn effects(self, settings: SettingsImpact, language_state_changed: bool) -> (bool, bool) {
+    fn invalidates_documents(self) -> bool {
         match self {
-            Self::Initialize => (false, false),
-            Self::Install => (false, true),
-            // The workspace root is an input no `WorkspaceSettings` diff sees:
-            // the reparse loop's injection processing keys bridge connections
-            // by it (the client-root fallback).
-            Self::WorkspaceFolders => (true, true),
-            Self::Configuration => {
-                let reparse = settings.reparse || language_state_changed;
-                (reparse, reparse || settings.retokenize)
-            }
+            Self::Initialize | Self::Install => false,
+            Self::WorkspaceFolders | Self::Configuration => true,
+        }
+    }
+
+    fn requests_semantic_refresh(self) -> bool {
+        match self {
+            Self::Initialize => false,
+            Self::Install | Self::WorkspaceFolders | Self::Configuration => true,
         }
     }
 }
 
-/// Which follow-ups a change between two effective settings calls for.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct SettingsImpact {
-    /// Reparse every open document. The reparse loop does more than rebuild
-    /// trees: it re-runs injection processing (eager virtual-document opens
-    /// on bridge servers, injected-language auto-install) and reschedules
-    /// diagnostics, so anything those read belongs here too.
-    reparse: bool,
-    /// Ask the client to re-request semantic tokens.
-    retokenize: bool,
+/// Whether moving from `previous` to `next` can change what open documents
+/// are parsed, highlighted or processed with, so the language reload and its
+/// follow-ups must run.
+///
+/// The follow-ups are wider than trees: the reparse loop re-runs injection
+/// processing (eager virtual-document opens on bridge servers,
+/// injected-language auto-install) and reschedules diagnostics, and the
+/// semantic-token generation bump is what makes new capture mappings reach
+/// the client, so everything those read counts.
+fn settings_affect_documents(previous: &WorkspaceSettings, next: &WorkspaceSettings) -> bool {
+    // Exhaustive on purpose: a new field fails to compile here until it is
+    // classified. When in doubt, it affects documents.
+    let WorkspaceSettings {
+        // Parser/query discovery, and where a failed load may now succeed.
+        search_paths,
+        // Parsers, queries, bases, bridge filters, layers and per-language
+        // auto-install: all read by parsing or the injection pass.
+        languages,
+        // Read by every semantic-tokens computation.
+        capture_mappings,
+        // Whether the injection pass installs a missing injected language.
+        auto_install,
+        // Which servers the injection pass opens virtual documents on.
+        language_servers,
+        // Diagnostic timing and log-level policy: applied below on every
+        // application, and read when diagnostics are scheduled or logs
+        // filtered, never by a parse, query or token.
+        diagnostics_debounce_ms: _,
+        features: _,
+    } = previous;
+    *search_paths != next.search_paths
+        || *languages != next.languages
+        || *capture_mappings != next.capture_mappings
+        || *auto_install != next.auto_install
+        || *language_servers != next.language_servers
 }
 
-impl SettingsImpact {
-    pub(super) fn between(previous: &WorkspaceSettings, next: &WorkspaceSettings) -> Self {
-        // Exhaustive on purpose: a new field fails to compile here until it
-        // is classified. When in doubt, it belongs under `reparse`.
-        let WorkspaceSettings {
-            // Parser/query discovery, and where a failed load may now succeed.
-            search_paths,
-            // Parsers, queries, bases, bridge filters, layers and per-language
-            // auto-install: all read by parsing or the injection pass.
-            languages,
-            // Read per request by semantic tokens only; no tree depends on it.
-            capture_mappings,
-            // Whether the injection pass installs a missing injected language.
-            auto_install,
-            // Which servers the injection pass opens virtual documents on.
-            language_servers,
-            // Diagnostic timing and log-level policy: read when diagnostics
-            // are scheduled or logs filtered, never by a parse, query or token.
-            diagnostics_debounce_ms: _,
-            features: _,
-        } = previous;
-        Self {
-            reparse: *search_paths != next.search_paths
-                || *languages != next.languages
-                || *auto_install != next.auto_install
-                || *language_servers != next.language_servers,
-            retokenize: *capture_mappings != next.capture_mappings,
-        }
+/// Whether a configuration reload to `settings` must run the language
+/// reload: the settings changed something documents depend on, or the parser
+/// and query files it would re-read changed on disk. The disk check runs on
+/// the blocking pool and never touches the live coordinator; if it cannot
+/// finish, reload.
+async fn configuration_reload_needed(
+    language: &std::sync::Arc<LanguageCoordinator>,
+    previous: &WorkspaceSettings,
+    settings: &WorkspaceSettings,
+) -> bool {
+    if settings_affect_documents(previous, settings) {
+        return true;
     }
+    let language = std::sync::Arc::clone(language);
+    let settings = settings.clone();
+    tokio::task::spawn_blocking(move || language.reload_would_change_languages(&settings))
+        .await
+        .unwrap_or(true)
 }
 
 /// What one settings application asked of the documents and the client.
@@ -265,6 +280,51 @@ pub(super) async fn apply_shared_settings(
     .await
 }
 
+/// The synchronous language half of a settings application: swap the
+/// parsers and queries, invalidate open documents' parses if the trigger
+/// asks for it, and fence every generation-stamped product built across the
+/// swap. Returns the load summary and the documents to reparse.
+fn reload_languages_locked(
+    language_state: &ReloadLanguageState<'_>,
+    cache: &CacheCoordinator,
+    settings: &WorkspaceSettings,
+) -> (crate::language::events::LanguageLoadSummary, Vec<Url>) {
+    // TRANSITIONAL generation bump BEFORE any query/config mutation: from
+    // this instant, every generation-stamped product built from the OLD
+    // queries (snapshot-riding discovery/bridge/resolved regions, layer
+    // trees, kind queries, walk memos) stops matching and consumers fall
+    // back inline — without it, `load_settings` swaps the queries first and
+    // the (possibly long: `propagate_settings` awaits the network) window
+    // until the post-reload bump kept serving old-query products as current.
+    // The second bump below then also invalidates anything a racing request
+    // built MID-swap against a half-updated query set.
+    cache.bump_semantic_token_generation();
+    crate::analysis::semantic::invalidate_thread_local_parser_caches();
+    let parser_reload = ParserReloadGuard::begin(language_state.parser_pool);
+    let summary = language_state.language.load_settings(settings);
+    let reparse_uris = if language_state.trigger.invalidates_documents() {
+        language_state.documents.invalidate_all_parses()
+    } else {
+        Vec::new()
+    };
+    // Second bump IMMEDIATELY after the query swap, before any await and
+    // BEFORE the reload guard is released: a request that started after the
+    // transitional bump above but before the swap computed against the OLD
+    // queries yet stamped the new generation — without this bump those
+    // products would be accepted as current for the whole awaited propagate
+    // that follows in the caller, and a publish landing between the guard's release and the bump
+    // would be accepted by readers that treat "no reload in progress" plus a
+    // current stamp as settled. (The final bump after apply_settings covers
+    // the settings-side inputs the apply swaps.)
+    cache.bump_semantic_token_generation();
+    // Invalidate again after the synchronous swap: the first bump rejects
+    // pre-reload checkouts, while this one rejects parsers acquired while the
+    // registry and query stores were being replaced.
+    drop(parser_reload);
+    crate::analysis::semantic::invalidate_thread_local_parser_caches();
+    (summary, reparse_uris)
+}
+
 pub(super) async fn apply_shared_settings_locked(
     _reload: &tokio::sync::MutexGuard<'static, ()>,
     client: &Client,
@@ -278,43 +338,27 @@ pub(super) async fn apply_shared_settings_locked(
         raw_settings,
         settings,
     } = input;
-    // TRANSITIONAL generation bump BEFORE any query/config mutation: from
-    // this instant, every generation-stamped product built from the OLD
-    // queries (snapshot-riding discovery/bridge/resolved regions, layer
-    // trees, kind queries, walk memos) stops matching and consumers fall
-    // back inline — without it, `load_settings` swaps the queries first and
-    // the (possibly long: `propagate_settings` awaits the network) window
-    // until the post-reload bump kept serving old-query products as current.
-    // The second bump below then also invalidates anything a racing request
-    // built MID-swap against a half-updated query set.
-    cache.bump_semantic_token_generation();
-    crate::analysis::semantic::invalidate_thread_local_parser_caches();
-    let settings_impact = SettingsImpact::between(&settings_manager.load_settings(), &settings);
-    let parser_reload = ParserReloadGuard::begin(language_state.parser_pool);
-    let mut summary = language_state.language.load_settings(&settings);
-    let (invalidate_documents, semantic_refresh_requested) = language_state
-        .trigger
-        .effects(settings_impact, summary.language_state_changed);
-    let reparse_uris = if invalidate_documents {
-        language_state.documents.invalidate_all_parses()
+    // Decide BEFORE touching anything: the language reload itself is what
+    // disturbs open documents (the generation bumps null in-flight token
+    // requests and stale every document's stored injection regions; the
+    // coordinator's load marks registrations stale while it re-reads them),
+    // and its follow-ups are what repair that. A reload that would change
+    // nothing skips both halves.
+    let reload_languages = language_state.trigger != ReloadTrigger::Configuration
+        || configuration_reload_needed(
+            language_state.language,
+            &settings_manager.load_settings(),
+            &settings,
+        )
+        .await;
+    let (mut summary, reparse_uris) = if reload_languages {
+        reload_languages_locked(&language_state, cache, &settings)
     } else {
-        Vec::new()
+        (
+            crate::language::events::LanguageLoadSummary::default(),
+            Vec::new(),
+        )
     };
-    // Second bump IMMEDIATELY after the query swap, before any await and
-    // BEFORE the reload guard is released: a request that started after the
-    // transitional bump above but before the swap computed against the OLD
-    // queries yet stamped the new generation — without this bump those
-    // products would be accepted as current for the whole awaited propagate
-    // below, and a publish landing between the guard's release and the bump
-    // would be accepted by readers that treat "no reload in progress" plus a
-    // current stamp as settled. (The final bump after apply_settings covers
-    // the settings-side inputs the apply swaps.)
-    cache.bump_semantic_token_generation();
-    // Invalidate again after the synchronous swap: the first bump rejects
-    // pre-reload checkouts, while this one rejects parsers acquired while the
-    // registry and query stores were being replaced.
-    drop(parser_reload);
-    crate::analysis::semantic::invalidate_thread_local_parser_caches();
     // Publish the settings snapshot before invalidating downstream connections:
     // once propagation exposes a pool miss, a concurrent request must resolve
     // the NEW launch config rather than respawn from the old snapshot (#587).
@@ -378,11 +422,15 @@ pub(super) async fn apply_shared_settings_locked(
     // an old generation, so its entry can't be served post-reload.
     // `didChange` deliberately does NOT invalidate (delta needs the previous
     // tokens); only a query/config reload does.
-    cache.bump_semantic_token_generation();
+    if reload_languages {
+        cache.bump_semantic_token_generation();
+    }
     // Query removal/replacement affects unchanged documents too. Request one
-    // workspace refresh for every reload that changed what tokens are built
-    // from; ClientNotifier capability-gates and coalesces it with any
-    // language-specific refresh events in this batch.
+    // workspace refresh for every language reload; ClientNotifier
+    // capability-gates and coalesces it with any language-specific refresh
+    // events in this batch.
+    let semantic_refresh_requested =
+        reload_languages && language_state.trigger.requests_semantic_refresh();
     if semantic_refresh_requested {
         summary
             .events
@@ -393,9 +441,7 @@ pub(super) async fn apply_shared_settings_locked(
         // Initialization may produce language-specific refresh events (for
         // example while registering a derived language). No refresh request is
         // valid before InitializeResult/initialized, and no document has yet
-        // consumed tokens. A reload that changed nothing tokens are built from
-        // re-registers languages just the same. Either way, keep the logs
-        // while stripping every refresh.
+        // consumed tokens, so keep the logs while stripping every refresh.
         summary.events.retain(|event| {
             !matches!(
                 event,

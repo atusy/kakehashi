@@ -63,7 +63,21 @@ async fn wait_for_tree(server: &Kakehashi, uri: &Url) {
     .expect("the opened document must get a current tree");
 }
 
-fn assert_no_reload_work(outcome: &SettingsReloadOutcome, server: &Kakehashi, uri: &Url) {
+/// Nothing observable happened to the documents: no reparse, no refresh,
+/// and — because the reload itself is what disturbs them — no token
+/// generation bump (it would null in-flight token requests and stale every
+/// stored injection region) and no loss of the document's language.
+fn assert_no_reload_work(
+    outcome: &SettingsReloadOutcome,
+    server: &Kakehashi,
+    uri: &Url,
+    token_generation_before: u64,
+) {
+    assert_eq!(
+        server.cache.semantic_token_generation(),
+        token_generation_before,
+        "a reload that changes nothing must not invalidate generation-stamped products"
+    );
     assert!(
         outcome.reparse_uris.is_empty(),
         "nothing parse-relevant changed, yet the reload invalidated {:?}",
@@ -103,6 +117,7 @@ async fn reload_changing_only_diagnostic_and_log_policy_neither_reparses_nor_ref
         .await;
     let uri = open_and_wait_for_tree(server, "irrelevant.rs", "rust").await;
 
+    let generation = server.cache.semantic_token_generation();
     let mut next = baseline_settings();
     next.diagnostics_debounce_ms += 250;
     next.features.window_log_message = LogMessageLevel::Warning;
@@ -112,7 +127,7 @@ async fn reload_changing_only_diagnostic_and_log_policy_neither_reparses_nor_ref
         .apply_raw_settings(RawWorkspaceSettings::default(), next)
         .await;
 
-    assert_no_reload_work(&outcome, server, &uri);
+    assert_no_reload_work(&outcome, server, &uri, generation);
     // Sanity: the settings themselves were applied.
     assert_eq!(
         server
@@ -133,12 +148,13 @@ async fn identical_reload_neither_reparses_nor_refreshes() {
         .apply_raw_settings(RawWorkspaceSettings::default(), baseline_settings())
         .await;
     let uri = open_and_wait_for_tree(server, "identical.rs", "rust").await;
+    let generation = server.cache.semantic_token_generation();
 
     let outcome = server
         .apply_raw_settings(RawWorkspaceSettings::default(), baseline_settings())
         .await;
 
-    assert_no_reload_work(&outcome, server, &uri);
+    assert_no_reload_work(&outcome, server, &uri, generation);
     client.abort();
 }
 
@@ -191,15 +207,16 @@ async fn reload_changing_language_servers_reparses() {
         .apply_raw_settings(RawWorkspaceSettings::default(), next)
         .await;
 
-    assert!(
-        outcome.reparse_uris.contains(&uri),
-        "a new server must get the eager opens the reparse loop drives"
-    );
+    // A new server must get the eager opens the reparse loop drives.
+    assert_full_reload_work(&outcome, &uri);
     client.abort();
 }
 
+/// Capture mappings change no tree, but every semantic-tokens computation
+/// reads them, and only a language reload's generation bump makes cached
+/// tokens stale.
 #[tokio::test]
-async fn reload_changing_only_capture_mappings_refreshes_without_reparsing() {
+async fn reload_changing_capture_mappings_reparses_and_refreshes() {
     let (service, client) = server_with_builtin_rust();
     let server = service.inner();
     server
@@ -218,22 +235,7 @@ async fn reload_changing_only_capture_mappings_refreshes_without_reparsing() {
         .apply_raw_settings(RawWorkspaceSettings::default(), next)
         .await;
 
-    assert!(
-        outcome.reparse_uris.is_empty(),
-        "capture mappings do not affect trees, got {:?}",
-        outcome.reparse_uris
-    );
-    assert!(
-        outcome.semantic_refresh_requested,
-        "capture mappings change the tokens, so the client must re-request them"
-    );
-    assert!(
-        server
-            .documents
-            .get(&uri)
-            .is_some_and(|document| document.has_current_tree()),
-        "the open document must keep its tree"
-    );
+    assert_full_reload_work(&outcome, &uri);
     client.abort();
 }
 
@@ -299,11 +301,12 @@ async fn identical_reload_tracks_edits_to_a_discovered_language_query() {
         .await;
     let uri = open_and_wait_for_tree(server, "discovered.lua", "lua").await;
     assert!(server.language.has_queries("lua"));
+    let generation = server.cache.semantic_token_generation();
 
     let unchanged = server
         .apply_raw_settings(RawWorkspaceSettings::default(), settings.clone())
         .await;
-    assert_no_reload_work(&unchanged, server, &uri);
+    assert_no_reload_work(&unchanged, server, &uri, generation);
 
     write_lua_highlights(
         search_path.path(),
