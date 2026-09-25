@@ -2111,6 +2111,27 @@ mod tests {
         assert!(request.await.unwrap().title.starts_with("resolved"));
     }
 
+    /// A legacy or client-modified envelope without a virtual identity keeps
+    /// the pre-routing host-URI fallback (see `get_or_create_virtual_connection`):
+    /// no virtual document can be named for it, so it is sent ungated rather
+    /// than asserting on an empty region or dropping a resolve main sent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn virtual_code_action_resolve_without_identity_keeps_the_fallback() {
+        use crate::lsp::bridge::test_helpers::wait_for_sent_request;
+        let (pool, handle, mut envelope, _virtual_uri, config) = virtual_resolve_fixture().await;
+        envelope.region_id = String::new();
+        envelope.injection_language = String::new();
+
+        let upstream_id = UpstreamId::Number(83);
+        let request = spawn_virtual_resolve(&pool, &envelope, &config, &upstream_id);
+        let downstream_id = wait_for_sent_request(&handle, &upstream_id).await;
+        let _ = handle.router().route(json!({
+            "jsonrpc": "2.0", "id": downstream_id.as_i64(), "result": {"title": "resolved"}
+        }));
+        assert!(request.await.unwrap().title.starts_with("resolved"));
+    }
+
     /// A settled barrier does not prove THIS document is open: a re-open that
     /// failed is retired by its first waiter, and later waiters see nothing
     /// outstanding. The resolve must still not reach a process that never
