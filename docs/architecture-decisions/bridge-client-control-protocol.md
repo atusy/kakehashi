@@ -568,9 +568,11 @@ and their waits (ls-bridge-graceful-shutdown § Unconfirmed Termination).
   before the respawn — otherwise the replacement's handshake would find
   nothing to claim. The replacement then re-opens whichever currently open
   documents belong to it, per respawn-reopen-derives-its-targets. Only the `workspace/executeCommand`
-  routes wait on the re-open barrier (execute-command-routing-token, fail-soft
-  if unsettled); other request paths open their own documents and do not
-  wait. Restoration is therefore an observable catch-up window: `restart`
+  routes (execute-command-routing-token) and the virtual-layer
+  `codeAction/resolve` and `completionItem/resolve` paths wait on the re-open
+  barrier (fail-soft if unsettled), because they carry references to documents
+  they cannot open themselves; other request paths open their own documents
+  and do not wait. Restoration is therefore an observable catch-up window: `restart`
   resolves at verified `Ready` (the completion transition above), the re-open
   sweep runs after it, `documents` may briefly under-report, and a
   pass-through request racing the sweep is — like all pass-through — the
