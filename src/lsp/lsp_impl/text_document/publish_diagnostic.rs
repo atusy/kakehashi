@@ -59,11 +59,11 @@ pub(crate) struct DiagnosticSnapshot {
     /// when `host` is `None`.
     pub(crate) host_pull_enabled: bool,
     /// Whether pending geometry or configuration excluded a pull-eligible
-    /// layer from this snapshot. The editor's own `textDocument/diagnostic` fan-out does not
-    /// honor `pullFallback` (it is a proactive-cache policy), so when this is
-    /// set, a pull built from this snapshot covers LESS than the editor's
-    /// re-pull would — the forwarded-refresh prefetch must then keep its
-    /// forced editor nudge instead of standing in for it.
+    /// layer from this snapshot. The editor's own `textDocument/diagnostic`
+    /// fan-out does not honor `pullFallback` (it is a proactive-cache policy),
+    /// so when this is set, a pull built from this snapshot covers LESS than
+    /// the editor's re-pull would — the forwarded-refresh prefetch must then
+    /// keep its forced editor nudge instead of standing in for it.
     pub(crate) narrower_than_editor_pull: bool,
     /// Cross-layer combine config for `textDocument/publishDiagnostics`.
     pub(crate) layer_cfg: ResolvedLayerConfig,
