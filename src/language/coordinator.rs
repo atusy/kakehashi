@@ -121,6 +121,10 @@ pub(crate) struct LanguageCoordinator {
     /// alive; dead entries are pruned on each settings load. Shared with
     /// [`Self::scratch_sharing_caches`] copies.
     compiled_queries: Arc<Mutex<CompiledQueries>>,
+    /// Set on a [`Self::scratch_sharing_caches`] copy: its load is a trial
+    /// whose events are discarded, so it must not log what the live load
+    /// will report itself.
+    is_trial: bool,
 }
 
 type CompiledQueries = HashMap<(Language, String), std::sync::Weak<tree_sitter::Query>>;
@@ -175,6 +179,7 @@ impl LanguageCoordinator {
             config_warnings: RwLock::new(Vec::new()),
             load_inflight: dashmap::DashMap::new(),
             compiled_queries: Arc::new(Mutex::new(HashMap::new())),
+            is_trial: false,
         }
     }
 
@@ -557,6 +562,7 @@ impl LanguageCoordinator {
         let scratch = Self {
             parser_loader: Arc::clone(&self.parser_loader),
             compiled_queries: Arc::clone(&self.compiled_queries),
+            is_trial: true,
             ..Self::new()
         };
         for language_id in self.language_registry.language_ids() {
@@ -921,7 +927,9 @@ impl LanguageCoordinator {
             if let Some(aliases) = &config.aliases {
                 let message =
                     crate::config::deprecation::aliases_deprecation_notice(lang_name, aliases);
-                log::warn!(target: "kakehashi::config", "{message}");
+                if !self.is_trial {
+                    log::warn!(target: "kakehashi::config", "{message}");
+                }
                 config_warnings.push(message);
             }
         }
