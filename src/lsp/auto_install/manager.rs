@@ -184,8 +184,8 @@ struct QueryDependencyChecks {
     /// because a generation that reparses nothing (a post-install reload)
     /// retries nothing.
     awaiting_retry: HashSet<String>,
-    /// Bumped by every recorded failure: a check's answer ends a wait only
-    /// when no failure landed since the check began.
+    /// Bumped by every recorded failure and deferred repair: a check's
+    /// answer ends a wait only when none landed since the check began.
     failure_revision: u64,
 }
 
@@ -360,12 +360,15 @@ impl AutoInstallManager {
 
     /// A repair judged needed that never ran (its document went away before
     /// the install started) is work still waiting for a retry.
+    /// Like a failure, it is newer than any answer from a check already
+    /// running, so it bumps the revision too.
     pub(crate) fn defer_query_repair_retry(&self, language: &str) {
-        self.query_dependency_checks
+        let mut checked = self
+            .query_dependency_checks
             .lock()
-            .recover_poison("AutoInstallManager::defer_query_repair_retry")
-            .awaiting_retry
-            .insert(language.to_string());
+            .recover_poison("AutoInstallManager::defer_query_repair_retry");
+        checked.awaiting_retry.insert(language.to_string());
+        checked.failure_revision += 1;
     }
 
     /// Whether a failed query repair has not been answered for since. A
@@ -1108,8 +1111,11 @@ mod tests {
         manager.resolve_query_repair_retry("lua", manager.query_repair_revision());
         assert!(!manager.has_query_repairs_awaiting_retry());
 
-        // A repair judged needed but dropped before it ran still waits.
+        // A repair judged needed but dropped before it ran still waits, even
+        // against an answer from a check that began before the deferral.
+        let revision = manager.query_repair_revision();
         manager.defer_query_repair_retry("python");
+        manager.resolve_query_repair_retry("python", revision);
         assert!(manager.has_query_repairs_awaiting_retry());
     }
 
