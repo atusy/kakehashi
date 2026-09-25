@@ -497,6 +497,15 @@ impl InstallCoordinator {
         }
         let search_paths = query_dependency_paths(&self.settings_manager.load_settings(), language);
         let mut result = self.auto_install.try_install(language, search_paths).await;
+        // Recorded for any owned failure, not only a repair's: waiters
+        // repairing through this claim rely on it, and the memo only gates
+        // query-repair decisions. Before the first await below: a caller
+        // cancelled there still publishes the failure to waiters (dropping
+        // the result does), and must not lose its wait for a retry.
+        if result.outcome.is_failure() {
+            self.auto_install
+                .record_query_repair_failure(language, generation);
+        }
 
         self.dispatch_install_events(language, &result.events).await;
 
@@ -645,13 +654,6 @@ impl InstallCoordinator {
                 .await;
             }
         } else {
-            // Recorded for any owned failure, not only a repair's: waiters
-            // repairing through this claim rely on it, and the memo only
-            // gates query-repair decisions.
-            if result.outcome.is_failure() {
-                self.auto_install
-                    .record_query_repair_failure(language, generation);
-            }
             result.complete_claim();
         }
         InstallCompletion {
