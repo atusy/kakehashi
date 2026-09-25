@@ -1655,4 +1655,32 @@ mod tests {
         let parsed = parse_text_with_deadline(&mut parser, &text, None, future, None);
         assert!(parsed.is_some(), "a live deadline parses normally");
     }
+
+    /// The reparse a settings reload schedules must never leave the reload
+    /// placeholder standing, even when it produces no tree: readers that
+    /// settle for the reparse would otherwise wait out their deadline on
+    /// every request until the next edit.
+    #[tokio::test]
+    async fn a_tree_less_reload_reparse_resolves_the_placeholder() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///test/no-language.unknown-923").unwrap();
+        server
+            .documents
+            .insert(uri.clone(), "plain text".into(), None, None);
+        server.documents.invalidate_all_parses();
+        let placeholder = server.documents.latest_snapshot(&uri).unwrap();
+        assert!(placeholder.slot.snapshot.unwrap().awaiting_reparse);
+
+        server.parse_coordinator().reparse_latest(&uri, None).await;
+
+        let view = server.documents.latest_snapshot(&uri).unwrap();
+        let held = view.slot.snapshot.expect("the reparse publishes");
+        assert!(
+            !held.awaiting_reparse,
+            "the placeholder outlived its reparse"
+        );
+        assert!(held.tree.is_none());
+        assert_eq!(held.parsed_version, view.content_version);
+    }
 }
