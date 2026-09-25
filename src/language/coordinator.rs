@@ -136,9 +136,11 @@ pub(crate) struct LanguageCoordinator {
     /// On-demand loads between reading their files and publishing (see
     /// [`DynamicLoadInFlight`]).
     dynamic_loads_in_flight: std::sync::atomic::AtomicUsize,
-    /// Query files that failed to load or compiled with skipped patterns —
-    /// every problem a load warns about. Read on a trial's scratch copy.
-    query_problems: std::sync::atomic::AtomicUsize,
+    /// Parser libraries that exist but failed to load, and query files that
+    /// failed to load or compiled with skipped patterns — the file problems a
+    /// load warns about (a parser that is simply missing is not one). Read
+    /// on a trial's scratch copy.
+    load_problems: std::sync::atomic::AtomicUsize,
 }
 
 /// Counts one on-demand load in [`LanguageCoordinator::dynamic_loads_in_flight`]
@@ -235,7 +237,7 @@ impl LanguageCoordinator {
             is_trial: false,
             trial_queries: Mutex::new(Vec::new()),
             dynamic_loads_in_flight: std::sync::atomic::AtomicUsize::new(0),
-            query_problems: std::sync::atomic::AtomicUsize::new(0),
+            load_problems: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -626,14 +628,14 @@ impl LanguageCoordinator {
             }
         }
         let trial = scratch.language_state(Some(scratch_generation));
-        // A broken query file compiles to the same (absent or partial) query
-        // however it is broken, so identity cannot tell a newly broken file
-        // from an old one. Reload whenever the files have problems, as every
-        // configuration push did before the skip existed: that is the only
-        // way their warnings reach the user.
+        // A broken parser or query file loads to the same (absent or partial)
+        // result however it is broken, so identity cannot tell a newly broken
+        // file from an old one. Reload whenever the files have problems, as
+        // every configuration push did before the skip existed: that is the
+        // only way their warnings reach the user.
         let changed = current != trial
             || scratch
-                .query_problems
+                .load_problems
                 .load(std::sync::atomic::Ordering::Relaxed)
                 > 0;
         *self
@@ -1235,6 +1237,11 @@ impl LanguageCoordinator {
             match result {
                 Ok(lang) => lang,
                 Err(err) => {
+                    // A configured parser path that does not exist yet is a
+                    // missing parser, not a broken one.
+                    if lib_path.exists() {
+                        self.note_load_problem();
+                    }
                     return Err(LanguageLoadResult::failure_with(LanguageEvent::log(
                         LanguageLogLevel::Error,
                         format!(
@@ -1301,7 +1308,7 @@ impl LanguageCoordinator {
                 return;
             }
             Err(err) => {
-                self.note_query_problem();
+                self.note_load_problem();
                 events.push(LanguageEvent::log(
                     LanguageLogLevel::Warning,
                     format!(
@@ -1336,7 +1343,7 @@ impl LanguageCoordinator {
         let result = match QueryLoader::load_content_from_paths(paths) {
             Ok(source) => self.compile_query(language, source, paths.len() > 1),
             Err(err) => {
-                self.note_query_problem();
+                self.note_load_problem();
                 events.push(LanguageEvent::log(
                     LanguageLogLevel::Error,
                     format!(
@@ -1421,8 +1428,8 @@ impl LanguageCoordinator {
             .retain(|_, (query, _)| query.strong_count() > 0);
     }
 
-    fn note_query_problem(&self) {
-        self.query_problems
+    fn note_load_problem(&self) {
+        self.load_problems
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -1436,7 +1443,7 @@ impl LanguageCoordinator {
         insert_fn: impl FnOnce(&QueryStore, Arc<tree_sitter::Query>),
     ) {
         if !result.skipped.is_empty() || result.query.is_none() {
-            self.note_query_problem();
+            self.note_load_problem();
         }
         // Log warnings for skipped patterns
         for skipped in &result.skipped {
@@ -3990,6 +3997,33 @@ mod tests {
         assert!(
             !coordinator.ensure_language_loaded("dynamic").success,
             "a prior-generation dynamic entry must not bypass current search-path resolution"
+        );
+    }
+
+    /// A parser library that exists but fails to load registers nothing,
+    /// like a missing one; only its error shows the difference, so a trial
+    /// meeting one must reload.
+    #[test]
+    fn reload_trial_reports_a_change_while_a_parser_library_is_broken() {
+        let dir = tempdir().unwrap();
+        let settings = WorkspaceSettings {
+            languages: HashMap::from([(
+                "broken".to_string(),
+                LanguageSettings {
+                    parser: Some(dir.path().join("broken.so").to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let coordinator = LanguageCoordinator::new();
+        coordinator.load_settings(&settings);
+        assert!(!coordinator.reload_would_change_languages(&settings));
+
+        fs::write(dir.path().join("broken.so"), b"not a library").unwrap();
+        assert!(
+            coordinator.reload_would_change_languages(&settings),
+            "an unloadable parser library must keep surfacing its error"
         );
     }
 
