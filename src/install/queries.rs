@@ -1090,8 +1090,8 @@ fn discard_backup(published: &PublishedQueryDir) {
     discard_backup_dir(backup);
 }
 
-/// Remove a backup directory and, once it is confirmed gone, the sidecar that
-/// marks it as ours.
+/// Remove a backup (a directory, or whatever shape sat in the slot) and, once
+/// it is confirmed gone, the sidecar that marks it as ours.
 ///
 /// The sidecar outlives a removal that *failed*: every collector — uninstall,
 /// the recovery sweep, `newest_complete_backup_dir` — gates on it, so dropping
@@ -1515,7 +1515,7 @@ pub fn recover_interrupted_query_installs(queries_parent: &Path) -> Result<(), Q
 pub struct QueryRemoval {
     pub removed_queries: bool,
     pub removed_backups: bool,
-    /// Whether the language's query directory is gone — removed by this call or
+    /// Whether the language's query entry is gone — removed by this call or
     /// already absent when it started. Distinct from `removed_queries`, which
     /// only says whether *this* call did the removing: a caller deciding
     /// whether it may now remove the parser needs the state, not the action.
@@ -1580,7 +1580,7 @@ fn remove_query_install_and_backups_inner(
     // discovery saw: a shape decided earlier is a statement about what the
     // path WAS.
     removal.removed_queries = remove_entry_tolerating_vanished(&queries_dir)?;
-    // Either branch of that call leaves the directory gone; anything else
+    // Every branch of that call leaves the entry gone; anything else
     // returned an error above.
     removal.queries_absent = true;
 
@@ -1601,9 +1601,9 @@ fn remove_query_install_and_backups_inner(
             let ownership = backup_ownership_sidecar(&path);
             // Same NotFound tolerance as the canonical entry above: a backup
             // deleted externally after enumeration is already the end state.
-            let removed_dir = remove_entry_tolerating_vanished(&path)?;
+            let removed_backup = remove_entry_tolerating_vanished(&path)?;
             // The sidecar is a kakehashi-owned artifact too: deleting it
-            // counts as removal even when the dir itself vanished first —
+            // counts as removal even when the backup itself vanished first —
             // and, like every other I/O in this loop, only NotFound is
             // tolerated (an unremovable marker must fail the uninstall, not
             // linger behind a success report).
@@ -1612,7 +1612,7 @@ fn remove_query_install_and_backups_inner(
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
                 Err(e) => return Err(QueryInstallError::IoError(e)),
             };
-            if removed_dir || removed_sidecar {
+            if removed_backup || removed_sidecar {
                 removal.removed_backups = true;
             }
         }
