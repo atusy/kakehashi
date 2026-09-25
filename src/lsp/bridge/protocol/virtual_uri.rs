@@ -54,6 +54,13 @@ impl PartialEq for VirtualDocumentUri {
 impl Eq for VirtualDocumentUri {}
 
 impl VirtualDocumentUri {
+    /// Whether `language` and `region_id` satisfy [`Self::new`]'s invariants.
+    /// Identities that round-trip through the client (resolve envelopes) are
+    /// untrusted and must be checked before being turned into a URI.
+    pub(crate) fn is_valid_identity(language: &str, region_id: &str) -> bool {
+        !language.is_empty() && !region_id.is_empty() && !region_id.contains('.')
+    }
+
     /// Build a virtual document URI for an injection region.
     ///
     /// `language` and `region_id` must be non-empty, and `region_id` must be

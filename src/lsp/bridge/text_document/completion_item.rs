@@ -311,26 +311,31 @@ impl LanguageServerPool {
         // A just-replaced origin re-opens its virtual documents asynchronously
         // after `Ready`; until then the send below finds the document not open
         // and gives up. Checked BEFORE `document` waits for the parse and takes
-        // the host edit lock, so a wait never holds up edits.
-        let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(&host_uri) else {
-            re_envelope_item(&mut item, &envelope);
-            return item;
-        };
-        let virtual_uri = VirtualDocumentUri::new(
-            &host_uri_lsp,
-            &envelope.injection_language,
-            &envelope.region_id,
-        );
-        if !self
-            .resolve_document_ready(
-                "completionItem/resolve",
-                handle.key(),
-                ResolveDocument::Virtual(&virtual_uri),
-            )
-            .await
+        // the host edit lock, so a wait never holds up edits. An envelope with
+        // no valid virtual identity names no document to wait for; the
+        // geometry check behind `document` rejects it.
+        if VirtualDocumentUri::is_valid_identity(&envelope.injection_language, &envelope.region_id)
         {
-            re_envelope_item(&mut item, &envelope);
-            return item;
+            let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(&host_uri) else {
+                re_envelope_item(&mut item, &envelope);
+                return item;
+            };
+            let virtual_uri = VirtualDocumentUri::new(
+                &host_uri_lsp,
+                &envelope.injection_language,
+                &envelope.region_id,
+            );
+            if !self
+                .resolve_document_ready(
+                    "completionItem/resolve",
+                    handle.key(),
+                    ResolveDocument::Virtual(&virtual_uri),
+                )
+                .await
+            {
+                re_envelope_item(&mut item, &envelope);
+                return item;
+            }
         }
 
         let Some(document) = document.await else {
