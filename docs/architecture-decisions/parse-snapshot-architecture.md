@@ -114,7 +114,9 @@ remain until their callers migrate. The contracts are distinct:
   from the pre-first-parse `None` — is `resolved && !has_tree`; it advances
   `parsed_version` and releases first-parse waiters (who then fall through to their
   empty / `null` / `ContentModified` paths), which the old boolean `has_tree` could
-  not express.
+  not express. The reload placeholder alone carries `awaiting_reparse`: it is not a
+  parse result, so the explicit-action waits keep waiting past it for the reparse,
+  while a completed tree-less parse is a final answer.
 - `parsed_version` is the document content version consumed by the parse;
   `current_incarnation` is the per-lifetime guard. The separately retained
   watermark tracks ingress writer tickets, which are not content versions.
@@ -142,13 +144,17 @@ check-then-act rather than a cross-map TOCTOU against `Document.incarnation`):
 >    `snapshot.parsed_version > slot.snapshot.parsed_version` and the incoming
 >    snapshot is not a tree **downgrade** (`Some` -> `None`) **or**
 >    `snapshot.parsed_version == slot.snapshot.parsed_version` and the incoming
->    snapshot is a tree **upgrade** (`None` -> `Some`).
+>    snapshot is a tree **upgrade** (`None` -> `Some`) or a parse result
+>    **resolving** a reload placeholder (`awaiting_reparse` -> not).
 >
 > The bootstrap case relaxes only the version compare (clause 2), never the
 > incarnation check (clause 1). The equal-version arm is what lets a reparse
 > attach its tree over a same-version tree-less publish — the reload placeholder
 > and the give-up snapshot both depend on it — without which strict `>` alone
-> would strand those documents tree-less until the next edit. Region completion
+> would strand those documents tree-less until the next edit. The resolving arm
+does the same for a reparse that produces no tree: it replaces the placeholder
+with the completed tree-less outcome, so no reader keeps waiting on a reparse
+that has already finished. Region completion
 > does not use this general admission rule: an equal-version replacement stays
 > rejected even if it carries a clone of the tree already published.
 
@@ -807,7 +813,8 @@ bridge/formatting/node families staleness-reject (`ContentModified`, or the
 protocol-appropriate `null`); `formatting`, `rangeFormatting`, and
 `selectionRange` take the explicit-action bounded wait (the two formatting
 verbs share the treatment as well as the `textDocument/formatting`
-configuration key); and **every** reader inline-parse fallback is
+configuration key), which also waits past a settings reload's placeholder for
+its reparse; and **every** reader inline-parse fallback is
 removed — `get_tree_with_wait`, `wait_for_epoch`, and the on-demand parse in
 `ensure_document_parsed` are gone, closing the resurrection vector.
 
