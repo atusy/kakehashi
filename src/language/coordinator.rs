@@ -15,6 +15,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use tree_sitter::Language;
 
+/// How many failed language loads survive a settings load for the reload
+/// trial to re-read (see `LanguageCoordinator::load_settings`).
+const MAX_REMEMBERED_FAILED_LOADS: usize = 256;
+
 /// Maximum length (in characters) for pattern previews in log messages.
 const MAX_PREVIEW_LEN: usize = 60;
 
@@ -531,6 +535,12 @@ impl LanguageCoordinator {
                 .recover_poison("LanguageCoordinator::load_settings(generation)");
             self.load_generation
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+        // Bound the remembered failures: every one is re-read by each reload
+        // trial, and names can come from document text (code-fence info
+        // strings). Past the bound, forget them all, as every load used to.
+        if self.failed_loads.len() > MAX_REMEMBERED_FAILED_LOADS {
+            self.failed_loads.clear();
         }
         self.configured_load_failures.clear();
 
