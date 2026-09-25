@@ -126,6 +126,13 @@ pub(crate) struct LanguageCoordinator {
     /// logs directly (deprecated `aliases`) out of the log; the query
     /// loader's rare pattern-split and combination warnings still fire.
     is_trial: bool,
+    /// The queries the latest [`Self::reload_would_change_languages`] trial
+    /// published into the compiled-query cache, held until the next trial.
+    /// The cache keeps only `Weak`s and the scratch coordinator that owned
+    /// them is gone, so without this a reload the trial calls for — the live
+    /// one for configured languages, the next on-demand load for discovered
+    /// ones — would compile the same text again.
+    trial_queries: Mutex<Vec<Arc<tree_sitter::Query>>>,
 }
 
 /// Published query per (grammar, complete source text), with the patterns
@@ -137,17 +144,6 @@ type CompiledQueries = HashMap<
         Vec<super::query_loader::SkippedPattern>,
     ),
 >;
-
-/// Outcome of [`LanguageCoordinator::reload_would_change_languages`].
-pub(crate) struct ReloadTrial {
-    /// Whether the reload would change any language documents see.
-    pub(crate) changed: bool,
-    /// The queries the trial published into the shared compiled-query cache,
-    /// held so the live reload a change calls for reuses them instead of
-    /// compiling the same text again: the cache keeps only `Weak`s, and the
-    /// scratch coordinator that owned them is gone.
-    _compiled: Vec<Arc<tree_sitter::Query>>,
-}
 
 /// A query compiled (or reused) for one grammar and source text.
 struct CompiledQuery {
@@ -208,6 +204,7 @@ impl LanguageCoordinator {
             load_inflight: dashmap::DashMap::new(),
             compiled_queries: Arc::new(Mutex::new(HashMap::new())),
             is_trial: false,
+            trial_queries: Mutex::new(Vec::new()),
         }
     }
 
@@ -553,10 +550,7 @@ impl LanguageCoordinator {
     /// demand. The live registrations, generation and query store stay as
     /// they are, so a caller that finds nothing changed can skip the reload
     /// entirely. Blocking: reads files and compiles queries.
-    pub(crate) fn reload_would_change_languages(
-        &self,
-        settings: &WorkspaceSettings,
-    ) -> ReloadTrial {
+    pub(crate) fn reload_would_change_languages(&self, settings: &WorkspaceSettings) -> bool {
         // Snapshot before the trial: the held `Arc`s keep every currently
         // published query interned, so an unchanged re-read resolves to it.
         // Every registration and every recorded failure counts, whatever
@@ -584,13 +578,15 @@ impl LanguageCoordinator {
             }
         }
         let trial = scratch.language_state(Some(scratch_generation));
-        ReloadTrial {
-            changed: current != trial,
-            _compiled: trial
-                .into_values()
-                .flat_map(|loaded| loaded.queries.into_iter().flatten())
-                .collect(),
-        }
+        let changed = current != trial;
+        *self
+            .trial_queries
+            .lock()
+            .recover_poison("LanguageCoordinator::reload_would_change_languages") = trial
+            .into_values()
+            .flat_map(|loaded| loaded.queries.into_iter().flatten())
+            .collect();
+        changed
     }
 
     /// A fresh coordinator sharing this one's grammar and compiled-query
@@ -3947,16 +3943,14 @@ mod tests {
         assert!(!coordinator.has_parser_available("dynamic"));
 
         assert!(
-            coordinator
-                .reload_would_change_languages(&WorkspaceSettings::default())
-                .changed,
+            coordinator.reload_would_change_languages(&WorkspaceSettings::default()),
             "the stale registration no longer resolves, so a reload changes it"
         );
     }
 
-    /// A trial that finds an edited query compiles the new text; holding
-    /// the trial across the live reload lets that reload reuse the query
-    /// instead of compiling the same text a second time.
+    /// A trial that finds an edited query compiles the new text; the
+    /// coordinator holds it so the live reload reuses the query instead of
+    /// compiling the same text a second time.
     #[test]
     fn live_reload_reuses_the_queries_a_held_trial_compiled() {
         let dir = tempdir().unwrap();
@@ -3980,24 +3974,86 @@ mod tests {
             ..Default::default()
         };
         coordinator.load_settings(&settings);
-        assert!(!coordinator.reload_would_change_languages(&settings).changed);
+        assert!(!coordinator.reload_would_change_languages(&settings));
 
         fs::write(
             &query_path,
             "(identifier) @variable\n(string_literal) @string\n",
         )
         .unwrap();
-        let trial = coordinator.reload_would_change_languages(&settings);
-        assert!(trial.changed);
+        assert!(coordinator.reload_would_change_languages(&settings));
+        let trial_compiled: Vec<_> = coordinator.trial_queries.lock().unwrap().clone();
         coordinator.load_settings(&settings);
 
         let live = coordinator.highlight_query("rust").unwrap();
         assert!(
-            trial
-                ._compiled
-                .iter()
-                .any(|query| Arc::ptr_eq(query, &live)),
+            trial_compiled.iter().any(|query| Arc::ptr_eq(query, &live)),
             "the live reload must reuse the query the trial compiled"
+        );
+    }
+
+    /// A discovered language is not reloaded by the live settings load but
+    /// by the next on-demand load, which must still reuse what the trial
+    /// compiled rather than compile the edited text again.
+    #[test]
+    fn on_demand_reload_reuses_the_queries_the_trial_compiled() {
+        let grammars = std::env::var("TREE_SITTER_GRAMMARS").unwrap_or_else(|_| {
+            std::env::current_dir()
+                .unwrap()
+                .join("deps/tree-sitter")
+                .to_string_lossy()
+                .into_owned()
+        });
+        let parser = Path::new(&grammars)
+            .join("parser")
+            .join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+        if !parser.exists() {
+            eprintln!("skipping: lua parser not built");
+            return;
+        }
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("parser")).unwrap();
+        fs::copy(
+            &parser,
+            dir.path()
+                .join("parser")
+                .join(format!("lua.{}", std::env::consts::DLL_EXTENSION)),
+        )
+        .unwrap();
+        let highlights = dir
+            .path()
+            .join("queries")
+            .join("lua")
+            .join("highlights.scm");
+        fs::create_dir_all(highlights.parent().unwrap()).unwrap();
+        fs::write(&highlights, "(identifier) @variable\n").unwrap();
+        let settings = WorkspaceSettings {
+            search_paths: vec![dir.path().to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        let coordinator = LanguageCoordinator::new();
+        coordinator.load_settings(&settings);
+        assert!(coordinator.ensure_language_loaded("lua").success);
+
+        fs::write(&highlights, "(identifier) @variable\n(string) @string\n").unwrap();
+        assert!(coordinator.reload_would_change_languages(&settings));
+        let trial_compiled: Vec<_> = coordinator
+            .trial_queries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(Arc::downgrade)
+            .collect();
+        coordinator.load_settings(&settings);
+        assert!(coordinator.ensure_language_loaded("lua").success);
+
+        let live = coordinator.highlight_query("lua").unwrap();
+        assert!(
+            trial_compiled
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+                .any(|query| Arc::ptr_eq(&query, &live)),
+            "the on-demand reload must reuse the query the trial compiled"
         );
     }
 
