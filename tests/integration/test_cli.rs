@@ -2255,8 +2255,8 @@ fn run_forced_uninstall(data_dir: &std::path::Path, args: &[&str]) -> (bool, Str
     (output.status.success(), combined)
 }
 
-/// A non-directory at `queries/<lang>` sits in the slot install owns — install
-/// moves whatever is there aside — so uninstall must be able to take it back.
+/// A non-directory at `queries/<lang>` occupies a name kakehashi owns — a
+/// publish moves such an entry aside — so uninstall must be able to take it.
 /// It used to fail on it forever by name (`remove_dir_all` cannot take a file)
 /// and not see it at all under `--all`, which then claimed nothing was there.
 #[test]
@@ -2444,9 +2444,9 @@ fn test_language_uninstall_unlinks_a_query_symlink_without_touching_its_target()
     );
 }
 
-/// The parser slot answers the same way as the query slot: install's rename
-/// replaces any non-directory at `parser/<lang>.<ext>`, so uninstall takes one
-/// back rather than walking past it and calling the language absent.
+/// The parser slot answers the same way as the query slot: a non-directory at
+/// `parser/<lang>.<ext>` occupies a name kakehashi owns, so uninstall takes it
+/// rather than walking past it and calling the language absent.
 #[test]
 #[cfg(unix)]
 fn test_language_uninstall_removes_special_file_parser_entries() {

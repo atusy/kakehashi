@@ -1112,13 +1112,15 @@ enum ParserEntry {
 /// which can be served from `readdir`'s cached `d_type` and so would report
 /// success on some filesystems and fail on others for an unreadable directory.
 ///
-/// Anything but a directory is removable. The slot is kakehashi's whatever
-/// occupies it: install publishes by `rename`, which replaces any non-directory
-/// there — a regular file, a hand-pointed symlink, a FIFO or a socket alike —
-/// so uninstall takes back the same set, with an `unlink` that neither opens
-/// the entry (a FIFO cannot block it) nor follows it. The queries slot answers
-/// the same way (#1006). A directory is [`WrongShape`]: `remove_file` cannot
-/// take one, and #828 settled that it is not an installed parser.
+/// Anything but a directory is removable. The name `parser/<lang>.<ext>` is
+/// kakehashi's — install publishes there — so uninstall clears whatever shape
+/// occupies it, as long as it can do so without opening or following the
+/// entry: a regular file, a hand-pointed symlink, a FIFO or a socket alike.
+/// `remove_parser_entry` takes each with `unlink` (or, for a Windows directory
+/// link, `RemoveDirectoryW`), neither of which opens the entry, so a FIFO
+/// cannot block it. The queries slot answers the same way (#1006). A directory
+/// is [`WrongShape`]: `remove_file` cannot take one, and #828 settled that it
+/// is not an installed parser.
 ///
 /// [`WrongShape`]: ParserEntry::WrongShape
 fn parser_entry_kind(path: &Path) -> std::io::Result<Option<ParserEntry>> {

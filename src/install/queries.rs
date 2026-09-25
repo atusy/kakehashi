@@ -1491,8 +1491,8 @@ pub fn recover_interrupted_query_installs(queries_parent: &Path) -> Result<(), Q
     for entry in entries.flatten() {
         let path = entry.path();
         // A backup is recognised by its generated name, whatever its shape:
-        // install displaces whatever sat in the slot, so a regular file there
-        // makes a regular-file backup. Restoring still takes only a complete
+        // a publish moves an existing slot entry aside, so a regular file
+        // there makes a regular-file backup. Restoring still takes only a complete
         // directory (newest_complete_backup_dir), so this widens collection,
         // not recovery.
         if let Some(language) = backup_language_name(&path) {
@@ -1592,11 +1592,11 @@ fn remove_query_install_and_backups_inner(
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        // Any shape: install displaces whatever sat in the slot, so a backup
+        // Any shape: a publish moves an existing slot entry aside, so a backup
         // is a regular file when a regular file was there. The generated name
         // and the ownership sidecar are what make it ours; the removal
-        // classifies it and propagates a failure to, rather than reading it as
-        // "not a backup" and reporting success over it.
+        // classifies it and propagates a failure to remove it, rather than
+        // reading it as "not a backup" and reporting success over it.
         if generated_backup_matches_language(name, language) && backup_is_owned(&path) {
             let ownership = backup_ownership_sidecar(&path);
             // Same NotFound tolerance as the canonical entry above: a backup
@@ -1658,10 +1658,10 @@ fn remove_entry_tolerating_vanished(path: &Path) -> Result<bool, QueryInstallErr
             remove_symlink_tolerating_vanished(path)
         }
         Ok(metadata) if metadata.is_dir() => remove_dir_all_tolerating_vanished(path),
-        // Anything else — a regular file, FIFO or socket — is still in a slot
-        // install owns: publishing moves whatever is there aside regardless of
-        // its shape. `remove_dir_all` cannot take it, and `unlink` never opens
-        // it, so a FIFO cannot block the removal (#1006).
+        // Anything else — a regular file, FIFO or socket — still occupies a
+        // name kakehashi owns, and a publish moves such an entry aside too.
+        // `remove_dir_all` cannot take it, and `unlink` never opens it, so a
+        // FIFO cannot block the removal (#1006).
         Ok(_) => remove_file_tolerating_vanished(path),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(QueryInstallError::IoError(e)),
@@ -3075,7 +3075,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// Install moves whatever occupies a query slot aside, so a regular file
+    /// A publish moves an existing query-slot entry aside, so a regular file
     /// there becomes a regular-file backup. Discarding it after a successful
     /// publish must take it and its sidecar; `remove_dir_all` alone cannot,
     /// which stranded both with a warning on every such install (#1006).
