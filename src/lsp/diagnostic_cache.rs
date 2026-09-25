@@ -109,6 +109,10 @@ pub(crate) struct SlotEntry {
 }
 
 impl SlotEntry {
+    /// `(virtual, host)` layers this pull-layer slot covers. Only meaningful on
+    /// the [`DiagnosticSource::PullLayer`] slot. A component-less pull slot comes
+    /// only from the `#[cfg(test)]` writers (`set_pull_layer*`), which model an
+    /// opaque full pull, hence the full-coverage fallback.
     pub(crate) fn pull_coverage(&self) -> (bool, bool) {
         self.pull_components
             .as_ref()
@@ -1313,12 +1317,6 @@ impl DiagnosticAggregator {
         components: PullLayerComponents,
     ) {
         self.update_pull_layer_nudgeless(host, |previous| {
-            // Legacy opaque slots cannot safely separate a pending layer.
-            if components.has_pending()
-                && previous.is_some_and(|slot| slot.pull_components.is_none())
-            {
-                return previous.cloned();
-            }
             let components = components
                 .retain_pending(previous.and_then(|slot| slot.pull_components.as_deref()));
             if components.coverage() == (false, false) {

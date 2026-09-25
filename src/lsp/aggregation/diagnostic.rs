@@ -58,11 +58,6 @@ impl PullLayerComponents {
         }
     }
 
-    pub(crate) fn has_pending(&self) -> bool {
-        matches!(self.virt, PullContribution::Pending)
-            || matches!(self.host, PullContribution::Pending)
-    }
-
     pub(crate) fn coverage(&self) -> (bool, bool) {
         (self.virt.was_pulled(), self.host.was_pulled())
     }
