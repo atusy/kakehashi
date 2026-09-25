@@ -204,8 +204,10 @@ narrows by configuration first.
   dispatch only registered ids.
 - Repair moves off the user-facing request and covers all request paths. The
   ordering barrier is taken by both `workspace/executeCommand` routes (the
-  encoded one and the palette one); other request paths benefit from the repair
-  without waiting on it, since they open their own documents first.
+  encoded one and the palette one), and by `codeAction/resolve` and
+  `completionItem/resolve` when their own document is not yet open (#1132);
+  other request paths benefit from the repair without waiting on it, since
+  they open their own documents first.
 - The "separator in a config key drops this server's commands" failure mode is
   gone; escaping makes the invariant structural.
 - Command names no longer grow with document path length.
