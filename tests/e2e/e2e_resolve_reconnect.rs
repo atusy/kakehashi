@@ -248,17 +248,28 @@ fn e2e_virtual_code_action_resolve_waits_for_reopen_after_replacement() {
 
     // Resolve the carried action again, with no fresh codeAction in between:
     // nothing but the re-open sweep may open the document on the replacement.
-    let mut failed_soft = 0;
+    let mut held = 0;
     let mut resolved = None;
-    // Past the 5 s stall plus a 2 s wait per held attempt, with load slack.
+    // The stall clock starts when the sweep is serviced and each held attempt
+    // waits up to 2 s, so allow well past the 5 s stall for a loaded machine.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     while std::time::Instant::now() < deadline {
+        // Only an attempt that starts once the replacement has initialized can
+        // meet the held re-open; one that hits the dead process fails anyway.
+        let replaced = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.split('\t').next() == Some("initialize"))
+            .count()
+            >= 2;
         let response = client.send_request("codeAction/resolve", old.clone());
         if let Some(text) = response["result"]["edit"]["changes"][URI][0]["newText"].as_str() {
             resolved = Some(text.to_string());
             break;
         }
-        failed_soft += 1;
+        if replaced {
+            held += 1;
+        }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     let wire = std::fs::read_to_string(&log).unwrap_or_default();
@@ -283,7 +294,7 @@ fn e2e_virtual_code_action_resolve_waits_for_reopen_after_replacement() {
     );
     // The stall must have held at least one attempt, else the order above
     // could come from a sweep that simply won the race.
-    assert!(failed_soft > 0, "no attempt met the held re-open:\n{wire}");
+    assert!(held > 0, "no attempt met the held re-open:\n{wire}");
     let new_pid = resolved
         .strip_prefix("resolved-pid:")
         .and_then(|rest| rest.split(';').next())
