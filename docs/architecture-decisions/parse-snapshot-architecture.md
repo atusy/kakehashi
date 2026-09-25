@@ -115,8 +115,9 @@ remain until their callers migrate. The contracts are distinct:
   waiters (who then fall through to their empty / `null` / `ContentModified` paths),
   which the old boolean `has_tree` could not express. A settings-reload placeholder
   reads the same way, but it is not a parse result: it alone carries
-  `awaiting_reparse`, so the explicit-action waits keep waiting past it for the
-  reparse, while a completed tree-less parse is a final answer.
+  `awaiting_reparse`, so `formatting`, `rangeFormatting` and `selectionRange` keep
+  waiting past it for the reparse, while a completed tree-less parse is a final
+  answer.
 - `parsed_version` is the document content version consumed by the parse;
   `current_incarnation` is the per-lifetime guard. The separately retained
   watermark tracks ingress writer tickets, which are not content versions.
