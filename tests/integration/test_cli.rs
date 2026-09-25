@@ -1924,6 +1924,10 @@ fn test_language_uninstall_all_ignores_parser_shaped_directories() {
         "parser-shaped directories must not enter uninstall discovery: {combined}"
     );
     assert!(
+        combined.contains("Note: left") && combined.contains("delete it by hand"),
+        "the directory left behind must be named, with advice: {combined}"
+    );
+    assert!(
         parser_dir.is_dir(),
         "unrelated directory must remain intact"
     );
@@ -3130,8 +3134,10 @@ fn test_language_uninstall_ignores_parser_shaped_directory() {
     // Not an installed parser (#828), but still on disk: the same note
     // `--all` prints for it, so "not installed" is not read as "nothing here".
     assert!(
-        combined.contains("Note: left") && combined.contains(&format!("fakeparser.{ext}")),
-        "the entry left in place must be named: {combined}"
+        combined.contains("Note: left")
+            && combined.contains(&format!("fakeparser.{ext}"))
+            && combined.contains("delete it by hand"),
+        "the entry left in place must be named, with advice: {combined}"
     );
     assert!(
         parser_dir.is_dir(),

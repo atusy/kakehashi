@@ -1094,7 +1094,7 @@ fn find_parser_entry(
 /// The only such shape is a directory, which no install writes, so it is the
 /// user's to judge.
 const WRONG_SHAPE_PARSER_NOTE: &str =
-    "it is a directory, which this CLI never removes; delete it by hand if it is not yours";
+    "it is a directory, which this CLI never removes; delete it by hand if you no longer need it";
 
 /// What a path in `parser/` is, as far as uninstall is concerned.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
