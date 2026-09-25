@@ -29,8 +29,8 @@ pub(crate) enum SnapshotWait {
 }
 
 /// The first-parse backstop shared by every snapshot wait (the token
-/// handlers' `snapshot_for_tokens` and the explicit-action
-/// `wait_for_current_snapshot`): generous on purpose, because it only runs
+/// handlers' `snapshot_for_tokens` and every `wait_for_snapshot_in` caller,
+/// including the explicit-action `wait_for_explicit_action_snapshot`): generous on purpose, because it only runs
 /// while the lifetime has NO snapshot and every open-parse resolution path
 /// publishes one (tree, tree-less give-up, or the didClose sentinel) — the
 /// wait is normally RELEASED by that publish long before this wall-clock
@@ -62,7 +62,8 @@ pub(crate) const FIRST_PARSE_BACKSTOP: std::time::Duration = std::time::Duration
 pub(crate) const TOKEN_SETTLE_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How long an explicit action (formatting / range formatting) waits for a
-/// trailing snapshot to catch up before rejecting with `ContentModified`.
+/// trailing snapshot to catch up before rejecting with `ContentModified`, or
+/// for a reload placeholder's reparse before falling back as `Unparsed`.
 const EXPLICIT_ACTION_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
 impl Kakehashi {
