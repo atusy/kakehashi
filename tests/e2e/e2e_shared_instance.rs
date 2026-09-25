@@ -239,7 +239,7 @@ fn e2e_opt_in_falls_back_to_per_root_when_server_incapable() {
     );
 }
 
-/// The process id a `workspace-folders-dynamic` hover reports.
+/// The process id a `workspace-folders*` hover reports.
 fn hover_pid(folders: &str) -> &str {
     folders
         .split_once(";pid:")
