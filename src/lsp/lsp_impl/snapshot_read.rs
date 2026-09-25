@@ -59,6 +59,10 @@ pub(crate) const FIRST_PARSE_BACKSTOP: std::time::Duration = std::time::Duration
 /// not this.
 pub(crate) const TOKEN_SETTLE_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long an explicit action (formatting / range formatting) waits for a
+/// trailing snapshot to catch up before rejecting with `ContentModified`.
+const EXPLICIT_ACTION_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
 impl Kakehashi {
     /// Resolve one snapshot's whole-document regions. `None` means the
     /// parser/query pair could not be read consistently; `Some(empty)` means
@@ -119,6 +123,15 @@ impl Kakehashi {
         wait: std::time::Duration,
     ) -> SnapshotWait {
         wait_for_current_snapshot_in(&self.documents, uri, wait).await
+    }
+
+    /// The explicit-action bounded wait (parse-snapshot ADR §3) for the
+    /// user-triggered formatting requests: infrequent and consciously
+    /// triggered, so they may briefly wait for the in-flight parse rather
+    /// than silently no-op.
+    pub(crate) async fn wait_for_explicit_action_snapshot(&self, uri: &Url) -> SnapshotWait {
+        self.wait_for_current_snapshot(uri, EXPLICIT_ACTION_WAIT)
+            .await
     }
 
     /// Resolve a **current** snapshot for the position/range readers

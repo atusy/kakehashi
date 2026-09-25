@@ -59,9 +59,8 @@ impl Kakehashi {
         // closures so it applies under every layer-order configuration.
         // Never-parsed/gone falls through to the layers' empty fallbacks.
         if let Ok(wait_uri) = uri_to_url(&lsp_uri)
-            && let crate::lsp::lsp_impl::snapshot_read::SnapshotWait::Stale = self
-                .wait_for_current_snapshot(&wait_uri, std::time::Duration::from_millis(500))
-                .await
+            && let crate::lsp::lsp_impl::snapshot_read::SnapshotWait::Stale =
+                self.wait_for_explicit_action_snapshot(&wait_uri).await
         {
             return Err(crate::error::content_modified_error());
         }
