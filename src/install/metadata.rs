@@ -775,6 +775,11 @@ return {
     }
 
     #[test]
+    fn non_string_field_values_are_skipped() {
+        assert_lua_entry_parses("    url = nil,\n    revision = 42,");
+    }
+
+    #[test]
     fn test_extract_parser_metadata() {
         let content = r#"
   rust = {
