@@ -80,9 +80,9 @@ pub(super) async fn perform_lsp_handshake(
     // (allowed once the response is out) can still land first and be undone
     // here — an accepted residual: withdrawing an id in the same breath as
     // declaring it has no use, and it only keeps the pre-#1117 behavior.
-    if let Some(registration) = static_folder_change_registration(&capabilities) {
-        handle.dynamic_capabilities().register(vec![registration]);
-    }
+    handle
+        .dynamic_capabilities()
+        .record_static_registration(static_folder_change_registration(&capabilities));
 
     // 4. Send initialized notification via the single-writer loop
     let initialized = build_initialized_notification();
