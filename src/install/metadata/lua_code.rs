@@ -266,17 +266,36 @@ fn parse_hex<T: TryFrom<u32>>(digits: &[u8], max: usize) -> Option<T> {
     T::try_from(value).ok()
 }
 
-/// A long string's value: its contents without a first line break. Unlike
-/// Lua, other CR or CR LF line breaks are kept as written rather than
-/// turned into LF; the fields read from parsers.lua are single-line.
+/// A long string's value, as Lua reads it: without a first line break, and
+/// with each other line break (LF, CR, CR LF or LF CR) read as LF.
 fn long_string_value(body: &[u8]) -> String {
-    let body = body
-        .strip_prefix(b"\r\n")
-        .or_else(|| body.strip_prefix(b"\n\r"))
-        .or_else(|| body.strip_prefix(b"\n"))
-        .or_else(|| body.strip_prefix(b"\r"))
-        .unwrap_or(body);
-    String::from_utf8_lossy(body).into_owned()
+    let mut out = Vec::with_capacity(body.len());
+    let mut j = line_break_end(body, 0);
+    while j < body.len() {
+        let end = line_break_end(body, j);
+        if end > j {
+            out.push(b'\n');
+            j = end;
+        } else {
+            out.push(body[j]);
+            j += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Offset past the line break (LF, CR, CR LF or LF CR) at `j`, or `j` if
+/// there is none.
+fn line_break_end(b: &[u8], j: usize) -> usize {
+    match b.get(j) {
+        Some(&c @ (b'\n' | b'\r')) => {
+            let pair = b
+                .get(j + 1)
+                .is_some_and(|&d| d != c && matches!(d, b'\n' | b'\r'));
+            j + 1 + usize::from(pair)
+        }
+        _ => j,
+    }
 }
 
 /// Copy `source`, replacing every character inside `ranges` except
