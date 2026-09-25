@@ -289,4 +289,26 @@ mod tests {
 
         assert!(matches!(result, Ok(None)), "{result:?}");
     }
+
+    /// An edit landing while the request waits on the placeholder makes it
+    /// trailing without waking the wait (edits publish no snapshot): the
+    /// deadline must judge the live state, where the request's coordinates
+    /// may no longer match the text — `ContentModified`, not `null`.
+    #[tokio::test(start_paused = true)]
+    async fn an_edit_during_the_placeholder_wait_is_judged_at_the_deadline() {
+        let uri = Url::parse("file:///edit_during_reload.rs").unwrap();
+        let service = server_with_parsed_doc(&uri);
+        let server = service.inner();
+        server.documents.invalidate_all_parses();
+
+        let edit = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            server
+                .documents
+                .update_document(uri.clone(), format!("{TEXT}\n"), None);
+        };
+        let (result, ()) = tokio::join!(server.selection_range_impl(params(&uri)), edit);
+
+        assert!(result.is_err(), "{result:?}");
+    }
 }
