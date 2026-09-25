@@ -1847,6 +1847,72 @@ mod tests {
         assert!(request.await.unwrap().title.starts_with("resolved"));
     }
 
+    /// A replaced host server gets its host document back only from the
+    /// re-open sweep; a resolve arriving first must wait for it rather than
+    /// find the document "no longer open" and fail.
+    #[tokio::test]
+    async fn host_code_action_resolve_waits_for_the_pending_reopen() {
+        use crate::lsp::bridge::test_helpers::wait_for_sent_request;
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("ruff");
+        let handle = crate::lsp::bridge::test_helpers::create_handle_advertising_resolve_methods(
+            key.clone(),
+        )
+        .await;
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let host_uri = Url::parse("file:///test.lua").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
+        // The replacement's handshake claimed a re-open that has not run yet.
+        let done = pool.claim_reopen_for_test(&key);
+        let envelope = CodeActionEnvelope {
+            origin: "ruff".into(),
+            host_uri: host_uri.to_string(),
+            region_id: String::new(),
+            injection_language: String::new(),
+            incarnation: Some(1),
+            content_version: Some(1),
+            offset: EnvelopeOffset::from(&RegionOffset::new(0, 0)),
+            original_title: "old".into(),
+            inner: None,
+            host_layer: true,
+        };
+        let upstream_id = UpstreamId::Number(78);
+        let mut request = {
+            let pool = Arc::clone(&pool);
+            let upstream_id = upstream_id.clone();
+            tokio::spawn(async move {
+                pool.send_host_code_action_resolve(
+                    &BridgeServerConfig::default(),
+                    CodeAction {
+                        title: "old".into(),
+                        ..Default::default()
+                    },
+                    envelope,
+                    caps_resolve(),
+                    Some(upstream_id),
+                    &super::super::test_helpers::resolve_host_snapshot,
+                )
+                .await
+            })
+        };
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), &mut request)
+                .await
+                .is_err(),
+            "resolve must wait for the outstanding re-open, not give up on it"
+        );
+
+        // The re-open lands: the host document is open on the replacement.
+        super::super::test_helpers::open_resolve_host(&pool, &handle, &host_uri).await;
+        done.send(true).unwrap();
+
+        let downstream_id = wait_for_sent_request(&handle, &upstream_id).await;
+        let _ = handle.router().route(json!({
+            "jsonrpc": "2.0", "id": downstream_id.as_i64(), "result": {"title": "resolved"}
+        }));
+        assert!(request.await.unwrap().title.starts_with("resolved"));
+    }
+
     fn range(start_line: u32, end_line: u32) -> Range {
         Range {
             start: Position {
