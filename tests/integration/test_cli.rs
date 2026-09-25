@@ -3084,6 +3084,12 @@ fn test_language_uninstall_ignores_parser_shaped_directory() {
         combined.contains("Language 'fakeparser' is not installed"),
         "parser-shaped directory must not count as an installed parser: {combined}"
     );
+    // Not an installed parser (#828), but still on disk: the same note
+    // `--all` prints for it, so "not installed" is not read as "nothing here".
+    assert!(
+        combined.contains("Note: left") && combined.contains(&format!("fakeparser.{ext}")),
+        "the entry left in place must be named: {combined}"
+    );
     assert!(
         parser_dir.is_dir(),
         "unrelated directory must remain intact"
