@@ -16,7 +16,8 @@ use super::Kakehashi;
 pub(crate) enum SnapshotWait {
     /// A current snapshot landed within the wait.
     Current(Arc<ParseSnapshot>),
-    /// Deadline passed with only a trailing snapshot — the reader's
+    /// Deadline passed with only a trailing snapshot, or (explicit actions
+    /// only) the text moved on from the one current at entry — the reader's
     /// staleness-reject signal applies (`ContentModified` / `null`).
     Stale,
     /// Deadline passed with no parse of the current text: no snapshot for
@@ -199,6 +200,8 @@ enum ReloadPlaceholder {
     Accept,
     /// It is not a parse: keep waiting (bounded by the settle wait) for the
     /// reparse, and report one still standing at the deadline as `Unparsed`.
+    /// The wait answers only for the text current at entry: an edit landing
+    /// meanwhile reads as `Stale`, even once its own reparse is current.
     AwaitReparse,
 }
 
@@ -218,6 +221,9 @@ async fn wait_for_snapshot_in(
     let stale_deadline = tokio::time::Instant::now() + wait;
     let first_parse_deadline = tokio::time::Instant::now() + FIRST_PARSE_BACKSTOP;
     let mut expired = false;
+    // An explicit action answers for the text it was sent against, so only
+    // it pins the entry lineage; a newer edit during the wait reads stale.
+    let mut request_lineage = None;
     loop {
         // Subscribe BEFORE checking (lost-wakeup guard): `subscribe` marks
         // the current value as seen, so a publish landing between a check
@@ -228,6 +234,12 @@ async fn wait_for_snapshot_in(
         let Some(view) = documents.latest_snapshot(uri) else {
             return SnapshotWait::Gone;
         };
+        if placeholder == ReloadPlaceholder::AwaitReparse {
+            let lineage = (view.slot.current_incarnation, view.content_version);
+            if *request_lineage.get_or_insert(lineage) != lineage {
+                return SnapshotWait::Stale;
+            }
+        }
         let (had_snapshot, awaiting_reparse) = match &view.slot.snapshot {
             Some(snapshot) if snapshot.parsed_version == view.content_version => {
                 if !(snapshot.awaiting_reparse && placeholder == ReloadPlaceholder::AwaitReparse) {
