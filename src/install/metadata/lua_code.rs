@@ -286,3 +286,15 @@ fn blank(source: &str, ranges: &[Range<usize>]) -> String {
     }
     code
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn line_comment_ends_at_a_lone_carriage_return() {
+        let lua = LuaCode::new("-- c\rx = '}'").unwrap();
+
+        assert_eq!(lua.code, "    \rx = ' '");
+    }
+}
