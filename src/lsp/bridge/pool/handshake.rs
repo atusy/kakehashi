@@ -201,7 +201,9 @@ mod tests {
             }))
             .unwrap();
 
-        let (capabilities, _, _) = perform_lsp_handshake(
+        // Capabilities are deliberately not stored: the pool stores them only
+        // after `initialized` is queued, too late for the id to be recorded.
+        perform_lsp_handshake(
             &handle,
             RequestId::new(1),
             response_rx,
@@ -213,10 +215,15 @@ mod tests {
         )
         .await
         .expect("handshake");
-        handle.set_server_capabilities(capabilities);
         assert!(
             handle.supports_workspace_folder_changes(),
             "a static registration id declares folder-change support"
+        );
+        assert!(
+            handle
+                .dynamic_capabilities()
+                .ever_registered("workspace/didChangeWorkspaceFolders"),
+            "the id is a registration like a dynamic one, for the served-root proof"
         );
 
         handle
@@ -228,6 +235,59 @@ mod tests {
         assert!(
             !handle.supports_workspace_folder_changes(),
             "unregistering the static id must withdraw folder-change support"
+        );
+    }
+
+    /// The id is recorded BEFORE `initialized` is queued: a server may
+    /// unregister it as soon as it hears `initialized`, and a later seed would
+    /// resurrect the withdrawn id (#1117). A full outbound queue stops the
+    /// handshake exactly at that send, so only an earlier seed is observed.
+    #[tokio::test]
+    async fn static_change_notifications_id_is_recorded_before_initialized() {
+        let handle = create_handle_with_state(ConnectionState::Initializing).await;
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let respond = async {
+            // Waits for `initialize` to drain, then holds every queue slot so
+            // the `initialized` send finds the queue full.
+            let permits = handle.reserve_outbound_capacity_for_test().await;
+            response_tx
+                .send(serde_json::json!({
+                    "result": {
+                        "capabilities": {
+                            "workspace": {
+                                "workspaceFolders": {
+                                    "supported": true,
+                                    "changeNotifications": "wf-id"
+                                }
+                            }
+                        }
+                    }
+                }))
+                .unwrap();
+            permits
+        };
+        let handshake = perform_lsp_handshake(
+            &handle,
+            RequestId::new(1),
+            response_rx,
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+
+        let (result, _permits) = tokio::join!(handshake, respond);
+
+        assert_eq!(
+            result.expect_err("initialized must not fit").kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(
+            handle
+                .dynamic_capabilities()
+                .has_registration("workspace/didChangeWorkspaceFolders"),
+            "the id must be recorded before initialized is queued"
         );
     }
 }
