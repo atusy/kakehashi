@@ -24,6 +24,13 @@ pub(crate) struct DynamicCapabilityRegistry {
     /// unregistration: some facts outlive the registration that established
     /// them (a server that registered folder changes was told of its folders).
     ever_registered: RwLock<std::collections::HashSet<String>>,
+    /// Ids unregistered while absent, remembered only until the handshake
+    /// records the static registration (`None` afterwards): a server may
+    /// withdraw its static `changeNotifications` id before the handshake task
+    /// has recorded it (#1117). Taken under the
+    /// `registrations` write lock, so a withdrawal and the record never
+    /// interleave.
+    unrecorded_withdrawals: std::sync::Mutex<Option<std::collections::HashSet<String>>>,
     /// Live workspace policy copied into every connection. The reader checks
     /// it before a suppressed log can consume bounded window-queue capacity.
     log_message_level: AtomicU8,
@@ -34,6 +41,7 @@ impl DynamicCapabilityRegistry {
         Self {
             registrations: RwLock::new(HashMap::new()),
             ever_registered: RwLock::new(std::collections::HashSet::new()),
+            unrecorded_withdrawals: std::sync::Mutex::new(Some(std::collections::HashSet::new())),
             log_message_level: AtomicU8::new(
                 crate::config::settings::LogMessageLevel::Info.as_u8(),
             ),
@@ -63,10 +71,31 @@ impl DynamicCapabilityRegistry {
 
     /// Record the registration a static capability declares — the
     /// `workspace.workspaceFolders.changeNotifications` id, if any (#1117) —
-    /// once the `initialize` response is in.
+    /// once the `initialize` response is in, unless the server already
+    /// withdrew that id. Called once per connection; ends the remembering of
+    /// withdrawals of absent ids.
     pub(crate) fn record_static_registration(&self, registration: Option<Registration>) {
-        if let Some(registration) = registration {
-            self.register(vec![registration]);
+        let mut guard = self
+            .registrations
+            .write()
+            .recover_poison("DynamicCapabilityRegistry::record_static_registration");
+        let withdrawn = self
+            .unrecorded_withdrawals
+            .lock()
+            .recover_poison("DynamicCapabilityRegistry::record_static_registration(withdrawn)")
+            .take()
+            .unwrap_or_default();
+        let Some(registration) = registration else {
+            return;
+        };
+        // Declared, even if already withdrawn: the server was told of the
+        // folders it was initialized with, like after any unregistration.
+        self.ever_registered
+            .write()
+            .recover_poison("DynamicCapabilityRegistry::record_static_registration(ever)")
+            .insert(registration.method.clone());
+        if !withdrawn.contains(&registration.id) {
+            guard.insert(registration.id.clone(), registration);
         }
     }
 
@@ -76,7 +105,15 @@ impl DynamicCapabilityRegistry {
             .write()
             .recover_poison("DynamicCapabilityRegistry::unregister");
         for unreg in unregistrations {
-            guard.remove(&unreg.id);
+            if guard.remove(&unreg.id).is_none()
+                && let Some(withdrawn) = self
+                    .unrecorded_withdrawals
+                    .lock()
+                    .recover_poison("DynamicCapabilityRegistry::unregister(withdrawn)")
+                    .as_mut()
+            {
+                withdrawn.insert(unreg.id);
+            }
         }
     }
 

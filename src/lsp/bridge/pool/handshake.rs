@@ -74,12 +74,10 @@ pub(super) async fn perform_lsp_handshake(
     let type_hierarchy_provider = parsed.type_hierarchy_provider;
     let capabilities = parsed.capabilities;
     // A `changeNotifications` id is a registration the server may withdraw
-    // (#1117). Record it before `initialized` is queued: the server may
-    // unregister it as soon as it hears `initialized`, and a later seed would
-    // resurrect the withdrawn id. An unregistration sent before `initialized`
-    // (allowed once the response is out) can still land first and be undone
-    // here — an accepted residual: withdrawing an id in the same breath as
-    // declaring it has no use, and it only keeps the pre-#1117 behavior.
+    // (#1117). Record it before `initialized` is queued, so a server that
+    // unregisters on hearing `initialized` finds it recorded. One sent
+    // earlier (allowed once the response is out) may reach the reader first;
+    // the registry remembers it and the record honors it.
     handle
         .dynamic_capabilities()
         .record_static_registration(static_folder_change_registration(&capabilities));
