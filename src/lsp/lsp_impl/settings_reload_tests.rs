@@ -227,6 +227,13 @@ async fn reload_changing_only_capture_mappings_refreshes_without_reparsing() {
         outcome.semantic_refresh_requested,
         "capture mappings change the tokens, so the client must re-request them"
     );
+    assert!(
+        server
+            .documents
+            .get(&uri)
+            .is_some_and(|document| document.has_current_tree()),
+        "the open document must keep its tree"
+    );
     client.abort();
 }
 

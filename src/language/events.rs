@@ -72,6 +72,10 @@ impl LanguageLoadResult {
 pub struct LanguageLoadSummary {
     pub loaded: Vec<String>,
     pub events: Vec<LanguageEvent>,
+    /// Whether the load changed any language a document could be parsed or
+    /// highlighted with: a parser or query appeared, disappeared, or now
+    /// resolves to a different grammar or query text.
+    pub language_state_changed: bool,
 }
 
 impl LanguageLoadSummary {

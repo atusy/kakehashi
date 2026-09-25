@@ -131,17 +131,63 @@ pub(super) enum ReloadTrigger {
 }
 
 impl ReloadTrigger {
-    fn invalidates_documents(self) -> bool {
+    /// Whether this reload invalidates every open document's parse, and
+    /// whether it asks the client to refresh semantic tokens.
+    fn effects(self, settings: SettingsImpact, language_state_changed: bool) -> (bool, bool) {
         match self {
-            Self::Initialize | Self::Install => false,
-            Self::WorkspaceFolders | Self::Configuration => true,
+            Self::Initialize => (false, false),
+            Self::Install => (false, true),
+            // The workspace root is an input no `WorkspaceSettings` diff sees:
+            // the reparse loop's injection processing keys bridge connections
+            // by it (the client-root fallback).
+            Self::WorkspaceFolders => (true, true),
+            Self::Configuration => {
+                let reparse = settings.reparse || language_state_changed;
+                (reparse, reparse || settings.retokenize)
+            }
         }
     }
+}
 
-    fn requests_semantic_refresh(self) -> bool {
-        match self {
-            Self::Initialize => false,
-            Self::Install | Self::WorkspaceFolders | Self::Configuration => true,
+/// Which follow-ups a change between two effective settings calls for.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SettingsImpact {
+    /// Reparse every open document. The reparse loop does more than rebuild
+    /// trees: it re-runs injection processing (eager virtual-document opens
+    /// on bridge servers, injected-language auto-install) and reschedules
+    /// diagnostics, so anything those read belongs here too.
+    reparse: bool,
+    /// Ask the client to re-request semantic tokens.
+    retokenize: bool,
+}
+
+impl SettingsImpact {
+    pub(super) fn between(previous: &WorkspaceSettings, next: &WorkspaceSettings) -> Self {
+        // Exhaustive on purpose: a new field fails to compile here until it
+        // is classified. When in doubt, it belongs under `reparse`.
+        let WorkspaceSettings {
+            // Parser/query discovery, and where a failed load may now succeed.
+            search_paths,
+            // Parsers, queries, bases, bridge filters, layers and per-language
+            // auto-install: all read by parsing or the injection pass.
+            languages,
+            // Read per request by semantic tokens only; no tree depends on it.
+            capture_mappings,
+            // Whether the injection pass installs a missing injected language.
+            auto_install,
+            // Which servers the injection pass opens virtual documents on.
+            language_servers,
+            // Diagnostic timing and log-level policy: read when diagnostics
+            // are scheduled or logs filtered, never by a parse, query or token.
+            diagnostics_debounce_ms: _,
+            features: _,
+        } = previous;
+        Self {
+            reparse: *search_paths != next.search_paths
+                || *languages != next.languages
+                || *auto_install != next.auto_install
+                || *language_servers != next.language_servers,
+            retokenize: *capture_mappings != next.capture_mappings,
         }
     }
 }
@@ -243,9 +289,13 @@ pub(super) async fn apply_shared_settings_locked(
     // built MID-swap against a half-updated query set.
     cache.bump_semantic_token_generation();
     crate::analysis::semantic::invalidate_thread_local_parser_caches();
+    let settings_impact = SettingsImpact::between(&settings_manager.load_settings(), &settings);
     let parser_reload = ParserReloadGuard::begin(language_state.parser_pool);
     let mut summary = language_state.language.load_settings(&settings);
-    let reparse_uris = if language_state.trigger.invalidates_documents() {
+    let (invalidate_documents, semantic_refresh_requested) = language_state
+        .trigger
+        .effects(settings_impact, summary.language_state_changed);
+    let reparse_uris = if invalidate_documents {
         language_state.documents.invalidate_all_parses()
     } else {
         Vec::new()
@@ -330,9 +380,9 @@ pub(super) async fn apply_shared_settings_locked(
     // tokens); only a query/config reload does.
     cache.bump_semantic_token_generation();
     // Query removal/replacement affects unchanged documents too. Request one
-    // workspace refresh for every reload; ClientNotifier capability-gates and
-    // coalesces it with any language-specific refresh events in this batch.
-    let semantic_refresh_requested = language_state.trigger.requests_semantic_refresh();
+    // workspace refresh for every reload that changed what tokens are built
+    // from; ClientNotifier capability-gates and coalesces it with any
+    // language-specific refresh events in this batch.
     if semantic_refresh_requested {
         summary
             .events
@@ -343,7 +393,9 @@ pub(super) async fn apply_shared_settings_locked(
         // Initialization may produce language-specific refresh events (for
         // example while registering a derived language). No refresh request is
         // valid before InitializeResult/initialized, and no document has yet
-        // consumed tokens, so keep the logs while stripping every refresh.
+        // consumed tokens. A reload that changed nothing tokens are built from
+        // re-registers languages just the same. Either way, keep the logs
+        // while stripping every refresh.
         summary.events.retain(|event| {
             !matches!(
                 event,

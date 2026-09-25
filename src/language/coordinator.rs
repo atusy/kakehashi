@@ -120,6 +120,31 @@ pub(crate) struct LanguageCoordinator {
     compiled_queries: Mutex<HashMap<(Language, String), std::sync::Weak<tree_sitter::Query>>>,
 }
 
+/// A registered language as documents see it. Equality is identity: the
+/// grammar compares by its loaded library, and queries by `Arc`, which
+/// [`LanguageCoordinator::compiled_queries`] keeps equal for equal text. The
+/// held `Arc`s also keep a replaced query's address from being reused while
+/// a comparison is pending.
+struct LoadedLanguage {
+    language: Language,
+    queries: [Option<Arc<tree_sitter::Query>>; QueryKind::ALL.len()],
+}
+
+impl PartialEq for LoadedLanguage {
+    fn eq(&self, other: &Self) -> bool {
+        self.language == other.language
+            && self
+                .queries
+                .iter()
+                .zip(&other.queries)
+                .all(|(mine, theirs)| match (mine, theirs) {
+                    (Some(mine), Some(theirs)) => Arc::ptr_eq(mine, theirs),
+                    (None, None) => true,
+                    _ => false,
+                })
+    }
+}
+
 impl Default for LanguageCoordinator {
     fn default() -> Self {
         Self::new()
@@ -399,6 +424,12 @@ impl LanguageCoordinator {
 
     /// Initialize from workspace-level settings and return coordination events.
     ///
+    /// Re-reads every parser and query from disk — for the configured
+    /// languages and for the languages loaded or attempted on demand since the
+    /// previous load — and reports through
+    /// [`LanguageLoadSummary::language_state_changed`] whether any of them now
+    /// differs, so the caller can skip reparsing documents when nothing did.
+    ///
     /// Visibility: pub(crate) - called by LSP layer during initialization and
     /// settings updates to configure language support.
     pub(crate) fn load_settings(&self, settings: &WorkspaceSettings) -> LanguageLoadSummary {
@@ -407,6 +438,22 @@ impl LanguageCoordinator {
             .lock()
             .recover_poison("LanguageCoordinator::load_settings(reload)");
         self.prune_compiled_queries();
+        // What documents can be parsed and highlighted with before this load:
+        // every language registered under the current generation, and every
+        // language whose load failed under it. The load below marks both
+        // stale; re-attempting them at the end (instead of on the next
+        // document that needs them) is what lets the result say whether the
+        // reload changed anything a document depends on.
+        let previous_generation = self
+            .load_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        let previous_state = self.language_state(previous_generation);
+        let previously_failed: Vec<String> = self
+            .failed_loads
+            .iter()
+            .filter(|entry| *entry.value() == previous_generation)
+            .map(|entry| entry.key().clone())
+            .collect();
         self.config_store.update_from_settings(settings);
         self.clear_derived_languages();
         // A reload (new search paths, or the post-install reload) is the only
@@ -476,7 +523,58 @@ impl LanguageCoordinator {
             summary.record(derived_name, result);
         }
 
+        // Re-read the languages documents were using (or waiting for) that
+        // the configured passes above did not settle. Their events surface
+        // only when their outcome changed: an unchanged re-read would
+        // otherwise repeat every "loaded" log and missing-parser warning on
+        // each reload.
+        let generation = self
+            .load_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        for language_id in previous_state
+            .keys()
+            .cloned()
+            .chain(previously_failed)
+            .collect::<HashSet<_>>()
+        {
+            if self.has_current_parser_registration(&language_id, generation)
+                || self.configured_load_failed(&language_id, generation)
+            {
+                continue;
+            }
+            let result = self.ensure_language_loaded(&language_id);
+            if previous_state.get(&language_id)
+                != self.language_state_entry(&language_id, generation).as_ref()
+            {
+                summary.events.extend(result.events);
+            }
+        }
+        summary.language_state_changed = previous_state != self.language_state(generation);
+
         summary
+    }
+
+    /// Every language registered under `generation`, with the grammar and
+    /// queries a document of that language is parsed and highlighted with.
+    fn language_state(&self, generation: u64) -> HashMap<String, LoadedLanguage> {
+        self.language_registry
+            .language_ids()
+            .into_iter()
+            .filter_map(|language_id| {
+                let loaded = self.language_state_entry(&language_id, generation)?;
+                Some((language_id, loaded))
+            })
+            .collect()
+    }
+
+    fn language_state_entry(&self, language_id: &str, generation: u64) -> Option<LoadedLanguage> {
+        if !self.has_current_parser_registration(language_id, generation) {
+            return None;
+        }
+        Some(LoadedLanguage {
+            language: self.language_registry.get(language_id)?,
+            queries: QueryKind::ALL.map(|kind| self.query_store.get_query(kind, language_id)),
+        })
     }
 
     /// Load a derived language by copying parser and queries from its base.
