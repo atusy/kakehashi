@@ -1583,6 +1583,10 @@ fn test_language_uninstall_keeps_the_parser_when_queries_cannot_be_removed() {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
+    if !restrictive_modes_are_enforced() {
+        eprintln!("skipping: this environment ignores restrictive directory modes");
+        return;
+    }
     let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
     fs::create_dir_all(test_dir.path().join("parser")).expect("Failed to create parser dir");
     let ext = std::env::consts::DLL_EXTENSION;
@@ -1645,6 +1649,10 @@ fn test_language_uninstall_does_not_mention_a_parser_it_does_not_have() {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
+    if !restrictive_modes_are_enforced() {
+        eprintln!("skipping: this environment ignores restrictive directory modes");
+        return;
+    }
     let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
     let queries_dir = test_dir.path().join("queries/stuck_lang");
     fs::create_dir_all(&queries_dir).expect("Failed to create queries dir");
