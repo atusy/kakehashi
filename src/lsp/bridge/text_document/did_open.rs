@@ -680,9 +680,10 @@ impl LanguageServerPool {
         if !connections.get(connection_key).is_some_and(|current| {
             Arc::ptr_eq(current, &handle) && current.state() == ConnectionState::Ready
         }) {
-            // Replaced by a respawn between wait-ready and here; the purge armed
-            // the replacement's re-open, which brings it up to date (a request's
-            // lazy sync covers anything it misses).
+            // Replaced, or failing, since wait-ready. The purge that precedes any
+            // replacement arms its re-open, which brings the new connection up to
+            // date; a later eager re-sync or a request's lazy sync covers
+            // anything it misses.
             return;
         }
         // Under the lifecycle lock, right before the sync: a task of a
