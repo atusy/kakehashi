@@ -17,7 +17,7 @@ use std::io;
 use tower_lsp_server::ls_types::{ClientCapabilities, ServerCapabilities, WorkspaceFolder};
 
 use super::ConnectionHandle;
-use super::connection_handle::NotificationSendResult;
+use super::connection_handle::{NotificationSendResult, static_folder_change_registration};
 use crate::lsp::bridge::protocol::{
     RequestId, build_initialize_request, build_initialized_notification,
     parse_initialize_response_capabilities,
@@ -70,6 +70,13 @@ pub(super) async fn perform_lsp_handshake(
     let bridge_routing = parsed.bridge_routing;
     let type_hierarchy_provider = parsed.type_hierarchy_provider;
     let capabilities = parsed.capabilities;
+    // A `changeNotifications` id is a registration the server may withdraw
+    // (#1117). Record it before `initialized` is queued: the server may
+    // unregister it as soon as it hears `initialized`, and a later seed would
+    // resurrect the withdrawn id.
+    if let Some(registration) = static_folder_change_registration(&capabilities) {
+        handle.dynamic_capabilities().register(vec![registration]);
+    }
 
     // 4. Send initialized notification via the single-writer loop
     let initialized = build_initialized_notification();
