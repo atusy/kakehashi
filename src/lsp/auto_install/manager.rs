@@ -178,10 +178,11 @@ struct QueryDependencyChecks {
     languages: HashSet<String>,
     /// Languages whose query repair failed in `generation`.
     failed: HashSet<String>,
-    /// Languages whose repair failed and has not been checked again since,
-    /// in whatever generation: unlike `failed`, a new generation does not
-    /// clear it, because a generation that reparses nothing (a post-install
-    /// reload) retries nothing.
+    /// Languages whose repair failed and no check has answered for since
+    /// (see [`AutoInstallManager::resolve_query_repair_retry`]), in whatever
+    /// generation: unlike `failed`, a new generation does not clear it,
+    /// because a generation that reparses nothing (a post-install reload)
+    /// retries nothing.
     awaiting_retry: HashSet<String>,
 }
 
@@ -323,14 +324,24 @@ impl AutoInstallManager {
         let first = current
             && !checked.languages.contains(language)
             && checked.languages.insert(language.to_string());
-        let due = initial_pass || first;
-        if due && !checked.awaiting_retry.is_empty() {
-            checked.awaiting_retry.remove(language);
-        }
-        due
+        initial_pass || first
     }
 
-    /// Whether a failed query repair has not been checked again since. A
+    /// A dependency check of `language` reached an answer that stands: the
+    /// chain is settled, or a repair is about to be attempted (whose failure
+    /// records itself again). Only then is a failed repair no longer waiting
+    /// for a retry; a busy, dropped or overruled probe leaves it waiting.
+    pub(crate) fn resolve_query_repair_retry(&self, language: &str) {
+        let mut checked = self
+            .query_dependency_checks
+            .lock()
+            .recover_poison("AutoInstallManager::resolve_query_repair_retry");
+        if !checked.awaiting_retry.is_empty() {
+            checked.awaiting_retry.remove(language);
+        }
+    }
+
+    /// Whether a failed query repair has not been answered for since. A
     /// retry needs a new generation AND a pass over the document, which only
     /// a reload that reparses provides, so a configuration push must not
     /// skip that reload meanwhile.
@@ -1041,6 +1052,27 @@ mod tests {
             "marker must be released when the guard drops, even if try_install \
              is cancelled at its install await"
         );
+    }
+
+    /// A failed repair waits for a retry until a check's answer stands; a
+    /// new generation, a check that merely began, or one forgotten as busy
+    /// must not end the wait.
+    #[test]
+    fn failed_query_repair_waits_until_an_answer_stands() {
+        let manager = create_test_manager();
+        assert!(!manager.has_query_repairs_awaiting_retry());
+        manager.record_query_repair_failure("lua", 10);
+        assert!(manager.has_query_repairs_awaiting_retry());
+
+        assert!(manager.begin_query_dependency_check("lua", 11, true));
+        manager.forget_query_dependency_check("lua", 11);
+        assert!(
+            manager.has_query_repairs_awaiting_retry(),
+            "a probe that began and was forgotten answered nothing"
+        );
+
+        manager.resolve_query_repair_retry("lua");
+        assert!(!manager.has_query_repairs_awaiting_retry());
     }
 
     #[test]

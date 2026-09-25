@@ -371,15 +371,29 @@ impl InstallCoordinator {
         generation: u64,
         state: QueryChainState,
     ) -> bool {
+        // Probes run concurrently; a repair that failed while this one read
+        // the chain has already answered. Judged in the current generation: a
+        // reload during the probe retires failures from the probe's own, and a
+        // failure after it is the one that counts. An answer that stands also
+        // ends the failed repair's wait for a retry.
+        let failed_meanwhile = || {
+            self.auto_install
+                .query_repair_failed(language, self.cache.semantic_token_generation())
+        };
         match state {
-            // Probes run concurrently; a repair that failed while this one
-            // read the chain has already answered. Judged in the current
-            // generation: a reload during the probe retires failures from the
-            // probe's own, and a failure after it is the one that counts.
-            QueryChainState::NeedsRepair => !self
-                .auto_install
-                .query_repair_failed(language, self.cache.semantic_token_generation()),
-            QueryChainState::Settled => false,
+            QueryChainState::NeedsRepair => {
+                let admitted = !failed_meanwhile();
+                if admitted {
+                    self.auto_install.resolve_query_repair_retry(language);
+                }
+                admitted
+            }
+            QueryChainState::Settled => {
+                if !failed_meanwhile() {
+                    self.auto_install.resolve_query_repair_retry(language);
+                }
+                false
+            }
             // A lock held exclusively by an install (staging or publishing)
             // or an uninstall is not evidence of a missing language. Leave the answer
             // to a later pass instead of spawning an install that would find
