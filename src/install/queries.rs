@@ -1654,12 +1654,10 @@ fn remove_dir_all_tolerating_vanished(dir: &Path) -> Result<bool, QueryInstallEr
 /// "not installed" over a still-present unreadable entry.
 fn remove_entry_tolerating_vanished(path: &Path) -> Result<bool, QueryInstallError> {
     match fs::symlink_metadata(path) {
-        // `remove_dir_all` takes a symlink itself and never its target —
-        // including a directory symlink on Windows, which `remove_file`
-        // refuses there.
-        Ok(metadata) if metadata.is_dir() || metadata.file_type().is_symlink() => {
-            remove_dir_all_tolerating_vanished(path)
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            remove_symlink_tolerating_vanished(path)
         }
+        Ok(metadata) if metadata.is_dir() => remove_dir_all_tolerating_vanished(path),
         // Anything else — a regular file, FIFO or socket — is still in a slot
         // install owns: publishing moves whatever is there aside regardless of
         // its shape. `remove_dir_all` cannot take it, and `unlink` never opens
@@ -1667,6 +1665,33 @@ fn remove_entry_tolerating_vanished(path: &Path) -> Result<bool, QueryInstallErr
         Ok(_) => remove_file_tolerating_vanished(path),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(QueryInstallError::IoError(e)),
+    }
+}
+
+/// Remove a symlink itself, never its target, whatever it points at.
+///
+/// `remove_file` is `unlink` on unix, which takes any link. Windows splits
+/// links by kind: a file symlink needs `DeleteFileW` (which `remove_dir_all`
+/// refuses, since the link is not a directory), while a directory symlink or
+/// junction needs `RemoveDirectoryW`. So try the first, and fall back to the
+/// second only while the entry is still a symlink — the same shape as the
+/// parser side's removal in `src/bin/main.rs`.
+fn remove_symlink_tolerating_vanished(path: &Path) -> Result<bool, QueryInstallError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => {
+            let still_a_symlink =
+                fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink());
+            if !still_a_symlink {
+                return Err(QueryInstallError::IoError(e));
+            }
+            match fs::remove_dir(path) {
+                Ok(()) => Ok(true),
+                Err(second) if second.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(_) => Err(QueryInstallError::IoError(e)),
+            }
+        }
     }
 }
 
