@@ -282,13 +282,12 @@ fn e2e_opt_in_shares_one_process_with_a_dynamically_registering_server() {
     );
 }
 
-/// A client-root fallback whose server registered folder-change support
-/// dynamically takes an upstream `workspace/didChangeWorkspaceFolders` as a
-/// notification (#968). Recycling it instead would ALSO leave the new folder
-/// known — the replacement initializes with the current snapshot — so only the
-/// unchanged process id tells forwarding apart from a restart.
-#[test]
-fn e2e_client_folder_change_is_forwarded_to_a_dynamically_registering_server() {
+/// Hovers a client-root fallback of a `mock_mode` server before and after the
+/// client adds a second workspace folder. Returns `(before, after)`; `after`
+/// already knows the added folder, whether the fallback took the change as a
+/// notification or was recycled with the current snapshot, so only the
+/// process ids tell those apart.
+fn hover_around_client_folder_change(mock_mode: &str) -> (String, String) {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     // Marker search is switched off below, so the document resolves to the
     // client-root fallback even when the temp dir sits inside a checkout.
@@ -303,7 +302,7 @@ fn e2e_client_folder_change_is_forwarded_to_a_dynamically_registering_server() {
 
     let (mut client, _cfg) = init_client_with_folders(
         false,
-        "workspace-folders-dynamic",
+        mock_mode,
         json!([{ "uri": root_a, "name": "a" }]),
         None,
         Some(json!([])),
@@ -324,6 +323,15 @@ fn e2e_client_folder_change_is_forwarded_to_a_dynamically_registering_server() {
         after.contains(&root_b),
         "the added folder must reach the server; got {after:?}"
     );
+    (before, after)
+}
+
+/// A client-root fallback whose server registered folder-change support
+/// dynamically takes an upstream `workspace/didChangeWorkspaceFolders` as a
+/// notification (#968), rather than being recycled.
+#[test]
+fn e2e_client_folder_change_is_forwarded_to_a_dynamically_registering_server() {
+    let (before, after) = hover_around_client_folder_change("workspace-folders-dynamic");
     assert_eq!(
         hover_pid(&after),
         hover_pid(&before),
