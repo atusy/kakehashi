@@ -168,6 +168,33 @@ async fn identical_reload_neither_reparses_nor_refreshes() {
     client.abort();
 }
 
+/// Only a configuration push may skip: a workspace-folder change moves the
+/// root, which keys bridge connections and which no settings comparison
+/// sees, so it reloads even with identical settings.
+#[tokio::test]
+async fn identical_workspace_folder_reload_still_reparses_and_refreshes() {
+    let (service, client) = server_with_builtin_rust();
+    let server = service.inner();
+    server
+        .apply_raw_settings(RawWorkspaceSettings::default(), baseline_settings())
+        .await;
+    let uri = open_and_wait_for_tree(server, "folders.rs", "rust").await;
+
+    let reload = lock_settings_reload().await;
+    let outcome = server
+        .apply_raw_settings_locked(
+            &reload,
+            ReloadTrigger::WorkspaceFolders,
+            RawWorkspaceSettings::default(),
+            baseline_settings(),
+        )
+        .await;
+    drop(reload);
+
+    assert_full_reload_work(&outcome, &uri);
+    client.abort();
+}
+
 #[tokio::test]
 async fn reload_changing_language_config_reparses_and_refreshes() {
     let (service, client) = server_with_builtin_rust();
