@@ -109,14 +109,14 @@ remain until their callers migrate. The contracts are distinct:
   current-tree question adds `parsed_version == content_version`
   (`Document::has_current_tree`, `snapshot_has_tree` in the injection coordinator). A
   **resolved-but-tree-less** outcome — a parse that completed with no usable tree
-  (no parser installed, install failed, no usable tree reached the publish, or a
-  settings-reload placeholder awaiting its reparse — see `ParseSnapshot`), distinct
-  from the pre-first-parse `None` — is `resolved && !has_tree`; it advances
-  `parsed_version` and releases first-parse waiters (who then fall through to their
-  empty / `null` / `ContentModified` paths), which the old boolean `has_tree` could
-  not express. The reload placeholder alone carries `awaiting_reparse`: it is not a
-  parse result, so the explicit-action waits keep waiting past it for the reparse,
-  while a completed tree-less parse is a final answer.
+  (no parser installed, install failed, or no usable tree reached the publish — see
+  `ParseSnapshot`), distinct from the pre-first-parse `None` — is
+  `resolved && !has_tree`; it advances `parsed_version` and releases first-parse
+  waiters (who then fall through to their empty / `null` / `ContentModified` paths),
+  which the old boolean `has_tree` could not express. A settings-reload placeholder
+  reads the same way, but it is not a parse result: it alone carries
+  `awaiting_reparse`, so the explicit-action waits keep waiting past it for the
+  reparse, while a completed tree-less parse is a final answer.
 - `parsed_version` is the document content version consumed by the parse;
   `current_incarnation` is the per-lifetime guard. The separately retained
   watermark tracks ingress writer tickets, which are not content versions.
@@ -152,11 +152,11 @@ check-then-act rather than a cross-map TOCTOU against `Document.incarnation`):
 > attach its tree over a same-version tree-less publish — the reload placeholder
 > and the give-up snapshot both depend on it — without which strict `>` alone
 > would strand those documents tree-less until the next edit. The resolving arm
-does the same for a reparse that produces no tree: it replaces the placeholder
-with the completed tree-less outcome, so no reader keeps waiting on a reparse
-that has already finished. Region completion
-> does not use this general admission rule: an equal-version replacement stays
-> rejected even if it carries a clone of the tree already published.
+> does the same for a reparse that produces no tree: it replaces the placeholder
+> with the completed tree-less outcome, so no reader keeps waiting on a reparse
+> that has already finished. Region completion does not use this general
+> admission rule: an equal-version replacement stays rejected even if it carries
+> a clone of the tree already published.
 
 `DocumentStore::complete_parse` instead receives the exact `Arc<ParseSnapshot>`
 accepted by the first install and optional resolved regions. Under the same
@@ -210,7 +210,9 @@ down.
 - **Incarnation-scoped, strict monotonicity.** The `>` is strict — equal-version
   double-publishes (e.g. a racing open-parse and reparse both at version 0) must
   not swap the `Tree` under an already-issued `result_id` and fire a spurious
-  refresh. `didOpen` sets `current_incarnation`; a reopen starts the URI's cell
+  refresh. The only equal-version admissions are the two exceptions above (a tree
+  upgrade over a tree-less snapshot, a parse resolving a reload placeholder); neither
+  replaces a tree. `didOpen` sets `current_incarnation`; a reopen starts the URI's cell
   fresh at `(current_incarnation = N+1, snapshot = None)` (whether the cell is reset
   in place or recreated is a correctness-irrelevant implementation choice — see the
   isolation bullet). Starting `snapshot` at `None` is what clears the version floor:
