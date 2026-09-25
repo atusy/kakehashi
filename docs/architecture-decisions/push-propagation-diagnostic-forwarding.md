@@ -367,11 +367,14 @@ policy clean:
   correct positions; this supplies the missing trigger.
 - **Host layer**: the `_self` host source uses the identical model keyed on the
   *host document's* content epoch. Every enabled `_self` server for the host
-  language is eagerly opened on host `didOpen` (#429) and eagerly **re-synced** on
-  edit at the debounced diagnostic cadence (#431), push-driven or not; the push-only
-  servers are the ones that need it. `eager_sync_host_document_on_servers` runs when the
-  debounce fires, so a push-only host server (skipped by the capability-gated
-  pull) re-analyzes current text rather than stale text. The host path's
+  language, push-driven or not, is eagerly opened on host `didOpen` (#429) and
+  eagerly **re-synced** on edit at the debounced diagnostic cadence (#431); the
+  push-only servers are the ones that need it. The re-sync rides the debounced
+  diagnostic snapshot, so it runs only while the host layer participates for
+  `textDocument/publishDiagnostics` (see the seal caveat above) and the document
+  has a parse tree. `eager_sync_host_document_on_servers` runs when the debounce
+  fires, so a push-only host server (skipped by the capability-gated pull)
+  re-analyzes current text rather than stale text. The host path's
   fingerprint gates the actual didChange; the gate and re-merge rules above apply
   unchanged.
 
@@ -500,17 +503,21 @@ Worked traces (servers `a1,a2` in one region, `priorities = [a1, a2]`):
   selects through `get_host_configs_for_language`, which has no push/pull
   distinction, so every spawnable server whose `languages` matches the host
   language is opened once `bridge._self.enabled = true`, unless a routing provider
-  suppresses the document on it. The first host request's lazy sync (`host.rs`)
-  remains only as the fallback for a server that missed the eager open.
+  suppresses the document on it. A server that missed the eager open gets the
+  document from a later sync instead: the debounced re-sync (#431) or the first
+  host request's lazy sync (`host.rs`).
   Because classification is live, a `_self` server may *unregister*
   `textDocument/diagnostic` mid-session (pull-driven → push-driven); it was
   opened on host `didOpen` like any other `_self` server, so the transition needs
   no open of its own. A config change that newly makes a `_self` server eligible
   (e.g. enabling host bridging, or widening its `languages`) must also reach the
   currently-open host docs: the settings reload re-parses every open document, and
-  the debounced diagnostic re-sync (#431) that follows the re-parse syncs the host
-  document to the newly resolved servers, opening it where it was never open.
-  `priorities` does not affect which servers are opened.
+  the debounced re-sync that follows the re-parse syncs the host document to the
+  newly resolved servers, opening it where it was never open. That re-sync has
+  the conditions stated under **Host layer** above (the host layer participates,
+  a parse tree exists); without them the newly eligible server gets the document
+  only on the first host request. Server `priorities` do not affect which
+  servers are opened.
 - **Re-merge on classification/config change**: a change that alters which slots
   are visible takes effect differently per path. Path A (proactive publish) must
   trigger an immediate host re-merge on any `textDocument/publishDiagnostics`
