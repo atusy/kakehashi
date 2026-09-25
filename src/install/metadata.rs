@@ -263,12 +263,14 @@ fn extract_parser_metadata(
     })
 }
 
-/// The non-empty string value of the first `key = <string>` field in the
-/// `block` range of `lua`.
+/// The value of the first `key = <string>` field in the `block` range of
+/// `lua`, skipping `key =` fields with other values; `None` if that value
+/// is empty.
 fn string_field(lua: &LuaCode, block: Range<usize>, key: &str) -> Option<String> {
     let field_re = Regex::new(&format!(r"\b{}\s*=\s*", regex::escape(key))).ok()?;
-    let value_start = block.start + field_re.find(&lua.code[block])?.end();
-    lua.string_at(value_start)
+    field_re
+        .find_iter(&lua.code[block.clone()])
+        .find_map(|field| lua.string_at(block.start + field.end()))
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
 }
