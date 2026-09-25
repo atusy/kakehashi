@@ -364,7 +364,7 @@ impl InstallCoordinator {
         let generation = self.cache.semantic_token_generation();
         // Read before the check is recorded: a failure landing after this is
         // newer than whatever the probe answers.
-        let failure_revision = self.auto_install.query_repair_revision();
+        let failure_revision = self.auto_install.query_repair_revision(language);
         (self
             .auto_install
             .begin_query_dependency_check(language, generation, initial_pass)
@@ -451,7 +451,7 @@ impl InstallCoordinator {
         let generation = self.cache.semantic_token_generation();
         // A successful install answers any earlier failure of this language
         // that is waiting for a retry — but not one recorded after it began.
-        let failure_revision = self.auto_install.query_repair_revision();
+        let failure_revision = self.auto_install.query_repair_revision(language);
         if !self.same_document_incarnation(&uri, expected_incarnation) {
             if request.repair_queries {
                 self.release_dropped_repair(language, generation);
