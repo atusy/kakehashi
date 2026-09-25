@@ -311,4 +311,26 @@ mod tests {
 
         assert!(result.is_err(), "{result:?}");
     }
+
+    /// The request's positions belong to the text it was sent against: an
+    /// edit and its reparse landing while it waits must not be answered
+    /// with ranges computed on the newer text.
+    #[tokio::test]
+    async fn an_edit_reparsed_during_the_wait_is_not_answered() {
+        let uri = Url::parse("file:///edit_reparsed_during_reload.rs").unwrap();
+        let service = server_with_parsed_doc(&uri);
+        let server = service.inner();
+        server.documents.invalidate_all_parses();
+
+        let edit = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            server
+                .documents
+                .update_document(uri.clone(), format!("{TEXT}\n"), None);
+            install_current_parse(server, &uri, Some(rust_tree(TEXT)));
+        };
+        let (result, ()) = tokio::join!(server.selection_range_impl(params(&uri)), edit);
+
+        assert!(result.is_err(), "{result:?}");
+    }
 }
