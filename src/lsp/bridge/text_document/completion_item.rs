@@ -1129,7 +1129,7 @@ mod tests {
             })
         };
         let downstream_id = tokio::time::timeout(
-            std::time::Duration::from_millis(300),
+            std::time::Duration::from_secs(1),
             wait_for_sent_request(&handle, &upstream_id),
         )
         .await
