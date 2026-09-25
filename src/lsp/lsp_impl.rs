@@ -130,7 +130,9 @@ pub(super) enum ReloadTrigger {
     WorkspaceFolders,
     /// A `workspace/didChangeConfiguration` push or a `workspace/configuration`
     /// pull. Skips the language reload altogether when it would change
-    /// nothing (see [`settings_affect_documents`]).
+    /// nothing: no setting documents depend on changed
+    /// ([`settings_affect_documents`]) and no parser or query file it would
+    /// re-read changed on disk ([`configuration_reload_needed`]).
     Configuration,
 }
 
@@ -174,8 +176,8 @@ fn settings_affect_documents(previous: &WorkspaceSettings, next: &WorkspaceSetti
         auto_install,
         // Which servers the injection pass opens virtual documents on.
         language_servers,
-        // Diagnostic timing and log-level policy: applied below on every
-        // application, and read when diagnostics are scheduled or logs
+        // Diagnostic timing and log-level policy: applied by every settings
+        // application, reload or not, and read when diagnostics are scheduled or logs
         // filtered, never by a parse, query or token.
         diagnostics_debounce_ms: _,
         features: _,
@@ -422,8 +424,10 @@ pub(super) async fn apply_shared_settings_locked(
     // apply (kills stamps that read the new queries but the OLD
     // settings-side inputs, e.g. capture mappings, during the awaited
     // propagate).
-    // Done at this single choke point so every reload path (initialize,
-    // didChangeConfiguration, and the auto-install reload) is covered, and
+    // Done at this single choke point so every language reload
+    // (initialize, didChangeConfiguration, the workspace-folder change and
+    // the auto-install reload) is covered — a configuration application that
+    // skipped the language reload changed nothing it would fence — and
     // *before* the refresh below so the editor's re-request recomputes. The
     // generation bump (not a bare clear) also defeats a request that was
     // mid-tokenization across the reload and stores afterwards: it captured
@@ -449,7 +453,8 @@ pub(super) async fn apply_shared_settings_locked(
         // Initialization may produce language-specific refresh events (for
         // example while registering a derived language). No refresh request is
         // valid before InitializeResult/initialized, and no document has yet
-        // consumed tokens, so keep the logs while stripping every refresh.
+        // consumed tokens, so keep the logs while stripping every refresh. (A
+        // skipped language reload has no events to strip.)
         summary.events.retain(|event| {
             !matches!(
                 event,
