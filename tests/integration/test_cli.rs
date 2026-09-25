@@ -2244,13 +2244,30 @@ fn test_language_uninstall_all_removes_a_dangling_query_entry() {
 
 /// Run `kakehashi language uninstall <args> --force --data-dir <dir>` and
 /// return the exit status with stdout and stderr combined.
+///
+/// Bounded: several callers put a FIFO in a slot, and an uninstall that
+/// regressed into opening one would block forever. That must fail as this
+/// test, not as a CI job timeout. The output is a few lines, so leaving it in
+/// the pipes until exit cannot fill them.
 fn run_forced_uninstall(data_dir: &std::path::Path, args: &[&str]) -> (bool, String) {
-    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
         .args(["language", "uninstall"])
         .args(args)
         .args(["--force", "--data-dir", data_dir.to_str().unwrap()])
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .expect("Failed to execute command");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while child.try_wait().expect("Failed to poll command").is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("uninstall {args:?} did not finish within 60s");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().expect("Failed to collect output");
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
