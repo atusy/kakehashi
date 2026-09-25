@@ -300,8 +300,11 @@ impl AutoInstallManager {
             .recover_poison("AutoInstallManager::record_query_repair_failure");
         if checked.observe(generation) {
             checked.failed.insert(language.to_string());
-            checked.awaiting_retry.insert(language.to_string());
         }
+        // Whatever generation it failed in: a failure that lands after a
+        // newer generation began suppresses nothing there, but nothing has
+        // retried it either.
+        checked.awaiting_retry.insert(language.to_string());
         checked.failure_revision += 1;
     }
 
@@ -1100,6 +1103,12 @@ mod tests {
             manager.has_query_repairs_awaiting_retry(),
             "a probe that began and was forgotten answered nothing"
         );
+
+        // A failure landing after a newer generation began still waits.
+        manager.resolve_query_repair_retry("lua", manager.query_repair_revision());
+        assert!(manager.begin_query_dependency_check("lua", 20, true));
+        manager.record_query_repair_failure("lua", 19);
+        assert!(manager.has_query_repairs_awaiting_retry());
 
         // An answer from a check that began before a newer failure does not
         // end the newer failure's wait.
