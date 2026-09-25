@@ -366,9 +366,10 @@ policy clean:
   if the re-anchored host coordinates actually changed. Lazy re-anchor supplies the
   correct positions; this supplies the missing trigger.
 - **Host layer**: the `_self` host source uses the identical model keyed on the
-  *host document's* content epoch. Push-driven `_self` servers are eagerly opened
-  on host `didOpen` (#429) and eagerly **re-synced** on edit at the debounced
-  diagnostic cadence (#431) — `eager_sync_host_document_on_servers` runs when the
+  *host document's* content epoch. Every enabled `_self` server for the host
+  language is eagerly opened on host `didOpen` (#429) and eagerly **re-synced** on
+  edit at the debounced diagnostic cadence (#431), push-driven or not; the push-only
+  servers are the ones that need it. `eager_sync_host_document_on_servers` runs when the
   debounce fires, so a push-only host server (skipped by the capability-gated
   pull) re-analyzes current text rather than stale text. The host path's
   fingerprint gates the actual didChange; the gate and re-merge rules above apply
@@ -493,17 +494,23 @@ Worked traces (servers `a1,a2` in one region, `priorities = [a1, a2]`):
   lets the server push again, so the cleared diagnostics return without an
   edit.
 - **Host-layer eager open**: a push-driven `_self` server only pushes once its
-  host document is open, but host sync is otherwise lazy — the host doc opens on
-  the first client host request (`host.rs`), not on host `didOpen`. So Path A must
-  eagerly open the real host document on host `didOpen` for push-driven `_self`
-  servers — the host-layer analogue of `eager_open_virtual_documents`. (Pull-only
-  `_self` servers do not need this; their `pullFallback` pull opens on demand.)
-  Because classification is live, a `_self` server that *unregisters*
-  `textDocument/diagnostic` mid-session (pull-driven → push-driven) has already
-  missed the host `didOpen`, so the transition into push-driven must itself
-  eagerly open any currently-open host docs where that `_self` server is enabled.
-  A config change that newly makes a push-driven `_self` server eligible (e.g.
-  enabling it, or adding it to `priorities`) must eagerly open in the same way.
+  host document is open, so Path A eagerly opens the real host document on host
+  `didOpen` — the host-layer analogue of `eager_open_virtual_documents`. The open
+  is not limited to push-driven servers: `eager_open_host_document_on_servers`
+  selects through `get_host_configs_for_language`, which has no push/pull
+  distinction, so every spawnable server whose `languages` matches the host
+  language is opened once `bridge._self.enabled = true`, unless a routing provider
+  suppresses the document on it. The first host request's lazy sync (`host.rs`)
+  remains only as the fallback for a server that missed the eager open.
+  Because classification is live, a `_self` server may *unregister*
+  `textDocument/diagnostic` mid-session (pull-driven → push-driven); it was
+  opened on host `didOpen` like any other `_self` server, so the transition needs
+  no open of its own. A config change that newly makes a `_self` server eligible
+  (e.g. enabling host bridging, or widening its `languages`) must also reach the
+  currently-open host docs: the settings reload re-parses every open document, and
+  the debounced diagnostic re-sync (#431) that follows the re-parse syncs the host
+  document to the newly resolved servers, opening it where it was never open.
+  `priorities` does not affect which servers are opened.
 - **Re-merge on classification/config change**: a change that alters which slots
   are visible takes effect differently per path. Path A (proactive publish) must
   trigger an immediate host re-merge on any `textDocument/publishDiagnostics`
