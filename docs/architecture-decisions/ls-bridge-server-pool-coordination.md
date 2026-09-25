@@ -98,10 +98,12 @@ sent no folders) is announced on their behalf, so a shared connection spawned
 under some marker root still learns the workspace such documents belong to. Keeping them on the client-root fallback would fork a
 second process whose session-wide state (e.g. a completion corpus over every
 open document) never meets the shared instance's. Root-JOINING is honored only when the downstream server advertises
-`workspace.workspaceFolders.{supported, changeNotifications}` or has a live
-dynamic `client/registerCapability` registration of
-`workspace/didChangeWorkspaceFolders`
-(`ConnectionHandle::supports_workspace_folder_changes`); the acquire path
+`workspace.workspaceFolders.{supported, changeNotifications: true}` or has a
+live registration of `workspace/didChangeWorkspaceFolders` — a dynamic
+`client/registerCapability`, or a string `changeNotifications` id, which the
+handshake records before `initialized` because LSP 3.18 lets the server
+unregister it (#1117) — (`ConnectionHandle::supports_workspace_folder_changes`);
+the acquire path
 (`resolve_acquire`) checks the existing shared connection's capability and, if
 it is `Ready` but incapable, logs once and falls back to the per-root key — so a
 misconfigured opt-in degrades to per-root instances rather than wedging the
@@ -135,7 +137,8 @@ that opted out). On a shared connection, roots it was already told of stay
 aboard after an unregistration (the served-root proof accepts its folder set
 for any server that ever registered folder changes); only new roots divert,
 and a root whose announce loses that race fails its acquisition rather than
-opening unannounced. Because registration arrives only after `initialized` while
+opening unannounced. Because a dynamic registration arrives only after
+`initialized` (a static `changeNotifications` id is recorded before it) while
 the divert check runs at `Ready`, roots acquired in that window divert
 deterministically; when the registration arrives on the shared connection, the
 pool retires that server's diverts (marker-rooted connections launched under
@@ -644,6 +647,12 @@ languageServers:
 
 ## Amendment History
 
+- **2026-09-25**: A string `workspace.workspaceFolders.changeNotifications`
+  now counts as a registration of `workspace/didChangeWorkspaceFolders` under
+  that id (#1117). The handshake records it before `initialized`, so a
+  `client/unregisterCapability` of the id withdraws folder-change support like
+  a dynamic unregistration; only `changeNotifications: true` remains a
+  lifelong declaration.
 - **2026-09-23**: Dynamic `client/registerCapability` registrations of
   `workspace/didChangeWorkspaceFolders` now count as folder-change capable
   (#968), read live at every decision point with no added synchronization;

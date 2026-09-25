@@ -96,7 +96,8 @@ pub(crate) fn build_didclose_notification(
 
 /// The folder-change notification's method. A server may register it
 /// dynamically instead of declaring
-/// `workspace.workspaceFolders.changeNotifications` statically (#968).
+/// `workspace.workspaceFolders.changeNotifications` statically (#968), and a
+/// static id string is itself a registration of it (#1117).
 pub(crate) const DID_CHANGE_WORKSPACE_FOLDERS_METHOD: &str = "workspace/didChangeWorkspaceFolders";
 
 /// Build a `workspace/didChangeWorkspaceFolders` notification announcing newly
