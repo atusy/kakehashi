@@ -2982,6 +2982,10 @@ fn test_language_uninstall_all_names_a_directory_parser_once() {
         !success,
         "the refused language must fail the run: {combined}"
     );
+    assert!(
+        combined.contains("is a directory, which this CLI never removes"),
+        "the refusal must describe the entry as the note does: {combined}"
+    );
     assert_eq!(
         combined.matches("Note: left").count(),
         1,

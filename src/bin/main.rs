@@ -904,7 +904,7 @@ fn run_language_uninstall(
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
                     Err(e) => {
                         eprintln!(
-                            "✗ Leaving '{}' untouched: {:?} is not a shape this CLI can remove, and whether it has queries could not be determined: {}",
+                            "✗ Leaving '{}' untouched: {:?} is a directory, which this CLI never removes, and whether it has queries could not be determined: {}",
                             lang, path, e
                         );
                         any_failed = true;
@@ -913,7 +913,7 @@ fn run_language_uninstall(
                 };
                 if queries_present {
                     eprintln!(
-                        "✗ Leaving '{}' untouched: {:?} is not a shape this CLI can remove, and taking its queries alone would half-remove it.",
+                        "✗ Leaving '{}' untouched: {:?} is a directory, which this CLI never removes, and taking its queries alone would half-remove it.",
                         lang, path
                     );
                     any_failed = true;
