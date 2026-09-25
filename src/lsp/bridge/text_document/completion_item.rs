@@ -25,7 +25,7 @@ use url::Url;
 
 use super::super::pool::{
     ConnectionHandle, ConnectionHandleSender, ConnectionState, LanguageServerPool,
-    NotificationSendResult, UpstreamId,
+    NotificationSendResult, ResolveDocument, UpstreamId,
 };
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, response_has_jsonrpc_error,
@@ -162,20 +162,6 @@ impl LanguageServerPool {
                 return item;
             }
         };
-        // A replaced host server gets the host document back only from the
-        // asynchronous re-open; until then the send below finds it not open
-        // and gives up. Wait for that re-open (bounded; a no-op when none is in
-        // flight) BEFORE `document` waits for the parse and takes the host
-        // edit lock, so the wait never holds up edits.
-        if !self.wait_for_pending_reopen(handle.key()).await {
-            warn!(
-                target: "kakehashi::bridge",
-                "completionItem/resolve (host): {server_name:?} is still re-opening its documents; \
-                 returning unresolved"
-            );
-            re_envelope_item(&mut item, &envelope);
-            return item;
-        }
         if !handle.has_capability("completionItem/resolve") {
             // Two ways here. The payload nests the reserved key: as far as
             // this branch can tell, the origin never advertised resolve and
@@ -196,6 +182,21 @@ impl LanguageServerPool {
                     "completionItem/resolve (host): {server_name:?} no longer advertises resolveProvider; returning unresolved"
                 );
             }
+            re_envelope_item(&mut item, &envelope);
+            return item;
+        }
+        // A replaced host server gets the host document back only from the
+        // asynchronous re-open; until then the send below finds it not open and
+        // gives up. Checked BEFORE `document` waits for the parse and takes the
+        // host edit lock, so a wait never holds up edits.
+        if !self
+            .resolve_document_ready(
+                "completionItem/resolve (host)",
+                handle.key(),
+                ResolveDocument::Host(&host_url),
+            )
+            .await
+        {
             re_envelope_item(&mut item, &envelope);
             return item;
         }
@@ -284,21 +285,6 @@ impl LanguageServerPool {
                 return item;
             }
         };
-        // A just-replaced origin re-opens its virtual documents asynchronously
-        // after `Ready`; until then the send below finds the document not open
-        // and gives up. Wait for that re-open (bounded; a no-op when none is in
-        // flight) BEFORE `document` takes the edit and lifecycle locks, so the
-        // wait never holds up edits or the re-open itself.
-        if !self.wait_for_pending_reopen(handle.key()).await {
-            warn!(
-                target: "kakehashi::bridge",
-                "completionItem/resolve: {server_name:?} is still re-opening its documents; \
-                 returning unresolved"
-            );
-            re_envelope_item(&mut item, &envelope);
-            return item;
-        }
-
         if !handle.has_capability("completionItem/resolve") {
             // Two ways here. The payload nests the reserved key: as far as
             // this branch can tell, the origin never advertised resolve and
@@ -319,6 +305,30 @@ impl LanguageServerPool {
                     "completionItem/resolve: {server_name:?} no longer advertises resolveProvider; returning unresolved"
                 );
             }
+            re_envelope_item(&mut item, &envelope);
+            return item;
+        }
+        // A just-replaced origin re-opens its virtual documents asynchronously
+        // after `Ready`; until then the send below finds the document not open
+        // and gives up. Checked BEFORE `document` waits for the parse and takes
+        // the host edit lock, so a wait never holds up edits.
+        let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(&host_uri) else {
+            re_envelope_item(&mut item, &envelope);
+            return item;
+        };
+        let virtual_uri = VirtualDocumentUri::new(
+            &host_uri_lsp,
+            &envelope.injection_language,
+            &envelope.region_id,
+        );
+        if !self
+            .resolve_document_ready(
+                "completionItem/resolve",
+                handle.key(),
+                ResolveDocument::Virtual(&virtual_uri),
+            )
+            .await
+        {
             re_envelope_item(&mut item, &envelope);
             return item;
         }
