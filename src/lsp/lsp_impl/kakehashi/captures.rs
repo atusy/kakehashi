@@ -394,12 +394,28 @@ fn load_kind_query_cached(
         search_paths: search_paths.to_vec(),
         source,
     };
+    store_kind_query(language_id, file_name, stored);
+    drop(in_flight);
+    loaded
+}
+
+/// Store a loaded kind query, unless an entry from a newer generation is
+/// already there. Replacing a same-generation entry compiled from other text
+/// records a [`KIND_SOURCE_CONFLICTS`] entry.
+fn store_kind_query(language_id: &str, file_name: &str, stored: CachedKindQuery) {
     let store = |by_kind: &dashmap::DashMap<String, CachedKindQuery>| match by_kind
         .entry(file_name.to_string())
     {
         dashmap::mapref::entry::Entry::Occupied(current)
-            if current.get().generation > generation => {}
+            if current.get().generation > stored.generation => {}
         dashmap::mapref::entry::Entry::Occupied(mut current) => {
+            let previous = current.get();
+            if previous.generation == stored.generation
+                && previous.search_paths == stored.search_paths
+                && previous.source != stored.source
+            {
+                note_kind_source_conflict(&stored.search_paths);
+            }
             current.insert(stored);
         }
         dashmap::mapref::entry::Entry::Vacant(vacant) => {
@@ -415,8 +431,23 @@ fn load_kind_query_cached(
                 .or_default(),
         );
     }
-    drop(in_flight);
-    loaded
+}
+
+/// Search paths under which two loads of one kind query in the same
+/// generation compiled different text: the file changed between them, and a
+/// document's captures memo may hold results of the older one. Only a
+/// generation bump invalidates those memos, so [`kind_queries_changed`]
+/// reports (and clears) a conflict as a change.
+static KIND_SOURCE_CONFLICTS: std::sync::Mutex<Vec<Vec<PathBuf>>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn note_kind_source_conflict(search_paths: &[PathBuf]) {
+    let mut conflicts = KIND_SOURCE_CONFLICTS
+        .lock()
+        .recover_poison("note_kind_source_conflict");
+    if !conflicts.iter().any(|paths| paths == search_paths) {
+        conflicts.push(search_paths.to_vec());
+    }
 }
 
 /// The search paths of every kind-query load between reading its file and
@@ -559,6 +590,15 @@ pub(in crate::lsp::lsp_impl) fn kind_queries_changed(
         .any(|paths| paths == search_paths)
     {
         return true;
+    }
+    {
+        let mut conflicts = KIND_SOURCE_CONFLICTS
+            .lock()
+            .recover_poison("kind_queries_changed(conflicts)");
+        if let Some(index) = conflicts.iter().position(|paths| paths == search_paths) {
+            conflicts.swap_remove(index);
+            return true;
+        }
     }
     let cached: Vec<(String, String, Option<String>)> = kind_query_cache()
         .iter()
@@ -1940,6 +1980,36 @@ fn execute_captures_walk(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two loads of one kind query in the same generation that read
+    /// different text (the file changed between them) leave captures memos
+    /// built from the older one, which only a generation bump invalidates:
+    /// the scan reports that once, even though the entry now matches disk.
+    #[test]
+    fn kind_queries_changed_reports_a_same_generation_source_conflict() {
+        const LANGUAGE: &str = "kind_conflict_969";
+        const GENERATION: u64 = u64::MAX - 9690;
+        let dir = tempfile::tempdir().unwrap();
+        let kind_dir = dir.path().join("queries").join(LANGUAGE);
+        std::fs::create_dir_all(&kind_dir).unwrap();
+        std::fs::write(kind_dir.join("folds.scm"), "(block) @fold\n").unwrap();
+        let search_paths = vec![dir.path().to_path_buf()];
+        let entry = |source: &str| CachedKindQuery {
+            load: std::sync::Arc::new(KindQueryLoad::Unavailable),
+            generation: GENERATION,
+            search_paths: search_paths.clone(),
+            source: Some(source.to_string()),
+        };
+
+        store_kind_query(LANGUAGE, "folds.scm", entry("(function_item) @fold\n"));
+        store_kind_query(LANGUAGE, "folds.scm", entry("(block) @fold\n"));
+
+        assert!(kind_queries_changed(&search_paths, GENERATION));
+        assert!(
+            !kind_queries_changed(&search_paths, GENERATION),
+            "a conflict is reported once; the entry itself matches the disk"
+        );
+    }
 
     /// A reload that skips the generation bump leaves this cache in place, so
     /// it must be able to tell whether a cached kind file changed on disk:
