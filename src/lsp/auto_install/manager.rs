@@ -178,11 +178,13 @@ struct QueryDependencyChecks {
     languages: HashSet<String>,
     /// Languages whose query repair failed in `generation`.
     failed: HashSet<String>,
-    /// Languages whose repair failed and no check has answered for since
-    /// (see [`AutoInstallManager::resolve_query_repair_retry`]), in whatever
-    /// generation: unlike `failed`, a new generation does not clear it,
-    /// because a generation that reparses nothing (a post-install reload)
-    /// retries nothing.
+    /// Languages whose repair failed (or was dropped or found busy) and has
+    /// not been retried since: no check's answer stood
+    /// ([`AutoInstallManager::resolve_query_repair_retry`]) and no
+    /// configuration reload ran for it
+    /// ([`AutoInstallManager::retire_query_repair_retries`]). Unlike `failed`,
+    /// a new generation does not clear it, because a generation that
+    /// reparses nothing (a post-install reload) retries nothing.
     awaiting_retry: HashSet<String>,
     /// Per language, bumped by every recorded failure and deferred repair of
     /// that language: a check's answer ends a wait only when none landed
@@ -390,10 +392,51 @@ impl AutoInstallManager {
             .or_default() += 1;
     }
 
+    /// The repairs waiting for a retry, each with its language's revision,
+    /// for [`Self::retire_query_repair_retries`].
+    pub(crate) fn query_repair_retries(&self) -> Vec<(String, u64)> {
+        let checked = self
+            .query_dependency_checks
+            .lock()
+            .recover_poison("AutoInstallManager::query_repair_retries");
+        checked
+            .awaiting_retry
+            .iter()
+            .map(|language| {
+                let revision = checked
+                    .failure_revisions
+                    .get(language)
+                    .copied()
+                    .unwrap_or(0);
+                (language.clone(), revision)
+            })
+            .collect()
+    }
+
+    /// A reload ran for `retries` (from [`Self::query_repair_retries`]): end
+    /// each wait, unless its language failed or deferred again since.
+    pub(crate) fn retire_query_repair_retries(&self, retries: &[(String, u64)]) {
+        let mut checked = self
+            .query_dependency_checks
+            .lock()
+            .recover_poison("AutoInstallManager::retire_query_repair_retries");
+        for (language, revision) in retries {
+            let current = checked
+                .failure_revisions
+                .get(language)
+                .copied()
+                .unwrap_or(0);
+            if current == *revision {
+                checked.awaiting_retry.remove(language);
+            }
+        }
+    }
+
     /// Whether a failed query repair has not been answered for since. A
     /// retry needs a new generation AND a pass over the document, which only
     /// a reload that reparses provides, so a configuration push must not
     /// skip that reload meanwhile.
+    #[cfg(test)]
     pub(crate) fn has_query_repairs_awaiting_retry(&self) -> bool {
         !self
             .query_dependency_checks

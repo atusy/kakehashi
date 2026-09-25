@@ -749,6 +749,7 @@ impl Kakehashi {
         raw_settings: RawWorkspaceSettings,
         settings: WorkspaceSettings,
     ) -> SettingsReloadOutcome {
+        let pending_repairs = self.auto_install.query_repair_retries();
         let outcome = apply_shared_settings_locked(
             reload,
             &self.client,
@@ -757,7 +758,7 @@ impl Kakehashi {
                 parser_pool: &self.parser_pool,
                 documents: &self.documents,
                 trigger,
-                reload_required: self.auto_install.has_query_repairs_awaiting_retry(),
+                reload_required: !pending_repairs.is_empty(),
             },
             &self.settings_manager,
             &self.cache,
@@ -780,6 +781,15 @@ impl Kakehashi {
         );
         for uri in &outcome.reparse_uris {
             self.schedule_reparse(uri.clone(), None);
+        }
+        // The reload is the retry a pending repair was waiting for, as every
+        // configuration push was before the skip existed: whatever the
+        // reparses retry, a failure they meet records itself again. Without
+        // this, a repair no reparse probes (a host language's) would force a
+        // reload on every push from now on.
+        if outcome.semantic_refresh_requested {
+            self.auto_install
+                .retire_query_repair_retries(&pending_repairs);
         }
         // The new settings can change what a client pull returns with no
         // publish to show it — e.g. a server newly excluded by

@@ -174,11 +174,13 @@ async fn identical_reload_neither_reparses_nor_refreshes() {
     client.abort();
 }
 
-/// A failed query repair is retried only in a new generation; before the
-/// skip existed any configuration push started one, so a push must still
-/// reload while a failure waits, even with nothing else changed.
+/// A failed query repair is retried only by a reparse in a new generation;
+/// before the skip existed every configuration push was one. So a push still
+/// reloads while a failure waits — also after a post-install reload moved the
+/// generation without reparsing — and that reload is the retry: the next
+/// identical push skips again unless the failure recurs.
 #[tokio::test]
-async fn identical_reload_still_reloads_while_a_query_repair_failure_waits() {
+async fn identical_reload_still_reloads_once_while_a_query_repair_failure_waits() {
     let (service, client) = server_with_builtin_rust();
     let server = service.inner();
     server
@@ -188,19 +190,21 @@ async fn identical_reload_still_reloads_while_a_query_repair_failure_waits() {
     server
         .auto_install
         .record_query_repair_failure("lua", server.cache.semantic_token_generation());
-
-    let outcome = server
-        .apply_raw_settings(RawWorkspaceSettings::default(), baseline_settings())
-        .await;
-
-    assert_full_reload_work(&outcome, &uri);
     // A post-install reload moves the generation without reparsing: the
     // failure is no longer this generation's, yet nothing retried it.
     server.cache.bump_semantic_token_generation();
-    let after_install = server
+
+    let retried = server
         .apply_raw_settings(RawWorkspaceSettings::default(), baseline_settings())
         .await;
-    assert_full_reload_work(&after_install, &uri);
+    assert_full_reload_work(&retried, &uri);
+
+    wait_for_tree(server, &uri).await;
+    let generation = generations(server);
+    let after_retry = server
+        .apply_raw_settings(RawWorkspaceSettings::default(), baseline_settings())
+        .await;
+    assert_no_reload_work(&after_retry, server, &uri, generation);
     client.abort();
 }
 
