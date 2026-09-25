@@ -136,6 +136,9 @@ pub(crate) struct LanguageCoordinator {
     /// On-demand loads between reading their files and publishing (see
     /// [`DynamicLoadInFlight`]).
     dynamic_loads_in_flight: std::sync::atomic::AtomicUsize,
+    /// Query files that failed to load or compiled with skipped patterns —
+    /// every problem a load warns about. Read on a trial's scratch copy.
+    query_problems: std::sync::atomic::AtomicUsize,
 }
 
 /// Counts one on-demand load in [`LanguageCoordinator::dynamic_loads_in_flight`]
@@ -232,6 +235,7 @@ impl LanguageCoordinator {
             is_trial: false,
             trial_queries: Mutex::new(Vec::new()),
             dynamic_loads_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            query_problems: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -622,7 +626,16 @@ impl LanguageCoordinator {
             }
         }
         let trial = scratch.language_state(Some(scratch_generation));
-        let changed = current != trial;
+        // A broken query file compiles to the same (absent or partial) query
+        // however it is broken, so identity cannot tell a newly broken file
+        // from an old one. Reload whenever the files have problems, as every
+        // configuration push did before the skip existed: that is the only
+        // way their warnings reach the user.
+        let changed = current != trial
+            || scratch
+                .query_problems
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0;
         *self
             .trial_queries
             .lock()
@@ -1288,6 +1301,7 @@ impl LanguageCoordinator {
                 return;
             }
             Err(err) => {
+                self.note_query_problem();
                 events.push(LanguageEvent::log(
                     LanguageLogLevel::Warning,
                     format!(
@@ -1322,6 +1336,7 @@ impl LanguageCoordinator {
         let result = match QueryLoader::load_content_from_paths(paths) {
             Ok(source) => self.compile_query(language, source, paths.len() > 1),
             Err(err) => {
+                self.note_query_problem();
                 events.push(LanguageEvent::log(
                     LanguageLogLevel::Error,
                     format!(
@@ -1406,6 +1421,11 @@ impl LanguageCoordinator {
             .retain(|_, (query, _)| query.strong_count() > 0);
     }
 
+    fn note_query_problem(&self) {
+        self.query_problems
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Process a ParseResult: log skipped patterns, insert query, log outcome.
     fn process_query_result(
         &self,
@@ -1415,6 +1435,9 @@ impl LanguageCoordinator {
         events: &mut Vec<LanguageEvent>,
         insert_fn: impl FnOnce(&QueryStore, Arc<tree_sitter::Query>),
     ) {
+        if !result.skipped.is_empty() || result.query.is_none() {
+            self.note_query_problem();
+        }
         // Log warnings for skipped patterns
         for skipped in &result.skipped {
             let preview = truncate_preview(&skipped.text, MAX_PREVIEW_LEN);
@@ -3967,6 +3990,43 @@ mod tests {
         assert!(
             !coordinator.ensure_language_loaded("dynamic").success,
             "a prior-generation dynamic entry must not bypass current search-path resolution"
+        );
+    }
+
+    /// A query file that fails to compile loads no query, before and after
+    /// it breaks, so only its warnings show the problem; a trial meeting one
+    /// must reload so they reach the user.
+    #[test]
+    fn reload_trial_reports_a_change_while_a_query_file_is_broken() {
+        let dir = tempdir().unwrap();
+        let query_path = dir.path().join("highlights.scm");
+        let coordinator = LanguageCoordinator::new();
+        coordinator
+            .language_registry
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        let settings = WorkspaceSettings {
+            languages: HashMap::from([(
+                "rust".to_string(),
+                LanguageSettings {
+                    queries: Some(vec![crate::config::settings::QueryItem {
+                        path: query_path.to_string_lossy().into_owned(),
+                        kind: Some(QueryKind::Highlights),
+                    }]),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        fs::write(&query_path, "(identifier) @variable\n").unwrap();
+        coordinator.load_settings(&settings);
+        assert!(!coordinator.reload_would_change_languages(&settings));
+
+        fs::write(&query_path, "(no_such_node) @broken\n").unwrap();
+        coordinator.load_settings(&settings);
+        assert!(coordinator.highlight_query("rust").is_none());
+        assert!(
+            coordinator.reload_would_change_languages(&settings),
+            "a broken query file must keep surfacing its warning"
         );
     }
 
