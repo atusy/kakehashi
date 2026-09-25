@@ -153,7 +153,8 @@ fn is_lua_space(c: u8) -> bool {
 
 /// Decode the escape sequences of a short string's contents, as Lua 5.4
 /// does. An escape Lua would reject, or a `\u{...}` that is not a Rust
-/// `char` (a surrogate or above `10FFFF`), is kept as written.
+/// `char` (a surrogate or above `10FFFF`), is kept as written. Byte
+/// escapes that form invalid UTF-8 become U+FFFD.
 fn decode_short_string(body: &[u8]) -> String {
     let mut out = Vec::with_capacity(body.len());
     let mut j = 0;
