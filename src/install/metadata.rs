@@ -249,34 +249,28 @@ fn extract_parser_metadata(
 
     // Find the end of this block by counting braces
     let block = find_matching_brace(&lua.code[block_start..])?;
-    let block_content = &lua.source[block_start + block.start..block_start + block.end];
+    let block = block_start + block.start..block_start + block.end;
 
-    // Extract URL (required)
-    let url_re = Regex::new(r#"url\s*=\s*'([^']+)'"#).ok()?;
-    let url = url_re
-        .captures(block_content)
-        .and_then(|cap| cap.get(1))
-        .map(|m| m.as_str().to_string())?;
-
-    // Extract revision (required) - in main branch, revision is inside install_info
-    let revision_re = Regex::new(r#"revision\s*=\s*'([^']+)'"#).ok()?;
-    let revision = revision_re
-        .captures(block_content)
-        .and_then(|cap| cap.get(1))
-        .map(|m| m.as_str().to_string())?;
-
-    // Extract location (optional)
-    let location_re = Regex::new(r#"location\s*=\s*'([^']+)'"#).ok()?;
-    let location = location_re
-        .captures(block_content)
-        .and_then(|cap| cap.get(1))
-        .map(|m| m.as_str().to_string());
+    // In main branch, all three live inside install_info
+    let url = string_field(lua, block.clone(), "url")?;
+    let revision = string_field(lua, block.clone(), "revision")?;
+    let location = string_field(lua, block, "location");
 
     Some(ParserMetadata {
         url,
         revision,
         location,
     })
+}
+
+/// The non-empty string value of the first `key = <string>` field in the
+/// `block` range of `lua`.
+fn string_field(lua: &LuaCode, block: Range<usize>, key: &str) -> Option<String> {
+    let field_re = Regex::new(&format!(r"\b{}\s*=\s*", regex::escape(key))).ok()?;
+    let value_start = block.start + field_re.find(&lua.code[block])?.end();
+    lua.string_at(value_start)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 /// Find the range of the braces matching the first `{`, inclusive.
