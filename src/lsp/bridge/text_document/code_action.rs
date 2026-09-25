@@ -597,8 +597,13 @@ impl LanguageServerPool {
                 async move {
                     (
                         idx,
-                        self.send_code_action_resolve_on_handle(handle, action, upstream_id, None)
-                            .await,
+                        self.send_code_action_resolve_on_handle(
+                            handle,
+                            action,
+                            upstream_id,
+                            ResolveTarget::Unchecked,
+                        )
+                        .await,
                     )
                 }
             }))
@@ -799,7 +804,7 @@ impl LanguageServerPool {
                 &handle,
                 outgoing,
                 upstream_id,
-                Some(HostResolveContext {
+                ResolveTarget::Host(HostResolveContext {
                     uri: &host_url,
                     incarnation: envelope.incarnation,
                     content_version: envelope.content_version,
@@ -943,7 +948,12 @@ impl LanguageServerPool {
         translate_action_ranges_host_to_virtual(&mut outgoing, &offset);
 
         let Some(resolved) = self
-            .send_code_action_resolve_on_handle(&handle, outgoing, upstream_id, None)
+            .send_code_action_resolve_on_handle(
+                &handle,
+                outgoing,
+                upstream_id,
+                ResolveTarget::Unchecked,
+            )
             .await
         else {
             // Per-selection warn (bounded: one per user-selected action) — the
@@ -1105,6 +1115,15 @@ fn finalize_virt_resolved_action(
     resolved
 }
 
+/// What a `codeAction/resolve` refers to on the connection it is sent on,
+/// which decides the checks made while it is enqueued.
+enum ResolveTarget<'a> {
+    /// No document check at enqueue (the virtual layer).
+    Unchecked,
+    /// A host-layer action: synchronize and verify the host document.
+    Host(HostResolveContext<'a>),
+}
+
 impl LanguageServerPool {
     /// Send a `codeAction/resolve` request on an already-connected handle and
     /// parse the response into a resolved `CodeAction`. Returns `None` on any
@@ -1114,7 +1133,7 @@ impl LanguageServerPool {
         handle: &Arc<ConnectionHandle>,
         action: CodeAction,
         upstream_id: Option<UpstreamId>,
-        host_context: Option<HostResolveContext<'_>>,
+        target: ResolveTarget<'_>,
     ) -> Option<CodeAction> {
         let connection_key = handle.key();
         if let Some(ref id) = upstream_id {
@@ -1147,7 +1166,7 @@ impl LanguageServerPool {
         // fetching the handle — earliest on the eager-resolve pass — and this
         // send would queue the resolve and its cancel bookkeeping on a dead
         // handle, losing cancel forwarding and waiting out the full timeout.
-        if let Some(context) = host_context {
+        if let ResolveTarget::Host(context) = target {
             if let Err(error) = self
                 .enqueue_host_resolve(handle, context, request, request_id)
                 .await
@@ -1776,7 +1795,7 @@ mod tests {
                         ..Default::default()
                     },
                     Some(upstream_id),
-                    None,
+                    ResolveTarget::Unchecked,
                 )
                 .await
             })
