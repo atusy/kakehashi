@@ -871,6 +871,20 @@ impl LanguageServerPool {
                 return action;
             }
         };
+        // A just-replaced origin re-opens its virtual documents asynchronously
+        // after `Ready`, and the outbound queue is FIFO: sending now could hand
+        // the downstream a resolve for a document it has not opened yet. Wait
+        // for that re-open (bounded; a no-op when none is in flight), and fail
+        // soft rather than send without the ordering guarantee.
+        if !self.wait_for_pending_reopen(handle.key()).await {
+            warn!(
+                target: "kakehashi::bridge",
+                "codeAction/resolve: {server_name:?} is still re-opening its documents; \
+                 returning unresolved rather than resolving out of order"
+            );
+            re_envelope_action(&mut action, &envelope);
+            return action;
+        }
         if !handle.has_capability("codeAction/resolve") {
             // Anomalous: the envelope was only minted because the origin
             // advertised resolve, so reaching here means a respawn changed
