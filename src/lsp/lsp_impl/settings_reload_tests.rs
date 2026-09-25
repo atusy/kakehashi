@@ -490,3 +490,45 @@ fn settings_affect_documents_classifies_each_field() {
         );
     }
 }
+
+/// `kakehashi/textDocument/captures` compiles kind files straight from the
+/// search paths and caches them per generation; an identical reload after
+/// such a file was edited must reload, or the cache keeps serving the old
+/// query.
+#[tokio::test]
+async fn identical_reload_tracks_edits_to_a_captures_kind_file() {
+    let search_path = tempfile::tempdir().unwrap();
+    let kind_dir = search_path.path().join("queries").join("rust");
+    std::fs::create_dir_all(&kind_dir).unwrap();
+    std::fs::write(kind_dir.join("folds.scm"), "(function_item) @fold\n").unwrap();
+    let (service, client) = server_with_builtin_rust();
+    let server = service.inner();
+    let settings = search_path_settings(search_path.path());
+    server
+        .apply_raw_settings(RawWorkspaceSettings::default(), settings.clone())
+        .await;
+    let uri = open_and_wait_for_tree(server, "captures.rs", "rust").await;
+    let captures = || {
+        server.kakehashi_captures_full(kakehashi::captures::CapturesFullParams {
+            text_document: tower_lsp_server::ls_types::TextDocumentIdentifier {
+                uri: url_to_uri(&uri).unwrap(),
+            },
+            kind: "folds".to_string(),
+            injection: false,
+        })
+    };
+    captures().await.expect("captures request must succeed");
+    let generation = generations(server);
+
+    let unchanged = server
+        .apply_raw_settings(RawWorkspaceSettings::default(), settings.clone())
+        .await;
+    assert_no_reload_work(&unchanged, server, &uri, generation);
+
+    std::fs::write(kind_dir.join("folds.scm"), "(block) @fold\n").unwrap();
+    let edited = server
+        .apply_raw_settings(RawWorkspaceSettings::default(), settings)
+        .await;
+    assert_full_reload_work(&edited, &uri);
+    client.abort();
+}
