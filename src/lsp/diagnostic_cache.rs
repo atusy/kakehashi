@@ -44,9 +44,9 @@
 //! (#429). Still deferred: the `preferred` sticky-election strategy fan-in (the
 //! `concatenated` strategy — keep every server, in a deterministic position
 //! order — ships in #423; `preferred` needs a per-source version baseline #422
-//! left unbuilt). The `content_epoch`
-//! version gate was evaluated and rejected (it converts a self-healing stale-overwrite
-//! into a reopen-resurrection hide); the stale-overwrite is left self-healing.
+//! left unbuilt). The `content_epoch` version gate was evaluated and rejected
+//! (it converts a self-healing stale-overwrite into a reopen-resurrection hide);
+//! the stale-overwrite is left self-healing.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
