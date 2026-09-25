@@ -152,7 +152,8 @@ fn is_lua_space(c: u8) -> bool {
 }
 
 /// Decode the escape sequences of a short string's contents, as Lua 5.4
-/// does. An escape Lua would reject is kept as written.
+/// does. An escape Lua would reject, or a `\u{...}` that is not a Rust
+/// `char` (a surrogate or above `10FFFF`), is kept as written.
 fn decode_short_string(body: &[u8]) -> String {
     let mut out = Vec::with_capacity(body.len());
     let mut j = 0;
@@ -191,10 +192,7 @@ fn decode_short_string(body: &[u8]) -> String {
                     j += 1;
                 }
             }
-            b'x' => match body
-                .get(j..j + 2)
-                .and_then(|h| u8::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok())
-            {
+            b'x' => match body.get(j..j + 2).and_then(|h| parse_hex(h, 2)) {
                 Some(byte) => {
                     out.push(byte);
                     j += 2;
@@ -233,12 +231,32 @@ fn decode_short_string(body: &[u8]) -> String {
 }
 
 /// Parse the `{XXX}` of a `\u{XXX}` escape, returning the character and
-/// the length of the braced part.
+/// the length of the braced part. Lua allows at most 8 hex digits
+/// (`7FFFFFFF`); only values that are Rust `char`s decode.
 fn unicode_escape(rest: &[u8]) -> Option<(char, usize)> {
-    let close = rest.strip_prefix(b"{")?.iter().position(|&c| c == b'}')?;
-    let hex = std::str::from_utf8(&rest[1..1 + close]).ok()?;
-    let ch = char::from_u32(u32::from_str_radix(hex, 16).ok()?)?;
-    Some((ch, close + 2))
+    let digits = rest.strip_prefix(b"{")?;
+    let len = digits
+        .iter()
+        .take(8)
+        .take_while(|c| c.is_ascii_hexdigit())
+        .count();
+    if digits.get(len) != Some(&b'}') {
+        return None;
+    }
+    let ch = char::from_u32(parse_hex(&digits[..len], 8)?)?;
+    Some((ch, len + 2))
+}
+
+/// Parse 1 to `max` hex digits, rejecting any other byte (including the
+/// sign `from_str_radix` would accept).
+fn parse_hex<T: TryFrom<u32>>(digits: &[u8], max: usize) -> Option<T> {
+    if digits.is_empty() || digits.len() > max || !digits.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    let value = digits
+        .iter()
+        .try_fold(0u32, |acc, &d| Some(acc * 16 + char::from(d).to_digit(16)?))?;
+    T::try_from(value).ok()
 }
 
 /// A long string's value: its contents without a first line break.
