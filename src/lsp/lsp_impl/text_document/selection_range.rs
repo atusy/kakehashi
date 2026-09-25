@@ -204,8 +204,8 @@ mod tests {
         }
     }
 
-    /// The reparse a reload schedules: the live text's tree at the live
-    /// version, installed like every parse.
+    /// A completed parse of the live version (with or without a tree),
+    /// published through `install_parse` — the placeholder's replacement.
     fn install_current_parse(server: &Kakehashi, uri: &Url, tree: Option<tree_sitter::Tree>) {
         let view = server.documents.latest_snapshot(uri).unwrap();
         let installed = server.documents.install_parse(
@@ -246,6 +246,10 @@ mod tests {
             .expect("the reparse is current")
             .expect("the reparse's tree answers the request");
         assert_eq!(ranges.len(), 1);
+        assert!(
+            ranges[0].parent.is_some(),
+            "a tree-less walk answers one parentless range; the reparse's tree nests"
+        );
     }
 
     /// A completed parse that produced no tree is a final answer: `null` at
@@ -271,7 +275,7 @@ mod tests {
     /// A reparse still queued at the deadline leaves the live text without a
     /// tree, not the request's coordinates stale: `null`, as before the first
     /// parse, rather than `ContentModified`.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn answers_null_when_the_reparse_outlasts_the_wait() {
         let uri = Url::parse("file:///slow_reparse.rs").unwrap();
         let service = server_with_parsed_doc(&uri);
