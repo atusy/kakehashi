@@ -2363,6 +2363,41 @@ fn test_language_uninstall_removes_special_file_query_entries() {
     }
 }
 
+/// The parser slot answers the same way as the query slot: install's rename
+/// replaces any non-directory at `parser/<lang>.<ext>`, so uninstall takes one
+/// back rather than walking past it and calling the language absent.
+#[test]
+#[cfg(unix)]
+fn test_language_uninstall_removes_special_file_parser_entries() {
+    use std::fs;
+
+    let ext = std::env::consts::DLL_EXTENSION;
+    for kind in ["fifo", "socket"] {
+        for args in [&["lua"][..], &["--all"][..]] {
+            let test_dir = short_temp_dir();
+            fs::create_dir_all(test_dir.path().join("parser"))
+                .expect("Failed to create parser dir");
+            let entry = test_dir.path().join(format!("parser/lua.{ext}"));
+            let _listener = make_special_file(&entry, kind);
+
+            let (success, combined) = run_forced_uninstall(test_dir.path(), args);
+
+            assert!(
+                success,
+                "a {kind} in the parser slot must not fail {args:?}: {combined}"
+            );
+            assert!(
+                fs::symlink_metadata(&entry).is_err(),
+                "the {kind} must be unlinked by {args:?}: {combined}"
+            );
+            assert!(
+                !combined.contains("is not installed"),
+                "an entry that was just removed was not absent: {combined}"
+            );
+        }
+    }
+}
+
 /// A language whose OWN parser entry could not be read must be left whole.
 /// Removing its queries anyway would manufacture the parser-only state — which
 /// is #953's headline shape, reached through the per-entry door instead of the
