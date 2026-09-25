@@ -738,7 +738,7 @@ fn run_language_uninstall(
                     }
                 }
                 Ok(Some(ParserEntry::WrongShape)) => {
-                    unmanaged.push((path.clone(), "it is not a shape this CLI can remove"));
+                    unmanaged.push((path.clone(), WRONG_SHAPE_PARSER_NOTE));
                 }
                 Err(error) => {
                     // Debug-format: the name comes from the filesystem, so it
@@ -911,6 +911,12 @@ fn run_language_uninstall(
                     any_failed = true;
                     continue;
                 }
+                // Still "not installed", but not "nothing here": name what is
+                // left, as `--all` discovery already did for this entry (and
+                // only by name, so `--all` does not print it twice).
+                if !all {
+                    unmanaged.push((path, WRONG_SHAPE_PARSER_NOTE));
+                }
                 None
             }
             Err(e) => {
@@ -1077,6 +1083,12 @@ fn find_parser_entry(
     let path = parser_entry_path(parser_dir, lang);
     Ok(parser_entry_kind(&path)?.map(|entry| (path, entry)))
 }
+
+/// Why a [`ParserEntry::WrongShape`] entry was left, and what to do about it.
+/// The only such shape is a directory, which no install writes, so it is the
+/// user's to judge.
+const WRONG_SHAPE_PARSER_NOTE: &str =
+    "it is a directory, which this CLI never removes; delete it by hand if it is not yours";
 
 /// What a path in `parser/` is, as far as uninstall is concerned.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
