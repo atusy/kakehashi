@@ -433,6 +433,10 @@ fn store_kind_query(language_id: &str, file_name: &str, stored: CachedKindQuery)
     }
 }
 
+/// How many cached kind queries [`kind_queries_changed`] resolves before it
+/// gives up and reports a change.
+const MAX_SCANNED_KIND_QUERIES: usize = 256;
+
 /// Search paths and generation under which two loads of one kind query
 /// compiled different text: the file changed between them, and a document's
 /// captures memo of that generation may hold results of the older one. Only
@@ -615,6 +619,13 @@ pub(in crate::lsp::lsp_impl) fn kind_queries_changed(
                 .collect::<Vec<_>>()
         })
         .collect();
+    // Kind names are client-chosen, so the cache can hold arbitrarily many
+    // entries, and this scan resolves each one on every push. Past the
+    // bound, report a change instead: the reload that follows bumps the
+    // generation, which leaves nothing current for the next scan to walk.
+    if cached.len() > MAX_SCANNED_KIND_QUERIES {
+        return true;
+    }
     // After the snapshot, not before: a store that replaced an entry with
     // different text either landed before the snapshot, and its conflict is
     // already recorded (under the entry's lock, before the replacement), or
@@ -2104,6 +2115,17 @@ mod tests {
             kind_queries_changed(&search_paths, GENERATION),
             "the current entry must survive an older request's store"
         );
+        // Past the scan bound, the scan reports a change without resolving.
+        for index in 0..=MAX_SCANNED_KIND_QUERIES {
+            let _ = load_kind_query_cached(
+                &registry,
+                &search_paths,
+                LANGUAGE,
+                &format!("unused_{index}.scm"),
+                GENERATION + 2,
+            );
+        }
+        assert!(kind_queries_changed(&search_paths, GENERATION + 2));
         let elsewhere = tempfile::tempdir().unwrap();
         assert!(
             !kind_queries_changed(&[elsewhere.path().to_path_buf()], GENERATION),
