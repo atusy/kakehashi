@@ -695,6 +695,37 @@ mod tests {
         assert_eq!(walked, vec![tmp.path().join("a.md")]);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_symlink_alias_collapses_to_the_first_given_spelling() {
+        // Windows keys aliases by canonical path, which is `\\?\`-prefixed;
+        // the survivor must still be the spelling the user gave. Creating a
+        // symlink needs Developer Mode or elevation, so skip without it.
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join("doc.md"), "x");
+        let doc = tmp.path().join("doc.md");
+        let alias = tmp.path().join("alias.md");
+        if std::os::windows::fs::symlink_file(&doc, &alias).is_err() {
+            return;
+        }
+
+        let target_first = collect_paths(
+            tmp.path(),
+            &[doc.clone(), alias.clone()],
+            &[],
+            &markdown_only,
+        );
+        let alias_first = collect_paths(
+            tmp.path(),
+            &[alias.clone(), doc.clone()],
+            &[],
+            &markdown_only,
+        );
+
+        assert_eq!(target_first, vec![doc]);
+        assert_eq!(alias_first, vec![alias]);
+    }
+
     #[test]
     fn explicitly_named_hidden_directory_is_walked() {
         // The walker's hidden-file filter applies to entries, not to the
