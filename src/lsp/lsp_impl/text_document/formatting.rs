@@ -102,9 +102,8 @@ impl Kakehashi {
         // ContentModified rather than silently no-opping an action the user
         // consciously triggered. Never-parsed/gone falls through to the
         // existing empty fallbacks below.
-        if let crate::lsp::lsp_impl::snapshot_read::SnapshotWait::Stale = self
-            .wait_for_current_snapshot(&uri, std::time::Duration::from_millis(500))
-            .await
+        if let crate::lsp::lsp_impl::snapshot_read::SnapshotWait::Stale =
+            self.wait_for_explicit_action_snapshot(&uri).await
         {
             return Err(crate::error::content_modified_error());
         }
