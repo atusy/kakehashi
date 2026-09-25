@@ -320,6 +320,17 @@ impl AutoInstallManager {
         initial_pass || first
     }
 
+    /// Whether any query repair failed in `generation`. Such a failure waits
+    /// for the next generation to be retried, so a configuration push must
+    /// not skip the reload that starts one.
+    pub(crate) fn has_failed_query_repairs(&self, generation: u64) -> bool {
+        let checked = self
+            .query_dependency_checks
+            .lock()
+            .recover_poison("AutoInstallManager::has_failed_query_repairs");
+        generation == checked.generation && !checked.failed.is_empty()
+    }
+
     /// Whether a repair of `language` already failed in `generation`, for a
     /// probe admitting its answer after other repairs may have finished.
     pub(crate) fn query_repair_failed(&self, language: &str, generation: u64) -> bool {

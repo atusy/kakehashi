@@ -168,6 +168,35 @@ async fn identical_reload_neither_reparses_nor_refreshes() {
     client.abort();
 }
 
+/// A failed query repair is retried only in a new generation; before the
+/// skip existed any configuration push started one, so a push must still
+/// reload while a failure waits, even with nothing else changed.
+#[tokio::test]
+async fn identical_reload_still_reloads_while_a_query_repair_failure_waits() {
+    let (service, client) = server_with_builtin_rust();
+    let server = service.inner();
+    server
+        .apply_raw_settings(RawWorkspaceSettings::default(), baseline_settings())
+        .await;
+    let uri = open_and_wait_for_tree(server, "repair.rs", "rust").await;
+    server
+        .auto_install
+        .record_query_repair_failure("lua", server.cache.semantic_token_generation());
+
+    let outcome = server
+        .apply_raw_settings(RawWorkspaceSettings::default(), baseline_settings())
+        .await;
+
+    assert_full_reload_work(&outcome, &uri);
+    assert!(
+        !server
+            .auto_install
+            .has_failed_query_repairs(server.cache.semantic_token_generation()),
+        "the reload starts the generation the failed repair retries in"
+    );
+    client.abort();
+}
+
 /// Only a configuration push may skip: a workspace-folder change moves the
 /// root, which keys bridge connections and which no settings comparison
 /// sees, so it reloads even with identical settings.

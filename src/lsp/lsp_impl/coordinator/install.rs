@@ -686,6 +686,7 @@ impl InstallCoordinator {
                 parser_pool: &self.parser_pool,
                 documents: &self.documents,
                 trigger: ReloadTrigger::Install,
+                reload_required: false,
             },
             &self.settings_manager,
             &self.cache,

@@ -107,6 +107,10 @@ pub(super) struct ReloadLanguageState<'a> {
     parser_pool: &'a std::sync::Mutex<DocumentParserPool>,
     documents: &'a DocumentStore,
     trigger: ReloadTrigger,
+    /// The caller needs the language reload whatever a configuration
+    /// reload's skip check finds: a failed query repair is retried only in a
+    /// new generation, which only the reload starts.
+    reload_required: bool,
 }
 
 /// What caused a settings application. Each trigger has its own answer to
@@ -354,6 +358,7 @@ pub(super) async fn apply_shared_settings_locked(
     // and its follow-ups are what repair that. A reload that would change
     // nothing skips both halves.
     let reload_languages = language_state.trigger != ReloadTrigger::Configuration
+        || language_state.reload_required
         || configuration_reload_needed(
             language_state.language,
             cache,
@@ -759,6 +764,9 @@ impl Kakehashi {
                 parser_pool: &self.parser_pool,
                 documents: &self.documents,
                 trigger,
+                reload_required: self
+                    .auto_install
+                    .has_failed_query_repairs(self.cache.semantic_token_generation()),
             },
             &self.settings_manager,
             &self.cache,
@@ -807,6 +815,7 @@ impl Kakehashi {
                 parser_pool: &self.parser_pool,
                 documents: &self.documents,
                 trigger: ReloadTrigger::Initialize,
+                reload_required: false,
             },
             &self.settings_manager,
             &self.cache,
