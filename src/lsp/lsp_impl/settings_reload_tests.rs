@@ -348,6 +348,14 @@ async fn identical_reload_reparses_when_a_missing_parser_appeared() {
         .await;
     assert!(!server.language.has_parser_available("lua"));
 
+    let generation = server.cache.semantic_token_generation();
+    let still_missing = server
+        .apply_raw_settings(RawWorkspaceSettings::default(), settings.clone())
+        .await;
+    assert!(still_missing.reparse_uris.is_empty());
+    assert!(!still_missing.semantic_refresh_requested);
+    assert_eq!(server.cache.semantic_token_generation(), generation);
+
     install_lua_parser(search_path.path(), &parser);
     let outcome = server
         .apply_raw_settings(RawWorkspaceSettings::default(), settings)
