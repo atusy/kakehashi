@@ -187,7 +187,7 @@ impl ReloadTrigger {
 ///   connection by an identical push; the next edit's reparse, any settings
 ///   change or a workspace-folder change re-roots it (#1145).
 /// - Failed language loads are remembered for the trial only up to a bound
-///   (see `LanguageCoordinator::load_settings`); past it, a parser appearing
+///   (`MAX_REMEMBERED_FAILED_LOADS` in the language coordinator); past it, a parser appearing
 ///   for a forgotten one is picked up by the next document that needs it,
 ///   not by an identical push.
 async fn configuration_reload_needed(

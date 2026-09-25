@@ -15,8 +15,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use tree_sitter::Language;
 
-/// How many failed language loads survive a settings load for the reload
-/// trial to re-read (see `LanguageCoordinator::load_settings`).
+/// How many failed language loads are remembered (see
+/// `LanguageCoordinator::failed_loads`). Every one is re-read by each reload
+/// trial, and names can come from document text (code-fence info strings).
 const MAX_REMEMBERED_FAILED_LOADS: usize = 256;
 
 /// Maximum length (in characters) for pattern previews in log messages.
@@ -335,6 +336,13 @@ impl LanguageCoordinator {
     /// entry suppresses nothing — the store itself cannot re-poison, closing
     /// the check-then-insert window an insert-time gate had.
     fn record_failed_load(&self, language_id: &str, current_generation: u64) {
+        // Past the bound, forget the rest, as every settings load used to:
+        // configuration pushes that skip the reload never load settings, so
+        // the bound is kept here. Forgetting only costs a language a fresh
+        // lookup (or the reload trial's attention) until it fails again.
+        if self.failed_loads.len() >= MAX_REMEMBERED_FAILED_LOADS {
+            self.failed_loads.clear();
+        }
         self.failed_loads
             .insert(language_id.to_string(), current_generation);
     }
@@ -535,12 +543,6 @@ impl LanguageCoordinator {
                 .recover_poison("LanguageCoordinator::load_settings(generation)");
             self.load_generation
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
-        }
-        // Bound the remembered failures: every one is re-read by each reload
-        // trial, and names can come from document text (code-fence info
-        // strings). Past the bound, forget them all, as every load used to.
-        if self.failed_loads.len() > MAX_REMEMBERED_FAILED_LOADS {
-            self.failed_loads.clear();
         }
         self.configured_load_failures.clear();
 
@@ -4178,6 +4180,17 @@ mod tests {
         assert!(coordinator.reload_would_change_languages(&settings));
         drop(in_flight);
         assert!(!coordinator.reload_would_change_languages(&settings));
+    }
+
+    /// Configuration pushes that skip the reload never run a settings load,
+    /// so the bound on remembered failures holds as they are recorded.
+    #[test]
+    fn remembered_failed_loads_stay_bounded_without_a_settings_load() {
+        let coordinator = LanguageCoordinator::new();
+        for index in 0..(MAX_REMEMBERED_FAILED_LOADS * 2) {
+            coordinator.record_failed_load(&format!("missing_{index}"), 0);
+        }
+        assert!(coordinator.failed_loads.len() <= MAX_REMEMBERED_FAILED_LOADS);
     }
 
     /// A reload that reparses nothing (the post-install one) must not make
