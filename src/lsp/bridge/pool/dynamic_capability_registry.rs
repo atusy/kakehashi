@@ -10,7 +10,9 @@ use crate::error::LockResultExt;
 ///
 /// Downstream language servers (e.g., Pyright) register capabilities dynamically
 /// via `client/registerCapability` after the initialize handshake. This registry
-/// tracks those registrations so the bridge can check capability support.
+/// tracks those registrations so the bridge can check capability support. It
+/// also holds a static `workspace.workspaceFolders.changeNotifications` id,
+/// which LSP makes a registration the server may unregister (#1117).
 ///
 /// The LSP spec allows multiple registrations per method (with different document
 /// selectors and IDs). We key by registration ID, allowing multiple same-method
