@@ -912,6 +912,89 @@ mod tests {
         assert_eq!(request.await.unwrap().label, "resolved");
     }
 
+    /// A host document the replacement already has open needs no barrier: its
+    /// didOpen is ahead in the FIFO. Waiting anyway stalls the resolve, and
+    /// fails it when the sweep reports some other document unsettled.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn host_completion_resolve_skips_the_barrier_for_an_open_document() {
+        use crate::lsp::bridge::ConnectionState;
+        use crate::lsp::bridge::pool::test_helpers::{
+            create_handle_with_command, devnull_config, wait_for_sent_request,
+        };
+        use tower_lsp_server::ls_types::{CompletionOptions, ServerCapabilities};
+        let pool = Arc::new(LanguageServerPool::new());
+        let mut envelope = test_envelope();
+        envelope.host_layer = true;
+        envelope.region_id = String::new();
+        let uri = Url::parse(&envelope.host_uri).unwrap();
+        let config = devnull_config();
+        let (_marker, key) = pool
+            .resolve_acquire(&envelope.origin, &config, Some(&uri))
+            .await;
+        let (handle, _) = create_handle_with_command(
+            ConnectionState::Ready,
+            key.clone(),
+            vec!["sh".into(), "-c".into(), "cat > /dev/null".into()],
+            Some(ServerCapabilities {
+                completion_provider: Some(CompletionOptions {
+                    resolve_provider: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        )
+        .await;
+        pool.insert_connection(Arc::clone(&handle)).await;
+        pool.open_host_incarnation(&uri, 1).await;
+        super::super::test_helpers::open_resolve_host(&pool, &handle, &uri).await;
+        // A re-open is outstanding and never settles within this test.
+        let _done = pool.claim_reopen_for_test(&key);
+
+        let edit_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let document = CompletionResolveDocument {
+            host_uri: uri.clone(),
+            language_id: "lua".into(),
+            text: Arc::from("local x = 1"),
+            geometry: None,
+            revision: HostRevision {
+                incarnation: 1,
+                content_version: 1,
+            },
+            edit_guard: Arc::clone(&edit_lock).lock_owned().await,
+        };
+        let upstream_id = UpstreamId::Number(80);
+        let request = {
+            let pool = Arc::clone(&pool);
+            let upstream_id = upstream_id.clone();
+            tokio::spawn(async move {
+                pool.send_host_completion_resolve(
+                    &config,
+                    CompletionItem {
+                        label: "old".into(),
+                        ..Default::default()
+                    },
+                    envelope,
+                    Some(upstream_id),
+                    std::future::ready(Some(document)),
+                )
+                .await
+            })
+        };
+        let downstream_id = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            wait_for_sent_request(&handle, &upstream_id),
+        )
+        .await
+        .expect("an already-open document must not wait on the re-open barrier");
+        let _ = handle.router().route(json!({
+            "jsonrpc": "2.0",
+            "id": downstream_id.as_i64(),
+            "result": { "label": "resolved" }
+        }));
+        assert_eq!(request.await.unwrap().label, "resolved");
+    }
+
     /// A matched reply remains usable when the connection retires after send.
     #[cfg(unix)]
     #[tokio::test]
