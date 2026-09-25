@@ -188,12 +188,15 @@ fn settings_affect_documents(previous: &WorkspaceSettings, next: &WorkspaceSetti
 }
 
 /// Whether a configuration reload to `settings` must run the language
-/// reload: the settings changed something documents depend on, or the parser
-/// and query files it would re-read changed on disk. The disk check runs on
-/// the blocking pool and never touches the live coordinator; if it cannot
-/// finish, reload.
+/// reload: the settings changed something documents depend on, or query or
+/// parser files it would re-read changed on disk — the languages' own, or a
+/// `kakehashi/captures` kind query compiled under the current generation,
+/// which only the reload's generation bump would otherwise invalidate. The
+/// disk checks run on the blocking pool and never touch the live
+/// coordinator; if they cannot finish, reload.
 async fn configuration_reload_needed(
     language: &std::sync::Arc<LanguageCoordinator>,
+    cache: &CacheCoordinator,
     previous: &WorkspaceSettings,
     settings: &WorkspaceSettings,
 ) -> bool {
@@ -202,9 +205,13 @@ async fn configuration_reload_needed(
     }
     let language = std::sync::Arc::clone(language);
     let settings = settings.clone();
-    tokio::task::spawn_blocking(move || language.reload_would_change_languages(&settings))
-        .await
-        .unwrap_or(true)
+    let generation = cache.semantic_token_generation();
+    tokio::task::spawn_blocking(move || {
+        language.reload_would_change_languages(&settings)
+            || kakehashi::captures::kind_queries_changed(&language.search_paths(), generation)
+    })
+    .await
+    .unwrap_or(true)
 }
 
 /// What one settings application asked of the documents and the client.
@@ -347,6 +354,7 @@ pub(super) async fn apply_shared_settings_locked(
     let reload_languages = language_state.trigger != ReloadTrigger::Configuration
         || configuration_reload_needed(
             language_state.language,
+            cache,
             &settings_manager.load_settings(),
             &settings,
         )

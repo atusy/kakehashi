@@ -476,6 +476,27 @@ impl QueryLoader {
         ))
     }
 
+    /// The complete query text [`Self::load_query_with_inheritance`] would
+    /// compile — `inherits` parents and `extends` overlays resolved across
+    /// the search paths — without compiling it.
+    pub(crate) fn resolve_query_source<P: AsRef<Path>>(
+        runtime_bases: &[P],
+        lang_name: &str,
+        file_name: &str,
+    ) -> Result<String, QueryLoadError> {
+        let mut visited = std::collections::HashSet::new();
+        let mut emitted = std::collections::HashSet::new();
+        Self::resolve_query_recursive(
+            runtime_bases,
+            lang_name,
+            file_name,
+            false,
+            &mut visited,
+            &mut emitted,
+        )
+        .map(|resolved| resolved.content)
+    }
+
     /// Resolve library path for a language.
     ///
     /// An explicit `library` is normalized and returned as-is; otherwise searches
