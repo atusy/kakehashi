@@ -51,6 +51,7 @@ impl Kakehashi {
         // staleness-reject, with the explicit-action wait). This replaces the
         // former reader on-demand parse: readers never parse inline.
         let deadline = tokio::time::Instant::now() + SELECTION_RANGE_WAIT;
+        let mut expired = false;
         let snapshot = loop {
             // Subscribe BEFORE checking (lost-wakeup guard, see
             // snapshot_for_tokens), then re-resolve per iteration
@@ -68,36 +69,35 @@ impl Kakehashi {
                 .snapshot
                 .as_ref()
                 .filter(|snapshot| snapshot.parsed_version == view.content_version);
-            match current {
-                Some(snapshot) if !snapshot.awaiting_reparse => {
-                    break std::sync::Arc::clone(snapshot);
-                }
-                _ => {
-                    // No snapshot yet (first parse in flight), trailing an
-                    // edit, or a reload placeholder whose reparse is still
-                    // queued: wait for the next publish, bounded by the
-                    // deadline.
-                    let wait = tokio::time::timeout_at(deadline, receiver.changed()).await;
-                    match wait {
-                        // A publish (or close) landed — loop and re-resolve.
-                        Ok(Ok(())) => continue,
-                        // Channel closed: the document is gone.
-                        Ok(Err(_)) => return Ok(None),
-                        // Deadline passed. A stale snapshot exists → the
-                        // coordinates can't be answered: ContentModified. No
-                        // parse of the current text yet — the first parse or
-                        // a reload's reparse still running — → the
-                        // pre-snapshot behavior: null (the coordinates are
-                        // the live text's, there is just no tree for them).
-                        Err(_elapsed) => {
-                            return if current.is_none() && view.slot.snapshot.is_some() {
-                                Err(crate::error::content_modified_error())
-                            } else {
-                                Ok(None)
-                            };
-                        }
-                    }
-                }
+            if let Some(snapshot) = current
+                && !snapshot.awaiting_reparse
+            {
+                break std::sync::Arc::clone(snapshot);
+            }
+            if expired {
+                // Deadline passed, judged on a fresh read: an edit publishes
+                // no snapshot, so one landing mid-wait never woke us. A stale
+                // snapshot exists → the coordinates can't be answered:
+                // ContentModified. No parse of the current text yet — the
+                // first parse or a reload's reparse still running — → the
+                // pre-snapshot behavior: null (the coordinates are the live
+                // text's, there is just no tree for them).
+                return if current.is_none() && view.slot.snapshot.is_some() {
+                    Err(crate::error::content_modified_error())
+                } else {
+                    Ok(None)
+                };
+            }
+            // No snapshot yet (first parse in flight), trailing an edit, or a
+            // reload placeholder whose reparse is still queued: wait for the
+            // next publish, bounded by the deadline.
+            match tokio::time::timeout_at(deadline, receiver.changed()).await {
+                // A publish (or close) landed — loop and re-resolve.
+                Ok(Ok(())) => {}
+                // Channel closed: the document is gone.
+                Ok(Err(_)) => return Ok(None),
+                // Re-resolve once more, then answer from that read.
+                Err(_elapsed) => expired = true,
             }
         };
 
