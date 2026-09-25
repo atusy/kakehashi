@@ -6,13 +6,17 @@
 //! The main branch of nvim-treesitter uses a consolidated format where each language
 //! entry contains url, revision, and location all in one place.
 
+mod lua_code;
+
 use regex::Regex;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::Path;
 use std::time::Duration;
 
 use super::cache::MetadataCache;
 use super::http::agent_with_timeout;
+use lua_code::LuaCode;
 
 /// URL for nvim-treesitter parsers.lua on GitHub (main branch).
 const PARSERS_LUA_URL: &str = "https://raw.githubusercontent.com/nvim-treesitter/nvim-treesitter/main/lua/nvim-treesitter/parsers.lua";
@@ -153,8 +157,11 @@ fn download_parsers_lua() -> Result<String, MetadataError> {
 /// Parse the parsers.lua content to extract parser information.
 ///
 /// Handles the main branch format where languages are direct table keys.
+/// Structure is found in [`LuaCode::code`], so braces, quotes and keys
+/// inside string literals and comments never count.
 fn parse_parsers_lua(content: &str) -> Result<HashMap<String, ParserMetadata>, MetadataError> {
-    let content = returned_table(content)?;
+    let lua = LuaCode::new(content)?;
+    let table = returned_table(&lua.code)?;
     let mut parsers = HashMap::new();
 
     // Pattern to match parser entries in main branch format: lang = { ... }
@@ -165,7 +172,7 @@ fn parse_parsers_lua(content: &str) -> Result<HashMap<String, ParserMetadata>, M
 
     // Find all language names first
     let lang_names: Vec<String> = lang_pattern
-        .captures_iter(content)
+        .captures_iter(&lua.code[table.clone()])
         .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_string()))
         // Filter out non-language keys like "return", "install_info", etc.
         .filter(|name| !is_reserved_key(name))
@@ -173,7 +180,7 @@ fn parse_parsers_lua(content: &str) -> Result<HashMap<String, ParserMetadata>, M
 
     // For each language, find its block and extract metadata
     for lang in lang_names {
-        if let Some(info) = extract_parser_metadata(content, &lang) {
+        if let Some(info) = extract_parser_metadata(&lua, table.clone(), &lang) {
             parsers.insert(lang, info);
         }
     }
@@ -185,22 +192,25 @@ fn parse_parsers_lua(content: &str) -> Result<HashMap<String, ParserMetadata>, M
     Ok(parsers)
 }
 
-/// Return the table that parsers.lua returns, rejecting incomplete content.
+/// Locate the table that parsers.lua returns, rejecting incomplete content.
 ///
 /// Complete language blocks survive a cut-off file, so parsing them alone
 /// cannot tell a partial language list from the full one. Requiring the
-/// returned table to close, with nothing but whitespace after it, catches
-/// truncation and interleaved writes.
-fn returned_table(content: &str) -> Result<&str, MetadataError> {
+/// returned table to close, with nothing but whitespace or comments after
+/// it, catches truncation and interleaved writes.
+///
+/// `code` is [`LuaCode::code`]; the returned range indexes it and the source.
+fn returned_table(code: &str) -> Result<Range<usize>, MetadataError> {
     let return_re = Regex::new(r#"(?m)^\s*return\s*\{"#).expect("valid regex for return pattern");
     let open_brace = return_re
-        .find(content)
+        .find(code)
         .ok_or_else(|| MetadataError::ParseError("parsers.lua does not return a table".into()))?
         .end()
         - 1;
-    let table = find_matching_brace(&content[open_brace..])
+    let table = find_matching_brace(&code[open_brace..])
         .ok_or_else(|| MetadataError::ParseError("parsers.lua table is not closed".into()))?;
-    if !content[open_brace + table.len()..].trim().is_empty() {
+    let table = open_brace + table.start..open_brace + table.end;
+    if !code[table.end..].trim().is_empty() {
         return Err(MetadataError::ParseError(
             "parsers.lua has content after the returned table".into(),
         ));
@@ -223,18 +233,23 @@ fn is_reserved_key(name: &str) -> bool {
     )
 }
 
-/// Extract parser metadata for a specific language from parsers.lua content.
-fn extract_parser_metadata(content: &str, language: &str) -> Option<ParserMetadata> {
+/// Extract parser metadata for a specific language from the `table` range
+/// of parsers.lua.
+fn extract_parser_metadata(
+    lua: &LuaCode,
+    table: Range<usize>,
+    language: &str,
+) -> Option<ParserMetadata> {
     // Find the start of this language's block
     // Use word boundary to avoid matching substrings (e.g., "c" matching "cpp")
     let block_start_pattern = format!(r#"(?m)^\s*{}\s*=\s*\{{"#, regex::escape(language));
     let block_start_re = Regex::new(&block_start_pattern).ok()?;
 
-    let block_start = block_start_re.find(content)?;
-    let start_pos = block_start.start();
+    let block_start = table.start + block_start_re.find(&lua.code[table])?.start();
 
     // Find the end of this block by counting braces
-    let block_content = find_matching_brace(&content[start_pos..])?;
+    let block = find_matching_brace(&lua.code[block_start..])?;
+    let block_content = &lua.source[block_start + block.start..block_start + block.end];
 
     // Extract URL (required)
     let url_re = Regex::new(r#"url\s*=\s*'([^']+)'"#).ok()?;
@@ -264,8 +279,10 @@ fn extract_parser_metadata(content: &str, language: &str) -> Option<ParserMetada
     })
 }
 
-/// Find the content within matching braces starting from the first `{`.
-fn find_matching_brace(s: &str) -> Option<&str> {
+/// Find the range of the braces matching the first `{`, inclusive.
+///
+/// Every brace counts, so `s` must be [`LuaCode::code`] rather than source.
+fn find_matching_brace(s: &str) -> Option<Range<usize>> {
     let start = s.find('{')?;
     let mut depth = 0;
     let mut end = start;
@@ -284,11 +301,7 @@ fn find_matching_brace(s: &str) -> Option<&str> {
         }
     }
 
-    if depth == 0 {
-        Some(&s[start..end])
-    } else {
-        None
-    }
+    if depth == 0 { Some(start..end) } else { None }
 }
 
 /// Fetch parser metadata for a language from nvim-treesitter.
@@ -565,11 +578,11 @@ return {
     #[test]
     fn test_find_matching_brace() {
         let s = "{ foo { bar } baz }";
-        let result = find_matching_brace(s);
+        let result = find_matching_brace(s).map(|r| &s[r]);
         assert_eq!(result, Some("{ foo { bar } baz }"));
 
         let s2 = "prefix { inner } suffix";
-        let result2 = find_matching_brace(s2);
+        let result2 = find_matching_brace(s2).map(|r| &s2[r]);
         assert_eq!(result2, Some("{ inner }"));
     }
 
@@ -678,7 +691,8 @@ return {
   },
 "#;
 
-        let info = extract_parser_metadata(content, "rust").expect("should extract");
+        let lua = LuaCode::new(content).unwrap();
+        let info = extract_parser_metadata(&lua, 0..content.len(), "rust").expect("should extract");
         assert_eq!(info.url, "https://github.com/tree-sitter/tree-sitter-rust");
         assert_eq!(info.revision, "abc123");
         assert!(info.location.is_none());
@@ -697,7 +711,9 @@ return {
   },
 "#;
 
-        let info = extract_parser_metadata(content, "markdown").expect("should extract");
+        let lua = LuaCode::new(content).unwrap();
+        let info =
+            extract_parser_metadata(&lua, 0..content.len(), "markdown").expect("should extract");
         assert_eq!(
             info.url,
             "https://github.com/tree-sitter-grammars/tree-sitter-markdown"
