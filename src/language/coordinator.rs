@@ -133,6 +133,31 @@ pub(crate) struct LanguageCoordinator {
     /// one for configured languages, the next on-demand load for discovered
     /// ones — would compile the same text again.
     trial_queries: Mutex<Vec<Arc<tree_sitter::Query>>>,
+    /// On-demand loads between reading their files and publishing (see
+    /// [`DynamicLoadInFlight`]).
+    dynamic_loads_in_flight: std::sync::atomic::AtomicUsize,
+}
+
+/// Counts one on-demand load in [`LanguageCoordinator::dynamic_loads_in_flight`]
+/// for as long as it lives.
+///
+/// Such a load may have read a query before it was edited and publish it
+/// after a reload trial compared the registrations: without a settings
+/// reload bumping the generation, nothing would reject that stale
+/// publication, so the trial must not call the files unchanged meanwhile.
+struct DynamicLoadInFlight<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl<'a> DynamicLoadInFlight<'a> {
+    fn begin(counter: &'a std::sync::atomic::AtomicUsize) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self(counter)
+    }
+}
+
+impl Drop for DynamicLoadInFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 /// Published query per (grammar, complete source text), with the patterns
@@ -205,6 +230,7 @@ impl LanguageCoordinator {
             compiled_queries: Arc::new(Mutex::new(HashMap::new())),
             is_trial: false,
             trial_queries: Mutex::new(Vec::new()),
+            dynamic_loads_in_flight: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -551,6 +577,15 @@ impl LanguageCoordinator {
     /// they are, so a caller that finds nothing changed can skip the reload
     /// entirely. Blocking: reads files and compiles queries.
     pub(crate) fn reload_would_change_languages(&self, settings: &WorkspaceSettings) -> bool {
+        // A load that read its files before they changed can still publish
+        // them after this comparison; only a real reload rejects it.
+        if self
+            .dynamic_loads_in_flight
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
+        {
+            return true;
+        }
         // Snapshot before the trial: the held `Arc`s keep every currently
         // published query interned, so an unchanged re-read resolves to it.
         // Every registration and every recorded failure counts, whatever
@@ -1041,6 +1076,7 @@ impl LanguageCoordinator {
         language_id: &str,
         current_generation: u64,
     ) -> LanguageLoadResult {
+        let _in_flight = DynamicLoadInFlight::begin(&self.dynamic_loads_in_flight);
         let search_paths = self.config_store.search_paths();
         if search_paths.is_empty() {
             return LanguageLoadResult::failure_with(LanguageEvent::log(
@@ -3924,6 +3960,21 @@ mod tests {
             !coordinator.ensure_language_loaded("dynamic").success,
             "a prior-generation dynamic entry must not bypass current search-path resolution"
         );
+    }
+
+    /// An on-demand load between reading its files and publishing them can
+    /// land a query read before an edit; with no reload rejecting it, the
+    /// trial cannot call the languages unchanged while one is running.
+    #[test]
+    fn reload_trial_reports_a_change_while_an_on_demand_load_is_in_flight() {
+        let coordinator = LanguageCoordinator::new();
+        let settings = WorkspaceSettings::default();
+        assert!(!coordinator.reload_would_change_languages(&settings));
+
+        let in_flight = DynamicLoadInFlight::begin(&coordinator.dynamic_loads_in_flight);
+        assert!(coordinator.reload_would_change_languages(&settings));
+        drop(in_flight);
+        assert!(!coordinator.reload_would_change_languages(&settings));
     }
 
     /// A reload that invalidates no parse (the post-install one) leaves a
