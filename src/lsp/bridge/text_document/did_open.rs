@@ -711,7 +711,7 @@ impl LanguageServerPool {
         {
             log::debug!(
                 target: "kakehashi::bridge",
-                "Eager host sync: didOpen/didChange failed for {} on {}: {}",
+                "Eager host sync: sync failed or was refused for {} on {}: {}",
                 host_uri,
                 server_name,
                 e
