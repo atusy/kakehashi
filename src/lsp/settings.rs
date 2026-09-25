@@ -117,7 +117,7 @@ fn fold_layers(
 /// process died rather than reporting a bad path.
 const MAX_CONFIG_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
-/// The `--config-file` inputs, read and judged exactly once.
+/// Startup file layers, read and judged exactly once.
 ///
 /// Read *once* is a contract, not an optimisation. A file replaced between two
 /// reads would have its second verdict either ignored or discovered too late to
@@ -131,7 +131,8 @@ pub(crate) struct ConfigFileLayers {
     events: Vec<SettingsEvent>,
     deprecated_keys: DeprecatedKeysSeen,
     /// Why this configuration cannot be used, if it cannot. `initialize` must
-    /// reject the session when this is set.
+    /// reject the session when this is set. Only [`StartupFilePolicy::Strict`]
+    /// sets it; a tolerant read reports failures as error events instead.
     pub(crate) fatal_error: Option<String>,
 }
 
@@ -157,11 +158,63 @@ impl ConfigFileLayers {
 /// the failed attempt's values, since those are first-write-wins. The result is
 /// then handed to [`load_settings`], so the files are not read again.
 pub(crate) fn load_explicit_config(
+    policy: StartupFilePolicy,
     home: Option<&str>,
     env_fn: impl Fn(&str) -> Option<String>,
 ) -> Option<ConfigFileLayers> {
     let files = crate::config::expand::config_file_override()?;
-    Some(read_explicit_layers(files, home, env_fn))
+    Some(read_startup_file_layers(
+        files,
+        ConfigFileSelection::Explicit,
+        policy,
+        home,
+        env_fn,
+    ))
+}
+
+/// Preload discovered startup files with the same validation as explicit files.
+/// Missing default locations remain optional; a present file that cannot be
+/// used is handled by `policy`.
+pub(crate) fn load_discovered_startup_config(
+    root_path: Option<&Path>,
+    policy: StartupFilePolicy,
+    home: Option<&str>,
+    env_fn: impl Fn(&str) -> Option<String>,
+) -> ConfigFileLayers {
+    let mut files = Vec::new();
+    if let Some(path) = crate::config::user::user_config_path() {
+        files.push(path);
+    }
+    if let Some(root) = root_path {
+        files.push(root.join("kakehashi.toml"));
+    }
+    read_startup_file_layers(
+        &files,
+        ConfigFileSelection::Discovered,
+        policy,
+        home,
+        env_fn,
+    )
+}
+
+/// What startup does with a config file it cannot use.
+///
+/// The frontend decides, not the file: the same broken file is fatal to an
+/// unattended `format`/`diagnose` run, whose clean result on defaults would be
+/// believed, and merely reported to an editor, whose user is better served by a
+/// server running on the layers that do work than by none at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StartupFilePolicy {
+    /// Stop at the first failure and reject the session.
+    Strict,
+    /// Report each failure as an error, skip that entry, and keep the rest.
+    Tolerant,
+}
+
+#[derive(Clone, Copy)]
+enum ConfigFileSelection {
+    Explicit,
+    Discovered,
 }
 
 fn append_unknown_config_key_warnings(
@@ -327,139 +380,54 @@ fn missing_base_config_warning(base_path: &Path, entry_path: &Path) -> SettingsE
     ))
 }
 
-/// The body of [`load_explicit_config`], taking the paths directly so it can be
-/// exercised without the process-global `--config-file` override.
-fn read_explicit_layers(
+fn read_startup_file_layers(
     files: &[std::path::PathBuf],
+    selection: ConfigFileSelection,
+    policy: StartupFilePolicy,
     home: Option<&str>,
     env_fn: impl Fn(&str) -> Option<String>,
 ) -> ConfigFileLayers {
     let env_fn = crate::config::expand::with_kakehashi_defaults(env_fn);
-    let mut events = vec![SettingsEvent::info(format!(
-        "Using {} explicit config file(s); default config locations skipped",
-        files.len()
-    ))];
+    let mut events = match selection {
+        ConfigFileSelection::Explicit => vec![SettingsEvent::info(format!(
+            "Using {} explicit config file(s); default config locations skipped",
+            files.len()
+        ))],
+        ConfigFileSelection::Discovered => Vec::new(),
+    };
     let mut deprecated_keys = DeprecatedKeysSeen::default();
     let mut fatal_error = None;
     let mut layers = Vec::with_capacity(files.len());
 
     for entry_path in files {
-        // The verdict cannot change once a layer has failed, and reading on is
-        // not free: a later path could be a FIFO that blocks forever, so an
-        // already-doomed session would hang instead of reporting the failure it
-        // already knows about.
-        if fatal_error.is_some() {
-            break;
-        }
-        let entry = match load_toml_file(entry_path, &mut events, &mut deprecated_keys) {
-            Ok(entry) => entry,
+        match read_entry_layers(
+            entry_path,
+            selection,
+            policy,
+            home,
+            &env_fn,
+            &mut events,
+            &mut deprecated_keys,
+        ) {
+            Ok(entry_layers) => layers.extend(entry_layers),
             Err(message) => {
                 events.push(SettingsEvent::error(message.clone()));
-                fatal_error.get_or_insert(message);
-                break;
-            }
-        };
-        let Some(entry) = entry else {
-            layers.push(None);
-            continue;
-        };
-        let configured_bases = entry.base_config_files.as_deref().unwrap_or_default();
-        if configured_bases.len() > MAX_BASE_CONFIG_FILES_PER_ENTRY {
-            let message = format!(
-                "{} lists {} baseConfigFiles entries; at most {} are allowed per entry",
-                entry_path.display(),
-                configured_bases.len(),
-                MAX_BASE_CONFIG_FILES_PER_ENTRY
-            );
-            events.push(SettingsEvent::error(message.clone()));
-            fatal_error = Some(message);
-            break;
-        }
-        let entry_base = if configured_bases.is_empty() {
-            None
-        } else {
-            match config_file_base(entry_path) {
-                Ok(base) => Some(base),
-                Err(error) => {
-                    let message = format!(
-                        "Failed to resolve the directory of {}: {error}",
-                        entry_path.display()
-                    );
-                    events.push(SettingsEvent::error(message.clone()));
-                    fatal_error = Some(message);
-                    break;
-                }
-            }
-        };
-
-        for configured in configured_bases {
-            let entry_base = entry_base
-                .as_deref()
-                .expect("a non-empty base list has a resolved entry directory");
-            let base_path =
-                match resolve_base_config_path(entry_path, entry_base, configured, home, &env_fn) {
-                    Ok(path) => path,
-                    Err(message) => {
-                        events.push(SettingsEvent::error(message.clone()));
+                match policy {
+                    // The verdict cannot change once a layer has failed, and
+                    // reading on is not free: a later path could be a FIFO that
+                    // blocks forever, so an already-doomed run would hang
+                    // instead of reporting the failure it already knows about.
+                    StartupFilePolicy::Strict => {
                         fatal_error = Some(message);
                         break;
                     }
-                };
-            let mut base_events = Vec::new();
-            let mut base_deprecated_keys = DeprecatedKeysSeen::default();
-            let base = match load_toml_file(&base_path, &mut base_events, &mut base_deprecated_keys)
-            {
-                Ok(base) => base,
-                Err(message) => {
-                    events.extend(base_events);
-                    events.push(SettingsEvent::error(message.clone()));
-                    fatal_error = Some(message);
-                    break;
+                    StartupFilePolicy::Tolerant => continue,
                 }
-            };
-            let Some(base) = base else {
-                events.push(missing_base_config_warning(&base_path, entry_path));
-                layers.push(None);
-                continue;
-            };
-            if base.base_config_files.is_some() {
-                let message = format!(
-                    "baseConfigFiles is only allowed in an entry config file; {} was included \
-                     from {}",
-                    base_path.display(),
-                    entry_path.display()
-                );
-                events.push(SettingsEvent::error(message.clone()));
-                fatal_error = Some(message);
-                break;
             }
-            let mut layer = Some(base.settings);
-            if let Err(message) =
-                validate_and_anchor_explicit_layer(&mut layer, &base_path, home, &env_fn)
-            {
-                events.push(SettingsEvent::error(message.clone()));
-                fatal_error = Some(message);
-                break;
-            }
-            events.extend(base_events);
-            deprecated_keys.merge(base_deprecated_keys);
-            layers.push(layer);
         }
-        if fatal_error.is_some() {
-            break;
-        }
-
-        let mut layer = Some(entry.settings);
-        if let Err(message) =
-            validate_and_anchor_explicit_layer(&mut layer, entry_path, home, &env_fn)
-        {
-            events.push(SettingsEvent::error(message.clone()));
-            fatal_error = Some(message);
-        }
-        layers.push(layer);
     }
 
-    // An explicit configuration also has to be valid *as a whole*, or startup
+    // A strict file configuration also has to be valid *as a whole*, or the run
     // would silently continue on programmed defaults. This is the only place a
     // cross-layer invariant can be judged: one file supplying `debounceMs` and
     // another `maxWaitMs` is valid in neither file alone. It is judged without
@@ -467,15 +435,26 @@ fn read_explicit_layers(
     // client sending a bad override must not be reported as a mistake in the
     // user's file.
     //
+    // A tolerant read leaves this to `load_settings`, which discards an invalid
+    // merge and reports it once; judging it here too would report it twice.
     // Skipped once a layer has already failed: the verdict cannot change, and
     // every `try_from_settings` re-resolves language `base` chains, whose cycle
     // detector logs as it goes.
-    if fatal_error.is_none() {
+    if policy == StartupFilePolicy::Strict && fatal_error.is_none() {
         let merged = merge_explicit_layers(&layers);
         if let Some(raw_settings) = merged.as_ref()
             && let Err(errs) = WorkspaceSettings::try_from_settings(raw_settings, home, &env_fn)
         {
-            let message = format!("Invalid configuration from --config-file: {errs}");
+            let source = match selection {
+                ConfigFileSelection::Explicit => "--config-file",
+                ConfigFileSelection::Discovered => "discovered config files",
+            };
+            let paths = files
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let message = format!("Invalid configuration from {source}: {errs} (files: {paths})");
             events.push(SettingsEvent::error(message.clone()));
             fatal_error = Some(message);
         }
@@ -489,11 +468,156 @@ fn read_explicit_layers(
     }
 }
 
+/// Read one entry file and the base files it names, as the layers they
+/// contribute in merge order.
+///
+/// An `Err` means the entry itself is unusable; the caller reports it. A base
+/// that fails is `policy`'s call: strict fails the entry, tolerant reports the
+/// base as an error and skips only it — how discovered entries have always
+/// treated their bases, so an editor keeps the entry the user actually wrote.
+/// Warnings and notices are pushed to `events` as they are found.
+fn read_entry_layers(
+    entry_path: &Path,
+    selection: ConfigFileSelection,
+    policy: StartupFilePolicy,
+    home: Option<&str>,
+    env_fn: &impl Fn(&str) -> Option<String>,
+    events: &mut Vec<SettingsEvent>,
+    deprecated_keys: &mut DeprecatedKeysSeen,
+) -> Result<Vec<Option<RawWorkspaceSettings>>, String> {
+    let events_before_read = events.len();
+    let Some(entry) = load_toml_file(entry_path, events, deprecated_keys)? else {
+        return match selection {
+            ConfigFileSelection::Explicit => Err(format!(
+                "Explicit config file not found: {}",
+                entry_path.display()
+            )),
+            // User discovery has always distinguished an unusable ancestor
+            // from a genuinely absent default location. Preserve that
+            // classification when sharing the single-read startup loader.
+            ConfigFileSelection::Discovered
+                if crate::config::user::contains_broken_symlink(entry_path) =>
+            {
+                Err(format!(
+                    "Failed to read {}: broken symbolic link in configuration path",
+                    entry_path.display()
+                ))
+            }
+            // Absent implicit locations are the ordinary zero-config case.
+            ConfigFileSelection::Discovered => {
+                events.truncate(events_before_read);
+                Ok(vec![None])
+            }
+        };
+    };
+    // A base-level failure: fatal to a strict read, reported and skipped by a
+    // tolerant one.
+    let base_failure = |message: String, events: &mut Vec<SettingsEvent>| match policy {
+        StartupFilePolicy::Strict => Err(message),
+        StartupFilePolicy::Tolerant => {
+            events.push(SettingsEvent::error(message));
+            Ok(())
+        }
+    };
+    let mut configured_bases = entry.base_config_files.as_deref().unwrap_or_default();
+    if configured_bases.len() > MAX_BASE_CONFIG_FILES_PER_ENTRY {
+        base_failure(
+            format!(
+                "{} lists {} baseConfigFiles entries; at most {} are allowed per entry",
+                entry_path.display(),
+                configured_bases.len(),
+                MAX_BASE_CONFIG_FILES_PER_ENTRY
+            ),
+            events,
+        )?;
+        configured_bases = &configured_bases[..MAX_BASE_CONFIG_FILES_PER_ENTRY];
+    }
+    let mut layers = Vec::with_capacity(configured_bases.len() + 1);
+    let entry_base = if configured_bases.is_empty() {
+        None
+    } else {
+        match config_file_base(entry_path) {
+            Ok(base) => Some(base),
+            Err(error) => {
+                base_failure(
+                    format!(
+                        "Failed to resolve the directory of {}: {error}",
+                        entry_path.display()
+                    ),
+                    events,
+                )?;
+                None
+            }
+        }
+    };
+    if let Some(entry_base) = entry_base.as_deref() {
+        for configured in configured_bases {
+            match read_base_layer(
+                entry_path,
+                entry_base,
+                configured,
+                home,
+                env_fn,
+                events,
+                deprecated_keys,
+            ) {
+                Ok(layer) => layers.push(layer),
+                Err(message) => base_failure(message, events)?,
+            }
+        }
+    }
+
+    let mut layer = Some(entry.settings);
+    validate_and_anchor_explicit_layer(&mut layer, entry_path, home, env_fn)?;
+    layers.push(layer);
+    Ok(layers)
+}
+
+/// Read one base file named by `entry_path`. `Ok(None)` is a missing base,
+/// already warned about: absence is optional, unlike being unusable.
+fn read_base_layer(
+    entry_path: &Path,
+    entry_base: &Path,
+    configured: &str,
+    home: Option<&str>,
+    env_fn: &impl Fn(&str) -> Option<String>,
+    events: &mut Vec<SettingsEvent>,
+    deprecated_keys: &mut DeprecatedKeysSeen,
+) -> Result<Option<RawWorkspaceSettings>, String> {
+    let base_path = resolve_base_config_path(entry_path, entry_base, configured, home, env_fn)?;
+    let mut base_events = Vec::new();
+    let mut base_deprecated_keys = DeprecatedKeysSeen::default();
+    let base = match load_toml_file(&base_path, &mut base_events, &mut base_deprecated_keys) {
+        Ok(base) => base,
+        Err(message) => {
+            events.extend(base_events);
+            return Err(message);
+        }
+    };
+    let Some(base) = base else {
+        events.push(missing_base_config_warning(&base_path, entry_path));
+        return Ok(None);
+    };
+    if base.base_config_files.is_some() {
+        return Err(format!(
+            "baseConfigFiles is only allowed in an entry config file; {} was included from {}",
+            base_path.display(),
+            entry_path.display()
+        ));
+    }
+    let mut layer = Some(base.settings);
+    validate_and_anchor_explicit_layer(&mut layer, &base_path, home, env_fn)?;
+    events.extend(base_events);
+    deprecated_keys.merge(base_deprecated_keys);
+    Ok(layer)
+}
+
 /// Merge every configuration layer into the settings the session will use.
 ///
-/// `explicit` carries the already-read `--config-file` inputs; when it is
-/// `Some`, the implicitly discovered user and project files are skipped and the
-/// strict gate applies. Callers must obtain it from [`load_explicit_config`]
+/// `explicit` carries already-read startup file layers, from explicit paths or
+/// discovered locations. When it is `Some`, files are not read again. Callers
+/// must preload and check their fatal verdict before applying settings using
+/// [`load_explicit_config`] or [`load_discovered_startup_config`]
 /// rather than reading the files themselves — passing `None` while
 /// `--config-file` is set would silently fall back to implicit discovery.
 pub fn load_settings(
@@ -556,9 +680,9 @@ fn load_settings_impl(
     // Layers 2+3: config files (either explicit --config-file or default locations)
     //
     // Each layer's relative paths are anchored to the directory that layer came
-    // from, while that is still known. Explicit layers were already anchored by
-    // `read_explicit_layers`, which is the only place their per-file parents are
-    // in scope.
+    // from, while that is still known. Preloaded layers were already anchored by
+    // `read_startup_file_layers`, which is the only place their per-file parents
+    // are in scope.
     let config_layers: Vec<Option<RawWorkspaceSettings>> = if let Some(explicit) = explicit {
         events.extend(explicit.events);
         deprecated_keys.merge(explicit.deprecated_keys);
@@ -884,19 +1008,12 @@ fn load_user_config_with_events(
     }
 }
 
-/// Load a TOML config file from an explicit path (used with `--config-file`).
+/// Read one TOML file and distinguish absence from unusable content.
 ///
-/// Every `Err` returned here is fatal to the session: unlike
-/// `load_toml_settings`, a file the user named explicitly and that is actually
-/// present must not be skipped in favour of defaults
-/// (configuration-merging-strategy).
-///
-/// An absent file is `Ok(None)`, not an error. Layered invocations
-/// (`--config-file base.toml --config-file overrides.toml`) rely on the overlay
-/// being optional, and a relative path resolves against the process working
-/// directory — for an editor-spawned server that is the editor's, not the
-/// workspace root — so absence is too easily accidental to be worth aborting
-/// over. It is still reported as a warning so the skip is visible.
+/// Startup callers reject errors for both explicit and discovered files.
+/// `Ok(None)` lets the caller distinguish a required explicit entry from an
+/// optional discovered location or base file. Absence emits a warning here;
+/// discovered startup locations suppress it to keep zero-config startup quiet.
 fn load_toml_file(
     path: &Path,
     events: &mut Vec<SettingsEvent>,
@@ -1128,6 +1245,22 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use tempfile::TempDir;
+
+    /// `--config-file` inputs as the CLI reads them, without the process-global
+    /// override.
+    fn read_explicit_layers(
+        files: &[std::path::PathBuf],
+        home: Option<&str>,
+        env_fn: impl Fn(&str) -> Option<String>,
+    ) -> ConfigFileLayers {
+        read_startup_file_layers(
+            files,
+            ConfigFileSelection::Explicit,
+            StartupFilePolicy::Strict,
+            home,
+            env_fn,
+        )
+    }
 
     /// load_settings() merges 4 layers via reduce(merge_workspace_settings):
     /// defaults < user (XDG_CONFIG_HOME) < project < InitializationOptions.
@@ -2597,8 +2730,57 @@ mod tests {
         );
     }
 
-    /// load_toml_file: an absent explicit path is an optional layer, not an
-    /// error, so a layered invocation whose overlay does not exist still starts.
+    #[test]
+    fn startup_file_selection_distinguishes_required_and_optional_absence() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("missing.toml");
+        let explicit = read_explicit_layers(std::slice::from_ref(&path), None, |_| None);
+        assert!(
+            explicit
+                .fatal_error
+                .unwrap()
+                .contains(path.to_str().unwrap())
+        );
+        let discovered = read_startup_file_layers(
+            &[path],
+            ConfigFileSelection::Discovered,
+            StartupFilePolicy::Strict,
+            None,
+            |_| None,
+        );
+        assert!(discovered.fatal_error.is_none());
+        assert!(
+            discovered.events.is_empty(),
+            "missing default locations should be quiet"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovered_startup_rejects_broken_ancestor_symlinks() {
+        let dir = TempDir::new().unwrap();
+        let parent = dir.path().join("xdg");
+        std::os::unix::fs::symlink(dir.path().join("absent-target"), &parent).unwrap();
+        let path = parent.join("kakehashi/kakehashi.toml");
+        let loaded = read_startup_file_layers(
+            std::slice::from_ref(&path),
+            ConfigFileSelection::Discovered,
+            StartupFilePolicy::Strict,
+            None,
+            |_| None,
+        );
+        assert!(
+            loaded
+                .fatal_error
+                .as_ref()
+                .is_some_and(|error| error.contains(path.to_str().unwrap())),
+            "an unusable discovered ancestor is not an absent optional file: {:?}",
+            loaded.fatal_error
+        );
+    }
+
+    /// The primitive loader distinguishes absence from read failure. Its caller
+    /// decides whether this was a required explicit entry or optional location.
     #[test]
     fn test_load_toml_file_missing() {
         // A child of a fresh temp dir, so "absent" cannot depend on what the
@@ -3165,6 +3347,90 @@ mod tests {
                 .all(|event| !event.message.contains(&later.display().to_string())),
             "nothing after the failure may be read: {:?}",
             explicit.events
+        );
+    }
+
+    /// The tolerant read an editor session uses reports every unusable entry
+    /// and keeps the ones after it, never deciding the session is unusable.
+    #[test]
+    fn tolerant_startup_read_skips_each_unusable_entry() {
+        let dir = TempDir::new().unwrap();
+        let broken = dir.path().join("broken.toml");
+        let missing = dir.path().join("missing.toml");
+        let later = dir.path().join("later.toml");
+        std::fs::write(&broken, "this is not [valid toml").unwrap();
+        std::fs::write(&later, "autoInstall = false\n").unwrap();
+
+        let loaded = read_startup_file_layers(
+            &[broken.clone(), missing.clone(), later],
+            ConfigFileSelection::Explicit,
+            StartupFilePolicy::Tolerant,
+            None,
+            crate::config::make_env(&[]),
+        );
+
+        assert!(loaded.fatal_error.is_none(), "{:?}", loaded.fatal_error);
+        let errors: Vec<_> = loaded
+            .events
+            .iter()
+            .filter(|event| event.kind == SettingsEventKind::Error)
+            .map(|event| event.message.as_str())
+            .collect();
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(
+            errors[0].contains(&broken.display().to_string()),
+            "{errors:?}"
+        );
+        assert!(
+            errors[1].contains(&missing.display().to_string()),
+            "{errors:?}"
+        );
+        let merged = fold_layers(loaded.layers).expect("the later layer survives");
+        assert_eq!(merged.auto_install, Some(false));
+    }
+
+    /// Under the tolerant policy a failing base costs only itself: the entry
+    /// and its other bases still load, as they always have for discovered
+    /// entries at runtime, and the failure is reported as an error.
+    #[test]
+    fn tolerant_startup_read_skips_only_the_failing_base() {
+        let dir = TempDir::new().unwrap();
+        let entry = dir.path().join("entry.toml");
+        let broken = dir.path().join("broken.toml");
+        std::fs::write(&broken, "this is not [valid toml").unwrap();
+        std::fs::write(dir.path().join("good.toml"), "searchPaths = [\"/good\"]\n").unwrap();
+        std::fs::write(
+            &entry,
+            "baseConfigFiles = [\"broken.toml\", \"good.toml\"]\nautoInstall = false\n",
+        )
+        .unwrap();
+
+        let loaded = read_startup_file_layers(
+            &[entry],
+            ConfigFileSelection::Explicit,
+            StartupFilePolicy::Tolerant,
+            None,
+            crate::config::make_env(&[]),
+        );
+
+        assert!(loaded.fatal_error.is_none());
+        let errors: Vec<_> = loaded
+            .events
+            .iter()
+            .filter(|event| event.kind == SettingsEventKind::Error)
+            .map(|event| event.message.as_str())
+            .collect();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains(&broken.display().to_string()),
+            "{errors:?}"
+        );
+        let merged = fold_layers(loaded.layers).expect("the entry survives");
+        assert_eq!(merged.auto_install, Some(false));
+        assert_eq!(
+            merged.search_paths,
+            Some(vec!["/good".to_string()]),
+            "the healthy base still applies"
         );
     }
 
