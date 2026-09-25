@@ -589,6 +589,14 @@ impl LanguageCoordinator {
         scratch
     }
 
+    /// The settings-load generation, for tests that pin a reload skipped
+    /// the load entirely.
+    #[cfg(test)]
+    pub(crate) fn load_generation(&self) -> u64 {
+        self.load_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Every language registered (under `generation`, or under any when
     /// `None`), with the grammar and queries a document of that language is
     /// parsed and highlighted with.

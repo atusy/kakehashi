@@ -63,20 +63,30 @@ async fn wait_for_tree(server: &Kakehashi, uri: &Url) {
     .expect("the opened document must get a current tree");
 }
 
+/// The semantic-token and settings-load generations.
+fn generations(server: &Kakehashi) -> (u64, u64) {
+    (
+        server.cache.semantic_token_generation(),
+        server.language.load_generation(),
+    )
+}
+
 /// Nothing observable happened to the documents: no reparse, no refresh,
-/// and — because the reload itself is what disturbs them — no token
-/// generation bump (it would null in-flight token requests and stale every
-/// stored injection region) and no loss of the document's language.
+/// and — because the reload itself is what disturbs them — neither
+/// generation moved: a token-generation bump nulls in-flight token requests
+/// and stales every stored injection region, and a load-generation bump
+/// makes every registration read as stale while the load re-reads it.
 fn assert_no_reload_work(
     outcome: &SettingsReloadOutcome,
     server: &Kakehashi,
     uri: &Url,
-    token_generation_before: u64,
+    generations_before: (u64, u64),
 ) {
     assert_eq!(
-        server.cache.semantic_token_generation(),
-        token_generation_before,
-        "a reload that changes nothing must not invalidate generation-stamped products"
+        generations(server),
+        generations_before,
+        "a reload that changes nothing must neither fence generation-stamped products nor \
+         re-run the settings load"
     );
     assert!(
         outcome.reparse_uris.is_empty(),
@@ -117,7 +127,7 @@ async fn reload_changing_only_diagnostic_and_log_policy_neither_reparses_nor_ref
         .await;
     let uri = open_and_wait_for_tree(server, "irrelevant.rs", "rust").await;
 
-    let generation = server.cache.semantic_token_generation();
+    let generation = generations(server);
     let mut next = baseline_settings();
     next.diagnostics_debounce_ms += 250;
     next.features.window_log_message = LogMessageLevel::Warning;
@@ -148,7 +158,7 @@ async fn identical_reload_neither_reparses_nor_refreshes() {
         .apply_raw_settings(RawWorkspaceSettings::default(), baseline_settings())
         .await;
     let uri = open_and_wait_for_tree(server, "identical.rs", "rust").await;
-    let generation = server.cache.semantic_token_generation();
+    let generation = generations(server);
 
     let outcome = server
         .apply_raw_settings(RawWorkspaceSettings::default(), baseline_settings())
@@ -301,7 +311,7 @@ async fn identical_reload_tracks_edits_to_a_discovered_language_query() {
         .await;
     let uri = open_and_wait_for_tree(server, "discovered.lua", "lua").await;
     assert!(server.language.has_queries("lua"));
-    let generation = server.cache.semantic_token_generation();
+    let generation = generations(server);
 
     let unchanged = server
         .apply_raw_settings(RawWorkspaceSettings::default(), settings.clone())
@@ -348,13 +358,13 @@ async fn identical_reload_reparses_when_a_missing_parser_appeared() {
         .await;
     assert!(!server.language.has_parser_available("lua"));
 
-    let generation = server.cache.semantic_token_generation();
+    let generation = generations(server);
     let still_missing = server
         .apply_raw_settings(RawWorkspaceSettings::default(), settings.clone())
         .await;
     assert!(still_missing.reparse_uris.is_empty());
     assert!(!still_missing.semantic_refresh_requested);
-    assert_eq!(server.cache.semantic_token_generation(), generation);
+    assert_eq!(generations(server), generation);
 
     install_lua_parser(search_path.path(), &parser);
     let outcome = server
@@ -392,7 +402,7 @@ async fn identical_reload_with_a_derived_language_neither_reparses_nor_refreshes
         .await;
     assert!(server.language.has_queries("derived_lua"));
     let uri = open_and_wait_for_tree(server, "derived.lua", "derived_lua").await;
-    let generation = server.cache.semantic_token_generation();
+    let generation = generations(server);
 
     let outcome = server
         .apply_raw_settings(RawWorkspaceSettings::default(), settings)
