@@ -144,3 +144,99 @@ impl Kakehashi {
         Ok(result)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tower_lsp_server::LspService;
+    use tower_lsp_server::ls_types::{Position, TextDocumentIdentifier};
+    use url::Url;
+
+    use super::*;
+    use crate::document::LanguageCheck;
+    use crate::document::snapshot::ParseSnapshot;
+
+    const TEXT: &str = "fn main() { let x = 1; }";
+
+    fn rust_tree(text: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        parser.parse(text, None).unwrap()
+    }
+
+    /// A rust document with a published tree and its parser registered, so
+    /// the handler passes its language gate.
+    fn server_with_parsed_doc(uri: &Url) -> LspService<Kakehashi> {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        server.documents.insert(
+            uri.clone(),
+            TEXT.to_string(),
+            Some("rust".to_string()),
+            Some(rust_tree(TEXT)),
+        );
+        service
+    }
+
+    fn params(uri: &Url) -> SelectionRangeParams {
+        SelectionRangeParams {
+            text_document: TextDocumentIdentifier {
+                uri: crate::lsp::lsp_impl::url_to_uri(uri).unwrap(),
+            },
+            positions: vec![Position::new(0, 16)],
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        }
+    }
+
+    /// The reparse a reload schedules: the live text's tree at the live
+    /// version, installed like every parse.
+    fn install_current_parse(server: &Kakehashi, uri: &Url, tree: Option<tree_sitter::Tree>) {
+        let view = server.documents.latest_snapshot(uri).unwrap();
+        let installed = server.documents.install_parse(
+            uri,
+            LanguageCheck::Record,
+            Arc::new(ParseSnapshot {
+                text: Arc::from(TEXT),
+                tree,
+                language: Some("rust".to_string()),
+                parsed_version: view.content_version,
+                incarnation: view.slot.current_incarnation,
+                injection_regions: None,
+                regions: None,
+                layer_trees: Arc::new(std::sync::OnceLock::new()),
+            }),
+        );
+        assert!(installed.published, "the reparse must land");
+    }
+
+    /// A settings reload replaces the tree with a version-current placeholder
+    /// until its reparse lands. An expand-selection issued in that window
+    /// must settle for the reparse, not answer `null` off the placeholder.
+    #[tokio::test]
+    async fn waits_for_the_reparse_behind_a_reload_placeholder() {
+        let uri = Url::parse("file:///reload_placeholder.rs").unwrap();
+        let service = server_with_parsed_doc(&uri);
+        let server = service.inner();
+        server.documents.invalidate_all_parses();
+
+        let reparse = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            install_current_parse(server, &uri, Some(rust_tree(TEXT)));
+        };
+        let (result, ()) = tokio::join!(server.selection_range_impl(params(&uri)), reparse);
+
+        let ranges = result
+            .expect("the reparse is current")
+            .expect("the reparse's tree answers the request");
+        assert_eq!(ranges.len(), 1);
+    }
+}
