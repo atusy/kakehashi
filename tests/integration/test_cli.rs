@@ -1637,6 +1637,44 @@ fn test_language_uninstall_keeps_the_parser_when_queries_cannot_be_removed() {
     );
 }
 
+/// With no parser at all, a failed query removal must not talk about leaving
+/// one in place: the user would go looking for a parser that does not exist.
+#[test]
+#[cfg(unix)]
+fn test_language_uninstall_does_not_mention_a_parser_it_does_not_have() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let queries_dir = test_dir.path().join("queries/stuck_lang");
+    fs::create_dir_all(&queries_dir).expect("Failed to create queries dir");
+    fs::write(queries_dir.join("highlights.scm"), "(comment) @comment")
+        .expect("Failed to write queries");
+    let mut permissions = fs::metadata(&queries_dir)
+        .expect("Failed to read permissions")
+        .permissions();
+    permissions.set_mode(0o500);
+    fs::set_permissions(&queries_dir, permissions).expect("Failed to seal queries dir");
+
+    let (success, combined) = run_forced_uninstall(test_dir.path(), &["stuck_lang"]);
+
+    let mut permissions = fs::metadata(&queries_dir)
+        .expect("Failed to read permissions")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&queries_dir, permissions).expect("Failed to unseal queries dir");
+
+    assert!(!success, "a failed removal must fail the run: {combined}");
+    assert!(
+        combined.contains("Failed to remove queries"),
+        "the run must reach the removal and fail there: {combined}"
+    );
+    assert!(
+        !combined.contains("Leaving the parser"),
+        "there is no parser to leave: {combined}"
+    );
+}
+
 /// Test that status does not recover user-created hidden backup directories
 #[test]
 fn test_language_status_ignores_manual_query_backup() {
