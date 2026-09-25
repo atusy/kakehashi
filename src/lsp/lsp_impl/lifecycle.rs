@@ -5754,15 +5754,25 @@ mod reopen_order_tests {
         );
     }
 
+    /// The host a reopen sweep finds, varied one input at a time so each
+    /// incomplete case has a settled twin that reports success.
+    #[derive(Clone, Copy)]
+    enum ReopenHost {
+        Absent,
+        Settled,
+        InvalidationPlaceholder,
+    }
+
     /// Exercise the actual producer for both success and incomplete results.
     /// E2E retries alone cannot distinguish them because commands can later
     /// pass a retired failed barrier.
     #[rstest::rstest]
-    #[case::no_documents(false, true)]
-    #[case::invalidation_placeholder(true, false)]
+    #[case::no_documents(ReopenHost::Absent, true)]
+    #[case::settled_host(ReopenHost::Settled, true)]
+    #[case::invalidation_placeholder(ReopenHost::InvalidationPlaceholder, false)]
     #[tokio::test]
     async fn reopen_reports_whether_documents_could_be_resolved(
-        #[case] invalidated: bool,
+        #[case] host: ReopenHost,
         #[case] expected: bool,
     ) {
         use super::*;
@@ -5788,11 +5798,12 @@ mod reopen_order_tests {
                 )]),
                 ..Default::default()
             });
-        if invalidated {
+        if !matches!(host, ReopenHost::Absent) {
             let uri = Url::parse("file:///reopen-placeholder.rs").unwrap();
             let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
-            // A published parser keeps the language settled, so only the
-            // missing tree can make the result incomplete.
+            // A published parser keeps the language settled, and the parser has
+            // no injection query, so a settled host resolves to zero regions.
+            // Only the varied input can make the result incomplete.
             server
                 .language
                 .language_registry_for_parallel()
@@ -5806,20 +5817,26 @@ mod reopen_order_tests {
                 Some("rust".into()),
                 parser.parse(text, None),
             );
-            server.documents.invalidate_all_parses();
             assert!(server.injection_coordinator().snapshot_is_current(&uri));
-            assert!(
-                server
-                    .documents
-                    .latest_snapshot(&uri)
-                    .unwrap()
-                    .slot
-                    .snapshot
-                    .as_ref()
-                    .unwrap()
-                    .tree
-                    .is_none()
-            );
+            match host {
+                ReopenHost::InvalidationPlaceholder => {
+                    server.documents.invalidate_all_parses();
+                    assert!(server.injection_coordinator().snapshot_is_current(&uri));
+                    assert!(
+                        server
+                            .documents
+                            .latest_snapshot(&uri)
+                            .unwrap()
+                            .slot
+                            .snapshot
+                            .as_ref()
+                            .unwrap()
+                            .tree
+                            .is_none()
+                    );
+                }
+                ReopenHost::Absent | ReopenHost::Settled => {}
+            }
         }
         let context = Arc::new(UpstreamDeliveryContext {
             diagnostic_publisher: Arc::new(

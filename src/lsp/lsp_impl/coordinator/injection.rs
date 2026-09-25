@@ -2514,14 +2514,23 @@ mod tests {
                 .language_registry_for_parallel()
                 .register(name.into(), language.clone());
             if has_query {
+                // The query matches the string below, so only a cache hit
+                // can answer with the published empty result.
                 server.language.query_store().insert_injection_query(
                     name.into(),
-                    std::sync::Arc::new(tree_sitter::Query::new(&language, "").unwrap()),
+                    std::sync::Arc::new(
+                        tree_sitter::Query::new(
+                            &language,
+                            r#"((string_literal (string_content) @injection.content)
+                                (#set! injection.language "html"))"#,
+                        )
+                        .unwrap(),
+                    ),
                 );
             }
         }
         let uri = Url::parse("file:///redetected.rs").unwrap();
-        let text = "fn main() {}";
+        let text = r#"fn main() { let _ = "<p></p>"; }"#;
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&language).unwrap();
         server.documents.insert(
@@ -2551,7 +2560,7 @@ mod tests {
                 .resolve_injection_data(&uri, "rust")
                 .unwrap()
                 .is_empty(),
-            "precondition: the current language can consume the cached empty result"
+            "the current language consumes the cached result instead of re-running its query"
         );
         assert!(
             injection.resolve_injection_data(&uri, "old-rust").is_none(),
