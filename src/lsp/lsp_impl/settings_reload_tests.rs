@@ -100,6 +100,10 @@ fn assert_no_reload_work(
         "nothing token-relevant changed, yet the reload requested a semantic tokens refresh"
     );
     assert!(
+        !outcome.languages_reloaded,
+        "nothing changed, so nothing (a pull-diagnostic refresh included) is asked of the client"
+    );
+    assert!(
         server
             .documents
             .get(uri)

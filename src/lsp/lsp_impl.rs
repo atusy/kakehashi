@@ -218,6 +218,9 @@ pub(super) struct SettingsReloadOutcome {
     /// Whether a `workspace/semanticTokens/refresh` was requested (before the
     /// client-capability gate).
     pub(super) semantic_refresh_requested: bool,
+    /// Whether the language reload ran; false only for a configuration
+    /// application that changed nothing.
+    pub(super) languages_reloaded: bool,
 }
 
 pub(super) struct SettingsReloadInput {
@@ -470,6 +473,7 @@ pub(super) async fn apply_shared_settings_locked(
     SettingsReloadOutcome {
         reparse_uris,
         semantic_refresh_requested,
+        languages_reloaded: reload_languages,
     }
 }
 
@@ -791,7 +795,7 @@ impl Kakehashi {
         // reparses retry, a failure they meet records itself again. Without
         // this, a repair no reparse probes (a host language's) would force a
         // reload on every push from now on.
-        if outcome.semantic_refresh_requested {
+        if outcome.languages_reloaded {
             self.auto_install
                 .retire_query_repair_retries(&pending_repairs);
         }
@@ -802,8 +806,11 @@ impl Kakehashi {
         // so ask it to. Forced past the coverage gate: no coverage version
         // moved, the configuration did. Refresh-capability-gated and
         // single-flighted like every other nudge; the re-pull waits for the
-        // reparse scheduled above.
-        DiagnosticPublisher::new(self).request_pull_diagnostic_refresh(true);
+        // reparse scheduled above. An application that skipped the reload
+        // changed nothing a pull returns, so it asks for nothing.
+        if outcome.languages_reloaded {
+            DiagnosticPublisher::new(self).request_pull_diagnostic_refresh(true);
+        }
         outcome
     }
 
