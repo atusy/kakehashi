@@ -119,10 +119,22 @@ impl Kakehashi {
         ) {
             Ok(settings) => {
                 let warnings = Self::misconfigured_settings_warnings(&settings);
+                let root_changed = *self.settings_manager.root_path() != root_path;
                 self.settings_manager.set_root_path(root_path);
                 self.apply_raw_settings_locked(&reload, raw, settings).await;
                 drop(reload);
                 self.warn_on_misconfigured_settings(&warnings).await;
+                // The client's configuration was read while the session sat in
+                // the old workspace, and even unscoped an editor may resolve it
+                // per workspace. Asked only once the new root is in effect, so
+                // the answer anchors to it; a rejected reload keeps the old
+                // root, where an answer would anchor to a workspace the editor
+                // has left. Awaited like the pull a
+                // no-payload `didChangeConfiguration` triggers, under the same
+                // timeout and single-flight.
+                if root_changed {
+                    self.pull_client_configuration().await;
+                }
             }
             Err(error) => {
                 drop(reload);
@@ -286,6 +298,272 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&before, &after),
             "a real folder change must still run the settings-reload transaction"
+        );
+    }
+
+    fn folder(dir: &std::path::Path, name: &str) -> WorkspaceFolder {
+        let uri = url::Url::from_directory_path(dir)
+            .expect("scratch workspace dir must convert to a file:// URL");
+        WorkspaceFolder {
+            uri: uri.as_str().parse().unwrap(),
+            name: name.to_string(),
+        }
+    }
+
+    /// Drive `initialize` through the real service — a client may only be
+    /// sent requests once it is initialized — with one workspace folder and a
+    /// client that can answer `workspace/configuration`. Every server→client
+    /// request is answered — a configuration pull with `[answer]` — and the
+    /// `workspace/configuration` params are recorded.
+    async fn initialized_pull_capable_server(
+        first: &std::path::Path,
+        answer: serde_json::Value,
+    ) -> (
+        LspService<Kakehashi>,
+        Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
+        initialized_server_answering(serde_json::json!([folder(first, "first")]), vec![answer])
+            .await
+    }
+
+    /// [`initialized_pull_capable_server`], with the `workspaceFolders` sent
+    /// at `initialize` spelled out and one answer per pull, in order — the
+    /// last one repeating once they run out.
+    async fn initialized_server_answering(
+        workspace_folders: serde_json::Value,
+        answers: Vec<serde_json::Value>,
+    ) -> (
+        LspService<Kakehashi>,
+        Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
+        initialized_server_holding_answers(workspace_folders, answers, None).await
+    }
+
+    /// [`initialized_server_answering`], but the first pull is answered only
+    /// once `release_first` is notified — so a test can move the session
+    /// while that answer is in flight.
+    async fn initialized_server_holding_answers(
+        workspace_folders: serde_json::Value,
+        answers: Vec<serde_json::Value>,
+        release_first: Option<Arc<tokio::sync::Notify>>,
+    ) -> (
+        LspService<Kakehashi>,
+        Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
+        use futures::{SinkExt, StreamExt};
+        use tower::{Service, ServiceExt};
+        use tower_lsp_server::jsonrpc::{Request, Response};
+
+        let (mut service, socket) = LspService::new(Kakehashi::new);
+        let pulls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&pulls);
+        let (mut requests, mut responses) = socket.split();
+        tokio::spawn(async move {
+            while let Some(request) = requests.next().await {
+                let Some(id) = request.id().cloned() else {
+                    continue;
+                };
+                let result = if request.method() == "workspace/configuration" {
+                    let count = {
+                        let mut recorded = recorded.lock().unwrap();
+                        recorded.push(request.params().cloned().unwrap_or_default());
+                        recorded.len()
+                    };
+                    if count == 1
+                        && let Some(release) = release_first.as_ref()
+                    {
+                        release.notified().await;
+                    }
+                    let answer = answers
+                        .get(count - 1)
+                        .or(answers.last())
+                        .cloned()
+                        .unwrap_or_default();
+                    serde_json::json!([answer])
+                } else {
+                    serde_json::Value::Null
+                };
+                if responses.send(Response::from_ok(id, result)).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        // After the responder is running: `initialize` logs to the client,
+        // and nothing would drain those messages otherwise.
+        let initialize = Request::build("initialize")
+            .params(serde_json::json!({
+                "capabilities": { "workspace": {
+                    "configuration": true,
+                    "workspaceFolders": true,
+                } },
+                "workspaceFolders": workspace_folders,
+            }))
+            .id(1)
+            .finish();
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(initialize)
+            .await
+            .expect("initialize must succeed");
+        (service, pulls)
+    }
+
+    /// A pull-capable client is asked again once the selected configuration
+    /// root moves: the settings in effect were read for the old workspace.
+    ///
+    /// The answer is a real layer rather than `null`, so it is applied — which
+    /// takes the reload lock the folder change held, and anchors its relative
+    /// path to the root now in effect.
+    #[tokio::test]
+    #[serial(xdg_env)]
+    async fn a_root_change_pulls_the_client_configuration_again() {
+        let xdg_scratch = tempfile::tempdir().expect("failed to create scratch XDG_CONFIG_HOME");
+        let _xdg_guard = XdgConfigHomeGuard::set(xdg_scratch.path());
+        let first = tempfile::tempdir().expect("failed to create first workspace dir");
+        let second = tempfile::tempdir().expect("failed to create second workspace dir");
+
+        let (service, pulls) = initialized_pull_capable_server(
+            first.path(),
+            serde_json::json!({ "searchPaths": ["./pulled"] }),
+        )
+        .await;
+        let server = service.inner();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            server.did_change_workspace_folders_impl(DidChangeWorkspaceFoldersParams {
+                event: WorkspaceFoldersChangeEvent {
+                    added: vec![folder(second.path(), "second")],
+                    removed: vec![folder(first.path(), "first")],
+                },
+            }),
+        )
+        .await
+        .expect("a root change must not hang");
+
+        assert_eq!(
+            pulls.lock().unwrap().len(),
+            1,
+            "a root change must ask the client for its configuration again"
+        );
+        let pulled = second.path().join("pulled");
+        assert!(
+            server
+                .settings_manager
+                .load_settings()
+                .search_paths
+                .iter()
+                .any(|path| std::path::Path::new(path) == pulled),
+            "the answer must be applied, anchored to the new root"
+        );
+    }
+
+    /// Adding a folder behind the first one leaves the selected root where it
+    /// was, so the configuration already read still describes it.
+    #[tokio::test]
+    #[serial(xdg_env)]
+    async fn a_folder_change_that_keeps_the_root_does_not_pull() {
+        let xdg_scratch = tempfile::tempdir().expect("failed to create scratch XDG_CONFIG_HOME");
+        let _xdg_guard = XdgConfigHomeGuard::set(xdg_scratch.path());
+        let first = tempfile::tempdir().expect("failed to create first workspace dir");
+        let second = tempfile::tempdir().expect("failed to create second workspace dir");
+
+        let (service, pulls) =
+            initialized_pull_capable_server(first.path(), serde_json::Value::Null).await;
+        let server = service.inner();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            server.did_change_workspace_folders_impl(DidChangeWorkspaceFoldersParams {
+                event: WorkspaceFoldersChangeEvent {
+                    added: vec![folder(second.path(), "second")],
+                    removed: Vec::new(),
+                },
+            }),
+        )
+        .await
+        .expect("a folder change must not hang");
+
+        assert!(
+            pulls.lock().unwrap().is_empty(),
+            "a folder change that keeps the selected root must not pull"
+        );
+    }
+
+    /// Trigger a pull the way a pull-model editor does: a
+    /// `didChangeConfiguration` carrying no payload.
+    async fn pull_now(server: &Kakehashi) {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            server.did_change_configuration_impl(
+                tower_lsp_server::ls_types::DidChangeConfigurationParams {
+                    settings: serde_json::Value::Null,
+                },
+            ),
+        )
+        .await
+        .expect("a pull must not hang");
+    }
+
+    /// An answer asked while the session sat at one root and arriving after it
+    /// moved to another was read for a workspace no longer selected: it is
+    /// dropped, and the root change's own pull asks again.
+    #[tokio::test]
+    #[serial(xdg_env)]
+    async fn an_answer_for_a_root_the_session_left_is_discarded() {
+        let xdg_scratch = tempfile::tempdir().expect("failed to create scratch XDG_CONFIG_HOME");
+        let _xdg_guard = XdgConfigHomeGuard::set(xdg_scratch.path());
+        let first = tempfile::tempdir().expect("failed to create first workspace dir");
+        let second = tempfile::tempdir().expect("failed to create second workspace dir");
+        let release_first = Arc::new(tokio::sync::Notify::new());
+
+        let (service, pulls) = initialized_server_holding_answers(
+            serde_json::json!([folder(first.path(), "first")]),
+            vec![
+                serde_json::json!({ "searchPaths": ["./stale"] }),
+                serde_json::Value::Null,
+            ],
+            Some(Arc::clone(&release_first)),
+        )
+        .await;
+        let server = service.inner();
+
+        let move_root_while_answering = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while pulls.lock().unwrap().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the first pull must be asked");
+            server
+                .did_change_workspace_folders_impl(DidChangeWorkspaceFoldersParams {
+                    event: WorkspaceFoldersChangeEvent {
+                        added: vec![folder(second.path(), "second")],
+                        removed: vec![folder(first.path(), "first")],
+                    },
+                })
+                .await;
+            release_first.notify_one();
+        };
+        tokio::join!(pull_now(server), move_root_while_answering);
+
+        assert_eq!(
+            pulls.lock().unwrap().len(),
+            2,
+            "the root change must still ask again"
+        );
+        assert!(
+            !server
+                .settings_manager
+                .load_settings()
+                .search_paths
+                .iter()
+                .any(|path| path.ends_with("stale")),
+            "an answer read for the root the session left must not be applied"
         );
     }
 }
