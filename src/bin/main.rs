@@ -962,10 +962,14 @@ fn run_language_uninstall(
                 // parser would *create* that state, so leave both and let the
                 // retry be a plain retry.
                 if !failure.removal.queries_absent {
-                    eprintln!(
-                        "  Leaving the parser for '{}' in place; run the command again.",
-                        lang
-                    );
+                    // Only when there is a parser to leave: naming one that
+                    // does not exist sends the user looking for it.
+                    if parser_entry.is_some() {
+                        eprintln!(
+                            "  Leaving the parser for '{}' in place; run the command again.",
+                            lang
+                        );
+                    }
                     if removed_something {
                         any_removed = true;
                     }
