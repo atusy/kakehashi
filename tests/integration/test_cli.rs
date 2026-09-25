@@ -2847,8 +2847,8 @@ fn test_language_uninstall_all_keeps_failing_when_a_declined_prompt_follows_a_ba
 }
 
 /// A parser entry of the wrong SHAPE is not "no parser here". Going on would
-/// remove the queries, step over the parser, and — on the named path, which has
-/// no leftovers summary — report a clean uninstall over a half-removed language.
+/// remove the queries, step over the parser, and report a clean uninstall over
+/// a half-removed language.
 #[test]
 fn test_language_uninstall_leaves_a_language_whole_when_its_parser_is_the_wrong_shape() {
     use std::fs;

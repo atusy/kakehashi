@@ -884,10 +884,15 @@ fn run_language_uninstall(
             // settled that such an entry does not count as an installed parser,
             // and that answer stands when there is nothing else to lose. What
             // it never considered is queries sitting beside one: taking those
-            // would leave the half-removed language and, on the named path
-            // (which has no leftovers summary), report it as a clean uninstall.
-            // So the refusal is scoped to exactly that case.
+            // would leave the half-removed language and report it as a clean
+            // uninstall. So the refusal is scoped to exactly that case.
             Ok(Some((path, ParserEntry::WrongShape))) => {
+                // Whichever way this goes, the directory stays, and only the
+                // user can clear it: name it with the advice. `--all` discovery
+                // already did, so it is not repeated there.
+                if !all {
+                    unmanaged.push((path.clone(), WRONG_SHAPE_PARSER_NOTE));
+                }
                 // Only a confirmed absence permits going on. Reading any other
                 // error as "no queries here" would hand back the half-removal
                 // this branch exists to prevent, decided on a guess.
@@ -910,12 +915,6 @@ fn run_language_uninstall(
                     );
                     any_failed = true;
                     continue;
-                }
-                // Still "not installed", but not "nothing here": name what is
-                // left, as `--all` discovery already did for this entry (and
-                // only by name, so `--all` does not print it twice).
-                if !all {
-                    unmanaged.push((path, WRONG_SHAPE_PARSER_NOTE));
                 }
                 None
             }
