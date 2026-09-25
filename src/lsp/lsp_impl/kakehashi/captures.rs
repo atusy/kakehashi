@@ -48,6 +48,7 @@ use tower_lsp_server::ls_types::{Range, TextDocumentIdentifier, Uri};
 use url::Url;
 
 use crate::analysis::next_result_id;
+use crate::error::LockResultExt;
 use crate::language::query_exec::execute_query;
 use crate::language::query_loader::{QueryLoadError, QueryLoader};
 use crate::language::registry::LanguageRegistry;
@@ -332,7 +333,7 @@ struct KindQuery {
     has_expanding_range: bool,
 }
 
-/// Compiled-kind-query cache, `language → kind file → (query, generation)`.
+/// Compiled-kind-query cache, `language → kind file → cached query`.
 /// `load_kind_query` re-read and re-COMPILED every visited language's kind
 /// file on every request — for a per-keystroke highlighter over an
 /// injection-heavy document that meant re-compiling several large query
@@ -344,8 +345,19 @@ struct KindQuery {
 /// than one generation per (language, kind), no sweep, no
 /// clear-vs-concurrent-store race, and reload churn cannot accumulate dead
 /// compiled queries.
-type KindQueryCache =
-    dashmap::DashMap<String, dashmap::DashMap<String, (std::sync::Arc<KindQueryLoad>, u64)>>;
+type KindQueryCache = dashmap::DashMap<String, dashmap::DashMap<String, CachedKindQuery>>;
+
+/// One cached kind query.
+struct CachedKindQuery {
+    load: std::sync::Arc<KindQueryLoad>,
+    /// The generation it was compiled under; a hit requires it to match.
+    generation: u64,
+    /// The search paths it was resolved against, and the query text it
+    /// compiled (`None` when no text resolved), which
+    /// [`kind_queries_changed`] compares against the files on disk.
+    search_paths: Vec<PathBuf>,
+    source: Option<String>,
+}
 
 fn kind_query_cache() -> &'static KindQueryCache {
     static CACHE: std::sync::OnceLock<KindQueryCache> = std::sync::OnceLock::new();
@@ -362,29 +374,122 @@ fn load_kind_query_cached(
 ) -> std::sync::Arc<KindQueryLoad> {
     if let Some(by_kind) = kind_query_cache().get(language_id)
         && let Some(hit) = by_kind.get(file_name)
-        && hit.1 == generation
+        && hit.generation == generation
     {
-        return std::sync::Arc::clone(&hit.0);
+        return std::sync::Arc::clone(&hit.load);
     }
-    let loaded = std::sync::Arc::new(load_kind_query(
-        registry,
-        search_paths,
-        language_id,
-        file_name,
-    ));
+    let in_flight = KindLoadInFlight::begin(search_paths);
+    let (loaded, source) = load_kind_query(registry, search_paths, language_id, file_name);
+    let loaded = std::sync::Arc::new(loaded);
     // Overwrite-on-miss doubles as eviction (one generation per entry). A
-    // racing same-generation compute overwrites with identical data. `get`
-    // first so a present language avoids the key clone `entry()` needs.
-    let stored = (std::sync::Arc::clone(&loaded), generation);
-    if let Some(by_kind) = kind_query_cache().get(language_id) {
-        by_kind.insert(file_name.to_string(), stored);
-    } else {
-        kind_query_cache()
-            .entry(language_id.to_string())
-            .or_default()
-            .insert(file_name.to_string(), stored);
-    }
+    // racing same-generation compute overwrites with whatever it read, which
+    // `kind_queries_changed` compares against the disk. An entry from a
+    // NEWER generation is never overwritten: a request that started before a
+    // reload would otherwise replace the current entry with one no lookup
+    // hits and no change scan looks at. `get` first so a present language
+    // avoids the key clone `entry()` needs.
+    let stored = CachedKindQuery {
+        load: std::sync::Arc::clone(&loaded),
+        generation,
+        search_paths: search_paths.to_vec(),
+        source,
+    };
+    store_kind_query(language_id, file_name, stored);
+    drop(in_flight);
     loaded
+}
+
+/// Store a loaded kind query, unless an entry from a newer generation is
+/// already there. Replacing a same-generation entry compiled from other text
+/// records a [`KIND_SOURCE_CONFLICTS`] entry.
+fn store_kind_query(language_id: &str, file_name: &str, stored: CachedKindQuery) {
+    let store = |by_kind: &dashmap::DashMap<String, CachedKindQuery>| match by_kind
+        .entry(file_name.to_string())
+    {
+        dashmap::mapref::entry::Entry::Occupied(current)
+            if current.get().generation > stored.generation => {}
+        dashmap::mapref::entry::Entry::Occupied(mut current) => {
+            let previous = current.get();
+            if previous.generation == stored.generation
+                && previous.search_paths == stored.search_paths
+                && previous.source != stored.source
+            {
+                note_kind_source_conflict(&stored.search_paths, stored.generation);
+            }
+            current.insert(stored);
+        }
+        dashmap::mapref::entry::Entry::Vacant(vacant) => {
+            vacant.insert(stored);
+        }
+    };
+    if let Some(by_kind) = kind_query_cache().get(language_id) {
+        store(&by_kind);
+    } else {
+        store(
+            &kind_query_cache()
+                .entry(language_id.to_string())
+                .or_default(),
+        );
+    }
+}
+
+/// How many cached kind queries [`kind_queries_changed`] resolves before it
+/// gives up and reports a change.
+const MAX_SCANNED_KIND_QUERIES: usize = 256;
+
+/// Search paths and generation under which two loads of one kind query
+/// compiled different text: the file changed between them, and a document's
+/// captures memo of that generation may hold results of the older one. Only
+/// a generation bump invalidates those memos, so [`kind_queries_changed`]
+/// reports (and clears) a conflict of the generation it checks as a change;
+/// one from an older generation was already settled by that bump.
+static KIND_SOURCE_CONFLICTS: std::sync::Mutex<Vec<(Vec<PathBuf>, u64)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn note_kind_source_conflict(search_paths: &[PathBuf], generation: u64) {
+    let mut conflicts = KIND_SOURCE_CONFLICTS
+        .lock()
+        .recover_poison("note_kind_source_conflict");
+    if !conflicts
+        .iter()
+        .any(|(paths, noted)| paths == search_paths && *noted == generation)
+    {
+        conflicts.push((search_paths.to_vec(), generation));
+    }
+}
+
+/// The search paths of every kind-query load between reading its file and
+/// storing the result, one entry per load.
+static KIND_LOADS_IN_FLIGHT: std::sync::Mutex<Vec<Vec<PathBuf>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Registers one kind-query load in [`KIND_LOADS_IN_FLIGHT`] for as long as
+/// it lives. Such a load may have read a kind file before it was edited and
+/// store it after [`kind_queries_changed`] scanned the cache; with no
+/// generation bump to make that entry miss, the scan must not call the
+/// files unchanged meanwhile. Keyed by search paths like the scan itself, so
+/// one configuration's loads never count against another's.
+struct KindLoadInFlight(Vec<PathBuf>);
+
+impl KindLoadInFlight {
+    fn begin(search_paths: &[PathBuf]) -> Self {
+        KIND_LOADS_IN_FLIGHT
+            .lock()
+            .recover_poison("KindLoadInFlight::begin")
+            .push(search_paths.to_vec());
+        Self(search_paths.to_vec())
+    }
+}
+
+impl Drop for KindLoadInFlight {
+    fn drop(&mut self) {
+        let mut in_flight = KIND_LOADS_IN_FLIGHT
+            .lock()
+            .recover_poison("KindLoadInFlight::drop");
+        if let Some(index) = in_flight.iter().position(|paths| *paths == self.0) {
+            in_flight.swap_remove(index);
+        }
+    }
 }
 
 /// Per-language outcome of resolving `queries/<lang>/<kind>.scm`.
@@ -409,14 +514,20 @@ enum KindQueryLoad {
 /// common "no such kind for this language" case (debug); a file that exists
 /// but fails to load or compiles to nothing is asset trouble (warn) —
 /// captures-protocol §"Null vs. error semantics".
+///
+/// Also returns the query text the load compiled, when one resolved.
 fn load_kind_query(
     registry: &LanguageRegistry,
     search_paths: &[PathBuf],
     language_id: &str,
     file_name: &str,
-) -> KindQueryLoad {
+) -> (KindQueryLoad, Option<String>) {
     let Some(language) = registry.get(language_id) else {
-        return KindQueryLoad::Unavailable;
+        // Record the text anyway: a grammar appearing is the language
+        // reload's business, and a missing text here would read as a change
+        // to `kind_queries_changed` on every reload.
+        let source = QueryLoader::resolve_query_source(search_paths, language_id, file_name).ok();
+        return (KindQueryLoad::Unavailable, source);
     };
     let parsed = match QueryLoader::load_query_with_inheritance(
         &language,
@@ -427,7 +538,7 @@ fn load_kind_query(
         Ok(parsed) => parsed,
         Err(err @ QueryLoadError::RefusedLanguage(_)) => {
             log::debug!(target: "kakehashi::captures", "{err}");
-            return KindQueryLoad::Unavailable;
+            return (KindQueryLoad::Unavailable, None);
         }
         Err(QueryLoadError::NotFound) => {
             log::debug!(
@@ -435,7 +546,7 @@ fn load_kind_query(
                 "no {file_name} for {}",
                 escape_terminal_controls(language_id),
             );
-            return KindQueryLoad::Unavailable;
+            return (KindQueryLoad::Unavailable, None);
         }
         Err(err) => {
             log::warn!(
@@ -443,7 +554,7 @@ fn load_kind_query(
                 "failed to load {file_name} for {}: {err}",
                 escape_terminal_controls(language_id),
             );
-            return KindQueryLoad::Unavailable;
+            return (KindQueryLoad::Unavailable, None);
         }
     };
     let Some(query) = parsed.query else {
@@ -453,16 +564,101 @@ fn load_kind_query(
             escape_terminal_controls(language_id),
             parsed.failure_reason,
         );
-        return KindQueryLoad::Broken(parsed.skipped);
+        return (KindQueryLoad::Broken(parsed.skipped), Some(parsed.source));
     };
     let has_offset = crate::language::query_directives::has_offset_directive(&query);
     let has_expanding_range =
         crate::language::query_directives::has_expanding_range_directive(&query);
-    KindQueryLoad::Loaded(KindQuery {
-        query,
-        skipped: parsed.skipped,
-        has_offset,
-        has_expanding_range,
+    (
+        KindQueryLoad::Loaded(KindQuery {
+            query,
+            skipped: parsed.skipped,
+            has_offset,
+            has_expanding_range,
+        }),
+        Some(parsed.source),
+    )
+}
+
+/// Whether any kind query cached under `generation` and `search_paths`
+/// (entries resolved elsewhere belong to another server's configuration,
+/// which only happens in tests) would now compile from
+/// different text: a kind file edited, added or removed on disk. Resolves
+/// the text only, without compiling. A settings reload that skips the
+/// generation bump asks this, since the cache is otherwise invalidated only
+/// by that bump.
+pub(in crate::lsp::lsp_impl) fn kind_queries_changed(
+    search_paths: &[PathBuf],
+    generation: u64,
+) -> bool {
+    if KIND_LOADS_IN_FLIGHT
+        .lock()
+        .recover_poison("kind_queries_changed")
+        .iter()
+        .any(|paths| paths == search_paths)
+    {
+        return true;
+    }
+    // Kind names are client-chosen, so the cache can hold arbitrarily many
+    // entries. This configuration's entries from older generations can no
+    // longer be hit by a current request, so they go; past the bound on
+    // current ones, stop collecting and report a change instead (below).
+    let mut cached: Vec<(String, String, Option<String>)> = Vec::new();
+    let mut over_bound = false;
+    for by_kind in kind_query_cache().iter() {
+        by_kind.retain(|_, entry| {
+            entry.search_paths != search_paths || entry.generation >= generation
+        });
+        for entry in by_kind.iter() {
+            if entry.value().generation != generation || entry.value().search_paths != search_paths
+            {
+                continue;
+            }
+            if cached.len() == MAX_SCANNED_KIND_QUERIES {
+                over_bound = true;
+                break;
+            }
+            cached.push((
+                by_kind.key().clone(),
+                entry.key().clone(),
+                entry.value().source.clone(),
+            ));
+        }
+        if over_bound {
+            break;
+        }
+    }
+    // After the snapshot, not before: a store that replaced an entry with
+    // different text either landed before the snapshot, and its conflict is
+    // already recorded (under the entry's lock, before the replacement), or
+    // after it, and the snapshot still holds the older text.
+    {
+        let mut conflicts = KIND_SOURCE_CONFLICTS
+            .lock()
+            .recover_poison("kind_queries_changed(conflicts)");
+        // Conflicts of this configuration: this generation's report a change;
+        // older ones were settled by the bump that ended their generation.
+        let current = conflicts
+            .iter()
+            .any(|(paths, noted)| paths == search_paths && *noted == generation);
+        conflicts.retain(|(paths, noted)| paths != search_paths || *noted > generation);
+        if current {
+            return true;
+        }
+    }
+    // Past the bound, report a change instead of resolving: the reload that
+    // follows bumps the generation, and the next scan drops what it left.
+    if over_bound {
+        return true;
+    }
+    cached.into_iter().any(|(language_id, file_name, source)| {
+        match QueryLoader::resolve_query_source(search_paths, &language_id, &file_name) {
+            Ok(text) => source.as_deref() != Some(text.as_str()),
+            Err(QueryLoadError::NotFound | QueryLoadError::RefusedLanguage(_)) => source.is_some(),
+            // An unreadable or malformed kind file: only a reload surfaces
+            // its warning, as every configuration push did before the skip.
+            Err(QueryLoadError::Other(_)) => true,
+        }
     })
 }
 
@@ -1815,6 +2011,142 @@ fn execute_captures_walk(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two loads of one kind query in the same generation that read
+    /// different text (the file changed between them) leave captures memos
+    /// built from the older one, which only a generation bump invalidates:
+    /// the scan reports that once, even though the entry now matches disk.
+    #[test]
+    fn kind_queries_changed_reports_a_same_generation_source_conflict() {
+        const LANGUAGE: &str = "kind_conflict_969";
+        const GENERATION: u64 = u64::MAX - 9690;
+        let dir = tempfile::tempdir().unwrap();
+        let kind_dir = dir.path().join("queries").join(LANGUAGE);
+        std::fs::create_dir_all(&kind_dir).unwrap();
+        std::fs::write(kind_dir.join("folds.scm"), "(block) @fold\n").unwrap();
+        let search_paths = vec![dir.path().to_path_buf()];
+        let entry = |source: &str| CachedKindQuery {
+            load: std::sync::Arc::new(KindQueryLoad::Unavailable),
+            generation: GENERATION,
+            search_paths: search_paths.clone(),
+            source: Some(source.to_string()),
+        };
+
+        store_kind_query(LANGUAGE, "folds.scm", entry("(function_item) @fold\n"));
+        store_kind_query(LANGUAGE, "folds.scm", entry("(block) @fold\n"));
+
+        assert!(kind_queries_changed(&search_paths, GENERATION));
+        assert!(
+            !kind_queries_changed(&search_paths, GENERATION),
+            "a conflict is reported once; the entry itself matches the disk"
+        );
+
+        // A conflict from an older generation was settled by the bump that
+        // ended it: a later scan must not report it.
+        let old = |source: &str| CachedKindQuery {
+            generation: GENERATION - 1,
+            ..entry(source)
+        };
+        store_kind_query(LANGUAGE, "context.scm", old("(a) @a\n"));
+        store_kind_query(LANGUAGE, "context.scm", old("(b) @b\n"));
+        assert!(!kind_queries_changed(&search_paths, GENERATION));
+    }
+
+    /// A reload that skips the generation bump leaves this cache in place, so
+    /// it must be able to tell whether a cached kind file changed on disk:
+    /// unchanged text is no change, an edit or a newly added kind file is.
+    #[test]
+    fn kind_queries_changed_tracks_the_kind_files_on_disk() {
+        // Unique names: the cache is process-wide and shared with other tests.
+        const LANGUAGE: &str = "kind_reload_969";
+        const GENERATION: u64 = u64::MAX - 969;
+        let registry = LanguageRegistry::new();
+        registry.register(LANGUAGE.into(), tree_sitter_rust::LANGUAGE.into());
+        let dir = tempfile::tempdir().unwrap();
+        let kind_dir = dir.path().join("queries").join(LANGUAGE);
+        std::fs::create_dir_all(&kind_dir).unwrap();
+        std::fs::write(kind_dir.join("folds.scm"), "(function_item) @fold\n").unwrap();
+        let search_paths = vec![dir.path().to_path_buf()];
+
+        let _ = load_kind_query_cached(&registry, &search_paths, LANGUAGE, "folds.scm", GENERATION);
+        let _ = load_kind_query_cached(
+            &registry,
+            &search_paths,
+            LANGUAGE,
+            "context.scm",
+            GENERATION,
+        );
+        assert!(!kind_queries_changed(&search_paths, GENERATION));
+
+        std::fs::write(kind_dir.join("folds.scm"), "(block) @fold\n").unwrap();
+        assert!(kind_queries_changed(&search_paths, GENERATION));
+
+        std::fs::write(kind_dir.join("folds.scm"), "(function_item) @fold\n").unwrap();
+        assert!(!kind_queries_changed(&search_paths, GENERATION));
+        std::fs::write(kind_dir.join("context.scm"), "(function_item) @context\n").unwrap();
+        assert!(kind_queries_changed(&search_paths, GENERATION));
+        std::fs::remove_file(kind_dir.join("context.scm")).unwrap();
+        assert!(!kind_queries_changed(&search_paths, GENERATION));
+        std::fs::write(kind_dir.join("context.scm"), b"\xff\xfe not utf-8").unwrap();
+        assert!(
+            kind_queries_changed(&search_paths, GENERATION),
+            "an unreadable kind file must keep surfacing its warning"
+        );
+        std::fs::remove_file(kind_dir.join("context.scm")).unwrap();
+        let in_flight = KindLoadInFlight::begin(&search_paths);
+        assert!(
+            kind_queries_changed(&search_paths, GENERATION),
+            "a load in flight may store a file read before an edit"
+        );
+        drop(in_flight);
+        assert!(!kind_queries_changed(&search_paths, GENERATION));
+
+        std::fs::remove_file(kind_dir.join("folds.scm")).unwrap();
+        assert!(
+            kind_queries_changed(&search_paths, GENERATION),
+            "a deleted kind file"
+        );
+        // A request that started under an older generation finishes after
+        // the current entry was stored: it must not replace it.
+        let _ = load_kind_query_cached(&registry, &search_paths, LANGUAGE, "folds.scm", GENERATION);
+        std::fs::write(kind_dir.join("folds.scm"), "(function_item) @fold\n").unwrap();
+        let _ = load_kind_query_cached(
+            &registry,
+            &search_paths,
+            LANGUAGE,
+            "folds.scm",
+            GENERATION - 1,
+        );
+        std::fs::write(kind_dir.join("folds.scm"), "(block) @fold\n").unwrap();
+        assert!(
+            kind_queries_changed(&search_paths, GENERATION),
+            "the current entry must survive an older request's store"
+        );
+        // Past the scan bound, the scan reports a change without resolving.
+        for index in 0..=MAX_SCANNED_KIND_QUERIES {
+            let _ = load_kind_query_cached(
+                &registry,
+                &search_paths,
+                LANGUAGE,
+                &format!("unused_{index}.scm"),
+                GENERATION + 2,
+            );
+        }
+        assert!(kind_queries_changed(&search_paths, GENERATION + 2));
+        assert!(
+            kind_query_cache()
+                .get(LANGUAGE)
+                .unwrap()
+                .get("folds.scm")
+                .is_none(),
+            "entries of an older generation are dropped by the scan"
+        );
+        let elsewhere = tempfile::tempdir().unwrap();
+        assert!(
+            !kind_queries_changed(&[elsewhere.path().to_path_buf()], GENERATION),
+            "entries resolved against other search paths are not this configuration's"
+        );
+    }
 
     fn vals(ns: &[i64]) -> Vec<Value> {
         ns.iter().map(|n| json!(n)).collect()

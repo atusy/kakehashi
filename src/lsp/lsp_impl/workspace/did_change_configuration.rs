@@ -9,7 +9,7 @@ use tower_lsp_server::ls_types::{ConfigurationItem, DidChangeConfigurationParams
 
 use crate::config::{RawWorkspaceSettings, WorkspaceSettings, merge_workspace_settings};
 
-use super::super::{Kakehashi, lock_settings_reload};
+use super::super::{Kakehashi, ReloadTrigger, lock_settings_reload};
 
 fn settings_payload(settings: Value) -> (Value, Vec<String>) {
     let Value::Object(mut object) = settings else {
@@ -471,8 +471,13 @@ impl Kakehashi {
                     .expect("client settings overrides lock poisoned")
                     .push(replay_layer);
                 let warnings = Self::misconfigured_settings_warnings(&settings);
-                self.apply_raw_settings_locked(&reload, merged_ts, settings)
-                    .await;
+                self.apply_raw_settings_locked(
+                    &reload,
+                    ReloadTrigger::Configuration,
+                    merged_ts,
+                    settings,
+                )
+                .await;
                 drop(reload);
                 self.warn_on_misconfigured_settings(&warnings).await;
                 self.notifier().log_info(ingress.applied_message()).await;

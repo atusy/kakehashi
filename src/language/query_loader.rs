@@ -67,13 +67,17 @@ pub(crate) struct ParseResult {
     /// overlays). When true, line numbers in `skipped` refer to the combined
     /// query, not any one source file.
     pub multi_file: bool,
+    /// The complete query text this result was compiled from. Together with
+    /// the grammar it determines the compiled query, so it identifies the
+    /// query's content across reloads.
+    pub source: String,
 }
 
 /// The text of a query assembled from every file that contributes to it.
-struct ResolvedQuery {
-    content: String,
+pub(crate) struct ResolvedQuery {
+    pub(crate) content: String,
     /// How many files were concatenated, across parents and overlays.
-    file_count: usize,
+    pub(crate) file_count: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -271,7 +275,7 @@ impl QueryLoader {
     }
 
     /// Load query content from paths (without parsing).
-    fn load_content_from_paths<P: AsRef<Path>>(paths: &[P]) -> LspResult<String> {
+    pub(crate) fn load_content_from_paths<P: AsRef<Path>>(paths: &[P]) -> LspResult<String> {
         let mut combined_query = String::new();
 
         for path in paths {
@@ -350,6 +354,7 @@ impl QueryLoader {
                 skipped: Vec::new(),
                 failure_reason: None,
                 multi_file,
+                source: query_str.to_owned(),
             };
         }
 
@@ -365,6 +370,7 @@ impl QueryLoader {
                     skipped: Vec::new(),
                     failure_reason: Some(ParseFailure::PatternSplitFailed(reason)),
                     multi_file,
+                    source: query_str.to_owned(),
                 };
             }
         };
@@ -395,6 +401,7 @@ impl QueryLoader {
                 skipped,
                 failure_reason: Some(ParseFailure::AllPatternsInvalid),
                 multi_file,
+                source: query_str.to_owned(),
             };
         }
 
@@ -405,6 +412,7 @@ impl QueryLoader {
                 skipped,
                 failure_reason: None,
                 multi_file,
+                source: query_str.to_owned(),
             },
             Err(e) => {
                 // Defensive: handle the rare case where individually-valid patterns
@@ -419,6 +427,7 @@ impl QueryLoader {
                     skipped,
                     failure_reason: Some(ParseFailure::CombinationFailed(e.message)),
                     multi_file,
+                    source: query_str.to_owned(),
                 }
             }
         }
@@ -429,6 +438,7 @@ impl QueryLoader {
     /// Tolerant parsing skips invalid patterns instead of failing the whole query;
     /// errors only on a missing/unreadable file. Several paths concatenate in
     /// the order given, and the result then says so through `multi_file`.
+    #[cfg(test)]
     pub(crate) fn load_query_from_paths<P: AsRef<Path>>(
         language: &Language,
         paths: &[P],
@@ -450,21 +460,41 @@ impl QueryLoader {
         lang_name: &str,
         file_name: &str,
     ) -> Result<ParseResult, QueryLoadError> {
+        let resolved = Self::resolve_query(runtime_bases, lang_name, file_name)?;
+        Ok(Self::parse_query(
+            language,
+            &resolved.content,
+            resolved.file_count > 1,
+        ))
+    }
+
+    /// The complete query text [`Self::load_query_with_inheritance`] would
+    /// compile — `inherits` parents and `extends` overlays resolved across
+    /// the search paths — without compiling it.
+    pub(crate) fn resolve_query_source<P: AsRef<Path>>(
+        runtime_bases: &[P],
+        lang_name: &str,
+        file_name: &str,
+    ) -> Result<String, QueryLoadError> {
+        Self::resolve_query(runtime_bases, lang_name, file_name).map(|resolved| resolved.content)
+    }
+
+    /// [`Self::resolve_query_source`], also counting the files it combined.
+    pub(crate) fn resolve_query<P: AsRef<Path>>(
+        runtime_bases: &[P],
+        lang_name: &str,
+        file_name: &str,
+    ) -> Result<ResolvedQuery, QueryLoadError> {
         let mut visited = std::collections::HashSet::new();
         let mut emitted = std::collections::HashSet::new();
-        let resolved = Self::resolve_query_recursive(
+        Self::resolve_query_recursive(
             runtime_bases,
             lang_name,
             file_name,
             false,
             &mut visited,
             &mut emitted,
-        )?;
-        Ok(Self::parse_query(
-            language,
-            &resolved.content,
-            resolved.file_count > 1,
-        ))
+        )
     }
 
     /// Resolve library path for a language.

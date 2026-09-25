@@ -10,14 +10,22 @@ use crate::lsp::bridge::BridgeCoordinator;
 use crate::lsp::cache::CacheCoordinator;
 use crate::lsp::client::ClientNotifier;
 use crate::lsp::lsp_impl::{
-    Kakehashi, ReloadLanguageState, SettingsReloadInput, apply_shared_settings_locked,
-    build_notifier, lock_settings_reload,
+    Kakehashi, ReloadLanguageState, ReloadTrigger, SettingsReloadInput,
+    apply_shared_settings_locked, build_notifier, lock_settings_reload,
 };
 use crate::lsp::settings_manager::SettingsManager;
 use tower_lsp_server::Client;
 
 use super::ParseCoordinator;
 use super::parse::ParseCoordinatorDeps;
+
+/// A query-dependency check that is due: the generation it was recorded in,
+/// and the repair-failure revision its answer is judged against.
+#[derive(Clone, Copy)]
+struct QueryRepairCheck {
+    generation: u64,
+    failure_revision: u64,
+}
 
 fn query_dependency_paths(settings: &WorkspaceSettings, language: &str) -> Vec<std::path::PathBuf> {
     // The loader returns after loading an explicit list (including an empty
@@ -301,7 +309,7 @@ impl InstallCoordinator {
     /// reads modelines across every search path, so it runs on the blocking
     /// pool rather than on an async worker.
     pub(crate) async fn query_repair_needed(&self, language: &str, initial_pass: bool) -> bool {
-        let Some(generation) = self.begin_query_repair_check(language, initial_pass) else {
+        let Some(check) = self.begin_query_repair_check(language, initial_pass) else {
             return false;
         };
         let settings = self.settings_manager.load_settings();
@@ -321,7 +329,7 @@ impl InstallCoordinator {
             );
             QueryChainState::Settled
         });
-        self.finish_query_repair_check(language, generation, state)
+        self.finish_query_repair_check(language, check, state)
     }
 
     #[cfg(test)]
@@ -332,11 +340,15 @@ impl InstallCoordinator {
         probe: impl FnOnce() -> QueryChainState,
     ) -> bool {
         self.begin_query_repair_check(language, initial_pass)
-            .is_some_and(|generation| self.finish_query_repair_check(language, generation, probe()))
+            .is_some_and(|check| self.finish_query_repair_check(language, check, probe()))
     }
 
     /// The generation to probe in, or `None` when no probe is due.
-    fn begin_query_repair_check(&self, language: &str, initial_pass: bool) -> Option<u64> {
+    fn begin_query_repair_check(
+        &self,
+        language: &str,
+        initial_pass: bool,
+    ) -> Option<QueryRepairCheck> {
         // Discovery may already have loaded the parser before this task runs.
         // Track checks independently of load events; reload generations reset
         // eligibility while steady-state edits do no dependency filesystem
@@ -350,11 +362,17 @@ impl InstallCoordinator {
         // while auto-install is off is harmless; enabling it is a settings
         // change, which starts a new generation.
         let generation = self.cache.semantic_token_generation();
+        // Read before the check is recorded: a failure landing after this is
+        // newer than whatever the probe answers.
+        let failure_revision = self.auto_install.query_repair_revision(language);
         (self
             .auto_install
             .begin_query_dependency_check(language, generation, initial_pass)
             && self.settings_manager.is_auto_install_enabled(language))
-        .then_some(generation)
+        .then_some(QueryRepairCheck {
+            generation,
+            failure_revision,
+        })
     }
 
     /// A repair a pass decided on but dropped before installing, because its
@@ -363,30 +381,50 @@ impl InstallCoordinator {
     fn release_dropped_repair(&self, language: &str, generation: u64) {
         self.auto_install
             .forget_query_dependency_check(language, generation);
+        self.auto_install.defer_query_repair_retry(language);
     }
 
     fn finish_query_repair_check(
         &self,
         language: &str,
-        generation: u64,
+        check: QueryRepairCheck,
         state: QueryChainState,
     ) -> bool {
+        // Probes run concurrently; a repair that failed while this one read
+        // the chain has already answered. Judged in the current generation: a
+        // reload during the probe retires failures from the probe's own, and a
+        // failure after it is the one that counts. An answer that stands also
+        // ends the failed repair's wait for a retry.
+        let failed_meanwhile = || {
+            self.auto_install
+                .query_repair_failed(language, self.cache.semantic_token_generation())
+        };
         match state {
-            // Probes run concurrently; a repair that failed while this one
-            // read the chain has already answered. Judged in the current
-            // generation: a reload during the probe retires failures from the
-            // probe's own, and a failure after it is the one that counts.
-            QueryChainState::NeedsRepair => !self
-                .auto_install
-                .query_repair_failed(language, self.cache.semantic_token_generation()),
-            QueryChainState::Settled => false,
+            QueryChainState::NeedsRepair => {
+                let admitted = !failed_meanwhile();
+                if admitted {
+                    self.auto_install
+                        .resolve_query_repair_retry(language, check.failure_revision);
+                }
+                admitted
+            }
+            QueryChainState::Settled => {
+                if !failed_meanwhile() {
+                    self.auto_install
+                        .resolve_query_repair_retry(language, check.failure_revision);
+                }
+                false
+            }
             // A lock held exclusively by an install (staging or publishing)
             // or an uninstall is not evidence of a missing language. Leave the answer
             // to a later pass instead of spawning an install that would find
             // nothing to do and still reload every document's queries.
             QueryChainState::Busy => {
                 self.auto_install
-                    .forget_query_dependency_check(language, generation);
+                    .forget_query_dependency_check(language, check.generation);
+                // Nothing answered: whatever the lock was hiding still waits
+                // for a check, which a configuration push must not skip.
+                self.auto_install.defer_query_repair_retry(language);
                 false
             }
         }
@@ -411,6 +449,9 @@ impl InstallCoordinator {
         // A failure is remembered for the generation it was attempted in, so
         // a reload that lands meanwhile already counts as the retry trigger.
         let generation = self.cache.semantic_token_generation();
+        // A successful install answers any earlier failure of this language
+        // that is waiting for a retry — but not one recorded after it began.
+        let failure_revision = self.auto_install.query_repair_revision(language);
         if !self.same_document_incarnation(&uri, expected_incarnation) {
             if request.repair_queries {
                 self.release_dropped_repair(language, generation);
@@ -456,10 +497,24 @@ impl InstallCoordinator {
         }
         let search_paths = query_dependency_paths(&self.settings_manager.load_settings(), language);
         let mut result = self.auto_install.try_install(language, search_paths).await;
+        // Recorded for any owned failure, not only a repair's: waiters
+        // repairing through this claim rely on it, and the memo only gates
+        // query-repair decisions. Before the first await below: a caller
+        // cancelled there still publishes the failure to waiters (dropping
+        // the result does), and must not lose its wait for a retry.
+        if result.outcome.is_failure() {
+            self.auto_install
+                .record_query_repair_failure(language, generation);
+        }
 
         self.dispatch_install_events(language, &result.events).await;
 
         if let Some(data_dir) = result.outcome.data_dir().cloned() {
+            // The install is the retry; one whose parser then cannot be
+            // loaded records itself as a failure again (see
+            // `reload_language_after_install`).
+            self.auto_install
+                .resolve_query_repair_retry(language, failure_revision);
             parsed = self
                 .reload_language_after_install(
                     language,
@@ -582,6 +637,16 @@ impl InstallCoordinator {
             // A shared failure is the owner's to record, in the generation
             // its attempt started in: a waiter joining after a reload must
             // not spend that reload's retry on an attempt from before it.
+            // Its wait for a retry is not generation-scoped, though, and the
+            // owner may never record it (cancelled mid-install, or its claim
+            // finished by a detached check), so the waiter puts the language
+            // on the wait itself. Whether the failure was already recorded
+            // and retried cannot be told from here — a reload may retire it
+            // while this waiter still belongs to the pre-reload claim — so
+            // this errs toward one more reload rather than a lost retry.
+            if terminal.is_failure() {
+                self.auto_install.defer_query_repair_retry(language);
+            }
             if terminal == crate::lsp::auto_install::InstallOutcome::Abandoned
                 && self.same_document_incarnation(&uri, expected_incarnation)
                 && request.allow_recovery
@@ -599,13 +664,6 @@ impl InstallCoordinator {
                 .await;
             }
         } else {
-            // Recorded for any owned failure, not only a repair's: waiters
-            // repairing through this claim rely on it, and the memo only
-            // gates query-repair decisions.
-            if result.outcome.is_failure() {
-                self.auto_install
-                    .record_query_repair_failure(language, generation);
-            }
             result.complete_claim();
         }
         InstallCompletion {
@@ -649,6 +707,10 @@ impl InstallCoordinator {
         if let Some(claim) = claim {
             if !global_loaded {
                 claim.outcome = crate::lsp::auto_install::InstallOutcome::Failed;
+                // An owned install that cannot be loaded failed like any
+                // other: it waits for a retry.
+                self.auto_install
+                    .record_query_repair_failure(language, self.cache.semantic_token_generation());
             }
             claim.complete_claim();
         }
@@ -678,15 +740,15 @@ impl InstallCoordinator {
         raw_settings: crate::config::RawWorkspaceSettings,
         settings: WorkspaceSettings,
     ) {
-        let _reparse_uris = apply_shared_settings_locked(
+        let _outcome = apply_shared_settings_locked(
             reload,
             &self.client,
             ReloadLanguageState {
                 language: &self.language,
                 parser_pool: &self.parser_pool,
                 documents: &self.documents,
-                invalidate_documents: false,
-                request_semantic_refresh: true,
+                trigger: ReloadTrigger::Install,
+                reload_required: false,
             },
             &self.settings_manager,
             &self.cache,
@@ -801,6 +863,10 @@ mod tests {
             "a held lock is an install at work, not a missing language"
         );
         assert!(
+            server.auto_install.has_query_repairs_awaiting_retry(),
+            "a busy answer answered nothing, so a configuration push must not skip its retry"
+        );
+        assert!(
             install.decide_query_repair("rust", false, || QueryChainState::NeedsRepair),
             "a busy answer must not consume this generation's check"
         );
@@ -889,6 +955,96 @@ mod tests {
             install.decide_query_repair("rust", true, || QueryChainState::NeedsRepair),
             "a reload (settings change or a successful install) retries it"
         );
+    }
+
+    /// A parser install's failure waits for a retry; the install that later
+    /// succeeds — its parser then loading — is that retry, so a configuration
+    /// push must stop reloading for it. An install whose parser still cannot
+    /// be loaded is not.
+    #[tokio::test]
+    async fn a_successful_install_ends_the_wait_its_earlier_failure_left() {
+        let grammars = std::env::var("TREE_SITTER_GRAMMARS").unwrap_or_else(|_| {
+            std::env::current_dir()
+                .unwrap()
+                .join("deps/tree-sitter")
+                .to_string_lossy()
+                .into_owned()
+        });
+        let parser = std::path::Path::new(&grammars)
+            .join("parser")
+            .join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+        if !parser.exists() {
+            eprintln!("skipping: lua parser not built");
+            return;
+        }
+        let (service, mut socket) = LspService::new(Kakehashi::new);
+        // The post-install reload logs to the client; keep the socket drained.
+        let client = tokio::spawn(async move {
+            use futures::StreamExt;
+            while socket.next().await.is_some() {}
+        });
+        let server = service.inner();
+        // Search paths of our own: a developer's data directory may already
+        // hold a Lua parser.
+        let search_path = tempfile::tempdir().unwrap();
+        server.settings_manager.apply_settings(WorkspaceSettings {
+            auto_install: true,
+            search_paths: vec![search_path.path().to_string_lossy().into_owned()],
+            ..Default::default()
+        });
+        let uri = Url::parse("file:///retried-install.lua").unwrap();
+        let incarnation =
+            server
+                .documents
+                .insert(uri.clone(), "local x = 1".into(), Some("lua".into()), None);
+        let install = server.install_coordinator();
+        let attempt = |outcome| {
+            server.auto_install.script_next_install("lua", outcome);
+            let install = &install;
+            let uri = uri.clone();
+            async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    install.maybe_auto_install_language(
+                        "lua",
+                        uri,
+                        false,
+                        Some(incarnation),
+                        InstallRequest::new(false),
+                    ),
+                )
+                .await
+                .expect("the install attempt must finish");
+            }
+        };
+        attempt(crate::lsp::auto_install::InstallOutcome::Failed).await;
+        assert!(server.auto_install.has_query_repairs_awaiting_retry());
+
+        let data_dir = tempfile::tempdir().unwrap();
+        attempt(crate::lsp::auto_install::InstallOutcome::Success {
+            data_dir: data_dir.path().to_path_buf(),
+        })
+        .await;
+        assert!(
+            server.auto_install.has_query_repairs_awaiting_retry(),
+            "an install whose parser cannot be loaded is not the retry"
+        );
+
+        std::fs::create_dir_all(data_dir.path().join("parser")).unwrap();
+        std::fs::copy(
+            &parser,
+            data_dir
+                .path()
+                .join("parser")
+                .join(format!("lua.{}", std::env::consts::DLL_EXTENSION)),
+        )
+        .unwrap();
+        attempt(crate::lsp::auto_install::InstallOutcome::Success {
+            data_dir: data_dir.path().to_path_buf(),
+        })
+        .await;
+        assert!(!server.auto_install.has_query_repairs_awaiting_retry());
+        client.abort();
     }
 
     #[tokio::test]

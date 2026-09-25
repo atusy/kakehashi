@@ -103,11 +103,124 @@ pub(super) fn bridge_configs_for_injection_language(
 }
 
 pub(super) struct ReloadLanguageState<'a> {
-    language: &'a LanguageCoordinator,
+    language: &'a std::sync::Arc<LanguageCoordinator>,
     parser_pool: &'a std::sync::Mutex<DocumentParserPool>,
     documents: &'a DocumentStore,
-    invalidate_documents: bool,
-    request_semantic_refresh: bool,
+    trigger: ReloadTrigger,
+    /// The caller needs the language reload whatever a configuration
+    /// reload's skip check finds: a failed query repair is retried only by a
+    /// pass over its document in a new generation, which only a reload that
+    /// reparses provides.
+    reload_required: bool,
+}
+
+/// What caused a settings application. Each trigger has its own answer to
+/// the two expensive follow-ups of a language reload: invalidating every
+/// open document's parse (whose reparse loop also re-drives injection
+/// processing, eager bridge opens and diagnostics) and asking the client to
+/// refresh semantic tokens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReloadTrigger {
+    /// `initialize`: no document is open and no client has consumed tokens,
+    /// and a refresh request is not valid before `initialized`.
+    Initialize,
+    /// A parser/query install finished: new files on disk, and possibly the
+    /// install directory newly added to the search paths. The install path
+    /// reparses the documents that waited for it itself, so only the refresh
+    /// is requested here.
+    Install,
+    /// A workspace-root change re-read the project configuration. Always a
+    /// full reload: the root feeds bridge connection keying (the client-root
+    /// fallback), an input no settings comparison sees.
+    WorkspaceFolders,
+    /// A `workspace/didChangeConfiguration` push or a `workspace/configuration`
+    /// pull. Skips the language reload altogether when it would change
+    /// nothing: the effective settings are equal and no parser or query file
+    /// it would re-read changed on disk ([`configuration_reload_needed`]).
+    Configuration,
+}
+
+impl ReloadTrigger {
+    fn invalidates_documents(self) -> bool {
+        match self {
+            Self::Initialize | Self::Install => false,
+            Self::WorkspaceFolders | Self::Configuration => true,
+        }
+    }
+
+    fn requests_semantic_refresh(self) -> bool {
+        match self {
+            Self::Initialize => false,
+            Self::Install | Self::WorkspaceFolders | Self::Configuration => true,
+        }
+    }
+}
+
+/// Whether a configuration reload to `settings` must run the language
+/// reload: the effective settings changed at all, or query or parser files
+/// it would re-read changed on disk — the languages' own, or a
+/// `kakehashi/captures` kind query compiled under the current generation,
+/// which only the reload's generation bump would otherwise invalidate. The
+/// disk checks run on the blocking pool and never touch the live
+/// coordinator; if they cannot finish, reload.
+///
+/// Any settings change counts, even one no parse or token reads (diagnostic
+/// timing, the log level): publishing changed settings advances the
+/// settings generation, which fences in-flight work (a host document's
+/// reopen, a diagnostic computed under the old settings) that only the
+/// reload's reparse repairs. Only an equal push can skip without leaving
+/// such work stranded.
+///
+/// # Known limits
+///
+/// The full reload also acted as a blanket retry for work that failed
+/// earlier, and a skip retries only what this check can see pending (query
+/// repairs waiting for a retry, parser and query files that changed or are
+/// broken, loads in flight). Not covered:
+///
+/// - A bridge server whose eager open failed (say, its executable was
+///   missing when the document opened) is not retried by an identical push;
+///   the next edit's reparse or the next request that acquires the server
+///   retries it (#1144).
+/// - A document whose `workspaceMarkers` root moved on disk (a nearer marker
+///   file appeared or went away) is not re-rooted onto the matching bridge
+///   connection by an identical push; the next edit's reparse, any settings
+///   change or a workspace-folder change re-roots it (#1145).
+/// - Failed language loads are remembered for the trial only up to a bound
+///   (`MAX_REMEMBERED_FAILED_LOADS` in the language coordinator); past it, a parser appearing
+///   for a forgotten one is picked up by the next document that needs it,
+///   not by an identical push.
+async fn configuration_reload_needed(
+    language: &std::sync::Arc<LanguageCoordinator>,
+    cache: &CacheCoordinator,
+    previous: &WorkspaceSettings,
+    settings: &WorkspaceSettings,
+) -> bool {
+    if previous != settings {
+        return true;
+    }
+    let language = std::sync::Arc::clone(language);
+    let settings = settings.clone();
+    let generation = cache.semantic_token_generation();
+    tokio::task::spawn_blocking(move || {
+        language.reload_would_change_languages(&settings)
+            || kakehashi::captures::kind_queries_changed(&language.search_paths(), generation)
+    })
+    .await
+    .unwrap_or(true)
+}
+
+/// What one settings application asked of the documents and the client.
+pub(super) struct SettingsReloadOutcome {
+    /// Documents whose parse was invalidated; the caller schedules their
+    /// reparse.
+    pub(super) reparse_uris: Vec<Url>,
+    /// Whether a `workspace/semanticTokens/refresh` was requested (before the
+    /// client-capability gate).
+    pub(super) semantic_refresh_requested: bool,
+    /// Whether the language reload ran; false only for a configuration
+    /// application that changed nothing.
+    pub(super) languages_reloaded: bool,
 }
 
 pub(super) struct SettingsReloadInput {
@@ -156,7 +269,7 @@ pub(super) async fn apply_shared_settings(
     bridge: &BridgeCoordinator,
     raw_settings: Option<RawWorkspaceSettings>,
     settings: WorkspaceSettings,
-) -> Vec<Url> {
+) -> SettingsReloadOutcome {
     let reload = lock_settings_reload().await;
     apply_shared_settings_locked(
         &reload,
@@ -173,19 +286,15 @@ pub(super) async fn apply_shared_settings(
     .await
 }
 
-pub(super) async fn apply_shared_settings_locked(
-    _reload: &tokio::sync::MutexGuard<'static, ()>,
-    client: &Client,
-    language_state: ReloadLanguageState<'_>,
-    settings_manager: &SettingsManager,
+/// The synchronous language half of a settings application: swap the
+/// parsers and queries, invalidate open documents' parses if the trigger
+/// asks for it, and fence every generation-stamped product built across the
+/// swap. Returns the load summary and the documents to reparse.
+fn reload_languages_locked(
+    language_state: &ReloadLanguageState<'_>,
     cache: &CacheCoordinator,
-    bridge: &BridgeCoordinator,
-    input: SettingsReloadInput,
-) -> Vec<Url> {
-    let SettingsReloadInput {
-        raw_settings,
-        settings,
-    } = input;
+    settings: &WorkspaceSettings,
+) -> (crate::language::events::LanguageLoadSummary, Vec<Url>) {
     // TRANSITIONAL generation bump BEFORE any query/config mutation: from
     // this instant, every generation-stamped product built from the OLD
     // queries (snapshot-riding discovery/bridge/resolved regions, layer
@@ -198,8 +307,8 @@ pub(super) async fn apply_shared_settings_locked(
     cache.bump_semantic_token_generation();
     crate::analysis::semantic::invalidate_thread_local_parser_caches();
     let parser_reload = ParserReloadGuard::begin(language_state.parser_pool);
-    let mut summary = language_state.language.load_settings(&settings);
-    let reparse_uris = if language_state.invalidate_documents {
+    let summary = language_state.language.load_settings(settings);
+    let reparse_uris = if language_state.trigger.invalidates_documents() {
         language_state.documents.invalidate_all_parses()
     } else {
         Vec::new()
@@ -209,7 +318,7 @@ pub(super) async fn apply_shared_settings_locked(
     // transitional bump above but before the swap computed against the OLD
     // queries yet stamped the new generation — without this bump those
     // products would be accepted as current for the whole awaited propagate
-    // below, and a publish landing between the guard's release and the bump
+    // that follows in the caller, and a publish landing between the guard's release and the bump
     // would be accepted by readers that treat "no reload in progress" plus a
     // current stamp as settled. (The final bump after apply_settings covers
     // the settings-side inputs the apply swaps.)
@@ -219,12 +328,58 @@ pub(super) async fn apply_shared_settings_locked(
     // registry and query stores were being replaced.
     drop(parser_reload);
     crate::analysis::semantic::invalidate_thread_local_parser_caches();
+    (summary, reparse_uris)
+}
+
+pub(super) async fn apply_shared_settings_locked(
+    _reload: &tokio::sync::MutexGuard<'static, ()>,
+    client: &Client,
+    language_state: ReloadLanguageState<'_>,
+    settings_manager: &SettingsManager,
+    cache: &CacheCoordinator,
+    bridge: &BridgeCoordinator,
+    input: SettingsReloadInput,
+) -> SettingsReloadOutcome {
+    let SettingsReloadInput {
+        raw_settings,
+        settings,
+    } = input;
+    // Decide BEFORE touching anything: the language reload itself is what
+    // disturbs open documents (the generation bumps null in-flight token
+    // requests and stale every document's stored injection regions; the
+    // coordinator's load marks registrations stale while it re-reads them),
+    // and its follow-ups are what repair that. A reload that would change
+    // nothing skips both halves.
+    let reload_languages = language_state.trigger != ReloadTrigger::Configuration
+        || language_state.reload_required
+        || configuration_reload_needed(
+            language_state.language,
+            cache,
+            &settings_manager.load_settings(),
+            &settings,
+        )
+        .await;
+    let (mut summary, reparse_uris) = if reload_languages {
+        reload_languages_locked(&language_state, cache, &settings)
+    } else {
+        (
+            crate::language::events::LanguageLoadSummary::default(),
+            Vec::new(),
+        )
+    };
     // Publish the settings snapshot before invalidating downstream connections:
     // once propagation exposes a pool miss, a concurrent request must resolve
     // the NEW launch config rather than respawn from the old snapshot (#587).
-    match raw_settings {
-        Some(raw_settings) => settings_manager.apply_settings_with_raw(raw_settings, settings),
-        None => settings_manager.apply_settings(settings),
+    // A skipped reload has equal effective settings: keep their generation,
+    // which would otherwise fence in-flight work with nothing to repair it,
+    // and store only the raw layer the next merge accumulates onto.
+    match (raw_settings, reload_languages) {
+        (Some(raw_settings), true) => {
+            settings_manager.apply_settings_with_raw(raw_settings, settings)
+        }
+        (None, true) => settings_manager.apply_settings(settings),
+        (Some(raw_settings), false) => settings_manager.store_equivalent_raw_settings(raw_settings),
+        (None, false) => {}
     }
     let settings = settings_manager.load_settings();
     // Update the reader-side copy before propagating downstream settings so a
@@ -274,19 +429,26 @@ pub(super) async fn apply_shared_settings_locked(
     // apply (kills stamps that read the new queries but the OLD
     // settings-side inputs, e.g. capture mappings, during the awaited
     // propagate).
-    // Done at this single choke point so every reload path (initialize,
-    // didChangeConfiguration, and the auto-install reload) is covered, and
+    // Done at this single choke point so every language reload
+    // (initialize, didChangeConfiguration, the workspace-folder change and
+    // the auto-install reload) is covered — a configuration application that
+    // skipped the language reload changed nothing it would fence — and
     // *before* the refresh below so the editor's re-request recomputes. The
     // generation bump (not a bare clear) also defeats a request that was
     // mid-tokenization across the reload and stores afterwards: it captured
     // an old generation, so its entry can't be served post-reload.
     // `didChange` deliberately does NOT invalidate (delta needs the previous
     // tokens); only a query/config reload does.
-    cache.bump_semantic_token_generation();
+    if reload_languages {
+        cache.bump_semantic_token_generation();
+    }
     // Query removal/replacement affects unchanged documents too. Request one
-    // workspace refresh for every reload; ClientNotifier capability-gates and
-    // coalesces it with any language-specific refresh events in this batch.
-    if language_state.request_semantic_refresh {
+    // workspace refresh for every language reload; ClientNotifier
+    // capability-gates and coalesces it with any language-specific refresh
+    // events in this batch.
+    let semantic_refresh_requested =
+        reload_languages && language_state.trigger.requests_semantic_refresh();
+    if semantic_refresh_requested {
         summary
             .events
             .push(crate::language::LanguageEvent::semantic_tokens_refresh(
@@ -296,7 +458,8 @@ pub(super) async fn apply_shared_settings_locked(
         // Initialization may produce language-specific refresh events (for
         // example while registering a derived language). No refresh request is
         // valid before InitializeResult/initialized, and no document has yet
-        // consumed tokens, so keep the logs while stripping every refresh.
+        // consumed tokens, so keep the logs while stripping every refresh. (A
+        // skipped language reload has no events to strip.)
         summary.events.retain(|event| {
             !matches!(
                 event,
@@ -307,7 +470,11 @@ pub(super) async fn apply_shared_settings_locked(
     build_notifier(client, settings_manager)
         .log_language_events(&summary.events)
         .await;
-    reparse_uris
+    SettingsReloadOutcome {
+        reparse_uris,
+        semantic_refresh_requested,
+        languages_reloaded: reload_languages,
+    }
 }
 
 /// Convert url::Url to ls_types::Uri, the reverse conversion for bridge protocol
@@ -572,27 +739,34 @@ impl Kakehashi {
         &self,
         raw_settings: RawWorkspaceSettings,
         settings: WorkspaceSettings,
-    ) {
+    ) -> SettingsReloadOutcome {
         let reload = lock_settings_reload().await;
-        self.apply_raw_settings_locked(&reload, raw_settings, settings)
-            .await;
+        self.apply_raw_settings_locked(
+            &reload,
+            ReloadTrigger::Configuration,
+            raw_settings,
+            settings,
+        )
+        .await
     }
 
     async fn apply_raw_settings_locked(
         &self,
         reload: &tokio::sync::MutexGuard<'static, ()>,
+        trigger: ReloadTrigger,
         raw_settings: RawWorkspaceSettings,
         settings: WorkspaceSettings,
-    ) {
-        apply_shared_settings_locked(
+    ) -> SettingsReloadOutcome {
+        let pending_repairs = self.auto_install.query_repair_retries();
+        let outcome = apply_shared_settings_locked(
             reload,
             &self.client,
             ReloadLanguageState {
                 language: &self.language,
                 parser_pool: &self.parser_pool,
                 documents: &self.documents,
-                invalidate_documents: true,
-                request_semantic_refresh: true,
+                trigger,
+                reload_required: !pending_repairs.is_empty(),
             },
             &self.settings_manager,
             &self.cache,
@@ -602,9 +776,29 @@ impl Kakehashi {
                 settings,
             },
         )
-        .await
-        .into_iter()
-        .for_each(|uri| self.schedule_reparse(uri, None));
+        .await;
+        log::debug!(
+            target: "kakehashi::config",
+            "Settings applied ({trigger:?}): {} document(s) to reparse, semantic tokens refresh {}",
+            outcome.reparse_uris.len(),
+            if outcome.semantic_refresh_requested {
+                "requested"
+            } else {
+                "not needed"
+            }
+        );
+        for uri in &outcome.reparse_uris {
+            self.schedule_reparse(uri.clone(), None);
+        }
+        // The reload is the retry a pending repair was waiting for, as every
+        // configuration push was before the skip existed: whatever the
+        // reparses retry, a failure they meet records itself again. Without
+        // this, a repair no reparse probes (a host language's) would force a
+        // reload on every push from now on.
+        if outcome.languages_reloaded {
+            self.auto_install
+                .retire_query_repair_retries(&pending_repairs);
+        }
         // The new settings can change what a client pull returns with no
         // publish to show it — e.g. a server newly excluded by
         // `textDocument/diagnostic` `priorities` (#916), whose folded pushes
@@ -612,8 +806,12 @@ impl Kakehashi {
         // so ask it to. Forced past the coverage gate: no coverage version
         // moved, the configuration did. Refresh-capability-gated and
         // single-flighted like every other nudge; the re-pull waits for the
-        // reparse scheduled above.
-        DiagnosticPublisher::new(self).request_pull_diagnostic_refresh(true);
+        // reparse scheduled above. An application that skipped the reload
+        // changed nothing a pull returns, so it asks for nothing.
+        if outcome.languages_reloaded {
+            DiagnosticPublisher::new(self).request_pull_diagnostic_refresh(true);
+        }
+        outcome
     }
 
     async fn apply_initial_settings(
@@ -628,8 +826,8 @@ impl Kakehashi {
                 language: &self.language,
                 parser_pool: &self.parser_pool,
                 documents: &self.documents,
-                invalidate_documents: false,
-                request_semantic_refresh: false,
+                trigger: ReloadTrigger::Initialize,
+                reload_required: false,
             },
             &self.settings_manager,
             &self.cache,
@@ -638,6 +836,7 @@ impl Kakehashi {
             settings,
         )
         .await
+        .reparse_uris
         .into_iter()
         .for_each(|uri| self.schedule_reparse(uri, None));
         self.warn_on_misconfigured_settings(&warnings).await;
@@ -1127,6 +1326,9 @@ impl LanguageServer for Kakehashi {
 
 #[cfg(test)]
 mod discovery_lifecycle_tests;
+
+#[cfg(test)]
+mod settings_reload_tests;
 
 #[cfg(test)]
 mod tests {

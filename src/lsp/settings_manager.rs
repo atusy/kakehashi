@@ -282,6 +282,19 @@ impl SettingsManager {
         }));
     }
 
+    /// Replace the raw workspace settings with a representation of the SAME
+    /// effective settings, keeping the snapshot's effective settings and
+    /// generation: nothing that reads effective settings can tell the
+    /// difference, so nothing needs fencing.
+    pub(crate) fn store_equivalent_raw_settings(&self, raw_settings: RawWorkspaceSettings) {
+        let current = self.settings_snapshot.load_full();
+        self.settings_snapshot.store(Arc::new(SettingsSnapshot {
+            raw_settings: Arc::new(raw_settings),
+            settings: Arc::clone(&current.settings),
+            generation: current.generation,
+        }));
+    }
+
     /// The generation of the currently visible settings snapshot. Reading it
     /// and the settings from the SAME `load_settings_pair` snapshot is what
     /// gives consumers an atomic (settings, generation) view; two separate

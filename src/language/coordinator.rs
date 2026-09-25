@@ -15,6 +15,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use tree_sitter::Language;
 
+/// How many failed language loads are remembered (see
+/// `LanguageCoordinator::failed_loads`). Every one is re-read by each reload
+/// trial, and names can come from document text (code-fence info strings).
+const MAX_REMEMBERED_FAILED_LOADS: usize = 256;
+
 /// Maximum length (in characters) for pattern previews in log messages.
 const MAX_PREVIEW_LEN: usize = 60;
 
@@ -33,8 +38,8 @@ struct QueryLoadContext<'a> {
 
 /// RAII single-flight marker for [`LanguageCoordinator::ensure_language_loaded_async`]:
 /// on drop, removes this language's in-flight entry (only if it still points
-/// at this guard's own `Notify` — a reload's `failed_loads.clear()` never
-/// touches this map, so nothing else contends the removal) and wakes every
+/// at this guard's own `Notify` — a reload never touches this map, so
+/// nothing else contends the removal) and wakes every
 /// parked loser, whether the load succeeded, failed, or panicked mid-flight.
 struct LanguageLoadFlightGuard<'a> {
     map: &'a dashmap::DashMap<String, Arc<tokio::sync::Notify>>,
@@ -55,7 +60,9 @@ pub(crate) struct LanguageCoordinator {
     query_store: QueryStore,
     config_store: ConfigStore,
     language_registry: LanguageRegistry,
-    parser_loader: RwLock<ParserLoader>,
+    /// Shared with [`Self::scratch_sharing_caches`] copies, so a trial load
+    /// resolves the same grammar objects as the live one.
+    parser_loader: Arc<RwLock<ParserLoader>>,
     /// Maps derived languageId → base language name.
     /// Built from `languages.<name>.base` in configuration.
     /// Example: "rmd" → "markdown" (when rmd has `base = "markdown"`)
@@ -74,6 +81,8 @@ pub(crate) struct LanguageCoordinator {
     /// re-poisoning — no clear-vs-store ordering to get right. The clear on
     /// `load_settings` is memory hygiene, not the correctness mechanism.
     failed_loads: dashmap::DashMap<String, u64>,
+    /// Serializes [`Self::record_failed_load`]'s bound check with its insert.
+    failed_load_bound: Mutex<()>,
     /// Explicit configured parser failures override same-generation dynamic
     /// discovery. This closes the reload window where fallback publication can
     /// race ahead of validating `languages.<id>.parser`.
@@ -111,6 +120,105 @@ pub(crate) struct LanguageCoordinator {
     /// pre-#575 free-for-all, and the common case (an LSP request burst)
     /// goes exclusively through the async path.
     load_inflight: dashmap::DashMap<String, Arc<tokio::sync::Notify>>,
+    /// Compiled queries by grammar and complete source text. A reload that
+    /// reads the same text for the same grammar gets the query it already
+    /// published back, so the query store's `Arc` identity tracks content: a
+    /// reload can tell "re-read, unchanged" from "re-read, edited" without
+    /// comparing sources. Holds `Weak`s, so it never keeps a replaced query
+    /// alive; dead entries are pruned on each settings load. Shared with
+    /// [`Self::scratch_sharing_caches`] copies.
+    compiled_queries: Arc<Mutex<CompiledQueries>>,
+    /// Set on a [`Self::scratch_sharing_caches`] copy: its load is a trial
+    /// whose events are discarded. It keeps the one warning a settings load
+    /// logs directly (deprecated `aliases`) out of the log; the query
+    /// loader's rare pattern-split and combination warnings still fire.
+    is_trial: bool,
+    /// The queries the latest [`Self::reload_would_change_languages`] trial
+    /// published into the compiled-query cache, held until the next trial.
+    /// The cache keeps only `Weak`s and the scratch coordinator that owned
+    /// them is gone, so without this a reload the trial calls for — the live
+    /// one for configured languages, the next on-demand load for discovered
+    /// ones — would compile the same text again.
+    trial_queries: Mutex<Vec<Arc<tree_sitter::Query>>>,
+    /// Registered languages the latest trial could no longer load or loaded
+    /// differently, and failed ones it now could, for the next live load to
+    /// settle (see `settle_trial_findings`).
+    trial_vanished: Mutex<Vec<String>>,
+    trial_appeared: Mutex<Vec<String>>,
+    /// On-demand loads between reading their files and publishing (see
+    /// [`DynamicLoadInFlight`]).
+    dynamic_loads_in_flight: std::sync::atomic::AtomicUsize,
+    /// Parser libraries that exist but failed to load, and query files that
+    /// failed to load or compiled with skipped patterns — the file problems a
+    /// load warns about (a parser that is simply missing is not one). Read
+    /// on a trial's scratch copy.
+    load_problems: std::sync::atomic::AtomicUsize,
+}
+
+/// Counts one on-demand load in [`LanguageCoordinator::dynamic_loads_in_flight`]
+/// for as long as it lives, from before it reads its files through
+/// publishing the parser and queries, or recording the failure.
+///
+/// Such a load may have read its files before they changed and publish
+/// what it read after a reload trial compared the registrations: without a
+/// settings reload bumping the generation, nothing would reject that stale
+/// publication, so the trial must not call the files unchanged meanwhile.
+struct DynamicLoadInFlight<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl<'a> DynamicLoadInFlight<'a> {
+    fn begin(counter: &'a std::sync::atomic::AtomicUsize) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self(counter)
+    }
+}
+
+impl Drop for DynamicLoadInFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Published query per (grammar, complete source text), with the patterns
+/// its tolerant compilation skipped, so a reuse reports them like a compile.
+type CompiledQueries = HashMap<
+    (Language, String),
+    (
+        std::sync::Weak<tree_sitter::Query>,
+        Vec<super::query_loader::SkippedPattern>,
+    ),
+>;
+
+/// A query compiled (or reused) for one grammar and source text.
+struct CompiledQuery {
+    query: Option<Arc<tree_sitter::Query>>,
+    skipped: Vec<super::query_loader::SkippedPattern>,
+    failure_reason: Option<ParseFailure>,
+    multi_file: bool,
+}
+
+/// A registered language as documents see it. Equality is identity: the
+/// grammar compares by its loaded library, and queries by `Arc`, which
+/// [`LanguageCoordinator::compiled_queries`] keeps equal for equal text. The
+/// held `Arc`s also keep a replaced query's address from being reused while
+/// a comparison is pending.
+struct LoadedLanguage {
+    language: Language,
+    queries: [Option<Arc<tree_sitter::Query>>; QueryKind::ALL.len()],
+}
+
+impl PartialEq for LoadedLanguage {
+    fn eq(&self, other: &Self) -> bool {
+        self.language == other.language
+            && self
+                .queries
+                .iter()
+                .zip(&other.queries)
+                .all(|(mine, theirs)| match (mine, theirs) {
+                    (Some(mine), Some(theirs)) => Arc::ptr_eq(mine, theirs),
+                    (None, None) => true,
+                    _ => false,
+                })
+    }
 }
 
 impl Default for LanguageCoordinator {
@@ -125,10 +233,11 @@ impl LanguageCoordinator {
             query_store: QueryStore::new(),
             config_store: ConfigStore::new(),
             language_registry: LanguageRegistry::new(),
-            parser_loader: RwLock::new(ParserLoader::new()),
+            parser_loader: Arc::new(RwLock::new(ParserLoader::new())),
             base_map: RwLock::new(HashMap::new()),
             derived_languages: RwLock::new(HashSet::new()),
             failed_loads: dashmap::DashMap::new(),
+            failed_load_bound: Mutex::new(()),
             configured_load_failures: dashmap::DashMap::new(),
             reload_scoped_registrations: dashmap::DashMap::new(),
             builtin_queries: dashmap::DashMap::new(),
@@ -137,6 +246,13 @@ impl LanguageCoordinator {
             load_generation: std::sync::atomic::AtomicU64::new(0),
             config_warnings: RwLock::new(Vec::new()),
             load_inflight: dashmap::DashMap::new(),
+            compiled_queries: Arc::new(Mutex::new(HashMap::new())),
+            is_trial: false,
+            trial_queries: Mutex::new(Vec::new()),
+            trial_vanished: Mutex::new(Vec::new()),
+            trial_appeared: Mutex::new(Vec::new()),
+            dynamic_loads_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            load_problems: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -152,6 +268,9 @@ impl LanguageCoordinator {
             if let Some(result) = self.cached_load_verdict(language_id, current_generation) {
                 return result;
             }
+            // Through the failure record below: a recorded failure is a
+            // publication as much as a registration is.
+            let _in_flight = DynamicLoadInFlight::begin(&self.dynamic_loads_in_flight);
             let result = self.try_load_language_by_id(language_id, current_generation);
             if self
                 .load_generation
@@ -220,6 +339,18 @@ impl LanguageCoordinator {
     /// entry suppresses nothing — the store itself cannot re-poison, closing
     /// the check-then-insert window an insert-time gate had.
     fn record_failed_load(&self, language_id: &str, current_generation: u64) {
+        // Past the bound, forget the rest, as every settings load used to:
+        // configuration pushes that skip the reload never load settings, so
+        // the bound is kept here. Forgetting only costs a language a fresh
+        // lookup (or the reload trial's attention) until it fails again.
+        // Serialized so concurrent failures cannot all pass the check.
+        let _bound = self
+            .failed_load_bound
+            .lock()
+            .recover_poison("LanguageCoordinator::record_failed_load");
+        if self.failed_loads.len() >= MAX_REMEMBERED_FAILED_LOADS {
+            self.failed_loads.clear();
+        }
         self.failed_loads
             .insert(language_id.to_string(), current_generation);
     }
@@ -306,6 +437,11 @@ impl LanguageCoordinator {
                         let coordinator = Arc::clone(self);
                         let owned_id = language_id.to_string();
                         let result = tokio::task::spawn_blocking(move || {
+                            // Through the failure record below: a recorded
+                            // failure is a publication as much as a
+                            // registration is.
+                            let _in_flight =
+                                DynamicLoadInFlight::begin(&coordinator.dynamic_loads_in_flight);
                             let result = coordinator
                                 .try_load_language_by_id(&owned_id, current_generation);
                             // Record the failure INSIDE the blocking task so a
@@ -398,15 +534,16 @@ impl LanguageCoordinator {
             .settings_reload_lock
             .lock()
             .recover_poison("LanguageCoordinator::load_settings(reload)");
+        self.prune_compiled_queries();
         self.config_store.update_from_settings(settings);
         self.clear_derived_languages();
         // A reload (new search paths, or the post-install reload) is the only
         // event that can turn a failed load into a success — bump the
         // generation so every existing negative entry stops suppressing
-        // (validity is read-side; see `failed_loads`). The clear is memory
-        // hygiene only: a stale store racing it lands with an old tag and is
-        // inert, so no ordering between bump, clear, and in-flight scans can
-        // produce a wrong suppression.
+        // (validity is read-side; see `failed_loads`). The stale entries stay:
+        // they are how a later reload trial knows which languages documents
+        // were waiting for, which a reload that reparses nothing (the
+        // post-install one) does not retry. A success removes its entry.
         {
             let _registration = self
                 .registration_lock
@@ -415,7 +552,6 @@ impl LanguageCoordinator {
             self.load_generation
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
         }
-        self.failed_loads.clear();
         self.configured_load_failures.clear();
 
         // Build base map from language configs
@@ -467,7 +603,208 @@ impl LanguageCoordinator {
             summary.record(derived_name, result);
         }
 
+        self.settle_trial_findings();
         summary
+    }
+
+    /// Settle what the latest trial found, now that the reload it called for
+    /// has run. Nothing else would, and the trial would report the same
+    /// change on every push from now on:
+    ///
+    /// - An older-generation registration it could no longer load (the parser
+    ///   went away) or loaded differently (a query changed) stays registered
+    ///   as it was until something loads that language again; it is
+    ///   unregistered, so the next document that needs it loads what is on
+    ///   disk. Registrations this load made current stay.
+    /// - A failed language it could now load (the parser appeared) is not
+    ///   loaded by this load unless configured; its failure is forgotten, so
+    ///   the next document that needs it loads it.
+    fn settle_trial_findings(&self) {
+        if self.is_trial {
+            return;
+        }
+        for language_id in std::mem::take(
+            &mut *self
+                .trial_appeared
+                .lock()
+                .recover_poison("LanguageCoordinator::settle_trial_findings(appeared)"),
+        ) {
+            self.failed_loads.remove(&language_id);
+        }
+        let vanished = std::mem::take(
+            &mut *self
+                .trial_vanished
+                .lock()
+                .recover_poison("LanguageCoordinator::settle_trial_findings"),
+        );
+        if vanished.is_empty() {
+            return;
+        }
+        let _registration = self
+            .registration_lock
+            .lock()
+            .recover_poison("LanguageCoordinator::settle_trial_findings(registration)");
+        let generation = self
+            .load_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        for language_id in vanished {
+            if self.reload_scoped_registrations.contains_key(&language_id)
+                && !self.has_current_parser_registration(&language_id, generation)
+            {
+                self.language_registry.unregister(&language_id);
+                self.reload_scoped_registrations.remove(&language_id);
+                self.query_store.remove_queries(&language_id);
+            }
+        }
+    }
+
+    /// Whether applying `settings` would change any language a document can be
+    /// parsed or highlighted with — a parser or query appearing, disappearing,
+    /// or now resolving to a different grammar or query text — WITHOUT
+    /// touching this coordinator.
+    ///
+    /// Runs the whole reload on a scratch copy sharing only the grammar and
+    /// compiled-query caches: every parser and query file is re-read, for the
+    /// configured languages and for every language loaded or attempted on
+    /// demand. The live registrations, generation and query store stay as
+    /// they are, so a caller that finds nothing changed can skip the reload
+    /// entirely. Blocking: reads files and compiles queries.
+    pub(crate) fn reload_would_change_languages(&self, settings: &WorkspaceSettings) -> bool {
+        // A load that read its files before they changed can still publish
+        // them after this comparison; only a real reload rejects it.
+        if self
+            .dynamic_loads_in_flight
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
+        {
+            return true;
+        }
+        // Snapshot before the trial: the held `Arc`s keep every currently
+        // published query interned, so an unchanged re-read resolves to it.
+        // Every registration and every recorded failure counts, whatever
+        // generation tagged it: a reload that invalidates no parse (the
+        // post-install one) leaves languages that open documents still use
+        // tagged with an older generation, and their re-read is as much this
+        // reload's job as a current one's.
+        let current = self.language_state(None);
+        let failed: Vec<String> = self
+            .failed_loads
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        let scratch = self.scratch_sharing_caches();
+        let _ = scratch.load_settings(settings);
+        let scratch_generation = scratch
+            .load_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        for language_id in current.keys().chain(&failed) {
+            if !scratch.has_current_parser_registration(language_id, scratch_generation)
+                && !scratch.configured_load_failed(language_id, scratch_generation)
+            {
+                let _ = scratch.ensure_language_loaded(language_id);
+            }
+        }
+        let trial = scratch.language_state(Some(scratch_generation));
+        *self
+            .trial_vanished
+            .lock()
+            .recover_poison("LanguageCoordinator::reload_would_change_languages(vanished)") =
+            current
+                .iter()
+                .filter(|(language_id, loaded)| trial.get(*language_id) != Some(*loaded))
+                .map(|(language_id, _)| language_id.clone())
+                .collect();
+        *self
+            .trial_appeared
+            .lock()
+            .recover_poison("LanguageCoordinator::reload_would_change_languages(appeared)") =
+            failed
+                .iter()
+                .filter(|language_id| trial.contains_key(*language_id))
+                .cloned()
+                .collect();
+        // A broken parser or query file loads to the same (absent or partial)
+        // result however it is broken, so identity cannot tell a newly broken
+        // file from an old one. Reload whenever the files have problems, as
+        // every configuration push did before the skip existed: that is the
+        // only way their warnings reach the user.
+        let changed = current != trial
+            || scratch
+                .load_problems
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0;
+        *self
+            .trial_queries
+            .lock()
+            .recover_poison("LanguageCoordinator::reload_would_change_languages") = trial
+            .into_values()
+            .flat_map(|loaded| loaded.queries.into_iter().flatten())
+            .collect();
+        changed
+    }
+
+    /// A fresh coordinator sharing this one's grammar and compiled-query
+    /// caches, carrying over the registrations no settings load produces
+    /// (built-in grammars, untagged) with their current and original queries.
+    fn scratch_sharing_caches(&self) -> Self {
+        let scratch = Self {
+            parser_loader: Arc::clone(&self.parser_loader),
+            compiled_queries: Arc::clone(&self.compiled_queries),
+            is_trial: true,
+            ..Self::new()
+        };
+        for language_id in self.language_registry.language_ids() {
+            if self.reload_scoped_registrations.contains_key(&language_id) {
+                continue;
+            }
+            let Some(language) = self.language_registry.get(&language_id) else {
+                continue;
+            };
+            for kind in QueryKind::ALL {
+                if let Some(query) = self.query_store.get_query(kind, &language_id) {
+                    scratch
+                        .query_store
+                        .insert_query(kind, language_id.clone(), query);
+                }
+            }
+            scratch.language_registry.register(language_id, language);
+        }
+        for entry in self.builtin_queries.iter() {
+            scratch
+                .builtin_queries
+                .insert(entry.key().clone(), Arc::clone(entry.value()));
+        }
+        scratch
+    }
+
+    /// The settings-load generation, for tests that pin a reload skipped
+    /// the load entirely.
+    #[cfg(test)]
+    pub(crate) fn load_generation(&self) -> u64 {
+        self.load_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Every language registered (under `generation`, or under any when
+    /// `None`), with the grammar and queries a document of that language is
+    /// parsed and highlighted with.
+    fn language_state(&self, generation: Option<u64>) -> HashMap<String, LoadedLanguage> {
+        self.language_registry
+            .language_ids()
+            .into_iter()
+            .filter(|language_id| {
+                generation.is_none_or(|generation| {
+                    self.has_current_parser_registration(language_id, generation)
+                })
+            })
+            .filter_map(|language_id| {
+                let language = self.language_registry.get(&language_id)?;
+                let queries =
+                    QueryKind::ALL.map(|kind| self.query_store.get_query(kind, &language_id));
+                Some((language_id, LoadedLanguage { language, queries }))
+            })
+            .collect()
     }
 
     /// Load a derived language by copying parser and queries from its base.
@@ -787,7 +1124,9 @@ impl LanguageCoordinator {
             if let Some(aliases) = &config.aliases {
                 let message =
                     crate::config::deprecation::aliases_deprecation_notice(lang_name, aliases);
-                log::warn!(target: "kakehashi::config", "{message}");
+                if !self.is_trial {
+                    log::warn!(target: "kakehashi::config", "{message}");
+                }
                 config_warnings.push(message);
             }
         }
@@ -944,6 +1283,7 @@ impl LanguageCoordinator {
             .register(language_id.to_string(), language);
         self.reload_scoped_registrations
             .insert(language_id.to_string(), expected_generation);
+        self.failed_loads.remove(language_id);
         true
     }
 
@@ -994,6 +1334,13 @@ impl LanguageCoordinator {
             match result {
                 Ok(lang) => lang,
                 Err(err) => {
+                    // A configured parser path that does not exist yet is a
+                    // missing parser, not a broken one. One whose existence
+                    // cannot even be checked (no permission, a symlink loop)
+                    // is broken.
+                    if !matches!(lib_path.try_exists(), Ok(false)) {
+                        self.note_load_problem();
+                    }
                     return Err(LanguageLoadResult::failure_with(LanguageEvent::log(
                         LanguageLogLevel::Error,
                         format!(
@@ -1045,13 +1392,8 @@ impl LanguageCoordinator {
         insert_fn: impl FnOnce(&QueryStore, Arc<tree_sitter::Query>),
     ) {
         let filename = ctx.query_kind.filename();
-        let result = match QueryLoader::load_query_with_inheritance(
-            language,
-            paths,
-            ctx.language_id,
-            filename,
-        ) {
-            Ok(r) => r,
+        let result = match QueryLoader::resolve_query(paths, ctx.language_id, filename) {
+            Ok(resolved) => self.compile_query(language, resolved.content, resolved.file_count > 1),
             Err(err @ crate::language::query_loader::QueryLoadError::RefusedLanguage(_)) => {
                 debug!("{err}");
                 return;
@@ -1065,6 +1407,7 @@ impl LanguageCoordinator {
                 return;
             }
             Err(err) => {
+                self.note_load_problem();
                 events.push(LanguageEvent::log(
                     LanguageLogLevel::Warning,
                     format!(
@@ -1096,9 +1439,10 @@ impl LanguageCoordinator {
         events: &mut Vec<LanguageEvent>,
         insert_fn: impl FnOnce(&QueryStore, Arc<tree_sitter::Query>),
     ) {
-        let result = match QueryLoader::load_query_from_paths(language, paths) {
-            Ok(r) => r,
+        let result = match QueryLoader::load_content_from_paths(paths) {
+            Ok(source) => self.compile_query(language, source, paths.len() > 1),
             Err(err) => {
+                self.note_load_problem();
                 events.push(LanguageEvent::log(
                     LanguageLogLevel::Error,
                     format!(
@@ -1124,15 +1468,82 @@ impl LanguageCoordinator {
         self.process_query_result(result, &query_label, &success_prefix, events, insert_fn);
     }
 
+    /// Compile `source` for `language`, or reuse the query already published
+    /// for exactly that grammar and text without compiling. See
+    /// [`Self::compiled_queries`].
+    fn compile_query(
+        &self,
+        language: &Language,
+        source: String,
+        multi_file: bool,
+    ) -> CompiledQuery {
+        let key = (language.clone(), source);
+        if let Some((published, skipped)) = self
+            .compiled_queries
+            .lock()
+            .recover_poison("LanguageCoordinator::compile_query(lookup)")
+            .get(&key)
+            .and_then(|(query, skipped)| Some((query.upgrade()?, skipped.clone())))
+        {
+            return CompiledQuery {
+                query: Some(published),
+                skipped,
+                failure_reason: None,
+                multi_file,
+            };
+        }
+        // Compile outside the lock; a concurrent compile of the same text
+        // settles on whichever published first.
+        let parsed = QueryLoader::parse_query(language, &key.1, multi_file);
+        let query = parsed.query.map(|query| {
+            let mut compiled = self
+                .compiled_queries
+                .lock()
+                .recover_poison("LanguageCoordinator::compile_query(publish)");
+            let (entry, skipped) = compiled
+                .entry(key)
+                .or_insert_with(|| (std::sync::Weak::new(), Vec::new()));
+            if let Some(published) = entry.upgrade() {
+                return published;
+            }
+            let query = Arc::new(query);
+            *entry = Arc::downgrade(&query);
+            *skipped = parsed.skipped.clone();
+            query
+        });
+        CompiledQuery {
+            query,
+            skipped: parsed.skipped,
+            failure_reason: parsed.failure_reason,
+            multi_file: parsed.multi_file,
+        }
+    }
+
+    /// Drop the [`Self::compiled_queries`] entries nothing references anymore.
+    fn prune_compiled_queries(&self) {
+        self.compiled_queries
+            .lock()
+            .recover_poison("LanguageCoordinator::prune_compiled_queries")
+            .retain(|_, (query, _)| query.strong_count() > 0);
+    }
+
+    fn note_load_problem(&self) {
+        self.load_problems
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Process a ParseResult: log skipped patterns, insert query, log outcome.
     fn process_query_result(
         &self,
-        result: super::query_loader::ParseResult,
+        result: CompiledQuery,
         query_label: &str,
         success_prefix: &str,
         events: &mut Vec<LanguageEvent>,
         insert_fn: impl FnOnce(&QueryStore, Arc<tree_sitter::Query>),
     ) {
+        if !result.skipped.is_empty() || result.query.is_none() {
+            self.note_load_problem();
+        }
         // Log warnings for skipped patterns
         for skipped in &result.skipped {
             let preview = truncate_preview(&skipped.text, MAX_PREVIEW_LEN);
@@ -1155,7 +1566,7 @@ impl LanguageCoordinator {
 
         match result.query {
             Some(query) => {
-                insert_fn(&self.query_store, Arc::new(query));
+                insert_fn(&self.query_store, query);
                 let skipped_count = result.skipped.len();
                 let msg = if skipped_count > 0 {
                     format!("{success_prefix} ({skipped_count} pattern(s) skipped)")
@@ -1772,6 +2183,7 @@ impl LanguageCoordinator {
         self.language_registry
             .register(language_id.to_string(), language);
         self.configured_load_failures.remove(language_id);
+        self.failed_loads.remove(language_id);
         let generation = self
             .load_generation
             .load(std::sync::atomic::Ordering::Acquire);
@@ -3686,6 +4098,401 @@ mod tests {
             !coordinator.ensure_language_loaded("dynamic").success,
             "a prior-generation dynamic entry must not bypass current search-path resolution"
         );
+    }
+
+    /// A parser library that exists but fails to load registers nothing,
+    /// like a missing one; only its error shows the difference, so a trial
+    /// meeting one must reload.
+    #[test]
+    fn reload_trial_reports_a_change_while_a_parser_library_is_broken() {
+        let dir = tempdir().unwrap();
+        let settings = WorkspaceSettings {
+            languages: HashMap::from([(
+                "broken".to_string(),
+                LanguageSettings {
+                    parser: Some(dir.path().join("broken.so").to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let coordinator = LanguageCoordinator::new();
+        coordinator.load_settings(&settings);
+        assert!(!coordinator.reload_would_change_languages(&settings));
+
+        fs::write(dir.path().join("broken.so"), b"not a library").unwrap();
+        assert!(
+            coordinator.reload_would_change_languages(&settings),
+            "an unloadable parser library must keep surfacing its error"
+        );
+
+        #[cfg(unix)]
+        {
+            fs::remove_file(dir.path().join("broken.so")).unwrap();
+            coordinator.load_settings(&settings);
+            assert!(!coordinator.reload_would_change_languages(&settings));
+            std::os::unix::fs::symlink("broken.so", dir.path().join("broken.so")).unwrap();
+            assert!(
+                coordinator.reload_would_change_languages(&settings),
+                "a parser path whose existence cannot be checked is broken, not missing"
+            );
+        }
+    }
+
+    /// A query file that fails to compile loads no query, before and after
+    /// it breaks, so only its warnings show the problem; a trial meeting one
+    /// must reload so they reach the user.
+    #[test]
+    fn reload_trial_reports_a_change_while_a_query_file_is_broken() {
+        let dir = tempdir().unwrap();
+        let query_path = dir.path().join("highlights.scm");
+        let coordinator = LanguageCoordinator::new();
+        coordinator
+            .language_registry
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        let settings = WorkspaceSettings {
+            languages: HashMap::from([(
+                "rust".to_string(),
+                LanguageSettings {
+                    queries: Some(vec![crate::config::settings::QueryItem {
+                        path: query_path.to_string_lossy().into_owned(),
+                        kind: Some(QueryKind::Highlights),
+                    }]),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        fs::write(&query_path, "(identifier) @variable\n").unwrap();
+        coordinator.load_settings(&settings);
+        assert!(!coordinator.reload_would_change_languages(&settings));
+
+        fs::write(&query_path, "(no_such_node) @broken\n").unwrap();
+        coordinator.load_settings(&settings);
+        assert!(coordinator.highlight_query("rust").is_none());
+        assert!(
+            coordinator.reload_would_change_languages(&settings),
+            "a broken query file must keep surfacing its warning"
+        );
+    }
+
+    /// An on-demand load between reading its files and publishing them can
+    /// land a query read before an edit; with no reload rejecting it, the
+    /// trial cannot call the languages unchanged while one is running.
+    #[test]
+    fn reload_trial_reports_a_change_while_an_on_demand_load_is_in_flight() {
+        let coordinator = LanguageCoordinator::new();
+        let settings = WorkspaceSettings::default();
+        assert!(!coordinator.reload_would_change_languages(&settings));
+
+        let in_flight = DynamicLoadInFlight::begin(&coordinator.dynamic_loads_in_flight);
+        assert!(coordinator.reload_would_change_languages(&settings));
+        drop(in_flight);
+        assert!(!coordinator.reload_would_change_languages(&settings));
+    }
+
+    /// Configuration pushes that skip the reload never run a settings load,
+    /// so the bound on remembered failures holds as they are recorded.
+    #[test]
+    fn remembered_failed_loads_stay_bounded_without_a_settings_load() {
+        let coordinator = LanguageCoordinator::new();
+        for index in 0..(MAX_REMEMBERED_FAILED_LOADS * 2) {
+            coordinator.record_failed_load(&format!("missing_{index}"), 0);
+        }
+        assert!(coordinator.failed_loads.len() <= MAX_REMEMBERED_FAILED_LOADS);
+    }
+
+    /// A reload that reparses nothing (the post-install one) must not make
+    /// the trial forget a language a document failed to load: when its
+    /// parser appears later, an identical push has to pick it up.
+    #[test]
+    fn reload_trial_retries_a_language_that_failed_before_an_intervening_reload() {
+        let grammars = std::env::var("TREE_SITTER_GRAMMARS").unwrap_or_else(|_| {
+            std::env::current_dir()
+                .unwrap()
+                .join("deps/tree-sitter")
+                .to_string_lossy()
+                .into_owned()
+        });
+        let parser = Path::new(&grammars)
+            .join("parser")
+            .join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+        if !parser.exists() {
+            eprintln!("skipping: lua parser not built");
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let settings = WorkspaceSettings {
+            search_paths: vec![dir.path().to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        let coordinator = LanguageCoordinator::new();
+        coordinator.load_settings(&settings);
+        assert!(!coordinator.ensure_language_loaded("lua").success);
+        // The post-install reload of some other language.
+        coordinator.load_settings(&settings);
+
+        fs::create_dir_all(dir.path().join("parser")).unwrap();
+        fs::copy(
+            &parser,
+            dir.path()
+                .join("parser")
+                .join(format!("lua.{}", std::env::consts::DLL_EXTENSION)),
+        )
+        .unwrap();
+        assert!(
+            coordinator.reload_would_change_languages(&settings),
+            "the parser a document was waiting for appeared"
+        );
+
+        // The reload that change calls for loads only configured languages;
+        // the appeared one must not keep reporting the same change.
+        coordinator.load_settings(&settings);
+        assert!(!coordinator.reload_would_change_languages(&settings));
+        assert!(coordinator.ensure_language_loaded("lua").success);
+    }
+
+    /// A reload that invalidates no parse (the post-install one) leaves a
+    /// language open documents still use tagged with an older generation.
+    /// The trial must re-read it like a current one: here it no longer loads
+    /// at all, which documents would see on the next reload.
+    #[test]
+    fn reload_trial_rereads_languages_tagged_by_an_older_generation() {
+        let coordinator = LanguageCoordinator::new();
+        coordinator
+            .language_registry
+            .register("dynamic".to_string(), tree_sitter_rust::LANGUAGE.into());
+        coordinator
+            .reload_scoped_registrations
+            .insert("dynamic".to_string(), 0);
+        coordinator.load_settings(&WorkspaceSettings::default());
+        assert!(!coordinator.has_parser_available("dynamic"));
+
+        assert!(
+            coordinator.reload_would_change_languages(&WorkspaceSettings::default()),
+            "the stale registration no longer resolves, so a reload changes it"
+        );
+
+        // The reload that change calls for retires the vanished registration;
+        // otherwise every later push would report the same change again.
+        coordinator.load_settings(&WorkspaceSettings::default());
+        assert!(!coordinator.language_registry.contains("dynamic"));
+        assert!(!coordinator.reload_would_change_languages(&WorkspaceSettings::default()));
+    }
+
+    /// A trial that finds an edited query compiles the new text; the
+    /// coordinator holds it so the live reload reuses the query instead of
+    /// compiling the same text a second time.
+    #[test]
+    fn live_reload_reuses_the_queries_a_held_trial_compiled() {
+        let dir = tempdir().unwrap();
+        let query_path = dir.path().join("highlights.scm");
+        fs::write(&query_path, "(identifier) @variable\n").unwrap();
+        let coordinator = LanguageCoordinator::new();
+        coordinator
+            .language_registry
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        let settings = WorkspaceSettings {
+            languages: HashMap::from([(
+                "rust".to_string(),
+                LanguageSettings {
+                    queries: Some(vec![crate::config::settings::QueryItem {
+                        path: query_path.to_string_lossy().into_owned(),
+                        kind: None,
+                    }]),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        coordinator.load_settings(&settings);
+        assert!(!coordinator.reload_would_change_languages(&settings));
+
+        fs::write(
+            &query_path,
+            "(identifier) @variable\n(string_literal) @string\n",
+        )
+        .unwrap();
+        assert!(coordinator.reload_would_change_languages(&settings));
+        let trial_compiled: Vec<_> = coordinator.trial_queries.lock().unwrap().clone();
+        coordinator.load_settings(&settings);
+
+        let live = coordinator.highlight_query("rust").unwrap();
+        assert!(
+            trial_compiled.iter().any(|query| Arc::ptr_eq(query, &live)),
+            "the live reload must reuse the query the trial compiled"
+        );
+    }
+
+    /// A discovered language whose query changed after its documents closed
+    /// is not reloaded by the live load either; unless the reload retires
+    /// the stale registration, every later push compares the old query with
+    /// the new file and reloads again.
+    #[test]
+    fn reload_retires_a_discovered_language_whose_query_changed() {
+        let grammars = std::env::var("TREE_SITTER_GRAMMARS").unwrap_or_else(|_| {
+            std::env::current_dir()
+                .unwrap()
+                .join("deps/tree-sitter")
+                .to_string_lossy()
+                .into_owned()
+        });
+        let parser = Path::new(&grammars)
+            .join("parser")
+            .join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+        if !parser.exists() {
+            eprintln!("skipping: lua parser not built");
+            return;
+        }
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("parser")).unwrap();
+        fs::copy(
+            &parser,
+            dir.path()
+                .join("parser")
+                .join(format!("lua.{}", std::env::consts::DLL_EXTENSION)),
+        )
+        .unwrap();
+        let highlights = dir
+            .path()
+            .join("queries")
+            .join("lua")
+            .join("highlights.scm");
+        fs::create_dir_all(highlights.parent().unwrap()).unwrap();
+        fs::write(&highlights, "(identifier) @variable\n").unwrap();
+        let settings = WorkspaceSettings {
+            search_paths: vec![dir.path().to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        let coordinator = LanguageCoordinator::new();
+        coordinator.load_settings(&settings);
+        assert!(coordinator.ensure_language_loaded("lua").success);
+        coordinator.load_settings(&settings);
+
+        fs::write(&highlights, "(identifier) @variable\n(string) @string\n").unwrap();
+        assert!(coordinator.reload_would_change_languages(&settings));
+        coordinator.load_settings(&settings);
+        assert!(
+            !coordinator.reload_would_change_languages(&settings),
+            "the reload that change called for must settle it"
+        );
+    }
+
+    /// A discovered language is not reloaded by the live settings load but
+    /// by the next on-demand load, which must still reuse what the trial
+    /// compiled rather than compile the edited text again.
+    #[test]
+    fn on_demand_reload_reuses_the_queries_the_trial_compiled() {
+        let grammars = std::env::var("TREE_SITTER_GRAMMARS").unwrap_or_else(|_| {
+            std::env::current_dir()
+                .unwrap()
+                .join("deps/tree-sitter")
+                .to_string_lossy()
+                .into_owned()
+        });
+        let parser = Path::new(&grammars)
+            .join("parser")
+            .join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+        if !parser.exists() {
+            eprintln!("skipping: lua parser not built");
+            return;
+        }
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("parser")).unwrap();
+        fs::copy(
+            &parser,
+            dir.path()
+                .join("parser")
+                .join(format!("lua.{}", std::env::consts::DLL_EXTENSION)),
+        )
+        .unwrap();
+        let highlights = dir
+            .path()
+            .join("queries")
+            .join("lua")
+            .join("highlights.scm");
+        fs::create_dir_all(highlights.parent().unwrap()).unwrap();
+        fs::write(&highlights, "(identifier) @variable\n").unwrap();
+        let settings = WorkspaceSettings {
+            search_paths: vec![dir.path().to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        let coordinator = LanguageCoordinator::new();
+        coordinator.load_settings(&settings);
+        assert!(coordinator.ensure_language_loaded("lua").success);
+
+        fs::write(&highlights, "(identifier) @variable\n(string) @string\n").unwrap();
+        assert!(coordinator.reload_would_change_languages(&settings));
+        let trial_compiled: Vec<_> = coordinator
+            .trial_queries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(Arc::downgrade)
+            .collect();
+        coordinator.load_settings(&settings);
+        assert!(coordinator.ensure_language_loaded("lua").success);
+
+        let live = coordinator.highlight_query("lua").unwrap();
+        assert!(
+            trial_compiled
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+                .any(|query| Arc::ptr_eq(&query, &live)),
+            "the on-demand reload must reuse the query the trial compiled"
+        );
+    }
+
+    /// Reusing a published query must report the patterns its compile
+    /// skipped exactly like the compile did, or a reload would silently drop
+    /// the warning for a still-broken query file.
+    #[test]
+    fn reused_query_reports_its_skipped_patterns_again() {
+        let dir = tempdir().unwrap();
+        let query_path = dir.path().join("highlights.scm");
+        fs::write(
+            &query_path,
+            "(identifier) @variable\n(no_such_node) @broken\n",
+        )
+        .unwrap();
+        let coordinator = LanguageCoordinator::new();
+        coordinator
+            .language_registry
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        let settings = WorkspaceSettings {
+            languages: HashMap::from([(
+                "rust".to_string(),
+                LanguageSettings {
+                    queries: Some(vec![crate::config::settings::QueryItem {
+                        path: query_path.to_string_lossy().into_owned(),
+                        kind: None,
+                    }]),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let skipped_warnings = |summary: &LanguageLoadSummary| {
+            summary
+                .events
+                .iter()
+                .filter(|event| {
+                    matches!(event, LanguageEvent::Log { message, .. }
+                        if message.contains("Skipped invalid pattern"))
+                })
+                .count()
+        };
+
+        let first = coordinator.load_settings(&settings);
+        let published = coordinator.highlight_query("rust").unwrap();
+        let second = coordinator.load_settings(&settings);
+
+        assert!(
+            Arc::ptr_eq(&published, &coordinator.highlight_query("rust").unwrap()),
+            "the second load must reuse the published query"
+        );
+        assert_eq!(skipped_warnings(&first), 1);
+        assert_eq!(skipped_warnings(&second), 1);
     }
 
     #[test]
