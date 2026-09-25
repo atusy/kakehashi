@@ -919,11 +919,12 @@ impl DiagnosticPublisher {
     /// later crash/edit eviction still clears the push slot.
     ///
     /// Interim limitation: `PullLayer` is one host-wide blob with no per-server
-    /// identity, so coverage is per layer rather than per server. With a *mixed* per-region `pullFallback` (one
-    /// region's pull-driven server pulled, a sibling's not), a pull-driven
-    /// server whose region set `pullFallback = false` can still have its push
-    /// suppressed while the blob carries the sibling region. The deferred
-    /// per-source fan-in (per-`(source, server)` pull slots) removes this.
+    /// identity, so coverage is per layer rather than per server. With a
+    /// *mixed* per-region `pullFallback` (one region's pull-driven server
+    /// pulled, a sibling's not), a pull-driven server whose region set
+    /// `pullFallback = false` can still have its push suppressed while the blob
+    /// carries the sibling region. The deferred per-source fan-in
+    /// (per-`(source, server)` pull slots) removes this.
     async fn filter_pull_driven_push_slots(
         &self,
         snapshot: &mut crate::lsp::diagnostic_cache::SourceSlots,
