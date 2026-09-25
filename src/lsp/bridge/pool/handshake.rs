@@ -107,6 +107,21 @@ mod tests {
     use crate::lsp::bridge::actor::{ResponseRouter, spawn_reader_task};
     use crate::lsp::bridge::connection::AsyncBridgeConnection;
 
+    /// A handle whose downstream swallows every message.
+    async fn sink_handle() -> ConnectionHandle {
+        let mut connection = AsyncBridgeConnection::spawn(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "cat > /dev/null".to_string(),
+        ])
+        .await
+        .unwrap();
+        let (writer, reader) = connection.split();
+        let router = Arc::new(ResponseRouter::new());
+        let reader_handle = spawn_reader_task(reader, Arc::clone(&router));
+        ConnectionHandle::new(writer, router, reader_handle)
+    }
+
     #[tokio::test]
     async fn recovered_capabilities_complete_the_handshake() {
         let temp = tempfile::tempdir().unwrap();
@@ -164,6 +179,61 @@ mod tests {
         assert!(
             messages.contains("\"method\":\"initialized\""),
             "initialized notification was not written: {messages:?}"
+        );
+    }
+
+    /// A string `changeNotifications` is the id the notification is registered
+    /// under and can be unregistered by (LSP 3.18). The handshake must record
+    /// it as a registration before `initialized` reaches the server, or a
+    /// `client/unregisterCapability` of that id withdraws nothing (#1117).
+    #[tokio::test]
+    async fn static_change_notifications_id_can_be_unregistered() {
+        use tower_lsp_server::ls_types::Unregistration;
+
+        let handle = sink_handle().await;
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        response_tx
+            .send(serde_json::json!({
+                "result": {
+                    "capabilities": {
+                        "workspace": {
+                            "workspaceFolders": {
+                                "supported": true,
+                                "changeNotifications": "wf-id"
+                            }
+                        }
+                    }
+                }
+            }))
+            .unwrap();
+
+        let (capabilities, _, _) = perform_lsp_handshake(
+            &handle,
+            RequestId::new(1),
+            response_rx,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect("handshake");
+        handle.set_server_capabilities(capabilities);
+        assert!(
+            handle.supports_workspace_folder_changes(),
+            "a static registration id declares folder-change support"
+        );
+
+        handle
+            .dynamic_capabilities()
+            .unregister(vec![Unregistration {
+                id: "wf-id".to_string(),
+                method: "workspace/didChangeWorkspaceFolders".to_string(),
+            }]);
+        assert!(
+            !handle.supports_workspace_folder_changes(),
+            "unregistering the static id must withdraw folder-change support"
         );
     }
 }
