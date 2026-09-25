@@ -401,3 +401,55 @@ async fn identical_reload_with_a_derived_language_neither_reparses_nor_refreshes
     assert_no_reload_work(&outcome, server, &uri, generation);
     client.abort();
 }
+
+#[test]
+fn settings_affect_documents_classifies_each_field() {
+    let base = baseline_settings();
+    assert!(!settings_affect_documents(&base, &base.clone()));
+    type Flip = (&'static str, fn(&mut WorkspaceSettings), bool);
+    let flips: [Flip; 7] = [
+        ("search_paths", |s| s.search_paths.push("/new".into()), true),
+        (
+            "languages",
+            |s| {
+                s.languages.insert("x".into(), LanguageSettings::default());
+            },
+            true,
+        ),
+        (
+            "capture_mappings",
+            |s| {
+                s.capture_mappings
+                    .insert("x".into(), QueryTypeMappings::default());
+            },
+            true,
+        ),
+        ("auto_install", |s| s.auto_install = !s.auto_install, true),
+        (
+            "language_servers",
+            |s| {
+                s.language_servers.insert("x".into(), Default::default());
+            },
+            true,
+        ),
+        (
+            "diagnostics_debounce_ms",
+            |s| s.diagnostics_debounce_ms += 1,
+            false,
+        ),
+        (
+            "features",
+            |s| s.features.window_log_message = LogMessageLevel::Off,
+            false,
+        ),
+    ];
+    for (field, flip, affects) in flips {
+        let mut next = base.clone();
+        flip(&mut next);
+        assert_eq!(
+            settings_affect_documents(&base, &next),
+            affects,
+            "changing `{field}`"
+        );
+    }
+}
