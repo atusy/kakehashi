@@ -115,20 +115,40 @@ fn long_bracket_close(b: &[u8], from: usize, level: usize) -> Option<usize> {
 }
 
 /// Offset of the quote closing a short string whose contents start at
-/// `from`. A backslash escapes the next byte; a raw line break or the end
-/// of input leaves the string unterminated, as in Lua.
+/// `from`. A raw line break outside an escape, or the end of input, leaves
+/// the string unterminated, as in Lua.
 fn short_string_close(b: &[u8], from: usize, quote: u8) -> Option<usize> {
     let mut j = from;
     while j < b.len() {
         match b[j] {
-            b'\\' if b[j + 1..].starts_with(b"\r\n") => j += 3,
-            b'\\' => j += 2,
+            b'\\' => j = escape_end(b, j),
             b'\n' | b'\r' => return None,
             c if c == quote => return Some(j),
             _ => j += 1,
         }
     }
     None
+}
+
+/// Offset just past the escape whose backslash is at `j`, for finding the
+/// string end: `\z` spans the whitespace after it, and a line break pair
+/// (CR LF or LF CR) counts as one line break.
+fn escape_end(b: &[u8], j: usize) -> usize {
+    match b.get(j + 1) {
+        Some(b'z') => j + 2 + b[j + 2..].iter().take_while(|&&c| is_lua_space(c)).count(),
+        Some(&c @ (b'\n' | b'\r')) => {
+            let pair = b
+                .get(j + 2)
+                .is_some_and(|&d| d != c && matches!(d, b'\n' | b'\r'));
+            j + 2 + usize::from(pair)
+        }
+        _ => j + 2,
+    }
+}
+
+/// Whitespace as Lua's lexer sees it (C `isspace`).
+fn is_lua_space(c: u8) -> bool {
+    matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
 }
 
 /// Decode the escape sequences of a short string's contents, as Lua 5.4
@@ -167,7 +187,7 @@ fn decode_short_string(body: &[u8]) -> String {
                 }
             }
             b'z' => {
-                while body.get(j).is_some_and(u8::is_ascii_whitespace) {
+                while body.get(j).is_some_and(|&d| is_lua_space(d)) {
                     j += 1;
                 }
             }
