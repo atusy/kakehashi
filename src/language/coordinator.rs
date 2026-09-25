@@ -122,8 +122,9 @@ pub(crate) struct LanguageCoordinator {
     /// [`Self::scratch_sharing_caches`] copies.
     compiled_queries: Arc<Mutex<CompiledQueries>>,
     /// Set on a [`Self::scratch_sharing_caches`] copy: its load is a trial
-    /// whose events are discarded, so it must not log what the live load
-    /// will report itself.
+    /// whose events are discarded. It keeps the one warning a settings load
+    /// logs directly (deprecated `aliases`) out of the log; the query
+    /// loader's rare pattern-split and combination warnings still fire.
     is_trial: bool,
 }
 
