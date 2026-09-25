@@ -907,14 +907,15 @@ impl LanguageServerPool {
         // opened, and nothing downstream of here checks that it is open. An
         // envelope with no valid virtual identity names no document; it keeps
         // the host-URI fallback its connection was acquired with, ungated.
-        let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(&host_url) else {
-            re_envelope_action(&mut action, &envelope);
-            return action;
-        };
+        let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(&host_url).ok();
         if VirtualDocumentUri::is_valid_identity(&envelope.injection_language, &envelope.region_id)
         {
+            let Some(host_uri_lsp) = host_uri_lsp.as_ref() else {
+                re_envelope_action(&mut action, &envelope);
+                return action;
+            };
             let virtual_uri = VirtualDocumentUri::new(
-                &host_uri_lsp,
+                host_uri_lsp,
                 &envelope.injection_language,
                 &envelope.region_id,
             );
@@ -961,7 +962,7 @@ impl LanguageServerPool {
             envelope,
             &offset,
             region_end,
-            Some(&host_uri_lsp),
+            host_uri_lsp.as_ref(),
             suffixed_title,
             upstream_caps,
             handle.key(),
