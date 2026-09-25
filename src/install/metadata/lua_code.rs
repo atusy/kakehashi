@@ -56,7 +56,7 @@ fn lex(b: &[u8]) -> Result<Lexed, MetadataError> {
                 } else {
                     b[i..]
                         .iter()
-                        .position(|&c| c == b'\n')
+                        .position(|&c| matches!(c, b'\n' | b'\r'))
                         .map_or(b.len(), |n| i + n)
                 };
                 ranges.push(i..end);
