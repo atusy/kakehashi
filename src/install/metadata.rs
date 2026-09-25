@@ -745,6 +745,18 @@ sub dir]],
     }
 
     #[test]
+    fn escaped_line_breaks_continue_a_string() {
+        // `\z` skips all following whitespace, line breaks and vertical tab
+        // included; `\` before LF CR is one escaped line break.
+        let content = "return {\n  lua = {\n    install_info = {\n      revision = 'a\\z\n\x0b  b',\n      url = 'u\\\n\rv',\n    },\n  },\n}\n";
+
+        let parsers = parse_parsers_lua(content).expect("should parse");
+
+        assert_eq!(parsers["lua"].revision, "ab");
+        assert_eq!(parsers["lua"].url, "u\nv");
+    }
+
+    #[test]
     fn test_extract_parser_metadata() {
         let content = r#"
   rust = {
