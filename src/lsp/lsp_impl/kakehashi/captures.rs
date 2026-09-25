@@ -414,7 +414,7 @@ fn store_kind_query(language_id: &str, file_name: &str, stored: CachedKindQuery)
                 && previous.search_paths == stored.search_paths
                 && previous.source != stored.source
             {
-                note_kind_source_conflict(&stored.search_paths);
+                note_kind_source_conflict(&stored.search_paths, stored.generation);
             }
             current.insert(stored);
         }
@@ -433,20 +433,24 @@ fn store_kind_query(language_id: &str, file_name: &str, stored: CachedKindQuery)
     }
 }
 
-/// Search paths under which two loads of one kind query in the same
-/// generation compiled different text: the file changed between them, and a
-/// document's captures memo may hold results of the older one. Only a
-/// generation bump invalidates those memos, so [`kind_queries_changed`]
-/// reports (and clears) a conflict as a change.
-static KIND_SOURCE_CONFLICTS: std::sync::Mutex<Vec<Vec<PathBuf>>> =
+/// Search paths and generation under which two loads of one kind query
+/// compiled different text: the file changed between them, and a document's
+/// captures memo of that generation may hold results of the older one. Only
+/// a generation bump invalidates those memos, so [`kind_queries_changed`]
+/// reports (and clears) a conflict of the generation it checks as a change;
+/// one from an older generation was already settled by that bump.
+static KIND_SOURCE_CONFLICTS: std::sync::Mutex<Vec<(Vec<PathBuf>, u64)>> =
     std::sync::Mutex::new(Vec::new());
 
-fn note_kind_source_conflict(search_paths: &[PathBuf]) {
+fn note_kind_source_conflict(search_paths: &[PathBuf], generation: u64) {
     let mut conflicts = KIND_SOURCE_CONFLICTS
         .lock()
         .recover_poison("note_kind_source_conflict");
-    if !conflicts.iter().any(|paths| paths == search_paths) {
-        conflicts.push(search_paths.to_vec());
+    if !conflicts
+        .iter()
+        .any(|(paths, noted)| paths == search_paths && *noted == generation)
+    {
+        conflicts.push((search_paths.to_vec(), generation));
     }
 }
 
@@ -619,8 +623,13 @@ pub(in crate::lsp::lsp_impl) fn kind_queries_changed(
         let mut conflicts = KIND_SOURCE_CONFLICTS
             .lock()
             .recover_poison("kind_queries_changed(conflicts)");
-        if let Some(index) = conflicts.iter().position(|paths| paths == search_paths) {
-            conflicts.swap_remove(index);
+        // Conflicts of this configuration: this generation's report a change;
+        // older ones were settled by the bump that ended their generation.
+        let current = conflicts
+            .iter()
+            .any(|(paths, noted)| paths == search_paths && *noted == generation);
+        conflicts.retain(|(paths, noted)| paths != search_paths || *noted > generation);
+        if current {
             return true;
         }
     }
@@ -2013,6 +2022,16 @@ mod tests {
             !kind_queries_changed(&search_paths, GENERATION),
             "a conflict is reported once; the entry itself matches the disk"
         );
+
+        // A conflict from an older generation was settled by the bump that
+        // ended it: a later scan must not report it.
+        let old = |source: &str| CachedKindQuery {
+            generation: GENERATION - 1,
+            ..entry(source)
+        };
+        store_kind_query(LANGUAGE, "context.scm", old("(a) @a\n"));
+        store_kind_query(LANGUAGE, "context.scm", old("(b) @b\n"));
+        assert!(!kind_queries_changed(&search_paths, GENERATION));
     }
 
     /// A reload that skips the generation bump leaves this cache in place, so
