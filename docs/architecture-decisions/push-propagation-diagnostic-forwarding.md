@@ -366,15 +366,15 @@ policy clean:
   if the re-anchored host coordinates actually changed. Lazy re-anchor supplies the
   correct positions; this supplies the missing trigger.
 - **Host layer**: the `_self` host source uses the identical model keyed on the
-  *host document's* content epoch. Every enabled `_self` server for the host
-  language, push-driven or not, is eagerly opened on host `didOpen` (#429) and
-  eagerly **re-synced** on edit at the debounced diagnostic cadence (#431); the
-  push-only servers are the ones that need it. The re-sync rides the debounced
-  diagnostic snapshot, so it runs only while the host layer participates for
-  `textDocument/publishDiagnostics` (see the seal caveat above) and the document
-  has a parse tree. `eager_sync_host_document_on_servers` runs when the debounce
-  fires, so a push-only host server (skipped by the capability-gated pull)
-  re-analyzes current text rather than stale text. The host path's
+  *host document's* content epoch. Once `bridge._self` is enabled for the host
+  language, every matching `_self` server, push-driven or not, is eagerly opened
+  on host `didOpen` (#429) and eagerly **re-synced** on edit at the debounced
+  diagnostic cadence (#431): `eager_sync_host_document_on_servers` runs when the
+  debounce fires, so a push-only host server (skipped by the capability-gated
+  pull) re-analyzes current text rather than stale text. The re-sync rides the
+  debounced diagnostic snapshot, so it runs only while the host layer
+  participates for `textDocument/publishDiagnostics` (see the seal caveat above)
+  and the document has a parse tree. The host path's
   fingerprint gates the actual didChange; the gate and re-merge rules above apply
   unchanged.
 
