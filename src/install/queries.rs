@@ -1474,7 +1474,8 @@ fn unique_backup_query_dir(queries_dir: &Path, language: &str) -> PathBuf {
     }
 }
 
-/// Recover query directories stranded by a process exit during replacement.
+/// Recover query directories stranded by a process exit during replacement,
+/// and collect the backups a completed replacement left behind.
 pub fn recover_interrupted_query_installs(queries_parent: &Path) -> Result<(), QueryInstallError> {
     let entries = match fs::read_dir(queries_parent) {
         Ok(entries) => entries,
@@ -1484,20 +1485,25 @@ pub fn recover_interrupted_query_installs(queries_parent: &Path) -> Result<(), Q
 
     // Recover at most once per language: a single recovery pass already
     // considers every backup for that language (newest_complete_backup_dir
-    // rescans the parent), so running it per backup directory would redo the
-    // same scan and lock acquisition for each stranded backup.
+    // rescans the parent), so running it per backup would redo the same scan
+    // and lock acquisition for each stranded backup.
     let mut recovered_languages = std::collections::HashSet::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
+        // A backup is recognised by its generated name, whatever its shape:
+        // install displaces whatever sat in the slot, so a regular file there
+        // makes a regular-file backup. Restoring still takes only a complete
+        // directory (newest_complete_backup_dir), so this widens collection,
+        // not recovery.
         if let Some(language) = backup_language_name(&path) {
             if recovered_languages.insert(language.clone()) {
                 recover_interrupted_query_install(queries_parent, &language)?;
                 collect_superseded_backups(queries_parent, &language)?;
             }
-        } else if let Some((language, _)) = temp_language_name_and_pid(&path) {
+        } else if path.is_dir()
+            && let Some((language, _)) = temp_language_name_and_pid(&path)
+        {
+            // Staging entries are always directories this process created.
             remove_interrupted_temp_query_install(queries_parent, &language, &path)?;
         }
     }
