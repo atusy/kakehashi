@@ -2384,13 +2384,22 @@ fn make_special_file(
 }
 
 /// A temp dir short enough for a socket path: macOS caps `sun_path` at about
-/// 104 bytes, and a long `TMPDIR` would fail the fixture for the wrong reason.
+/// 104 bytes, and a long `TMPDIR` (macOS's default is ~50 bytes before the
+/// fixture's own components) would fail the fixture for the wrong reason. The
+/// configured temp dir is used whenever it is short enough, so a runner
+/// without a writable `/tmp` still works; `/tmp` is only the fallback.
 #[cfg(unix)]
 fn short_temp_dir() -> tempfile::TempDir {
+    let configured = std::env::temp_dir();
+    let root = if configured.as_os_str().len() <= 40 {
+        configured
+    } else {
+        std::path::PathBuf::from("/tmp")
+    };
     tempfile::Builder::new()
         .prefix("kh")
-        .tempdir_in("/tmp")
-        .expect("Failed to create temp dir")
+        .tempdir_in(&root)
+        .unwrap_or_else(|e| panic!("Failed to create temp dir in {root:?}: {e}"))
 }
 
 /// FIFOs and sockets in the query slot are unlinked like any other
