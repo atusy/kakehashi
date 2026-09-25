@@ -308,6 +308,13 @@ mod tests {
     }
 
     #[test]
+    fn long_string_line_breaks_read_as_lf() {
+        let lua = LuaCode::new("[[\r\na\r\nb\n\rc\rd]]").unwrap();
+
+        assert_eq!(lua.string_at(0), Some("a\nb\nc\nd"));
+    }
+
+    #[test]
     fn unicode_escape_allows_leading_zeros_beyond_eight_digits() {
         let lua = LuaCode::new(r"'\u{000000041}'").unwrap();
 
