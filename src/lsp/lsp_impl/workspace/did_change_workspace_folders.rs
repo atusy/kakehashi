@@ -5,7 +5,9 @@ use tower_lsp_server::ls_types::DidChangeWorkspaceFoldersParams;
 use crate::config::WorkspaceSettings;
 use crate::lsp::load_settings_with_client_layers;
 
-use super::super::{Kakehashi, lifecycle::config_root_after_folder_change, lock_settings_reload};
+use super::super::{
+    Kakehashi, ReloadTrigger, lifecycle::config_root_after_folder_change, lock_settings_reload,
+};
 
 impl Kakehashi {
     pub(crate) async fn did_change_workspace_folders_impl(
@@ -120,7 +122,13 @@ impl Kakehashi {
             Ok(settings) => {
                 let warnings = Self::misconfigured_settings_warnings(&settings);
                 self.settings_manager.set_root_path(root_path);
-                self.apply_raw_settings_locked(&reload, raw, settings).await;
+                self.apply_raw_settings_locked(
+                    &reload,
+                    ReloadTrigger::WorkspaceFolders,
+                    raw,
+                    settings,
+                )
+                .await;
                 drop(reload);
                 self.warn_on_misconfigured_settings(&warnings).await;
             }

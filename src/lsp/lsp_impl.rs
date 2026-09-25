@@ -106,8 +106,54 @@ pub(super) struct ReloadLanguageState<'a> {
     language: &'a LanguageCoordinator,
     parser_pool: &'a std::sync::Mutex<DocumentParserPool>,
     documents: &'a DocumentStore,
-    invalidate_documents: bool,
-    request_semantic_refresh: bool,
+    trigger: ReloadTrigger,
+}
+
+/// What caused a settings application. Each trigger owns a fixed answer to
+/// the two expensive follow-ups of a reload: invalidating every open
+/// document's parse (whose reparse loop also re-drives injection processing,
+/// eager bridge opens and diagnostics) and asking the client to refresh
+/// semantic tokens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReloadTrigger {
+    /// `initialize`: no document is open and no client has consumed tokens,
+    /// and a refresh request is not valid before `initialized`.
+    Initialize,
+    /// A parser/query install finished: new files on disk under the same
+    /// settings. The install path reparses the documents that waited for it
+    /// itself, so only the refresh is requested here.
+    Install,
+    /// A workspace-root change re-read the project configuration.
+    WorkspaceFolders,
+    /// A `workspace/didChangeConfiguration` push or a `workspace/configuration`
+    /// pull.
+    Configuration,
+}
+
+impl ReloadTrigger {
+    fn invalidates_documents(self) -> bool {
+        match self {
+            Self::Initialize | Self::Install => false,
+            Self::WorkspaceFolders | Self::Configuration => true,
+        }
+    }
+
+    fn requests_semantic_refresh(self) -> bool {
+        match self {
+            Self::Initialize => false,
+            Self::Install | Self::WorkspaceFolders | Self::Configuration => true,
+        }
+    }
+}
+
+/// What one settings application asked of the documents and the client.
+pub(super) struct SettingsReloadOutcome {
+    /// Documents whose parse was invalidated; the caller schedules their
+    /// reparse.
+    pub(super) reparse_uris: Vec<Url>,
+    /// Whether a `workspace/semanticTokens/refresh` was requested (before the
+    /// client-capability gate).
+    pub(super) semantic_refresh_requested: bool,
 }
 
 pub(super) struct SettingsReloadInput {
@@ -156,7 +202,7 @@ pub(super) async fn apply_shared_settings(
     bridge: &BridgeCoordinator,
     raw_settings: Option<RawWorkspaceSettings>,
     settings: WorkspaceSettings,
-) -> Vec<Url> {
+) -> SettingsReloadOutcome {
     let reload = lock_settings_reload().await;
     apply_shared_settings_locked(
         &reload,
@@ -181,7 +227,7 @@ pub(super) async fn apply_shared_settings_locked(
     cache: &CacheCoordinator,
     bridge: &BridgeCoordinator,
     input: SettingsReloadInput,
-) -> Vec<Url> {
+) -> SettingsReloadOutcome {
     let SettingsReloadInput {
         raw_settings,
         settings,
@@ -199,7 +245,7 @@ pub(super) async fn apply_shared_settings_locked(
     crate::analysis::semantic::invalidate_thread_local_parser_caches();
     let parser_reload = ParserReloadGuard::begin(language_state.parser_pool);
     let mut summary = language_state.language.load_settings(&settings);
-    let reparse_uris = if language_state.invalidate_documents {
+    let reparse_uris = if language_state.trigger.invalidates_documents() {
         language_state.documents.invalidate_all_parses()
     } else {
         Vec::new()
@@ -286,7 +332,8 @@ pub(super) async fn apply_shared_settings_locked(
     // Query removal/replacement affects unchanged documents too. Request one
     // workspace refresh for every reload; ClientNotifier capability-gates and
     // coalesces it with any language-specific refresh events in this batch.
-    if language_state.request_semantic_refresh {
+    let semantic_refresh_requested = language_state.trigger.requests_semantic_refresh();
+    if semantic_refresh_requested {
         summary
             .events
             .push(crate::language::LanguageEvent::semantic_tokens_refresh(
@@ -307,7 +354,10 @@ pub(super) async fn apply_shared_settings_locked(
     build_notifier(client, settings_manager)
         .log_language_events(&summary.events)
         .await;
-    reparse_uris
+    SettingsReloadOutcome {
+        reparse_uris,
+        semantic_refresh_requested,
+    }
 }
 
 /// Convert url::Url to ls_types::Uri, the reverse conversion for bridge protocol
@@ -572,27 +622,32 @@ impl Kakehashi {
         &self,
         raw_settings: RawWorkspaceSettings,
         settings: WorkspaceSettings,
-    ) {
+    ) -> SettingsReloadOutcome {
         let reload = lock_settings_reload().await;
-        self.apply_raw_settings_locked(&reload, raw_settings, settings)
-            .await;
+        self.apply_raw_settings_locked(
+            &reload,
+            ReloadTrigger::Configuration,
+            raw_settings,
+            settings,
+        )
+        .await
     }
 
     async fn apply_raw_settings_locked(
         &self,
         reload: &tokio::sync::MutexGuard<'static, ()>,
+        trigger: ReloadTrigger,
         raw_settings: RawWorkspaceSettings,
         settings: WorkspaceSettings,
-    ) {
-        apply_shared_settings_locked(
+    ) -> SettingsReloadOutcome {
+        let outcome = apply_shared_settings_locked(
             reload,
             &self.client,
             ReloadLanguageState {
                 language: &self.language,
                 parser_pool: &self.parser_pool,
                 documents: &self.documents,
-                invalidate_documents: true,
-                request_semantic_refresh: true,
+                trigger,
             },
             &self.settings_manager,
             &self.cache,
@@ -602,9 +657,20 @@ impl Kakehashi {
                 settings,
             },
         )
-        .await
-        .into_iter()
-        .for_each(|uri| self.schedule_reparse(uri, None));
+        .await;
+        log::debug!(
+            target: "kakehashi::config",
+            "Settings applied ({trigger:?}): {} document(s) to reparse, semantic tokens refresh {}",
+            outcome.reparse_uris.len(),
+            if outcome.semantic_refresh_requested {
+                "requested"
+            } else {
+                "not needed"
+            }
+        );
+        for uri in &outcome.reparse_uris {
+            self.schedule_reparse(uri.clone(), None);
+        }
         // The new settings can change what a client pull returns with no
         // publish to show it — e.g. a server newly excluded by
         // `textDocument/diagnostic` `priorities` (#916), whose folded pushes
@@ -614,6 +680,7 @@ impl Kakehashi {
         // single-flighted like every other nudge; the re-pull waits for the
         // reparse scheduled above.
         DiagnosticPublisher::new(self).request_pull_diagnostic_refresh(true);
+        outcome
     }
 
     async fn apply_initial_settings(
@@ -628,8 +695,7 @@ impl Kakehashi {
                 language: &self.language,
                 parser_pool: &self.parser_pool,
                 documents: &self.documents,
-                invalidate_documents: false,
-                request_semantic_refresh: false,
+                trigger: ReloadTrigger::Initialize,
             },
             &self.settings_manager,
             &self.cache,
@@ -638,6 +704,7 @@ impl Kakehashi {
             settings,
         )
         .await
+        .reparse_uris
         .into_iter()
         .for_each(|uri| self.schedule_reparse(uri, None));
         self.warn_on_misconfigured_settings(&warnings).await;

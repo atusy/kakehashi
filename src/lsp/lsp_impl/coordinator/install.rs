@@ -10,8 +10,8 @@ use crate::lsp::bridge::BridgeCoordinator;
 use crate::lsp::cache::CacheCoordinator;
 use crate::lsp::client::ClientNotifier;
 use crate::lsp::lsp_impl::{
-    Kakehashi, ReloadLanguageState, SettingsReloadInput, apply_shared_settings_locked,
-    build_notifier, lock_settings_reload,
+    Kakehashi, ReloadLanguageState, ReloadTrigger, SettingsReloadInput,
+    apply_shared_settings_locked, build_notifier, lock_settings_reload,
 };
 use crate::lsp::settings_manager::SettingsManager;
 use tower_lsp_server::Client;
@@ -678,15 +678,14 @@ impl InstallCoordinator {
         raw_settings: crate::config::RawWorkspaceSettings,
         settings: WorkspaceSettings,
     ) {
-        let _reparse_uris = apply_shared_settings_locked(
+        let _outcome = apply_shared_settings_locked(
             reload,
             &self.client,
             ReloadLanguageState {
                 language: &self.language,
                 parser_pool: &self.parser_pool,
                 documents: &self.documents,
-                invalidate_documents: false,
-                request_semantic_refresh: true,
+                trigger: ReloadTrigger::Install,
             },
             &self.settings_manager,
             &self.cache,
