@@ -11,7 +11,7 @@ use super::super::{Kakehashi, uri_to_url};
 /// is keyboard-triggered expand/shrink — a silent no-op on a consciously
 /// triggered action is jarring, and the request is not per-keystroke, so it
 /// may briefly wait for the in-flight parse to land before falling back to
-/// `ContentModified`. The same bound as the formatting verbs', but its own
+/// `ContentModified` (or `null` while a reload's reparse is pending). The same bound as the formatting verbs', but its own
 /// loop rather than `wait_for_explicit_action_snapshot`: a document with no
 /// snapshot yet also waits only this long, not the first-parse backstop.
 const SELECTION_RANGE_WAIT: std::time::Duration =
