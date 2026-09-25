@@ -62,6 +62,7 @@ pub(super) enum ResolveDocument<'a> {
     /// An injection region's virtual document.
     Virtual(&'a VirtualDocumentUri),
 }
+
 /// Re-exported so the server-side re-open handler bounds its work by the same
 /// budget requests wait on — the two must not drift apart.
 pub(crate) use pending_reopen::REOPEN_WAIT;
