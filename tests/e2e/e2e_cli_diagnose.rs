@@ -114,10 +114,74 @@ fn e2e_diagnose_invalid_explicit_config_exits_error() {
     );
 }
 
-/// The mirror image: an explicit config file that is merely absent is an
-/// optional layer, so the run proceeds on defaults.
+/// Run `kakehashi diagnose` with configuration discovered rather than named:
+/// the workspace `kakehashi.toml` and `$XDG_CONFIG_HOME/kakehashi/kakehashi.toml`.
+fn run_diagnose_discovered(workspace: &Path, xdg_config_home: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .arg("diagnose")
+        .args(args)
+        .current_dir(workspace)
+        .env("KAKEHASHI_DATA_DIR", data_dir())
+        .env("XDG_CONFIG_HOME", xdg_config_home)
+        .output()
+        .expect("spawn kakehashi diagnose")
+}
+
+/// CI runs the CLI unattended, so a discovered file it cannot use is as fatal
+/// as a named one: a run on defaults would report a clean result for a
+/// configuration nobody wrote.
 #[test]
-fn e2e_diagnose_missing_explicit_config_still_runs() {
+fn e2e_diagnose_invalid_discovered_config_exits_error() {
+    let ws = tempfile::tempdir().expect("create workspace tempdir");
+    let xdg = tempfile::tempdir().expect("create XDG_CONFIG_HOME");
+    std::fs::write(ws.path().join("doc.md"), PLAIN_MARKDOWN).expect("write document");
+    std::fs::write(ws.path().join("kakehashi.toml"), "autoInstall = \n")
+        .expect("write malformed config");
+
+    let output = run_diagnose_discovered(ws.path(), xdg.path(), &["doc.md"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stderr: {}",
+        stderr_of(&output)
+    );
+    assert!(output.stdout.is_empty(), "{}", stdout_of(&output));
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("Failed to parse") && stderr.contains("kakehashi.toml"),
+        "{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_diagnose_broken_discovered_symlink_exits_error() {
+    let ws = tempfile::tempdir().expect("create workspace tempdir");
+    let xdg = tempfile::tempdir().expect("create XDG_CONFIG_HOME");
+    std::fs::write(ws.path().join("doc.md"), PLAIN_MARKDOWN).expect("write document");
+    std::os::unix::fs::symlink(xdg.path().join("absent"), xdg.path().join("kakehashi"))
+        .expect("create broken symlink");
+
+    let output = run_diagnose_discovered(ws.path(), xdg.path(), &["doc.md"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stderr: {}",
+        stderr_of(&output)
+    );
+    assert!(output.stdout.is_empty(), "{}", stdout_of(&output));
+    assert!(
+        stderr_of(&output).contains("broken symbolic link"),
+        "{}",
+        stderr_of(&output)
+    );
+}
+
+/// An explicitly selected missing file must fail before producing output.
+#[test]
+fn e2e_diagnose_missing_explicit_config_fails() {
     let ws = tempfile::tempdir().expect("create workspace tempdir");
     std::fs::write(ws.path().join("doc.md"), PLAIN_MARKDOWN).expect("write document");
 
@@ -125,10 +189,12 @@ fn e2e_diagnose_missing_explicit_config_still_runs() {
 
     assert_eq!(
         output.status.code(),
-        Some(0),
-        "a missing explicit config must be skipped, not fatal; stderr: {}",
+        Some(2),
+        "a missing explicit config must fail; stderr: {}",
         stderr_of(&output)
     );
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("kakehashi.toml"));
 }
 
 #[test]

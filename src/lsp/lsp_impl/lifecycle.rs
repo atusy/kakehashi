@@ -271,37 +271,54 @@ impl Kakehashi {
         &self,
         params: InitializeParams,
     ) -> Result<InitializeResult> {
-        // Reject an unusable `--config-file` before anything from `params` is
-        // latched. Several of the stores below are first-write-wins
-        // (`set_capabilities`, `set_folderless_root_path`), and
-        // tower-lsp-server resets to `Uninitialized` after an error response,
-        // so a client may fix the file and retry: without this, the retry would
-        // load the corrected settings while downstream servers kept the failed
-        // attempt's capabilities, root URI, and workspace folders.
+        // Startup files are judged by the frontend's policy. The one-shot CLI
+        // (`format`, `diagnose`) runs unattended, often in CI, where a clean
+        // result computed on defaults would be believed: any file it cannot use
+        // rejects the run. An editor session is better served running on the
+        // layers that do work, so it reports each unusable entry as an error
+        // popup (via the settings events) and skips it.
+        //
+        // A rejection happens before anything from `params` is latched.
+        // Several of the stores below are first-write-wins
+        // (`set_capabilities`, `set_folderless_root_path`), and a rejected
+        // handshake must not leave them holding the failed attempt's values.
         //
         // Reported only through this response — the settings events carrying
-        // the same text are never sent, so the client does not also get a
-        // `window/showMessage` popup on top of a handshake it already failed.
-        // Pinned by `test_config_file_fatal_error_is_not_also_shown_as_a_message`.
+        // the same text are never sent, so the CLI's single stderr report is
+        // the only one.
         //
         // The files are read here and the result carried into `load_settings`
         // below, never re-read: a `--config-file` may name a stream, and a file
         // swapped between two reads would slip past whichever check ran first.
+        let policy = if self.is_cli_mode() {
+            crate::lsp::settings::StartupFilePolicy::Strict
+        } else {
+            crate::lsp::settings::StartupFilePolicy::Tolerant
+        };
+        let (root_path, source) = config_root_path(client_root(&params));
         let explicit_config =
-            crate::lsp::settings::load_explicit_config(self.home_dir.as_deref(), |var| {
+            crate::lsp::settings::load_explicit_config(policy, self.home_dir.as_deref(), |var| {
                 std::env::var(var).ok()
             });
-        if let Some(error) = explicit_config
-            .as_ref()
-            .and_then(|config| config.fatal_error.clone())
-        {
+        let explicit_selected = explicit_config.is_some();
+        let startup_config = explicit_config.unwrap_or_else(|| {
+            crate::lsp::settings::load_discovered_startup_config(
+                root_path.as_deref(),
+                policy,
+                self.home_dir.as_deref(),
+                |var| std::env::var(var).ok(),
+            )
+        });
+        if let Some(error) = startup_config.fatal_error.clone() {
             return Err(configuration_load_error(error));
         }
-        let _ = self.explicit_config.set(
-            explicit_config
-                .as_ref()
-                .map(crate::lsp::settings::ExplicitConfig::for_replay),
-        );
+        // Explicit stacks replay for the whole session — under the tolerant
+        // policy, only the entries that loaded; repairing a skipped one takes a
+        // restart. Discovered files are preloaded only for startup; later root
+        // changes still discover anew.
+        let _ = self
+            .explicit_config
+            .set(explicit_selected.then(|| startup_config.for_replay()));
 
         let position_encoding = host_position_encoding(&params.capabilities);
         // Store client capabilities for LSP compliance checks (e.g., refresh support).
@@ -327,9 +344,6 @@ impl Kakehashi {
         // separate internal root path below may still fall back to the CWD.
         let root_uri_for_bridge = bridge_root_uri(&params);
 
-        // Resolved here, into owned values, because `params.capabilities` is
-        // moved into the pool below and that ends any borrow of `params`.
-        let (root_path, source) = config_root_path(client_root(&params));
         // The root a later `didChangeWorkspaceFolders` falls back to once it
         // empties the folder list. Resolved here because `params` does not
         // outlive this request, and deliberately without `config_root_path`'s
@@ -387,11 +401,11 @@ impl Kakehashi {
                 .map(|options| (SettingsSource::InitializationOptions, options)),
             self.home_dir.as_deref(),
             |var| std::env::var(var).ok(),
-            explicit_config,
+            Some(startup_config),
         );
 
         // There is deliberately no second fatal check here. Every verdict on
-        // the explicit configuration was reached above, before any of the
+        // startup file configuration was reached above, before any of the
         // stores in between — and the files must not be read again to reach
         // one, since a `--config-file` may name a stream.
         let settings_events = settings_outcome.events;

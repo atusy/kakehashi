@@ -174,7 +174,7 @@ pub fn load_user_config() -> UserConfigResult<Option<UserConfig>> {
     }))
 }
 
-fn contains_broken_symlink(path: &std::path::Path) -> bool {
+pub(crate) fn contains_broken_symlink(path: &std::path::Path) -> bool {
     let mut prefix = std::path::PathBuf::new();
     for component in path.components() {
         prefix.push(component);
