@@ -67,6 +67,10 @@ pub(crate) struct ParseResult {
     /// overlays). When true, line numbers in `skipped` refer to the combined
     /// query, not any one source file.
     pub multi_file: bool,
+    /// The complete query text this result was compiled from. Together with
+    /// the grammar it determines the compiled query, so it identifies the
+    /// query's content across reloads.
+    pub source: String,
 }
 
 /// The text of a query assembled from every file that contributes to it.
@@ -350,6 +354,7 @@ impl QueryLoader {
                 skipped: Vec::new(),
                 failure_reason: None,
                 multi_file,
+                source: query_str.to_owned(),
             };
         }
 
@@ -365,6 +370,7 @@ impl QueryLoader {
                     skipped: Vec::new(),
                     failure_reason: Some(ParseFailure::PatternSplitFailed(reason)),
                     multi_file,
+                    source: query_str.to_owned(),
                 };
             }
         };
@@ -395,6 +401,7 @@ impl QueryLoader {
                 skipped,
                 failure_reason: Some(ParseFailure::AllPatternsInvalid),
                 multi_file,
+                source: query_str.to_owned(),
             };
         }
 
@@ -405,6 +412,7 @@ impl QueryLoader {
                 skipped,
                 failure_reason: None,
                 multi_file,
+                source: query_str.to_owned(),
             },
             Err(e) => {
                 // Defensive: handle the rare case where individually-valid patterns
@@ -419,6 +427,7 @@ impl QueryLoader {
                     skipped,
                     failure_reason: Some(ParseFailure::CombinationFailed(e.message)),
                     multi_file,
+                    source: query_str.to_owned(),
                 }
             }
         }

@@ -111,6 +111,13 @@ pub(crate) struct LanguageCoordinator {
     /// pre-#575 free-for-all, and the common case (an LSP request burst)
     /// goes exclusively through the async path.
     load_inflight: dashmap::DashMap<String, Arc<tokio::sync::Notify>>,
+    /// Compiled queries by grammar and complete source text. A reload that
+    /// reads the same text for the same grammar gets the query it already
+    /// published back, so the query store's `Arc` identity tracks content: a
+    /// reload can tell "re-read, unchanged" from "re-read, edited" without
+    /// comparing sources. Holds `Weak`s, so it never keeps a replaced query
+    /// alive; dead entries are pruned on each settings load.
+    compiled_queries: Mutex<HashMap<(Language, String), std::sync::Weak<tree_sitter::Query>>>,
 }
 
 impl Default for LanguageCoordinator {
@@ -137,6 +144,7 @@ impl LanguageCoordinator {
             load_generation: std::sync::atomic::AtomicU64::new(0),
             config_warnings: RwLock::new(Vec::new()),
             load_inflight: dashmap::DashMap::new(),
+            compiled_queries: Mutex::new(HashMap::new()),
         }
     }
 
@@ -398,6 +406,7 @@ impl LanguageCoordinator {
             .settings_reload_lock
             .lock()
             .recover_poison("LanguageCoordinator::load_settings(reload)");
+        self.prune_compiled_queries();
         self.config_store.update_from_settings(settings);
         self.clear_derived_languages();
         // A reload (new search paths, or the post-install reload) is the only
@@ -1084,7 +1093,14 @@ impl LanguageCoordinator {
             ctx.query_kind.name(),
             escape_terminal_controls(ctx.language_id)
         );
-        self.process_query_result(result, &query_label, &success_prefix, events, insert_fn);
+        self.process_query_result(
+            language,
+            result,
+            &query_label,
+            &success_prefix,
+            events,
+            insert_fn,
+        );
     }
 
     /// Load a query from explicit paths (unified queries configuration).
@@ -1121,12 +1137,51 @@ impl LanguageCoordinator {
             ctx.query_kind.name(),
             escape_terminal_controls(ctx.language_id)
         );
-        self.process_query_result(result, &query_label, &success_prefix, events, insert_fn);
+        self.process_query_result(
+            language,
+            result,
+            &query_label,
+            &success_prefix,
+            events,
+            insert_fn,
+        );
+    }
+
+    /// The published query compiled from `source` for `language`, or `query`
+    /// when none is alive. See [`Self::compiled_queries`].
+    fn intern_query(
+        &self,
+        language: &Language,
+        source: String,
+        query: tree_sitter::Query,
+    ) -> Arc<tree_sitter::Query> {
+        let mut compiled = self
+            .compiled_queries
+            .lock()
+            .recover_poison("LanguageCoordinator::intern_query");
+        let entry = compiled
+            .entry((language.clone(), source))
+            .or_insert_with(std::sync::Weak::new);
+        if let Some(published) = entry.upgrade() {
+            return published;
+        }
+        let query = Arc::new(query);
+        *entry = Arc::downgrade(&query);
+        query
+    }
+
+    /// Drop the [`Self::compiled_queries`] entries nothing references anymore.
+    fn prune_compiled_queries(&self) {
+        self.compiled_queries
+            .lock()
+            .recover_poison("LanguageCoordinator::prune_compiled_queries")
+            .retain(|_, query| query.strong_count() > 0);
     }
 
     /// Process a ParseResult: log skipped patterns, insert query, log outcome.
     fn process_query_result(
         &self,
+        language: &Language,
         result: super::query_loader::ParseResult,
         query_label: &str,
         success_prefix: &str,
@@ -1155,7 +1210,10 @@ impl LanguageCoordinator {
 
         match result.query {
             Some(query) => {
-                insert_fn(&self.query_store, Arc::new(query));
+                insert_fn(
+                    &self.query_store,
+                    self.intern_query(language, result.source, query),
+                );
                 let skipped_count = result.skipped.len();
                 let msg = if skipped_count > 0 {
                     format!("{success_prefix} ({skipped_count} pattern(s) skipped)")
