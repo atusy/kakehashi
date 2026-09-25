@@ -802,9 +802,10 @@ impl ConnectionHandle {
     /// ordering between registration and folder-change handling. A check that
     /// races an in-flight registration just sees the older answer, whose worst
     /// case is what the static-only check did unconditionally (a spurious
-    /// recycle or divert). The registry's lock is a leaf: its writer, the
-    /// reader task's register handler, never holds `connections`, so reading
-    /// it under `connections` cannot invert an order.
+    /// recycle or divert). The registry's lock is a leaf: its writers — the
+    /// reader task's register handlers and the handshake's `changeNotifications`
+    /// id seed — never hold `connections`, so reading it under `connections`
+    /// cannot invert an order.
     pub(crate) fn supports_workspace_folder_changes(&self) -> bool {
         self.server_capabilities()
             .is_some_and(supports_workspace_folder_changes)
