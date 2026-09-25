@@ -913,8 +913,10 @@ impl LanguageServerPool {
         // envelope with no valid virtual identity names no document; it keeps
         // the host-URI fallback its connection was acquired with, ungated.
         let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(&host_url).ok();
-        if VirtualDocumentUri::is_valid_identity(&envelope.injection_language, &envelope.region_id)
-        {
+        let virtual_uri = if VirtualDocumentUri::is_valid_identity(
+            &envelope.injection_language,
+            &envelope.region_id,
+        ) {
             let Some(host_uri_lsp) = host_uri_lsp.as_ref() else {
                 re_envelope_action(&mut action, &envelope);
                 return action;
@@ -935,7 +937,10 @@ impl LanguageServerPool {
                 re_envelope_action(&mut action, &envelope);
                 return action;
             }
-        }
+            Some(virtual_uri)
+        } else {
+            None
+        };
 
         let offset = RegionOffset::from(&envelope.offset);
 
@@ -952,7 +957,9 @@ impl LanguageServerPool {
                 &handle,
                 outgoing,
                 upstream_id,
-                ResolveTarget::Unchecked,
+                virtual_uri
+                    .as_ref()
+                    .map_or(ResolveTarget::Unchecked, ResolveTarget::Virtual),
             )
             .await
         else {
@@ -1118,10 +1125,14 @@ fn finalize_virt_resolved_action(
 /// What a `codeAction/resolve` refers to on the connection it is sent on,
 /// which decides the checks made while it is enqueued.
 enum ResolveTarget<'a> {
-    /// No document check at enqueue (the virtual layer).
+    /// No document check at enqueue: the eager pass right after the
+    /// producing request opened the document, or a resolve envelope that
+    /// names no virtual document.
     Unchecked,
     /// A host-layer action: synchronize and verify the host document.
     Host(HostResolveContext<'a>),
+    /// A virtual-layer action: its virtual document must still be open.
+    Virtual(&'a VirtualDocumentUri),
 }
 
 impl LanguageServerPool {
@@ -1192,6 +1203,34 @@ impl LanguageServerPool {
                 }
                 return None;
             }
+            // The gate saw the virtual document open, but a close may have
+            // landed since. Recheck under its transition lock and hold that
+            // through enqueue, so the resolve cannot follow a didClose.
+            let _transition = match target {
+                ResolveTarget::Virtual(virtual_uri) => {
+                    let transition = self.open_transition_lock(virtual_uri, connection_key);
+                    let guard = Arc::clone(&transition).lock_owned().await;
+                    if !self.is_document_opened_on_connection(virtual_uri, connection_key) {
+                        drop(guard);
+                        self.remove_open_transition_lock_if_unshared(
+                            virtual_uri,
+                            connection_key,
+                            &transition,
+                        );
+                        drop(connections);
+                        log::debug!(
+                            target: "kakehashi::bridge",
+                            "codeAction/resolve: the document closed on {connection_key} before send"
+                        );
+                        if let Some(ref id) = upstream_id {
+                            self.unregister_upstream_request(id, connection_key);
+                        }
+                        return None;
+                    }
+                    Some(guard)
+                }
+                _ => None,
+            };
             if let Err(e) = handle.send_request(request, request_id) {
                 drop(connections);
                 // DEBUG: see the register-failure note above.
@@ -2206,6 +2245,31 @@ mod tests {
             "jsonrpc": "2.0", "id": downstream_id.as_i64(), "result": {"title": "resolved"}
         }));
         assert!(request.await.unwrap().title.starts_with("resolved"));
+    }
+
+    /// The gate's open check runs before the send, so a close can land in
+    /// between. The send must recheck under the document's transition lock, as
+    /// completion resolve does, or the resolve follows the didClose in the FIFO.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn virtual_code_action_resolve_is_not_sent_for_a_document_closed_before_enqueue() {
+        let (pool, handle, _envelope, virtual_uri, _config) = virtual_resolve_fixture().await;
+        let upstream_id = UpstreamId::Number(85);
+        let resolved = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            pool.send_code_action_resolve_on_handle(
+                &handle,
+                CodeAction {
+                    title: "old".into(),
+                    ..Default::default()
+                },
+                Some(upstream_id.clone()),
+                ResolveTarget::Virtual(&virtual_uri),
+            ),
+        )
+        .await
+        .expect("a resolve for a closed document must fail soft, not wait for a reply");
+        assert!(resolved.is_none());
     }
 
     /// A settled barrier does not prove THIS document is open: a re-open that
