@@ -664,6 +664,32 @@ mod tests {
         assert_eq!(walked, vec![a]);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn walked_aliases_keep_the_first_spelling_whatever_the_readdir_order() {
+        // One walk yields its entries in readdir order, which is hash order
+        // on APFS and ext4. With many hard-linked names the first entry
+        // listed is almost never the lexicographically first one, so this
+        // pins that the survivor comes from sorted order, not from the
+        // filesystem.
+        let tmp = tempfile::tempdir().unwrap();
+        let names = [
+            "p", "d", "w", "k", "s", "b", "x", "m", "f", "t", "h", "q", "c", "v", "j", "a",
+        ];
+        write(&tmp.path().join("p.md"), "x");
+        for name in &names[1..] {
+            std::fs::hard_link(
+                tmp.path().join("p.md"),
+                tmp.path().join(format!("{name}.md")),
+            )
+            .unwrap();
+        }
+
+        let walked = collect_paths(tmp.path(), &[tmp.path().to_path_buf()], &[], &markdown_only);
+
+        assert_eq!(walked, vec![tmp.path().join("a.md")]);
+    }
+
     #[test]
     fn explicitly_named_hidden_directory_is_walked() {
         // The walker's hidden-file filter applies to entries, not to the
