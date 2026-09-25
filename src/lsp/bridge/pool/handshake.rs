@@ -4,7 +4,9 @@
 //! with a downstream language server. The handshake follows the LSP specification:
 //! 1. Send `initialize` request
 //! 2. Wait for `initialize` response
-//! 3. Send `initialized` notification
+//! 3. Validate the response; record a static `changeNotifications` id as a
+//!    registration (#1117)
+//! 4. Send `initialized` notification
 //!
 //! # Single-Writer Loop (ls-bridge-message-ordering)
 //!
@@ -23,8 +25,8 @@ use crate::lsp::bridge::protocol::{
     parse_initialize_response_capabilities,
 };
 
-/// Send `initialize`, await the response, send `initialized`, return the typed
-/// `ServerCapabilities`. Invoked by `get_or_create_connection_with_timeout`
+/// Send `initialize`, await the response, record a `changeNotifications` id as
+/// a registration, send `initialized`, return the typed `ServerCapabilities`. Invoked by `get_or_create_connection_with_timeout`
 /// once the connection has spawned and the reader task is up; goes through
 /// the single-writer channel (ls-bridge-message-ordering) for FIFO ordering.
 #[allow(clippy::too_many_arguments)]
