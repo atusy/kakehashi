@@ -581,7 +581,13 @@ pub(in crate::lsp::lsp_impl) fn kind_queries_changed(
         })
         .collect();
     cached.into_iter().any(|(language_id, file_name, source)| {
-        QueryLoader::resolve_query_source(search_paths, &language_id, &file_name).ok() != source
+        match QueryLoader::resolve_query_source(search_paths, &language_id, &file_name) {
+            Ok(text) => source.as_deref() != Some(text.as_str()),
+            Err(QueryLoadError::NotFound | QueryLoadError::RefusedLanguage(_)) => source.is_some(),
+            // An unreadable or malformed kind file: only a reload surfaces
+            // its warning, as every configuration push did before the skip.
+            Err(QueryLoadError::Other(_)) => true,
+        }
     })
 }
 
@@ -1970,21 +1976,24 @@ mod tests {
         assert!(kind_queries_changed(&search_paths, GENERATION));
         std::fs::remove_file(kind_dir.join("context.scm")).unwrap();
         assert!(!kind_queries_changed(&search_paths, GENERATION));
-
-        std::fs::remove_file(kind_dir.join("folds.scm")).unwrap();
+        std::fs::write(kind_dir.join("context.scm"), b"\xff\xfe not utf-8").unwrap();
         assert!(
             kind_queries_changed(&search_paths, GENERATION),
-            "a deleted kind file"
+            "an unreadable kind file must keep surfacing its warning"
         );
+        std::fs::remove_file(kind_dir.join("context.scm")).unwrap();
         let in_flight = KindLoadInFlight::begin(&search_paths);
         assert!(
             kind_queries_changed(&search_paths, GENERATION),
             "a load in flight may store a file read before an edit"
         );
         drop(in_flight);
+        assert!(!kind_queries_changed(&search_paths, GENERATION));
+
+        std::fs::remove_file(kind_dir.join("folds.scm")).unwrap();
         assert!(
             kind_queries_changed(&search_paths, GENERATION),
-            "folds.scm is still deleted"
+            "a deleted kind file"
         );
         // A request that started under an older generation finishes after
         // the current entry was stored: it must not replace it.
