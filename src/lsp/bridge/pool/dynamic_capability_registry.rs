@@ -173,6 +173,39 @@ mod tests {
         }
     }
 
+    /// A server may unregister its static `changeNotifications` id as soon as
+    /// its `initialize` response is out, and the reader can apply that before
+    /// the handshake records the id (#1117). The withdrawal must survive.
+    #[test]
+    fn unregistration_before_the_static_record_withdraws_it() {
+        let registry = DynamicCapabilityRegistry::new();
+
+        registry.unregister(vec![make_unregistration(
+            "wf-id",
+            "workspace/didChangeWorkspaceFolders",
+        )]);
+        registry.record_static_registration(Some(make_registration(
+            "wf-id",
+            "workspace/didChangeWorkspaceFolders",
+        )));
+
+        assert!(!registry.has_registration("workspace/didChangeWorkspaceFolders"));
+    }
+
+    /// Only a withdrawal that precedes the static record is remembered: once
+    /// recorded, a later unknown-id unregistration must not veto a later
+    /// dynamic registration under that id.
+    #[test]
+    fn unknown_unregistration_after_the_static_record_is_forgotten() {
+        let registry = DynamicCapabilityRegistry::new();
+        registry.record_static_registration(None);
+
+        registry.unregister(vec![make_unregistration("other", "textDocument/hover")]);
+        registry.register(vec![make_registration("other", "textDocument/hover")]);
+
+        assert!(registry.has_registration("textDocument/hover"));
+    }
+
     #[test]
     fn register_stores_capability() {
         let registry = DynamicCapabilityRegistry::new();
