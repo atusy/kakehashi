@@ -639,8 +639,9 @@ impl InstallCoordinator {
             // not spend that reload's retry on an attempt from before it.
             // Its wait for a retry is not generation-scoped, though, and an
             // owner cancelled mid-install never records it, so the waiter
-            // puts the language on the wait itself.
-            if terminal.is_failure() {
+            // puts the language on the wait itself — only then: a settled
+            // owner recorded it, and a reload may already have retried it.
+            if terminal.is_failure() && !completion_token.owner_settled() {
                 self.auto_install.defer_query_repair_retry(language);
             }
             if terminal == crate::lsp::auto_install::InstallOutcome::Abandoned
