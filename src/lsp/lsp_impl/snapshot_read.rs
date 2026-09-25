@@ -61,10 +61,11 @@ pub(crate) const FIRST_PARSE_BACKSTOP: std::time::Duration = std::time::Duration
 /// not this.
 pub(crate) const TOKEN_SETTLE_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// How long an explicit action (formatting / range formatting) waits for a
+/// How long an explicit action (formatting / range formatting /
+/// selectionRange) waits for a
 /// trailing snapshot to catch up before rejecting with `ContentModified`, or
 /// for a reload placeholder's reparse before falling back as `Unparsed`.
-const EXPLICIT_ACTION_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+pub(crate) const EXPLICIT_ACTION_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
 impl Kakehashi {
     /// Resolve one snapshot's whole-document regions. `None` means the
