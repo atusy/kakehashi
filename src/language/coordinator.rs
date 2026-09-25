@@ -4001,6 +4001,58 @@ mod tests {
         );
     }
 
+    /// Reusing a published query must report the patterns its compile
+    /// skipped exactly like the compile did, or a reload would silently drop
+    /// the warning for a still-broken query file.
+    #[test]
+    fn reused_query_reports_its_skipped_patterns_again() {
+        let dir = tempdir().unwrap();
+        let query_path = dir.path().join("highlights.scm");
+        fs::write(
+            &query_path,
+            "(identifier) @variable\n(no_such_node) @broken\n",
+        )
+        .unwrap();
+        let coordinator = LanguageCoordinator::new();
+        coordinator
+            .language_registry
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        let settings = WorkspaceSettings {
+            languages: HashMap::from([(
+                "rust".to_string(),
+                LanguageSettings {
+                    queries: Some(vec![crate::config::settings::QueryItem {
+                        path: query_path.to_string_lossy().into_owned(),
+                        kind: None,
+                    }]),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let skipped_warnings = |summary: &LanguageLoadSummary| {
+            summary
+                .events
+                .iter()
+                .filter(|event| {
+                    matches!(event, LanguageEvent::Log { message, .. }
+                        if message.contains("Skipped invalid pattern"))
+                })
+                .count()
+        };
+
+        let first = coordinator.load_settings(&settings);
+        let published = coordinator.highlight_query("rust").unwrap();
+        let second = coordinator.load_settings(&settings);
+
+        assert!(
+            Arc::ptr_eq(&published, &coordinator.highlight_query("rust").unwrap()),
+            "the second load must reuse the published query"
+        );
+        assert_eq!(skipped_warnings(&first), 1);
+        assert_eq!(skipped_warnings(&second), 1);
+    }
+
     #[test]
     fn stale_dynamic_load_cannot_retag_configured_registration() {
         let coordinator = LanguageCoordinator::new();
