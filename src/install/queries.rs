@@ -914,7 +914,7 @@ impl PublishedQueryInstall {
         })
     }
 
-    /// Un-publish the requested language, restoring the directory it displaced.
+    /// Un-publish the requested language, restoring the entry it displaced.
     ///
     /// Only the requested language is un-published. Query files for the base
     /// languages it inherits are shared: another install running concurrently
@@ -1027,7 +1027,7 @@ pub(crate) enum RollbackOutcome {
     NewQueriesRemain,
     /// The new queries are gone but the ones they displaced could not be put
     /// back, so the language has no queries and the previous ones are in a
-    /// backup directory. The warnings name it.
+    /// backup. The warnings name it.
     PreviousQueriesStranded,
 }
 
@@ -1078,16 +1078,16 @@ fn discard_backup_locked(published: &PublishedQueryDir) {
     discard_backup(published);
 }
 
-/// Drop a displaced query directory and the sidecar that marks it as ours.
+/// Drop a displaced query entry and the sidecar that marks it as ours.
 ///
-/// The sidecar is removed even when the directory is already gone: gating it on
+/// The sidecar is removed even when the backup is already gone: gating it on
 /// a successful removal is how orphaned `.kakehashi-backup` files accumulate
-/// when a concurrent uninstall collects the directory first.
+/// when a concurrent uninstall collects the backup first.
 fn discard_backup(published: &PublishedQueryDir) {
     let Some(backup) = &published.backup else {
         return;
     };
-    discard_backup_dir(backup);
+    discard_backup_entry(backup);
 }
 
 /// Remove a backup (a directory, or whatever shape sat in the slot) and, once
@@ -1095,10 +1095,10 @@ fn discard_backup(published: &PublishedQueryDir) {
 ///
 /// The sidecar outlives a removal that *failed*: every collector — uninstall,
 /// the recovery sweep, `newest_complete_backup_dir` — gates on it, so dropping
-/// it while the directory survives would make that directory unreachable by all
-/// of them. It is dropped when the directory is confirmed absent, which is how
+/// it while the backup survives would make that backup unreachable by all of
+/// them. It is dropped when the backup is confirmed absent, which is how
 /// a concurrent uninstall's collection stops leaving sidecars behind.
-fn discard_backup_dir(backup: &Path) {
+fn discard_backup_entry(backup: &Path) {
     // Whatever shape it has: a backup is what sat in the slot before, and a
     // regular file there makes a regular-file backup that `remove_dir_all`
     // cannot take (#1006).
@@ -1863,7 +1863,7 @@ fn recover_interrupted_query_install(
 /// directory but before committing.
 ///
 /// [`recover_interrupted_query_install`] restores a backup only when the live
-/// directory is missing. Once the publish landed, the directory it displaced is
+/// directory is missing. Once the publish landed, the entry it displaced is
 /// superseded — and invisible to that recovery for exactly that reason — so
 /// without this it would sit under `queries/` until the user uninstalled the
 /// language by name. An install publishes one such backup per language in the
@@ -1907,7 +1907,7 @@ fn collect_superseded_backups(
         let entry = entry.map_err(QueryInstallError::IoError)?;
         let path = entry.path();
         // Any shape, as in uninstall's sweep: a displaced regular file is a
-        // backup too, and `discard_backup_dir` takes one.
+        // backup too, and `discard_backup_entry` takes one.
         if !backup_is_owned(&path) {
             continue;
         }
@@ -1920,7 +1920,7 @@ fn collect_superseded_backups(
         if backup_language != language || process_is_running(pid) {
             continue;
         }
-        discard_backup_dir(&path);
+        discard_backup_entry(&path);
     }
     Ok(())
 }
@@ -3086,7 +3086,7 @@ mod tests {
         fs::write(&backup, "a file that sat in the query slot").unwrap();
         write_backup_ownership_marker(&backup).unwrap();
 
-        discard_backup_dir(&backup);
+        discard_backup_entry(&backup);
 
         assert!(
             fs::symlink_metadata(&backup).is_err(),
