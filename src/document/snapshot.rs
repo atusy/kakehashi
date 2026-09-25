@@ -93,9 +93,12 @@ pub(crate) struct ParseSnapshot {
     /// (`Document::invalidate_parse`), which is not a parse result. A reader
     /// that settles for a parse (the explicit-action waits) keeps waiting on
     /// it, where a completed tree-less parse is a final answer. Every parse
-    /// pass publishes `false`, and [`SnapshotSlot::admits`] lets any parse of
-    /// the placeholder's version replace it, so a reparse — with or without
-    /// a tree — never leaves the flag standing.
+    /// pass publishes `false`, and [`SnapshotSlot::admits`] lets a parse of
+    /// the placeholder's version replace it: a tree lands through the normal
+    /// install, and the live version's reparse ending without one publishes
+    /// the tree-less outcome through `DocumentStore::resolve_reload_placeholder`.
+    /// A pass an edit overtook leaves it standing, but then trailing, like
+    /// any snapshot the edit's own reparse will supersede.
     pub(crate) awaiting_reparse: bool,
 }
 
