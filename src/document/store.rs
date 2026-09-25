@@ -1740,10 +1740,9 @@ mod tests {
 
         /// A reparse that cannot produce a tree resolves the reload
         /// placeholder at its own version, so readers settling for the
-        /// reparse stop waiting — but only the live version's pass, and
-        /// never over a real parse result.
+        /// reparse stop waiting.
         #[test]
-        fn failed_reparse_resolves_only_the_live_placeholder() {
+        fn failed_reparse_resolves_the_live_placeholder() {
             let store = DocumentStore::new();
             let uri = Url::parse("file:///resolve-placeholder.rs").unwrap();
             let incarnation = store.insert(uri.clone(), "a".into(), Some("rust".into()), None);
@@ -1751,27 +1750,51 @@ mod tests {
             store.invalidate_all_parses();
             let reload_version = store.latest_snapshot(&uri).unwrap().content_version;
 
-            store.resolve_reload_placeholder(&uri, incarnation, reload_version - 1);
-            let held = store.latest_snapshot(&uri).unwrap().slot.snapshot.unwrap();
-            assert!(held.awaiting_reparse, "an overtaken pass resolves nothing");
-
             store.resolve_reload_placeholder(&uri, incarnation, reload_version);
+
             let held = store.latest_snapshot(&uri).unwrap().slot.snapshot.unwrap();
-            assert!(!held.awaiting_reparse, "the live pass resolves it");
+            assert!(!held.awaiting_reparse);
             assert!(held.tree.is_none());
             assert_eq!(held.parsed_version, reload_version);
+        }
 
-            // With no placeholder held, the same call leaves a parse alone.
+        /// A pass an edit overtook is not the outcome readers wait on: the
+        /// cell would admit its newer tree-less publish over the trailing
+        /// placeholder, so only the live-version gate keeps it out.
+        #[test]
+        fn an_overtaken_reparse_leaves_the_placeholder_alone() {
+            let store = DocumentStore::new();
+            let uri = Url::parse("file:///overtaken-reparse.rs").unwrap();
+            let incarnation = store.insert(uri.clone(), "a".into(), Some("rust".into()), None);
+            store.publish_giveup_snapshot(&uri, incarnation);
+            store.invalidate_all_parses();
+            let reload_version = store.latest_snapshot(&uri).unwrap().content_version;
             store.update_document(uri.clone(), "ab".into(), None);
-            let version = store.latest_snapshot(&uri).unwrap().content_version;
-            let parsed = ParseSnapshot {
-                tree: Some(super::markdown_tree("ab")),
-                ..snap_for(&store, &uri, version)
-            };
-            assert!(publish(&store, &uri, parsed));
-            store.resolve_reload_placeholder(&uri, incarnation, version);
+            store.update_document(uri.clone(), "abc".into(), None);
+
+            store.resolve_reload_placeholder(&uri, incarnation, reload_version + 1);
+
             let held = store.latest_snapshot(&uri).unwrap().slot.snapshot.unwrap();
-            assert!(held.tree.is_some(), "a real parse result is never replaced");
+            assert!(held.awaiting_reparse, "an overtaken pass resolved it");
+            assert_eq!(held.parsed_version, reload_version);
+        }
+
+        /// Only a placeholder is resolved: the cell would admit a newer
+        /// tree-less publish over a trailing tree-less parse result too, so
+        /// only the placeholder gate keeps the call from replacing it.
+        #[test]
+        fn resolution_never_replaces_a_parse_result() {
+            let store = DocumentStore::new();
+            let uri = Url::parse("file:///no-placeholder.rs").unwrap();
+            let incarnation = store.insert(uri.clone(), "a".into(), Some("rust".into()), None);
+            store.publish_giveup_snapshot(&uri, incarnation);
+            store.update_document(uri.clone(), "ab".into(), None);
+            let live_version = store.latest_snapshot(&uri).unwrap().content_version;
+
+            store.resolve_reload_placeholder(&uri, incarnation, live_version);
+
+            let held = store.latest_snapshot(&uri).unwrap().slot.snapshot.unwrap();
+            assert_eq!(held.parsed_version, 0, "a parse result was replaced");
         }
 
         #[test]
