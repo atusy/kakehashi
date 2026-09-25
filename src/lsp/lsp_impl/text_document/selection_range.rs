@@ -52,6 +52,10 @@ impl Kakehashi {
         // former reader on-demand parse: readers never parse inline.
         let deadline = tokio::time::Instant::now() + SELECTION_RANGE_WAIT;
         let mut expired = false;
+        // The live input the request's positions were authored against: an
+        // edit landing while it waits is newer text, which no answer here
+        // may be computed on.
+        let mut request_lineage = None;
         let snapshot = loop {
             // Subscribe BEFORE checking (lost-wakeup guard, see
             // snapshot_for_tokens), then re-resolve per iteration
@@ -64,6 +68,10 @@ impl Kakehashi {
                 // Unregistered or closed.
                 return Ok(None);
             };
+            let lineage = (view.slot.current_incarnation, view.content_version);
+            if *request_lineage.get_or_insert(lineage) != lineage {
+                return Err(crate::error::content_modified_error());
+            }
             let current = view
                 .slot
                 .snapshot
