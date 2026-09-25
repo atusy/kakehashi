@@ -1238,8 +1238,10 @@ impl LanguageCoordinator {
                 Ok(lang) => lang,
                 Err(err) => {
                     // A configured parser path that does not exist yet is a
-                    // missing parser, not a broken one.
-                    if lib_path.exists() {
+                    // missing parser, not a broken one. One whose existence
+                    // cannot even be checked (no permission, a symlink loop)
+                    // is broken.
+                    if !matches!(lib_path.try_exists(), Ok(false)) {
                         self.note_load_problem();
                     }
                     return Err(LanguageLoadResult::failure_with(LanguageEvent::log(
@@ -4025,6 +4027,18 @@ mod tests {
             coordinator.reload_would_change_languages(&settings),
             "an unloadable parser library must keep surfacing its error"
         );
+
+        #[cfg(unix)]
+        {
+            fs::remove_file(dir.path().join("broken.so")).unwrap();
+            coordinator.load_settings(&settings);
+            assert!(!coordinator.reload_would_change_languages(&settings));
+            std::os::unix::fs::symlink("broken.so", dir.path().join("broken.so")).unwrap();
+            assert!(
+                coordinator.reload_would_change_languages(&settings),
+                "a parser path whose existence cannot be checked is broken, not missing"
+            );
+        }
     }
 
     /// A query file that fails to compile loads no query, before and after
