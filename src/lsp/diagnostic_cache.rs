@@ -39,13 +39,14 @@
 //! Region-invalidation eviction is implemented (`evict_source`, wired into the
 //! edit path that orphans a region — #424) and crash/server eviction too
 //! (`evict_connection`, wired into the reader-exit path — #469; slots are tagged
-//! with the producing connection's id so a restart's slots survive). Still
-//! deferred: the `preferred` sticky-election strategy fan-in (the `concatenated`
-//! strategy — keep every server, in a deterministic position order — ships in #423;
-//! `preferred` needs a per-source version baseline #422 left unbuilt) and host-layer
-//! eager-open (diagnostics on open before the first request). The `content_epoch`
-//! version gate was evaluated and rejected (it converts a self-healing stale-overwrite
-//! into a reopen-resurrection hide); the stale-overwrite is left self-healing.
+//! with the producing connection's id so a restart's slots survive), as is the
+//! host-layer eager open that lets a push-only `_self` server push on open
+//! (#429). Still deferred: the `preferred` sticky-election strategy fan-in (the
+//! `concatenated` strategy — keep every server, in a deterministic position
+//! order — ships in #423; `preferred` needs a per-source version baseline #422
+//! left unbuilt). The `content_epoch` version gate was evaluated and rejected
+//! (it converts a self-healing stale-overwrite into a reopen-resurrection hide);
+//! the stale-overwrite is left self-healing.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

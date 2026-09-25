@@ -528,12 +528,16 @@ impl LanguageServerPool {
         }
     }
 
-    /// Fire `didOpen` for the real host document on a `_self` host-bridge server
-    /// (host-document-bridge), so a push-only host server (no `textDocument/diagnostic`
-    /// support) starts analyzing and pushing diagnostics immediately, instead of
-    /// only after the first host-bridged request lazily opens it. Fire-and-forget:
-    /// failures are logged at debug and never propagated.
-    /// `doc.revision` must be `Some`: the lifetime the open was scheduled in.
+    /// Sync the real host document to a `_self` host-bridge server
+    /// (host-document-bridge) outside any request: `sync_host_document` sends
+    /// `didOpen` the first time, a full-text `didChange` when the text changed
+    /// since the last sync, and nothing when it did not. Both the eager open on
+    /// host `didOpen` (#429) and the debounced on-edit re-sync (#431) run through
+    /// here, so a push-only host server (no `textDocument/diagnostic` support)
+    /// analyzes and pushes diagnostics for the current text without waiting for
+    /// a host-bridged request. Fire-and-forget: failures are logged at debug and
+    /// never propagated.
+    /// `doc.revision` must be `Some`: the lifetime the sync was scheduled in.
     pub(crate) async fn eager_open_host_document(
         &self,
         server_name: &str,
@@ -560,7 +564,7 @@ impl LanguageServerPool {
             Err(e) => {
                 log::debug!(
                     target: "kakehashi::bridge",
-                    "Eager host open: server {} not ready for {}: {}",
+                    "Eager host sync: server {} not ready for {}: {}",
                     server_name,
                     host_uri,
                     e
@@ -667,16 +671,19 @@ impl LanguageServerPool {
                 }
             }
         }
-        // Sync (sends didOpen) under the `connections` + `host_documents` locks in
-        // that order, with the live-handle `Arc::ptr_eq` check — identical to
-        // `execute_host_request`, so a concurrent respawn purge cannot interleave
-        // and leave sync state the replacement never saw.
+        // Sync (didOpen, didChange, or nothing) under the `connections` +
+        // `host_documents` locks in that order, with the live-handle
+        // `Arc::ptr_eq` check — identical to `execute_host_request`, so a
+        // concurrent respawn purge cannot interleave and leave sync state the
+        // replacement never saw.
         let connections = self.connections().await;
         if !connections.get(connection_key).is_some_and(|current| {
             Arc::ptr_eq(current, &handle) && current.state() == ConnectionState::Ready
         }) {
-            // Replaced by a respawn between wait-ready and here; the new connection
-            // will sync lazily on its first request.
+            // Replaced, or failing, since wait-ready. The purge that precedes any
+            // replacement arms its re-open, which brings the new connection up to
+            // date; a later eager re-sync or a request's lazy sync covers
+            // anything it misses.
             return;
         }
         // Under the lifecycle lock, right before the sync: a task of a
@@ -687,7 +694,7 @@ impl LanguageServerPool {
         if self.current_host_incarnation(host_uri) != doc.revision.map(|r| r.incarnation) {
             log::debug!(
                 target: "kakehashi::bridge",
-                "Eager host open: {} was closed or reopened since this open was scheduled; skipping",
+                "Eager host sync: {} was closed or reopened since this sync was scheduled; skipping",
                 host_uri
             );
             return;
@@ -705,7 +712,7 @@ impl LanguageServerPool {
         {
             log::debug!(
                 target: "kakehashi::bridge",
-                "Eager host open: didOpen failed for {} on {}: {}",
+                "Eager host sync: sync failed or was refused for {} on {}: {}",
                 host_uri,
                 server_name,
                 e

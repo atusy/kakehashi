@@ -1295,9 +1295,10 @@ fn e2e_host_will_save_notification_reaches_host() {
     let (mut client, _config_dir, _init) =
         init_will_save_client("[languages.markdown.bridge._self]\nenabled = true\n");
 
-    // Warm up: a hover opens the host document downstream (the host bridge syncs
-    // lazily on the first request) and reports the willSave count — zero before
-    // any willSave is forwarded.
+    // Warm up: the host document is opened downstream eagerly on didOpen, but
+    // fire-and-forget, so poll a hover until the host server answers (a hover
+    // syncs the document itself if the eager open has not landed yet). The
+    // answer reports the willSave count, zero before any willSave is forwarded.
     let mut warmed = false;
     for _ in 0..300 {
         if let Some(state) = host_save_hover(&mut client) {
