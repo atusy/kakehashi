@@ -963,14 +963,19 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::current(1, 0, OpenOutcome::Opened, true)]
-    #[case::superseded(2, 0, OpenOutcome::NotOpened, false)]
-    #[case::reload_before_enqueue(1, 2, OpenOutcome::NotOpened, false)]
-    #[case::reload_during_enqueue(1, 3, OpenOutcome::NotOpened, true)]
+    #[case::current(1, 0, false, OpenOutcome::Opened, true)]
+    #[case::superseded(2, 0, false, OpenOutcome::NotOpened, false)]
+    #[case::reload_before_enqueue(1, 2, false, OpenOutcome::NotOpened, false)]
+    #[case::reload_during_enqueue(1, 3, false, OpenOutcome::NotOpened, true)]
+    // A region whose route is disabled skips the enqueue-time checks, so only
+    // the check made on first taking the edit lock can reject a stale repair.
+    #[case::current_unrouted(1, 0, true, OpenOutcome::Opened, false)]
+    #[case::superseded_unrouted(2, 0, true, OpenOutcome::NotOpened, false)]
     #[tokio::test]
     async fn repair_checks_content_revision_under_the_edit_lock(
         #[case] current_version: u64,
         #[case] reject_read: usize,
+        #[case] unrouted: bool,
         #[case] expected: OpenOutcome,
         #[case] opened: bool,
     ) {
@@ -981,6 +986,13 @@ mod tests {
         let host_uri = test_host_uri("revision_repair");
         let uri = url_to_uri(&host_uri);
         pool.open_host_incarnation(&host_uri, 1).await;
+        if unrouted {
+            let routing_uri = url::Url::parse(
+                &VirtualDocumentUri::new(&uri, "lua", TEST_ULID_LUA_0).to_uri_string(),
+            )
+            .unwrap();
+            pool.set_host_routing_by_server(&routing_uri, "test-server", false);
+        }
         let edit_lock = tokio::sync::Mutex::new(());
         let reads = std::sync::atomic::AtomicUsize::new(0);
         let read = || {
