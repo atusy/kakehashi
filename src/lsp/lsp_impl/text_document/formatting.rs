@@ -100,8 +100,10 @@ impl Kakehashi {
         // user-triggered and infrequent, so it may briefly wait for the
         // in-flight parse; a still-stale snapshot after the wait rejects with
         // ContentModified rather than silently no-opping an action the user
-        // consciously triggered. Never-parsed/gone falls through to the
-        // existing empty fallbacks below.
+        // consciously triggered. A settings reload's placeholder is waited
+        // past like a trailing snapshot, but one still standing at the
+        // deadline falls through with never-parsed/gone to the existing empty
+        // fallbacks below.
         if let crate::lsp::lsp_impl::snapshot_read::SnapshotWait::Stale =
             self.wait_for_explicit_action_snapshot(&uri).await
         {

@@ -19,8 +19,10 @@ pub(crate) enum SnapshotWait {
     /// Deadline passed with only a trailing snapshot — the reader's
     /// staleness-reject signal applies (`ContentModified` / `null`).
     Stale,
-    /// Deadline passed with no snapshot for this lifetime (first parse still
-    /// pending) — the reader's empty/`null` fallback applies.
+    /// Deadline passed with no parse of the current text: no snapshot for
+    /// this lifetime (first parse still pending), or — for a wait that does
+    /// not accept it — a reload placeholder whose reparse is still pending.
+    /// The reader's empty/`null` fallback applies.
     Unparsed,
     /// Unregistered or closed.
     Gone,
@@ -114,9 +116,10 @@ impl Kakehashi {
 
     /// Wait (bounded) until `uri`'s latest snapshot is current, re-resolving
     /// the cell per wakeup (per-request re-resolution + incarnation validation
-    /// happen inside `latest_snapshot`). This is the ADR's explicit-action
-    /// wait (`formatting` / `rename` / `selectionRange`) and doubles as the
-    /// first-parse wait.
+    /// happen inside `latest_snapshot`). It doubles as the first-parse wait,
+    /// and accepts a settings reload's placeholder as current; the explicit
+    /// actions wait past it through
+    /// [`wait_for_explicit_action_snapshot`](Self::wait_for_explicit_action_snapshot).
     pub(crate) async fn wait_for_current_snapshot(
         &self,
         uri: &Url,
@@ -129,9 +132,19 @@ impl Kakehashi {
     /// user-triggered formatting requests: infrequent and consciously
     /// triggered, so they may briefly wait for the in-flight parse rather
     /// than silently no-op.
+    ///
+    /// Unlike [`wait_for_current_snapshot`](Self::wait_for_current_snapshot),
+    /// a settings reload's placeholder does not end the wait: it is not a
+    /// parse, so the action settles for the reparse it awaits and reads the
+    /// placeholder still standing at the deadline as [`SnapshotWait::Unparsed`].
     pub(crate) async fn wait_for_explicit_action_snapshot(&self, uri: &Url) -> SnapshotWait {
-        self.wait_for_current_snapshot(uri, EXPLICIT_ACTION_WAIT)
-            .await
+        wait_for_snapshot_in(
+            &self.documents,
+            uri,
+            EXPLICIT_ACTION_WAIT,
+            ReloadPlaceholder::AwaitReparse,
+        )
+        .await
     }
 
     /// Resolve a **current** snapshot for the position/range readers
@@ -172,6 +185,27 @@ pub(crate) async fn wait_for_current_snapshot_in(
     uri: &Url,
     wait: std::time::Duration,
 ) -> SnapshotWait {
+    wait_for_snapshot_in(documents, uri, wait, ReloadPlaceholder::Accept).await
+}
+
+/// How a wait treats a settings reload's placeholder
+/// ([`ParseSnapshot::awaiting_reparse`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReloadPlaceholder {
+    /// It is current: the reader serves its missing tree like any tree-less
+    /// parse and relies on its own heal path.
+    Accept,
+    /// It is not a parse: keep waiting (bounded by the settle wait) for the
+    /// reparse, and report one still standing at the deadline as `Unparsed`.
+    AwaitReparse,
+}
+
+async fn wait_for_snapshot_in(
+    documents: &crate::document::DocumentStore,
+    uri: &Url,
+    wait: std::time::Duration,
+    placeholder: ReloadPlaceholder,
+) -> SnapshotWait {
     // Two deadlines: the caller's `wait` bounds the SETTLE wait (a
     // snapshot exists but trails the input — degrading fast there is the
     // point), while the FIRST-parse wait is generous, because it is
@@ -191,11 +225,14 @@ pub(crate) async fn wait_for_current_snapshot_in(
         let Some(view) = documents.latest_snapshot(uri) else {
             return SnapshotWait::Gone;
         };
-        let had_snapshot = match &view.slot.snapshot {
+        let (had_snapshot, awaiting_reparse) = match &view.slot.snapshot {
             Some(snapshot) if snapshot.parsed_version == view.content_version => {
-                return SnapshotWait::Current(Arc::clone(snapshot));
+                if !(snapshot.awaiting_reparse && placeholder == ReloadPlaceholder::AwaitReparse) {
+                    return SnapshotWait::Current(Arc::clone(snapshot));
+                }
+                (true, true)
             }
-            trailing => trailing.is_some(),
+            trailing => (trailing.is_some(), false),
         };
         let deadline = if had_snapshot {
             stale_deadline
@@ -206,7 +243,7 @@ pub(crate) async fn wait_for_current_snapshot_in(
             Ok(Ok(())) => continue,
             Ok(Err(_closed)) => return SnapshotWait::Gone,
             Err(_deadline) => {
-                return if had_snapshot {
+                return if had_snapshot && !awaiting_reparse {
                     SnapshotWait::Stale
                 } else {
                     SnapshotWait::Unparsed
@@ -489,5 +526,30 @@ mod tests {
             snapshot.tree.is_some(),
             "settled on the placeholder instead"
         );
+    }
+
+    /// A reparse that outlasts the wait leaves the live text unparsed, not
+    /// the action's coordinates stale; the readers that accept the
+    /// placeholder still get it at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_reload_placeholder_outlasting_the_wait_reads_unparsed_for_explicit_actions_only() {
+        let uri = Url::parse("file:///slow_reparse.rs").unwrap();
+        let text = "fn main() {}";
+        let (service, inc) = server_with_doc(&uri, text);
+        let server = service.inner();
+        publish(&service, &uri, text, 0, inc);
+        server.documents.invalidate_all_parses();
+
+        assert!(matches!(
+            server.wait_for_explicit_action_snapshot(&uri).await,
+            SnapshotWait::Unparsed
+        ));
+        let SnapshotWait::Current(snapshot) = server
+            .wait_for_current_snapshot(&uri, std::time::Duration::ZERO)
+            .await
+        else {
+            panic!("the default wait accepts the placeholder as current");
+        };
+        assert!(snapshot.awaiting_reparse);
     }
 }
