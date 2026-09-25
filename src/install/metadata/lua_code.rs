@@ -136,12 +136,7 @@ fn short_string_close(b: &[u8], from: usize, quote: u8) -> Option<usize> {
 fn escape_end(b: &[u8], j: usize) -> usize {
     match b.get(j + 1) {
         Some(b'z') => j + 2 + b[j + 2..].iter().take_while(|&&c| is_lua_space(c)).count(),
-        Some(&c @ (b'\n' | b'\r')) => {
-            let pair = b
-                .get(j + 2)
-                .is_some_and(|&d| d != c && matches!(d, b'\n' | b'\r'));
-            j + 2 + usize::from(pair)
-        }
+        Some(b'\n' | b'\r') => line_break_end(b, j + 1),
         _ => j + 2,
     }
 }
@@ -181,12 +176,7 @@ fn decode_short_string(body: &[u8]) -> String {
             b'\n' | b'\r' => {
                 // An escaped line break is one newline, even as `\r\n`.
                 out.push(b'\n');
-                if body
-                    .get(j)
-                    .is_some_and(|&d| d != c && matches!(d, b'\n' | b'\r'))
-                {
-                    j += 1;
-                }
+                j = line_break_end(body, j - 1);
             }
             b'z' => {
                 while body.get(j).is_some_and(|&d| is_lua_space(d)) {
