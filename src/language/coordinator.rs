@@ -33,8 +33,8 @@ struct QueryLoadContext<'a> {
 
 /// RAII single-flight marker for [`LanguageCoordinator::ensure_language_loaded_async`]:
 /// on drop, removes this language's in-flight entry (only if it still points
-/// at this guard's own `Notify` — a reload's `failed_loads.clear()` never
-/// touches this map, so nothing else contends the removal) and wakes every
+/// at this guard's own `Notify` — a reload never touches this map, so
+/// nothing else contends the removal) and wakes every
 /// parked loser, whether the load succeeded, failed, or panicked mid-flight.
 struct LanguageLoadFlightGuard<'a> {
     map: &'a dashmap::DashMap<String, Arc<tokio::sync::Notify>>,
@@ -517,10 +517,10 @@ impl LanguageCoordinator {
         // A reload (new search paths, or the post-install reload) is the only
         // event that can turn a failed load into a success — bump the
         // generation so every existing negative entry stops suppressing
-        // (validity is read-side; see `failed_loads`). The clear is memory
-        // hygiene only: a stale store racing it lands with an old tag and is
-        // inert, so no ordering between bump, clear, and in-flight scans can
-        // produce a wrong suppression.
+        // (validity is read-side; see `failed_loads`). The stale entries stay:
+        // they are how a later reload trial knows which languages documents
+        // were waiting for, which a reload that reparses nothing (the
+        // post-install one) does not retry. A success removes its entry.
         {
             let _registration = self
                 .registration_lock
@@ -529,7 +529,6 @@ impl LanguageCoordinator {
             self.load_generation
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
         }
-        self.failed_loads.clear();
         self.configured_load_failures.clear();
 
         // Build base map from language configs
@@ -1238,6 +1237,7 @@ impl LanguageCoordinator {
             .register(language_id.to_string(), language);
         self.reload_scoped_registrations
             .insert(language_id.to_string(), expected_generation);
+        self.failed_loads.remove(language_id);
         true
     }
 
@@ -2137,6 +2137,7 @@ impl LanguageCoordinator {
         self.language_registry
             .register(language_id.to_string(), language);
         self.configured_load_failures.remove(language_id);
+        self.failed_loads.remove(language_id);
         let generation = self
             .load_generation
             .load(std::sync::atomic::Ordering::Acquire);
@@ -4142,6 +4143,50 @@ mod tests {
         assert!(coordinator.reload_would_change_languages(&settings));
         drop(in_flight);
         assert!(!coordinator.reload_would_change_languages(&settings));
+    }
+
+    /// A reload that reparses nothing (the post-install one) must not make
+    /// the trial forget a language a document failed to load: when its
+    /// parser appears later, an identical push has to pick it up.
+    #[test]
+    fn reload_trial_retries_a_language_that_failed_before_an_intervening_reload() {
+        let grammars = std::env::var("TREE_SITTER_GRAMMARS").unwrap_or_else(|_| {
+            std::env::current_dir()
+                .unwrap()
+                .join("deps/tree-sitter")
+                .to_string_lossy()
+                .into_owned()
+        });
+        let parser = Path::new(&grammars)
+            .join("parser")
+            .join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+        if !parser.exists() {
+            eprintln!("skipping: lua parser not built");
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let settings = WorkspaceSettings {
+            search_paths: vec![dir.path().to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        let coordinator = LanguageCoordinator::new();
+        coordinator.load_settings(&settings);
+        assert!(!coordinator.ensure_language_loaded("lua").success);
+        // The post-install reload of some other language.
+        coordinator.load_settings(&settings);
+
+        fs::create_dir_all(dir.path().join("parser")).unwrap();
+        fs::copy(
+            &parser,
+            dir.path()
+                .join("parser")
+                .join(format!("lua.{}", std::env::consts::DLL_EXTENSION)),
+        )
+        .unwrap();
+        assert!(
+            coordinator.reload_would_change_languages(&settings),
+            "the parser a document was waiting for appeared"
+        );
     }
 
     /// A reload that invalidates no parse (the post-install one) leaves a
