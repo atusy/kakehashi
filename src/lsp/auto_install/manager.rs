@@ -178,6 +178,11 @@ struct QueryDependencyChecks {
     languages: HashSet<String>,
     /// Languages whose query repair failed in `generation`.
     failed: HashSet<String>,
+    /// Languages whose repair failed and has not been checked again since,
+    /// in whatever generation: unlike `failed`, a new generation does not
+    /// clear it, because a generation that reparses nothing (a post-install
+    /// reload) retries nothing.
+    awaiting_retry: HashSet<String>,
 }
 
 impl QueryDependencyChecks {
@@ -291,6 +296,7 @@ impl AutoInstallManager {
             .recover_poison("AutoInstallManager::record_query_repair_failure");
         if checked.observe(generation) {
             checked.failed.insert(language.to_string());
+            checked.awaiting_retry.insert(language.to_string());
         }
     }
 
@@ -317,18 +323,24 @@ impl AutoInstallManager {
         let first = current
             && !checked.languages.contains(language)
             && checked.languages.insert(language.to_string());
-        initial_pass || first
+        let due = initial_pass || first;
+        if due && !checked.awaiting_retry.is_empty() {
+            checked.awaiting_retry.remove(language);
+        }
+        due
     }
 
-    /// Whether any query repair failed in `generation`. Such a failure waits
-    /// for the next generation to be retried, so a configuration push must
-    /// not skip the reload that starts one.
-    pub(crate) fn has_failed_query_repairs(&self, generation: u64) -> bool {
-        let checked = self
+    /// Whether a failed query repair has not been checked again since. A
+    /// retry needs a new generation AND a pass over the document, which only
+    /// a reload that reparses provides, so a configuration push must not
+    /// skip that reload meanwhile.
+    pub(crate) fn has_query_repairs_awaiting_retry(&self) -> bool {
+        !self
             .query_dependency_checks
             .lock()
-            .recover_poison("AutoInstallManager::has_failed_query_repairs");
-        generation == checked.generation && !checked.failed.is_empty()
+            .recover_poison("AutoInstallManager::has_query_repairs_awaiting_retry")
+            .awaiting_retry
+            .is_empty()
     }
 
     /// Whether a repair of `language` already failed in `generation`, for a

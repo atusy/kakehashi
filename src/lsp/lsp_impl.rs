@@ -108,8 +108,9 @@ pub(super) struct ReloadLanguageState<'a> {
     documents: &'a DocumentStore,
     trigger: ReloadTrigger,
     /// The caller needs the language reload whatever a configuration
-    /// reload's skip check finds: a failed query repair is retried only in a
-    /// new generation, which only the reload starts.
+    /// reload's skip check finds: a failed query repair is retried only by a
+    /// pass over its document in a new generation, which only a reload that
+    /// reparses provides.
     reload_required: bool,
 }
 
@@ -764,9 +765,7 @@ impl Kakehashi {
                 parser_pool: &self.parser_pool,
                 documents: &self.documents,
                 trigger,
-                reload_required: self
-                    .auto_install
-                    .has_failed_query_repairs(self.cache.semantic_token_generation()),
+                reload_required: self.auto_install.has_query_repairs_awaiting_retry(),
             },
             &self.settings_manager,
             &self.cache,

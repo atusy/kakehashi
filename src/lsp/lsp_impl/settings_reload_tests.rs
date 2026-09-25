@@ -188,12 +188,13 @@ async fn identical_reload_still_reloads_while_a_query_repair_failure_waits() {
         .await;
 
     assert_full_reload_work(&outcome, &uri);
-    assert!(
-        !server
-            .auto_install
-            .has_failed_query_repairs(server.cache.semantic_token_generation()),
-        "the reload starts the generation the failed repair retries in"
-    );
+    // A post-install reload moves the generation without reparsing: the
+    // failure is no longer this generation's, yet nothing retried it.
+    server.cache.bump_semantic_token_generation();
+    let after_install = server
+        .apply_raw_settings(RawWorkspaceSettings::default(), baseline_settings())
+        .await;
+    assert_full_reload_work(&after_install, &uri);
     client.abort();
 }
 
