@@ -1174,15 +1174,16 @@ fn remove_parser_entry(path: &Path) -> std::io::Result<bool> {
 /// `queries/lua` is unusable but perfectly removable, so calling it an I/O
 /// error — as the shared helper does, correctly, for `status` — would leave
 /// `uninstall --all` failing on it forever while `uninstall lua` cleared it.
+///
+/// Every shape counts, because removal takes every shape: a regular file, FIFO
+/// or socket in the slot is unlinked like a symlink is. Skipping those here
+/// made `--all` blind to them while it reported the directory empty (#1006).
 fn query_entry_language_name(path: &Path) -> std::io::Result<Option<String>> {
     let Some(name) = safe_query_entry_name(path) else {
         return Ok(None);
     };
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            let file_type = metadata.file_type();
-            Ok((file_type.is_dir() || file_type.is_symlink()).then(|| name.to_string()))
-        }
+        Ok(_) => Ok(Some(name)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
