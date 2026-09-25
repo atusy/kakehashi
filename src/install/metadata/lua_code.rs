@@ -3,34 +3,48 @@
 //! The reader finds structure with brace counting and regexes, which only
 //! work if braces, quotes and keys inside string literals and comments are
 //! out of the way. [`LuaCode`] blanks those while keeping every byte offset,
-//! so a position found in the blanked text is valid in the source too.
+//! so a position found in the blanked text is valid in the source too, and
+//! keeps each string's decoded value for reading field values.
 
+use std::collections::HashMap;
 use std::ops::Range;
 
 use super::MetadataError;
 
 /// Lua source with comments and string contents blanked out.
-pub(super) struct LuaCode<'a> {
-    /// The original source.
-    pub(super) source: &'a str,
-    /// Same length as `source`. Comments and string contents are spaces,
+pub(super) struct LuaCode {
+    /// Same length as the source. Comments and string contents are spaces,
     /// newlines kept; string delimiters and all code are unchanged.
     pub(super) code: String,
+    /// Decoded value of each string literal, keyed by the offset of its
+    /// opening delimiter.
+    strings: HashMap<usize, String>,
 }
 
-impl<'a> LuaCode<'a> {
-    pub(super) fn new(source: &'a str) -> Result<Self, MetadataError> {
-        let blanked = blanked_ranges(source.as_bytes())?;
+impl LuaCode {
+    pub(super) fn new(source: &str) -> Result<Self, MetadataError> {
+        let Lexed { blanked, strings } = lex(source.as_bytes())?;
         Ok(Self {
-            source,
             code: blank(source, &blanked),
+            strings,
         })
+    }
+
+    /// The value of the string literal starting at `offset`, if one does.
+    pub(super) fn string_at(&self, offset: usize) -> Option<&str> {
+        self.strings.get(&offset).map(String::as_str)
     }
 }
 
-/// Byte ranges covering comments and string contents, in source order.
-fn blanked_ranges(b: &[u8]) -> Result<Vec<Range<usize>>, MetadataError> {
+struct Lexed {
+    /// Byte ranges covering comments and string contents, in source order.
+    blanked: Vec<Range<usize>>,
+    strings: HashMap<usize, String>,
+}
+
+fn lex(b: &[u8]) -> Result<Lexed, MetadataError> {
     let mut ranges = Vec::new();
+    let mut strings = HashMap::new();
     let mut i = 0;
     while i < b.len() {
         match b[i] {
@@ -52,6 +66,7 @@ fn blanked_ranges(b: &[u8]) -> Result<Vec<Range<usize>>, MetadataError> {
                 let close =
                     short_string_close(b, i + 1, quote).ok_or_else(|| unterminated("string", i))?;
                 ranges.push(i + 1..close);
+                strings.insert(i, decode_short_string(&b[i + 1..close]));
                 i = close + 1;
             }
             b'[' => {
@@ -60,6 +75,7 @@ fn blanked_ranges(b: &[u8]) -> Result<Vec<Range<usize>>, MetadataError> {
                     let close = long_bracket_close(b, open_end, level)
                         .ok_or_else(|| unterminated("string", i))?;
                     ranges.push(open_end..close);
+                    strings.insert(i, long_string_value(&b[open_end..close]));
                     i = close + level + 2;
                 } else {
                     i += 1;
@@ -68,7 +84,10 @@ fn blanked_ranges(b: &[u8]) -> Result<Vec<Range<usize>>, MetadataError> {
             _ => i += 1,
         }
     }
-    Ok(ranges)
+    Ok(Lexed {
+        blanked: ranges,
+        strings,
+    })
 }
 
 fn unterminated(what: &str, at: usize) -> MetadataError {
@@ -110,6 +129,107 @@ fn short_string_close(b: &[u8], from: usize, quote: u8) -> Option<usize> {
         }
     }
     None
+}
+
+/// Decode the escape sequences of a short string's contents, as Lua 5.4
+/// does. An escape Lua would reject is kept as written.
+fn decode_short_string(body: &[u8]) -> String {
+    let mut out = Vec::with_capacity(body.len());
+    let mut j = 0;
+    while j < body.len() {
+        if body[j] != b'\\' {
+            out.push(body[j]);
+            j += 1;
+            continue;
+        }
+        let Some(&c) = body.get(j + 1) else {
+            out.push(b'\\');
+            break;
+        };
+        j += 2;
+        match c {
+            b'a' => out.push(0x07),
+            b'b' => out.push(0x08),
+            b'f' => out.push(0x0c),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'v' => out.push(0x0b),
+            b'\\' | b'"' | b'\'' => out.push(c),
+            b'\n' | b'\r' => {
+                // An escaped line break is one newline, even as `\r\n`.
+                out.push(b'\n');
+                if body
+                    .get(j)
+                    .is_some_and(|&d| d != c && matches!(d, b'\n' | b'\r'))
+                {
+                    j += 1;
+                }
+            }
+            b'z' => {
+                while body.get(j).is_some_and(u8::is_ascii_whitespace) {
+                    j += 1;
+                }
+            }
+            b'x' => match body
+                .get(j..j + 2)
+                .and_then(|h| u8::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok())
+            {
+                Some(byte) => {
+                    out.push(byte);
+                    j += 2;
+                }
+                None => out.extend_from_slice(b"\\x"),
+            },
+            b'0'..=b'9' => {
+                let digits = 1 + body[j..]
+                    .iter()
+                    .take(2)
+                    .take_while(|d| d.is_ascii_digit())
+                    .count();
+                let start = j - 1;
+                match std::str::from_utf8(&body[start..start + digits])
+                    .ok()
+                    .and_then(|d| d.parse::<u8>().ok())
+                {
+                    Some(byte) => {
+                        out.push(byte);
+                        j = start + digits;
+                    }
+                    None => out.extend_from_slice(&[b'\\', c]),
+                }
+            }
+            b'u' => match unicode_escape(&body[j..]) {
+                Some((ch, len)) => {
+                    out.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
+                    j += len;
+                }
+                None => out.extend_from_slice(b"\\u"),
+            },
+            _ => out.extend_from_slice(&[b'\\', c]),
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Parse the `{XXX}` of a `\u{XXX}` escape, returning the character and
+/// the length of the braced part.
+fn unicode_escape(rest: &[u8]) -> Option<(char, usize)> {
+    let close = rest.strip_prefix(b"{")?.iter().position(|&c| c == b'}')?;
+    let hex = std::str::from_utf8(&rest[1..1 + close]).ok()?;
+    let ch = char::from_u32(u32::from_str_radix(hex, 16).ok()?)?;
+    Some((ch, close + 2))
+}
+
+/// A long string's value: its contents without a first line break.
+fn long_string_value(body: &[u8]) -> String {
+    let body = body
+        .strip_prefix(b"\r\n")
+        .or_else(|| body.strip_prefix(b"\n\r"))
+        .or_else(|| body.strip_prefix(b"\n"))
+        .or_else(|| body.strip_prefix(b"\r"))
+        .unwrap_or(body);
+    String::from_utf8_lossy(body).into_owned()
 }
 
 /// Copy `source`, replacing every character inside `ranges` except
