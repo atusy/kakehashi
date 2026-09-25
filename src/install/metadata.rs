@@ -757,6 +757,24 @@ sub dir]],
     }
 
     #[test]
+    fn numeric_escapes_take_only_hex_digits() {
+        let content = r"
+return {
+  lua = {
+    install_info = {
+      revision = '\x+f\u{+41}\u{41',
+      url = 'u',
+    },
+  },
+}
+";
+
+        let parsers = parse_parsers_lua(content).expect("should parse");
+
+        assert_eq!(parsers["lua"].revision, r"\x+f\u{+41}\u{41");
+    }
+
+    #[test]
     fn test_extract_parser_metadata() {
         let content = r#"
   rust = {
