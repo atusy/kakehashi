@@ -203,6 +203,12 @@
 //! - `workspace-folders-dynamic-late` — like `workspace-folders-dynamic`, but
 //!   registers on the first `textDocument/hover` this process receives, so a
 //!   test can let other roots divert before the capability appears.
+//! - `workspace-folders-static-id` — like `workspace-folders`, but declares
+//!   `changeNotifications` as the registration id `"workspace-folders"`
+//!   instead of `true` (#1117).
+//! - `workspace-folders-static-id-unregister` — like
+//!   `workspace-folders-static-id`, then withdraws that id via
+//!   `client/unregisterCapability` on `initialized` (#1117).
 //!
 //! `--stamp-resolve-process` tags completion/action data and resolved output with
 //! the process ID; `--reject-old-resolve` rejects data from another process.
@@ -531,6 +537,20 @@ fn main() {
                             }
                         })
                     }
+                    // Declares folder-change support under a registration id,
+                    // which LSP 3.18 lets the server unregister later (#1117).
+                    "workspace-folders-static-id" | "workspace-folders-static-id-unregister" => {
+                        json!({
+                            "hoverProvider": true,
+                            "textDocumentSync": 1,
+                            "workspace": {
+                                "workspaceFolders": {
+                                    "supported": true,
+                                    "changeNotifications": "workspace-folders"
+                                }
+                            }
+                        })
+                    }
                     // Declares `supported` but NOT `changeNotifications`:
                     // folder-change support arrives later, via a dynamic
                     // registration sent on `initialized` (#968).
@@ -589,6 +609,21 @@ fn main() {
                     "client/registerCapability",
                     json!({
                         "registrations": [{
+                            "id": "workspace-folders",
+                            "method": "workspace/didChangeWorkspaceFolders"
+                        }]
+                    }),
+                );
+            }
+            "initialized" if mode == "workspace-folders-static-id-unregister" => {
+                // Withdraw the folder-change support declared statically
+                // under this id (#1117).
+                request_with_params(
+                    &mut writer,
+                    json!("unregister-workspace-folders"),
+                    "client/unregisterCapability",
+                    json!({
+                        "unregisterations": [{
                             "id": "workspace-folders",
                             "method": "workspace/didChangeWorkspaceFolders"
                         }]

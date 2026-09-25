@@ -339,6 +339,34 @@ fn e2e_client_folder_change_is_forwarded_to_a_dynamically_registering_server() {
     );
 }
 
+/// A `changeNotifications` registration id declares folder-change support as
+/// `true` does: the fallback takes the client's folder change as a
+/// notification (#1117). The control for the unregistration case below — it
+/// fails if the id is not counted at all.
+#[test]
+fn e2e_client_folder_change_is_forwarded_under_a_static_registration_id() {
+    let (before, after) = hover_around_client_folder_change("workspace-folders-static-id");
+    assert_eq!(
+        hover_pid(&after),
+        hover_pid(&before),
+        "the folder change must be forwarded, not answered with a restart"
+    );
+}
+
+/// Unregistering the `changeNotifications` id withdraws folder-change support
+/// (LSP 3.18, #1117): the fallback no longer takes the client's folder change
+/// as a notification and is recycled onto the new workspace instead.
+#[test]
+fn e2e_unregistered_static_registration_id_recycles_on_client_folder_change() {
+    let (before, after) =
+        hover_around_client_folder_change("workspace-folders-static-id-unregister");
+    assert_ne!(
+        hover_pid(&after),
+        hover_pid(&before),
+        "a server that unregistered folder changes must be recycled, not notified"
+    );
+}
+
 /// A root diverted to its own process while the shared instance had not yet
 /// registered folder-change support is consolidated once it does (#968): the
 /// diverted process is shut down rather than left serving a root the shared
