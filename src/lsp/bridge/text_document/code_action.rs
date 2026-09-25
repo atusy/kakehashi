@@ -33,7 +33,8 @@ use tower_lsp_server::ls_types::{
 use url::Url;
 
 use super::super::pool::{
-    ConnectionHandle, ConnectionKey, ConnectionState, LanguageServerPool, UpstreamId,
+    ConnectionHandle, ConnectionKey, ConnectionState, LanguageServerPool, ResolveDocument,
+    UpstreamId,
 };
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, encode_command,
@@ -756,19 +757,6 @@ impl LanguageServerPool {
                 return action;
             }
         };
-        // A replaced host server gets the host document back only from the
-        // asynchronous re-open; until then the enqueue below finds it not open
-        // and fails. Wait for that re-open (bounded; a no-op when none is in
-        // flight) before taking any host lock.
-        if !self.wait_for_pending_reopen(handle.key()).await {
-            warn!(
-                target: "kakehashi::bridge",
-                "codeAction/resolve (host): {server_name:?} is still re-opening its documents; \
-                 returning unresolved"
-            );
-            re_envelope_action(&mut action, &envelope);
-            return action;
-        }
         if !handle.has_capability("codeAction/resolve") {
             // Anomalous: the envelope was only minted because the origin
             // advertised resolve, so reaching here means a respawn changed
@@ -782,6 +770,20 @@ impl LanguageServerPool {
                  returning unresolved",
                 envelope.origin
             );
+            re_envelope_action(&mut action, &envelope);
+            return action;
+        }
+        // A replaced host server gets the host document back only from the
+        // asynchronous re-open; until then the enqueue below finds it not open
+        // and fails. Checked before taking any host lock.
+        if !self
+            .resolve_document_ready(
+                "codeAction/resolve (host)",
+                handle.key(),
+                ResolveDocument::Host(&host_url),
+            )
+            .await
+        {
             re_envelope_action(&mut action, &envelope);
             return action;
         }
@@ -884,20 +886,6 @@ impl LanguageServerPool {
                 return action;
             }
         };
-        // A just-replaced origin re-opens its virtual documents asynchronously
-        // after `Ready`, and the outbound queue is FIFO: sending now could hand
-        // the downstream a resolve for a document it has not opened yet. Wait
-        // for that re-open (bounded; a no-op when none is in flight), and fail
-        // soft rather than send without the ordering guarantee.
-        if !self.wait_for_pending_reopen(handle.key()).await {
-            warn!(
-                target: "kakehashi::bridge",
-                "codeAction/resolve: {server_name:?} is still re-opening its documents; \
-                 returning unresolved rather than resolving out of order"
-            );
-            re_envelope_action(&mut action, &envelope);
-            return action;
-        }
         if !handle.has_capability("codeAction/resolve") {
             // Anomalous: the envelope was only minted because the origin
             // advertised resolve, so reaching here means a respawn changed
@@ -913,9 +901,32 @@ impl LanguageServerPool {
             re_envelope_action(&mut action, &envelope);
             return action;
         }
+        // A just-replaced origin re-opens its virtual documents asynchronously
+        // after `Ready`, and the outbound queue is FIFO: sending before the
+        // re-open could hand the downstream a resolve for a document it has not
+        // opened, and nothing downstream of here checks that it is open.
+        let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(&host_url) else {
+            re_envelope_action(&mut action, &envelope);
+            return action;
+        };
+        let virtual_uri = VirtualDocumentUri::new(
+            &host_uri_lsp,
+            &envelope.injection_language,
+            &envelope.region_id,
+        );
+        if !self
+            .resolve_document_ready(
+                "codeAction/resolve",
+                handle.key(),
+                ResolveDocument::Virtual(&virtual_uri),
+            )
+            .await
+        {
+            re_envelope_action(&mut action, &envelope);
+            return action;
+        }
 
         let offset = RegionOffset::from(&envelope.offset);
-        let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(&host_url).ok();
 
         // Forward with the ORIGINAL (unsuffixed) title restored and any
         // client-supplied ranges translated back to virtual coordinates. Keep
@@ -945,7 +956,7 @@ impl LanguageServerPool {
             envelope,
             &offset,
             region_end,
-            host_uri_lsp.as_ref(),
+            Some(&host_uri_lsp),
             suffixed_title,
             upstream_caps,
             handle.key(),
