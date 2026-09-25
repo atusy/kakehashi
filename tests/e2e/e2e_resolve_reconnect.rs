@@ -2,6 +2,7 @@
 
 use crate::helpers::lsp_client::LspClient;
 use crate::helpers::lua_bridge::shutdown_client;
+use crate::helpers::wire_log::replacement_segment;
 use serde_json::{Value, json};
 
 const URI: &str = "file:///producer_resolve.md";
@@ -188,16 +189,6 @@ fn assert_resolved(response: &Value, completion: bool, new_pid: u64, data_pid: u
         actual,
         format!("resolved-pid:{new_pid};data-pid:{data_pid}")
     );
-}
-
-/// Split the mock's wire log at the replacement's `initialize`.
-fn replacement_segment(wire: &str) -> Vec<&str> {
-    let lines: Vec<&str> = wire.lines().collect();
-    let last_init = lines
-        .iter()
-        .rposition(|l| l.split('\t').next() == Some("initialize"))
-        .unwrap_or_else(|| panic!("no initialize in the wire log:\n{wire}"));
-    lines[last_init..].to_vec()
 }
 
 /// A carried virtual action resolved right after its server was replaced must
