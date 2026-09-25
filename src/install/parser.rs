@@ -2031,6 +2031,34 @@ mod tests {
     }
 
     #[test]
+    fn failed_publication_preserves_the_previous_parser() {
+        let temp = tempdir().expect("temp dir");
+        let staged = fake_staged_parser(temp.path(), "lua");
+        let parser_file = staged.parser_file.clone();
+        fs::write(&parser_file, b"previous parser").expect("write previous parser");
+        // Force the publication rename to fail after Windows has displaced the
+        // existing regular file. A directory blocker never enters that branch.
+        fs::remove_file(&staged.tmp_file).expect("remove staged parser");
+
+        let error = staged.publish().expect_err("publication must fail");
+
+        assert!(matches!(error, ParserInstallError::IoError(_)));
+        assert_eq!(
+            fs::read(&parser_file).expect("previous parser must remain installed"),
+            b"previous parser"
+        );
+        let entries: Vec<_> = fs::read_dir(parser_file.parent().unwrap())
+            .expect("read parser directory")
+            .map(|entry| entry.expect("read directory entry").path())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![parser_file],
+            "rollback must reclaim its backup"
+        );
+    }
+
+    #[test]
     fn test_github_archive_url_from_standard_repo() {
         let url = github_archive_url("https://github.com/tree-sitter/tree-sitter-json", "v0.24.8");
         assert_eq!(url, Some(TREE_SITTER_JSON_URL.to_string()));
