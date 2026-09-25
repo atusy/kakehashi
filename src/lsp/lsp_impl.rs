@@ -182,6 +182,10 @@ impl ReloadTrigger {
 ///   missing when the document opened) is not retried by an identical push;
 ///   the next edit's reparse or the next request that acquires the server
 ///   retries it (#1144).
+/// - A document whose `workspaceMarkers` root moved on disk (a nearer marker
+///   file appeared or went away) is not re-rooted onto the matching bridge
+///   connection by an identical push; the next edit's reparse, any settings
+///   change or a workspace-folder change re-roots it (#1145).
 async fn configuration_reload_needed(
     language: &std::sync::Arc<LanguageCoordinator>,
     cache: &CacheCoordinator,
