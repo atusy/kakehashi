@@ -170,6 +170,18 @@ impl ReloadTrigger {
 /// reopen, a diagnostic computed under the old settings) that only the
 /// reload's reparse repairs. Only an equal push can skip without leaving
 /// such work stranded.
+///
+/// # Known limits
+///
+/// The full reload also acted as a blanket retry for work that failed
+/// earlier, and a skip retries only what this check can see pending (query
+/// repairs waiting for a retry, parser and query files that changed or are
+/// broken, loads in flight). Not covered:
+///
+/// - A bridge server whose eager open failed (say, its executable was
+///   missing when the document opened) is not retried by an identical push;
+///   the next edit's reparse or the next request that acquires the server
+///   retries it (#1144).
 async fn configuration_reload_needed(
     language: &std::sync::Arc<LanguageCoordinator>,
     cache: &CacheCoordinator,
