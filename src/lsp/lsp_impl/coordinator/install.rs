@@ -19,6 +19,14 @@ use tower_lsp_server::Client;
 use super::ParseCoordinator;
 use super::parse::ParseCoordinatorDeps;
 
+/// A query-dependency check that is due: the generation it was recorded in,
+/// and the repair-failure revision its answer is judged against.
+#[derive(Clone, Copy)]
+struct QueryRepairCheck {
+    generation: u64,
+    failure_revision: u64,
+}
+
 fn query_dependency_paths(settings: &WorkspaceSettings, language: &str) -> Vec<std::path::PathBuf> {
     // The loader returns after loading an explicit list (including an empty
     // one), so runtime files for this root language are not dependency inputs.
@@ -301,7 +309,7 @@ impl InstallCoordinator {
     /// reads modelines across every search path, so it runs on the blocking
     /// pool rather than on an async worker.
     pub(crate) async fn query_repair_needed(&self, language: &str, initial_pass: bool) -> bool {
-        let Some(generation) = self.begin_query_repair_check(language, initial_pass) else {
+        let Some(check) = self.begin_query_repair_check(language, initial_pass) else {
             return false;
         };
         let settings = self.settings_manager.load_settings();
@@ -321,7 +329,7 @@ impl InstallCoordinator {
             );
             QueryChainState::Settled
         });
-        self.finish_query_repair_check(language, generation, state)
+        self.finish_query_repair_check(language, check, state)
     }
 
     #[cfg(test)]
@@ -332,11 +340,15 @@ impl InstallCoordinator {
         probe: impl FnOnce() -> QueryChainState,
     ) -> bool {
         self.begin_query_repair_check(language, initial_pass)
-            .is_some_and(|generation| self.finish_query_repair_check(language, generation, probe()))
+            .is_some_and(|check| self.finish_query_repair_check(language, check, probe()))
     }
 
     /// The generation to probe in, or `None` when no probe is due.
-    fn begin_query_repair_check(&self, language: &str, initial_pass: bool) -> Option<u64> {
+    fn begin_query_repair_check(
+        &self,
+        language: &str,
+        initial_pass: bool,
+    ) -> Option<QueryRepairCheck> {
         // Discovery may already have loaded the parser before this task runs.
         // Track checks independently of load events; reload generations reset
         // eligibility while steady-state edits do no dependency filesystem
@@ -350,11 +362,17 @@ impl InstallCoordinator {
         // while auto-install is off is harmless; enabling it is a settings
         // change, which starts a new generation.
         let generation = self.cache.semantic_token_generation();
+        // Read before the check is recorded: a failure landing after this is
+        // newer than whatever the probe answers.
+        let failure_revision = self.auto_install.query_repair_revision();
         (self
             .auto_install
             .begin_query_dependency_check(language, generation, initial_pass)
             && self.settings_manager.is_auto_install_enabled(language))
-        .then_some(generation)
+        .then_some(QueryRepairCheck {
+            generation,
+            failure_revision,
+        })
     }
 
     /// A repair a pass decided on but dropped before installing, because its
@@ -363,12 +381,13 @@ impl InstallCoordinator {
     fn release_dropped_repair(&self, language: &str, generation: u64) {
         self.auto_install
             .forget_query_dependency_check(language, generation);
+        self.auto_install.defer_query_repair_retry(language);
     }
 
     fn finish_query_repair_check(
         &self,
         language: &str,
-        generation: u64,
+        check: QueryRepairCheck,
         state: QueryChainState,
     ) -> bool {
         // Probes run concurrently; a repair that failed while this one read
@@ -384,13 +403,15 @@ impl InstallCoordinator {
             QueryChainState::NeedsRepair => {
                 let admitted = !failed_meanwhile();
                 if admitted {
-                    self.auto_install.resolve_query_repair_retry(language);
+                    self.auto_install
+                        .resolve_query_repair_retry(language, check.failure_revision);
                 }
                 admitted
             }
             QueryChainState::Settled => {
                 if !failed_meanwhile() {
-                    self.auto_install.resolve_query_repair_retry(language);
+                    self.auto_install
+                        .resolve_query_repair_retry(language, check.failure_revision);
                 }
                 false
             }
@@ -400,7 +421,7 @@ impl InstallCoordinator {
             // nothing to do and still reload every document's queries.
             QueryChainState::Busy => {
                 self.auto_install
-                    .forget_query_dependency_check(language, generation);
+                    .forget_query_dependency_check(language, check.generation);
                 false
             }
         }

@@ -184,6 +184,9 @@ struct QueryDependencyChecks {
     /// because a generation that reparses nothing (a post-install reload)
     /// retries nothing.
     awaiting_retry: HashSet<String>,
+    /// Bumped by every recorded failure: a check's answer ends a wait only
+    /// when no failure landed since the check began.
+    failure_revision: u64,
 }
 
 impl QueryDependencyChecks {
@@ -299,6 +302,7 @@ impl AutoInstallManager {
             checked.failed.insert(language.to_string());
             checked.awaiting_retry.insert(language.to_string());
         }
+        checked.failure_revision += 1;
     }
 
     /// Whether a query dependency check of `language` is due in `generation`,
@@ -331,14 +335,37 @@ impl AutoInstallManager {
     /// chain is settled, or a repair is about to be attempted (whose failure
     /// records itself again). Only then is a failed repair no longer waiting
     /// for a retry; a busy, dropped or overruled probe leaves it waiting.
-    pub(crate) fn resolve_query_repair_retry(&self, language: &str) {
+    ///
+    /// `revision` is [`Self::query_repair_revision`] from before the check
+    /// began; a failure recorded since then (in any generation) is newer
+    /// than the answer, so the wait stands.
+    pub(crate) fn resolve_query_repair_retry(&self, language: &str, revision: u64) {
         let mut checked = self
             .query_dependency_checks
             .lock()
             .recover_poison("AutoInstallManager::resolve_query_repair_retry");
-        if !checked.awaiting_retry.is_empty() {
+        if checked.failure_revision == revision && !checked.awaiting_retry.is_empty() {
             checked.awaiting_retry.remove(language);
         }
+    }
+
+    /// The failure revision a check starting now answers against; see
+    /// [`Self::resolve_query_repair_retry`].
+    pub(crate) fn query_repair_revision(&self) -> u64 {
+        self.query_dependency_checks
+            .lock()
+            .recover_poison("AutoInstallManager::query_repair_revision")
+            .failure_revision
+    }
+
+    /// A repair judged needed that never ran (its document went away before
+    /// the install started) is work still waiting for a retry.
+    pub(crate) fn defer_query_repair_retry(&self, language: &str) {
+        self.query_dependency_checks
+            .lock()
+            .recover_poison("AutoInstallManager::defer_query_repair_retry")
+            .awaiting_retry
+            .insert(language.to_string());
     }
 
     /// Whether a failed query repair has not been answered for since. A
@@ -1071,8 +1098,19 @@ mod tests {
             "a probe that began and was forgotten answered nothing"
         );
 
-        manager.resolve_query_repair_retry("lua");
+        // An answer from a check that began before a newer failure does not
+        // end the newer failure's wait.
+        let revision = manager.query_repair_revision();
+        manager.record_query_repair_failure("lua", 12);
+        manager.resolve_query_repair_retry("lua", revision);
+        assert!(manager.has_query_repairs_awaiting_retry());
+
+        manager.resolve_query_repair_retry("lua", manager.query_repair_revision());
         assert!(!manager.has_query_repairs_awaiting_retry());
+
+        // A repair judged needed but dropped before it ran still waits.
+        manager.defer_query_repair_retry("python");
+        assert!(manager.has_query_repairs_awaiting_retry());
     }
 
     #[test]
