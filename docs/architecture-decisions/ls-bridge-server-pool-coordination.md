@@ -100,10 +100,10 @@ second process whose session-wide state (e.g. a completion corpus over every
 open document) never meets the shared instance's. Root-JOINING is honored only when the downstream server advertises
 `workspace.workspaceFolders.{supported, changeNotifications: true}` or has a
 live registration of `workspace/didChangeWorkspaceFolders` — a dynamic
-`client/registerCapability`, or a string `changeNotifications`, which LSP 3.18
-makes a registration id the server can later unregister, so the handshake
-records it in the registry before `initialized` (#1117)
-(`ConnectionHandle::supports_workspace_folder_changes`); the acquire path
+`client/registerCapability`, or a string `changeNotifications` id, which the
+handshake records before `initialized` because LSP 3.18 lets the server
+unregister it (#1117) — (`ConnectionHandle::supports_workspace_folder_changes`);
+the acquire path
 (`resolve_acquire`) checks the existing shared connection's capability and, if
 it is `Ready` but incapable, logs once and falls back to the per-root key — so a
 misconfigured opt-in degrades to per-root instances rather than wedging the
