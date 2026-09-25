@@ -113,21 +113,8 @@ mod tests {
     use super::*;
     use crate::lsp::bridge::actor::{ResponseRouter, spawn_reader_task};
     use crate::lsp::bridge::connection::AsyncBridgeConnection;
-
-    /// A handle whose downstream swallows every message.
-    async fn sink_handle() -> ConnectionHandle {
-        let mut connection = AsyncBridgeConnection::spawn(vec![
-            "sh".to_string(),
-            "-c".to_string(),
-            "cat > /dev/null".to_string(),
-        ])
-        .await
-        .unwrap();
-        let (writer, reader) = connection.split();
-        let router = Arc::new(ResponseRouter::new());
-        let reader_handle = spawn_reader_task(reader, Arc::clone(&router));
-        ConnectionHandle::new(writer, router, reader_handle)
-    }
+    use crate::lsp::bridge::pool::ConnectionState;
+    use crate::lsp::bridge::pool::test_helpers::create_handle_with_state;
 
     #[tokio::test]
     async fn recovered_capabilities_complete_the_handshake() {
@@ -197,7 +184,7 @@ mod tests {
     async fn static_change_notifications_id_can_be_unregistered() {
         use tower_lsp_server::ls_types::Unregistration;
 
-        let handle = sink_handle().await;
+        let handle = create_handle_with_state(ConnectionState::Initializing).await;
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         response_tx
             .send(serde_json::json!({
