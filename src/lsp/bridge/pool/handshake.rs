@@ -26,9 +26,10 @@ use crate::lsp::bridge::protocol::{
 };
 
 /// Send `initialize`, await the response, record a `changeNotifications` id as
-/// a registration, send `initialized`, return the typed `ServerCapabilities`. Invoked by `get_or_create_connection_with_timeout`
-/// once the connection has spawned and the reader task is up; goes through
-/// the single-writer channel (ls-bridge-message-ordering) for FIFO ordering.
+/// a registration, send `initialized`, return the typed `ServerCapabilities`.
+/// Invoked by `get_or_create_connection_with_timeout` once the connection has
+/// spawned and the reader task is up; goes through the single-writer channel
+/// (ls-bridge-message-ordering) for FIFO ordering.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn perform_lsp_handshake(
     handle: &ConnectionHandle,
