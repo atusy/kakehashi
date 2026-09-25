@@ -1196,6 +1196,9 @@ impl LanguageServer for Kakehashi {
 mod discovery_lifecycle_tests;
 
 #[cfg(test)]
+mod settings_reload_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::lsp::auto_install::InstallingLanguagesExt;
