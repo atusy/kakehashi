@@ -151,6 +151,9 @@ rstest = "0.27"
 # binaries (e.g. HEAD vs origin/main). Custom harness (no criterion): it drives
 # the compiled `kakehashi` binary over LSP, so it benchmarks the real process
 # without needing access to pub(crate) internals. See benches/semantic_tokens.rs.
+# Gated on the e2e feature because the harness installs parsers through
+# install::test_support, which only exists in test and e2e builds.
 [[bench]]
 name = "semantic_tokens"
 harness = false
+required-features = ["e2e"]
