@@ -139,11 +139,12 @@ pub(crate) struct LanguageCoordinator {
 }
 
 /// Counts one on-demand load in [`LanguageCoordinator::dynamic_loads_in_flight`]
-/// for as long as it lives.
+/// for as long as it lives, from before it reads its files through
+/// publishing the parser and queries, or recording the failure.
 ///
-/// Such a load may have read a query before it was edited and publish it
-/// after a reload trial compared the registrations: without a settings
-/// reload bumping the generation, nothing would reject that stale
+/// Such a load may have read its files before they changed and publish
+/// what it read after a reload trial compared the registrations: without a
+/// settings reload bumping the generation, nothing would reject that stale
 /// publication, so the trial must not call the files unchanged meanwhile.
 struct DynamicLoadInFlight<'a>(&'a std::sync::atomic::AtomicUsize);
 
@@ -246,6 +247,9 @@ impl LanguageCoordinator {
             if let Some(result) = self.cached_load_verdict(language_id, current_generation) {
                 return result;
             }
+            // Through the failure record below: a recorded failure is a
+            // publication as much as a registration is.
+            let _in_flight = DynamicLoadInFlight::begin(&self.dynamic_loads_in_flight);
             let result = self.try_load_language_by_id(language_id, current_generation);
             if self
                 .load_generation
@@ -400,6 +404,11 @@ impl LanguageCoordinator {
                         let coordinator = Arc::clone(self);
                         let owned_id = language_id.to_string();
                         let result = tokio::task::spawn_blocking(move || {
+                            // Through the failure record below: a recorded
+                            // failure is a publication as much as a
+                            // registration is.
+                            let _in_flight =
+                                DynamicLoadInFlight::begin(&coordinator.dynamic_loads_in_flight);
                             let result = coordinator
                                 .try_load_language_by_id(&owned_id, current_generation);
                             // Record the failure INSIDE the blocking task so a
@@ -1076,7 +1085,6 @@ impl LanguageCoordinator {
         language_id: &str,
         current_generation: u64,
     ) -> LanguageLoadResult {
-        let _in_flight = DynamicLoadInFlight::begin(&self.dynamic_loads_in_flight);
         let search_paths = self.config_store.search_paths();
         if search_paths.is_empty() {
             return LanguageLoadResult::failure_with(LanguageEvent::log(
