@@ -135,9 +135,8 @@ pub(super) enum ReloadTrigger {
     WorkspaceFolders,
     /// A `workspace/didChangeConfiguration` push or a `workspace/configuration`
     /// pull. Skips the language reload altogether when it would change
-    /// nothing: no setting documents depend on changed
-    /// ([`settings_affect_documents`]) and no parser or query file it would
-    /// re-read changed on disk ([`configuration_reload_needed`]).
+    /// nothing: the effective settings are equal and no parser or query file
+    /// it would re-read changed on disk ([`configuration_reload_needed`]).
     Configuration,
 }
 
@@ -157,57 +156,27 @@ impl ReloadTrigger {
     }
 }
 
-/// Whether moving from `previous` to `next` can change what open documents
-/// are parsed, highlighted or processed with, so the language reload and its
-/// follow-ups must run.
-///
-/// The follow-ups are wider than trees: the reparse loop re-runs injection
-/// processing (eager virtual-document opens on bridge servers,
-/// injected-language auto-install) and reschedules diagnostics, and the
-/// semantic-token generation bump is what makes new capture mappings reach
-/// the client, so everything those read counts.
-fn settings_affect_documents(previous: &WorkspaceSettings, next: &WorkspaceSettings) -> bool {
-    // Exhaustive on purpose: a new field fails to compile here until it is
-    // classified. When in doubt, it affects documents.
-    let WorkspaceSettings {
-        // Parser/query discovery, and where a failed load may now succeed.
-        search_paths,
-        // Parsers, queries, bases, bridge filters, layers and per-language
-        // auto-install: all read by parsing or the injection pass.
-        languages,
-        // Read by every semantic-tokens computation.
-        capture_mappings,
-        // Whether the injection pass installs a missing injected language.
-        auto_install,
-        // Which servers the injection pass opens virtual documents on.
-        language_servers,
-        // Diagnostic timing and log-level policy: applied by every settings
-        // application, reload or not, and read when diagnostics are scheduled or logs
-        // filtered, never by a parse, query or token.
-        diagnostics_debounce_ms: _,
-        features: _,
-    } = previous;
-    *search_paths != next.search_paths
-        || *languages != next.languages
-        || *capture_mappings != next.capture_mappings
-        || *auto_install != next.auto_install
-        || *language_servers != next.language_servers
-}
-
 /// Whether a configuration reload to `settings` must run the language
-/// reload: the settings changed something documents depend on, or query or
-/// parser files it would re-read changed on disk — the languages' own, or a
+/// reload: the effective settings changed at all, or query or parser files
+/// it would re-read changed on disk — the languages' own, or a
 /// `kakehashi/captures` kind query compiled under the current generation,
 /// which only the reload's generation bump would otherwise invalidate. The
 /// disk checks run on the blocking pool and never touch the live
 /// coordinator; if they cannot finish, reload.
+///
+/// Any settings change counts, even one no parse or token reads (diagnostic
+/// timing, the log level): publishing changed settings advances the
+/// settings generation, which fences in-flight work (a host document's
+/// reopen, a diagnostic computed under the old settings) that only the
+/// reload's reparse repairs. Only an equal push can skip without leaving
+/// such work stranded.
 async fn configuration_reload_needed(
     language: &std::sync::Arc<LanguageCoordinator>,
     cache: &CacheCoordinator,
     previous: &WorkspaceSettings,
     settings: &WorkspaceSettings,
 ) -> bool {
-    if settings_affect_documents(previous, settings) {
+    if previous != settings {
         return true;
     }
     let language = std::sync::Arc::clone(language);
@@ -378,9 +347,16 @@ pub(super) async fn apply_shared_settings_locked(
     // Publish the settings snapshot before invalidating downstream connections:
     // once propagation exposes a pool miss, a concurrent request must resolve
     // the NEW launch config rather than respawn from the old snapshot (#587).
-    match raw_settings {
-        Some(raw_settings) => settings_manager.apply_settings_with_raw(raw_settings, settings),
-        None => settings_manager.apply_settings(settings),
+    // A skipped reload has equal effective settings: keep their generation,
+    // which would otherwise fence in-flight work with nothing to repair it,
+    // and store only the raw layer the next merge accumulates onto.
+    match (raw_settings, reload_languages) {
+        (Some(raw_settings), true) => {
+            settings_manager.apply_settings_with_raw(raw_settings, settings)
+        }
+        (None, true) => settings_manager.apply_settings(settings),
+        (Some(raw_settings), false) => settings_manager.store_equivalent_raw_settings(raw_settings),
+        (None, false) => {}
     }
     let settings = settings_manager.load_settings();
     // Update the reader-side copy before propagating downstream settings so a

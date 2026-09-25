@@ -1,8 +1,8 @@
 //! What a `workspace/didChangeConfiguration` reload asks of the open documents
 //! and the client: a full reparse (which also re-drives injection processing,
 //! eager bridge opens and diagnostics) and a `semanticTokens/refresh` are paid
-//! only when something they depend on changed — a parse-relevant setting, or
-//! the parser/query files a reload actually read.
+//! only when something changed — the effective settings, or the parser and
+//! query files a reload would re-read.
 
 use super::*;
 use crate::config::settings::{LanguageSettings, LogMessageLevel, QueryTypeMappings};
@@ -63,24 +63,26 @@ async fn wait_for_tree(server: &Kakehashi, uri: &Url) {
     .expect("the opened document must get a current tree");
 }
 
-/// The semantic-token and settings-load generations.
-fn generations(server: &Kakehashi) -> (u64, u64) {
+/// The semantic-token, settings-load and settings-snapshot generations.
+fn generations(server: &Kakehashi) -> (u64, u64, u64) {
     (
         server.cache.semantic_token_generation(),
         server.language.load_generation(),
+        server.settings_manager.settings_generation(),
     )
 }
 
 /// Nothing observable happened to the documents: no reparse, no refresh,
 /// and — because the reload itself is what disturbs them — neither
 /// generation moved: a token-generation bump nulls in-flight token requests
-/// and stales every stored injection region, and a load-generation bump
-/// makes every registration read as stale while the load re-reads it.
+/// and stales every stored injection region, a load-generation bump makes
+/// every registration read as stale while the load re-reads it, and a
+/// settings-generation bump fences in-flight work such as a host reopen.
 fn assert_no_reload_work(
     outcome: &SettingsReloadOutcome,
     server: &Kakehashi,
     uri: &Url,
-    generations_before: (u64, u64),
+    generations_before: (u64, u64, u64),
 ) {
     assert_eq!(
         generations(server),
@@ -118,8 +120,11 @@ fn assert_full_reload_work(outcome: &SettingsReloadOutcome, uri: &Url) {
     );
 }
 
+/// Diagnostic timing and the log level feed no parse or token, but
+/// publishing them advances the settings generation, which fences in-flight
+/// work (a host document's reopen) that only the reparse repairs.
 #[tokio::test]
-async fn reload_changing_only_diagnostic_and_log_policy_neither_reparses_nor_refreshes() {
+async fn reload_changing_only_diagnostic_and_log_policy_still_reloads() {
     let (service, client) = server_with_builtin_rust();
     let server = service.inner();
     server
@@ -127,7 +132,6 @@ async fn reload_changing_only_diagnostic_and_log_policy_neither_reparses_nor_ref
         .await;
     let uri = open_and_wait_for_tree(server, "irrelevant.rs", "rust").await;
 
-    let generation = generations(server);
     let mut next = baseline_settings();
     next.diagnostics_debounce_ms += 250;
     next.features.window_log_message = LogMessageLevel::Warning;
@@ -137,7 +141,9 @@ async fn reload_changing_only_diagnostic_and_log_policy_neither_reparses_nor_ref
         .apply_raw_settings(RawWorkspaceSettings::default(), next)
         .await;
 
-    assert_no_reload_work(&outcome, server, &uri, generation);
+    // Publishing changed settings advances the settings generation, which
+    // fences in-flight work only the reparse repairs.
+    assert_full_reload_work(&outcome, &uri);
     // Sanity: the settings themselves were applied.
     assert_eq!(
         server
@@ -467,58 +473,6 @@ async fn identical_reload_with_a_derived_language_neither_reparses_nor_refreshes
 
     assert_no_reload_work(&outcome, server, &uri, generation);
     client.abort();
-}
-
-#[test]
-fn settings_affect_documents_classifies_each_field() {
-    let base = baseline_settings();
-    assert!(!settings_affect_documents(&base, &base.clone()));
-    type Flip = (&'static str, fn(&mut WorkspaceSettings), bool);
-    let flips: [Flip; 7] = [
-        ("search_paths", |s| s.search_paths.push("/new".into()), true),
-        (
-            "languages",
-            |s| {
-                s.languages.insert("x".into(), LanguageSettings::default());
-            },
-            true,
-        ),
-        (
-            "capture_mappings",
-            |s| {
-                s.capture_mappings
-                    .insert("x".into(), QueryTypeMappings::default());
-            },
-            true,
-        ),
-        ("auto_install", |s| s.auto_install = !s.auto_install, true),
-        (
-            "language_servers",
-            |s| {
-                s.language_servers.insert("x".into(), Default::default());
-            },
-            true,
-        ),
-        (
-            "diagnostics_debounce_ms",
-            |s| s.diagnostics_debounce_ms += 1,
-            false,
-        ),
-        (
-            "features",
-            |s| s.features.window_log_message = LogMessageLevel::Off,
-            false,
-        ),
-    ];
-    for (field, flip, affects) in flips {
-        let mut next = base.clone();
-        flip(&mut next);
-        assert_eq!(
-            settings_affect_documents(&base, &next),
-            affects,
-            "changing `{field}`"
-        );
-    }
 }
 
 /// `kakehashi/textDocument/captures` compiles kind files straight from the
