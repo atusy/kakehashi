@@ -516,21 +516,22 @@ impl LanguageCoordinator {
     ///
     /// Runs the whole reload on a scratch copy sharing only the grammar and
     /// compiled-query caches: every parser and query file is re-read, for the
-    /// configured languages and for the languages loaded or attempted on
-    /// demand since the last load. The live registrations, generation and
-    /// caches stay as they are, so a caller that finds nothing changed can
-    /// skip the reload entirely. Blocking: reads files and compiles queries.
+    /// configured languages and for every language loaded or attempted on
+    /// demand. The live registrations, generation and query store stay as
+    /// they are, so a caller that finds nothing changed can skip the reload
+    /// entirely. Blocking: reads files and compiles queries.
     pub(crate) fn reload_would_change_languages(&self, settings: &WorkspaceSettings) -> bool {
         // Snapshot before the trial: the held `Arc`s keep every currently
         // published query interned, so an unchanged re-read resolves to it.
-        let generation = self
-            .load_generation
-            .load(std::sync::atomic::Ordering::Acquire);
-        let current = self.language_state(generation);
+        // Every registration and every recorded failure counts, whatever
+        // generation tagged it: a reload that invalidates no parse (the
+        // post-install one) leaves languages that open documents still use
+        // tagged with an older generation, and their re-read is as much this
+        // reload's job as a current one's.
+        let current = self.language_state(None);
         let failed: Vec<String> = self
             .failed_loads
             .iter()
-            .filter(|entry| *entry.value() == generation)
             .map(|entry| entry.key().clone())
             .collect();
 
@@ -546,7 +547,7 @@ impl LanguageCoordinator {
                 let _ = scratch.ensure_language_loaded(language_id);
             }
         }
-        current != scratch.language_state(scratch_generation)
+        current != scratch.language_state(Some(scratch_generation))
     }
 
     /// A fresh coordinator sharing this one's grammar and compiled-query
@@ -582,13 +583,18 @@ impl LanguageCoordinator {
         scratch
     }
 
-    /// Every language registered under `generation`, with the grammar and
-    /// queries a document of that language is parsed and highlighted with.
-    fn language_state(&self, generation: u64) -> HashMap<String, LoadedLanguage> {
+    /// Every language registered (under `generation`, or under any when
+    /// `None`), with the grammar and queries a document of that language is
+    /// parsed and highlighted with.
+    fn language_state(&self, generation: Option<u64>) -> HashMap<String, LoadedLanguage> {
         self.language_registry
             .language_ids()
             .into_iter()
-            .filter(|language_id| self.has_current_parser_registration(language_id, generation))
+            .filter(|language_id| {
+                generation.is_none_or(|generation| {
+                    self.has_current_parser_registration(language_id, generation)
+                })
+            })
             .filter_map(|language_id| {
                 let language = self.language_registry.get(&language_id)?;
                 let queries =
@@ -3862,6 +3868,28 @@ mod tests {
         assert!(
             !coordinator.ensure_language_loaded("dynamic").success,
             "a prior-generation dynamic entry must not bypass current search-path resolution"
+        );
+    }
+
+    /// A reload that invalidates no parse (the post-install one) leaves a
+    /// language open documents still use tagged with an older generation.
+    /// The trial must re-read it like a current one: here it no longer loads
+    /// at all, which documents would see on the next reload.
+    #[test]
+    fn reload_trial_rereads_languages_tagged_by_an_older_generation() {
+        let coordinator = LanguageCoordinator::new();
+        coordinator
+            .language_registry
+            .register("dynamic".to_string(), tree_sitter_rust::LANGUAGE.into());
+        coordinator
+            .reload_scoped_registrations
+            .insert("dynamic".to_string(), 0);
+        coordinator.load_settings(&WorkspaceSettings::default());
+        assert!(!coordinator.has_parser_available("dynamic"));
+
+        assert!(
+            coordinator.reload_would_change_languages(&WorkspaceSettings::default()),
+            "the stale registration no longer resolves, so a reload changes it"
         );
     }
 
