@@ -364,3 +364,40 @@ async fn identical_reload_reparses_when_a_missing_parser_appeared() {
     assert_full_reload_work(&outcome, &uri);
     client.abort();
 }
+
+/// A configured language derived from a discovered one registers on every
+/// language reload and announces a refresh when it does; an identical reload
+/// must not run that registration at all.
+#[tokio::test]
+async fn identical_reload_with_a_derived_language_neither_reparses_nor_refreshes() {
+    let Some(parser) = lua_parser() else {
+        eprintln!("skipping: lua parser not built");
+        return;
+    };
+    let search_path = tempfile::tempdir().unwrap();
+    install_lua_parser(search_path.path(), &parser);
+    write_lua_highlights(search_path.path(), "(identifier) @variable\n");
+    let (service, client) = server_with_builtin_rust();
+    let server = service.inner();
+    let mut settings = search_path_settings(search_path.path());
+    settings.languages.insert(
+        "derived_lua".into(),
+        LanguageSettings {
+            base: Some("lua".into()),
+            ..Default::default()
+        },
+    );
+    server
+        .apply_raw_settings(RawWorkspaceSettings::default(), settings.clone())
+        .await;
+    assert!(server.language.has_queries("derived_lua"));
+    let uri = open_and_wait_for_tree(server, "derived.lua", "derived_lua").await;
+    let generation = server.cache.semantic_token_generation();
+
+    let outcome = server
+        .apply_raw_settings(RawWorkspaceSettings::default(), settings)
+        .await;
+
+    assert_no_reload_work(&outcome, server, &uri, generation);
+    client.abort();
+}
