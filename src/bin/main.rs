@@ -1081,12 +1081,12 @@ fn find_parser_entry(
 /// What a path in `parser/` is, as far as uninstall is concerned.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ParserEntry {
-    /// An entry removal can take: a regular file, or a symlink.
+    /// An entry removal can take: anything that is not a directory.
     Removable { is_symlink: bool },
     /// An entry that is plainly there but is not a shape removal can take —
-    /// a directory (#828), or a special file. Discovery must remember these
-    /// rather than skip them silently, because the summary goes on to claim
-    /// it removed everything and one of these on disk makes that false.
+    /// a directory (#828). Discovery must remember these rather than skip
+    /// them silently, because the summary goes on to claim it removed
+    /// everything and one of these on disk makes that false.
     WrongShape,
 }
 
@@ -1097,23 +1097,25 @@ enum ParserEntry {
 /// which can be served from `readdir`'s cached `d_type` and so would report
 /// success on some filesystems and fail on others for an unreadable directory.
 ///
-/// A regular file or a symlink is removable — install produces the first, and a
-/// hand-pointed local build the second. Everything else is [`WrongShape`]:
-/// `remove_file` cannot take a directory (#828), and a FIFO or socket named
-/// `lua.dylib` is not an install this CLI created, so removing it would be
-/// discovery inventing one.
+/// Anything but a directory is removable. The slot is kakehashi's whatever
+/// occupies it: install publishes by `rename`, which replaces any non-directory
+/// there — a regular file, a hand-pointed symlink, a FIFO or a socket alike —
+/// so uninstall takes back the same set, with an `unlink` that neither opens
+/// the entry (a FIFO cannot block it) nor follows it. The queries slot answers
+/// the same way (#1006). A directory is [`WrongShape`]: `remove_file` cannot
+/// take one, and #828 settled that it is not an installed parser.
 ///
 /// [`WrongShape`]: ParserEntry::WrongShape
 fn parser_entry_kind(path: &Path) -> std::io::Result<Option<ParserEntry>> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
             let file_type = metadata.file_type();
-            Ok(Some(if file_type.is_file() || file_type.is_symlink() {
+            Ok(Some(if file_type.is_dir() {
+                ParserEntry::WrongShape
+            } else {
                 ParserEntry::Removable {
                     is_symlink: file_type.is_symlink(),
                 }
-            } else {
-                ParserEntry::WrongShape
             }))
         }
         // Absent is the ordinary "not installed" answer; every other failure
