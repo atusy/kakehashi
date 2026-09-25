@@ -647,6 +647,12 @@ languageServers:
 
 ## Amendment History
 
+- **2026-09-25**: A string `workspace.workspaceFolders.changeNotifications`
+  now counts as a registration of `workspace/didChangeWorkspaceFolders` under
+  that id (#1117). The handshake records it before `initialized`, so a
+  `client/unregisterCapability` of the id withdraws folder-change support like
+  a dynamic unregistration; only `changeNotifications: true` remains a
+  lifelong declaration.
 - **2026-09-23**: Dynamic `client/registerCapability` registrations of
   `workspace/didChangeWorkspaceFolders` now count as folder-change capable
   (#968), read live at every decision point with no added synchronization;
