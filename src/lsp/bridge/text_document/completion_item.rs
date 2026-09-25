@@ -270,6 +270,20 @@ impl LanguageServerPool {
                 return item;
             }
         };
+        // A just-replaced origin re-opens its virtual documents asynchronously
+        // after `Ready`; until then the send below finds the document not open
+        // and gives up. Wait for that re-open (bounded; a no-op when none is in
+        // flight) BEFORE `document` takes the edit and lifecycle locks, so the
+        // wait never holds up edits or the re-open itself.
+        if !self.wait_for_pending_reopen(handle.key()).await {
+            warn!(
+                target: "kakehashi::bridge",
+                "completionItem/resolve: {server_name:?} is still re-opening its documents; \
+                 returning unresolved"
+            );
+            re_envelope_item(&mut item, &envelope);
+            return item;
+        }
 
         if !handle.has_capability("completionItem/resolve") {
             // Two ways here. The payload nests the reserved key: as far as
