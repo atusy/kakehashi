@@ -678,3 +678,31 @@ fn e2e_diagnose_directory_walk_includes_extensionless_shebang_file() {
         stdout_of(&output)
     );
 }
+
+/// A symlink alias names the same file as its target, so the file is
+/// diagnosed once, under the spelling the user named first.
+#[cfg(unix)]
+#[test]
+fn e2e_diagnose_symlink_alias_is_diagnosed_once() {
+    let ws = workspace_with(&config_toml(), &[("doc.md", MARKDOWN)]);
+    std::os::unix::fs::symlink("doc.md", ws.path().join("alias.md")).expect("create symlink");
+
+    let output = run_diagnose(ws.path(), &["doc.md", "alias.md"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a warning does not fail by default; stderr: {}",
+        stderr_of(&output)
+    );
+    let stdout = stdout_of(&output);
+    assert_eq!(
+        stdout.matches(":4:1: warning: ").count(),
+        1,
+        "the aliased file must be diagnosed once; got: {stdout:?}"
+    );
+    assert!(
+        stdout.starts_with("doc.md:4:1: warning: "),
+        "the first-named spelling is reported; got: {stdout:?}"
+    );
+}

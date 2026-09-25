@@ -539,6 +539,83 @@ mod tests {
         assert_eq!(files, vec![tmp.path().join("doc.md")]);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn symlink_alias_collapses_to_the_first_given_spelling() {
+        // A symlink and its target are one file: processing both would
+        // diagnose it twice or format it twice. The spelling the user named
+        // first survives, in either argument order.
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join("doc.md"), "x");
+        std::os::unix::fs::symlink("doc.md", tmp.path().join("alias.md")).unwrap();
+        let doc = tmp.path().join("doc.md");
+        let alias = tmp.path().join("alias.md");
+
+        let target_first = collect_paths(
+            tmp.path(),
+            &[doc.clone(), alias.clone()],
+            &[],
+            &markdown_only,
+        );
+        let alias_first = collect_paths(
+            tmp.path(),
+            &[alias.clone(), doc.clone()],
+            &[],
+            &markdown_only,
+        );
+
+        assert_eq!(target_first, vec![doc]);
+        assert_eq!(alias_first, vec![alias]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_directory_walked_alongside_its_target_collapses() {
+        // Walking a directory and a symlink to it yields every file under
+        // two spellings; the root named first keeps its spelling.
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join("docs/a.md"), "x");
+        write(&tmp.path().join("docs/sub/b.md"), "x");
+        std::os::unix::fs::symlink("docs", tmp.path().join("link")).unwrap();
+        let docs = tmp.path().join("docs");
+        let link = tmp.path().join("link");
+
+        let target_first = collect_paths(
+            tmp.path(),
+            &[docs.clone(), link.clone()],
+            &[],
+            &markdown_only,
+        );
+        let link_first = collect_paths(
+            tmp.path(),
+            &[link.clone(), docs.clone()],
+            &[],
+            &markdown_only,
+        );
+
+        assert_eq!(target_first, vec![docs.join("a.md"), docs.join("sub/b.md")]);
+        assert_eq!(link_first, vec![link.join("a.md"), link.join("sub/b.md")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_links_collapse_to_one_entry() {
+        // Hard links share one inode, so they are the same file too.
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join("b.md"), "x");
+        std::fs::hard_link(tmp.path().join("b.md"), tmp.path().join("a.md")).unwrap();
+        let a = tmp.path().join("a.md");
+        let b = tmp.path().join("b.md");
+
+        let explicit = collect_paths(tmp.path(), &[b.clone(), a.clone()], &[], &markdown_only);
+        // Within one walk there is no user-given order (the walker yields
+        // readdir order), so the lexicographically first spelling survives.
+        let walked = collect_paths(tmp.path(), &[tmp.path().to_path_buf()], &[], &markdown_only);
+
+        assert_eq!(explicit, vec![b]);
+        assert_eq!(walked, vec![a]);
+    }
+
     #[test]
     fn explicitly_named_hidden_directory_is_walked() {
         // The walker's hidden-file filter applies to entries, not to the
