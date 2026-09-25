@@ -53,6 +53,16 @@ pub(crate) use document_tracker::{OpenedVirtualDoc, VirtualUriObserver};
 pub(crate) use dynamic_capability_registry::DynamicCapabilityRegistry;
 pub(crate) use message_sender::{ConnectionHandleSender, MessageSender};
 use pending_reopen::PendingReopenRegistry;
+
+/// The document a resolve refers to on the connection it is sent on.
+#[derive(Clone, Copy)]
+pub(super) enum ResolveDocument<'a> {
+    /// A host document, forwarded to a host-layer server under its own URI.
+    Host(&'a Url),
+    /// An injection region's virtual document.
+    Virtual(&'a VirtualDocumentUri),
+}
+
 /// Re-exported so the server-side re-open handler bounds its work by the same
 /// budget requests wait on — the two must not drift apart.
 pub(crate) use pending_reopen::REOPEN_WAIT;
@@ -2108,6 +2118,69 @@ impl LanguageServerPool {
         true
     }
 
+    /// Whether a resolve may be sent on `key` for `document` without overtaking
+    /// the `didOpen` it depends on (#1132).
+    ///
+    /// A document already open on the connection needs no wait: the open was
+    /// enqueued before it was recorded, so its `didOpen` is ahead in the FIFO.
+    /// Waiting on the connection-wide barrier anyway would hold the resolve
+    /// for a re-open of OTHER documents, and fail it when that re-open reports
+    /// them unsettled. Otherwise wait for the pending re-open, then check
+    /// again whatever the barrier answered: a refusal can come from another
+    /// document while this one was already re-opened, and a settled barrier
+    /// does not prove this document came back (a failed re-open is retired by
+    /// its first waiter, and one may simply not apply to it).
+    ///
+    /// `false` means the caller must fail soft rather than send.
+    pub(super) async fn resolve_document_ready(
+        &self,
+        method: &str,
+        key: &ConnectionKey,
+        document: ResolveDocument<'_>,
+    ) -> bool {
+        if self.is_resolve_document_open(key, document).await {
+            return true;
+        }
+        if !self.wait_for_pending_reopen(key).await {
+            // The sweep may have reached this document before stalling on
+            // another; its didOpen is then already ahead in the FIFO.
+            if self.is_resolve_document_open(key, document).await {
+                return true;
+            }
+            log::warn!(
+                target: "kakehashi::bridge",
+                "{method}: the re-open on {key} did not settle (timed out or failed); \
+                 not sending out of order"
+            );
+            return false;
+        }
+        if self.is_resolve_document_open(key, document).await {
+            return true;
+        }
+        log::debug!(
+            target: "kakehashi::bridge",
+            "{method}: the document is not open on {key}; not sending"
+        );
+        false
+    }
+
+    async fn is_resolve_document_open(
+        &self,
+        key: &ConnectionKey,
+        document: ResolveDocument<'_>,
+    ) -> bool {
+        match document {
+            ResolveDocument::Host(uri) => self
+                .host_documents()
+                .await
+                .get(uri.as_str())
+                .is_some_and(|connections| connections.contains_key(key)),
+            ResolveDocument::Virtual(virtual_uri) => {
+                self.is_document_opened_on_connection(virtual_uri, key)
+            }
+        }
+    }
+
     /// Wait for an in-flight virtual-document re-open on `key` before sending on
     /// that connection (execute-command-routing-token). Bounded; a no-op when
     /// none is in flight.
@@ -2115,6 +2188,19 @@ impl LanguageServerPool {
     /// then fail soft rather than send without the ordering guarantee.
     pub(super) async fn wait_for_pending_reopen(&self, key: &ConnectionKey) -> bool {
         self.pending_reopen.wait_for_reopen(key).await
+    }
+
+    /// Test seam: stand in for a replacement's handshake that claimed a
+    /// re-open which has not run yet. The caller settles it through `done`.
+    #[cfg(test)]
+    pub(in crate::lsp::bridge) fn claim_reopen_for_test(
+        &self,
+        key: &ConnectionKey,
+    ) -> tokio::sync::watch::Sender<bool> {
+        self.pending_reopen.arm(key);
+        self.pending_reopen
+            .claim(key)
+            .expect("an armed key can be claimed")
     }
 
     /// Arm re-open debt for the RESOLVED key of a key-CHANGING palette
@@ -3097,7 +3183,7 @@ impl LanguageServerPool {
         // region_id to `VirtualDocumentUri::new` (debug builds assert, and
         // release builds would select a route no minted document uses);
         // preserve the pre-routing host-URI fallback instead.
-        if injection_language.is_empty() || region_id.is_empty() || region_id.contains('.') {
+        if !VirtualDocumentUri::is_valid_identity(injection_language, region_id) {
             return self
                 .get_or_create_connection(server_name, server_config, Some(host_uri))
                 .await;

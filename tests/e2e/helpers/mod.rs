@@ -7,3 +7,4 @@ pub mod lua_bridge;
 pub mod sanitization;
 pub mod test_fixtures;
 pub mod text;
+pub mod wire_log;
