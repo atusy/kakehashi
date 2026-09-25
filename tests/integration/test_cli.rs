@@ -2895,6 +2895,11 @@ fn test_language_uninstall_leaves_a_language_whole_when_its_parser_is_the_wrong_
         shaped_dir.is_dir(),
         "the entry must be left alone: {combined}"
     );
+    // A refusal that repeats on every retry must say how to get past it.
+    assert!(
+        combined.contains("Note: left") && combined.contains("which this CLI never removes"),
+        "the refusal must carry the advice --all gives for the same entry: {combined}"
+    );
 }
 
 /// A removal that FAILS is a different case from one that could not be
