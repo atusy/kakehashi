@@ -48,6 +48,7 @@ use tower_lsp_server::ls_types::{Range, TextDocumentIdentifier, Uri};
 use url::Url;
 
 use crate::analysis::next_result_id;
+use crate::error::LockResultExt;
 use crate::language::query_exec::execute_query;
 use crate::language::query_loader::{QueryLoadError, QueryLoader};
 use crate::language::registry::LanguageRegistry;
@@ -377,6 +378,7 @@ fn load_kind_query_cached(
     {
         return std::sync::Arc::clone(&hit.load);
     }
+    let in_flight = KindLoadInFlight::begin(search_paths);
     let (loaded, source) = load_kind_query(registry, search_paths, language_id, file_name);
     let loaded = std::sync::Arc::new(loaded);
     // Overwrite-on-miss doubles as eviction (one generation per entry). A
@@ -396,7 +398,42 @@ fn load_kind_query_cached(
             .or_default()
             .insert(file_name.to_string(), stored);
     }
+    drop(in_flight);
     loaded
+}
+
+/// The search paths of every kind-query load between reading its file and
+/// storing the result, one entry per load.
+static KIND_LOADS_IN_FLIGHT: std::sync::Mutex<Vec<Vec<PathBuf>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Registers one kind-query load in [`KIND_LOADS_IN_FLIGHT`] for as long as
+/// it lives. Such a load may have read a kind file before it was edited and
+/// store it after [`kind_queries_changed`] scanned the cache; with no
+/// generation bump to make that entry miss, the scan must not call the
+/// files unchanged meanwhile. Keyed by search paths like the scan itself, so
+/// one configuration's loads never count against another's.
+struct KindLoadInFlight(Vec<PathBuf>);
+
+impl KindLoadInFlight {
+    fn begin(search_paths: &[PathBuf]) -> Self {
+        KIND_LOADS_IN_FLIGHT
+            .lock()
+            .recover_poison("KindLoadInFlight::begin")
+            .push(search_paths.to_vec());
+        Self(search_paths.to_vec())
+    }
+}
+
+impl Drop for KindLoadInFlight {
+    fn drop(&mut self) {
+        let mut in_flight = KIND_LOADS_IN_FLIGHT
+            .lock()
+            .recover_poison("KindLoadInFlight::drop");
+        if let Some(index) = in_flight.iter().position(|paths| *paths == self.0) {
+            in_flight.swap_remove(index);
+        }
+    }
 }
 
 /// Per-language outcome of resolving `queries/<lang>/<kind>.scm`.
@@ -498,6 +535,14 @@ pub(in crate::lsp::lsp_impl) fn kind_queries_changed(
     search_paths: &[PathBuf],
     generation: u64,
 ) -> bool {
+    if KIND_LOADS_IN_FLIGHT
+        .lock()
+        .recover_poison("kind_queries_changed")
+        .iter()
+        .any(|paths| paths == search_paths)
+    {
+        return true;
+    }
     let cached: Vec<(String, String, Option<String>)> = kind_query_cache()
         .iter()
         .flat_map(|by_kind| {
@@ -1913,6 +1958,16 @@ mod tests {
         assert!(
             kind_queries_changed(&search_paths, GENERATION),
             "a deleted kind file"
+        );
+        let in_flight = KindLoadInFlight::begin(&search_paths);
+        assert!(
+            kind_queries_changed(&search_paths, GENERATION),
+            "a load in flight may store a file read before an edit"
+        );
+        drop(in_flight);
+        assert!(
+            kind_queries_changed(&search_paths, GENERATION),
+            "folds.scm is still deleted"
         );
         let elsewhere = tempfile::tempdir().unwrap();
         assert!(
