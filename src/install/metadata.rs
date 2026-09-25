@@ -573,6 +573,99 @@ return {
         assert_eq!(result2, Some("{ inner }"));
     }
 
+    /// Parse a parsers.lua holding one `lua` entry whose body is `fields`.
+    fn parse_lua_entry(fields: &str) -> Result<ParserMetadata, MetadataError> {
+        let content = format!(
+            "return {{\n  lua = {{\n{fields}\n    install_info = {{\n      revision = 'abc123',\n      url = 'https://example.com/tree-sitter-lua',\n    }},\n  }},\n}}\n"
+        );
+        let mut parsers = parse_parsers_lua(&content)?;
+        parsers
+            .remove("lua")
+            .ok_or_else(|| MetadataError::LanguageNotFound("lua".into()))
+    }
+
+    fn assert_lua_entry_parses(fields: &str) {
+        let lua = parse_lua_entry(fields)
+            .unwrap_or_else(|e| panic!("lua entry with {fields:?} must parse: {e}"));
+        assert_eq!(lua.url, "https://example.com/tree-sitter-lua");
+        assert_eq!(lua.revision, "abc123");
+    }
+
+    #[test]
+    fn closing_brace_in_double_quoted_string_does_not_end_the_block() {
+        assert_lua_entry_parses(r#"    readme_note = "write } literally","#);
+    }
+
+    #[test]
+    fn opening_brace_in_single_quoted_string_does_not_open_a_block() {
+        assert_lua_entry_parses("    readme_note = 'open { here',");
+    }
+
+    #[test]
+    fn escaped_quote_does_not_end_a_string() {
+        assert_lua_entry_parses(r#"    readme_note = "a \" } b","#);
+    }
+
+    #[test]
+    fn escaped_backslash_before_quote_ends_the_string() {
+        // `'x\\'` ends at its quote; reading `\'` as an escaped quote would
+        // swallow the real `}` after it and leave `'}'` unquoted.
+        assert_lua_entry_parses(r"    extra = { 'x\\' }, tier = '}',");
+    }
+
+    #[test]
+    fn long_bracket_string_ends_only_at_its_own_level() {
+        assert_lua_entry_parses("    readme_note = [==[ ]] } ]==],");
+        assert_lua_entry_parses("    readme_note = [[\n  } {\n]],");
+    }
+
+    #[test]
+    fn index_bracket_is_not_a_long_string() {
+        assert_lua_entry_parses("    extra = { ['}'] = 1, [ [=[}]=] ] = 2 },");
+    }
+
+    #[test]
+    fn comment_marker_in_string_is_not_a_comment() {
+        // Treating `--` inside the string as a comment would swallow the `}`.
+        assert_lua_entry_parses("    requires = { '--' },");
+    }
+
+    #[test]
+    fn braces_and_quotes_in_line_comments_are_ignored() {
+        assert_lua_entry_parses("    -- a stray } here\n    -- don't { open");
+    }
+
+    #[test]
+    fn braces_in_block_comments_are_ignored() {
+        assert_lua_entry_parses("    --[[ } ]]\n    --[==[ ]] } ]==]\n    --[[\n }\n ]]");
+    }
+
+    #[test]
+    fn language_keys_inside_literals_are_not_languages() {
+        let content = "return {\n  --[[\n  fake = {\n    install_info = { revision = 'r', url = 'u' },\n  },\n  ]]\n  lua = {\n    readme_note = [[\n  ghost = {\n    install_info = { revision = 'r', url = 'u' },\n  },\n]],\n    install_info = { revision = 'abc123', url = 'https://example.com/tree-sitter-lua' },\n  },\n}\n";
+
+        let parsers = parse_parsers_lua(content).expect("should parse");
+
+        let mut names: Vec<_> = parsers.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["lua"]);
+    }
+
+    #[test]
+    fn unterminated_literals_are_parse_errors() {
+        for fields in [
+            "    readme_note = 'oops,",
+            "    readme_note = \"oops\n\",",
+            "    readme_note = [==[ oops ]],",
+            "    --[[ oops",
+        ] {
+            assert!(
+                matches!(parse_lua_entry(fields), Err(MetadataError::ParseError(_))),
+                "{fields:?} must be a parse error"
+            );
+        }
+    }
+
     #[test]
     fn test_extract_parser_metadata() {
         let content = r#"
