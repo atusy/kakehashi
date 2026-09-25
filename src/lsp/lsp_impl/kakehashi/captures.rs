@@ -382,21 +382,38 @@ fn load_kind_query_cached(
     let (loaded, source) = load_kind_query(registry, search_paths, language_id, file_name);
     let loaded = std::sync::Arc::new(loaded);
     // Overwrite-on-miss doubles as eviction (one generation per entry). A
-    // racing same-generation compute overwrites with identical data. `get`
-    // first so a present language avoids the key clone `entry()` needs.
+    // racing same-generation compute overwrites with whatever it read, which
+    // `kind_queries_changed` compares against the disk. An entry from a
+    // NEWER generation is never overwritten: a request that started before a
+    // reload would otherwise replace the current entry with one no lookup
+    // hits and no change scan looks at. `get` first so a present language
+    // avoids the key clone `entry()` needs.
     let stored = CachedKindQuery {
         load: std::sync::Arc::clone(&loaded),
         generation,
         search_paths: search_paths.to_vec(),
         source,
     };
+    let store = |by_kind: &dashmap::DashMap<String, CachedKindQuery>| match by_kind
+        .entry(file_name.to_string())
+    {
+        dashmap::mapref::entry::Entry::Occupied(current)
+            if current.get().generation > generation => {}
+        dashmap::mapref::entry::Entry::Occupied(mut current) => {
+            current.insert(stored);
+        }
+        dashmap::mapref::entry::Entry::Vacant(vacant) => {
+            vacant.insert(stored);
+        }
+    };
     if let Some(by_kind) = kind_query_cache().get(language_id) {
-        by_kind.insert(file_name.to_string(), stored);
+        store(&by_kind);
     } else {
-        kind_query_cache()
-            .entry(language_id.to_string())
-            .or_default()
-            .insert(file_name.to_string(), stored);
+        store(
+            &kind_query_cache()
+                .entry(language_id.to_string())
+                .or_default(),
+        );
     }
     drop(in_flight);
     loaded
@@ -1968,6 +1985,22 @@ mod tests {
         assert!(
             kind_queries_changed(&search_paths, GENERATION),
             "folds.scm is still deleted"
+        );
+        // A request that started under an older generation finishes after
+        // the current entry was stored: it must not replace it.
+        let _ = load_kind_query_cached(&registry, &search_paths, LANGUAGE, "folds.scm", GENERATION);
+        std::fs::write(kind_dir.join("folds.scm"), "(function_item) @fold\n").unwrap();
+        let _ = load_kind_query_cached(
+            &registry,
+            &search_paths,
+            LANGUAGE,
+            "folds.scm",
+            GENERATION - 1,
+        );
+        std::fs::write(kind_dir.join("folds.scm"), "(block) @fold\n").unwrap();
+        assert!(
+            kind_queries_changed(&search_paths, GENERATION),
+            "the current entry must survive an older request's store"
         );
         let elsewhere = tempfile::tempdir().unwrap();
         assert!(
