@@ -591,15 +591,6 @@ pub(in crate::lsp::lsp_impl) fn kind_queries_changed(
     {
         return true;
     }
-    {
-        let mut conflicts = KIND_SOURCE_CONFLICTS
-            .lock()
-            .recover_poison("kind_queries_changed(conflicts)");
-        if let Some(index) = conflicts.iter().position(|paths| paths == search_paths) {
-            conflicts.swap_remove(index);
-            return true;
-        }
-    }
     let cached: Vec<(String, String, Option<String>)> = kind_query_cache()
         .iter()
         .flat_map(|by_kind| {
@@ -620,6 +611,19 @@ pub(in crate::lsp::lsp_impl) fn kind_queries_changed(
                 .collect::<Vec<_>>()
         })
         .collect();
+    // After the snapshot, not before: a store that replaced an entry with
+    // different text either landed before the snapshot, and its conflict is
+    // already recorded (under the entry's lock, before the replacement), or
+    // after it, and the snapshot still holds the older text.
+    {
+        let mut conflicts = KIND_SOURCE_CONFLICTS
+            .lock()
+            .recover_poison("kind_queries_changed(conflicts)");
+        if let Some(index) = conflicts.iter().position(|paths| paths == search_paths) {
+            conflicts.swap_remove(index);
+            return true;
+        }
+    }
     cached.into_iter().any(|(language_id, file_name, source)| {
         match QueryLoader::resolve_query_source(search_paths, &language_id, &file_name) {
             Ok(text) => source.as_deref() != Some(text.as_str()),
