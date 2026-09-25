@@ -599,26 +599,35 @@ pub(in crate::lsp::lsp_impl) fn kind_queries_changed(
     {
         return true;
     }
-    let cached: Vec<(String, String, Option<String>)> = kind_query_cache()
-        .iter()
-        .flat_map(|by_kind| {
-            let language_id = by_kind.key().clone();
-            by_kind
-                .iter()
-                .filter(|entry| {
-                    entry.value().generation == generation
-                        && entry.value().search_paths == search_paths
-                })
-                .map(|entry| {
-                    (
-                        language_id.clone(),
-                        entry.key().clone(),
-                        entry.value().source.clone(),
-                    )
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect();
+    // Kind names are client-chosen, so the cache can hold arbitrarily many
+    // entries. This configuration's entries from older generations can no
+    // longer be hit by a current request, so they go; past the bound on
+    // current ones, stop collecting and report a change instead (below).
+    let mut cached: Vec<(String, String, Option<String>)> = Vec::new();
+    let mut over_bound = false;
+    for by_kind in kind_query_cache().iter() {
+        by_kind.retain(|_, entry| {
+            entry.search_paths != search_paths || entry.generation >= generation
+        });
+        for entry in by_kind.iter() {
+            if entry.value().generation != generation || entry.value().search_paths != search_paths
+            {
+                continue;
+            }
+            if cached.len() == MAX_SCANNED_KIND_QUERIES {
+                over_bound = true;
+                break;
+            }
+            cached.push((
+                by_kind.key().clone(),
+                entry.key().clone(),
+                entry.value().source.clone(),
+            ));
+        }
+        if over_bound {
+            break;
+        }
+    }
     // After the snapshot, not before: a store that replaced an entry with
     // different text either landed before the snapshot, and its conflict is
     // already recorded (under the entry's lock, before the replacement), or
@@ -637,11 +646,9 @@ pub(in crate::lsp::lsp_impl) fn kind_queries_changed(
             return true;
         }
     }
-    // Kind names are client-chosen, so the cache can hold arbitrarily many
-    // entries, and this scan resolves each one on every push. Past the
-    // bound, report a change instead: the reload that follows bumps the
-    // generation, which leaves nothing current for the next scan to walk.
-    if cached.len() > MAX_SCANNED_KIND_QUERIES {
+    // Past the bound, report a change instead of resolving: the reload that
+    // follows bumps the generation, and the next scan drops what it left.
+    if over_bound {
         return true;
     }
     cached.into_iter().any(|(language_id, file_name, source)| {
@@ -2126,6 +2133,14 @@ mod tests {
             );
         }
         assert!(kind_queries_changed(&search_paths, GENERATION + 2));
+        assert!(
+            kind_query_cache()
+                .get(LANGUAGE)
+                .unwrap()
+                .get("folds.scm")
+                .is_none(),
+            "entries of an older generation are dropped by the scan"
+        );
         let elsewhere = tempfile::tempdir().unwrap();
         assert!(
             !kind_queries_changed(&[elsewhere.path().to_path_buf()], GENERATION),
