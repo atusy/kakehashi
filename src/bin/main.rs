@@ -632,7 +632,8 @@ fn installed_query_language_name_checked(path: &Path) -> std::io::Result<Option<
     Ok(Some(name))
 }
 
-/// Say what discovery deliberately left on disk, and why.
+/// Say what this run deliberately left on disk, and why — entries `--all`
+/// discovery walked past, or a directory a named uninstall's parser probe met.
 ///
 /// Called on EVERY exit that makes a claim about the directory — including the
 /// failing ones and the "nothing installed" one — because the claim is exactly
@@ -686,8 +687,10 @@ fn run_language_uninstall(
         eprintln!("Warning: failed to recover interrupted query installs: {e}");
     }
 
-    // Entries discovery deliberately walked past, with why. Kept so the summary
-    // cannot claim it removed everything while one of them is still on disk.
+    // Entries this run deliberately leaves on disk, with why: filled by `--all`
+    // discovery, and by a named uninstall that meets a directory-shaped parser.
+    // Kept so the summary cannot claim it removed everything while one of them
+    // is still on disk.
     let mut unmanaged: Vec<(PathBuf, &'static str)> = Vec::new();
 
     // Entries discovery could not classify at all. Distinct from `unmanaged`,
