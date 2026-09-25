@@ -197,11 +197,30 @@ struct QueryDependencyChecks {
     revision_clock: u64,
 }
 
+/// How many languages may wait for a repair retry individually.
+const MAX_AWAITING_RETRIES: usize = 256;
+
+/// The wait standing in for every language past [`MAX_AWAITING_RETRIES`]; no
+/// check answers for it, only a reload (`retire_query_repair_retries`). Not a
+/// valid language id.
+const RETRY_OVERFLOW: &str = "\u{0}overflow";
+
 impl QueryDependencyChecks {
     /// A failure or deferred repair of `language`: it waits for a retry,
     /// under a revision newer than any a running check captured.
     fn await_retry(&mut self, language: &str) {
         self.revision_clock += 1;
+        // Language ids can come from document text: past the bound, collapse
+        // every wait into one that only the next reload ends.
+        let language = if self.awaiting_retry.len() >= MAX_AWAITING_RETRIES
+            && !self.awaiting_retry.contains(language)
+        {
+            self.awaiting_retry.clear();
+            self.failure_revisions.clear();
+            RETRY_OVERFLOW
+        } else {
+            language
+        };
         self.awaiting_retry.insert(language.to_string());
         self.failure_revisions
             .insert(language.to_string(), self.revision_clock);
@@ -1177,6 +1196,16 @@ mod tests {
 
         manager.resolve_query_repair_retry("lua", manager.query_repair_revision("lua"));
         assert!(!manager.has_query_repairs_awaiting_retry());
+
+        // Past the bound, the waits collapse into one only a reload ends.
+        let many = create_test_manager();
+        for index in 0..=MAX_AWAITING_RETRIES {
+            many.record_query_repair_failure(&format!("unsupported_{index}"), 1);
+        }
+        let retries = many.query_repair_retries();
+        assert!(retries.len() <= MAX_AWAITING_RETRIES);
+        many.retire_query_repair_retries(&retries);
+        assert!(!many.has_query_repairs_awaiting_retry());
 
         // A repair judged needed but dropped before it ran still waits, even
         // against an answer from a check that began before the deferral.
