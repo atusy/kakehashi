@@ -554,4 +554,26 @@ mod tests {
         };
         assert!(snapshot.awaiting_reparse);
     }
+
+    /// Edits publish no snapshot, so one landing mid-wait does not wake the
+    /// waiter; the deadline must still see that the placeholder now trails.
+    #[tokio::test(start_paused = true)]
+    async fn an_edit_during_the_placeholder_wait_reads_stale_at_the_deadline() {
+        let uri = Url::parse("file:///edit_during_reload.rs").unwrap();
+        let text = "fn main() {}";
+        let (service, inc) = server_with_doc(&uri, text);
+        let server = service.inner();
+        publish(&service, &uri, text, 0, inc);
+        server.documents.invalidate_all_parses();
+
+        let edit = async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            server
+                .documents
+                .update_document(uri.clone(), "fn main() { }".to_string(), None);
+        };
+        let (outcome, ()) = tokio::join!(server.wait_for_explicit_action_snapshot(&uri), edit);
+
+        assert!(matches!(outcome, SnapshotWait::Stale));
+    }
 }
