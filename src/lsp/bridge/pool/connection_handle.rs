@@ -199,6 +199,18 @@ pub(crate) struct ConnectionHandle {
 }
 
 impl ConnectionHandle {
+    /// Hold every queue slot without sending, for deterministic backpressure tests.
+    #[cfg(test)]
+    pub(crate) async fn reserve_outbound_capacity_for_test(
+        &self,
+    ) -> Vec<tokio::sync::mpsc::OwnedPermit<OutboundMessage>> {
+        let mut permits = Vec::with_capacity(self.tx.max_capacity());
+        for _ in 0..self.tx.max_capacity() {
+            permits.push(self.tx.clone().reserve_owned().await.expect("live writer"));
+        }
+        permits
+    }
+
     /// Stop the writer while preserving a Ready handle for send-failure tests.
     #[cfg(test)]
     pub(crate) async fn cancel_writer_for_test(&self) {

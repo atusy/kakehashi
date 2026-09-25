@@ -22,6 +22,34 @@ use crate::lsp::lsp_impl::{build_notifier, detect_document_language};
 use super::InstallCoordinator;
 use super::install::InstallCoordinatorDeps;
 
+/// Keeps closed-document lock cleanup tied to the future's lifetime, including
+/// cancellation while routing or waiting for a connection. This owns a lock
+/// reference; the bridge acquires the mutex only around revision admission.
+struct ReopenEditLock<'a> {
+    documents: &'a DocumentStore,
+    uri: &'a Url,
+    lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+}
+
+impl<'a> ReopenEditLock<'a> {
+    fn new(documents: &'a DocumentStore, uri: &'a Url) -> Self {
+        Self {
+            documents,
+            uri,
+            lock: documents.edit_lock(uri),
+        }
+    }
+}
+
+impl Drop for ReopenEditLock<'_> {
+    fn drop(&mut self) {
+        if self.documents.get(self.uri).is_none() {
+            self.documents
+                .remove_edit_lock_if_unshared(self.uri, &self.lock);
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum InjectionTarget {
     Incarnation(u64),
@@ -66,6 +94,21 @@ pub(crate) enum ParseWait {
     Gone,
     /// The budget expired with the tree still trailing or absent.
     Unsettled,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ReopenSnapshotState {
+    Gone,
+    Current,
+    Changed,
+}
+
+/// Inputs whose identity must survive from injection discovery to repair.
+/// Query reloads can change regions without editing the document.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReopenRevision {
+    document: crate::lsp::bridge::HostRevision,
+    query_generation: u64,
 }
 
 impl InjectionCoordinator {
@@ -209,10 +252,11 @@ impl InjectionCoordinator {
         // downstream runs right after the publish, so it virtually always is;
         // a raced edit falls back to the inline resolution below (which reads
         // the live tree, exactly as before).
-        if let Some(regions) = self
-            .documents
-            .current_bridge_regions(uri, self.cache.semantic_token_generation())
-        {
+        if let Some(regions) = self.documents.current_bridge_regions(
+            uri,
+            host_language,
+            self.cache.semantic_token_generation(),
+        ) {
             let regions = regions
                 .iter()
                 .map(|region| BridgeInjection {
@@ -237,12 +281,6 @@ impl InjectionCoordinator {
         if !settled() {
             return None;
         }
-        let Some(injection_query) = injection_query else {
-            // Queries are published before the parser, so a visible parser
-            // with no injection query is definitive.
-            return settled().then(Vec::new);
-        };
-
         // Tree, text, language and lifetime from ONE current snapshot: the
         // legacy document's tree can already be a replacement parse's while
         // the current snapshot (and the language the caller screened) is
@@ -260,6 +298,16 @@ impl InjectionCoordinator {
             // Trailing or never parsed: could not look.
             return None;
         };
+        if snapshot.language.as_deref() != Some(host_language) {
+            // A re-detection between the caller's screen and this read also
+            // invalidates a no-query answer for the old language.
+            return None;
+        }
+        let Some(injection_query) = injection_query else {
+            // Queries are published before the parser, so a visible parser
+            // with no injection query is definitive for THIS host language.
+            return settled().then(Vec::new);
+        };
         let Some(tree) = snapshot.tree.clone() else {
             // No tree under a published parser: a reload placeholder
             // (`Document::invalidate_parse`, version-current and tree-less) or
@@ -267,11 +315,6 @@ impl InjectionCoordinator {
             // at.
             return None;
         };
-        if snapshot.language.as_deref() != Some(host_language) {
-            // The tree belongs to another language than the one asked about
-            // (a re-detection between the caller's screen and this read).
-            return None;
-        }
         let text = std::sync::Arc::clone(&snapshot.text);
         let incarnation = snapshot.incarnation;
 
@@ -435,11 +478,13 @@ impl InjectionCoordinator {
                 .evict_source(uri, &DiagnosticSource::Region(region_id));
         }
 
-        if forward_did_change {
+        let synchronized = if forward_did_change {
             self.bridge
                 .forward_didchange_to_opened_docs(uri, incarnation, &injections)
-                .await;
-        }
+                .await
+        } else {
+            true
+        };
 
         let languages: HashSet<String> =
             injections.iter().map(|inj| inj.language.clone()).collect();
@@ -498,7 +543,7 @@ impl InjectionCoordinator {
                     .await;
             },
         );
-        true
+        synchronized
     }
 
     /// Check injected languages and handle missing parsers: auto-install when enabled,
@@ -696,28 +741,29 @@ impl InjectionCoordinator {
     ) {
         const INJECTION_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
         const INJECTION_RETRY_POLL: std::time::Duration = std::time::Duration::from_millis(50);
-        // One waiter per document LIFETIME: a burst of passes deferred by the
-        // same window re-runs the pass once, when the language settles; a
-        // close and reopen in the meantime gets its own waiter, since this
-        // one exits at its lifetime check.
-        let Some(claim) = self.settle_retry_waiters.claim(
-            if matches!(required, Some(InjectionTarget::Parsed(_))) {
-                // An open retry is revision-bound and may become a no-op.
-                // It cannot satisfy the edit path's latest-revision retry.
-                "open-injection"
-            } else {
-                "injection"
-            },
-            uri,
-            Some(incarnation),
-        ) else {
+        // Coalesce each retry kind per document lifetime. A forwarding pass
+        // retries failed enqueues within the original budget; close/reopen
+        // gets a separate waiter and the old pass fails its lifetime check.
+        let retry_kind = if matches!(required, Some(InjectionTarget::Parsed(_))) {
+            // Revision-bound and non-forwarding retries cannot absorb the
+            // latest-revision synchronization required by edits and repairs.
+            "open-injection"
+        } else if !forward_did_change {
+            "eager-injection"
+        } else {
+            "injection"
+        };
+        let Some(claim) = self
+            .settle_retry_waiters
+            .claim(retry_kind, uri, Some(incarnation))
+        else {
             return;
         };
         let this = self.clone();
         let uri = uri.clone();
         let host_language = host_language.to_string();
         tokio::spawn(async move {
-            let claim = claim;
+            let mut claim = Some(claim);
             let deadline = tokio::time::Instant::now() + INJECTION_RETRY_BUDGET;
             loop {
                 tokio::select! {
@@ -746,19 +792,39 @@ impl InjectionCoordinator {
                     // Release the slot BEFORE the rerun: a reload starting
                     // right now makes the rerun defer again, and its retry
                     // must be able to claim the slot this waiter held.
-                    drop(claim);
-                    match required {
+                    drop(claim.take());
+                    let query_generation = this.cache.semantic_token_generation();
+                    let synchronized = match required {
                         Some(InjectionTarget::Parsed(lineage)) => {
-                            let _ = this.process_injections_for_parse(&uri, lineage).await;
+                            this.process_injections_for_parse(&uri, lineage).await
                         }
                         _ => {
-                            let _ = this
-                                .process_injections_for_incarnation(
-                                    &uri,
-                                    forward_did_change,
-                                    incarnation,
-                                )
-                                .await;
+                            this.process_injections_for_incarnation(
+                                &uri,
+                                forward_did_change,
+                                incarnation,
+                            )
+                            .await
+                        }
+                    };
+                    // A reload can start after resolution, during the awaited
+                    // downstream sends. Preserve the sync intent until a pass
+                    // uses one settled query generation throughout.
+                    if forward_did_change
+                        && this.document_incarnation(&uri) == Some(incarnation)
+                        && (!synchronized
+                            || this.reload_in_progress()
+                            || this.cache.semantic_token_generation() != query_generation)
+                        && tokio::time::Instant::now() < deadline
+                    {
+                        // A failed enqueue leaves the sent fingerprint old.
+                        // Retry within this waiter's original budget; if another
+                        // sync waiter claimed the slot meanwhile, it owns recovery.
+                        claim =
+                            this.settle_retry_waiters
+                                .claim(retry_kind, &uri, Some(incarnation));
+                        if claim.is_some() {
+                            continue;
                         }
                     }
                     return;
@@ -948,6 +1014,219 @@ impl InjectionCoordinator {
             .map(|document| document.incarnation())
     }
 
+    pub(crate) fn document_revision(&self, uri: &Url) -> Option<crate::lsp::bridge::HostRevision> {
+        self.documents
+            .get(uri)
+            .map(|document| crate::lsp::bridge::HostRevision {
+                incarnation: document.incarnation(),
+                content_version: document.content_version(),
+            })
+    }
+
+    pub(crate) fn reopen_revision(&self, uri: &Url) -> Option<ReopenRevision> {
+        let query_generation = self.cache.semantic_token_generation();
+        self.document_revision(uri).map(|document| ReopenRevision {
+            document,
+            query_generation,
+        })
+    }
+
+    fn reopen_document_revision(
+        &self,
+        uri: &Url,
+        expected: ReopenRevision,
+    ) -> Option<crate::lsp::bridge::HostRevision> {
+        let document = self.document_revision(uri)?;
+        self.reopen_queries_are_current(expected)
+            .then_some(document)
+    }
+
+    fn reopen_queries_are_current(&self, expected: ReopenRevision) -> bool {
+        // Also reject the swapping interval before the final generation bump.
+        let pool = self
+            .parser_pool
+            .lock()
+            .recover_poison("InjectionCoordinator::reopen_queries_are_current");
+        !pool.reload_in_progress()
+            && self.cache.semantic_token_generation() == expected.query_generation
+    }
+
+    pub(crate) fn reopen_snapshot_state(
+        &self,
+        uri: &Url,
+        expected: ReopenRevision,
+    ) -> ReopenSnapshotState {
+        // One store read distinguishes a closed document from an unchanged
+        // resolution and from a newer parse/lifetime. Independent liveness and
+        // currency reads can accidentally confirm a different snapshot.
+        let Some(view) = self.documents.latest_snapshot(uri) else {
+            return ReopenSnapshotState::Gone;
+        };
+        if view.slot.current_incarnation == expected.document.incarnation
+            && view.content_version == expected.document.content_version
+            && view.slot.snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot.parsed_version == expected.document.content_version
+            })
+            && self.reopen_queries_are_current(expected)
+        {
+            ReopenSnapshotState::Current
+        } else {
+            ReopenSnapshotState::Changed
+        }
+    }
+
+    /// Retry the actual Ready-only open, outside the lifecycle edit guard.
+    /// A detached eager-open task cannot confirm that an untracked didOpen was
+    /// enqueued. This waiter owns that outcome without changing the failed barrier.
+    fn retry_reopen_when_settled(
+        &self,
+        uri: &Url,
+        incarnation: u64,
+        key: &crate::lsp::bridge::ConnectionKey,
+    ) {
+        let Some(claim) =
+            self.settle_retry_waiters
+                .claim_connection("reopen", uri, incarnation, key)
+        else {
+            return;
+        };
+        let this = self.clone();
+        let uri = uri.clone();
+        let key = key.clone();
+        tokio::spawn(async move {
+            let _claim = claim;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            let retry = async {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    if this.document_incarnation(&uri) != Some(incarnation) {
+                        return;
+                    }
+                    let Some(host_language) = this.document_language(&uri) else {
+                        continue;
+                    };
+                    if this.language_is_unsettled(&host_language) {
+                        continue;
+                    }
+                    let Some(revision) = this.reopen_revision(&uri) else {
+                        return;
+                    };
+                    if revision.document.incarnation != incarnation {
+                        return;
+                    }
+                    let Some(injections) = this.resolve_injection_data(&uri, &host_language) else {
+                        continue;
+                    };
+                    let settings = this.settings_manager.load_settings();
+                    let edit_lock = ReopenEditLock::new(&this.documents, &uri);
+                    let read = || this.reopen_document_revision(&uri, revision);
+                    let outcome = this
+                        .bridge
+                        .ensure_server_documents_open(
+                            &settings,
+                            &host_language,
+                            &uri,
+                            crate::lsp::bridge::OpenExpectation {
+                                incarnation,
+                                connection: Some(&key),
+                                expected_connection: None,
+                                revision: Some(crate::lsp::bridge::OpenRevision {
+                                    content_version: revision.document.content_version,
+                                    edit_lock: &edit_lock.lock,
+                                    read: &read,
+                                }),
+                            },
+                            injections,
+                            key.server(),
+                        )
+                        .await;
+                    if outcome != crate::lsp::bridge::OpenOutcome::NotOpened
+                        && this.reopen_snapshot_state(&uri, revision)
+                            == ReopenSnapshotState::Current
+                    {
+                        return;
+                    }
+                }
+            };
+            tokio::select! {
+                _ = this.shutdown.cancelled() => {},
+                _ = tokio::time::timeout_at(deadline, retry) => {},
+            }
+        });
+    }
+
+    pub(crate) async fn reopen_server_documents(
+        &self,
+        settings: &std::sync::Arc<crate::config::WorkspaceSettings>,
+        host_language: &str,
+        uri: &Url,
+        revision: ReopenRevision,
+        key: &crate::lsp::bridge::ConnectionKey,
+        injections: Vec<BridgeInjection>,
+    ) -> crate::lsp::bridge::OpenOutcome {
+        let edit_lock = ReopenEditLock::new(&self.documents, uri);
+        let read = || self.reopen_document_revision(uri, revision);
+        let outcome = self
+            .bridge
+            .ensure_server_documents_open(
+                settings,
+                host_language,
+                uri,
+                crate::lsp::bridge::OpenExpectation {
+                    incarnation: revision.document.incarnation,
+                    connection: Some(key),
+                    expected_connection: None,
+                    revision: Some(crate::lsp::bridge::OpenRevision {
+                        content_version: revision.document.content_version,
+                        edit_lock: &edit_lock.lock,
+                        read: &read,
+                    }),
+                },
+                injections,
+                key.server(),
+            )
+            .await;
+        // Failure can follow one or more successful enqueues. A query-only
+        // reload can preserve their URIs while changing extracted content;
+        // ordinary parse passes skip didChange and already-opened documents.
+        // Re-resolve and forward every current region, including earlier batch
+        // entries, and refresh the cache used by deferred opens. Recovery uses
+        // the existing bounded settlement wait; it does not turn the failed
+        // repair barrier into a success.
+        let snapshot_state = self.reopen_snapshot_state(uri, revision);
+        // Queue backpressure also leaves existing content stale even when
+        // the snapshot is still current. Retry that failed synchronization
+        // after the settlement delay, rather than requiring another edit.
+        if (snapshot_state == ReopenSnapshotState::Changed
+            || matches!(outcome, crate::lsp::bridge::OpenOutcome::NotOpened))
+            && self.document_incarnation(uri) == Some(revision.document.incarnation)
+        {
+            self.retry_injection_pass_when_settled(
+                uri,
+                host_language,
+                true,
+                revision.document.incarnation,
+                Some(InjectionTarget::Incarnation(revision.document.incarnation)),
+            );
+            self.retry_reopen_when_settled(uri, revision.document.incarnation, key);
+        }
+        // Routing can decide that none of the resolved regions belongs to
+        // this connection without reaching the open's edit guard. An edit
+        // during that decision may introduce an applicable region, so confirm
+        // the original revision before accepting a no-target result. Also
+        // recheck successful opens: query reloads are not held by edit locks.
+        if matches!(
+            outcome,
+            crate::lsp::bridge::OpenOutcome::NotApplicable
+                | crate::lsp::bridge::OpenOutcome::Opened
+        ) && snapshot_state == ReopenSnapshotState::Changed
+        {
+            crate::lsp::bridge::OpenOutcome::NotOpened
+        } else {
+            outcome
+        }
+    }
+
     /// The host language and resolved bridge injections for `uri`, or `None`
     /// when the document has no detectable language. Lets a caller re-derive the
     /// injected regions on demand (the respawn re-open), mirroring the
@@ -1104,6 +1383,98 @@ fn parser_enabled_injection_language(language: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{InjectionTarget, parser_enabled_injection_language};
+
+    #[rstest::rstest]
+    #[case::timeout(false)]
+    #[case::shutdown(true)]
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_reopen_retry_reclaims_closed_document_lock(#[case] shutdown: bool) {
+        use crate::lsp::bridge::ConnectionKey;
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), language.clone());
+        server.language.query_store().insert_injection_query("rust".into(), Arc::new(
+            tree_sitter::Query::new(&language, r#"((string_literal) @injection.content (#set! injection.language "rust") (#set! injection.include-children))"#).unwrap()));
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let uri = Url::parse("file:///cancelled-reopen.rs").unwrap();
+        let text = r#"fn main() { let x = "old"; }"#;
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            text.into(),
+            Some("rust".into()),
+            parser.parse(text, None),
+        );
+        server
+            .settings_manager
+            .apply_settings(crate::config::WorkspaceSettings {
+                auto_install: false,
+                language_servers: std::collections::HashMap::from([(
+                    "test".into(),
+                    crate::config::settings::BridgeServerConfig {
+                        cmd: Some(vec!["unused".into()]),
+                        languages: Some(vec!["rust".into()]),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            });
+        let coordinator = server.injection_coordinator();
+        let key = ConnectionKey::for_server("test");
+        let pool = server.bridge.pool();
+        let _connections = pool.lock_connections_for_test().await;
+        coordinator.retry_reopen_when_settled(&uri, incarnation, &key);
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_millis(50)).await;
+        for _ in 0..100 {
+            if server.documents.has_edit_lock(&uri) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            server.documents.has_edit_lock(&uri),
+            "retry must reach blocked open"
+        );
+        {
+            let closing = server.documents.edit_lock(&uri);
+            let _guard = closing.lock().await;
+            server.documents.remove_preserving_edit_lock(&uri);
+            server
+                .documents
+                .remove_edit_lock_if_unshared(&uri, &closing);
+        }
+        assert!(
+            server.documents.has_edit_lock(&uri),
+            "in-flight retry owns the lock"
+        );
+        if shutdown {
+            coordinator.shutdown.cancel();
+        } else {
+            tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        }
+        let mut finished = false;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            if coordinator
+                .settle_retry_waiters
+                .claim_connection("reopen", &uri, incarnation, &key)
+                .is_some()
+            {
+                finished = true;
+                break;
+            }
+        }
+        assert!(finished, "retry must finish by cancellation");
+        assert!(
+            !server.documents.has_edit_lock(&uri),
+            "cancelled retry must reclaim closed document lock"
+        );
+    }
 
     #[test]
     fn explicit_plaintext_does_not_request_a_parser() {
@@ -1482,8 +1853,11 @@ mod tests {
         assert!(!processed);
     }
 
+    #[rstest::rstest]
+    #[case::parsed(true)]
+    #[case::latest(false)]
     #[tokio::test]
-    async fn deferred_open_does_not_consume_the_edits_retry_slot() {
+    async fn deferred_open_does_not_consume_the_edits_retry_slot(#[case] parsed: bool) {
         let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
         let server = service.inner();
         let uri = Url::parse("file:///deferred-open.rs").unwrap();
@@ -1496,7 +1870,7 @@ mod tests {
             "rust",
             false,
             incarnation,
-            Some(InjectionTarget::Parsed(super::super::parse::ParseLineage {
+            parsed.then_some(InjectionTarget::Parsed(super::super::parse::ParseLineage {
                 incarnation,
                 content_version: 0,
             })),
@@ -1711,6 +2085,478 @@ mod tests {
             assert_eq!(a.region_id, b.region_id, "region id must match");
             assert_eq!(a.content, b.content, "clean content must match");
         }
+    }
+
+    #[rstest::rstest]
+    #[case::query_reload(true, false)]
+    #[case::queue_backpressure(false, false)]
+    #[case::unopened_queue_backpressure(false, true)]
+    #[tokio::test]
+    async fn rejected_reopen_resynchronizes_all_regions(
+        #[case] query_reload: bool,
+        #[case] unopened: bool,
+    ) {
+        use crate::lsp::bridge::OutboundMessage;
+        use crate::lsp::bridge::VirtualDocumentUri;
+        use crate::lsp::bridge::{ConnectionKey, OpenOutcome};
+        use crate::lsp::bridge::{ConnectionState, test_helpers};
+
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), language.clone());
+        let install_query = |offset: usize| {
+            let source = format!(
+                r#"((string_literal (string_content) @injection.content)
+                (#set! injection.language "rust") (#offset! @injection.content 0 {offset} 0 0))"#
+            );
+            server.language.query_store().insert_injection_query(
+                "rust".into(),
+                std::sync::Arc::new(tree_sitter::Query::new(&language, &source).unwrap()),
+            );
+        };
+        install_query(0);
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let uri = Url::parse("file:///reopen-query-sync.rs").unwrap();
+        let text = r#"fn main() { let a = "old1"; let b = "old2"; }"#;
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            text.into(),
+            Some("rust".into()),
+            parser.parse(text, None),
+        );
+        let coordinator = server.injection_coordinator();
+        let revision = coordinator.reopen_revision(&uri).unwrap();
+        let mut old = coordinator.resolve_injection_data(&uri, "rust").unwrap();
+        let resolved = old.clone();
+        if !query_reload {
+            for region in &mut old {
+                region.content = format!("stale-{}", region.content);
+            }
+        }
+        assert_eq!(old.len(), 2);
+        let pool = server.bridge.pool();
+        pool.open_host_incarnation(&uri, incarnation).await;
+        let key = ConnectionKey::for_server("test");
+        let handle = test_helpers::create_handle_with_state(ConnectionState::Ready).await;
+        pool.insert_connection(std::sync::Arc::clone(&handle)).await;
+        server
+            .settings_manager
+            .apply_settings(crate::config::WorkspaceSettings {
+                auto_install: false,
+                language_servers: std::collections::HashMap::from([(
+                    "test".into(),
+                    crate::config::settings::BridgeServerConfig {
+                        cmd: Some(vec!["sh".into(), "-c".into(), "cat > /dev/null".into()]),
+                        languages: Some(vec!["rust".into()]),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            });
+        let host_uri = crate::lsp::lsp_impl::url_to_uri(&uri).unwrap();
+        let (mut sender, mut received) = tokio::sync::mpsc::channel(8);
+        for region in old.iter().filter(|_| !unopened) {
+            pool.record_latest_virtual_content(
+                &uri,
+                incarnation,
+                &region.language,
+                &region.region_id,
+                &region.content,
+            );
+            pool.ensure_document_opened_from_snapshot(
+                &mut sender,
+                &uri,
+                &VirtualDocumentUri::new(&host_uri, &region.language, &region.region_id),
+                &region.content,
+                &key,
+            )
+            .await
+            .unwrap();
+            received.recv().await.unwrap();
+        }
+        // Keep a weaker, already-scheduled pass in flight: it must not absorb
+        // the authoritative forwarding needed after a partially enqueued repair.
+        let _weaker = coordinator
+            .settle_retry_waiters
+            .claim("open-injection", &uri, Some(incarnation))
+            .unwrap();
+        let reserved = if query_reload {
+            install_query(1);
+            server.cache.bump_semantic_token_generation();
+            None
+        } else {
+            Some(handle.reserve_outbound_capacity_for_test().await)
+        };
+        let current = coordinator.resolve_injection_data(&uri, "rust").unwrap();
+        assert_eq!(
+            old.iter().map(|r| &r.region_id).collect::<Vec<_>>(),
+            current.iter().map(|r| &r.region_id).collect::<Vec<_>>()
+        );
+        assert!(
+            old.iter()
+                .zip(&current)
+                .all(|(a, b)| a.content != b.content)
+        );
+        let outcome = coordinator
+            .reopen_server_documents(
+                &server.settings_manager.load_settings(),
+                "rust",
+                &uri,
+                revision,
+                &key,
+                resolved,
+            )
+            .await;
+        assert_eq!(outcome, OpenOutcome::NotOpened);
+        if !query_reload {
+            assert_eq!(
+                coordinator.reopen_snapshot_state(&uri, revision),
+                super::ReopenSnapshotState::Current,
+                "backpressure must fail repair without changing its snapshot"
+            );
+        }
+        // Probe normal opens on fresh connections: they consume the forwarded
+        // cache, which must also stop overriding current content with old text.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut attempt = 0;
+            loop {
+                let probe_key = ConnectionKey::for_server(&format!("probe-{attempt}"));
+                attempt += 1;
+                let mut all_current = true;
+                for (before, after) in old.iter().zip(&current) {
+                    pool.ensure_document_opened(
+                        &mut sender,
+                        &uri,
+                        &VirtualDocumentUri::new(&host_uri, &before.language, &before.region_id),
+                        &before.content,
+                        &probe_key,
+                    )
+                    .await
+                    .unwrap();
+                    let OutboundMessage::Untracked(message) = received.recv().await.unwrap() else {
+                        panic!("expected notification")
+                    };
+                    all_current &= message["params"]["textDocument"]["text"] == after.content;
+                }
+                if all_current {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("failed repair must refresh the forwarded cache without an edit");
+        if !query_reload && !unopened {
+            assert!(
+                coordinator
+                    .settle_retry_waiters
+                    .claim("injection", &uri, Some(incarnation))
+                    .is_none(),
+                "a failed first retry must keep synchronization pending"
+            );
+        }
+        if unopened {
+            // Keep the queue full until the detached eager attempt has also
+            // failed, rather than letting a late first attempt consume capacity.
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !server.bridge.eager_open_tasks_finished(&uri) {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        drop(reserved);
+        if unopened {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !current.iter().all(|region| {
+                    pool.is_document_opened_on_connection(
+                        &VirtualDocumentUri::new(&host_uri, &region.language, &region.region_id),
+                        &key,
+                    )
+                }) {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("a failed didOpen must recover after queue capacity returns");
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if coordinator
+                    .settle_retry_waiters
+                    .claim("injection", &uri, Some(incarnation))
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("recovery must finish after queue capacity returns");
+        // Both regions opened before the rejection were synchronized, including
+        // the earlier batch region. An authoritative repeat should send nothing.
+        for region in &current {
+            pool.ensure_document_opened_from_snapshot(
+                &mut sender,
+                &uri,
+                &VirtualDocumentUri::new(&host_uri, &region.language, &region.region_id),
+                &region.content,
+                &key,
+            )
+            .await
+            .unwrap();
+        }
+        assert!(
+            received.try_recv().is_err(),
+            "reconciliation must synchronize already-opened content too"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::completed_reload(false)]
+    #[case::reload_in_progress(true)]
+    #[tokio::test]
+    async fn reopen_rejects_queries_changed_without_a_document_edit(#[case] in_progress: bool) {
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let uri = Url::parse("file:///reopen-query-generation.rs").unwrap();
+        let text = "fn main() {}";
+        server.documents.insert(
+            uri.clone(),
+            text.into(),
+            Some("rust".into()),
+            parser.parse(text, None),
+        );
+        let injection = server.injection_coordinator();
+        let revision = injection.reopen_revision(&uri).unwrap();
+        assert_eq!(
+            injection.reopen_snapshot_state(&uri, revision),
+            super::ReopenSnapshotState::Current
+        );
+        assert_eq!(
+            injection.reopen_document_revision(&uri, revision),
+            Some(revision.document)
+        );
+        if in_progress {
+            server.parser_pool.lock().unwrap().begin_reload();
+        } else {
+            server.cache.bump_semantic_token_generation();
+        }
+        assert_eq!(
+            injection.document_revision(&uri),
+            Some(revision.document),
+            "reload preserves the document revision"
+        );
+        assert_eq!(
+            injection.reopen_document_revision(&uri, revision),
+            None,
+            "enqueue must reject the retired query result"
+        );
+        assert_eq!(
+            injection.reopen_snapshot_state(&uri, revision),
+            super::ReopenSnapshotState::Changed,
+            "empty and no-target results need the same query guard"
+        );
+        if in_progress {
+            server.parser_pool.lock().unwrap().finish_reload();
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::current(false, crate::lsp::bridge::OpenOutcome::NotApplicable)]
+    #[case::edited(true, crate::lsp::bridge::OpenOutcome::NotOpened)]
+    #[tokio::test]
+    async fn reopen_not_applicable_requires_the_resolved_revision(
+        #[case] edited: bool,
+        #[case] expected: crate::lsp::bridge::OpenOutcome,
+    ) {
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let uri = Url::parse("file:///reopen-not-applicable.rs").unwrap();
+        let text = "fn main() {}";
+        server.documents.insert(
+            uri.clone(),
+            text.into(),
+            Some("rust".into()),
+            parser.parse(text, None),
+        );
+        let injection = server.injection_coordinator();
+        let revision = injection.reopen_revision(&uri).unwrap();
+        if edited {
+            let newer = "fn newer() {}";
+            server
+                .documents
+                .update_document(uri.clone(), newer.into(), None);
+            publish_test_snapshot(
+                server,
+                &uri,
+                newer,
+                parser.parse(newer, None).unwrap(),
+                "rust",
+            );
+        }
+        // These nonempty resolved regions belong to the captured revision.
+        // A no-target answer must not validate them against a newer parse.
+        let outcome = injection
+            .reopen_server_documents(
+                &server.settings_manager.load_settings(),
+                "rust",
+                &uri,
+                revision,
+                &crate::lsp::bridge::ConnectionKey::for_server("not-selected"),
+                vec![super::BridgeInjection {
+                    language: "python".into(),
+                    region_id: "00000000000000000000000000".into(),
+                    content: "old()".into(),
+                }],
+            )
+            .await;
+        assert_eq!(outcome, expected);
+    }
+
+    #[rstest::rstest]
+    #[case::edited(false)]
+    #[case::reopened(true)]
+    #[tokio::test]
+    async fn reopen_empty_result_cannot_be_confirmed_by_a_newer_snapshot(#[case] reopen: bool) {
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), language.clone());
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let uri = Url::parse("file:///reopen-revision.rs").unwrap();
+        let text = "fn main() {}";
+        server.documents.insert(
+            uri.clone(),
+            text.into(),
+            Some("rust".into()),
+            parser.parse(text, None),
+        );
+        let injection = server.injection_coordinator();
+        let revision = injection.reopen_revision(&uri).unwrap();
+        assert!(
+            injection
+                .bridge_injections(&uri)
+                .unwrap()
+                .1
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            injection.reopen_snapshot_state(&uri, revision),
+            super::ReopenSnapshotState::Current
+        );
+
+        if reopen {
+            server.documents.remove(&uri);
+            server.documents.insert(
+                uri.clone(),
+                text.into(),
+                Some("rust".into()),
+                parser.parse(text, None),
+            );
+        } else {
+            let edited = "fn newer() {}";
+            server
+                .documents
+                .update_document(uri.clone(), edited.into(), None);
+            publish_test_snapshot(
+                server,
+                &uri,
+                edited,
+                parser.parse(edited, None).unwrap(),
+                "rust",
+            );
+        }
+        assert!(
+            injection.snapshot_is_current(&uri),
+            "precondition: the replacement parse is already current"
+        );
+        assert_eq!(
+            injection.reopen_snapshot_state(&uri, revision),
+            super::ReopenSnapshotState::Changed,
+            "the replacement snapshot cannot confirm the old empty resolution"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::with_query(true)]
+    #[case::without_query(false)]
+    #[tokio::test]
+    async fn bridge_fast_path_rejects_a_language_from_before_redetection(#[case] has_query: bool) {
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        // Both names have a published parser, so a stale language cannot
+        // be rejected merely because its parser has not finished loading.
+        for name in ["rust", "old-rust"] {
+            server
+                .language
+                .language_registry_for_parallel()
+                .register(name.into(), language.clone());
+            if has_query {
+                server.language.query_store().insert_injection_query(
+                    name.into(),
+                    std::sync::Arc::new(tree_sitter::Query::new(&language, "").unwrap()),
+                );
+            }
+        }
+        let uri = Url::parse("file:///redetected.rs").unwrap();
+        let text = "fn main() {}";
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        server.documents.insert(
+            uri.clone(),
+            text.into(),
+            Some("rust".into()),
+            parser.parse(text, None),
+        );
+        let snapshot = server
+            .documents
+            .latest_snapshot(&uri)
+            .unwrap()
+            .slot
+            .snapshot
+            .unwrap();
+        assert!(server.documents.complete_parse(
+            &uri,
+            crate::document::LanguageCheck::Expect(Some("rust")),
+            &snapshot,
+            Some(crate::document::snapshot::ResolvedRegions::empty(
+                server.cache.semantic_token_generation(),
+            )),
+        ));
+        let injection = server.injection_coordinator();
+        assert!(
+            injection
+                .resolve_injection_data(&uri, "rust")
+                .unwrap()
+                .is_empty(),
+            "precondition: the current language can consume the cached empty result"
+        );
+        assert!(
+            injection.resolve_injection_data(&uri, "old-rust").is_none(),
+            "a language screened before redetection must not validate the replacement snapshot's empty result"
+        );
     }
 
     /// A reload publishes a version-current placeholder with no tree while

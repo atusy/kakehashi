@@ -101,7 +101,7 @@ pub(crate) use text_document::{
     extract_document_link_envelope, extract_envelope, extract_inlay_hint_envelope,
     extract_type_hierarchy_envelope, parse_code_actions_leniently, parse_type_hierarchy_items,
 };
-pub(crate) use text_document::{OpenExpectation, OpenOutcome};
+pub(crate) use text_document::{OpenExpectation, OpenOutcome, OpenRevision};
 pub(crate) use workspace::WorkspaceFolderSet;
 
 /// Integration tests for the bridge module.

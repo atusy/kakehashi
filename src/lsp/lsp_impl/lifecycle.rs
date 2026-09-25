@@ -1814,13 +1814,10 @@ fn spawn_upstream_request(
                                 continue;
                             }
                         }
-                        // Incarnation BEFORE injections, matching the ordering the
-                        // inline heal used: a close+reopen landing between the two
-                        // reads then pairs a stale incarnation with fresh
-                        // injections, which the downstream sync rejects. The
-                        // reverse pairs stale injections with a fresh incarnation,
-                        // which reads as current.
-                        let Some(incarnation) = injection.document_incarnation(&host) else {
+                        // Capture document and query revisions BEFORE resolving
+                        // injections. An edit, reopen, or query reload must not
+                        // validate a result derived from the old inputs.
+                        let Some(revision) = injection.reopen_revision(&host) else {
                             continue;
                         };
                         let Some((host_language, injections)) = injection.bridge_injections(&host)
@@ -1848,21 +1845,12 @@ fn spawn_upstream_request(
                             continue;
                         };
                         if injections.is_empty() {
-                            // Empty means one of two very different things: this
-                            // host genuinely has no region for this server, or
-                            // an edit cleared the tree between the currency
-                            // check above and this resolution — `didChange`
-                            // clears it WITHOUT bumping the incarnation, so
-                            // neither guard above catches that. Re-check rather
-                            // than assume the benign reading, because the benign
-                            // reading is the one that releases commands.
-                            // ...unless the host is simply gone. A buffer
-                            // closed mid-sweep is not a repair this connection
-                            // is owed, and `document_language` falls back to the
-                            // URI extension, so a closed document can reach here
-                            // and would otherwise wedge the barrier shut.
-                            if injection.document_incarnation(&host).is_some()
-                                && !injection.snapshot_is_current(&host)
+                            // Confirm exactly the revision used for resolution,
+                            // even if a newer parse is already current. A closed
+                            // document is no longer owed a repair; distinguish
+                            // that case in the same store read.
+                            if injection.reopen_snapshot_state(&host, revision)
+                                == super::coordinator::ReopenSnapshotState::Changed
                             {
                                 repaired = false;
                             }
@@ -1879,21 +1867,13 @@ fn spawn_upstream_request(
                         // connection, so fanning out would only contend on the
                         // single-writer outbound queue.
                         let outcome = injection
-                            .bridge()
-                            .ensure_server_documents_open(
+                            .reopen_server_documents(
                                 &settings,
                                 &host_language,
                                 &host,
-                                crate::lsp::bridge::OpenExpectation {
-                                    incarnation,
-                                    // Both the filter and the target: only hosts
-                                    // that route here are opened, and they are
-                                    // opened HERE.
-                                    connection: Some(&key),
-                                    expected_connection: None,
-                                },
+                                revision,
+                                &key,
                                 injections,
-                                &reopen_server,
                             )
                             .await;
                         match outcome {
@@ -5774,17 +5754,73 @@ mod reopen_order_tests {
         );
     }
 
-    /// Exercise the actual producer, not a test that supplies `done=true` by
-    /// hand. A false or missing completion must fail even though E2E command
-    /// retries can eventually pass a retired failed barrier.
+    /// Exercise the actual producer for both success and incomplete results.
+    /// E2E retries alone cannot distinguish them because commands can later
+    /// pass a retired failed barrier.
+    #[rstest::rstest]
+    #[case::no_documents(false, true)]
+    #[case::invalidation_placeholder(true, false)]
     #[tokio::test]
-    async fn completed_reopen_reports_success() {
+    async fn reopen_reports_whether_documents_could_be_resolved(
+        #[case] invalidated: bool,
+        #[case] expected: bool,
+    ) {
         use super::*;
         use crate::lsp::bridge::{ConnectionKey, UpstreamRequest};
         use tower_lsp_server::LspService;
 
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
+        // Let injections reach the retired server. Otherwise configuration
+        // alone proves the placeholder irrelevant, and the sweep correctly
+        // skips it before the tree-less snapshot is examined.
+        server
+            .settings_manager
+            .apply_settings(crate::config::WorkspaceSettings {
+                auto_install: false,
+                language_servers: std::collections::HashMap::from([(
+                    "retired-server".into(),
+                    crate::config::settings::BridgeServerConfig {
+                        cmd: Some(vec!["retired-server".into()]),
+                        languages: Some(vec!["html".into()]),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            });
+        if invalidated {
+            let uri = Url::parse("file:///reopen-placeholder.rs").unwrap();
+            let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+            // A published parser keeps the language settled, so only the
+            // missing tree can make the result incomplete.
+            server
+                .language
+                .language_registry_for_parallel()
+                .register("rust".into(), language.clone());
+            let mut parser = tree_sitter::Parser::new();
+            parser.set_language(&language).unwrap();
+            let text = "fn main() {}";
+            server.documents.insert(
+                uri.clone(),
+                text.into(),
+                Some("rust".into()),
+                parser.parse(text, None),
+            );
+            server.documents.invalidate_all_parses();
+            assert!(server.injection_coordinator().snapshot_is_current(&uri));
+            assert!(
+                server
+                    .documents
+                    .latest_snapshot(&uri)
+                    .unwrap()
+                    .slot
+                    .snapshot
+                    .as_ref()
+                    .unwrap()
+                    .tree
+                    .is_none()
+            );
+        }
         let context = Arc::new(UpstreamDeliveryContext {
             diagnostic_publisher: Arc::new(
                 crate::lsp::lsp_impl::coordinator::DiagnosticPublisher::new(server),
@@ -5804,16 +5840,14 @@ mod reopen_order_tests {
             false,
             Some(context),
         );
-        // No documents need repair. Await the producer's own completion signal,
-        // with a generous deadlock guard rather than a latency assertion.
+        // Await the producer's own signal, including the false result for a
+        // version-current placeholder. No test-supplied completion can mask a
+        // sweep that accidentally treats the missing tree as zero regions.
         tokio::time::timeout(std::time::Duration::from_secs(15), completion.changed())
             .await
             .expect("reopen task must finish")
             .expect("reopen task must report its result before dropping the sender");
-        assert!(
-            *completion.borrow(),
-            "a completed repair must report success"
-        );
+        assert_eq!(*completion.borrow(), expected);
     }
 
     #[cfg(unix)]

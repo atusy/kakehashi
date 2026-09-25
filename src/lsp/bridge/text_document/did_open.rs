@@ -14,9 +14,6 @@ use super::super::pool::{
 use super::super::protocol::VirtualDocumentUri;
 use super::super::protocol::{RoutingLanguageServer, RoutingParams, RoutingTextDocument};
 
-/// What the caller requires to STILL hold by the time an eager open actually
-/// runs. Both fields are preconditions checked inside the open, not inputs to
-/// it, which is why they travel together.
 /// Whether an eager open did what the caller asked for.
 ///
 /// Only a caller that named a `connection` can act on the difference, but the
@@ -43,6 +40,7 @@ pub(crate) enum OpenOutcome {
     NotOpened,
 }
 
+/// Preconditions that must still hold when an eager open reaches enqueue.
 pub(crate) struct OpenExpectation<'a> {
     /// The document lifetime the injections were resolved under; a close+reopen
     /// in between invalidates them.
@@ -65,6 +63,20 @@ pub(crate) struct OpenExpectation<'a> {
     /// not force a ready-only repair; it rejects a race that reacquires a
     /// different key after the group was formed.
     pub(crate) expected_connection: Option<ConnectionKey>,
+    /// A respawn repair must still describe the revision it resolved. Ordinary
+    /// deferred opens instead take their content from the latest-content cache.
+    pub(crate) revision: Option<OpenRevision<'a>>,
+}
+
+/// Caller-owned document access for a revision-bound repair. Routing-provider
+/// requests and connection acquisition finish before the edit lock is taken.
+/// Queue-time workspace-folder announcements and connection liveness checks
+/// stay inside the edit/lifecycle critical section with the document enqueue.
+pub(crate) struct OpenRevision<'a> {
+    pub(crate) content_version: u64,
+    pub(crate) edit_lock: &'a tokio::sync::Mutex<()>,
+    /// The caller also rejects retired query generations and reloads in progress.
+    pub(crate) read: &'a (dyn Fn() -> Option<super::super::HostRevision> + Send + Sync),
 }
 
 struct LifecycleCleanup<'a> {
@@ -188,11 +200,13 @@ impl LanguageServerPool {
         }
     }
 
-    /// Fire `didOpen` for every resolved bridge virtual URI so the downstream
-    /// server starts analyzing immediately instead of waiting for the first
-    /// user request. Fire-and-forget: per-document failures are logged at
-    /// debug level and never propagated; one open failing leaves the others
-    /// alone.
+    /// Enqueue opens for resolved virtual documents so analysis can start
+    /// before the first request. A revision expectation also synchronizes
+    /// changed content on documents already open on this connection.
+    ///
+    /// Return `NotOpened` when a required enqueue fails or the expected
+    /// document/connection becomes stale. Individual enqueue failures allow
+    /// other injections to proceed, but the batch remains incomplete.
     pub(crate) async fn eager_open_virtual_documents(
         &self,
         server_name: &str,
@@ -206,6 +220,7 @@ impl LanguageServerPool {
             incarnation: expected_incarnation,
             connection: expected_key,
             expected_connection,
+            revision,
         } = expect;
         // Routing decisions for injected documents are cached by virtual URI.
         // Use one of those URIs for connection acquisition; resolving from the
@@ -356,6 +371,19 @@ impl LanguageServerPool {
             lifecycle: &lifecycle,
         };
         for injection in injections {
+            let _edit_guard = match revision.as_ref() {
+                Some(revision) => Some(revision.edit_lock.lock().await),
+                None => None,
+            };
+            if let Some(revision) = &revision
+                && (revision.read)()
+                    != Some(super::super::HostRevision {
+                        incarnation: expected_incarnation,
+                        content_version: revision.content_version,
+                    })
+            {
+                return OpenOutcome::NotOpened;
+            }
             // Hold the host cache guard through didOpen. didClose/reopen replaces
             // this entry, so it either linearizes after this open (and closes the
             // tracked virtual document) or wins first and makes this stale batch
@@ -384,6 +412,11 @@ impl LanguageServerPool {
                 drop(lifecycle_guard);
                 continue;
             }
+            // This applies an already-decided route through notifications; it
+            // does not await a routing-provider response. Keep these enqueues
+            // serialized with the following document open and host close. Both
+            // this operation and the open below need the pool's connection lock
+            // to reject a replaced handle before sending.
             if let Err(error) = self
                 .apply_host_routing_workspace_folders(&routing_uri, server_name, &handle)
                 .await
@@ -427,8 +460,20 @@ impl LanguageServerPool {
                 return OpenOutcome::NotOpened;
             }
 
-            if let Err(e) = self
-                .ensure_document_opened(
+            // Reloads do not take the edit lock. Recheck after the awaited
+            // locks, before this connection can receive old snapshot content.
+            if let Some(revision) = &revision
+                && (revision.read)()
+                    != Some(super::super::HostRevision {
+                        incarnation: expected_incarnation,
+                        content_version: revision.content_version,
+                    })
+            {
+                return OpenOutcome::NotOpened;
+            }
+
+            let opened = if revision.is_some() {
+                self.ensure_document_opened_from_snapshot(
                     &mut sender,
                     host_uri,
                     &virtual_uri,
@@ -436,7 +481,29 @@ impl LanguageServerPool {
                     &connection_key,
                 )
                 .await
+            } else {
+                self.ensure_document_opened(
+                    &mut sender,
+                    host_uri,
+                    &virtual_uri,
+                    &injection.content,
+                    &connection_key,
+                )
+                .await
+            };
+            // The query set can also change while opening. The connection
+            // guard orders sends, but a changed query set is not caught up.
+            if let Some(revision) = &revision
+                && (revision.read)()
+                    != Some(super::super::HostRevision {
+                        incarnation: expected_incarnation,
+                        content_version: revision.content_version,
+                    })
             {
+                return OpenOutcome::NotOpened;
+            }
+
+            if let Err(e) = opened {
                 log::debug!(
                     target: "kakehashi::bridge",
                     "Eager open: failed to open {} on {}: {}",
@@ -895,6 +962,78 @@ mod tests {
         }
     }
 
+    #[rstest::rstest]
+    #[case::current(1, 0, OpenOutcome::Opened, true)]
+    #[case::superseded(2, 0, OpenOutcome::NotOpened, false)]
+    #[case::reload_before_enqueue(1, 2, OpenOutcome::NotOpened, false)]
+    #[case::reload_during_enqueue(1, 3, OpenOutcome::NotOpened, true)]
+    #[tokio::test]
+    async fn repair_checks_content_revision_under_the_edit_lock(
+        #[case] current_version: u64,
+        #[case] reject_read: usize,
+        #[case] expected: OpenOutcome,
+        #[case] opened: bool,
+    ) {
+        let pool = LanguageServerPool::new();
+        let key = crate::lsp::bridge::ConnectionKey::for_server("test-server");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        pool.insert_connection(handle).await;
+        let host_uri = test_host_uri("revision_repair");
+        let uri = url_to_uri(&host_uri);
+        pool.open_host_incarnation(&host_uri, 1).await;
+        let edit_lock = tokio::sync::Mutex::new(());
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let read = || {
+            let count = reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if count == reject_read {
+                return None;
+            }
+            assert!(
+                edit_lock.try_lock().is_err(),
+                "revision must be checked while edits are serialized"
+            );
+            Some(crate::lsp::bridge::HostRevision {
+                incarnation: 1,
+                content_version: current_version,
+            })
+        };
+        let outcome = pool
+            .eager_open_virtual_documents(
+                "test-server",
+                &devnull_config(),
+                &host_uri,
+                &uri,
+                OpenExpectation {
+                    incarnation: 1,
+                    connection: Some(&key),
+                    expected_connection: None,
+                    revision: Some(super::OpenRevision {
+                        content_version: 1,
+                        edit_lock: &edit_lock,
+                        read: &read,
+                    }),
+                },
+                vec![super::super::super::coordinator::BridgeInjection {
+                    language: "lua".into(),
+                    region_id: TEST_ULID_LUA_0.into(),
+                    content: "print('old')".into(),
+                }],
+            )
+            .await;
+        assert_eq!(outcome, expected);
+        assert_eq!(
+            pool.is_document_opened_on_connection(
+                &VirtualDocumentUri::new(&uri, "lua", TEST_ULID_LUA_0),
+                &key,
+            ),
+            opened
+        );
+        assert!(
+            edit_lock.try_lock().is_ok(),
+            "repair must release the edit lock"
+        );
+    }
+
     /// Test that eager_open_virtual_documents marks virtual documents as opened.
     ///
     /// Given a ready server and injection data, calling eager_open_virtual_documents
@@ -941,6 +1080,7 @@ mod tests {
                     incarnation: 1,
                     connection: None,
                     expected_connection: None,
+                    revision: None,
                 },
                 injections,
             )
@@ -1004,6 +1144,7 @@ mod tests {
                     incarnation: 1,
                     connection: Some(&claimed),
                     expected_connection: None,
+                    revision: None,
                 },
                 vec![BridgeInjection {
                     language: "lua".to_string(),
@@ -1061,6 +1202,7 @@ mod tests {
                     incarnation: 1,
                     connection: Some(&shared_key),
                     expected_connection: None,
+                    revision: None,
                 },
                 vec![BridgeInjection {
                     language: "lua".to_string(),
@@ -1118,6 +1260,7 @@ mod tests {
                     incarnation: 1,
                     connection: Some(&gone),
                     expected_connection: None,
+                    revision: None,
                 },
                 injections,
             )
@@ -1173,6 +1316,7 @@ mod tests {
                     incarnation: 1,
                     connection: Some(&elsewhere),
                     expected_connection: None,
+                    revision: None,
                 },
                 vec![BridgeInjection {
                     language: "lua".to_string(),
@@ -1220,6 +1364,7 @@ mod tests {
                     incarnation: 1,
                     connection: Some(&routed_key),
                     expected_connection: None,
+                    revision: None,
                 },
                 vec![BridgeInjection {
                     language: "lua".to_string(),
@@ -1277,6 +1422,7 @@ mod tests {
                     incarnation: 1,
                     connection: None,
                     expected_connection: None,
+                    revision: None,
                 },
                 injections.clone(),
             )
@@ -1300,6 +1446,7 @@ mod tests {
                     incarnation: 1,
                     connection: None,
                     expected_connection: None,
+                    revision: None,
                 },
                 injections,
             )

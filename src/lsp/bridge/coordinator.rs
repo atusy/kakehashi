@@ -690,29 +690,19 @@ impl BridgeCoordinator {
     // Config lookup (moved from Kakehashi)
     // ========================================
 
-    /// Await eager-opening ONLY `server_name`'s virtual documents for `host_uri`,
-    /// so a bridged `workspace/executeCommand` routed to a respawned downstream
-    /// (whose doc tracker was purged) doesn't compute against missing document
-    /// state. Unlike the request path, executeCommand has no
-    /// `ensure_document_opened` step; unlike [`Self::eager_spawn_and_open_documents`]
-    /// (fire-and-forget), this is AWAITED so that, WHEN a `didOpen` is enqueued,
-    /// it lands on the shared single-writer connection before the caller sends
-    /// the command (FIFO → didOpen first). The open is best-effort:
-    /// `eager_open_virtual_documents` may skip or return early (downstream not
-    /// ready, outbound queue full), in which case no `didOpen` is queued and the
-    /// command simply proceeds without it (handled fail-soft by dispatch). A
-    /// no-op when the docs are already open (idempotent claim), and when no
-    /// injection maps to `server_name`; the re-open sweep synchronizes the
-    /// host layer separately before calling this injection-only helper.
+    /// Await the opens required by `server_name` for this host, filtered to
+    /// `expect.connection` when repairing one respawned connection. Host-layer
+    /// synchronization is handled separately by the reopen sweep.
     ///
-    /// This heals MISSING document state (a purged tracker), not stale content —
-    /// it never sends `didChange` (that is the edit path's job). And it is
-    /// best-effort against a *concurrent* respawn: if the downstream is replaced
-    /// in the narrow gap between this open and the caller's own connection
-    /// acquisition, the command can still execute against missing state (the
-    /// fresh server may error, no-op, or act on incomplete state); any failure
-    /// is handled fail-soft by the existing dispatch path. Still a far smaller
-    /// window than the codeAction↔executeCommand gap this closes.
+    /// A revision-validated repair also synchronizes already-open documents
+    /// with changed content. Without that expectation, an existing open is
+    /// reused. The returned outcome distinguishes confirmed enqueue, no
+    /// applicable injections, and incomplete repair; the sweep uses it to
+    /// decide whether commands waiting on its barrier may proceed.
+    ///
+    /// Notifications enter the connection's single-writer queue before this
+    /// call completes. Connection replacement and document-lifetime checks in
+    /// the open path prevent stale batches from marking a replacement repaired.
     pub(crate) async fn ensure_server_documents_open(
         &self,
         settings: &Arc<WorkspaceSettings>,
@@ -1434,16 +1424,16 @@ impl BridgeCoordinator {
 
     /// Forward didChange notifications to opened virtual documents.
     ///
-    /// Delegates to the pool's forward_didchange_to_opened_docs method.
+    /// Returns false if any attempted enqueue fails and needs another sync pass.
     pub(crate) async fn forward_didchange_to_opened_docs(
         &self,
         uri: &Url,
         incarnation: u64,
         injections: &[BridgeInjection],
-    ) {
+    ) -> bool {
         self.pool
             .forward_didchange_to_opened_docs(uri, incarnation, injections)
-            .await;
+            .await
     }
 
     pub(crate) async fn open_host_incarnation(&self, uri: &Url, incarnation: u64) {
@@ -1799,6 +1789,7 @@ impl BridgeCoordinator {
                                 // The eager batch opens wherever the host routes now.
                                 connection: None,
                                 expected_connection: Some(connection_key.clone()),
+                                revision: None,
                             },
                             group_injections,
                         ) => {}
@@ -3515,6 +3506,7 @@ mod tests {
                     incarnation: 1,
                     connection: None,
                     expected_connection: None,
+                    revision: None,
                 },
                 injections,
                 "other-server",
