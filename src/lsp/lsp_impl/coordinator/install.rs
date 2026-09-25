@@ -637,11 +637,14 @@ impl InstallCoordinator {
             // A shared failure is the owner's to record, in the generation
             // its attempt started in: a waiter joining after a reload must
             // not spend that reload's retry on an attempt from before it.
-            // Its wait for a retry is not generation-scoped, though, and an
-            // owner cancelled mid-install never records it, so the waiter
-            // puts the language on the wait itself — only then: a settled
-            // owner recorded it, and a reload may already have retried it.
-            if terminal.is_failure() && !completion_token.owner_settled() {
+            // Its wait for a retry is not generation-scoped, though, and the
+            // owner may never record it (cancelled mid-install, or its claim
+            // finished by a detached check), so the waiter puts the language
+            // on the wait itself. Whether the failure was already recorded
+            // and retried cannot be told from here — a reload may retire it
+            // while this waiter still belongs to the pre-reload claim — so
+            // this errs toward one more reload rather than a lost retry.
+            if terminal.is_failure() {
                 self.auto_install.defer_query_repair_retry(language);
             }
             if terminal == crate::lsp::auto_install::InstallOutcome::Abandoned
