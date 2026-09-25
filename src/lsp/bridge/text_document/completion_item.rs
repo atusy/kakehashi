@@ -725,6 +725,138 @@ mod tests {
         assert!(edit_lock.try_lock().is_ok());
     }
 
+    /// A resolve-capable virtual completion target under the key the test
+    /// envelope routes to, with the host incarnation open. The sink discards
+    /// whatever is sent; tests answer through the router.
+    #[cfg(unix)]
+    async fn virtual_completion_fixture() -> (
+        Arc<LanguageServerPool>,
+        Arc<ConnectionHandle>,
+        KakehashiEnvelope,
+        crate::config::settings::BridgeServerConfig,
+    ) {
+        use crate::lsp::bridge::ConnectionState;
+        use crate::lsp::bridge::pool::test_helpers::{create_handle_with_command, devnull_config};
+        use tower_lsp_server::ls_types::{CompletionOptions, ServerCapabilities};
+        let pool = Arc::new(LanguageServerPool::new());
+        let envelope = test_envelope();
+        let uri = Url::parse(&envelope.host_uri).unwrap();
+        let config = devnull_config();
+        let (_marker, key) = pool
+            .resolve_acquire(&envelope.origin, &config, Some(&uri))
+            .await;
+        let (handle, _) = create_handle_with_command(
+            ConnectionState::Ready,
+            key,
+            vec!["sh".into(), "-c".into(), "cat > /dev/null".into()],
+            Some(ServerCapabilities {
+                completion_provider: Some(CompletionOptions {
+                    resolve_provider: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        )
+        .await;
+        pool.insert_connection(Arc::clone(&handle)).await;
+        pool.open_host_incarnation(&uri, 1).await;
+        (pool, handle, envelope, config)
+    }
+
+    /// An already-open virtual document needs no barrier: its didOpen is
+    /// ahead in the FIFO, so an unsettled re-open must not hold the resolve.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn virtual_completion_resolve_skips_the_barrier_for_an_open_document() {
+        use crate::lsp::bridge::pool::test_helpers::wait_for_sent_request;
+        let (pool, handle, envelope, config) = virtual_completion_fixture().await;
+        let uri = Url::parse(&envelope.host_uri).unwrap();
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&uri).unwrap(),
+            &envelope.injection_language,
+            &envelope.region_id,
+        );
+        pool.ensure_document_opened(
+            &mut ConnectionHandleSender(&handle),
+            &uri,
+            &virtual_uri,
+            "text",
+            handle.key(),
+        )
+        .await
+        .unwrap();
+        // A re-open is outstanding and never settles within this test.
+        let _done = pool.claim_reopen_for_test(handle.key());
+
+        let edit_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let document = CompletionResolveDocument {
+            host_uri: uri,
+            language_id: envelope.injection_language.clone(),
+            text: Arc::from("text"),
+            geometry: Some((RegionOffset::new(5, 0), Position::new(9, 0))),
+            revision: HostRevision {
+                incarnation: 1,
+                content_version: 1,
+            },
+            edit_guard: Arc::clone(&edit_lock).lock_owned().await,
+        };
+        let upstream_id = UpstreamId::Number(81);
+        let request = {
+            let pool = Arc::clone(&pool);
+            let upstream_id = upstream_id.clone();
+            tokio::spawn(async move {
+                pool.send_completion_resolve_request(
+                    &config,
+                    CompletionItem {
+                        label: "old".into(),
+                        ..Default::default()
+                    },
+                    envelope,
+                    Some(upstream_id),
+                    std::future::ready(Some(document)),
+                )
+                .await
+            })
+        };
+        let downstream_id = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            wait_for_sent_request(&handle, &upstream_id),
+        )
+        .await
+        .expect("an already-open document must not wait on the re-open barrier");
+        let _ = handle.router().route(json!({
+            "jsonrpc": "2.0",
+            "id": downstream_id.as_i64(),
+            "result": { "label": "resolved" }
+        }));
+        assert_eq!(request.await.unwrap().label, "resolved");
+    }
+
+    /// An envelope without a valid virtual identity (legacy, or edited by the
+    /// client) names no document to gate on; it must fail soft, never build a
+    /// virtual URI from the empty fields.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn virtual_completion_resolve_without_identity_fails_soft() {
+        let (pool, _handle, mut envelope, config) = virtual_completion_fixture().await;
+        envelope.region_id = String::new();
+        envelope.injection_language = String::new();
+        let item = pool
+            .send_completion_resolve_request(
+                &config,
+                CompletionItem {
+                    label: "old".into(),
+                    ..Default::default()
+                },
+                envelope,
+                None,
+                std::future::ready(None),
+            )
+            .await;
+        assert_eq!(item.label, "old");
+        assert!(extract_envelope(&item).is_some(), "envelope restored");
+    }
+
     /// A resolve that arrives while a replaced origin is still re-opening its
     /// virtual documents must wait for that re-open instead of finding the
     /// document "not open" and returning the item unresolved.
