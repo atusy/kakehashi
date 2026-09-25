@@ -1205,7 +1205,9 @@ impl LanguageServerPool {
             }
             // The gate saw the virtual document open, but a close may have
             // landed since. Recheck under its transition lock and hold that
-            // through enqueue, so the resolve cannot follow a didClose.
+            // through enqueue, so the resolve cannot follow a didClose. Lock
+            // order is `connections` then transition, as in completion resolve
+            // and didChange; never take them the other way round.
             let _transition = match target {
                 ResolveTarget::Virtual(virtual_uri) => {
                     let transition = self.open_transition_lock(virtual_uri, connection_key);
