@@ -86,7 +86,9 @@ fn build_exclude_matcher(
 ///   content when support cannot be determined from the path alone.
 /// - A path that does not exist is an error.
 ///
-/// The files are sorted and deduplicated for deterministic processing order.
+/// The files are sorted for deterministic processing order, and aliases of
+/// one file collapse to a single entry (see [`dedup_aliases`] for which
+/// aliases are recognized and which spelling survives).
 pub(crate) fn collect_files(
     base: &Path,
     paths: &[PathBuf],
@@ -99,6 +101,7 @@ pub(crate) fn collect_files(
     let mut files = Vec::new();
     let mut walk_errors = 0usize;
     for path in paths {
+        let first_of_this_path = files.len();
         // Normalize before stat: a relative path must resolve against
         // `base`, not against whatever the process cwd happens to be.
         let path = normalize_path(base, path);
@@ -120,16 +123,66 @@ pub(crate) fn collect_files(
                 path.display()
             ));
         }
+        // The walker yields readdir order; sort each argument's share so
+        // the alias survivor below never depends on the filesystem.
+        files[first_of_this_path..].sort();
     }
+    let mut files = dedup_aliases(files);
     files.sort();
     files.dedup();
     Ok(CollectedFiles { files, walk_errors })
 }
 
+/// Drop every entry that names a file already seen earlier in `files`, so a
+/// symlink or a symlinked directory walked next to its target is processed
+/// once, and on Unix a hard link too (see [`file_identity`]).
+///
+/// The survivor is the first spelling in collection order: the path the user
+/// named first, and within one argument the lexicographically first. The
+/// user-facing spelling is never replaced by a resolved one: canonical paths
+/// would rewrite what the user typed (macOS `/var` → `/private/var`,
+/// Windows `\\?\` verbatim prefixes). Writing through a symlink spelling
+/// is safe because `format` canonicalizes before its atomic rename.
+///
+/// Only the surviving spelling is processed, so where the language comes
+/// from the path (extension, file name), aliases spelled differently are
+/// handled as the first spelling's language: the same file cannot be
+/// formatted as two languages in one run.
+///
+/// An entry whose identity cannot be read (it vanished meanwhile) is kept;
+/// the later read reports the failure as it would without deduplication.
+fn dedup_aliases(files: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = std::collections::HashSet::new();
+    files
+        .into_iter()
+        .filter(|path| file_identity(path).is_none_or(|id| seen.insert(id)))
+        .collect()
+}
+
+/// Which file `path` resolves to, following symlinks: device and inode on
+/// Unix, which also unifies hard links, read via `stat` so a FIFO swapped in
+/// after collection is never opened.
+#[cfg(unix)]
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+/// Which file `path` resolves to, following symlinks. Elsewhere std exposes
+/// no stable file index, so the canonical path serves as the key; hard links
+/// there stay separate entries. The canonical form is only compared, never
+/// shown.
+#[cfg(not(unix))]
+fn file_identity(path: &Path) -> Option<PathBuf> {
+    std::fs::canonicalize(path).ok()
+}
+
 /// Absolutize `path` against `base` and clean `.`/`..` components, so the
-/// same file always collects to one canonical form — without this, passing
-/// `doc.md` and `/abs/to/doc.md` (or `sub/../doc.md`) together would defeat
-/// `dedup()` and process the file twice.
+/// user-facing spelling of `doc.md`, `/abs/to/doc.md` and `sub/../doc.md` is
+/// the same clean absolute path. Symlink and hard-link aliases keep distinct
+/// spellings here; [`dedup_aliases`] collapses them by file identity.
 fn normalize_path(base: &Path, path: &Path) -> PathBuf {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -537,6 +590,140 @@ mod tests {
         );
 
         assert_eq!(files, vec![tmp.path().join("doc.md")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_alias_collapses_to_the_first_given_spelling() {
+        // A symlink and its target are one file: processing both would
+        // diagnose it twice or format it twice. The spelling the user named
+        // first survives, in either argument order.
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join("doc.md"), "x");
+        std::os::unix::fs::symlink("doc.md", tmp.path().join("alias.md")).unwrap();
+        let doc = tmp.path().join("doc.md");
+        let alias = tmp.path().join("alias.md");
+
+        let target_first = collect_paths(
+            tmp.path(),
+            &[doc.clone(), alias.clone()],
+            &[],
+            &markdown_only,
+        );
+        let alias_first = collect_paths(
+            tmp.path(),
+            &[alias.clone(), doc.clone()],
+            &[],
+            &markdown_only,
+        );
+
+        assert_eq!(target_first, vec![doc]);
+        assert_eq!(alias_first, vec![alias]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_directory_walked_alongside_its_target_collapses() {
+        // Walking a directory and a symlink to it yields every file under
+        // two spellings; the root named first keeps its spelling.
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join("docs/a.md"), "x");
+        write(&tmp.path().join("docs/sub/b.md"), "x");
+        std::os::unix::fs::symlink("docs", tmp.path().join("link")).unwrap();
+        let docs = tmp.path().join("docs");
+        let link = tmp.path().join("link");
+
+        let target_first = collect_paths(
+            tmp.path(),
+            &[docs.clone(), link.clone()],
+            &[],
+            &markdown_only,
+        );
+        let link_first = collect_paths(
+            tmp.path(),
+            &[link.clone(), docs.clone()],
+            &[],
+            &markdown_only,
+        );
+
+        assert_eq!(target_first, vec![docs.join("a.md"), docs.join("sub/b.md")]);
+        assert_eq!(link_first, vec![link.join("a.md"), link.join("sub/b.md")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_links_collapse_to_one_entry() {
+        // Hard links share one inode, so they are the same file too.
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join("b.md"), "x");
+        std::fs::hard_link(tmp.path().join("b.md"), tmp.path().join("a.md")).unwrap();
+        let a = tmp.path().join("a.md");
+        let b = tmp.path().join("b.md");
+
+        let explicit = collect_paths(tmp.path(), &[b.clone(), a.clone()], &[], &markdown_only);
+        // Within one walk there is no user-given order (the walker yields
+        // readdir order), so the lexicographically first spelling survives.
+        let walked = collect_paths(tmp.path(), &[tmp.path().to_path_buf()], &[], &markdown_only);
+
+        assert_eq!(explicit, vec![b]);
+        assert_eq!(walked, vec![a]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walked_aliases_keep_the_first_spelling_whatever_the_readdir_order() {
+        // One walk yields its entries in readdir order, which is hash order
+        // on APFS and ext4. With many hard-linked names the first entry
+        // listed is almost never the lexicographically first one, so this
+        // pins that the survivor comes from sorted order, not from the
+        // filesystem.
+        let tmp = tempfile::tempdir().unwrap();
+        let names = [
+            "p", "d", "w", "k", "s", "b", "x", "m", "f", "t", "h", "q", "c", "v", "j", "a",
+        ];
+        write(&tmp.path().join("p.md"), "x");
+        for name in &names[1..] {
+            std::fs::hard_link(
+                tmp.path().join("p.md"),
+                tmp.path().join(format!("{name}.md")),
+            )
+            .unwrap();
+        }
+
+        let walked = collect_paths(tmp.path(), &[tmp.path().to_path_buf()], &[], &markdown_only);
+
+        assert_eq!(walked, vec![tmp.path().join("a.md")]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_symlink_alias_collapses_to_the_first_given_spelling() {
+        // Windows keys aliases by canonical path, which is `\\?\`-prefixed;
+        // the survivor must still be the spelling the user gave. Creating a
+        // symlink needs Developer Mode or elevation, so skip without it.
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join("doc.md"), "x");
+        let doc = tmp.path().join("doc.md");
+        let alias = tmp.path().join("alias.md");
+        if std::os::windows::fs::symlink_file(&doc, &alias).is_err() {
+            return;
+        }
+
+        let target_first = collect_paths(
+            tmp.path(),
+            &[doc.clone(), alias.clone()],
+            &[],
+            &markdown_only,
+        );
+        let alias_first = collect_paths(
+            tmp.path(),
+            &[alias.clone(), doc.clone()],
+            &[],
+            &markdown_only,
+        );
+
+        assert_eq!(target_first, vec![doc]);
+        assert_eq!(alias_first, vec![alias]);
     }
 
     #[test]

@@ -847,6 +847,50 @@ fn e2e_hard_linked_file_is_refused_and_counted_as_an_error() {
     );
 }
 
+/// A symlink alias names the same file as its target, so the file is
+/// formatted once, and when the symlink is named first the write goes
+/// through it: the target gains the formatted text and the link survives.
+#[cfg(unix)]
+#[test]
+fn e2e_symlink_alias_is_formatted_once_through_the_link() {
+    let ws = workspace_with(&[("doc.md", MARKDOWN)]);
+    std::os::unix::fs::symlink("doc.md", ws.path().join("alias.md")).expect("create symlink");
+
+    let output = run_format(ws.path(), &["alias.md", "doc.md", "--check"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches("Would reformat").count(),
+        1,
+        "the aliased file must be checked once; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Would reformat: alias.md"),
+        "the first-named spelling is reported; stderr: {stderr}"
+    );
+
+    let output = run_format(ws.path(), &["alias.md", "doc.md"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "format should succeed; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("1 file(s) reformatted, 0 unchanged"),
+        "the aliased file must be formatted once; stderr: {stderr}"
+    );
+    assert!(
+        read(ws.path(), "doc.md").contains("LOCAL X = 1"),
+        "the target must receive the formatted text"
+    );
+    assert!(
+        std::fs::symlink_metadata(ws.path().join("alias.md"))
+            .expect("stat alias")
+            .file_type()
+            .is_symlink(),
+        "writing through the alias must not replace the link"
+    );
+}
+
 #[test]
 fn e2e_excludes_filters_directory_walk() {
     let ws = workspace_with(&[("kept.md", MARKDOWN), ("vendor/dep.md", MARKDOWN)]);
