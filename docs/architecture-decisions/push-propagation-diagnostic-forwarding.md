@@ -504,8 +504,8 @@ Worked traces (servers `a1,a2` in one region, `priorities = [a1, a2]`):
   distinction, so every spawnable server whose `languages` matches the host
   language is opened once `bridge._self.enabled = true`, unless a routing provider
   suppresses the document on it. A server that missed the eager open gets the
-  document from a later sync instead: the debounced re-sync (#431) or the first
-  host request's lazy sync (`host.rs`).
+  document from a later sync instead: the debounced re-sync (#431) or the lazy
+  sync (`host.rs`) of a host request that is routed to that server.
   Because classification is live, a `_self` server may *unregister*
   `textDocument/diagnostic` mid-session (pull-driven → push-driven); it was
   opened on host `didOpen` like any other `_self` server, so the transition needs
@@ -516,9 +516,11 @@ Worked traces (servers `a1,a2` in one region, `priorities = [a1, a2]`):
   newly resolved servers, opening it where it was never open. That re-sync has
   the conditions stated under **Host layer** above (the host layer participates,
   a parse tree exists); without them the newly eligible server gets the document
-  from the next sync that does run: an eager open after a host-language change,
-  or at the latest the first host request. Server `priorities` do not affect
-  which servers are opened.
+  from the next sync that does reach it: an eager open after a host-language
+  change, or a host request routed to that server. Such a request is not
+  guaranteed: it syncs only the servers its method selects (server `priorities`,
+  `maxFanOut`) and that support the method, so a push-only server may stay
+  unopened. Server `priorities` do not affect the eager open or the re-sync.
 - **Re-merge on classification/config change**: a change that alters which slots
   are visible takes effect differently per path. Path A (proactive publish) must
   trigger an immediate host re-merge on any `textDocument/publishDiagnostics`
