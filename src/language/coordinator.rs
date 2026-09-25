@@ -127,7 +127,23 @@ pub(crate) struct LanguageCoordinator {
     is_trial: bool,
 }
 
-type CompiledQueries = HashMap<(Language, String), std::sync::Weak<tree_sitter::Query>>;
+/// Published query per (grammar, complete source text), with the patterns
+/// its tolerant compilation skipped, so a reuse reports them like a compile.
+type CompiledQueries = HashMap<
+    (Language, String),
+    (
+        std::sync::Weak<tree_sitter::Query>,
+        Vec<super::query_loader::SkippedPattern>,
+    ),
+>;
+
+/// A query compiled (or reused) for one grammar and source text.
+struct CompiledQuery {
+    query: Option<Arc<tree_sitter::Query>>,
+    skipped: Vec<super::query_loader::SkippedPattern>,
+    failure_reason: Option<ParseFailure>,
+    multi_file: bool,
+}
 
 /// A registered language as documents see it. Equality is identity: the
 /// grammar compares by its loaded library, and queries by `Arc`, which
@@ -1195,13 +1211,8 @@ impl LanguageCoordinator {
         insert_fn: impl FnOnce(&QueryStore, Arc<tree_sitter::Query>),
     ) {
         let filename = ctx.query_kind.filename();
-        let result = match QueryLoader::load_query_with_inheritance(
-            language,
-            paths,
-            ctx.language_id,
-            filename,
-        ) {
-            Ok(r) => r,
+        let result = match QueryLoader::resolve_query(paths, ctx.language_id, filename) {
+            Ok(resolved) => self.compile_query(language, resolved.content, resolved.file_count > 1),
             Err(err @ crate::language::query_loader::QueryLoadError::RefusedLanguage(_)) => {
                 debug!("{err}");
                 return;
@@ -1234,14 +1245,7 @@ impl LanguageCoordinator {
             ctx.query_kind.name(),
             escape_terminal_controls(ctx.language_id)
         );
-        self.process_query_result(
-            language,
-            result,
-            &query_label,
-            &success_prefix,
-            events,
-            insert_fn,
-        );
+        self.process_query_result(result, &query_label, &success_prefix, events, insert_fn);
     }
 
     /// Load a query from explicit paths (unified queries configuration).
@@ -1253,8 +1257,8 @@ impl LanguageCoordinator {
         events: &mut Vec<LanguageEvent>,
         insert_fn: impl FnOnce(&QueryStore, Arc<tree_sitter::Query>),
     ) {
-        let result = match QueryLoader::load_query_from_paths(language, paths) {
-            Ok(r) => r,
+        let result = match QueryLoader::load_content_from_paths(paths) {
+            Ok(source) => self.compile_query(language, source, paths.len() > 1),
             Err(err) => {
                 events.push(LanguageEvent::log(
                     LanguageLogLevel::Error,
@@ -1278,37 +1282,58 @@ impl LanguageCoordinator {
             ctx.query_kind.name(),
             escape_terminal_controls(ctx.language_id)
         );
-        self.process_query_result(
-            language,
-            result,
-            &query_label,
-            &success_prefix,
-            events,
-            insert_fn,
-        );
+        self.process_query_result(result, &query_label, &success_prefix, events, insert_fn);
     }
 
-    /// The published query compiled from `source` for `language`, or `query`
-    /// when none is alive. See [`Self::compiled_queries`].
-    fn intern_query(
+    /// Compile `source` for `language`, or reuse the query already published
+    /// for exactly that grammar and text without compiling. See
+    /// [`Self::compiled_queries`].
+    fn compile_query(
         &self,
         language: &Language,
         source: String,
-        query: tree_sitter::Query,
-    ) -> Arc<tree_sitter::Query> {
-        let mut compiled = self
+        multi_file: bool,
+    ) -> CompiledQuery {
+        let key = (language.clone(), source);
+        if let Some((published, skipped)) = self
             .compiled_queries
             .lock()
-            .recover_poison("LanguageCoordinator::intern_query");
-        let entry = compiled
-            .entry((language.clone(), source))
-            .or_insert_with(std::sync::Weak::new);
-        if let Some(published) = entry.upgrade() {
-            return published;
+            .recover_poison("LanguageCoordinator::compile_query(lookup)")
+            .get(&key)
+            .and_then(|(query, skipped)| Some((query.upgrade()?, skipped.clone())))
+        {
+            return CompiledQuery {
+                query: Some(published),
+                skipped,
+                failure_reason: None,
+                multi_file,
+            };
         }
-        let query = Arc::new(query);
-        *entry = Arc::downgrade(&query);
-        query
+        // Compile outside the lock; a concurrent compile of the same text
+        // settles on whichever published first.
+        let parsed = QueryLoader::parse_query(language, &key.1, multi_file);
+        let query = parsed.query.map(|query| {
+            let mut compiled = self
+                .compiled_queries
+                .lock()
+                .recover_poison("LanguageCoordinator::compile_query(publish)");
+            let (entry, skipped) = compiled
+                .entry(key)
+                .or_insert_with(|| (std::sync::Weak::new(), Vec::new()));
+            if let Some(published) = entry.upgrade() {
+                return published;
+            }
+            let query = Arc::new(query);
+            *entry = Arc::downgrade(&query);
+            *skipped = parsed.skipped.clone();
+            query
+        });
+        CompiledQuery {
+            query,
+            skipped: parsed.skipped,
+            failure_reason: parsed.failure_reason,
+            multi_file: parsed.multi_file,
+        }
     }
 
     /// Drop the [`Self::compiled_queries`] entries nothing references anymore.
@@ -1316,14 +1341,13 @@ impl LanguageCoordinator {
         self.compiled_queries
             .lock()
             .recover_poison("LanguageCoordinator::prune_compiled_queries")
-            .retain(|_, query| query.strong_count() > 0);
+            .retain(|_, (query, _)| query.strong_count() > 0);
     }
 
     /// Process a ParseResult: log skipped patterns, insert query, log outcome.
     fn process_query_result(
         &self,
-        language: &Language,
-        result: super::query_loader::ParseResult,
+        result: CompiledQuery,
         query_label: &str,
         success_prefix: &str,
         events: &mut Vec<LanguageEvent>,
@@ -1351,10 +1375,7 @@ impl LanguageCoordinator {
 
         match result.query {
             Some(query) => {
-                insert_fn(
-                    &self.query_store,
-                    self.intern_query(language, result.source, query),
-                );
+                insert_fn(&self.query_store, query);
                 let skipped_count = result.skipped.len();
                 let msg = if skipped_count > 0 {
                     format!("{success_prefix} ({skipped_count} pattern(s) skipped)")
