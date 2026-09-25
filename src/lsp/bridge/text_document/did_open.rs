@@ -83,6 +83,111 @@ impl Drop for LifecycleCleanup<'_> {
 }
 
 impl LanguageServerPool {
+    /// Await host synchronization on an existing, exact connection. Unlike an
+    /// eager batch this work is not cancelled by a debounced edit, and its result
+    /// can therefore complete the connection's re-open barrier (#1116).
+    pub(crate) async fn reopen_host_document(
+        &self,
+        key: &ConnectionKey,
+        config: &crate::config::settings::BridgeServerConfig,
+        doc: &super::host::HostDocument<'_>,
+        read: super::host::HostResolveReader<'_>,
+        admit: &(dyn Fn() -> bool + Sync),
+    ) -> OpenOutcome {
+        // Another root's eager open can hold its host lifecycle lock for an
+        // entire handshake. Exclude that document before waiting, so its
+        // unrelated initialization cannot consume this connection's barrier.
+        // This is read-only; repeat the routing check under the lifecycle lock
+        // below before sending, because a route can change while we wait.
+        if self.host_routing_by_server(doc.uri, key.server()) == Some(false)
+            || self
+                .resolved_connection_key(key.server(), config, doc.uri)
+                .await
+                != *key
+        {
+            return OpenOutcome::NotApplicable;
+        }
+        let lifecycle = self.host_lifecycle_lock(doc.uri);
+        let _cleanup = LifecycleCleanup {
+            pool: self,
+            host_uri: doc.uri,
+            lifecycle: &lifecycle,
+        };
+        let _guard = lifecycle.write().await;
+        if !admit()
+            || self.current_host_incarnation(doc.uri) != doc.revision.map(|r| r.incarnation)
+            || !self.accepts_host_language(doc.uri, doc.language_id)
+        {
+            return OpenOutcome::NotOpened;
+        }
+        if self.host_routing_by_server(doc.uri, key.server()) == Some(false) {
+            return OpenOutcome::NotApplicable;
+        }
+        let (routed, announce) = self
+            .resolved_connection_key_and_marker(key.server(), config, doc.uri)
+            .await;
+        if &routed != key {
+            return OpenOutcome::NotApplicable;
+        }
+        let Some(handle) = self
+            .ready_connection_by_key_for_config(key, Some(config))
+            .await
+        else {
+            return OpenOutcome::NotOpened;
+        };
+        if let Some(marker) = announce
+            && self.announce_shared_root(&handle, &marker).await.is_err()
+        {
+            return OpenOutcome::NotOpened;
+        }
+        if self
+            .apply_host_routing_workspace_folders(doc.uri, key.server(), &handle)
+            .await
+            .is_err()
+        {
+            return OpenOutcome::NotOpened;
+        }
+        let connections = self.connections().await;
+        if !connections.get(key).is_some_and(|current| {
+            Arc::ptr_eq(current, &handle) && current.state() == ConnectionState::Ready
+        }) {
+            return OpenOutcome::NotOpened;
+        }
+        let mut docs = self.host_documents().await;
+        let Some(current) = read(doc.uri) else {
+            return OpenOutcome::NotApplicable;
+        };
+        if !admit()
+            || Some(current.revision.incarnation) != doc.revision.map(|r| r.incarnation)
+            || current.language_id != doc.language_id
+        {
+            return OpenOutcome::NotOpened;
+        }
+        if self.host_routing_by_server(doc.uri, key.server()) == Some(false)
+            || self.is_host_routing_suppressed(doc.uri, key)
+        {
+            return OpenOutcome::NotApplicable;
+        }
+        let current = super::host::HostDocument {
+            uri: doc.uri,
+            language_id: &current.language_id,
+            text: &current.text,
+            revision: Some(current.revision),
+        };
+        match super::host::sync_host_document(
+            &mut ConnectionHandleSender(&handle),
+            &mut docs,
+            &current,
+            None,
+            key,
+        )
+        .await
+        {
+            Ok(()) => OpenOutcome::Opened,
+            Err(_) => OpenOutcome::NotOpened,
+        }
+    }
+
     /// Fire `didOpen` for every resolved bridge virtual URI so the downstream
     /// server starts analyzing immediately instead of waiting for the first
     /// user request. Fire-and-forget: per-document failures are logged at
@@ -548,6 +653,247 @@ mod tests {
     use super::super::super::pool::{ConnectionState, LanguageServerPool};
     use super::super::super::protocol::VirtualDocumentUri;
     use super::{OpenExpectation, OpenOutcome};
+
+    #[cfg(unix)]
+    mod host_reopen {
+        use super::*;
+        use crate::lsp::bridge::text_document::host::{HostDocument, HostResolveSnapshot};
+        use crate::lsp::bridge::{ConnectionKey, HostRevision};
+        use std::sync::Arc;
+        use url::Url;
+
+        async fn fixture() -> (LanguageServerPool, ConnectionKey, BridgeServerConfig, Url) {
+            let pool = LanguageServerPool::new();
+            let key = ConnectionKey::for_server("host-server");
+            let mut config = devnull_config_for_language("host-language");
+            config.workspace_markers = Some(Vec::new());
+            let uri = test_host_uri("host_reopen");
+            pool.open_host_incarnation(&uri, 1).await;
+            pool.insert_connection(
+                create_handle_with_key(ConnectionState::Ready, key.clone()).await,
+            )
+            .await;
+            (pool, key, config, uri)
+        }
+
+        fn document(uri: &Url, incarnation: u64) -> HostDocument<'_> {
+            HostDocument {
+                uri,
+                language_id: "host-language",
+                text: "original text",
+                revision: Some(HostRevision {
+                    incarnation,
+                    content_version: 1,
+                }),
+            }
+        }
+
+        fn snapshot(incarnation: u64, version: u64, text: &str) -> HostResolveSnapshot {
+            HostResolveSnapshot {
+                text: Arc::from(text),
+                language_id: "host-language".to_string(),
+                revision: HostRevision {
+                    incarnation,
+                    content_version: version,
+                },
+            }
+        }
+
+        #[tokio::test]
+        async fn unrelated_host_lifecycle_does_not_delay_connection_repair() {
+            let (pool, routed, config, uri) = fixture().await;
+            let other = ConnectionKey::new("host-server", Some("file:///other-root".into()));
+            pool.insert_connection(
+                create_handle_with_key(ConnectionState::Ready, other.clone()).await,
+            )
+            .await;
+            // An eager open on this host holds the lifecycle lock throughout
+            // its handshake. Repairing another root must not wait for it.
+            let lifecycle = pool.host_lifecycle_lock(&uri);
+            let _blocked = lifecycle.write().await;
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                pool.reopen_host_document(
+                    &other,
+                    &config,
+                    &document(&uri, 1),
+                    &|_| Some(snapshot(1, 1, "original text")),
+                    &|| true,
+                ),
+            )
+            .await
+            .expect("an unrelated lifecycle must not consume the repair barrier's wait");
+            assert_eq!(outcome, OpenOutcome::NotApplicable);
+            assert!(
+                !pool
+                    .is_host_document_opened_on_connection(&uri, &other)
+                    .await
+            );
+            assert!(
+                !pool
+                    .is_host_document_opened_on_connection(&uri, &routed)
+                    .await
+            );
+        }
+
+        #[tokio::test]
+        async fn repair_does_not_open_a_host_on_another_root() {
+            let (pool, routed, config, uri) = fixture().await;
+            let other = ConnectionKey::new("host-server", Some("file:///other-root".into()));
+            pool.insert_connection(
+                create_handle_with_key(ConnectionState::Ready, other.clone()).await,
+            )
+            .await;
+            let outcome = pool
+                .reopen_host_document(
+                    &other,
+                    &config,
+                    &document(&uri, 1),
+                    &|_| Some(snapshot(1, 1, "original text")),
+                    &|| true,
+                )
+                .await;
+            assert_eq!(outcome, OpenOutcome::NotApplicable);
+            assert!(
+                !pool
+                    .is_host_document_opened_on_connection(&uri, &other)
+                    .await
+            );
+            assert!(
+                !pool
+                    .is_host_document_opened_on_connection(&uri, &routed)
+                    .await
+            );
+            assert_eq!(pool.connections().await.len(), 2, "repair must not spawn");
+        }
+
+        #[tokio::test]
+        async fn cached_server_and_connection_suppression_each_prevent_host_open() {
+            for by_server in [true, false] {
+                let (pool, key, config, uri) = fixture().await;
+                if by_server {
+                    pool.set_host_routing_by_server(&uri, key.server(), false);
+                } else {
+                    pool.set_host_routing_suppressed(&uri, &key);
+                }
+                let outcome = pool
+                    .reopen_host_document(
+                        &key,
+                        &config,
+                        &document(&uri, 1),
+                        &|_| Some(snapshot(1, 1, "original text")),
+                        &|| true,
+                    )
+                    .await;
+                assert_eq!(outcome, OpenOutcome::NotApplicable, "by_server={by_server}");
+                assert!(!pool.is_host_document_opened_on_connection(&uri, &key).await);
+            }
+        }
+
+        #[tokio::test]
+        async fn a_closed_and_reopened_host_rejects_the_old_lifetime() {
+            let (pool, key, config, uri) = fixture().await;
+            pool.close_host_incarnation(&uri, 1).await;
+            pool.open_host_incarnation(&uri, 2).await;
+            let read = |_: &Url| Some(snapshot(2, 1, "new lifetime"));
+            assert_eq!(
+                pool.reopen_host_document(&key, &config, &document(&uri, 1), &read, &|| true)
+                    .await,
+                OpenOutcome::NotOpened
+            );
+            assert!(!pool.is_host_document_opened_on_connection(&uri, &key).await);
+            assert_eq!(
+                pool.reopen_host_document(&key, &config, &document(&uri, 2), &read, &|| true)
+                    .await,
+                OpenOutcome::Opened
+            );
+            assert!(pool.is_host_document_opened_on_connection(&uri, &key).await);
+        }
+
+        #[tokio::test]
+        async fn settings_changed_before_the_send_prevent_host_open() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let (pool, key, config, uri) = fixture().await;
+            let current_settings = AtomicBool::new(true);
+            let read = |_: &Url| {
+                current_settings.store(false, Ordering::SeqCst);
+                Some(snapshot(1, 1, "original text"))
+            };
+            let admit = || current_settings.load(Ordering::SeqCst);
+            assert_eq!(
+                pool.reopen_host_document(&key, &config, &document(&uri, 1), &read, &admit)
+                    .await,
+                OpenOutcome::NotOpened
+            );
+            assert!(!pool.is_host_document_opened_on_connection(&uri, &key).await);
+        }
+
+        #[tokio::test]
+        async fn an_absent_or_dead_connection_is_not_spawned_by_host_repair() {
+            for state in [None, Some(ConnectionState::Failed)] {
+                let pool = LanguageServerPool::new();
+                let key = ConnectionKey::for_server("host-server");
+                let mut config = devnull_config_for_language("host-language");
+                config.workspace_markers = Some(Vec::new());
+                let uri = test_host_uri("host_reopen_unavailable");
+                pool.open_host_incarnation(&uri, 1).await;
+                if let Some(state) = state {
+                    pool.insert_connection(create_handle_with_key(state, key.clone()).await)
+                        .await;
+                }
+                assert_eq!(
+                    pool.reopen_host_document(
+                        &key,
+                        &config,
+                        &document(&uri, 1),
+                        &|_| { Some(snapshot(1, 1, "original text")) },
+                        &|| true
+                    )
+                    .await,
+                    OpenOutcome::NotOpened,
+                    "state={state:?}"
+                );
+                assert!(!pool.is_host_document_opened_on_connection(&uri, &key).await);
+                let connections = pool.connections().await;
+                assert_eq!(connections.len(), usize::from(state.is_some()));
+                if let Some(state) = state {
+                    assert_eq!(connections.get(&key).unwrap().state(), state);
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn host_repair_sends_current_text_instead_of_the_scheduled_snapshot() {
+            let (pool, key, config, uri) = fixture().await;
+            let read = |_: &Url| Some(snapshot(1, 2, "edited while waiting"));
+            assert_eq!(
+                pool.reopen_host_document(&key, &config, &document(&uri, 1), &read, &|| true)
+                    .await,
+                OpenOutcome::Opened
+            );
+            assert!(pool.is_host_document_opened_on_connection(&uri, &key).await);
+            assert_eq!(
+                pool.host_document_version(&uri, key.server()).await,
+                Some(1)
+            );
+            // A later sync of the same current text must be a no-op. If the
+            // repair sent its old snapshot, this would enqueue didChange v2.
+            let current = HostDocument {
+                text: "edited while waiting",
+                revision: Some(HostRevision {
+                    incarnation: 1,
+                    content_version: 2,
+                }),
+                ..document(&uri, 1)
+            };
+            pool.eager_open_host_document(key.server(), &config, &current, None)
+                .await;
+            assert_eq!(
+                pool.host_document_version(&uri, key.server()).await,
+                Some(1)
+            );
+        }
+    }
 
     /// Test that eager_open_virtual_documents marks virtual documents as opened.
     ///

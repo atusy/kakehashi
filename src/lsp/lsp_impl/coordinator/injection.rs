@@ -793,79 +793,77 @@ impl InjectionCoordinator {
         self.documents.open_uris()
     }
 
-    /// Re-sync every open host document that `server` host-bridges, onto
-    /// wherever each now routes (#968: a shared-instance consolidation retired
-    /// the per-root connections that held them).
-    ///
-    /// The respawn re-open covers injected regions only; a host document is
-    /// otherwise re-opened by its next edit or request, so an idle tab would
-    /// sit without the diagnostics its retired connection had pushed. The
-    /// sync goes to ALL of the host's servers, not just `server`: a host's
-    /// eager sync is one batch that supersedes the previous one, so a batch
-    /// naming one server would abort an in-flight re-sync to the others. For
-    /// connections that already hold the document at its current text the
-    /// sync is a no-op, and each send reads the live text.
-    ///
-    /// Returns once every started sync has run (or been superseded), so a
-    /// re-open barrier can hold commands until the documents they name are
-    /// open on their new connection.
-    pub(crate) async fn resync_host_documents_for_server(
+    /// Read this server's host language, content and revision together.
+    /// Requests use detected grammar names; initial eager opens can retain a
+    /// declared alias or parserless label. Recover either target, preferring
+    /// ordinary request dispatch when this server supports both languages.
+    pub(crate) fn host_reopen_snapshot(
         &self,
-        settings: &crate::config::WorkspaceSettings,
+        uri: &Url,
+        settings: &std::sync::Arc<crate::config::WorkspaceSettings>,
         server: &str,
-    ) {
-        let mut batches = Vec::new();
-        for uri in self.documents.open_uris() {
-            let Some(language) = self.document_language(&uri) else {
-                continue;
-            };
-            if !self
-                .bridge
-                .get_host_configs_for_language(settings, &language)
+    ) -> Option<crate::lsp::bridge::HostResolveSnapshot> {
+        let document = self.documents.get(uri)?;
+        let selected = |language: &str| {
+            self.bridge
+                .cached_host_configs_for_language(settings, language)
                 .iter()
                 .any(|config| config.server_name == server)
-            {
-                continue;
-            }
-            let Some((text, incarnation, content_version)) =
-                self.documents.get(&uri).map(|document| {
-                    (
-                        document.text_arc(),
-                        document.incarnation(),
-                        document.content_version(),
-                    )
-                })
-            else {
-                continue;
-            };
-            let documents = std::sync::Arc::clone(&self.documents);
-            let host_uri = uri.clone();
-            let live_text_reader: crate::lsp::bridge::HostTextReader =
-                std::sync::Arc::new(move || {
-                    documents
-                        .get(&host_uri)
-                        .filter(|doc| doc.incarnation() == incarnation)
-                        .map(|doc| (doc.text_arc(), doc.content_version()))
-                });
-            let (finished, batch) = tokio::sync::oneshot::channel();
-            self.bridge.eager_open_host_document_on_servers_notifying(
-                settings,
-                &language,
-                &uri,
-                &text,
-                crate::lsp::bridge::HostRevision {
-                    incarnation,
-                    content_version,
+        };
+        let language_id = self
+            .language
+            .detect_language(uri.path(), document.text(), None, document.language_id())
+            .filter(|language| selected(language))
+            .or_else(|| {
+                document
+                    .language_id()
+                    .filter(|language| selected(language))
+                    .map(str::to_owned)
+            })?;
+        Some(crate::lsp::bridge::HostResolveSnapshot {
+            text: document.text_arc(),
+            language_id,
+            revision: crate::lsp::bridge::HostRevision {
+                incarnation: document.incarnation(),
+                content_version: document.content_version(),
+            },
+        })
+    }
+
+    /// Restore the host layer independently of edit-driven eager batches. A
+    /// failed applicable open must keep the connection's barrier unsuccessful.
+    pub(crate) async fn reopen_host_document(
+        &self,
+        uri: &Url,
+        key: &crate::lsp::bridge::ConnectionKey,
+    ) -> crate::lsp::bridge::OpenOutcome {
+        use crate::lsp::bridge::OpenOutcome;
+        let settings = self.settings_manager.load_settings_pair();
+        let Some(host) = self.host_reopen_snapshot(uri, &settings.settings, key.server()) else {
+            return OpenOutcome::NotApplicable;
+        };
+        self.bridge
+            .reopen_host_document(
+                &settings.settings,
+                key,
+                &crate::lsp::bridge::HostDocument {
+                    uri,
+                    language_id: &host.language_id,
+                    text: &host.text,
+                    revision: Some(host.revision),
                 },
-                live_text_reader,
-                finished,
-            );
-            batches.push(batch);
-        }
-        for batch in batches {
-            // Err is the only outcome: the sender is dropped when the batch ends.
-            let _ = batch.await;
-        }
+                &|uri| self.host_reopen_snapshot(uri, &settings.settings, key.server()),
+                &|| {
+                    self.settings_manager.settings_generation() == settings.generation
+                        && self
+                            .host_reopen_snapshot(uri, &settings.settings, key.server())
+                            .is_some_and(|current| {
+                                current.revision.incarnation == host.revision.incarnation
+                                    && current.language_id == host.language_id
+                            })
+                },
+            )
+            .await
     }
 
     /// `uri`'s host language, without parsing or resolving anything.
@@ -897,7 +895,8 @@ impl InjectionCoordinator {
     /// snapshot view, so a reload invalidating the parse (or a replacement
     /// parse landing) between two reads cannot pair a settled tree with a
     /// language that is not that tree's. The sweep's screen trusts a
-    /// rejection only when the flag is set.
+    /// rejection when the flag is set. Without a settled parse it additionally
+    /// needs a parser-independent exclusion of every candidate.
     pub(crate) fn screen_language(&self, uri: &Url) -> Option<(String, bool)> {
         let settled = self.documents.latest_snapshot(uri).and_then(|view| {
             view.slot.snapshot.as_ref().and_then(|snapshot| {
@@ -916,6 +915,29 @@ impl InjectionCoordinator {
         stored
             .or_else(|| self.get_language_for_document(uri))
             .map(|language| (language, false))
+    }
+
+    /// Prove injection non-applicability without trusting an unsettled label.
+    /// Host routing keeps declared aliases; parsing can instead choose their
+    /// base grammar or a path/first-line fallback, including parsers still
+    /// loading. Every such candidate must be excluded before skipping its wait.
+    pub(crate) fn unsettled_injections_are_excluded(
+        &self,
+        settings: &std::sync::Arc<crate::config::WorkspaceSettings>,
+        uri: &Url,
+        server: &str,
+    ) -> bool {
+        let Some(document) = self.documents.get(uri) else {
+            return false;
+        };
+        self.language
+            .document_language_candidates(uri.path(), document.text(), document.language_id())
+            .iter()
+            .all(|language| {
+                !self
+                    .bridge
+                    .host_language_can_reach_server(settings, language, server)
+            })
     }
 
     /// `uri`'s reopen generation, which scopes a downstream `didOpen` to the
@@ -1170,6 +1192,122 @@ mod tests {
                 .await,
             super::ParseWait::Current
         ));
+    }
+
+    #[cfg(unix)]
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn host_reopen_resolves_missing_sibling_provider_decision(#[case] settings_change: bool) {
+        use crate::config::settings::{BridgeLanguageConfig, BridgeServerConfig, LanguageSettings};
+        use crate::lsp::bridge::test_helpers::{
+            advertise_routing_for_test, create_ready_handle_with_capabilities,
+        };
+        use crate::lsp::bridge::{ConnectionKey, OpenOutcome};
+        use std::collections::HashMap;
+
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let settings = crate::config::WorkspaceSettings {
+            auto_install: false,
+            languages: HashMap::from([(
+                "host-language".into(),
+                LanguageSettings {
+                    bridge: Some(HashMap::from([(
+                        "_self".into(),
+                        BridgeLanguageConfig {
+                            enabled: Some(true),
+                            ..Default::default()
+                        },
+                    )])),
+                    ..Default::default()
+                },
+            )]),
+            language_servers: ["provider", "target"]
+                .into_iter()
+                .map(|name| {
+                    (
+                        name.into(),
+                        BridgeServerConfig {
+                            cmd: Some(vec!["sh".into(), "-c".into(), "cat >/dev/null".into()]),
+                            languages: Some(vec!["host-language".into()]),
+                            workspace_markers: Some(Vec::new()),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        };
+        server.settings_manager.apply_settings(settings);
+        let uri = Url::parse("file:///host-routing-missing.host-language").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "contents".into(),
+            Some("host-language".into()),
+            None,
+        );
+        let pool = server.bridge.pool();
+        pool.open_host_incarnation(&uri, incarnation).await;
+        let target_key = ConnectionKey::for_server("target");
+        let provider = create_ready_handle_with_capabilities(
+            ConnectionKey::for_server("provider"),
+            Default::default(),
+        )
+        .await;
+        advertise_routing_for_test(&provider);
+        pool.insert_connection(Arc::clone(&provider)).await;
+        pool.insert_connection(
+            create_ready_handle_with_capabilities(target_key.clone(), Default::default()).await,
+        )
+        .await;
+        assert_eq!(pool.host_routing_by_server(&uri, "target"), None);
+        // An eager batch cancelled before deciding leaves this state. Only
+        // the sibling provider can suppress this otherwise eligible target.
+        let settings_manager = Arc::clone(&server.settings_manager);
+        let answer = tokio::spawn(async move {
+            loop {
+                if let Some(id) = provider.router().pending_ids().first().copied() {
+                    if settings_change {
+                        settings_manager
+                            .apply_settings((*settings_manager.load_settings()).clone());
+                    }
+                    let _ = provider.router().route(serde_json::json!({
+                        "jsonrpc": "2.0", "id": id.as_i64(),
+                        "result": { "routing": { "target": { "enabled": false } } }
+                    }));
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            server
+                .injection_coordinator()
+                .reopen_host_document(&uri, &target_key),
+        )
+        .await
+        .expect("host routing should finish");
+        answer.abort();
+        assert_eq!(
+            outcome,
+            if settings_change {
+                OpenOutcome::NotOpened
+            } else {
+                OpenOutcome::NotApplicable
+            }
+        );
+        assert_eq!(
+            pool.host_routing_by_server(&uri, "target"),
+            if settings_change { None } else { Some(false) }
+        );
+        assert!(
+            !pool
+                .is_host_document_opened_on_connection(&uri, &target_key)
+                .await
+        );
     }
 
     #[tokio::test]

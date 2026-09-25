@@ -702,8 +702,8 @@ impl BridgeCoordinator {
     /// ready, outbound queue full), in which case no `didOpen` is queued and the
     /// command simply proceeds without it (handled fail-soft by dispatch). A
     /// no-op when the docs are already open (idempotent claim), and when no
-    /// injection maps to `server_name` (e.g. a host-layer command — host-layer
-    /// sync is a separate follow-up).
+    /// injection maps to `server_name`; the re-open sweep synchronizes the
+    /// host layer separately before calling this injection-only helper.
     ///
     /// This heals MISSING document state (a purged tracker), not stale content —
     /// it never sends `didChange` (that is the edit path's job). And it is
@@ -750,6 +750,62 @@ impl BridgeCoordinator {
                 for_server,
             )
             .await
+    }
+
+    fn host_recovery_config(
+        &self,
+        settings: &Arc<WorkspaceSettings>,
+        host_language: &str,
+        host_uri: &Url,
+        server: &str,
+    ) -> Option<ResolvedServerConfig> {
+        if self.pool.host_routing_by_server(host_uri, server) == Some(false) {
+            return None;
+        }
+        self.cached_host_configs_for_language(settings, host_language)
+            .into_iter()
+            .find(|config| config.server_name == server)
+    }
+
+    /// Whether the host layer itself needs this connection, without acquiring
+    /// candidates or asking a routing provider. Parser availability is irrelevant.
+    pub(crate) async fn host_layer_routes_to_connection(
+        &self,
+        settings: &Arc<WorkspaceSettings>,
+        host_language: &str,
+        host_uri: &Url,
+        connection: &super::pool::ConnectionKey,
+    ) -> bool {
+        let Some(resolved) =
+            self.host_recovery_config(settings, host_language, host_uri, connection.server())
+        else {
+            return false;
+        };
+        self.pool
+            .resolved_connection_key(connection.server(), &resolved.config, host_uri)
+            .await
+            == *connection
+    }
+
+    /// Recovery demand must defer a negative verdict while a shared handshake
+    /// can still route this host back to its failed per-root connection.
+    pub(crate) async fn host_layer_recovery_demand(
+        &self,
+        settings: &Arc<WorkspaceSettings>,
+        host_language: &str,
+        host_uri: &Url,
+        connection: &super::pool::ConnectionKey,
+    ) -> Result<bool, Arc<super::pool::ConnectionHandle>> {
+        let Some(resolved) =
+            self.host_recovery_config(settings, host_language, host_uri, connection.server())
+        else {
+            return Ok(false);
+        };
+        Ok(self
+            .pool
+            .recovery_connection_key(connection.server(), &resolved.config, host_uri)
+            .await?
+            == *connection)
     }
 
     /// A current injection URI routing to exactly `connection`, suitable for
@@ -1069,8 +1125,8 @@ impl BridgeCoordinator {
     /// spent in proportion to workspace size rather than to the work that
     /// belongs to the connection (respawn-reopen-derives-its-targets).
     ///
-    /// Conservative in the safe direction: a server declaring the `*` wildcard
-    /// could serve any injection language, so it is never pre-rejected.
+    /// A server declaring the `*` wildcard could serve any injection language,
+    /// but still needs the host's bridge filter to permit an injection.
     pub(crate) fn host_language_can_reach_server(
         &self,
         settings: &Arc<WorkspaceSettings>,
@@ -1080,6 +1136,29 @@ impl BridgeCoordinator {
         let Some(config) = settings.language_servers.get(server_name) else {
             return false;
         };
+        // A wildcard language list cannot make a disabled or commandless
+        // server reachable. Match the authoritative resolver before spending
+        // the reopen barrier on a parse this server cannot receive.
+        if !config
+            .is_spawnable_with_wildcard(settings.language_servers.get(crate::config::WILDCARD_KEY))
+        {
+            return false;
+        }
+        // `_self` names a separate host layer, not an injectable language.
+        // Even a wildcard server supplies no injections when the host permits
+        // only that layer. Otherwise a parserless host that was successfully
+        // repaired would still fail the barrier waiting for a needless parse.
+        // Resolve each entry's enabled flag through the ordinary filter so a
+        // named entry inherits `_`, and an explicit true can override false.
+        if let Some(host) = settings.resolve_host_language_settings(host_language)
+            && let Some(bridge) = &host.bridge
+            && !bridge.keys().any(|language| {
+                language != crate::config::settings::HOST_BRIDGE_KEY
+                    && host.is_language_bridgeable(language)
+            })
+        {
+            return false;
+        }
         // Resolve `_` inheritance: `languages` is `#[serde(default)]`, so a
         // server that omits it reads as declaring NOTHING until the wildcard
         // template is merged in — and the authoritative resolver merges before
@@ -1441,6 +1520,7 @@ impl BridgeCoordinator {
                 }),
                 configs,
                 routing_guard,
+                None,
             )
             .await;
             if let Some(token) = routing_tokens.and_then(|tokens| tokens.get(&document_uri)) {
@@ -1767,6 +1847,74 @@ impl BridgeCoordinator {
         );
     }
 
+    /// Complete routing left unfinished by a cancelled eager batch before
+    /// repairing the host. Provider selection still sees every host candidate,
+    /// so a sibling provider can suppress the connection being repaired.
+    pub(crate) async fn reopen_host_document(
+        &self,
+        settings: &Arc<WorkspaceSettings>,
+        key: &super::ConnectionKey,
+        doc: &super::HostDocument<'_>,
+        read: super::text_document::host::HostResolveReader<'_>,
+        admit: &(dyn Fn() -> bool + Sync),
+    ) -> super::OpenOutcome {
+        use super::OpenOutcome;
+        let configs = self.cached_host_configs_for_language(settings, doc.language_id);
+        let Some(config) = configs
+            .iter()
+            .find(|config| config.server_name == key.server())
+            .map(|config| Arc::clone(&config.config))
+        else {
+            return OpenOutcome::NotApplicable;
+        };
+        if self
+            .pool
+            .host_routing_by_server(doc.uri, key.server())
+            .is_none()
+        {
+            // Exclude other roots before waiting for their lifecycle lock.
+            if self
+                .pool
+                .resolved_connection_key(key.server(), &config, doc.uri)
+                .await
+                != *key
+            {
+                return OpenOutcome::NotApplicable;
+            }
+            let lifecycle = self.pool.host_lifecycle_lock(doc.uri);
+            let _guard = lifecycle.write().await;
+            if !admit()
+                || self.pool.current_host_incarnation(doc.uri)
+                    != doc.revision.map(|r| r.incarnation)
+                || !self.pool.accepts_host_language(doc.uri, doc.language_id)
+            {
+                return OpenOutcome::NotOpened;
+            }
+            if self
+                .pool
+                .host_routing_by_server(doc.uri, key.server())
+                .is_none()
+            {
+                Self::resolve_document_routing(
+                    &self.pool,
+                    doc.uri,
+                    doc.language_id,
+                    None,
+                    configs,
+                    None,
+                    Some(admit),
+                )
+                .await;
+            }
+            if !admit() {
+                return OpenOutcome::NotOpened;
+            }
+        }
+        self.pool
+            .reopen_host_document(key, &config, doc, read, admit)
+            .await
+    }
+
     /// Ask one advertising host bridge for a routing decision over the full
     /// candidate set, then mark every candidate connection with that decision
     /// before any host `didOpen` is sent. This is deliberately one orchestration
@@ -1779,10 +1927,13 @@ impl BridgeCoordinator {
         host: Option<super::protocol::RoutingHostDocument>,
         configs: Vec<ResolvedServerConfig>,
         routing_guard: Option<(&Url, &Url, &Arc<tokio::sync::watch::Sender<bool>>)>,
+        admit: Option<&(dyn Fn() -> bool + Sync)>,
     ) -> Vec<ResolvedServerConfig> {
-        if routing_guard.is_some_and(|(host_uri, virtual_uri, token)| {
-            !pool.is_virtual_routing_current(host_uri, virtual_uri, token)
-        }) {
+        if admit.is_some_and(|admit| !admit())
+            || routing_guard.is_some_and(|(host_uri, virtual_uri, token)| {
+                !pool.is_virtual_routing_current(host_uri, virtual_uri, token)
+            })
+        {
             return Vec::new();
         }
         if configs.iter().all(|config| {
@@ -1837,11 +1988,13 @@ impl BridgeCoordinator {
             let document_uri = document_uri.clone();
             candidates.push(async move {
                 let result = pool
-                    .get_or_create_connection_wait_ready(
+                    .get_or_create_connection_wait_ready_admitted(
                         &server_name,
                         &server_config,
                         Some(&document_uri),
                         std::time::Duration::from_secs(INIT_TIMEOUT_SECS),
+                        admit,
+                        None,
                     )
                     .await;
                 (server_name, result)
@@ -1851,6 +2004,9 @@ impl BridgeCoordinator {
         let mut handles = Vec::with_capacity(configs.len());
         let mut answer: Option<RoutingAnswer> = None;
         while let Some((server_name, result)) = candidates.next().await {
+            if admit.is_some_and(|admit| !admit()) {
+                return Vec::new();
+            }
             let handle = match result {
                 Ok(handle) => handle,
                 Err(error) => {
@@ -1882,9 +2038,11 @@ impl BridgeCoordinator {
 
         let mut selected = Vec::new();
         for config in configs {
-            if routing_guard.is_some_and(|(host_uri, virtual_uri, token)| {
-                !pool.is_virtual_routing_current(host_uri, virtual_uri, token)
-            }) {
+            if admit.is_some_and(|admit| !admit())
+                || routing_guard.is_some_and(|(host_uri, virtual_uri, token)| {
+                    !pool.is_virtual_routing_current(host_uri, virtual_uri, token)
+                })
+            {
                 return Vec::new();
             }
             let enabled = answer
@@ -1950,54 +2108,6 @@ impl BridgeCoordinator {
         configs: Vec<ResolvedServerConfig>,
         live_text_reader: Option<crate::lsp::bridge::HostTextReader>,
     ) {
-        self.eager_sync_host_document_on_servers_notifying(
-            host_uri,
-            language_id,
-            text,
-            revision,
-            configs,
-            live_text_reader,
-            None,
-        );
-    }
-
-    /// [`Self::eager_open_host_document_on_servers`], dropping `finished` once
-    /// the batch has run (or was superseded or cancelled), so a caller can
-    /// wait until every server's sync has been attempted.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn eager_open_host_document_on_servers_notifying(
-        &self,
-        settings: &WorkspaceSettings,
-        host_language: &str,
-        host_uri: &Url,
-        text: &str,
-        revision: crate::lsp::bridge::HostRevision,
-        live_text_reader: crate::lsp::bridge::HostTextReader,
-        finished: tokio::sync::oneshot::Sender<()>,
-    ) {
-        let configs = self.get_host_configs_for_language(settings, host_language);
-        self.eager_sync_host_document_on_servers_notifying(
-            host_uri,
-            host_language,
-            Arc::from(text),
-            revision,
-            configs,
-            Some(live_text_reader),
-            Some(finished),
-        );
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn eager_sync_host_document_on_servers_notifying(
-        &self,
-        host_uri: &Url,
-        language_id: &str,
-        text: Arc<str>,
-        revision: crate::lsp::bridge::HostRevision,
-        configs: Vec<ResolvedServerConfig>,
-        live_text_reader: Option<crate::lsp::bridge::HostTextReader>,
-        finished: Option<tokio::sync::oneshot::Sender<()>>,
-    ) {
         if configs.is_empty() {
             // Host bridging off / no host server for this language — drop any
             // prior batch so a stale sync can't fire.
@@ -2055,6 +2165,7 @@ impl BridgeCoordinator {
                         None,
                         configs_for_routing,
                         None,
+                        None,
                     ).await
                 } => configs,
             };
@@ -2090,9 +2201,6 @@ impl BridgeCoordinator {
             for open in opens {
                 let _ = open.await;
             }
-            // Dropped, not sent: an aborted batch drops it just the same, and
-            // the waiter only needs to know the batch is over.
-            drop(finished);
         });
         self.push_or_abort_host_eager_open_handle(host_uri, task.abort_handle(), generation);
     }
@@ -3167,6 +3275,117 @@ mod tests {
         assert!(
             !coordinator.host_language_can_reach_server(&settings, "markdown", "ruff"),
             "markdown blocks python, so ruff can receive nothing from it"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::unrestricted(None, true)]
+    #[case::empty(Some(vec![]), false)]
+    #[case::host_only(Some(vec![("_self", Some(true))]), false)]
+    #[case::implicit_enabled(Some(vec![("python", None)]), true)]
+    #[case::wildcard_enabled(Some(vec![("_", None)]), true)]
+    #[case::wildcard_disabled(Some(vec![("_", Some(false)), ("_self", Some(true))]), false)]
+    #[case::inherited_disabled(Some(vec![("_", Some(false)), ("python", None)]), false)]
+    #[case::explicit_override(Some(vec![("_", Some(false)), ("python", Some(true))]), true)]
+    #[case::specific_disabled(Some(vec![("python", Some(false))]), false)]
+    fn wildcard_server_screen_obeys_injection_filter(
+        #[case] entries: Option<Vec<(&str, Option<bool>)>>,
+        #[case] reachable: bool,
+    ) {
+        let coordinator = BridgeCoordinator::new();
+        // An unlisted host inherits the language wildcard entry. The server
+        // also inherits its language list from the server wildcard entry.
+        let settings = Arc::new(WorkspaceSettings {
+            languages: HashMap::from([(
+                "_".into(),
+                LanguageSettings {
+                    bridge: entries.map(|entries| {
+                        entries
+                            .into_iter()
+                            .map(|(language, enabled)| {
+                                (
+                                    language.to_string(),
+                                    BridgeLanguageConfig {
+                                        enabled,
+                                        ..Default::default()
+                                    },
+                                )
+                            })
+                            .collect()
+                    }),
+                    ..Default::default()
+                },
+            )]),
+            language_servers: HashMap::from([
+                (
+                    "_".into(),
+                    BridgeServerConfig {
+                        languages: Some(vec!["*".into()]),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "any".into(),
+                    BridgeServerConfig {
+                        cmd: Some(vec!["any-server".into()]),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        });
+        assert_eq!(
+            coordinator.host_language_can_reach_server(&settings, "unlisted-host", "any"),
+            reachable
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::disabled(Some(false), Some("server"), None, None, false)]
+    #[case::commandless(None, None, None, None, false)]
+    #[case::inherited_disabled(None, Some("server"), Some(false), None, false)]
+    #[case::inherited_command(None, None, None, Some("server"), true)]
+    #[case::override_disabled(Some(true), Some("server"), Some(false), None, true)]
+    fn wildcard_server_screen_requires_spawnable_configuration(
+        #[case] enabled: Option<bool>,
+        #[case] command: Option<&str>,
+        #[case] inherited_enabled: Option<bool>,
+        #[case] inherited_command: Option<&str>,
+        #[case] reachable: bool,
+    ) {
+        let coordinator = BridgeCoordinator::new();
+        let settings = Arc::new(WorkspaceSettings {
+            language_servers: HashMap::from([
+                (
+                    "_".into(),
+                    BridgeServerConfig {
+                        languages: Some(vec!["*".into()]),
+                        enabled: inherited_enabled,
+                        cmd: inherited_command.map(|cmd| vec![cmd.into()]),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "any".into(),
+                    BridgeServerConfig {
+                        enabled,
+                        cmd: command.map(|cmd| vec![cmd.into()]),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        });
+        assert_eq!(
+            !coordinator
+                .get_all_configs_for_language(&settings, "markdown", "python")
+                .is_empty(),
+            reachable,
+            "authoritative resolution must agree with the recovery screen"
+        );
+        assert_eq!(
+            coordinator.host_language_can_reach_server(&settings, "markdown", "any"),
+            reachable
         );
     }
 

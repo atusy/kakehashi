@@ -215,12 +215,7 @@ pub(crate) enum UpstreamRequest {
     /// incapable. Routed upward only because the reader holds no pool
     /// reference; the pool re-checks the capability before acting.
     ConsolidateSharedInstance { server: String },
-    /// Re-sync the open host documents `server` host-bridges onto wherever
-    /// they now route: a consolidation retired the per-root connections that
-    /// held them (#968). Routed upward because the document text lives on the
-    /// server side; injected regions are re-opened through `ReopenDocuments`.
-    ResyncHostDocuments { server: String },
-    /// Bring `key`'s virtual documents up to date: its previous connection was
+    /// Bring `key`'s host and virtual documents up to date: its previous connection was
     /// purged and has now been replaced by a `Ready` process
     /// (respawn-reopen-derives-its-targets).
     ///
@@ -243,12 +238,6 @@ pub(crate) enum UpstreamRequest {
         /// stopped being true — documents close, hosts re-root, and a
         /// connection that died young held nothing to capture at all.
         key: ConnectionKey,
-        /// Also re-sync, before `done` is signalled, the open host documents
-        /// this server host-bridges. Set only by a shared-instance
-        /// consolidation (#968), which moves host documents as well as
-        /// injected regions onto a live connection; a respawn re-open keeps
-        /// its injection-only scope.
-        host_documents: bool,
         done: tokio::sync::watch::Sender<bool>,
     },
 }

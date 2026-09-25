@@ -541,13 +541,14 @@ fn init_crash_once_client() -> (LspClient, tempfile::TempDir, std::path::PathBuf
 fn init_crash_once_client_shared(
     shared: bool,
 ) -> (LspClient, tempfile::TempDir, std::path::PathBuf) {
-    init_crash_once_client_workspace(shared, "diagnostics-push-crash-once", Value::Null)
+    init_crash_once_client_workspace(shared, "diagnostics-push-crash-once", Value::Null, false)
 }
 
 fn init_crash_once_client_workspace(
     shared: bool,
     mode: &str,
     workspace_folders: Value,
+    host_layer: bool,
 ) -> (LspClient, tempfile::TempDir, std::path::PathBuf) {
     let config_dir = tempfile::TempDir::new().expect("temp dir");
     let config_path = config_dir.path().join("push_diagnostics.toml");
@@ -567,10 +568,17 @@ fn init_crash_once_client_workspace(
             "capabilities": {},
             "workspaceFolders": workspace_folders,
             "initializationOptions": {
+                "languages": if host_layer {
+                    json!({ "markdown": { "bridge": {
+                        "_": { "enabled": false }, "_self": { "enabled": true }
+                    }}})
+                } else {
+                    json!({})
+                },
                 "languageServers": {
                     "mock-push": {
                         "cmd": [mock_bin(), mode],
-                        "languages": ["lua"],
+                        "languages": [if host_layer { "markdown" } else { "lua" }],
                         "preferSharedInstance": shared
                     }
                 }
@@ -579,6 +587,86 @@ fn init_crash_once_client_workspace(
     );
     client.send_notification("initialized", json!({}));
     (client, config_dir, wire_log)
+}
+
+#[test]
+fn e2e_crashed_host_only_server_restores_diagnostics_without_editor_activity() {
+    assert_crashed_host_server_recovers(false, false);
+}
+
+#[test]
+fn e2e_crashed_mixed_server_restores_host_and_injection_diagnostics() {
+    assert_crashed_host_server_recovers(true, false);
+}
+
+#[test]
+fn e2e_crashed_shared_host_only_server_restores_diagnostics() {
+    assert_crashed_host_server_recovers(false, true);
+}
+
+#[test]
+fn e2e_crashed_shared_mixed_server_restores_both_layers() {
+    assert_crashed_host_server_recovers(true, true);
+}
+
+fn assert_crashed_host_server_recovers(with_injections: bool, shared: bool) {
+    let config_dir = tempfile::TempDir::new().unwrap();
+    let config_path = config_dir.path().join("host-crash.toml");
+    std::fs::write(&config_path, "").unwrap();
+    let wire_log = config_dir.path().join("mock-wire.log");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().unwrap())
+        .env("MOCK_LSP_WIRE_LOG", wire_log.to_string_lossy())
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "initializationOptions": {
+                "autoInstall": false,
+                "languages": { "markdown": { "bridge": {
+                    "_": { "enabled": with_injections }, "_self": { "enabled": true }
+                }}},
+                "languageServers": { "mock-push": {
+                    "cmd": [mock_bin(), "diagnostics-push-crash-once"],
+                    "preferSharedInstance": shared,
+                    "languages": if with_injections { vec!["markdown", "lua"] } else { vec!["markdown"] }
+                }}
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    open_host(&mut client);
+    wait_for_crash_once(&mut client, &wire_log);
+    let host_message = format!("mock-push-diag:{MD_URI}:replacement");
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            |params| {
+                if params["uri"] != json!(MD_URI) {
+                    return false;
+                }
+                let Some(diagnostics) = params["diagnostics"].as_array() else {
+                    return false;
+                };
+                let host_returned = diagnostics.iter().any(|d| d["message"] == host_message);
+                let injection_returned = diagnostics.iter().any(|d| {
+                    d["message"].as_str().is_some_and(|m| {
+                        m != host_message
+                            && m.starts_with("mock-push-diag:")
+                            && m.ends_with(":replacement")
+                    })
+                });
+                host_returned && (!with_injections || injection_returned)
+            },
+        )
+        .expect("every layer must recover without an edit or request");
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
 }
 
 /// Wait for the first process's push, then for the crash that clears it.
@@ -642,15 +730,20 @@ fn e2e_crashed_shared_downstream_recovers_without_editor_activity() {
 
 #[test]
 fn e2e_shared_crash_recovery_announces_marker_and_client_roots_before_open() {
-    assert_shared_crash_workspace_recovery("diagnostics-push-crash-folders", true);
+    assert_shared_crash_workspace_recovery("diagnostics-push-crash-folders", true, false);
 }
 
 #[test]
 fn e2e_shared_crash_recovery_reopens_new_per_root_fallbacks() {
-    assert_shared_crash_workspace_recovery("diagnostics-push-crash-downgrade", false);
+    assert_shared_crash_workspace_recovery("diagnostics-push-crash-downgrade", false, false);
 }
 
-fn assert_shared_crash_workspace_recovery(mode: &str, include_markerless: bool) {
+#[test]
+fn e2e_shared_host_crash_recovery_reopens_new_per_root_fallbacks() {
+    assert_shared_crash_workspace_recovery("diagnostics-push-crash-downgrade", false, true);
+}
+
+fn assert_shared_crash_workspace_recovery(mode: &str, include_markerless: bool, host_layer: bool) {
     let workspace = tempfile::tempdir().expect("workspace");
     let roots: Vec<_> = ["a", "b", "client"]
         .into_iter()
@@ -679,6 +772,7 @@ fn assert_shared_crash_workspace_recovery(mode: &str, include_markerless: bool) 
         true,
         mode,
         json!([{ "uri": root_uris[2], "name": "client" }]),
+        host_layer,
     );
     for uri in &documents {
         client.send_notification(
@@ -737,6 +831,25 @@ fn assert_shared_crash_workspace_recovery(mode: &str, include_markerless: bool) 
         );
     }
     assert!(std::path::Path::new(&format!("{}.replacement", wire_log.display())).exists());
+    if host_layer {
+        let wire = std::fs::read_to_string(&wire_log).expect("mock wire log");
+        let opened: Vec<_> = wire
+            .lines()
+            .filter_map(|line| line.strip_prefix("textDocument/didOpen\t"))
+            .collect();
+        for uri in &documents {
+            assert!(
+                opened.contains(&uri.as_str()),
+                "real host URI was not opened: {uri}"
+            );
+        }
+        assert!(
+            opened
+                .iter()
+                .all(|uri| documents.iter().any(|host| host == uri)),
+            "host-only recovery must open real host documents: {opened:?}"
+        );
+    }
     client.send_request("shutdown", json!(null));
     client.send_notification("exit", json!(null));
 }

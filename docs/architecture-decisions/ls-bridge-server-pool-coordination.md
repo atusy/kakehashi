@@ -140,9 +140,9 @@ the divert check runs at `Ready`, roots acquired in that window divert
 deterministically; when the registration arrives on the shared connection, the
 pool retires that server's diverts (marker-rooted connections launched under
 the preference) through the same invalidate path and asks for the respawn
-re-open against the live shared connection (injected regions) plus an
-upstream re-sync of the host-bridged documents it serves (their text lives
-upstream), so documents move there without a data-structure migration. Two races remain and are healed rather
+awaited re-open against the live shared connection for both injected regions
+and host-bridged documents (their text lives upstream), so documents move there
+without a data-structure migration. Two races remain and are healed rather
 than prevented: a divert still handshaking when the sweep retires it falls back
 to the shared connection, and a divert landing after the sweep is found by the
 next acquisition of its root, which routes to the shared connection and queues
@@ -268,9 +268,9 @@ diagnostics its exit evicted stay gone on a document nobody edits. The
 respawn is an ordinary acquire, so the replacement is brought up to date by
 the same re-open as any other (respawn-reopen-derives-its-targets). Per-root
 connections acquire by key. Shared connections acquire using a currently open
-region's routing URI, reconstructing their initial workspace (or rootless
+document's routing URI, reconstructing their initial workspace (or rootless
 route); the re-open announces each additional root before its documents.
-If the replacement lacks folder-change support, current regions previously
+If the replacement lacks folder-change support, current host documents and injected regions previously
 routed to the shared connection may now need per-root instances. Recovery
 rechecks those units after the handshake and acquires their current routes,
 arming ordinary re-open debt before spawning a new diverted key. Each distinct
@@ -303,10 +303,10 @@ What must hold:
 - Recovery is bounded: a server that dies on every start must not be
   respawned in a loop, and giving up only stops the proactive path.
 - It never revives a server settings no longer start, nor a connection that
-  no open document's injected region routes to (per connection, not per
-  server; host-layer documents do not count because the re-open restores
-  only injected regions). Shared recovery derives its document after the
-  backoff, rather than retaining the dead instance's workspace-folder set.
+  no open host document or injected region routes to (per connection, not
+  per server). Host-layer demand does not require a parser. Shared recovery
+  derives its documents after the backoff, rather than retaining the dead
+  instance's workspace-folder set.
 - It never stalls the forwarding loop that delivers every server's
   diagnostics.
 

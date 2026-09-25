@@ -1258,6 +1258,42 @@ impl LanguageCoordinator {
         None
     }
 
+    /// Possible document grammars, without depending on parser availability.
+    /// A rejection must cover every fallback: an unavailable parser can finish
+    /// loading while a re-open barrier is waiting for the document's parse.
+    pub(crate) fn document_language_candidates(
+        &self,
+        path: &str,
+        content: &str,
+        language_id: Option<&str>,
+    ) -> Vec<String> {
+        let mut candidates = Vec::new();
+        let mut add = |candidate: &str| {
+            if !candidates.iter().any(|existing| existing == candidate) {
+                candidates.push(candidate.to_string());
+            }
+            if let Some(base) = self.resolve_base(candidate)
+                && !candidates.contains(&base)
+            {
+                candidates.push(base);
+            }
+        };
+        if let Some(language) = language_id {
+            add(language);
+        }
+        if let Some(token) = super::heuristic::extract_token_from_path(path) {
+            if let Some(candidate) = super::heuristic::detect_from_token(token) {
+                add(&candidate);
+            } else {
+                add(token);
+            }
+        }
+        if let Some(candidate) = super::heuristic::detect_from_first_line(content) {
+            add(&candidate);
+        }
+        candidates
+    }
+
     /// Load `candidate` (or its configured base) from the search paths,
     /// returning the name that actually loaded.
     fn load_candidate_or_base(&self, candidate: String) -> Option<String> {

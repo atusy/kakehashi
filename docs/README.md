@@ -621,20 +621,18 @@ true` can still be opted out of per server with `preferSharedInstance =
 false`. A wildcard-only entry is never spawned itself, and a concrete server
 whose merged `cmd` is still empty is skipped.
 
-A bridged server that crashes is restarted automatically while an injected
-region of an open document still routes to it: those regions are re-opened on
+A bridged server that crashes is restarted automatically while an open host
+document (`bridge._self`) or injected region still routes to it: they are re-opened on
 the new process, so the diagnostics that vanished with it come back without
 an edit. Restarts back off (2 s, doubling) and stop after five in a row,
 starting over only when a crash ends a run of at least five minutes; a server that
 keeps dying is left down until the next edit or request needs it. A server
-that configuration no longer starts is never restarted. Host documents
-(`bridge._self`) are not re-opened by the restart, so their diagnostics return
-on the next request for that document — and a server serving only host
-documents is left for the next request to restart. Shared instances recover
-using a currently open region to reconstruct their workspace; the re-open
-announces other regions' workspace roots before sending their documents.
-Explicit rootless routing (`workspaceFolders: []`) stays rootless.
-If the replacement cannot accept additional roots, those regions recover on
+that configuration no longer starts is never restarted. Host documents are
+synchronized before the re-open barrier completes, independently of edit
+debouncing. Shared instances recover using a current document to reconstruct
+their workspace; the re-open announces other documents' workspace roots before
+sending them. Explicit rootless routing (`workspaceFolders: []`) stays rootless.
+If the replacement cannot accept additional roots, those documents recover on
 per-root instances instead, using the same bounded retry policy on failure.
 
 **Servers for any language (`languages = ["*"]`)**
