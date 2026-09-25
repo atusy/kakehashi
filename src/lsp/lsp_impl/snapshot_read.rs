@@ -217,6 +217,7 @@ async fn wait_for_snapshot_in(
     // made requests racing didOpen degrade to empty on loaded machines.
     let stale_deadline = tokio::time::Instant::now() + wait;
     let first_parse_deadline = tokio::time::Instant::now() + FIRST_PARSE_BACKSTOP;
+    let mut expired = false;
     loop {
         // Subscribe BEFORE checking (lost-wakeup guard): `subscribe` marks
         // the current value as seen, so a publish landing between a check
@@ -236,6 +237,16 @@ async fn wait_for_snapshot_in(
             }
             trailing => (trailing.is_some(), false),
         };
+        if expired {
+            // Judged on a fresh read: an edit publishes no snapshot, so one
+            // landing mid-wait (turning a waited-on placeholder into a
+            // trailing snapshot) never woke the wait.
+            return if had_snapshot && !awaiting_reparse {
+                SnapshotWait::Stale
+            } else {
+                SnapshotWait::Unparsed
+            };
+        }
         let deadline = if had_snapshot {
             stale_deadline
         } else {
@@ -244,13 +255,8 @@ async fn wait_for_snapshot_in(
         match tokio::time::timeout_at(deadline, receiver.changed()).await {
             Ok(Ok(())) => continue,
             Ok(Err(_closed)) => return SnapshotWait::Gone,
-            Err(_deadline) => {
-                return if had_snapshot && !awaiting_reparse {
-                    SnapshotWait::Stale
-                } else {
-                    SnapshotWait::Unparsed
-                };
-            }
+            // Re-resolve once more, then answer from that read.
+            Err(_deadline) => expired = true,
         }
     }
 }
