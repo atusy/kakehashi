@@ -299,4 +299,11 @@ mod tests {
 
         assert_eq!(lua.code, "    \rx = ' '");
     }
+
+    #[test]
+    fn unicode_escape_allows_leading_zeros_beyond_eight_digits() {
+        let lua = LuaCode::new(r"'\u{000000041}'").unwrap();
+
+        assert_eq!(lua.string_at(0), Some("A"));
+    }
 }
