@@ -212,6 +212,9 @@
 //!
 //! `--stamp-resolve-process` tags completion/action data and resolved output with
 //! the process ID; `--reject-old-resolve` rejects data from another process.
+//! `--exit-after-resolve-once` exits right after answering the first
+//! `codeAction/resolve` of the whole test (the `MOCK_LSP_WIRE_LOG` crash marker
+//! makes it once across incarnations), so the next resolve needs a replacement.
 //!
 //! Only built for E2E runs (`required-features = ["e2e"]` in Cargo.toml).
 
@@ -227,6 +230,7 @@ fn main() {
         .unwrap_or_else(|| "upper".to_string());
     let stamp_resolve_process = std::env::args().any(|arg| arg == "--stamp-resolve-process");
     let reject_old_resolve = std::env::args().any(|arg| arg == "--reject-old-resolve");
+    let exit_after_resolve_once = std::env::args().any(|arg| arg == "--exit-after-resolve-once");
     let stdin = std::io::stdin();
     let mut reader = BufReader::new(stdin.lock());
     let stdout = std::io::stdout();
@@ -1444,6 +1448,13 @@ fn main() {
                     pending_resolve = Some((id, result));
                 } else {
                     respond(&mut writer, id, result);
+                    // `--exit-after-resolve-once`: die right after the first
+                    // answered resolve, so the carried action's next resolve
+                    // lands on a replacement that owes a re-open.
+                    if exit_after_resolve_once && crash_once() {
+                        let _ = writer.flush();
+                        std::process::exit(0);
+                    }
                 }
             }
             "workspace/executeCommand" => {
