@@ -133,6 +133,9 @@ pub(crate) struct LanguageCoordinator {
     /// one for configured languages, the next on-demand load for discovered
     /// ones — would compile the same text again.
     trial_queries: Mutex<Vec<Arc<tree_sitter::Query>>>,
+    /// Registered languages the latest trial could no longer load, for the
+    /// next live load to retire (see `retire_vanished_languages`).
+    trial_vanished: Mutex<Vec<String>>,
     /// On-demand loads between reading their files and publishing (see
     /// [`DynamicLoadInFlight`]).
     dynamic_loads_in_flight: std::sync::atomic::AtomicUsize,
@@ -236,6 +239,7 @@ impl LanguageCoordinator {
             compiled_queries: Arc::new(Mutex::new(HashMap::new())),
             is_trial: false,
             trial_queries: Mutex::new(Vec::new()),
+            trial_vanished: Mutex::new(Vec::new()),
             dynamic_loads_in_flight: std::sync::atomic::AtomicUsize::new(0),
             load_problems: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -577,7 +581,45 @@ impl LanguageCoordinator {
             summary.record(derived_name, result);
         }
 
+        self.retire_vanished_languages();
         summary
+    }
+
+    /// Unregister the older-generation registrations the latest trial found
+    /// no longer loading (their parser went away). Nothing else would: such
+    /// an entry stays registered until something loads that language again,
+    /// and the trial, re-reading it, would then report a change on every push
+    /// from now on. A document still using one would lose it on its next
+    /// load anyway. Registrations this load made current are kept.
+    fn retire_vanished_languages(&self) {
+        if self.is_trial {
+            return;
+        }
+        let vanished = std::mem::take(
+            &mut *self
+                .trial_vanished
+                .lock()
+                .recover_poison("LanguageCoordinator::retire_vanished_languages"),
+        );
+        if vanished.is_empty() {
+            return;
+        }
+        let _registration = self
+            .registration_lock
+            .lock()
+            .recover_poison("LanguageCoordinator::retire_vanished_languages(registration)");
+        let generation = self
+            .load_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        for language_id in vanished {
+            if self.reload_scoped_registrations.contains_key(&language_id)
+                && !self.has_current_parser_registration(&language_id, generation)
+            {
+                self.language_registry.unregister(&language_id);
+                self.reload_scoped_registrations.remove(&language_id);
+                self.query_store.remove_queries(&language_id);
+            }
+        }
     }
 
     /// Whether applying `settings` would change any language a document can be
@@ -628,6 +670,15 @@ impl LanguageCoordinator {
             }
         }
         let trial = scratch.language_state(Some(scratch_generation));
+        *self
+            .trial_vanished
+            .lock()
+            .recover_poison("LanguageCoordinator::reload_would_change_languages(vanished)") =
+            current
+                .keys()
+                .filter(|language_id| !trial.contains_key(*language_id))
+                .cloned()
+                .collect();
         // A broken parser or query file loads to the same (absent or partial)
         // result however it is broken, so identity cannot tell a newly broken
         // file from an old one. Reload whenever the files have problems, as
@@ -4113,6 +4164,12 @@ mod tests {
             coordinator.reload_would_change_languages(&WorkspaceSettings::default()),
             "the stale registration no longer resolves, so a reload changes it"
         );
+
+        // The reload that change calls for retires the vanished registration;
+        // otherwise every later push would report the same change again.
+        coordinator.load_settings(&WorkspaceSettings::default());
+        assert!(!coordinator.language_registry.contains("dynamic"));
+        assert!(!coordinator.reload_would_change_languages(&WorkspaceSettings::default()));
     }
 
     /// A trial that finds an edited query compiles the new text; the
