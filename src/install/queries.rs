@@ -3045,6 +3045,51 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Install moves whatever occupies a query slot aside, so a regular file
+    /// there becomes a regular-file backup. Discarding it after a successful
+    /// publish must take it and its sidecar; `remove_dir_all` alone cannot,
+    /// which stranded both with a warning on every such install (#1006).
+    #[test]
+    fn discarding_a_regular_file_backup_takes_it_and_its_sidecar() {
+        let temp = TempDir::new().unwrap();
+        let backup = temp.path().join(".lua.1.2.backup");
+        fs::write(&backup, "a file that sat in the query slot").unwrap();
+        write_backup_ownership_marker(&backup).unwrap();
+
+        discard_backup_dir(&backup);
+
+        assert!(
+            fs::symlink_metadata(&backup).is_err(),
+            "the displaced file must be removed"
+        );
+        assert!(
+            fs::symlink_metadata(backup_ownership_sidecar(&backup)).is_err(),
+            "its ownership sidecar must go with it"
+        );
+    }
+
+    /// The same backup stranded by an interrupted install is uninstall's to
+    /// collect: it is owned (sidecar present) and named for the language.
+    #[test]
+    fn uninstall_collects_an_owned_regular_file_backup() {
+        let temp = TempDir::new().unwrap();
+        let data_dir = temp.path().join("data");
+        let queries_parent = data_dir.join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        let backup = queries_parent.join(".lua.1.2.backup");
+        fs::write(&backup, "a file that sat in the query slot").unwrap();
+        write_backup_ownership_marker(&backup).unwrap();
+        let LanguageLockProbe::Idle(lock) = try_lock_language(&data_dir, "lua") else {
+            panic!("test language should be unlocked");
+        };
+
+        let removal = remove_query_install_and_backups(&lock).unwrap();
+
+        assert!(removal.removed_backups, "the backup was there to remove");
+        assert!(fs::symlink_metadata(&backup).is_err());
+        assert!(fs::symlink_metadata(backup_ownership_sidecar(&backup)).is_err());
+    }
+
     #[test]
     #[cfg(unix)]
     fn uninstall_refuses_a_tombstone_symlink_without_removing_queries() {
