@@ -422,6 +422,9 @@ impl InstallCoordinator {
             QueryChainState::Busy => {
                 self.auto_install
                     .forget_query_dependency_check(language, check.generation);
+                // Nothing answered: whatever the lock was hiding still waits
+                // for a check, which a configuration push must not skip.
+                self.auto_install.defer_query_repair_retry(language);
                 false
             }
         }
@@ -834,6 +837,10 @@ mod tests {
         assert!(
             !install.decide_query_repair("rust", false, || QueryChainState::Busy),
             "a held lock is an install at work, not a missing language"
+        );
+        assert!(
+            server.auto_install.has_query_repairs_awaiting_retry(),
+            "a busy answer answered nothing, so a configuration push must not skip its retry"
         );
         assert!(
             install.decide_query_repair("rust", false, || QueryChainState::NeedsRepair),
