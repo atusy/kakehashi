@@ -2126,9 +2126,10 @@ impl LanguageServerPool {
     /// Waiting on the connection-wide barrier anyway would hold the resolve
     /// for a re-open of OTHER documents, and fail it when that re-open reports
     /// them unsettled. Otherwise wait for the pending re-open, then check
-    /// again: a settled barrier does not prove this document came back (a
-    /// failed re-open is retired by its first waiter, and one may simply not
-    /// apply to it).
+    /// again whatever the barrier answered: a refusal can come from another
+    /// document while this one was already re-opened, and a settled barrier
+    /// does not prove this document came back (a failed re-open is retired by
+    /// its first waiter, and one may simply not apply to it).
     ///
     /// `false` means the caller must fail soft rather than send.
     pub(super) async fn resolve_document_ready(
@@ -2141,6 +2142,11 @@ impl LanguageServerPool {
             return true;
         }
         if !self.wait_for_pending_reopen(key).await {
+            // The sweep may have reached this document before stalling on
+            // another; its didOpen is then already ahead in the FIFO.
+            if self.is_resolve_document_open(key, document).await {
+                return true;
+            }
             log::warn!(
                 target: "kakehashi::bridge",
                 "{method}: the re-open on {key} did not settle (timed out or failed); \
