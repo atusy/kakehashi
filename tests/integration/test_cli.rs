@@ -2363,6 +2363,49 @@ fn test_language_uninstall_removes_special_file_query_entries() {
     }
 }
 
+/// Taking the query slot back must never reach outside the data dir: a live
+/// symlink there loses the link, and whatever it points at — a file or a
+/// populated directory — survives untouched.
+#[test]
+#[cfg(unix)]
+fn test_language_uninstall_unlinks_a_query_symlink_without_touching_its_target() {
+    use std::fs;
+
+    let outside = tempfile::tempdir().expect("Failed to create outside dir");
+    let target_file = outside.path().join("file");
+    fs::write(&target_file, "keep").expect("Failed to create target file");
+    let target_dir = outside.path().join("dir");
+    fs::create_dir_all(&target_dir).expect("Failed to create target dir");
+    fs::write(target_dir.join("highlights.scm"), "(comment) @comment")
+        .expect("Failed to populate target dir");
+
+    for target in [&target_file, &target_dir] {
+        for args in [&["lua"][..], &["--all"][..]] {
+            let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+            fs::create_dir_all(test_dir.path().join("queries"))
+                .expect("Failed to create queries dir");
+            let entry = test_dir.path().join("queries/lua");
+            std::os::unix::fs::symlink(target, &entry).expect("Failed to create symlink");
+
+            let (success, combined) = run_forced_uninstall(test_dir.path(), args);
+
+            assert!(success, "uninstall {args:?} failed: {combined}");
+            assert!(
+                fs::symlink_metadata(&entry).is_err(),
+                "the link must be removed by {args:?}: {combined}"
+            );
+        }
+    }
+    assert_eq!(
+        fs::read_to_string(&target_file).expect("the target file must survive"),
+        "keep"
+    );
+    assert!(
+        target_dir.join("highlights.scm").is_file(),
+        "the target directory's contents must survive"
+    );
+}
+
 /// The parser slot answers the same way as the query slot: install's rename
 /// replaces any non-directory at `parser/<lang>.<ext>`, so uninstall takes one
 /// back rather than walking past it and calling the language absent.
