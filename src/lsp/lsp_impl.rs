@@ -196,24 +196,29 @@ fn settings_affect_documents(previous: &WorkspaceSettings, next: &WorkspaceSetti
 /// which only the reload's generation bump would otherwise invalidate. The
 /// disk checks run on the blocking pool and never touch the live
 /// coordinator; if they cannot finish, reload.
+///
+/// Also returns the disk trial, when one ran, for the caller to hold across
+/// the reload it calls for (see [`ReloadTrial`](crate::language::coordinator::ReloadTrial)).
 async fn configuration_reload_needed(
     language: &std::sync::Arc<LanguageCoordinator>,
     cache: &CacheCoordinator,
     previous: &WorkspaceSettings,
     settings: &WorkspaceSettings,
-) -> bool {
+) -> (bool, Option<crate::language::coordinator::ReloadTrial>) {
     if settings_affect_documents(previous, settings) {
-        return true;
+        return (true, None);
     }
     let language = std::sync::Arc::clone(language);
     let settings = settings.clone();
     let generation = cache.semantic_token_generation();
     tokio::task::spawn_blocking(move || {
-        language.reload_would_change_languages(&settings)
-            || kakehashi::captures::kind_queries_changed(&language.search_paths(), generation)
+        let trial = language.reload_would_change_languages(&settings);
+        let needed = trial.changed
+            || kakehashi::captures::kind_queries_changed(&language.search_paths(), generation);
+        (needed, Some(trial))
     })
     .await
-    .unwrap_or(true)
+    .unwrap_or((true, None))
 }
 
 /// What one settings application asked of the documents and the client.
@@ -353,14 +358,17 @@ pub(super) async fn apply_shared_settings_locked(
     // coordinator's load marks registrations stale while it re-reads them),
     // and its follow-ups are what repair that. A reload that would change
     // nothing skips both halves.
-    let reload_languages = language_state.trigger != ReloadTrigger::Configuration
-        || configuration_reload_needed(
+    let (reload_languages, trial) = if language_state.trigger == ReloadTrigger::Configuration {
+        configuration_reload_needed(
             language_state.language,
             cache,
             &settings_manager.load_settings(),
             &settings,
         )
-        .await;
+        .await
+    } else {
+        (true, None)
+    };
     let (mut summary, reparse_uris) = if reload_languages {
         reload_languages_locked(&language_state, cache, &settings)
     } else {
@@ -369,6 +377,7 @@ pub(super) async fn apply_shared_settings_locked(
             Vec::new(),
         )
     };
+    drop(trial);
     // Publish the settings snapshot before invalidating downstream connections:
     // once propagation exposes a pool miss, a concurrent request must resolve
     // the NEW launch config rather than respawn from the old snapshot (#587).

@@ -137,6 +137,17 @@ type CompiledQueries = HashMap<
     ),
 >;
 
+/// Outcome of [`LanguageCoordinator::reload_would_change_languages`].
+pub(crate) struct ReloadTrial {
+    /// Whether the reload would change any language documents see.
+    pub(crate) changed: bool,
+    /// The queries the trial published into the shared compiled-query cache,
+    /// held so the live reload a change calls for reuses them instead of
+    /// compiling the same text again: the cache keeps only `Weak`s, and the
+    /// scratch coordinator that owned them is gone.
+    _compiled: Vec<Arc<tree_sitter::Query>>,
+}
+
 /// A query compiled (or reused) for one grammar and source text.
 struct CompiledQuery {
     query: Option<Arc<tree_sitter::Query>>,
@@ -541,7 +552,10 @@ impl LanguageCoordinator {
     /// demand. The live registrations, generation and query store stay as
     /// they are, so a caller that finds nothing changed can skip the reload
     /// entirely. Blocking: reads files and compiles queries.
-    pub(crate) fn reload_would_change_languages(&self, settings: &WorkspaceSettings) -> bool {
+    pub(crate) fn reload_would_change_languages(
+        &self,
+        settings: &WorkspaceSettings,
+    ) -> ReloadTrial {
         // Snapshot before the trial: the held `Arc`s keep every currently
         // published query interned, so an unchanged re-read resolves to it.
         // Every registration and every recorded failure counts, whatever
@@ -568,7 +582,14 @@ impl LanguageCoordinator {
                 let _ = scratch.ensure_language_loaded(language_id);
             }
         }
-        current != scratch.language_state(Some(scratch_generation))
+        let trial = scratch.language_state(Some(scratch_generation));
+        ReloadTrial {
+            changed: current != trial,
+            _compiled: trial
+                .into_values()
+                .flat_map(|loaded| loaded.queries.into_iter().flatten())
+                .collect(),
+        }
     }
 
     /// A fresh coordinator sharing this one's grammar and compiled-query
@@ -3925,8 +3946,57 @@ mod tests {
         assert!(!coordinator.has_parser_available("dynamic"));
 
         assert!(
-            coordinator.reload_would_change_languages(&WorkspaceSettings::default()),
+            coordinator
+                .reload_would_change_languages(&WorkspaceSettings::default())
+                .changed,
             "the stale registration no longer resolves, so a reload changes it"
+        );
+    }
+
+    /// A trial that finds an edited query compiles the new text; holding
+    /// the trial across the live reload lets that reload reuse the query
+    /// instead of compiling the same text a second time.
+    #[test]
+    fn live_reload_reuses_the_queries_a_held_trial_compiled() {
+        let dir = tempdir().unwrap();
+        let query_path = dir.path().join("highlights.scm");
+        fs::write(&query_path, "(identifier) @variable\n").unwrap();
+        let coordinator = LanguageCoordinator::new();
+        coordinator
+            .language_registry
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        let settings = WorkspaceSettings {
+            languages: HashMap::from([(
+                "rust".to_string(),
+                LanguageSettings {
+                    queries: Some(vec![crate::config::settings::QueryItem {
+                        path: query_path.to_string_lossy().into_owned(),
+                        kind: None,
+                    }]),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        coordinator.load_settings(&settings);
+        assert!(!coordinator.reload_would_change_languages(&settings).changed);
+
+        fs::write(
+            &query_path,
+            "(identifier) @variable\n(string_literal) @string\n",
+        )
+        .unwrap();
+        let trial = coordinator.reload_would_change_languages(&settings);
+        assert!(trial.changed);
+        coordinator.load_settings(&settings);
+
+        let live = coordinator.highlight_query("rust").unwrap();
+        assert!(
+            trial
+                ._compiled
+                .iter()
+                .any(|query| Arc::ptr_eq(query, &live)),
+            "the live reload must reuse the query the trial compiled"
         );
     }
 
