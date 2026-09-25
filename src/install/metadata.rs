@@ -665,6 +665,77 @@ return {
     }
 
     #[test]
+    fn issue_791_reproduction_parses() {
+        let content = r#"
+return {
+  lua = {
+    readme_note = "write } literally",
+    install_info = {
+      url = "https://github.com/tree-sitter-grammars/tree-sitter-lua",
+      revision = "main",
+      location = "lua",
+    },
+  },
+}
+"#;
+
+        let parsers = parse_parsers_lua(content).expect("should parse");
+
+        let lua = &parsers["lua"];
+        assert_eq!(
+            lua.url,
+            "https://github.com/tree-sitter-grammars/tree-sitter-lua"
+        );
+        assert_eq!(lua.revision, "main");
+        assert_eq!(lua.location.as_deref(), Some("lua"));
+    }
+
+    #[test]
+    fn field_keys_inside_literals_and_longer_keys_are_ignored() {
+        let content = r#"
+return {
+  lua = {
+    readme_note = "fork of url = 'https://wrong.example'",
+    -- revision = 'wrong'
+    mirror_url = 'https://mirror.example',
+    install_info = {
+      revision = 'abc123',
+      url = 'https://example.com/tree-sitter-lua',
+    },
+  },
+}
+"#;
+
+        let parsers = parse_parsers_lua(content).expect("should parse");
+
+        assert_eq!(parsers["lua"].url, "https://example.com/tree-sitter-lua");
+        assert_eq!(parsers["lua"].revision, "abc123");
+    }
+
+    #[test]
+    fn field_values_are_decoded_lua_strings() {
+        let content = r#"
+return {
+  lua = {
+    install_info = {
+      location = [[
+sub dir]],
+      revision = 'it\'s\\\x41\65\u{42}',
+      url = "https://example.com/a\"b",
+    },
+  },
+}
+"#;
+
+        let parsers = parse_parsers_lua(content).expect("should parse");
+
+        let lua = &parsers["lua"];
+        assert_eq!(lua.url, r#"https://example.com/a"b"#);
+        assert_eq!(lua.revision, r"it's\AAB");
+        assert_eq!(lua.location.as_deref(), Some("sub dir"));
+    }
+
+    #[test]
     fn unterminated_literals_are_parse_errors() {
         for fields in [
             "    readme_note = 'oops,",
