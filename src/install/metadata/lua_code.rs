@@ -231,20 +231,26 @@ fn decode_short_string(body: &[u8]) -> String {
 }
 
 /// Parse the `{XXX}` of a `\u{XXX}` escape, returning the character and
-/// the length of the braced part. Lua allows at most 8 hex digits
-/// (`7FFFFFFF`); only values that are Rust `char`s decode.
+/// the length of the braced part. Lua bounds the value (at most
+/// `7FFFFFFF`), not the digit count, so any leading zeros are allowed
+/// before at most 8 significant digits; only Rust `char`s decode.
 fn unicode_escape(rest: &[u8]) -> Option<(char, usize)> {
     let digits = rest.strip_prefix(b"{")?;
-    let len = digits
+    let zeros = digits.iter().take_while(|&&c| c == b'0').count();
+    let significant = digits[zeros..]
         .iter()
         .take(8)
         .take_while(|c| c.is_ascii_hexdigit())
         .count();
-    if digits.get(len) != Some(&b'}') {
+    let end = zeros + significant;
+    if end == 0 || digits.get(end) != Some(&b'}') {
         return None;
     }
-    let ch = char::from_u32(parse_hex(&digits[..len], 8)?)?;
-    Some((ch, len + 2))
+    let value = match significant {
+        0 => 0,
+        _ => parse_hex(&digits[zeros..end], 8)?,
+    };
+    Some((char::from_u32(value)?, end + 2))
 }
 
 /// Parse 1 to `max` hex digits, rejecting any other byte (including the
