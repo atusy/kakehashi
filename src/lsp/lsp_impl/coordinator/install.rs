@@ -501,6 +501,9 @@ impl InstallCoordinator {
         self.dispatch_install_events(language, &result.events).await;
 
         if let Some(data_dir) = result.outcome.data_dir().cloned() {
+            // The install is the retry; one whose parser then cannot be
+            // loaded records itself as a failure again (see
+            // `reload_language_after_install`).
             self.auto_install
                 .resolve_query_repair_retry(language, failure_revision);
             parsed = self
@@ -692,6 +695,10 @@ impl InstallCoordinator {
         if let Some(claim) = claim {
             if !global_loaded {
                 claim.outcome = crate::lsp::auto_install::InstallOutcome::Failed;
+                // An owned install that cannot be loaded failed like any
+                // other: it waits for a retry.
+                self.auto_install
+                    .record_query_repair_failure(language, self.cache.semantic_token_generation());
             }
             claim.complete_claim();
         }
@@ -939,68 +946,93 @@ mod tests {
     }
 
     /// A parser install's failure waits for a retry; the install that later
-    /// succeeds is that retry, so a configuration push must stop reloading
-    /// for it.
+    /// succeeds — its parser then loading — is that retry, so a configuration
+    /// push must stop reloading for it. An install whose parser still cannot
+    /// be loaded is not.
     #[tokio::test]
     async fn a_successful_install_ends_the_wait_its_earlier_failure_left() {
-        let (service, _socket) = LspService::new(Kakehashi::new);
+        let grammars = std::env::var("TREE_SITTER_GRAMMARS").unwrap_or_else(|_| {
+            std::env::current_dir()
+                .unwrap()
+                .join("deps/tree-sitter")
+                .to_string_lossy()
+                .into_owned()
+        });
+        let parser = std::path::Path::new(&grammars)
+            .join("parser")
+            .join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+        if !parser.exists() {
+            eprintln!("skipping: lua parser not built");
+            return;
+        }
+        let (service, mut socket) = LspService::new(Kakehashi::new);
+        // The post-install reload logs to the client; keep the socket drained.
+        let client = tokio::spawn(async move {
+            use futures::StreamExt;
+            while socket.next().await.is_some() {}
+        });
         let server = service.inner();
-        server
-            .settings_manager
-            .apply_settings(auto_install_settings());
-        let uri = Url::parse("file:///retried-install.rs").unwrap();
-        let incarnation = server.documents.insert(
-            uri.clone(),
-            "fn main() {}".into(),
-            Some("rust".into()),
-            None,
-        );
+        // Search paths of our own: a developer's data directory may already
+        // hold a Lua parser.
+        let search_path = tempfile::tempdir().unwrap();
+        server.settings_manager.apply_settings(WorkspaceSettings {
+            auto_install: true,
+            search_paths: vec![search_path.path().to_string_lossy().into_owned()],
+            ..Default::default()
+        });
+        let uri = Url::parse("file:///retried-install.lua").unwrap();
+        let incarnation =
+            server
+                .documents
+                .insert(uri.clone(), "local x = 1".into(), Some("lua".into()), None);
         let install = server.install_coordinator();
-        server
-            .auto_install
-            .script_next_install("rust", crate::lsp::auto_install::InstallOutcome::Failed);
-        install
-            .maybe_auto_install_language(
-                "rust",
-                uri.clone(),
-                false,
-                Some(incarnation),
-                InstallRequest::new(false),
-            )
-            .await;
+        let attempt = |outcome| {
+            server.auto_install.script_next_install("lua", outcome);
+            let install = &install;
+            let uri = uri.clone();
+            async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    install.maybe_auto_install_language(
+                        "lua",
+                        uri,
+                        false,
+                        Some(incarnation),
+                        InstallRequest::new(false),
+                    ),
+                )
+                .await
+                .expect("the install attempt must finish");
+            }
+        };
+        attempt(crate::lsp::auto_install::InstallOutcome::Failed).await;
         assert!(server.auto_install.has_query_repairs_awaiting_retry());
 
         let data_dir = tempfile::tempdir().unwrap();
-        server.auto_install.script_next_install(
-            "rust",
-            crate::lsp::auto_install::InstallOutcome::Success {
-                data_dir: data_dir.path().to_path_buf(),
-            },
-        );
-        // The post-install reload that follows is beside the point here (and
-        // needs a real parser on disk); the wait must end once the install
-        // has succeeded.
-        let retried = install.maybe_auto_install_language(
-            "rust",
-            uri,
-            false,
-            Some(incarnation),
-            InstallRequest::new(false),
-        );
-        let wait_ended = async {
-            while server.auto_install.has_query_repairs_awaiting_retry() {
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
-        };
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            tokio::select! {
-                _ = retried => {}
-                () = wait_ended => {}
-            }
+        attempt(crate::lsp::auto_install::InstallOutcome::Success {
+            data_dir: data_dir.path().to_path_buf(),
         })
-        .await
-        .expect("the install must finish or end the wait");
+        .await;
+        assert!(
+            server.auto_install.has_query_repairs_awaiting_retry(),
+            "an install whose parser cannot be loaded is not the retry"
+        );
+
+        std::fs::create_dir_all(data_dir.path().join("parser")).unwrap();
+        std::fs::copy(
+            &parser,
+            data_dir
+                .path()
+                .join("parser")
+                .join(format!("lua.{}", std::env::consts::DLL_EXTENSION)),
+        )
+        .unwrap();
+        attempt(crate::lsp::auto_install::InstallOutcome::Success {
+            data_dir: data_dir.path().to_path_buf(),
+        })
+        .await;
         assert!(!server.auto_install.has_query_repairs_awaiting_retry());
+        client.abort();
     }
 
     #[tokio::test]
