@@ -241,6 +241,7 @@ mod tests {
                     injection_regions: None,
                     regions: None,
                     layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
+                    awaiting_reparse: false,
                 }))
             })
             .unwrap_or(false);
@@ -265,6 +266,7 @@ mod tests {
             injection_regions: None,
             regions: None,
             layer_trees: Arc::new(std::sync::OnceLock::new()),
+            awaiting_reparse: false,
         };
         assert!(
             server.whole_document_regions(&uri, &snapshot).is_none(),

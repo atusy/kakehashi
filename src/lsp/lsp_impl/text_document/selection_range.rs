@@ -60,13 +60,20 @@ impl Kakehashi {
                 // Unregistered or closed.
                 return Ok(None);
             };
-            match &view.slot.snapshot {
-                Some(snapshot) if snapshot.parsed_version == view.content_version => {
+            let current = view
+                .slot
+                .snapshot
+                .as_ref()
+                .filter(|snapshot| snapshot.parsed_version == view.content_version);
+            match current {
+                Some(snapshot) if !snapshot.awaiting_reparse => {
                     break std::sync::Arc::clone(snapshot);
                 }
                 _ => {
-                    // No snapshot yet (first parse in flight) or trailing an
-                    // edit: wait for the next publish, bounded by the deadline.
+                    // No snapshot yet (first parse in flight), trailing an
+                    // edit, or a reload placeholder whose reparse is still
+                    // queued: wait for the next publish, bounded by the
+                    // deadline.
                     let wait = tokio::time::timeout_at(deadline, receiver.changed()).await;
                     match wait {
                         // A publish (or close) landed — loop and re-resolve.
@@ -75,10 +82,12 @@ impl Kakehashi {
                         Ok(Err(_)) => return Ok(None),
                         // Deadline passed. A stale snapshot exists → the
                         // coordinates can't be answered: ContentModified. No
-                        // snapshot at all (first parse still running) → the
-                        // pre-snapshot behavior: null.
+                        // parse of the current text yet — the first parse or
+                        // a reload's reparse still running — → the
+                        // pre-snapshot behavior: null (the coordinates are
+                        // the live text's, there is just no tree for them).
                         Err(_elapsed) => {
-                            return if view.slot.snapshot.is_some() {
+                            return if current.is_none() && view.slot.snapshot.is_some() {
                                 Err(crate::error::content_modified_error())
                             } else {
                                 Ok(None)
@@ -89,11 +98,9 @@ impl Kakehashi {
             }
         };
 
-        // A resolved-but-tree-less snapshot cannot produce selection ranges. See
-        // `ParseSnapshot` for the causes — they include a settings-reload
-        // placeholder that reads as current, so this is not only a failure path:
-        // the wait above breaks on that placeholder and answers `null` instead
-        // of settling for its reparse (#923).
+        // A completed parse that produced no tree cannot produce selection
+        // ranges (see `ParseSnapshot` for the causes). The reload placeholder
+        // never reaches here: the wait above settles for its reparse.
         if snapshot.tree.is_none() {
             return Ok(None);
         }
@@ -213,6 +220,7 @@ mod tests {
                 injection_regions: None,
                 regions: None,
                 layer_trees: Arc::new(std::sync::OnceLock::new()),
+                awaiting_reparse: false,
             }),
         );
         assert!(installed.published, "the reparse must land");
@@ -238,5 +246,40 @@ mod tests {
             .expect("the reparse is current")
             .expect("the reparse's tree answers the request");
         assert_eq!(ranges.len(), 1);
+    }
+
+    /// A completed parse that produced no tree is a final answer: `null` at
+    /// once, not after the wait meant for the placeholder.
+    #[tokio::test]
+    async fn answers_null_at_once_for_a_completed_tree_less_parse() {
+        let uri = Url::parse("file:///tree_less_parse.rs").unwrap();
+        let service = server_with_parsed_doc(&uri);
+        let server = service.inner();
+        server.documents.invalidate_all_parses();
+        install_current_parse(server, &uri, None);
+
+        let result = tokio::time::timeout(
+            SELECTION_RANGE_WAIT / 2,
+            server.selection_range_impl(params(&uri)),
+        )
+        .await
+        .expect("a completed parse needs no wait");
+
+        assert!(matches!(result, Ok(None)));
+    }
+
+    /// A reparse still queued at the deadline leaves the live text without a
+    /// tree, not the request's coordinates stale: `null`, as before the first
+    /// parse, rather than `ContentModified`.
+    #[tokio::test]
+    async fn answers_null_when_the_reparse_outlasts_the_wait() {
+        let uri = Url::parse("file:///slow_reparse.rs").unwrap();
+        let service = server_with_parsed_doc(&uri);
+        let server = service.inner();
+        server.documents.invalidate_all_parses();
+
+        let result = server.selection_range_impl(params(&uri)).await;
+
+        assert!(matches!(result, Ok(None)), "{result:?}");
     }
 }
