@@ -140,9 +140,9 @@ pub(crate) struct LanguageCoordinator {
     /// one for configured languages, the next on-demand load for discovered
     /// ones — would compile the same text again.
     trial_queries: Mutex<Vec<Arc<tree_sitter::Query>>>,
-    /// Registered languages the latest trial could no longer load, and
-    /// failed ones it now could, for the next live load to settle (see
-    /// `settle_trial_findings`).
+    /// Registered languages the latest trial could no longer load or loaded
+    /// differently, and failed ones it now could, for the next live load to
+    /// settle (see `settle_trial_findings`).
     trial_vanished: Mutex<Vec<String>>,
     trial_appeared: Mutex<Vec<String>>,
     /// On-demand loads between reading their files and publishing (see
@@ -612,9 +612,10 @@ impl LanguageCoordinator {
     /// change on every push from now on:
     ///
     /// - An older-generation registration it could no longer load (the parser
-    ///   went away) stays registered until something loads that language
-    ///   again; it is unregistered. A document still using one would lose it
-    ///   on its next load anyway. Registrations this load made current stay.
+    ///   went away) or loaded differently (a query changed) stays registered
+    ///   as it was until something loads that language again; it is
+    ///   unregistered, so the next document that needs it loads what is on
+    ///   disk. Registrations this load made current stay.
     /// - A failed language it could now load (the parser appeared) is not
     ///   loaded by this load unless configured; its failure is forgotten, so
     ///   the next document that needs it loads it.
@@ -710,9 +711,9 @@ impl LanguageCoordinator {
             .lock()
             .recover_poison("LanguageCoordinator::reload_would_change_languages(vanished)") =
             current
-                .keys()
-                .filter(|language_id| !trial.contains_key(*language_id))
-                .cloned()
+                .iter()
+                .filter(|(language_id, loaded)| trial.get(*language_id) != Some(*loaded))
+                .map(|(language_id, _)| language_id.clone())
                 .collect();
         *self
             .trial_appeared
@@ -4320,6 +4321,60 @@ mod tests {
         assert!(
             trial_compiled.iter().any(|query| Arc::ptr_eq(query, &live)),
             "the live reload must reuse the query the trial compiled"
+        );
+    }
+
+    /// A discovered language whose query changed after its documents closed
+    /// is not reloaded by the live load either; unless the reload retires
+    /// the stale registration, every later push compares the old query with
+    /// the new file and reloads again.
+    #[test]
+    fn reload_retires_a_discovered_language_whose_query_changed() {
+        let grammars = std::env::var("TREE_SITTER_GRAMMARS").unwrap_or_else(|_| {
+            std::env::current_dir()
+                .unwrap()
+                .join("deps/tree-sitter")
+                .to_string_lossy()
+                .into_owned()
+        });
+        let parser = Path::new(&grammars)
+            .join("parser")
+            .join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+        if !parser.exists() {
+            eprintln!("skipping: lua parser not built");
+            return;
+        }
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("parser")).unwrap();
+        fs::copy(
+            &parser,
+            dir.path()
+                .join("parser")
+                .join(format!("lua.{}", std::env::consts::DLL_EXTENSION)),
+        )
+        .unwrap();
+        let highlights = dir
+            .path()
+            .join("queries")
+            .join("lua")
+            .join("highlights.scm");
+        fs::create_dir_all(highlights.parent().unwrap()).unwrap();
+        fs::write(&highlights, "(identifier) @variable\n").unwrap();
+        let settings = WorkspaceSettings {
+            search_paths: vec![dir.path().to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        let coordinator = LanguageCoordinator::new();
+        coordinator.load_settings(&settings);
+        assert!(coordinator.ensure_language_loaded("lua").success);
+        coordinator.load_settings(&settings);
+
+        fs::write(&highlights, "(identifier) @variable\n(string) @string\n").unwrap();
+        assert!(coordinator.reload_would_change_languages(&settings));
+        coordinator.load_settings(&settings);
+        assert!(
+            !coordinator.reload_would_change_languages(&settings),
+            "the reload that change called for must settle it"
         );
     }
 
