@@ -81,6 +81,8 @@ pub(crate) struct LanguageCoordinator {
     /// re-poisoning — no clear-vs-store ordering to get right. The clear on
     /// `load_settings` is memory hygiene, not the correctness mechanism.
     failed_loads: dashmap::DashMap<String, u64>,
+    /// Serializes [`Self::record_failed_load`]'s bound check with its insert.
+    failed_load_bound: Mutex<()>,
     /// Explicit configured parser failures override same-generation dynamic
     /// discovery. This closes the reload window where fallback publication can
     /// race ahead of validating `languages.<id>.parser`.
@@ -235,6 +237,7 @@ impl LanguageCoordinator {
             base_map: RwLock::new(HashMap::new()),
             derived_languages: RwLock::new(HashSet::new()),
             failed_loads: dashmap::DashMap::new(),
+            failed_load_bound: Mutex::new(()),
             configured_load_failures: dashmap::DashMap::new(),
             reload_scoped_registrations: dashmap::DashMap::new(),
             builtin_queries: dashmap::DashMap::new(),
@@ -340,6 +343,11 @@ impl LanguageCoordinator {
         // configuration pushes that skip the reload never load settings, so
         // the bound is kept here. Forgetting only costs a language a fresh
         // lookup (or the reload trial's attention) until it fails again.
+        // Serialized so concurrent failures cannot all pass the check.
+        let _bound = self
+            .failed_load_bound
+            .lock()
+            .recover_poison("LanguageCoordinator::record_failed_load");
         if self.failed_loads.len() >= MAX_REMEMBERED_FAILED_LOADS {
             self.failed_loads.clear();
         }
