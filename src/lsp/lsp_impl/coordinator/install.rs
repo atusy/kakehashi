@@ -449,6 +449,9 @@ impl InstallCoordinator {
         // A failure is remembered for the generation it was attempted in, so
         // a reload that lands meanwhile already counts as the retry trigger.
         let generation = self.cache.semantic_token_generation();
+        // A successful install answers any earlier failure of this language
+        // that is waiting for a retry — but not one recorded after it began.
+        let failure_revision = self.auto_install.query_repair_revision();
         if !self.same_document_incarnation(&uri, expected_incarnation) {
             if request.repair_queries {
                 self.release_dropped_repair(language, generation);
@@ -498,6 +501,8 @@ impl InstallCoordinator {
         self.dispatch_install_events(language, &result.events).await;
 
         if let Some(data_dir) = result.outcome.data_dir().cloned() {
+            self.auto_install
+                .resolve_query_repair_retry(language, failure_revision);
             parsed = self
                 .reload_language_after_install(
                     language,
@@ -931,6 +936,71 @@ mod tests {
             install.decide_query_repair("rust", true, || QueryChainState::NeedsRepair),
             "a reload (settings change or a successful install) retries it"
         );
+    }
+
+    /// A parser install's failure waits for a retry; the install that later
+    /// succeeds is that retry, so a configuration push must stop reloading
+    /// for it.
+    #[tokio::test]
+    async fn a_successful_install_ends_the_wait_its_earlier_failure_left() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .apply_settings(auto_install_settings());
+        let uri = Url::parse("file:///retried-install.rs").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "fn main() {}".into(),
+            Some("rust".into()),
+            None,
+        );
+        let install = server.install_coordinator();
+        server
+            .auto_install
+            .script_next_install("rust", crate::lsp::auto_install::InstallOutcome::Failed);
+        install
+            .maybe_auto_install_language(
+                "rust",
+                uri.clone(),
+                false,
+                Some(incarnation),
+                InstallRequest::new(false),
+            )
+            .await;
+        assert!(server.auto_install.has_query_repairs_awaiting_retry());
+
+        let data_dir = tempfile::tempdir().unwrap();
+        server.auto_install.script_next_install(
+            "rust",
+            crate::lsp::auto_install::InstallOutcome::Success {
+                data_dir: data_dir.path().to_path_buf(),
+            },
+        );
+        // The post-install reload that follows is beside the point here (and
+        // needs a real parser on disk); the wait must end once the install
+        // has succeeded.
+        let retried = install.maybe_auto_install_language(
+            "rust",
+            uri,
+            false,
+            Some(incarnation),
+            InstallRequest::new(false),
+        );
+        let wait_ended = async {
+            while server.auto_install.has_query_repairs_awaiting_retry() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::select! {
+                _ = retried => {}
+                () = wait_ended => {}
+            }
+        })
+        .await
+        .expect("the install must finish or end the wait");
+        assert!(!server.auto_install.has_query_repairs_awaiting_retry());
     }
 
     #[tokio::test]
