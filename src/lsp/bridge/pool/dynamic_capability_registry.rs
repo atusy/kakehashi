@@ -61,6 +61,15 @@ impl DynamicCapabilityRegistry {
         }
     }
 
+    /// Record the registration a static capability declares — the
+    /// `workspace.workspaceFolders.changeNotifications` id, if any (#1117) —
+    /// once the `initialize` response is in.
+    pub(crate) fn record_static_registration(&self, registration: Option<Registration>) {
+        if let Some(registration) = registration {
+            self.register(vec![registration]);
+        }
+    }
+
     pub(crate) fn unregister(&self, unregistrations: Vec<Unregistration>) {
         let mut guard = self
             .registrations
