@@ -86,9 +86,9 @@ fn build_exclude_matcher(
 ///   content when support cannot be determined from the path alone.
 /// - A path that does not exist is an error.
 ///
-/// The files are sorted for deterministic processing order, and each
-/// underlying file appears once even when reached under several spellings
-/// (see [`dedup_aliases`] for which spelling survives).
+/// The files are sorted for deterministic processing order, and aliases of
+/// one file collapse to a single entry (see [`dedup_aliases`] for which
+/// aliases are recognized and which spelling survives).
 pub(crate) fn collect_files(
     base: &Path,
     paths: &[PathBuf],
@@ -134,8 +134,8 @@ pub(crate) fn collect_files(
 }
 
 /// Drop every entry that names a file already seen earlier in `files`, so a
-/// symlink, a hard link, or a symlinked directory walked next to its target
-/// is processed once.
+/// symlink or a symlinked directory walked next to its target is processed
+/// once, and on Unix a hard link too (see [`file_identity`]).
 ///
 /// The survivor is the first spelling in collection order: the path the user
 /// named first, and within one argument the lexicographically first. The
@@ -143,6 +143,11 @@ pub(crate) fn collect_files(
 /// would rewrite what the user typed (macOS `/var` → `/private/var`,
 /// Windows `\\?\` verbatim prefixes). Writing through a symlink spelling
 /// is safe because `format` canonicalizes before its atomic rename.
+///
+/// Only the surviving spelling is processed, so where the language comes
+/// from the path (extension, file name), aliases spelled differently are
+/// handled as the first spelling's language: the same file cannot be
+/// formatted as two languages in one run.
 ///
 /// An entry whose identity cannot be read (it vanished meanwhile) is kept;
 /// the later read reports the failure as it would without deduplication.
