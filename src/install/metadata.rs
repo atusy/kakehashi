@@ -241,7 +241,7 @@ fn extract_parser_metadata(
     language: &str,
 ) -> Option<ParserMetadata> {
     // Find the start of this language's block
-    // Use word boundary to avoid matching substrings (e.g., "c" matching "cpp")
+    // The key must be followed by `=`, so "c" does not match "cpp"
     let block_start_pattern = format!(r#"(?m)^\s*{}\s*=\s*\{{"#, regex::escape(language));
     let block_start_re = Regex::new(&block_start_pattern).ok()?;
 
