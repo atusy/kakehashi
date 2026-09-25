@@ -162,6 +162,20 @@ impl LanguageServerPool {
                 return item;
             }
         };
+        // A replaced host server gets the host document back only from the
+        // asynchronous re-open; until then the send below finds it not open
+        // and gives up. Wait for that re-open (bounded; a no-op when none is in
+        // flight) BEFORE `document` waits for the parse and takes the host
+        // edit lock, so the wait never holds up edits.
+        if !self.wait_for_pending_reopen(handle.key()).await {
+            warn!(
+                target: "kakehashi::bridge",
+                "completionItem/resolve (host): {server_name:?} is still re-opening its documents; \
+                 returning unresolved"
+            );
+            re_envelope_item(&mut item, &envelope);
+            return item;
+        }
         if !handle.has_capability("completionItem/resolve") {
             // Two ways here. The payload nests the reserved key: as far as
             // this branch can tell, the origin never advertised resolve and

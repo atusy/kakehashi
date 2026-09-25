@@ -756,6 +756,19 @@ impl LanguageServerPool {
                 return action;
             }
         };
+        // A replaced host server gets the host document back only from the
+        // asynchronous re-open; until then the enqueue below finds it not open
+        // and fails. Wait for that re-open (bounded; a no-op when none is in
+        // flight) before taking any host lock.
+        if !self.wait_for_pending_reopen(handle.key()).await {
+            warn!(
+                target: "kakehashi::bridge",
+                "codeAction/resolve (host): {server_name:?} is still re-opening its documents; \
+                 returning unresolved"
+            );
+            re_envelope_action(&mut action, &envelope);
+            return action;
+        }
         if !handle.has_capability("codeAction/resolve") {
             // Anomalous: the envelope was only minted because the origin
             // advertised resolve, so reaching here means a respawn changed
