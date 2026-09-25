@@ -41,7 +41,9 @@ pub(crate) const CLOSED_INCARNATION: u64 = u64::MAX;
 /// - **A placeholder that is not a parse result at all.**
 ///   `Document::invalidate_parse` publishes one on a settings/grammar reload,
 ///   stamped at the bumped `content_version` so it reads as current until the
-///   replacement parse lands.
+///   replacement parse lands. It alone carries
+///   [`awaiting_reparse`](Self::awaiting_reparse), so a reader can tell it
+///   apart from a completed parse that produced no tree.
 ///
 /// `language` is independently `None` when no language was detected.
 pub(crate) struct ParseSnapshot {
@@ -87,6 +89,14 @@ pub(crate) struct ParseSnapshot {
     /// seeing a generation mismatch bypasses the cell and walks fresh (the
     /// pre-cache per-request cost) until the next snapshot rebuilds it.
     pub(crate) layer_trees: Arc<std::sync::OnceLock<(u64, Arc<SnapshotLayerTrees>)>>,
+    /// Provenance: `true` only on the reload placeholder
+    /// (`Document::invalidate_parse`), which is not a parse result. A reader
+    /// that settles for a parse (the explicit-action waits) keeps waiting on
+    /// it, where a completed tree-less parse is a final answer. Every parse
+    /// pass publishes `false`, and [`SnapshotSlot::admits`] lets any parse of
+    /// the placeholder's version replace it, so a reparse — with or without
+    /// a tree — never leaves the flag standing.
+    pub(crate) awaiting_reparse: bool,
 }
 
 impl ParseSnapshot {
@@ -163,7 +173,11 @@ impl SnapshotSlot {
     ///    (tree-less, releases parked first-parse waiters) must not block
     ///    the real parse of the same version that a later successful install
     ///    produces. Same version means same input text, so the upgrade only
-    ///    adds information; an equal-version tree swap stays rejected.
+    ///    adds information; an equal-version tree swap stays rejected. The
+    ///    same holds for an equal-version **placeholder resolution**: a
+    ///    tree-less parse result replacing the reload placeholder (see
+    ///    [`ParseSnapshot::awaiting_reparse`]) turns "not parsed yet" into
+    ///    "parsed, no tree" without changing the text or the tree.
     ///
     /// Regions use the separate, exact-snapshot [`Self::enrich_regions`]
     /// operation rather than this general parse-result admission rule.
@@ -176,8 +190,10 @@ impl SnapshotSlot {
             && self.snapshot.as_ref().is_none_or(|current| {
                 let tree_downgrade = current.tree.is_some() && snapshot.tree.is_none();
                 let tree_upgrade = current.tree.is_none() && snapshot.tree.is_some();
+                let resolves_placeholder = current.awaiting_reparse && !snapshot.awaiting_reparse;
                 (snapshot.parsed_version > current.parsed_version && !tree_downgrade)
-                    || (snapshot.parsed_version == current.parsed_version && tree_upgrade)
+                    || (snapshot.parsed_version == current.parsed_version
+                        && (tree_upgrade || resolves_placeholder))
             })
     }
 
@@ -210,6 +226,7 @@ impl SnapshotSlot {
             injection_regions: expected.injection_regions.clone(),
             regions: Some(regions.clone()),
             layer_trees: Arc::clone(&expected.layer_trees),
+            awaiting_reparse: expected.awaiting_reparse,
         }));
         true
     }
@@ -229,6 +246,7 @@ mod tests {
             injection_regions: None,
             regions: None,
             layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
+            awaiting_reparse: false,
         }
     }
 
@@ -275,6 +293,7 @@ mod tests {
             injection_regions: None,
             regions: None,
             layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
+            awaiting_reparse: false,
         }
     }
 
@@ -379,6 +398,37 @@ mod tests {
         };
         assert!(!slot.enrich_regions(&held, &regions));
         assert!(!SnapshotSlot::closed().enrich_regions(&held, &regions));
+    }
+
+    fn placeholder(incarnation: u64, parsed_version: u64) -> ParseSnapshot {
+        ParseSnapshot {
+            awaiting_reparse: true,
+            ..snap(incarnation, parsed_version)
+        }
+    }
+
+    #[test]
+    fn a_tree_less_parse_resolves_an_equal_version_placeholder_only() {
+        let mut slot = SnapshotSlot::bootstrap(7);
+        slot.snapshot = Some(Arc::new(placeholder(7, 3)));
+        assert!(
+            slot.admits(&snap(7, 3)),
+            "a reparse that produced no tree must replace the placeholder it resolves"
+        );
+        assert!(
+            !slot.admits(&placeholder(7, 3)),
+            "a placeholder does not resolve a placeholder"
+        );
+        assert!(
+            !slot.admits(&snap(6, 3)),
+            "the incarnation clause is never bypassed by the resolution"
+        );
+
+        slot.snapshot = Some(Arc::new(snap(7, 3)));
+        assert!(
+            !slot.admits(&snap(7, 3)),
+            "a completed tree-less parse stays frozen at its version"
+        );
     }
 
     #[test]
