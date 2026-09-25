@@ -112,11 +112,12 @@ and `$$` literal-dollar expansion syntax as setting paths, then relative values
 anchor to the entry file's directory. Settings inside each base still anchor
 to that base file's own directory before the merge.
 
-Base files cannot name more base files in this first version. An explicit entry
-rejects that mistake; an implicit user/project entry warns and skips the
-offending base, preserving the strictness of the source that owns the entry.
-An entry may name at most 64 bases: explicit overflow rejects the entry, while
-implicit overflow warns once and loads the first 64.
+Base files cannot name more base files in this first version, and an entry may
+name at most 64 bases. At startup either mistake is an unusable configuration;
+what that means is set by
+[startup-configuration-validation](startup-configuration-validation.md).
+During later implicit workspace-root reloads, invalid bases are warned about and
+skipped, and overflow warns once and loads the first 64.
 This leaves a backward-compatible route to recursive composition later without
 requiring cycle identity, depth, or duplicate-traversal rules now.
 
@@ -188,8 +189,8 @@ what it prepends: a `$` in the layer's directory name is escaped as `$$`, and a
 `..` is not folded past an unexpanded variable, which would delete the variable
 along with the error expansion owes for it. A value it cannot anchor at all — a
 directory name that is not valid UTF-8, or a drive-relative `C:lib` — is
-reported rather than silently left alone, so the strict `--config-file` layer
-can reject what it cannot honour.
+reported rather than silently left alone, so startup can treat the file as
+unusable instead of honouring it wrongly.
 
 Because each layer is anchored while raw, a language `base` chain that spans
 layers inherits values that have *already* been resolved against their own
@@ -317,51 +318,36 @@ The top-level spelling is accepted through v1 and removed in v2.
 
 ### File Loading Behavior
 
-Strictness is owned by the directly selected entry. A `--config-file` entry and
-the base files it names are strict; an implicitly discovered user or project
-entry and its base files are tolerant. The spelling of a base path does not
-change that policy.
+Startup policy in this section is superseded by
+[startup-configuration-validation](startup-configuration-validation.md).
+The merge order and runtime update policy remain as described here.
 
-1. **Implicitly discovered files degrade quietly**
-   - User config doesn't exist: proceed with empty user config
-   - Project config doesn't exist: proceed with empty project config
-   - Either one exists but fails to parse: warn and skip that layer
-   - This is what keeps zero-config startup working: a stray or half-edited
-     `kakehashi.toml` must never leave the user without a server
+1. **Missing discovered locations preserve zero-config startup**
+   - Missing user and project configuration files contribute no layer.
 
-2. **An explicit `--config-file` that is present but unusable fails startup**
-   - Unreadable, malformed TOML, larger than the 8 MiB read ceiling, carrying a
-     path that cannot be expanded, or sitting somewhere whose own directory
-     cannot be resolved — anchoring that layer's relative paths needs it, and
-     continuing without it would silently resolve them against the working
-     directory
-   - LSP `initialize` returns `RequestFailed` (-32803) naming the first such
-     file; `format` and `diagnose` print it and exit 2
-   - Silently dropping the layer and continuing on defaults is what hides
-     configuration mistakes, and an explicit path is where the user is most
-     entitled to be told
+2. **Unusable startup files: the frontend decides**
+   - A missing `--config-file` entry, or any present file that is unreadable,
+     malformed, oversized, or semantically invalid, is *unusable*.
+   - `format` and `diagnose` print the path and error and exit 2.
+   - The LSP server shows the error (`window/showMessage`) and starts on what
+     loaded: an unusable entry is skipped, an unusable base is skipped on its
+     own while its entry still applies.
 
-3. **An explicit `--config-file` that is absent is skipped**
-   - Layered invocations (`--config-file base.toml --config-file overrides.toml`)
-     depend on the overlay being allowed not to exist, and a relative path
-     resolves against the process working directory — for an editor-spawned
-     server, the editor's rather than the workspace root. Absence is too easily
-     accidental to be worth refusing to start over; being unusable is not.
-   - A path whose metadata cannot be read at all counts as unusable, not
-     absent: `exists()` answers "no" to both, and only one of them is the
-     optional-overlay case.
-   - The skip is a `SettingsEvent::warning`, so an editor sees it as
-     `window/logMessage`. `format` and `diagnose` show nothing: CLI mode has no
-     channel for non-fatal settings events at all (the stub client pump
-     discards them), which is a pre-existing gap rather than a decision here.
+3. **Base-file absence remains optional**
+   - A missing `baseConfigFiles` entry is skipped with a warning.
+   - A present invalid base is unusable, explicit or discovered: the CLI exits
+     2, the LSP server skips that base. Later implicit workspace-root reloads
+     retain tolerant loading.
 
 4. **Where each class of failure is judged**
    - Path expansion: per file, because a later layer replaces path fields
      wholesale, so the merged result would never mention an earlier layer's
      undefined variable
    - Cross-field invariants (e.g. `debounceMs` ≤ `maxWaitMs`): on the merged
-     explicit configuration only, because their operands merge independently —
-     one file may legitimately supply just one half
+     configuration only, because their operands merge independently — one file
+     may legitimately supply just one half. The CLI judges the merged file
+     layers before starting; the LSP server leaves it to the ordinary merge,
+     which reports once and falls back to programmed defaults
    - Unrecognised key names: reported as a warning on TOML configuration files,
      including the implicit user and workspace files and explicit
      `--config-file` layers, but not fatal. Serde drops an unknown field
@@ -387,13 +373,10 @@ change that policy.
      favour of programmed defaults, explicit files included. Only the abort is
      avoided, not the loss.
 
-5. **When the strict gate runs**
-   - Before `initialize` stores anything derived from the request. Several of
-     those stores are first-write-wins and `tower-lsp-server` accepts a retry
-     after an error response, so a client that fixes the file and re-sends
-     `initialize` would otherwise get the corrected settings alongside the
-     failed attempt's capabilities and workspace folders.
-   - Each `--config-file` is read exactly once and the result carried into the
+5. **When the CLI's gate runs**
+   - Before `initialize` stores anything derived from the request, so a
+     rejected handshake leaves no first-write-wins store holding its values.
+   - Each startup configuration file is read exactly once and the result carried into the
      merge: a file swapped between two reads would slip past whichever check
      ran first. Reads are bounded, so a path naming an endless source fails
      instead of exhausting memory; a path naming a stream with no writer still
@@ -405,26 +388,25 @@ change that policy.
 
 `--config-file` is not an alternative *path* for the project layer — it replaces
 the whole implicit pair, and accepts any number of files that merge in flag
-order. It is also the only layer with a verdict of its own, reached before
-`initialize` stores anything, so the files are read once and carried into the
-merge rather than re-read:
+order. Startup preloads either that explicit stack or the discovered pair and
+judges its verdict before `initialize` stores request-derived state. Validated
+layers enter the merge without a second read:
 
 ```rust
-// `initialize`, before any request-derived state is stored:
-let explicit = load_explicit_config(home, env_fn);   // None when the flag is absent
-if let Some(error) = explicit.as_ref().and_then(|c| c.fatal_error.clone()) {
+let policy = if cli_mode { Strict } else { Tolerant };
+let explicit = load_explicit_config(policy, home, env_fn);
+let startup = explicit.unwrap_or_else(|| load_discovered_startup_config(root, policy, home, env_fn));
+if let Some(error) = startup.fatal_error.clone() {   // only ever set when Strict
     return Err(configuration_load_error(error));
 }
-
-fn load_settings(root, override_settings, home, env_fn, explicit) -> SettingsLoadOutcome {
-    let defaults = Some(default_settings());          // src/config/defaults.rs
-    let files = match explicit {
-        Some(explicit) => explicit.layers,            // --config-file, in order
-        None => vec![load_user_config(), load_project_config(root)],
-    };
-    // initializationOptions merge last, and are never fatal
-}
+// Store initialization state only after the file verdict succeeds.
+let settings = load_settings(root, initialization_options, home, env_fn, Some(startup));
+// InitializationOptions merge last and retain nonfatal validation.
 ```
+
+Only explicit file layers are retained for session replay — under the tolerant
+policy, only the entries that loaded. A later workspace-root
+change rediscovers implicit user/project files using the tolerant runtime loader.
 
 **XDG Base Directory compliance:**
 - Use `$XDG_CONFIG_HOME` if set
@@ -438,7 +420,7 @@ fn load_settings(root, override_settings, home, env_fn, explicit) -> SettingsLoa
 - **Layered flexibility**: Users can set sensible defaults globally while projects customize as needed
 - **Editor-agnostic defaults**: User config works regardless of which editor/client is used
 - **Version control friendly**: Project configs can be committed to repos
-- **Zero-config still works**: All layers are optional; empty config results in auto-install behavior
+- **Zero-config still works**: Discovered file layers are optional; empty config results in auto-install behavior
 - **Precedence is intuitive**: "Closer to the action" = higher priority (session > project > user)
 - **Unified queries format**: Single `queries` field with type inference reduces config verbosity
 - **Self-documenting paths**: Filenames like `highlights.scm` convey intent without explicit `kind`
