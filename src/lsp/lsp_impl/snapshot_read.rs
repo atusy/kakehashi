@@ -437,4 +437,57 @@ mod tests {
             "the didClose sentinel must release a parked waiter as Gone"
         );
     }
+
+    fn rust_tree(text: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        parser.parse(text, None).unwrap()
+    }
+
+    /// A settings reload's placeholder is version-current but is not a parse:
+    /// an explicit action settles for the reparse it awaits, not for the
+    /// placeholder's missing tree.
+    #[tokio::test(start_paused = true)]
+    async fn explicit_action_wait_settles_for_the_reparse_behind_a_reload_placeholder() {
+        let uri = Url::parse("file:///reload_placeholder.rs").unwrap();
+        let text = "fn main() {}";
+        let (service, inc) = server_with_doc(&uri, text);
+        let server = service.inner();
+        publish(&service, &uri, text, 0, inc);
+        server.documents.invalidate_all_parses();
+        let reload_version = server
+            .documents
+            .latest_snapshot(&uri)
+            .unwrap()
+            .content_version;
+
+        let reparse = async {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let landed = server.documents.get(&uri).is_some_and(|doc| {
+                doc.publish_snapshot(&Arc::new(ParseSnapshot {
+                    text: Arc::from(text),
+                    tree: Some(rust_tree(text)),
+                    language: Some("rust".to_string()),
+                    parsed_version: reload_version,
+                    incarnation: inc,
+                    injection_regions: None,
+                    regions: None,
+                    layer_trees: Arc::new(std::sync::OnceLock::new()),
+                    awaiting_reparse: false,
+                }))
+            });
+            assert!(landed, "the reparse must land over the placeholder");
+        };
+        let (outcome, ()) = tokio::join!(server.wait_for_explicit_action_snapshot(&uri), reparse);
+
+        let SnapshotWait::Current(snapshot) = outcome else {
+            panic!("the reparse is current");
+        };
+        assert!(
+            snapshot.tree.is_some(),
+            "settled on the placeholder instead"
+        );
+    }
 }
