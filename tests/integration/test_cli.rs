@@ -2961,6 +2961,38 @@ fn test_language_uninstall_leaves_a_language_whole_when_its_parser_is_the_wrong_
     );
 }
 
+/// Under `--all`, discovery has already named a directory-shaped parser, so
+/// the per-language refusal must not name it a second time.
+#[test]
+fn test_language_uninstall_all_names_a_directory_parser_once() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let ext = std::env::consts::DLL_EXTENSION;
+    fs::create_dir_all(test_dir.path().join(format!("parser/lua.{ext}")))
+        .expect("Failed to create parser-shaped directory");
+    let queries_lua = test_dir.path().join("queries/lua");
+    fs::create_dir_all(&queries_lua).expect("Failed to create queries dir");
+    fs::write(queries_lua.join("highlights.scm"), "(comment) @comment")
+        .expect("Failed to write queries");
+
+    let (success, combined) = run_forced_uninstall(test_dir.path(), &["--all"]);
+
+    assert!(
+        !success,
+        "the refused language must fail the run: {combined}"
+    );
+    assert_eq!(
+        combined.matches("Note: left").count(),
+        1,
+        "the directory must be named exactly once: {combined}"
+    );
+    assert!(
+        queries_lua.is_dir(),
+        "the language must be left whole: {combined}"
+    );
+}
+
 /// A removal that FAILS is a different case from one that could not be
 /// classified: the queries are already gone, so the language really is
 /// half-removed. It must say which half, and must not go on to call the
