@@ -516,8 +516,9 @@ Worked traces (servers `a1,a2` in one region, `priorities = [a1, a2]`):
   newly resolved servers, opening it where it was never open. That re-sync has
   the conditions stated under **Host layer** above (the host layer participates,
   a parse tree exists); without them the newly eligible server gets the document
-  only on the first host request. Server `priorities` do not affect which
-  servers are opened.
+  from the next sync that does run: an eager open after a host-language change,
+  or at the latest the first host request. Server `priorities` do not affect
+  which servers are opened.
 - **Re-merge on classification/config change**: a change that alters which slots
   are visible takes effect differently per path. Path A (proactive publish) must
   trigger an immediate host re-merge on any `textDocument/publishDiagnostics`
