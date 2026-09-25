@@ -133,9 +133,11 @@ pub(crate) struct LanguageCoordinator {
     /// one for configured languages, the next on-demand load for discovered
     /// ones — would compile the same text again.
     trial_queries: Mutex<Vec<Arc<tree_sitter::Query>>>,
-    /// Registered languages the latest trial could no longer load, for the
-    /// next live load to retire (see `retire_vanished_languages`).
+    /// Registered languages the latest trial could no longer load, and
+    /// failed ones it now could, for the next live load to settle (see
+    /// `settle_trial_findings`).
     trial_vanished: Mutex<Vec<String>>,
+    trial_appeared: Mutex<Vec<String>>,
     /// On-demand loads between reading their files and publishing (see
     /// [`DynamicLoadInFlight`]).
     dynamic_loads_in_flight: std::sync::atomic::AtomicUsize,
@@ -240,6 +242,7 @@ impl LanguageCoordinator {
             is_trial: false,
             trial_queries: Mutex::new(Vec::new()),
             trial_vanished: Mutex::new(Vec::new()),
+            trial_appeared: Mutex::new(Vec::new()),
             dynamic_loads_in_flight: std::sync::atomic::AtomicUsize::new(0),
             load_problems: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -580,25 +583,38 @@ impl LanguageCoordinator {
             summary.record(derived_name, result);
         }
 
-        self.retire_vanished_languages();
+        self.settle_trial_findings();
         summary
     }
 
-    /// Unregister the older-generation registrations the latest trial found
-    /// no longer loading (their parser went away). Nothing else would: such
-    /// an entry stays registered until something loads that language again,
-    /// and the trial, re-reading it, would then report a change on every push
-    /// from now on. A document still using one would lose it on its next
-    /// load anyway. Registrations this load made current are kept.
-    fn retire_vanished_languages(&self) {
+    /// Settle what the latest trial found, now that the reload it called for
+    /// has run. Nothing else would, and the trial would report the same
+    /// change on every push from now on:
+    ///
+    /// - An older-generation registration it could no longer load (the parser
+    ///   went away) stays registered until something loads that language
+    ///   again; it is unregistered. A document still using one would lose it
+    ///   on its next load anyway. Registrations this load made current stay.
+    /// - A failed language it could now load (the parser appeared) is not
+    ///   loaded by this load unless configured; its failure is forgotten, so
+    ///   the next document that needs it loads it.
+    fn settle_trial_findings(&self) {
         if self.is_trial {
             return;
+        }
+        for language_id in std::mem::take(
+            &mut *self
+                .trial_appeared
+                .lock()
+                .recover_poison("LanguageCoordinator::settle_trial_findings(appeared)"),
+        ) {
+            self.failed_loads.remove(&language_id);
         }
         let vanished = std::mem::take(
             &mut *self
                 .trial_vanished
                 .lock()
-                .recover_poison("LanguageCoordinator::retire_vanished_languages"),
+                .recover_poison("LanguageCoordinator::settle_trial_findings"),
         );
         if vanished.is_empty() {
             return;
@@ -606,7 +622,7 @@ impl LanguageCoordinator {
         let _registration = self
             .registration_lock
             .lock()
-            .recover_poison("LanguageCoordinator::retire_vanished_languages(registration)");
+            .recover_poison("LanguageCoordinator::settle_trial_findings(registration)");
         let generation = self
             .load_generation
             .load(std::sync::atomic::Ordering::Acquire);
@@ -676,6 +692,15 @@ impl LanguageCoordinator {
             current
                 .keys()
                 .filter(|language_id| !trial.contains_key(*language_id))
+                .cloned()
+                .collect();
+        *self
+            .trial_appeared
+            .lock()
+            .recover_poison("LanguageCoordinator::reload_would_change_languages(appeared)") =
+            failed
+                .iter()
+                .filter(|language_id| trial.contains_key(*language_id))
                 .cloned()
                 .collect();
         // A broken parser or query file loads to the same (absent or partial)
@@ -4187,6 +4212,12 @@ mod tests {
             coordinator.reload_would_change_languages(&settings),
             "the parser a document was waiting for appeared"
         );
+
+        // The reload that change calls for loads only configured languages;
+        // the appeared one must not keep reporting the same change.
+        coordinator.load_settings(&settings);
+        assert!(!coordinator.reload_would_change_languages(&settings));
+        assert!(coordinator.ensure_language_loaded("lua").success);
     }
 
     /// A reload that invalidates no parse (the post-install one) leaves a
