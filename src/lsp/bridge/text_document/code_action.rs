@@ -904,26 +904,31 @@ impl LanguageServerPool {
         // A just-replaced origin re-opens its virtual documents asynchronously
         // after `Ready`, and the outbound queue is FIFO: sending before the
         // re-open could hand the downstream a resolve for a document it has not
-        // opened, and nothing downstream of here checks that it is open.
+        // opened, and nothing downstream of here checks that it is open. An
+        // envelope with no valid virtual identity names no document; it keeps
+        // the host-URI fallback its connection was acquired with, ungated.
         let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(&host_url) else {
             re_envelope_action(&mut action, &envelope);
             return action;
         };
-        let virtual_uri = VirtualDocumentUri::new(
-            &host_uri_lsp,
-            &envelope.injection_language,
-            &envelope.region_id,
-        );
-        if !self
-            .resolve_document_ready(
-                "codeAction/resolve",
-                handle.key(),
-                ResolveDocument::Virtual(&virtual_uri),
-            )
-            .await
+        if VirtualDocumentUri::is_valid_identity(&envelope.injection_language, &envelope.region_id)
         {
-            re_envelope_action(&mut action, &envelope);
-            return action;
+            let virtual_uri = VirtualDocumentUri::new(
+                &host_uri_lsp,
+                &envelope.injection_language,
+                &envelope.region_id,
+            );
+            if !self
+                .resolve_document_ready(
+                    "codeAction/resolve",
+                    handle.key(),
+                    ResolveDocument::Virtual(&virtual_uri),
+                )
+                .await
+            {
+                re_envelope_action(&mut action, &envelope);
+                return action;
+            }
         }
 
         let offset = RegionOffset::from(&envelope.offset);

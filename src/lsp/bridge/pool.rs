@@ -3175,7 +3175,7 @@ impl LanguageServerPool {
         // region_id to `VirtualDocumentUri::new` (debug builds assert, and
         // release builds would select a route no minted document uses);
         // preserve the pre-routing host-URI fallback instead.
-        if injection_language.is_empty() || region_id.is_empty() || region_id.contains('.') {
+        if !VirtualDocumentUri::is_valid_identity(injection_language, region_id) {
             return self
                 .get_or_create_connection(server_name, server_config, Some(host_uri))
                 .await;
