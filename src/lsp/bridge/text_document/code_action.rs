@@ -2138,6 +2138,57 @@ mod tests {
         assert!(request.await.unwrap().title.starts_with("resolved"));
     }
 
+    /// The sweep can re-open THIS document and then stall on another one, so
+    /// the connection-wide wait times out although this resolve's didOpen is
+    /// already ahead of it in the FIFO. That resolve must still be sent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn virtual_code_action_resolve_sends_when_its_document_reopened_before_a_timeout() {
+        use crate::lsp::bridge::test_helpers::wait_for_sent_request;
+        let (pool, handle, envelope, virtual_uri, config) = virtual_resolve_fixture().await;
+        // The re-open is claimed and never reports within this test.
+        let _done = pool.claim_reopen_for_test(handle.key());
+        let upstream_id = UpstreamId::Number(84);
+        let request = spawn_virtual_resolve(&pool, &envelope, &config, &upstream_id);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // The sweep reaches this document, then goes on to stall elsewhere.
+        pool.ensure_document_opened(
+            &mut crate::lsp::bridge::pool::ConnectionHandleSender(&handle),
+            &Url::parse(&envelope.host_uri).unwrap(),
+            &virtual_uri,
+            "local x = 1",
+            handle.key(),
+        )
+        .await
+        .unwrap();
+
+        // Past the barrier's budget: the resolve is either sent or refused.
+        tokio::time::timeout(
+            crate::lsp::bridge::REOPEN_WAIT + std::time::Duration::from_secs(2),
+            async {
+                while !request.is_finished()
+                    && handle
+                        .router()
+                        .lookup_downstream_ids(&upstream_id)
+                        .is_empty()
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            },
+        )
+        .await
+        .expect("the resolve must settle once the barrier's budget is spent");
+        assert!(
+            !request.is_finished(),
+            "a document re-opened before the timeout must still be resolved"
+        );
+        let downstream_id = wait_for_sent_request(&handle, &upstream_id).await;
+        let _ = handle.router().route(json!({
+            "jsonrpc": "2.0", "id": downstream_id.as_i64(), "result": {"title": "resolved"}
+        }));
+        assert!(request.await.unwrap().title.starts_with("resolved"));
+    }
+
     /// A settled barrier does not prove THIS document is open: a re-open that
     /// failed is retired by its first waiter, and later waiters see nothing
     /// outstanding. The resolve must still not reach a process that never
