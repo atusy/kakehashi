@@ -1099,7 +1099,10 @@ fn discard_backup(published: &PublishedQueryDir) {
 /// of them. It is dropped when the directory is confirmed absent, which is how
 /// a concurrent uninstall's collection stops leaving sidecars behind.
 fn discard_backup_dir(backup: &Path) {
-    match remove_dir_all_tolerating_vanished(backup) {
+    // Whatever shape it has: a backup is what sat in the slot before, and a
+    // regular file there makes a regular-file backup that `remove_dir_all`
+    // cannot take (#1006).
+    match remove_entry_tolerating_vanished(backup) {
         Ok(_) => {
             let _ = fs::remove_file(backup_ownership_sidecar(backup));
         }
@@ -1583,17 +1586,16 @@ fn remove_query_install_and_backups_inner(
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        // file_type() over path.is_dir(): is_dir() swallows metadata errors
-        // as "not a directory", which could leave an unreadable backup behind
-        // while uninstall reports success.
-        if entry.file_type()?.is_dir()
-            && generated_backup_matches_language(name, language)
-            && backup_is_owned(&path)
-        {
+        // Any shape: install displaces whatever sat in the slot, so a backup
+        // is a regular file when a regular file was there. The generated name
+        // and the ownership sidecar are what make it ours; the removal
+        // classifies it and propagates a failure to, rather than reading it as
+        // "not a backup" and reporting success over it.
+        if generated_backup_matches_language(name, language) && backup_is_owned(&path) {
             let ownership = backup_ownership_sidecar(&path);
-            // Same NotFound tolerance as the canonical dir above: a backup
+            // Same NotFound tolerance as the canonical entry above: a backup
             // deleted externally after enumeration is already the end state.
-            let removed_dir = remove_dir_all_tolerating_vanished(&path)?;
+            let removed_dir = remove_entry_tolerating_vanished(&path)?;
             // The sidecar is a kakehashi-owned artifact too: deleting it
             // counts as removal even when the dir itself vanished first —
             // and, like every other I/O in this loop, only NotFound is
@@ -1873,12 +1875,9 @@ fn collect_superseded_backups(
         // could not even read is how residue it never saw becomes permanent.
         let entry = entry.map_err(QueryInstallError::IoError)?;
         let path = entry.path();
-        if !entry
-            .file_type()
-            .map_err(QueryInstallError::IoError)?
-            .is_dir()
-            || !backup_is_owned(&path)
-        {
+        // Any shape, as in uninstall's sweep: a displaced regular file is a
+        // backup too, and `discard_backup_dir` takes one.
+        if !backup_is_owned(&path) {
             continue;
         }
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
