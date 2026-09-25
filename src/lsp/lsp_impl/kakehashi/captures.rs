@@ -619,13 +619,6 @@ pub(in crate::lsp::lsp_impl) fn kind_queries_changed(
                 .collect::<Vec<_>>()
         })
         .collect();
-    // Kind names are client-chosen, so the cache can hold arbitrarily many
-    // entries, and this scan resolves each one on every push. Past the
-    // bound, report a change instead: the reload that follows bumps the
-    // generation, which leaves nothing current for the next scan to walk.
-    if cached.len() > MAX_SCANNED_KIND_QUERIES {
-        return true;
-    }
     // After the snapshot, not before: a store that replaced an entry with
     // different text either landed before the snapshot, and its conflict is
     // already recorded (under the entry's lock, before the replacement), or
@@ -643,6 +636,13 @@ pub(in crate::lsp::lsp_impl) fn kind_queries_changed(
         if current {
             return true;
         }
+    }
+    // Kind names are client-chosen, so the cache can hold arbitrarily many
+    // entries, and this scan resolves each one on every push. Past the
+    // bound, report a change instead: the reload that follows bumps the
+    // generation, which leaves nothing current for the next scan to walk.
+    if cached.len() > MAX_SCANNED_KIND_QUERIES {
+        return true;
     }
     cached.into_iter().any(|(language_id, file_name, source)| {
         match QueryLoader::resolve_query_source(search_paths, &language_id, &file_name) {
