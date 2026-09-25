@@ -1567,11 +1567,26 @@ fn remove_query_install_and_backups_inner(
     write_uninstall_tombstone(queries_parent, language)?;
     let queries_dir = queries_parent.join(language);
 
-    // No exists() pre-check: Path::exists() reads false on metadata errors
-    // (e.g. PermissionDenied), which would skip removal and report "not
-    // installed" over a still-present unreadable dir. The tolerant removal
-    // reports whether anything was actually removed.
-    removal.removed_queries = remove_dir_all_tolerating_vanished(&queries_dir)?;
+    // Classified here, under the replace lock, rather than trusting whatever
+    // discovery saw: a shape decided earlier is a statement about what the
+    // path WAS. And by `symlink_metadata`, not `exists()`, which reads false on
+    // metadata errors (e.g. PermissionDenied) and would skip removal and report
+    // "not installed" over a still-present unreadable entry.
+    removal.removed_queries = match fs::symlink_metadata(&queries_dir) {
+        // `remove_dir_all` takes a symlink itself and never its target —
+        // including a directory symlink on Windows, which `remove_file`
+        // refuses there.
+        Ok(metadata) if metadata.is_dir() || metadata.file_type().is_symlink() => {
+            remove_dir_all_tolerating_vanished(&queries_dir)?
+        }
+        // Anything else in the slot — a regular file, FIFO or socket — is
+        // still the slot install owns: publishing moves whatever is here aside
+        // regardless of its shape. `remove_dir_all` cannot take it, and
+        // `unlink` never opens it, so a FIFO cannot block the removal (#1006).
+        Ok(_) => remove_file_tolerating_vanished(&queries_dir)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(QueryInstallError::IoError(e)),
+    };
     // Either branch of that call leaves the directory gone; anything else
     // returned an error above.
     removal.queries_absent = true;
@@ -1634,6 +1649,18 @@ fn remove_dir_all_tolerating_vanished(dir: &Path) -> Result<bool, QueryInstallEr
         {
             Ok(false)
         }
+        Err(e) => Err(QueryInstallError::IoError(e)),
+    }
+}
+
+/// `fs::remove_file` that treats an entry already gone as the desired end
+/// state. Returns whether this call removed anything. Unlike a directory
+/// removal, `unlink` is a single step, so its `NotFound` cannot mean a
+/// partially removed entry and needs no confirmation.
+fn remove_file_tolerating_vanished(path: &Path) -> Result<bool, QueryInstallError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(QueryInstallError::IoError(e)),
     }
 }
