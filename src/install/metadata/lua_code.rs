@@ -259,7 +259,9 @@ fn parse_hex<T: TryFrom<u32>>(digits: &[u8], max: usize) -> Option<T> {
     T::try_from(value).ok()
 }
 
-/// A long string's value: its contents without a first line break.
+/// A long string's value: its contents without a first line break. Unlike
+/// Lua, other CR or CR LF line breaks are kept as written rather than
+/// turned into LF; the fields read from parsers.lua are single-line.
 fn long_string_value(body: &[u8]) -> String {
     let body = body
         .strip_prefix(b"\r\n")
