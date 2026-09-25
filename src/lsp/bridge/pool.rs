@@ -2142,7 +2142,8 @@ impl LanguageServerPool {
         if !self.wait_for_pending_reopen(key).await {
             log::warn!(
                 target: "kakehashi::bridge",
-                "{method}: {key} is still re-opening its documents; not sending out of order"
+                "{method}: the re-open on {key} did not settle (timed out or failed); \
+                 not sending out of order"
             );
             return false;
         }
