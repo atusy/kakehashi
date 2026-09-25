@@ -2200,6 +2200,169 @@ fn test_language_uninstall_all_removes_a_dangling_query_entry() {
     );
 }
 
+/// Run `kakehashi language uninstall <args> --force --data-dir <dir>` and
+/// return the exit status with stdout and stderr combined.
+fn run_forced_uninstall(data_dir: &std::path::Path, args: &[&str]) -> (bool, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args(["language", "uninstall"])
+        .args(args)
+        .args(["--force", "--data-dir", data_dir.to_str().unwrap()])
+        .output()
+        .expect("Failed to execute command");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (output.status.success(), combined)
+}
+
+/// A non-directory at `queries/<lang>` sits in the slot install owns — install
+/// moves whatever is there aside — so uninstall must be able to take it back.
+/// It used to fail on it forever by name (`remove_dir_all` cannot take a file)
+/// and not see it at all under `--all`, which then claimed nothing was there.
+#[test]
+fn test_language_uninstall_removes_a_regular_file_query_entry_by_name() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    fs::create_dir_all(test_dir.path().join("queries")).expect("Failed to create queries dir");
+    let entry = test_dir.path().join("queries/lua");
+    fs::write(&entry, "not a directory").expect("Failed to create query-slot file");
+
+    let (success, combined) = run_forced_uninstall(test_dir.path(), &["lua"]);
+
+    assert!(
+        success,
+        "a removable entry must not fail the run: {combined}"
+    );
+    assert!(
+        fs::symlink_metadata(&entry).is_err(),
+        "the entry must be unlinked, so a second run converges: {combined}"
+    );
+    assert!(
+        !combined.contains("is not installed"),
+        "an entry that was just removed was not absent: {combined}"
+    );
+}
+
+#[test]
+fn test_language_uninstall_all_removes_a_regular_file_query_entry() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    fs::create_dir_all(test_dir.path().join("queries")).expect("Failed to create queries dir");
+    let entry = test_dir.path().join("queries/lua");
+    fs::write(&entry, "not a directory").expect("Failed to create query-slot file");
+
+    let (success, combined) = run_forced_uninstall(test_dir.path(), &["--all"]);
+
+    assert!(
+        success,
+        "a removable entry must not fail the run: {combined}"
+    );
+    assert!(
+        fs::symlink_metadata(&entry).is_err(),
+        "discovery must offer the entry, and removal must take it: {combined}"
+    );
+    assert!(
+        !combined.contains("No languages installed to uninstall."),
+        "'nothing installed' is false while the entry is on disk: {combined}"
+    );
+}
+
+/// Beside a real parser, the file in the query slot used to strand the whole
+/// language: the failed query removal left the parser in place and every
+/// retry failed the same way.
+#[test]
+fn test_language_uninstall_removes_a_parser_beside_a_regular_file_query_entry() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let ext = std::env::consts::DLL_EXTENSION;
+    fs::create_dir_all(test_dir.path().join("parser")).expect("Failed to create parser dir");
+    fs::create_dir_all(test_dir.path().join("queries")).expect("Failed to create queries dir");
+    let parser = test_dir.path().join(format!("parser/lua.{ext}"));
+    fs::write(&parser, "parser").expect("Failed to create parser");
+    let entry = test_dir.path().join("queries/lua");
+    fs::write(&entry, "not a directory").expect("Failed to create query-slot file");
+
+    let (success, combined) = run_forced_uninstall(test_dir.path(), &["lua"]);
+
+    assert!(success, "uninstall failed: {combined}");
+    assert!(
+        fs::symlink_metadata(&entry).is_err(),
+        "the query-slot file must be removed: {combined}"
+    );
+    assert!(
+        fs::symlink_metadata(&parser).is_err(),
+        "the parser must be removed too: {combined}"
+    );
+    assert!(
+        combined.contains("Uninstalled 'lua'."),
+        "a full removal is a clean uninstall: {combined}"
+    );
+}
+
+/// Make a FIFO or a socket at `path`. The socket's listener is returned so the
+/// caller decides how long the endpoint lives; the entry outlives it either way.
+#[cfg(unix)]
+fn make_special_file(
+    path: &std::path::Path,
+    kind: &str,
+) -> Option<std::os::unix::net::UnixListener> {
+    match kind {
+        "fifo" => {
+            use nix::sys::stat::Mode;
+            nix::unistd::mkfifo(path, Mode::S_IRUSR | Mode::S_IWUSR).expect("Failed to mkfifo");
+            None
+        }
+        "socket" => {
+            Some(std::os::unix::net::UnixListener::bind(path).expect("Failed to bind socket"))
+        }
+        other => panic!("unknown special file kind {other}"),
+    }
+}
+
+/// A temp dir short enough for a socket path: macOS caps `sun_path` at about
+/// 104 bytes, and a long `TMPDIR` would fail the fixture for the wrong reason.
+#[cfg(unix)]
+fn short_temp_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("kh")
+        .tempdir_in("/tmp")
+        .expect("Failed to create temp dir")
+}
+
+/// FIFOs and sockets in the query slot are unlinked like any other
+/// non-directory: `unlink` never opens the entry, so a FIFO cannot block it.
+#[test]
+#[cfg(unix)]
+fn test_language_uninstall_removes_special_file_query_entries() {
+    use std::fs;
+
+    for kind in ["fifo", "socket"] {
+        for args in [&["lua"][..], &["--all"][..]] {
+            let test_dir = short_temp_dir();
+            fs::create_dir_all(test_dir.path().join("queries"))
+                .expect("Failed to create queries dir");
+            let entry = test_dir.path().join("queries/lua");
+            let _listener = make_special_file(&entry, kind);
+
+            let (success, combined) = run_forced_uninstall(test_dir.path(), args);
+
+            assert!(
+                success,
+                "a {kind} in the query slot must not fail {args:?}: {combined}"
+            );
+            assert!(
+                fs::symlink_metadata(&entry).is_err(),
+                "the {kind} must be unlinked by {args:?}: {combined}"
+            );
+        }
+    }
+}
+
 /// A language whose OWN parser entry could not be read must be left whole.
 /// Removing its queries anyway would manufacture the parser-only state — which
 /// is #953's headline shape, reached through the per-entry door instead of the
