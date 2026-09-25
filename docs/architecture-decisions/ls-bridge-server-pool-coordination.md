@@ -137,7 +137,8 @@ that opted out). On a shared connection, roots it was already told of stay
 aboard after an unregistration (the served-root proof accepts its folder set
 for any server that ever registered folder changes); only new roots divert,
 and a root whose announce loses that race fails its acquisition rather than
-opening unannounced. Because registration arrives only after `initialized` while
+opening unannounced. Because a dynamic registration arrives only after
+`initialized` (a static `changeNotifications` id is recorded before it) while
 the divert check runs at `Ready`, roots acquired in that window divert
 deterministically; when the registration arrives on the shared connection, the
 pool retires that server's diverts (marker-rooted connections launched under
