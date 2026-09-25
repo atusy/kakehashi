@@ -582,4 +582,33 @@ mod tests {
 
         assert!(matches!(outcome, SnapshotWait::Stale));
     }
+
+    /// An explicit action answers for the text it was sent against: a newer
+    /// edit reparsed during the wait is not that text.
+    #[tokio::test(start_paused = true)]
+    async fn an_edit_reparsed_during_the_placeholder_wait_reads_stale() {
+        let uri = Url::parse("file:///edit_reparsed_during_reload.rs").unwrap();
+        let text = "fn main() {}";
+        let edited = "fn main() { }";
+        let (service, inc) = server_with_doc(&uri, text);
+        let server = service.inner();
+        publish(&service, &uri, text, 0, inc);
+        server.documents.invalidate_all_parses();
+
+        let edit = async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            server
+                .documents
+                .update_document(uri.clone(), edited.to_string(), None);
+            let version = server
+                .documents
+                .latest_snapshot(&uri)
+                .unwrap()
+                .content_version;
+            publish(&service, &uri, edited, version, inc);
+        };
+        let (outcome, ()) = tokio::join!(server.wait_for_explicit_action_snapshot(&uri), edit);
+
+        assert!(matches!(outcome, SnapshotWait::Stale));
+    }
 }
