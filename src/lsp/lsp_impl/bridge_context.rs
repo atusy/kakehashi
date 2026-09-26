@@ -58,6 +58,19 @@ fn capability_prefilter_applies(method: &str) -> bool {
 /// range, including inter-capture gaps, stripped line prefixes, and excluded
 /// child ranges. Until edit translation carries the exact allowed spans,
 /// forwarding these methods could apply virtual whitespace over real host text.
+fn protected_completion_allowed(protected: &[Range], position: Position) -> bool {
+    !protected.is_empty()
+        && protected
+            .iter()
+            .all(|range| range.start.line == range.end.line)
+        && !protected.iter().any(|range| {
+            let point = (position.line, position.character);
+            let start = (range.start.line, range.start.character);
+            let end = (range.end.line, range.end.character);
+            start <= point && point < end
+        })
+}
+
 fn method_requires_contiguous_injection(method: &str) -> bool {
     matches!(
         method,
@@ -1086,7 +1099,11 @@ impl Kakehashi {
             return None;
         };
 
-        if !resolved.contiguous && method_requires_contiguous_injection(method_name) {
+        if !resolved.contiguous
+            && method_requires_contiguous_injection(method_name)
+            && (method_name != "textDocument/completion"
+                || !protected_completion_allowed(&resolved.protected_host_ranges, position))
+        {
             return None;
         }
 
@@ -3379,6 +3396,20 @@ mod tests {
         ] {
             assert!(!method_requires_contiguous_injection(method), "{method}");
         }
+    }
+
+    #[test]
+    fn protected_completion_requires_single_line_gaps_and_cursor_outside() {
+        let p = |line, character| Position { line, character };
+        let range = |start, end| Range { start, end };
+        let single = [range(p(2, 4), p(2, 10))];
+        assert!(protected_completion_allowed(&single, p(2, 3)));
+        assert!(!protected_completion_allowed(&single, p(2, 4)));
+        assert!(!protected_completion_allowed(&single, p(2, 7)));
+        assert!(protected_completion_allowed(&single, p(2, 10)));
+        assert!(!protected_completion_allowed(&[], p(2, 3)));
+        let multiline = [range(p(2, 4), p(3, 2))];
+        assert!(!protected_completion_allowed(&multiline, p(4, 0)));
     }
 
     /// Range endpoints are bounds, not carets: the whole-document idiom

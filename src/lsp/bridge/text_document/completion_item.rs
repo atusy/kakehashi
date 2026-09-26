@@ -33,7 +33,7 @@ use super::super::protocol::{
 };
 use super::completion::{
     EnvelopeContext, KakehashiEnvelope, envelope_item_data, strip_envelope,
-    transform_completion_item,
+    transform_completion_item_protected,
 };
 use super::host::{HostDocument, sync_host_document};
 use crate::config::settings::WorkspaceSettings;
@@ -50,7 +50,11 @@ pub(crate) struct CompletionResolveDocument {
     pub(crate) host_uri: Url,
     pub(crate) language_id: String,
     pub(crate) text: Arc<str>,
-    pub(crate) geometry: Option<(RegionOffset, Position)>,
+    pub(crate) geometry: Option<(
+        RegionOffset,
+        Position,
+        Vec<tower_lsp_server::ls_types::Range>,
+    )>,
     pub(crate) revision: HostRevision,
     pub(crate) edit_guard: tokio::sync::OwnedMutexGuard<()>,
 }
@@ -299,7 +303,7 @@ impl LanguageServerPool {
             re_envelope_item(&mut item, &envelope);
             return item;
         };
-        let Some((offset, region_end)) = document.geometry.clone() else {
+        let Some((offset, region_end, protected_host_ranges)) = document.geometry.clone() else {
             re_envelope_item(&mut item, &envelope);
             return item;
         };
@@ -319,13 +323,20 @@ impl LanguageServerPool {
             .await
         {
             Some(mut resolved) => {
-                if transform_completion_item(&mut resolved, &offset, region_end, None) {
+                if transform_completion_item_protected(
+                    &mut resolved,
+                    &offset,
+                    region_end,
+                    None,
+                    &protected_host_ranges,
+                ) {
                     // A client may resolve this result again. Its ranges now
                     // use the live geometry, so their next inverse mapping
                     // must use that same geometry rather than the producer's.
                     let mut resolved_envelope = envelope;
                     resolved_envelope.offset = (&offset).into();
                     resolved_envelope.region_end = Some((region_end.line, region_end.character));
+                    resolved_envelope.protected_host_ranges = protected_host_ranges;
                     re_envelope_item(&mut resolved, &resolved_envelope);
                     resolved
                 } else {
@@ -605,6 +616,7 @@ fn re_envelope_item(item: &mut CompletionItem, envelope: &KakehashiEnvelope) {
         region_end: envelope
             .region_end
             .map(|(line, character)| Position { line, character }),
+        protected_host_ranges: &envelope.protected_host_ranges,
         // Preserve the layer: a host-layer item that has been resolved once
         // must still take the host path on the client's NEXT resolve of it.
         host_layer: envelope.host_layer,
@@ -636,6 +648,7 @@ mod tests {
                 line_column_offsets: None,
             },
             region_end: Some((9, 0)),
+            protected_host_ranges: Vec::new(),
             host_layer: false,
         }
     }
@@ -1029,6 +1042,7 @@ mod tests {
                 line_column_offsets: None,
             },
             region_end: Some((9, 0)),
+            protected_host_ranges: Vec::new(),
             host_layer: false,
         };
         let mut item = CompletionItem {

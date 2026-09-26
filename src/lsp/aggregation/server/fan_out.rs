@@ -32,6 +32,7 @@ pub(crate) struct FanOutTask {
     pub(crate) region_id: String,
     pub(crate) offset: RegionOffset,
     pub(crate) virtual_content: String,
+    pub(crate) protected_host_ranges: Vec<tower_lsp_server::ls_types::Range>,
     /// Lazily derived end-of-content position, shared across every arm of one
     /// request (see [`FanOutTask::region_end`]).
     region_end_cell: std::sync::Arc<std::sync::OnceLock<tower_lsp_server::ls_types::Position>>,
@@ -139,6 +140,7 @@ where
                 ctx.resolved.line_column_offsets.clone(),
             ),
             virtual_content: ctx.resolved.virtual_content.clone(),
+            protected_host_ranges: ctx.resolved.protected_host_ranges.clone(),
             region_end_cell: std::sync::Arc::clone(&region_end_cell),
             upstream_id: ctx.upstream_request_id.clone(),
             client_progress_token: client_progress_tokens

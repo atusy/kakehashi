@@ -95,11 +95,18 @@ impl Kakehashi {
                             &envelope.region_id,
                         )?;
                         let text = std::sync::Arc::from(region.virtual_content.as_str());
+                        let protected_host_ranges = region.protected_host_ranges.clone();
                         let (offset, end, contiguous, language) = resolved_region_geometry(region);
-                        if !completion_geometry_matches(envelope, &offset, contiguous, &language) {
+                        if !completion_geometry_matches(
+                            envelope,
+                            &offset,
+                            contiguous,
+                            &language,
+                            &protected_host_ranges,
+                        ) {
                             return None;
                         }
-                        (language, text, Some((offset, end)))
+                        (language, text, Some((offset, end, protected_host_ranges)))
                     };
                     Some((
                         language_id,
@@ -175,10 +182,16 @@ fn completion_geometry_matches(
     live_offset: &RegionOffset,
     contiguous: bool,
     live_language: &str,
+    live_protected_host_ranges: &[tower_lsp_server::ls_types::Range],
 ) -> bool {
     let produced_at = RegionOffset::from(&envelope.offset);
+    let protected_geometry_supported = !live_protected_host_ranges.is_empty()
+        && live_protected_host_ranges
+            .iter()
+            .all(|range| range.start.line == range.end.line);
     !envelope.region_id.is_empty()
-        && contiguous
+        && (contiguous || protected_geometry_supported)
+        && envelope.protected_host_ranges == live_protected_host_ranges
         // The start identifies the region; the per-line columns below it
         // grow with the region and are read live for translation.
         && produced_at.line() == live_offset.line()
@@ -207,30 +220,101 @@ mod tests {
     }
 
     #[test]
-    fn completion_resolve_requires_current_contiguous_geometry() {
+    fn completion_resolve_requires_current_geometry() {
+        use tower_lsp_server::ls_types::{Position, Range};
         let offset = RegionOffset::with_per_line_offsets(3, vec![2]);
         let region = envelope("01ARZ3NDEKTSV4RRFFQ69G5FAV");
-        assert!(completion_geometry_matches(&region, &offset, true, "lua"));
+        assert!(completion_geometry_matches(
+            &region,
+            &offset,
+            true,
+            "lua",
+            &[]
+        ));
         assert!(!completion_geometry_matches(
             &envelope(""),
             &offset,
             true,
-            "lua"
+            "lua",
+            &[]
         ));
-        assert!(!completion_geometry_matches(&region, &offset, false, "lua"));
+        assert!(!completion_geometry_matches(
+            &region,
+            &offset,
+            false,
+            "lua",
+            &[]
+        ));
         let moved = RegionOffset::with_per_line_offsets(4, vec![2]);
         assert!(
-            !completion_geometry_matches(&region, &moved, true, "lua"),
+            !completion_geometry_matches(&region, &moved, true, "lua", &[]),
             "a region that moved is not the region the item was produced for"
         );
         assert!(
-            !completion_geometry_matches(&region, &offset, true, "python"),
+            !completion_geometry_matches(&region, &offset, true, "python", &[]),
             "a region re-routed to another language is not the region the item was produced for"
         );
         let grown = RegionOffset::with_per_line_offsets(3, vec![2, 2, 2]);
         assert!(
-            completion_geometry_matches(&region, &grown, true, "lua"),
+            completion_geometry_matches(&region, &grown, true, "lua", &[]),
             "a blockquoted region that grew is still the region the item was produced for"
         );
+
+        let gap = Range {
+            start: Position {
+                line: 3,
+                character: 5,
+            },
+            end: Position {
+                line: 3,
+                character: 11,
+            },
+        };
+        let mut protected = envelope("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        protected.protected_host_ranges = vec![gap];
+        assert!(completion_geometry_matches(
+            &protected,
+            &offset,
+            false,
+            "lua",
+            &[gap]
+        ));
+        let multiline_gap = Range {
+            start: Position {
+                line: 3,
+                character: 5,
+            },
+            end: Position {
+                line: 4,
+                character: 1,
+            },
+        };
+        let mut multiline = envelope("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        multiline.protected_host_ranges = vec![multiline_gap];
+        assert!(!completion_geometry_matches(
+            &multiline,
+            &offset,
+            false,
+            "lua",
+            &[multiline_gap]
+        ));
+
+        let shifted = Range {
+            start: Position {
+                line: 3,
+                character: 6,
+            },
+            end: Position {
+                line: 3,
+                character: 12,
+            },
+        };
+        assert!(!completion_geometry_matches(
+            &protected,
+            &offset,
+            false,
+            "lua",
+            &[shifted]
+        ));
     }
 }
