@@ -112,39 +112,15 @@ pub(super) fn dedent_virtual_content(
     }
 
     fn body_without_eol(line: &str) -> &str {
-        let without_lf = line.strip_suffix('\n').unwrap_or(line);
-        without_lf.strip_suffix('\r').unwrap_or(without_lf)
+        line.strip_suffix("\r\n")
+            .or_else(|| line.strip_suffix('\n'))
+            .unwrap_or(line)
     }
 
-    fn split_physical_lines(content: &str) -> Vec<&str> {
-        let bytes = content.as_bytes();
-        let mut lines = Vec::new();
-        let mut start = 0usize;
-        let mut index = 0usize;
-        while index < bytes.len() {
-            let end = match bytes[index] {
-                b'\n' => Some(index + 1),
-                b'\r' if bytes.get(index + 1) == Some(&b'\n') => Some(index + 2),
-                b'\r' => Some(index + 1),
-                _ => None,
-            };
-            if let Some(end) = end {
-                lines.push(&content[start..end]);
-                start = end;
-                index = end;
-            } else {
-                index += 1;
-            }
-        }
-        if start < content.len() {
-            lines.push(&content[start..]);
-        }
-        lines
-    }
-
-    let physical_lines = split_physical_lines(&content);
-    let logical_line_count = physical_lines.len()
-        + usize::from(matches!(content.as_bytes().last(), Some(b'\n' | b'\r')));
+    // Keep the same line model as tree-sitter and the bridge translation
+    // pipeline: only \n advances a row. A lone \r remains content.
+    let physical_lines: Vec<&str> = content.split_inclusive('\n').collect();
+    let logical_line_count = physical_lines.len() + usize::from(content.ends_with('\n'));
 
     let common = physical_lines
         .iter()
@@ -679,12 +655,12 @@ mod tests {
     }
 
     #[test]
-    fn dedent_preserves_lone_cr_and_mixed_line_endings() {
+    fn dedent_keeps_lone_cr_within_virtual_line() {
         let (content, offsets) =
             dedent_virtual_content("  one\r    two\r\n  three\n".to_string(), Vec::new());
 
-        assert_eq!(content, "one\r  two\r\nthree\n");
-        assert_eq!(offsets, vec![2, 2, 2, 0]);
+        assert_eq!(content, "one\r    two\r\nthree\n");
+        assert_eq!(offsets, vec![2, 2, 0]);
     }
 
     #[test]
