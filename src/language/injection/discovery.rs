@@ -1706,6 +1706,13 @@ fn render_gap_segment(
     let multiline = clamped_slice(text, full_gap.clone()).contains('\n');
     let is_first = segment.start == full_gap.start;
     let is_last = segment.end == full_gap.end;
+    let (content, terminator) = if let Some(content) = segment_text.strip_suffix("\r\n") {
+        (content, "\r\n")
+    } else if let Some(content) = segment_text.strip_suffix('\n') {
+        (content, "\n")
+    } else {
+        (segment_text, "")
+    };
     let combined_edge_token = if multiline && is_first && is_last {
         match (prefix, suffix) {
             (Some(prefix), Some(suffix)) => Some([prefix, suffix].concat()),
@@ -1717,7 +1724,11 @@ fn render_gap_segment(
         None
     };
     let token = if multiline && is_first && is_last {
-        combined_edge_token.as_deref()
+        let width = content.encode_utf16().count();
+        combined_edge_token
+            .as_deref()
+            .filter(|candidate| token_padded_to_utf16_width(candidate, width).is_some())
+            .or(placeholder)
     } else if multiline {
         if is_first {
             prefix.or(placeholder)
@@ -1730,13 +1741,6 @@ fn render_gap_segment(
         placeholder
     };
 
-    let (content, terminator) = if let Some(content) = segment_text.strip_suffix("\r\n") {
-        (content, "\r\n")
-    } else if let Some(content) = segment_text.strip_suffix('\n') {
-        (content, "\n")
-    } else {
-        (segment_text, "")
-    };
     let mut rendered = render_gap_line(content, token, multiline && !is_first);
     rendered.push_str(terminator);
     rendered
@@ -3320,6 +3324,24 @@ mod tests {
         assert_eq!(
             render_gap_segment(text, &full_gap, full_gap.clone(), Some("0"), None, None),
             "0  \n"
+        );
+    }
+
+    #[test]
+    fn newline_terminated_single_segment_gap_falls_back_when_wrapper_edges_do_not_fit() {
+        let text = "x\n";
+        let full_gap = 0..text.len();
+
+        assert_eq!(
+            render_gap_segment(
+                text,
+                &full_gap,
+                full_gap.clone(),
+                Some("0"),
+                Some("(0"),
+                Some(")"),
+            ),
+            "0\n"
         );
     }
 
