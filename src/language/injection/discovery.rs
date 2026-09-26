@@ -40,7 +40,7 @@ fn iter_injection_content_captures<'a, 'b>(
 
 fn injection_gap_ranges(match_: &QueryMatch<'_, '_>, query: &Query) -> Vec<Range<usize>> {
     match_
-        .captures
+        .captures()
         .iter()
         .filter_map(|capture| {
             query
@@ -1888,7 +1888,7 @@ fn build_combined_virtual_content_with_gaps(
             gap_index += 1;
         }
         let first_gap = explicit_gaps.get(gap_index).and_then(|range| {
-            let start = ceil_char_boundary(text, range.start.max(line_start));
+            let start = text.ceil_char_boundary(range.start.max(line_start));
             let end = range.end.min(content_end);
             (start < end).then_some(start)
         });
