@@ -7,12 +7,12 @@ use tree_sitter::{Node, Query, QueryCapture, QueryCursor, QueryMatch, StreamingI
 use ulid::Ulid;
 use url::Url;
 
-use super::content::{compute_line_column_offsets, extract_clean_content};
+use super::content::{compute_line_column_offsets, dedent_virtual_content, extract_clean_content};
 use super::language::extract_injection_language;
 use super::offset::InjectionOffset;
 use super::ranges::{
     compute_included_ranges, compute_included_ranges_clipped, has_combined_for_pattern,
-    has_include_children_for_pattern,
+    has_dedent_for_pattern, has_include_children_for_pattern,
 };
 use crate::language::LanguageCoordinator;
 use crate::language::node_tracker::NodeTracker;
@@ -105,6 +105,8 @@ pub(crate) struct InjectionRegionInfo<'a> {
     pub offset: Option<InjectionOffset>,
     /// Whether this pattern's captures form one virtual document.
     pub combined: bool,
+    /// Whether common leading indentation should be stripped from the bridge virtual document.
+    pub dedent: bool,
     /// Stable query pattern index used as part of tracker identity.
     pub identity_slot: usize,
 }
@@ -263,7 +265,11 @@ fn extract_virtual_content_and_offsets(
         cacheable.start_column,
         included_ranges.as_deref(),
     );
-    Some((virtual_content, line_column_offsets))
+    if region.dedent {
+        Some(dedent_virtual_content(virtual_content, line_column_offsets))
+    } else {
+        Some((virtual_content, line_column_offsets))
+    }
 }
 
 impl CacheableInjectionRegion {
@@ -547,6 +553,7 @@ fn collect_query_range<'a>(
                     // adjustment; consumers compose each member's effective
                     // range into the shared injected document.
                     combined: has_combined_for_pattern(query, match_.pattern_index),
+                    dedent: has_dedent_for_pattern(query, match_.pattern_index),
                     identity_slot: 0,
                     offset,
                 }
@@ -1234,6 +1241,11 @@ impl InjectionResolver {
         }) && covered_until >= group_end;
         let (virtual_content, line_column_offsets) =
             build_combined_virtual_content(text, group_start..group_end, &included);
+        let (virtual_content, line_column_offsets) = if first.dedent {
+            dedent_virtual_content(virtual_content, line_column_offsets)
+        } else {
+            (virtual_content, line_column_offsets)
+        };
 
         let mut combined_region = first_cacheable.clone();
         combined_region.byte_range.end = group_end;
@@ -1743,6 +1755,7 @@ mod tests {
                         // adjustment; consumers compose each member's effective
                         // range into the shared injected document.
                         combined: has_combined_for_pattern(query, match_.pattern_index),
+                        dedent: has_dedent_for_pattern(query, match_.pattern_index),
                         identity_slot: 0,
                         offset,
                     }
@@ -2549,6 +2562,92 @@ mod tests {
         );
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].virtual_content, "    original\n");
+    }
+
+    #[test]
+    fn resolve_all_applies_dedent_after_runtime_offset() {
+        let mut parser = create_rust_parser();
+        let text = "/*\n    alpha\n      beta\n*/";
+        let tree = parse_rust_code(&mut parser, text);
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(
+            &language,
+            r#"
+                ((block_comment) @injection.content
+                 (#set! injection.language "rust")
+                 (#set! injection.dedent)
+                 (#offset! @injection.content 1 0 0 -2))
+            "#,
+        )
+        .expect("valid query");
+
+        let resolved = InjectionResolver::resolve_all(
+            &test_coordinator(),
+            &NodeTracker::new(),
+            &test_uri("dedent_offset"),
+            &tree,
+            text,
+            &query,
+            0,
+        );
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].virtual_content, "alpha\n  beta\n");
+        assert_eq!(resolved[0].line_column_offsets, vec![4, 4, 0]);
+    }
+
+    #[test]
+    fn resolve_all_combined_dedent_preserves_masked_gaps_and_offsets() {
+        let mut parser = create_rust_parser();
+        let text = "/*\n    alpha\n      beta\n*/\nlet x = 0;\n/*\n    gamma\n*/";
+        let tree = parse_rust_code(&mut parser, text);
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(
+            &language,
+            r#"
+                ((block_comment) @injection.content
+                 (#set! injection.language "rust")
+                 (#set! injection.combined)
+                 (#set! injection.dedent)
+                 (#offset! @injection.content 1 0 0 -2))
+            "#,
+        )
+        .expect("valid query");
+
+        let resolved = InjectionResolver::resolve_all(
+            &test_coordinator(),
+            &NodeTracker::new(),
+            &test_uri("combined_dedent"),
+            &tree,
+            text,
+            &query,
+            0,
+        );
+
+        assert_eq!(resolved.len(), 1);
+        let resolved = &resolved[0];
+        assert!(!resolved.contiguous);
+        assert!(resolved.virtual_content.starts_with("alpha\n  beta\n"));
+        assert!(resolved.virtual_content.ends_with("gamma\n"));
+        assert!(!resolved.virtual_content.contains("let x = 0"));
+        let alpha_line = resolved
+            .virtual_content
+            .lines()
+            .position(|line| line == "alpha")
+            .expect("dedented alpha line");
+        let beta_line = resolved
+            .virtual_content
+            .lines()
+            .position(|line| line == "  beta")
+            .expect("dedented beta line");
+        let gamma_line = resolved
+            .virtual_content
+            .lines()
+            .position(|line| line == "gamma")
+            .expect("dedented gamma line");
+        assert_eq!(resolved.line_column_offsets[alpha_line], 4);
+        assert_eq!(resolved.line_column_offsets[beta_line], 4);
+        assert_eq!(resolved.line_column_offsets[gamma_line], 4);
     }
 
     #[test]
@@ -3487,6 +3586,7 @@ mod tests {
                 include_children: false,
                 offset: None,
                 combined: false,
+                dedent: false,
                 identity_slot: 0,
             },
             InjectionRegionInfo {
@@ -3496,6 +3596,7 @@ mod tests {
                 include_children: false,
                 offset: None,
                 combined: false,
+                dedent: false,
                 identity_slot: 0,
             },
             InjectionRegionInfo {
@@ -3505,6 +3606,7 @@ mod tests {
                 include_children: false,
                 offset: None,
                 combined: false,
+                dedent: false,
                 identity_slot: 0,
             },
         ];
@@ -3578,6 +3680,7 @@ mod tests {
                 include_children: false,
                 offset: None,
                 combined: false,
+                dedent: false,
                 identity_slot: 0,
             },
             InjectionRegionInfo {
@@ -3587,6 +3690,7 @@ mod tests {
                 include_children: false,
                 offset: None,
                 combined: false,
+                dedent: false,
                 identity_slot: 0,
             },
             InjectionRegionInfo {
@@ -3596,6 +3700,7 @@ mod tests {
                 include_children: false,
                 offset: None,
                 combined: false,
+                dedent: false,
                 identity_slot: 0,
             },
         ];
@@ -3789,6 +3894,7 @@ mod tests {
             include_children: false,
             offset: Some(trim_across_newline),
             combined: false,
+            dedent: false,
             identity_slot: 0,
         }];
         assert_eq!(
@@ -3869,6 +3975,7 @@ mod tests {
                 include_children: false,
                 offset: None,
                 combined: false,
+                dedent: false,
                 identity_slot: 0,
             },
             InjectionRegionInfo {
@@ -3878,6 +3985,7 @@ mod tests {
                 include_children: false,
                 offset: None,
                 combined: false,
+                dedent: false,
                 identity_slot: 0,
             },
         ];
@@ -3931,6 +4039,7 @@ mod tests {
                 include_children: false,
                 offset: None,
                 combined: false,
+                dedent: false,
                 identity_slot: 0,
             },
             InjectionRegionInfo {
@@ -3940,6 +4049,7 @@ mod tests {
                 include_children: false,
                 offset: None,
                 combined: false,
+                dedent: false,
                 identity_slot: 0,
             },
         ];
@@ -3983,6 +4093,7 @@ mod tests {
                     end_column: -1,
                 }),
                 combined: false,
+                dedent: false,
                 identity_slot: 0,
             },
             InjectionRegionInfo {
@@ -3992,6 +4103,7 @@ mod tests {
                 include_children: false,
                 offset: None,
                 combined: false,
+                dedent: false,
                 identity_slot: 0,
             },
         ];
@@ -4129,6 +4241,7 @@ mod tests {
                 include_children,
                 offset: Some(offset),
                 combined: false,
+                dedent: false,
                 identity_slot: 0,
             }],
             node.start_byte(),
