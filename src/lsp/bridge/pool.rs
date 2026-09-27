@@ -3847,7 +3847,9 @@ impl LanguageServerPool {
         };
         if !handle.supports_workspace_folder_changes() {
             // Routing chose this connection while it was capable and an
-            // unregistration landed since (#968's rare reverse transition).
+            // unregistration landed since (the rare reverse transition: of a
+            // dynamic registration, #968, or of a static
+            // `changeNotifications` id, #1117).
             // A marker root it does not serve must not be opened here
             // unannounced: refuse, so the acquisition re-resolves and diverts.
             // Only that transition: a server that never registered was never

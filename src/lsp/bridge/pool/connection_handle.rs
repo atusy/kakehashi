@@ -16,9 +16,9 @@ use tokio::sync::mpsc;
 use tower_lsp_server::ls_types::{
     CodeActionOptions, CodeActionProviderCapability, ColorProviderCapability,
     DeclarationCapability, FoldingRangeProviderCapability, HoverProviderCapability,
-    ImplementationProviderCapability, LinkedEditingRangeServerCapabilities, OneOf, RenameOptions,
-    SaveOptions, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncOptions,
-    TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability,
+    ImplementationProviderCapability, LinkedEditingRangeServerCapabilities, OneOf, Registration,
+    RenameOptions, SaveOptions, ServerCapabilities, TextDocumentSyncCapability,
+    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability,
 };
 
 use super::connection_action::BridgeError;
@@ -52,14 +52,16 @@ pub(crate) fn supports_initial_workspace_folders(caps: &ServerCapabilities) -> b
         .is_some_and(|folders| folders.supported == Some(true))
 }
 
-/// Whether `caps` STATICALLY advertises everything the shared-instance opt-in
-/// (#391) needs to drive one connection across roots via
-/// `workspace/didChangeWorkspaceFolders`: `workspace.workspaceFolders` with
-/// `supported == true` AND `changeNotifications` set to a value other than the
-/// explicit `false` (either `true` or a registration id string). Anything
-/// missing or `Left(false)` means the `InitializeResult` alone does not
-/// promise folder-change handling — the server may still register the
-/// notification dynamically, which
+/// Whether `caps` STATICALLY advertises, for the connection's whole life,
+/// everything the shared-instance opt-in (#391) needs to drive one connection
+/// across roots via `workspace/didChangeWorkspaceFolders`:
+/// `workspace.workspaceFolders` with `supported == true` AND
+/// `changeNotifications == true`. A registration id string declares the same
+/// support but can be unregistered (LSP 3.18), so the handshake records it in
+/// the registry instead ([`static_folder_change_registration`]) and it is not
+/// counted here. Anything missing or `Left(false)` means the
+/// `InitializeResult` alone does not promise folder-change handling — the
+/// server may still register the notification dynamically, which
 /// [`ConnectionHandle::supports_workspace_folder_changes`] also consults.
 /// Without either, the bridge diverts new, unserved marker roots to per-root
 /// instances — roots the connection already serves (its spawn root, and
@@ -73,12 +75,28 @@ pub(crate) fn supports_workspace_folder_changes(caps: &ServerCapabilities) -> bo
     else {
         return false;
     };
-    let supported = folders.supported == Some(true);
-    let wants_change_notifications = matches!(
-        folders.change_notifications,
-        Some(OneOf::Left(true)) | Some(OneOf::Right(_))
-    );
-    supported && wants_change_notifications
+    folders.supported == Some(true) && folders.change_notifications == Some(OneOf::Left(true))
+}
+
+/// The registration a `changeNotifications` id string stands for, when `caps`
+/// declares `workspace.workspaceFolders.supported == true` with one (#1117).
+/// LSP 3.18 makes that id usable to unregister the notification, so the
+/// handshake enters it into the connection's registry like a dynamic
+/// registration; the live registry read then decides for both shapes, and a
+/// `client/unregisterCapability` of the id withdraws the support.
+pub(crate) fn static_folder_change_registration(caps: &ServerCapabilities) -> Option<Registration> {
+    let folders = caps.workspace.as_ref()?.workspace_folders.as_ref()?;
+    if folders.supported != Some(true) {
+        return None;
+    }
+    let Some(OneOf::Right(id)) = &folders.change_notifications else {
+        return None;
+    };
+    Some(Registration {
+        id: id.clone(),
+        method: DID_CHANGE_WORKSPACE_FOLDERS_METHOD.to_string(),
+        register_options: None,
+    })
 }
 
 /// Result of attempting to send a notification.
@@ -767,16 +785,17 @@ impl ConnectionHandle {
     /// notifications — the capability the shared-instance opt-in (#391) and
     /// the upstream folder-change forwarding both require. Either declaration
     /// counts: the static `InitializeResult` shape
-    /// ([`supports_workspace_folder_changes`]) or a live dynamic registration
-    /// of the notification (Pyright-style, #968). Returns `false` until the
-    /// initialize handshake stores capabilities or a registration arrives, so
-    /// a still-initializing connection is treated as not-yet-capable.
+    /// ([`supports_workspace_folder_changes`]) or a live registration of the
+    /// notification — dynamic (Pyright-style, #968) or a static
+    /// `changeNotifications` id the handshake recorded (#1117). Returns
+    /// `false` until the initialize handshake stores capabilities or a
+    /// registration arrives, so a still-initializing connection is treated as
+    /// not-yet-capable.
     ///
     /// The registry is read live rather than latched, even though the
     /// capability is treated as effectively monotone: an `unregisterCapability`
-    /// of a dynamic registration really withdraws it. (A static
-    /// `changeNotifications` id is not in the registry, so unregistering that
-    /// id leaves the static declaration standing — as before #968; #1117.)
+    /// of a registration — dynamic, or a static `changeNotifications` id —
+    /// really withdraws it (#1117).
     /// Latching would keep forwarding notifications to a server that opted
     /// out; reading live instead lets the
     /// next upstream folder change find the connection incapable and recycle
@@ -784,9 +803,10 @@ impl ConnectionHandle {
     /// ordering between registration and folder-change handling. A check that
     /// races an in-flight registration just sees the older answer, whose worst
     /// case is what the static-only check did unconditionally (a spurious
-    /// recycle or divert). The registry's lock is a leaf: its writer, the
-    /// reader task's register handler, never holds `connections`, so reading
-    /// it under `connections` cannot invert an order.
+    /// recycle or divert). The registry's lock is a leaf: its writers — the
+    /// reader task's register handlers and the handshake's `changeNotifications`
+    /// id seed — never hold `connections`, so reading it under `connections`
+    /// cannot invert an order.
     pub(crate) fn supports_workspace_folder_changes(&self) -> bool {
         self.server_capabilities()
             .is_some_and(supports_workspace_folder_changes)
@@ -802,8 +822,9 @@ impl ConnectionHandle {
     /// read lease across the send: an unregistration cannot land between
     /// "still registered" and "queued", and its acknowledgement shares this
     /// writer FIFO, so the server always receives the notification before it
-    /// learns the unregistration was accepted. A static declaration cannot be
-    /// withdrawn and needs no lease.
+    /// learns the unregistration was accepted. A static
+    /// `changeNotifications == true` cannot be withdrawn and needs no lease;
+    /// a static id is a registration and takes the lease (#1117).
     pub(crate) fn send_folder_change<P: serde::Serialize>(
         &self,
         notification: JsonRpcNotification<P>,
@@ -2484,11 +2505,13 @@ mod tests {
 
     #[test]
     fn supports_workspace_folder_changes_requires_supported_and_change_notifications() {
-        // The capable shapes: supported + (Left(true) | Right(id)).
+        // The one lifelong shape: supported + Left(true).
         assert!(supports_workspace_folder_changes(
             &caps_with_workspace_folders(Some(folders_cap(Some(true), Some(OneOf::Left(true)))),)
         ));
-        assert!(supports_workspace_folder_changes(
+        // A registration id can be withdrawn, so it counts through the
+        // registry instead (#1117).
+        assert!(!supports_workspace_folder_changes(
             &caps_with_workspace_folders(Some(folders_cap(
                 Some(true),
                 Some(OneOf::Right("id".to_string()))
@@ -2514,6 +2537,34 @@ mod tests {
         assert!(!supports_workspace_folder_changes(
             &ServerCapabilities::default()
         ));
+    }
+
+    #[test]
+    fn static_folder_change_registration_only_for_a_supported_id() {
+        let registration = static_folder_change_registration(&caps_with_workspace_folders(Some(
+            folders_cap(Some(true), Some(OneOf::Right("id".to_string()))),
+        )))
+        .expect("a supported id is a registration");
+        assert_eq!(registration.id, "id");
+        assert_eq!(registration.method, "workspace/didChangeWorkspaceFolders");
+
+        // An id without `supported == true` declares no folder support, as
+        // before; `true` needs no registration; nothing else is one.
+        for folders in [
+            folders_cap(None, Some(OneOf::Right("id".to_string()))),
+            folders_cap(Some(false), Some(OneOf::Right("id".to_string()))),
+            folders_cap(Some(true), Some(OneOf::Left(true))),
+            folders_cap(Some(true), None),
+        ] {
+            assert!(
+                static_folder_change_registration(&caps_with_workspace_folders(Some(
+                    folders.clone()
+                )))
+                .is_none(),
+                "{folders:?}"
+            );
+        }
+        assert!(static_folder_change_registration(&ServerCapabilities::default()).is_none());
     }
 
     #[tokio::test]

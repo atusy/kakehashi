@@ -1,7 +1,9 @@
 //! `client/unregisterCapability` server-request handler.
 //!
-//! Inbound (downstream → bridge). A downstream server unregisters a dynamic
-//! capability it previously registered; the bridge drops it from the shared
+//! Inbound (downstream → bridge). A downstream server unregisters a capability
+//! it registered under an id — dynamically, or as the static
+//! `workspace.workspaceFolders.changeNotifications` id the handshake recorded
+//! (#1117); the bridge drops it from the shared
 //! [`DynamicCapabilityRegistry`] and acks with `null`. Param-parse failures (or
 //! a missing `params` field) reply with InvalidParams (-32602), mirroring
 //! [`register_capability`](super::register_capability).
@@ -40,7 +42,7 @@ pub(in crate::lsp::bridge) fn handle(
             for unreg in &unreg_params.unregisterations {
                 debug!(
                     target: "kakehashi::bridge::reader",
-                    "{}Unregistered dynamic capability: {} (id={})",
+                    "{}Unregistered capability: {} (id={})",
                     server_prefix, unreg.method, unreg.id
                 );
             }
