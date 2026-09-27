@@ -16,7 +16,8 @@
 //! ## Staging
 //! Three source kinds are populated:
 //! - [`DiagnosticSource::PullLayer`] — the host-event pull's already
-//!   cross-layer-combined result, in host coordinates, as one blob.
+//!   cross-layer-combined result, in host coordinates, alongside the raw
+//!   components needed to retain a pending layer.
 //! - [`DiagnosticSource::Region`] — a downstream push for an injection region, in
 //!   virtual coordinates, transformed to host coordinates at publish time.
 //! - [`DiagnosticSource::Host`] — a downstream `_self` host-layer push for the
@@ -29,7 +30,7 @@
 //! [`DiagnosticPublisher`](crate::lsp::lsp_impl::coordinator::DiagnosticPublisher)'s
 //! `filter_pull_driven_push_slots` drops a
 //! **pull-driven** server's push slots from the publish whenever a `PullLayer`
-//! blob is present (classification is live via
+//! contribution covers that layer (classification is live via
 //! [`LanguageServerPool::pull_driven_servers`](crate::lsp::bridge::LanguageServerPool)),
 //! so the pull contribution wins and the push is kept only as the proactive
 //! source for genuinely **push-driven** servers. The slot stays cached either
@@ -55,6 +56,7 @@ use tower_lsp_server::ls_types::Diagnostic;
 use url::Url;
 
 use crate::error::LockResultExt;
+use crate::lsp::aggregation::diagnostic::PullLayerComponents;
 use crate::lsp::bridge::{
     ProgressConnectionId, RegionOffset, VirtualDocumentUri, translate_virtual_range_to_host,
 };
@@ -95,6 +97,8 @@ pub(crate) const PULL_LAYER_SERVER: &str = "<pull-layer>";
 #[derive(Debug, Clone)]
 pub(crate) struct SlotEntry {
     pub(crate) diagnostics: Vec<Diagnostic>,
+    /// Raw synthetic pull contributions; push slots carry no components.
+    pub(crate) pull_components: Option<Arc<PullLayerComponents>>,
     /// The downstream connection that produced this slot, or `None` for the
     /// synthetic pull-layer blob (not tied to one connection's lifetime). A server
     /// restart mints a *new* connection id, so a later push from the restart
@@ -102,6 +106,18 @@ pub(crate) struct SlotEntry {
     /// ([`DiagnosticAggregator::evict_connection`]) drop only the dead connection's
     /// slots, never a live restart's (#469).
     pub(crate) connection_id: Option<ProgressConnectionId>,
+}
+
+impl SlotEntry {
+    /// `(virtual, host)` layers this pull-layer slot covers. Only meaningful on
+    /// the [`DiagnosticSource::PullLayer`] slot. A component-less pull slot comes
+    /// only from the `#[cfg(test)]` writers (`set_pull_layer*`), which model an
+    /// opaque full pull, hence the full-coverage fallback.
+    pub(crate) fn pull_coverage(&self) -> (bool, bool) {
+        self.pull_components
+            .as_ref()
+            .map_or((true, true), |parts| parts.coverage())
+    }
 }
 
 /// `server name → slot`. Several servers can attach to one source.
@@ -469,7 +485,7 @@ pub(crate) struct DiagnosticAggregator {
     /// nudge-less** mutation (`publish_pull_layer`/`clear_pull_layer`, and
     /// the refresh prefetch's own commit) since the last **covering** editor
     /// pull — confirmed at the Changed republish that recorded the move (see
-    /// [`Self::set_pull_layer_nudgeless`] /
+    /// [`Self::set_pull_components_nudgeless`] /
     /// [`Self::settle_pending_pull_view_lag`]). Those writers never emit `workspace/diagnostic/refresh` (by
     /// design — they are normally paired with the editor's own event-driven
     /// pull), but that pairing is a race: the editor's pull can answer with
@@ -493,7 +509,7 @@ pub(crate) struct DiagnosticAggregator {
     /// Nudge-less mutations performed but not yet settled by a recorded
     /// republish, keyed to the CACHE REVISION current when the mutation
     /// landed (stamped inside the same `cache_revisions` critical section —
-    /// see [`Self::set_pull_layer_nudgeless`]). The republish that validates
+    /// see [`Self::set_pull_components_nudgeless`]). The republish that validates
     /// a revision `r` settles every mark with revision ≤ r: a Changed record
     /// converts it into the confirmed lag, an Unchanged record drops it (the
     /// mutation demonstrably left the merged set alone). Revision-keying is
@@ -1080,6 +1096,7 @@ impl DiagnosticAggregator {
         source_slots.entry(source).or_default().insert(
             server,
             SlotEntry {
+                pull_components: None,
                 diagnostics,
                 connection_id,
             },
@@ -1096,7 +1113,7 @@ impl DiagnosticAggregator {
     /// The pull-layer is a cross-connection aggregate, not a single connection's
     /// push, so its slot is tagged `None` and is never touched by crash eviction.
     /// Test-only since the production writers moved to
-    /// [`Self::set_pull_layer_nudgeless`] (which additionally stamps the
+    /// [`Self::set_pull_components_nudgeless`] (which additionally stamps the
     /// pending pull-view-lag mark in the same critical section).
     #[cfg(test)]
     pub(crate) fn set_pull_layer(&self, host: &Url, diagnostics: Vec<Diagnostic>) {
@@ -1281,67 +1298,88 @@ impl DiagnosticAggregator {
     /// field doc). Stamping atomically with the mutation ties the mark to
     /// the exact revision carrying this data, so a republish can only settle
     /// it once its validated snapshot INCLUDES the mutation.
+    #[cfg(test)]
     pub(crate) fn set_pull_layer_nudgeless(&self, host: &Url, diagnostics: Vec<Diagnostic>) {
-        let mut revisions = self
-            .cache_revisions
-            .lock()
-            .recover_poison("DiagnosticAggregator::cache_revisions");
-        let mut cache = self.lock();
-        let source_slots = if let Some(source_slots) = cache.get_mut(host) {
-            source_slots
-        } else {
-            cache.entry(host.clone()).or_default()
-        };
-        let changed = source_slots
-            .get(&DiagnosticSource::PullLayer)
-            .and_then(|servers| servers.get(PULL_LAYER_SERVER))
-            .is_none_or(|slot| slot.diagnostics != diagnostics);
-        source_slots
-            .entry(DiagnosticSource::PullLayer)
-            .or_default()
-            .insert(
-                PULL_LAYER_SERVER.to_string(),
-                SlotEntry {
-                    diagnostics,
-                    connection_id: None,
-                },
-            );
-        if changed {
-            revisions.insert(host.clone(), self.allocate_cache_revision());
-            // Stamp only a REAL change (Qodo, PR #972): a no-op mutation owes
-            // the editor nothing, and its stale mark would otherwise be
-            // converted into a spurious lag by whatever unrelated Changed
-            // republish settles next.
-            let revision = revisions.get(host).copied().unwrap_or(0);
-            self.pull_view_lag_pending
-                .lock()
-                .recover_poison("DiagnosticAggregator::pull_view_lag_pending")
-                .insert(host.clone(), revision);
-        }
+        self.update_pull_layer_nudgeless(host, |_| {
+            Some(SlotEntry {
+                pull_components: None,
+                diagnostics,
+                connection_id: None,
+            })
+        });
+    }
+
+    /// Merge collected components with any pending cached layers, then stamp
+    /// publication/coverage changes under the same revision and cache locks.
+    pub(crate) fn set_pull_components_nudgeless(
+        &self,
+        host: &Url,
+        components: PullLayerComponents,
+    ) {
+        self.update_pull_layer_nudgeless(host, |previous| {
+            let components = components
+                .retain_pending(previous.and_then(|slot| slot.pull_components.as_deref()));
+            if components.coverage() == (false, false) {
+                return None;
+            }
+            Some(SlotEntry {
+                diagnostics: components.combine(),
+                connection_id: None,
+                pull_components: Some(Arc::new(components)),
+            })
+        });
     }
 
     /// Evict the pull-layer blob AND stamp the pending mark, like
-    /// [`Self::set_pull_layer_nudgeless`] — the nudge-less variant of
+    /// [`Self::set_pull_components_nudgeless`] — the nudge-less variant of
     /// `evict_source(host, PullLayer)`.
     pub(crate) fn evict_pull_layer_nudgeless(&self, host: &Url) {
+        self.update_pull_layer_nudgeless(host, |_| None);
+    }
+
+    /// Read, transform, and replace the synthetic pull slot under the same
+    /// revision/cache guards. A partial collection can therefore retain a
+    /// previous contribution without racing another cache writer.
+    fn update_pull_layer_nudgeless(
+        &self,
+        host: &Url,
+        update: impl FnOnce(Option<&SlotEntry>) -> Option<SlotEntry>,
+    ) {
         let mut revisions = self
             .cache_revisions
             .lock()
             .recover_poison("DiagnosticAggregator::cache_revisions");
         let mut cache = self.lock();
-        let removed = if let Some(slots) = cache.get_mut(host) {
-            let removed = slots.remove(&DiagnosticSource::PullLayer).is_some();
-            if slots.is_empty() {
+        let previous = cache
+            .get(host)
+            .and_then(|sources| sources.get(&DiagnosticSource::PullLayer))
+            .and_then(|servers| servers.get(PULL_LAYER_SERVER));
+        let next = update(previous);
+        let changed = previous.map(|slot| (&slot.diagnostics, slot.pull_coverage()))
+            != next
+                .as_ref()
+                .map(|slot| (&slot.diagnostics, slot.pull_coverage()));
+        if let Some(slot) = next {
+            let sources = if let Some(sources) = cache.get_mut(host) {
+                sources
+            } else {
+                cache.entry(host.clone()).or_default()
+            };
+            sources
+                .entry(DiagnosticSource::PullLayer)
+                .or_default()
+                .insert(PULL_LAYER_SERVER.to_string(), slot);
+        } else if let Some(sources) = cache.get_mut(host) {
+            sources.remove(&DiagnosticSource::PullLayer);
+            if sources.is_empty() {
                 cache.remove(host);
             }
-            removed
-        } else {
-            false
-        };
-        if removed {
-            revisions.insert(host.clone(), self.allocate_cache_revision());
-            // Same real-change gate as `set_pull_layer_nudgeless`.
-            let revision = revisions.get(host).copied().unwrap_or(0);
+        }
+        if changed {
+            let revision = self.allocate_cache_revision();
+            revisions.insert(host.clone(), revision);
+            // A no-op mutation owes the editor nothing. Stamp only a real
+            // change, atomically with the revision carrying the new data.
             self.pull_view_lag_pending
                 .lock()
                 .recover_poison("DiagnosticAggregator::pull_view_lag_pending")
@@ -3291,6 +3329,123 @@ mod tests {
             .collect();
         out.sort();
         out
+    }
+
+    fn pull_components(
+        virt: crate::lsp::aggregation::diagnostic::PullContribution,
+        host: crate::lsp::aggregation::diagnostic::PullContribution,
+        preferred: bool,
+    ) -> PullLayerComponents {
+        use crate::config::settings::{AggregationStrategy, LayerSource, ResolvedLayerConfig};
+        PullLayerComponents {
+            virt,
+            host,
+            layer_cfg: ResolvedLayerConfig {
+                priorities: vec![LayerSource::Virt, LayerSource::Host],
+                strategy: if preferred {
+                    AggregationStrategy::Preferred
+                } else {
+                    AggregationStrategy::Concatenated
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn pending_virtual_pull_preserves_previous_results_while_host_advances() {
+        use crate::lsp::aggregation::diagnostic::PullContribution::{Pending, Pulled};
+        let agg = DiagnosticAggregator::new();
+        agg.set_pull_components_nudgeless(
+            &host(),
+            pull_components(
+                Pulled(vec![diag("virt")].into()),
+                Pulled(vec![diag("old host")].into()),
+                false,
+            ),
+        );
+        agg.set_pull_components_nudgeless(
+            &host(),
+            pull_components(Pending, Pulled(vec![diag("new host")].into()), false),
+        );
+        let snapshot = agg.snapshot(&host());
+        assert_eq!(
+            messages(&snapshot[&DiagnosticSource::PullLayer]),
+            vec!["new host", "virt"]
+        );
+    }
+
+    #[test]
+    fn preferred_pull_keeps_hidden_updates_for_later_fallback() {
+        use crate::lsp::aggregation::diagnostic::PullContribution::{Pending, Pulled};
+        let agg = DiagnosticAggregator::new();
+        agg.set_pull_components_nudgeless(
+            &host(),
+            pull_components(
+                Pulled(vec![diag("virt")].into()),
+                Pulled(vec![diag("old host")].into()),
+                true,
+            ),
+        );
+        let (_, before) = agg.snapshot_with_revision(&host());
+        agg.set_pull_components_nudgeless(
+            &host(),
+            pull_components(Pending, Pulled(vec![diag("new host")].into()), true),
+        );
+        let (_, after) = agg.snapshot_with_revision(&host());
+        assert_eq!(
+            before, after,
+            "hidden data alone does not change publication"
+        );
+        agg.set_pull_components_nudgeless(
+            &host(),
+            pull_components(Pulled(Vec::new().into()), Pending, true),
+        );
+        let snapshot = agg.snapshot(&host());
+        assert_eq!(
+            messages(&snapshot[&DiagnosticSource::PullLayer]),
+            vec!["new host"]
+        );
+    }
+
+    #[test]
+    fn clean_and_disabled_virtual_pulls_replace_pending_results() {
+        use crate::lsp::aggregation::diagnostic::PullContribution::{NotPulled, Pulled};
+        let agg = DiagnosticAggregator::new();
+        agg.set_pull_components_nudgeless(
+            &host(),
+            pull_components(Pulled(vec![diag("virt")].into()), NotPulled, false),
+        );
+        agg.set_pull_components_nudgeless(
+            &host(),
+            pull_components(Pulled(Vec::new().into()), NotPulled, false),
+        );
+        let snapshot = agg.snapshot(&host());
+        let slot = &snapshot[&DiagnosticSource::PullLayer][PULL_LAYER_SERVER];
+        assert!(slot.diagnostics.is_empty());
+        assert_eq!(slot.pull_coverage(), (true, false));
+        agg.set_pull_components_nudgeless(&host(), pull_components(NotPulled, NotPulled, false));
+        assert!(agg.snapshot(&host()).is_empty());
+    }
+
+    #[test]
+    fn pull_coverage_changes_revision_even_when_diagnostics_stay_empty() {
+        use crate::lsp::aggregation::diagnostic::PullContribution::{Pending, Pulled};
+        let agg = DiagnosticAggregator::new();
+        agg.set_pull_components_nudgeless(
+            &host(),
+            pull_components(Pending, Pulled(Vec::new().into()), false),
+        );
+        let (snapshot, before) = agg.snapshot_with_revision(&host());
+        assert_eq!(
+            snapshot[&DiagnosticSource::PullLayer][PULL_LAYER_SERVER].pull_coverage(),
+            (false, true)
+        );
+        agg.set_pull_components_nudgeless(
+            &host(),
+            pull_components(Pulled(Vec::new().into()), Pulled(Vec::new().into()), false),
+        );
+        let (_, after) = agg.snapshot_with_revision(&host());
+        assert_ne!(before, after);
     }
 
     #[test]

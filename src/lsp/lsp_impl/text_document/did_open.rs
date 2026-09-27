@@ -29,6 +29,25 @@ async fn spawn_synthetic_diagnostic_for_parse<F>(
     }
 }
 
+async fn spawn_synthetic_diagnostic_after_install(
+    documents: &DocumentStore,
+    diagnostic_scheduler: &crate::lsp::lsp_impl::coordinator::DiagnosticScheduler,
+    uri: url::Url,
+    incarnation: u64,
+) {
+    let edit_lock = documents.edit_lock(&uri);
+    let _lifecycle = edit_lock.lock().await;
+    let Some(document) = documents.get(&uri) else {
+        documents.remove_edit_lock_if_unshared(&uri, &edit_lock);
+        return;
+    };
+    let eligible = document.incarnation() == incarnation;
+    drop(document);
+    if eligible {
+        diagnostic_scheduler.spawn_synthetic_diagnostic_task(uri);
+    }
+}
+
 impl Kakehashi {
     pub(crate) async fn did_open_impl(&self, params: DidOpenTextDocumentParams) {
         self.did_open_impl_with_lock_probe(params, std::future::ready(()))
@@ -192,8 +211,8 @@ impl Kakehashi {
                         if !completion.same_lifetime {
                             return;
                         }
-                        // A new parse or a completed query reload grants this
-                        // pass. Query-only repair may retain the existing tree.
+                        // A new parse or completed query reload grants injection
+                        // work. Host diagnostics can also run after parse give-up.
                         if let Some(lineage) =
                             completion.downstream_lineage(&documents, &install_uri, incarnation)
                         {
@@ -217,6 +236,17 @@ impl Kakehashi {
                                 )
                                 .await;
                             }
+                        } else if !is_cli_mode {
+                            // Registration can succeed even when parsing gives up.
+                            // Re-check the lifetime under the edit lock before
+                            // collecting host diagnostics from the current text.
+                            spawn_synthetic_diagnostic_after_install(
+                                &documents,
+                                &diagnostic_scheduler,
+                                install_uri,
+                                incarnation,
+                            )
+                            .await;
                         }
                     });
                     skip_parse = !load_result.success;
@@ -293,6 +323,10 @@ impl Kakehashi {
                 .process_injections(&uri, false)
                 .await;
         } else {
+            // Host diagnostics need only live text. The parse callback below
+            // follows up with virtual diagnostics once geometry is current.
+            self.diagnostic_scheduler()
+                .spawn_synthetic_diagnostic_task(uri.clone());
             // #6 off-ingress open flip (interactive LSP). The owned coordinators /
             // Arcs are captured into the spawned task; the handler returns without
             // awaiting the parse.
@@ -1385,6 +1419,7 @@ print("hello")
                 },
             virt_contexts: vec![],
             host_pull_enabled: true,
+            virtual_geometry_pending: false,
             narrower_than_editor_pull: false,
             host: Some(HostRequestContext {
                 uri: uri.clone(),
@@ -1516,6 +1551,7 @@ print("hello")
                 },
             virt_contexts: vec![],
             host_pull_enabled: true,
+            virtual_geometry_pending: false,
             narrower_than_editor_pull: false,
             host: Some(HostRequestContext {
                 uri: uri.clone(),
@@ -2412,20 +2448,356 @@ print("hello")
         );
     }
 
-    /// Regression (parse-actor flip): the debounced diagnostic — which drives the
-    /// on-edit host re-sync (#431) that keeps a push host's diagnostics following
-    /// edits — must be scheduled AFTER the off-ingress reparse, not in the
-    /// `did_change` handler. The handler makes the tree stale, and
-    /// `prepare_diagnostic_snapshot` returns `None` without a tree, so scheduling
-    /// the debounce there would capture a `None` snapshot and silently skip the
-    /// re-sync (the diagnostics-don't-follow-edits bug). This pins the mechanism:
-    /// the snapshot is `None` with the tree cleared and valid again once the
-    /// reparse restores it.
+    #[cfg(unix)]
     #[tokio::test]
-    async fn diagnostic_snapshot_needs_the_reparsed_tree_not_the_cleared_one() {
+    async fn saved_host_diagnostics_run_before_parse_and_again_after_parse() {
+        use crate::lsp::diagnostic_cache::{DiagnosticSource, PULL_LAYER_SERVER};
+        use serde_json::json;
+        use std::time::Duration;
+
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
         configure_rust_self_host(server);
+        let mut settings = (*server.settings_manager.load_settings()).clone();
+        settings
+            .languages
+            .get_mut("rust")
+            .unwrap()
+            .bridge
+            .as_mut()
+            .unwrap()
+            .insert(
+                "rust".to_string(),
+                BridgeLanguageConfig {
+                    enabled: Some(true),
+                    aggregation: None,
+                },
+            );
+        server.settings_manager.apply_settings(settings);
+        let query = Query::new(
+            &tree_sitter_rust::LANGUAGE.into(),
+            r#"((function_item body: (block) @injection.content) (#set! injection.language "rust"))"#,
+        ).unwrap();
+        server
+            .language
+            .query_store()
+            .insert_injection_query("rust".to_string(), std::sync::Arc::new(query));
+        let handle = server
+            .bridge
+            .insert_diagnostic_test_connection("rust_ls")
+            .await;
+        let uri = Url::parse("file:///test/saved-unparsed.rs").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        server.bridge.open_tracker_incarnation(&uri, incarnation);
+        server.bridge.open_host_incarnation(&uri, incarnation).await;
+        assert!(server.documents.get(&uri).unwrap().tree().is_none());
+        server
+            .diagnostic_scheduler()
+            .spawn_synthetic_diagnostic_task_when_current(uri.clone(), incarnation, 0);
+
+        for (message, count) in [("before parse", 1), ("after parse", 2)] {
+            let request_ids = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let ids: Vec<_> = handle
+                        .router()
+                        .pending_ids()
+                        .into_iter()
+                        .filter(|id| handle.router().is_sent(*id))
+                        .collect();
+                    if ids.len() == count {
+                        break ids;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("saved host pull must not wait for a tree, and must follow up once it lands");
+            for request_id in request_ids {
+                let _ = handle.router().route(json!({
+                "jsonrpc": "2.0", "id": request_id.as_i64(),
+                "result": { "kind": "full", "items": [{
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+                    "message": message
+                }] }
+                }));
+            }
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let snapshot = server.diagnostics.snapshot(&uri);
+                    if snapshot
+                        .get(&DiagnosticSource::PullLayer)
+                        .and_then(|slots| slots.get(PULL_LAYER_SERVER))
+                        .is_some_and(|slot| {
+                            slot.diagnostics.len() == count
+                                && slot.diagnostics.iter().all(|diag| diag.message == message)
+                        })
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("saved host result should reach the proactive cache");
+            if message == "after parse" {
+                let snapshot = server.diagnostics.snapshot(&uri);
+                let mut columns: Vec<_> = snapshot[&DiagnosticSource::PullLayer][PULL_LAYER_SERVER]
+                    .diagnostics
+                    .iter()
+                    .map(|diag| diag.range.start.character)
+                    .collect();
+                columns.sort();
+                assert_eq!(
+                    columns,
+                    vec![0, 10],
+                    "host and virtual results both survive the saved follow-up"
+                );
+            }
+            if message == "before parse" {
+                assert!(server.documents.get(&uri).unwrap().tree().is_none());
+                let lineage = server
+                    .parse_coordinator()
+                    .parse_document(uri.clone(), Some("rust"), None, Some(incarnation))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    server
+                        .diagnostic_scheduler()
+                        .prepare_diagnostic_snapshot(&uri)
+                        .unwrap()
+                        .virt_contexts
+                        .len(),
+                    1
+                );
+                // A late Open callback cannot take ownership from the Save.
+                server
+                    .diagnostic_scheduler()
+                    .spawn_synthetic_diagnostic_task_for_parse(uri.clone(), lineage);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    async fn assert_saved_pull_after_parser_registration(give_up: bool, previous_give_up: bool) {
+        use crate::lsp::diagnostic_cache::DiagnosticSource;
+        use std::time::Duration;
+
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+        server.bridge.insert_ready_test_connection("rust_ls").await;
+        server
+            .language
+            .language_registry_for_parallel()
+            .unregister("rust");
+        let uri = Url::parse("file:///test/parser-install-save.rs").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        server.bridge.open_host_incarnation(&uri, incarnation).await;
+        assert!(
+            server
+                .diagnostic_scheduler()
+                .prepare_diagnostic_snapshot(&uri)
+                .is_none()
+        );
+        if previous_give_up {
+            server.documents.publish_giveup_snapshot(&uri, incarnation);
+        }
+        server
+            .diagnostic_scheduler()
+            .spawn_synthetic_diagnostic_task_when_current(uri.clone(), incarnation, 0);
+        // On this current-thread runtime, let Save observe the unavailable
+        // parser before the install completion publishes it.
+        tokio::task::yield_now().await;
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        if give_up {
+            server.documents.publish_giveup_snapshot(&uri, incarnation);
+        } else {
+            let lineage = server
+                .parse_coordinator()
+                .parse_document(uri.clone(), Some("rust"), None, Some(incarnation))
+                .await
+                .unwrap();
+            // The install callback's Open cannot override the Save ordering key,
+            // even if the old Save future already finished without collecting.
+            server
+                .diagnostic_scheduler()
+                .spawn_synthetic_diagnostic_task_for_parse(uri.clone(), lineage);
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if server
+                    .diagnostics
+                    .snapshot(&uri)
+                    .contains_key(&DiagnosticSource::PullLayer)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the saved pull must survive the parser-registration window");
+        assert_eq!(
+            server.documents.get(&uri).unwrap().tree().is_none(),
+            give_up
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn installed_host_diagnostics_run_after_parse_giveup() {
+        use crate::lsp::diagnostic_cache::DiagnosticSource;
+
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+        server.bridge.insert_ready_test_connection("rust_ls").await;
+        server
+            .language
+            .language_registry_for_parallel()
+            .unregister("rust");
+        let uri = Url::parse("file:///test/parser-install-open.rs").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        server.bridge.open_host_incarnation(&uri, incarnation).await;
+        let scheduler = server.diagnostic_scheduler();
+        assert!(scheduler.prepare_diagnostic_snapshot(&uri).is_none());
+        scheduler.spawn_synthetic_diagnostic_task(uri.clone());
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        server.documents.publish_giveup_snapshot(&uri, incarnation);
+        spawn_synthetic_diagnostic_after_install(
+            &server.documents,
+            &scheduler,
+            uri.clone(),
+            incarnation,
+        )
+        .await;
+        wait_until(|| {
+            server
+                .diagnostics
+                .snapshot(&uri)
+                .contains_key(&DiagnosticSource::PullLayer)
+        })
+        .await;
+        assert!(server.documents.get(&uri).unwrap().tree().is_none());
+    }
+
+    #[tokio::test]
+    async fn installed_host_diagnostics_do_not_register_for_reopened_document() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+        let uri = Url::parse("file:///test/parser-install-reopened.rs").unwrap();
+        let old = server.documents.insert(
+            uri.clone(),
+            "old".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let current = server.documents.insert(
+            uri.clone(),
+            "new".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        assert_ne!(old, current);
+        assert!(
+            server
+                .diagnostic_scheduler()
+                .prepare_diagnostic_snapshot(&uri)
+                .is_some()
+        );
+        spawn_synthetic_diagnostic_after_install(
+            &server.documents,
+            &server.diagnostic_scheduler(),
+            uri.clone(),
+            old,
+        )
+        .await;
+        assert!(!server.synthetic_diagnostics.has_active_task(&uri));
+        assert!(server.diagnostics.snapshot(&uri).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn saved_diagnostics_survive_unavailable_language_until_parser_registration() {
+        assert_saved_pull_after_parser_registration(false, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn saved_host_diagnostics_resume_after_parser_registration_and_parse_giveup() {
+        assert_saved_pull_after_parser_registration(true, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn saved_host_diagnostics_resume_after_repeated_parse_giveup() {
+        assert_saved_pull_after_parser_registration(true, true).await;
+    }
+
+    #[tokio::test]
+    async fn unparsed_non_injecting_host_has_complete_diagnostic_coverage() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+        let uri = Url::parse("file:///test/non-injecting.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        assert!(server.language.injection_query("rust").is_none());
+        let snapshot = server
+            .diagnostic_scheduler()
+            .prepare_diagnostic_snapshot(&uri)
+            .unwrap();
+        assert!(snapshot.host.is_some());
+        assert!(
+            !snapshot.virtual_geometry_pending,
+            "no query means there is no virtual layer to await"
+        );
+        assert!(
+            !snapshot.narrower_than_editor_pull,
+            "host-only collection covers this language completely"
+        );
+    }
+
+    /// Live host text remains available while virtual geometry awaits reparse.
+    #[tokio::test]
+    async fn diagnostic_snapshot_keeps_host_text_while_virtual_geometry_is_pending() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+        let query = Query::new(
+            &tree_sitter_rust::LANGUAGE.into(),
+            r#"((function_item body: (block) @injection.content) (#set! injection.language "rust"))"#,
+        ).unwrap();
+        server
+            .language
+            .query_store()
+            .insert_injection_query("rust".to_string(), std::sync::Arc::new(query));
 
         let uri = Url::parse("file:///test/diag_follow.rs").unwrap();
         server.documents.insert(
@@ -2450,17 +2822,16 @@ print("hello")
         server
             .documents
             .update_document(uri.clone(), "fn changed() {}".to_string(), None);
-        assert!(
-            server
-                .diagnostic_scheduler()
-                .prepare_diagnostic_snapshot(&uri)
-                .is_none(),
-            "with the tree cleared, the snapshot is None — scheduling the debounce \
-             here (as the handler used to) would skip the on-edit host re-sync"
-        );
+        let snapshot = server
+            .diagnostic_scheduler()
+            .prepare_diagnostic_snapshot(&uri)
+            .expect("host diagnostics remain available without a current tree");
+        assert_eq!(&*snapshot.host.unwrap().text, "fn changed() {}");
+        assert!(snapshot.virtual_geometry_pending);
+        assert!(snapshot.narrower_than_editor_pull);
+        assert!(snapshot.virt_contexts.is_empty());
 
-        // The off-ingress reparse restores the tree → the snapshot is valid again,
-        // which is exactly why the debounce is scheduled from the reparse loop.
+        // The off-ingress reparse makes virtual geometry available again.
         server
             .parse_coordinator()
             .reparse_latest(&uri, Some(1))
