@@ -1598,6 +1598,7 @@ mod tests {
                 injection_regions: None,
                 regions: None,
                 layer_trees: Arc::new(std::sync::OnceLock::new()),
+                awaiting_reparse: false,
             }),
         );
         assert!(installed.current);

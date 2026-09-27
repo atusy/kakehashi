@@ -460,7 +460,8 @@ group-kills the compile even if the parent dies first. Readers wait on the
 `(incarnation, ticket)` epoch watermark rather than on tree presence. New tree
 snapshots pass through the non-inserting `install_parse`: the cell requires the
 captured incarnation and accepts bootstrap, a newer parsed version without tree
-downgrade, or a same-version tree upgrade over a tree-less placeholder. The
+downgrade, a same-version tree upgrade over a tree-less placeholder, or a
+same-version parse result resolving a settings reload's placeholder. The
 language admission check runs under the document entry lock. Publication may
 retain a stale-but-consistent snapshot; currentness additionally requires the
 current content version. Region completion uses the separate `enrich_regions`

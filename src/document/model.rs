@@ -169,7 +169,7 @@ impl Document {
     ) -> Self {
         let doc = Self::with_language(text, language_id, incarnation);
         doc.snapshot_tx
-            .send_replace(doc.slot_with(doc.bare_snapshot(Some(tree))));
+            .send_replace(doc.slot_with(Arc::new(doc.bare_snapshot(Some(tree)))));
         doc
     }
 
@@ -226,8 +226,8 @@ impl Document {
 
     /// A snapshot of the current inputs carrying `tree` and nothing derived —
     /// the reload placeholder and the test fixtures' published tree.
-    fn bare_snapshot(&self, tree: Option<Tree>) -> Arc<ParseSnapshot> {
-        Arc::new(ParseSnapshot {
+    fn bare_snapshot(&self, tree: Option<Tree>) -> ParseSnapshot {
+        ParseSnapshot {
             text: Arc::clone(&self.text),
             tree,
             language: self.language_id.clone(),
@@ -236,7 +236,8 @@ impl Document {
             injection_regions: None,
             regions: None,
             layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
-        })
+            awaiting_reparse: false,
+        }
     }
 
     fn slot_with(&self, snapshot: Arc<ParseSnapshot>) -> SnapshotSlot {
@@ -352,7 +353,7 @@ impl Document {
         // (#348); the tree published here, at this version, may.
         self.seed_edits.clear();
         self.seed_floor = self.content_version;
-        self.publish_snapshot(&self.bare_snapshot(Some(new_tree)));
+        self.publish_snapshot(&Arc::new(self.bare_snapshot(Some(new_tree))));
     }
 
     /// Publish a tree-less placeholder at the bumped version on a
@@ -365,8 +366,12 @@ impl Document {
         self.advance_input_version();
         self.seed_edits.clear();
         self.seed_floor = self.content_version;
+        let placeholder = ParseSnapshot {
+            awaiting_reparse: true,
+            ..self.bare_snapshot(None)
+        };
         self.snapshot_tx
-            .send_replace(self.slot_with(self.bare_snapshot(None)));
+            .send_replace(self.slot_with(Arc::new(placeholder)));
     }
 
     /// Record a parse result's `language` (`None` for a no-language parse)
@@ -534,6 +539,7 @@ mod tests {
             injection_regions: None,
             regions: None,
             layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
+            awaiting_reparse: false,
         })
     }
 
@@ -681,7 +687,9 @@ mod tests {
             "an edit after the sync has no tree it can be replayed onto"
         );
 
-        assert!(doc.publish_snapshot(&doc.bare_snapshot(Some(rust_tree("fn other() { }")))));
+        assert!(doc.publish_snapshot(&Arc::new(
+            doc.bare_snapshot(Some(rust_tree("fn other() { }")))
+        )));
         assert!(
             seed_tree(&doc).is_some(),
             "a fresh published tree seeds again"
@@ -705,7 +713,9 @@ mod tests {
         doc.apply_edit("fn main() { }".to_string(), &[edit(11, 11, 12)]);
         doc.apply_edit("fn main() { x }".to_string(), &[edit(12, 12, 14)]);
         // The reparse of version 2 lands.
-        assert!(doc.publish_snapshot(&doc.bare_snapshot(Some(rust_tree("fn main() { x }")))));
+        assert!(doc.publish_snapshot(&Arc::new(
+            doc.bare_snapshot(Some(rust_tree("fn main() { x }")))
+        )));
         doc.apply_edit("fn main() { xy }".to_string(), &[edit(13, 13, 14)]);
         let seed = seed_tree(&doc).expect("seeded from the version-2 tree");
         assert!(
@@ -736,6 +746,7 @@ mod tests {
             injection_regions: None,
             regions: None,
             layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
+            awaiting_reparse: false,
         })));
         // `Tree` clones share their subtrees but not the root handle, so a
         // child node's id is the identity that survives the clone.
@@ -792,7 +803,7 @@ mod tests {
         // A parse-result write (language record + published tree) does not bump.
         let tree = parser.parse("fn main() { }", None).unwrap();
         doc.record_language(Some("rust".to_string()));
-        assert!(doc.publish_snapshot(&doc.bare_snapshot(Some(tree))));
+        assert!(doc.publish_snapshot(&Arc::new(doc.bare_snapshot(Some(tree)))));
         assert_eq!(
             doc.content_version(),
             1,
