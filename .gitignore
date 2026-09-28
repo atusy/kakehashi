@@ -1,5 +1,6 @@
 /target
 /deps
+__pycache__/
 
 # Nix
 /result
