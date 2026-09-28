@@ -201,14 +201,16 @@ pub(crate) struct BridgeCoordinator {
     /// - Host document is closed while tasks wait for server readiness
     /// - Rapid did_change events spawn many overlapping batches
     eager_open_tasks: DashMap<Url, EagerOpenBatch>,
-    /// Generation counter for host-layer eager-open batches (#429); separate from
-    /// `eager_open_generation` so the two paths never alias.
+    /// Generation counter for host-layer eager-sync batches (#429, #431);
+    /// separate from `eager_open_generation` so the two paths never alias.
     host_eager_open_generation: std::sync::atomic::AtomicU64,
-    /// Host-layer eager-open tasks, keyed by host document URI (#429). Separate
-    /// from `eager_open_tasks` because the host path fires on `didOpen` for the
-    /// real host doc (no injections). Uses the same generation/placeholder shape
-    /// as the virt path: `supersede` resets to an empty placeholder before
-    /// spawning, so a handle *registered* after a concurrent
+    /// Host-layer eager-sync tasks, keyed by host document URI: the open on
+    /// `didOpen` (#429) and the debounced on-edit re-sync (#431) share one slot
+    /// per document, where a newer batch supersedes the older. Separate from
+    /// `eager_open_tasks` because the host path syncs the real host doc (no
+    /// injections). Uses the same generation/placeholder shape as the virt path:
+    /// `supersede` resets to an empty placeholder before spawning, so a handle
+    /// *registered* after a concurrent
     /// `cancel_host_eager_open` (didClose) / `abort_all_eager_open` (shutdown) is
     /// aborted on the spot (the registration leak is closed). The
     /// body-started-before-registration window is closed too (#435): the batch's
