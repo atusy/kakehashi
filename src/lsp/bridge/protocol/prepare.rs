@@ -719,6 +719,17 @@ impl PreparedMap {
         })
     }
 
+    /// The V positions where a gap starts a line.
+    pub(crate) fn line_start_gap_positions(&self) -> impl Iterator<Item = Position> + '_ {
+        let virtual_text = self.virtual_lines.text();
+        self.runs
+            .iter()
+            .filter(move |run| {
+                run.kind == RunKind::Gap && is_line_start(virtual_text, run.virtual_.start)
+            })
+            .map(|gap| self.virtual_lines.position(gap.virtual_.start))
+    }
+
     /// Whether a gap starts at V offset `offset`, at a line start.
     fn gap_starts_line_at(&self, offset: usize) -> bool {
         if !is_line_start(self.virtual_lines.text(), offset) {

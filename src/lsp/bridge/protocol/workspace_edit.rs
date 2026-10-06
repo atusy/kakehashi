@@ -79,7 +79,44 @@ pub(crate) fn transform_workspace_edit_to_host(
     // can come to overlap them. And a server editing the host URI directly
     // bypasses the prepared map, so its edits must keep off the gaps too.
     !(prepared
-        && (host_edits_overlap(edit, host_uri) || host_edits_touch_gaps(edit, host_uri, original)))
+        && (host_edits_overlap(edit, host_uri)
+            || host_edits_touch_gaps(edit, host_uri, original)
+            || host_edits_join_gap_lines(edit, host_uri, original)))
+}
+
+/// Whether any edit to `host_uri` ending right where a gap starts a line
+/// (a closing fence between combined blocks) would leave that line joined
+/// to the text before it: it must end with a line break or delete whole
+/// lines, as edits mapped through the prepared document must.
+fn host_edits_join_gap_lines(edit: &WorkspaceEdit, host_uri: &Uri, offset: &RegionOffset) -> bool {
+    let Some(prepared) = offset.prepared() else {
+        return false;
+    };
+    let unprepared = offset.unprepared();
+    let gap_starts: Vec<Position> = prepared
+        .line_start_gap_positions()
+        .map(|mut position| {
+            super::translation::translate_virtual_position_to_host(&mut position, &unprepared);
+            position
+        })
+        .collect();
+    if gap_starts.is_empty() {
+        return false;
+    }
+    host_text_edits(edit, host_uri).any(|(range, new_text)| {
+        if !gap_starts.contains(&range.end) {
+            return false;
+        }
+        let breaks_line = new_text.ends_with(['\n', '\r']);
+        let whole_lines = new_text.is_empty() && {
+            // The start of a host line, or of a region line after its
+            // host prefix (a blockquote's `> `).
+            let mut start = range.start;
+            super::translation::translate_host_position_to_virtual(&mut start, &unprepared);
+            range.start.character == 0 || range.start.line >= offset.line() && start.character == 0
+        };
+        !(breaks_line || whole_lines)
+    })
 }
 
 /// Whether any edit to `host_uri` reaches into a gap of the prepared
@@ -113,18 +150,19 @@ fn host_edits_overlap(edit: &WorkspaceEdit, host_uri: &Uri) -> bool {
     super::translation::ranges_overlap(host_edit_ranges(edit, host_uri))
 }
 
-/// The ranges of every edit a `WorkspaceEdit` makes to `host_uri`.
-fn host_edit_ranges<'a>(
+/// The range and new text of every edit a `WorkspaceEdit` makes to
+/// `host_uri`.
+fn host_text_edits<'a>(
     edit: &'a WorkspaceEdit,
     host_uri: &'a Uri,
-) -> impl Iterator<Item = &'a Range> {
+) -> impl Iterator<Item = (&'a Range, &'a str)> {
     let changes = edit
         .changes
         .as_ref()
         .and_then(|changes| changes.get(host_uri))
         .into_iter()
         .flatten()
-        .map(|edit| &edit.range);
+        .map(|edit| (&edit.range, edit.new_text.as_str()));
     let document_edits: Vec<&TextDocumentEdit> = match &edit.document_changes {
         None => Vec::new(),
         Some(DocumentChanges::Edits(edits)) => edits.iter().collect(),
@@ -141,11 +179,22 @@ fn host_edit_ranges<'a>(
         .filter(move |document_edit| &document_edit.text_document.uri == host_uri)
         .flat_map(|document_edit| {
             document_edit.edits.iter().map(|one_of| match one_of {
-                OneOf::Left(text_edit) => &text_edit.range,
-                OneOf::Right(annotated) => &annotated.text_edit.range,
+                OneOf::Left(text_edit) => (&text_edit.range, text_edit.new_text.as_str()),
+                OneOf::Right(annotated) => (
+                    &annotated.text_edit.range,
+                    annotated.text_edit.new_text.as_str(),
+                ),
             })
         });
     changes.chain(document_changes)
+}
+
+/// The ranges of every edit a `WorkspaceEdit` makes to `host_uri`.
+fn host_edit_ranges<'a>(
+    edit: &'a WorkspaceEdit,
+    host_uri: &'a Uri,
+) -> impl Iterator<Item = &'a Range> {
+    host_text_edits(edit, host_uri).map(|(range, _)| range)
 }
 
 /// Rewrite every edit to the request's (prepared) virtual document into
@@ -911,6 +960,45 @@ mod tests {
             &host_uri,
             &interpolated_offset(),
         ));
+    }
+
+    #[test]
+    fn a_host_edit_joining_a_line_onto_a_gap_refuses_the_whole_edit() {
+        use super::super::prepare::{SegmentKind, VirtualLayout, apply_prepare_result};
+        // `foo()` and `bar()` in two combined blocks at host line 10; the
+        // closing fence, prose and opening fence between them are a gap
+        // starting host line 11.
+        let virtual_text = "foo()\n\n\n\nbar()\n";
+        let layout = VirtualLayout::from_pieces(
+            virtual_text,
+            [
+                (SegmentKind::Content, 0..6, String::new()),
+                (SegmentKind::Gap, 6..9, "```\ntext\n```lua\n".to_string()),
+                (SegmentKind::Content, 9..15, String::new()),
+            ],
+        );
+        let prepared = apply_prepare_result(virtual_text, &layout, None).unwrap();
+        let offset = RegionOffset::new(10, 0).with_prepared(prepared.map);
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let host_edit = |start: (u32, u32), end: (u32, u32), new_text: &str| {
+            parse_workspace_edit(json!({
+                "changes": { host_uri.as_str(): [{
+                    "range": {
+                        "start": { "line": start.0, "character": start.1 },
+                        "end": { "line": end.0, "character": end.1 }
+                    },
+                    "newText": new_text
+                }]}
+            }))
+        };
+        let accepts = |mut edit: WorkspaceEdit| {
+            transform_workspace_edit_to_host(&mut edit, &virtual_uri, &host_uri, &offset)
+        };
+        assert!(!accepts(host_edit((10, 5), (11, 0), "")), "foo()```");
+        assert!(!accepts(host_edit((11, 0), (11, 0), ";")), ";```");
+        assert!(accepts(host_edit((10, 0), (11, 0), "")), "whole line");
+        assert!(accepts(host_edit((11, 0), (11, 0), "baz()\n")), "own line");
     }
 
     #[test]
