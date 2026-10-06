@@ -265,6 +265,16 @@ impl PrepareRegistry {
         self.ever_used.load(Ordering::Acquire)
     }
 
+    /// Queue `resync` again after `delay` — for a pass whose sends failed,
+    /// which nothing else would repeat. A shutdown drops it.
+    pub(crate) fn requeue_resync(&self, resync: Resync, delay: Duration) {
+        let resync_tx = self.resync_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = resync_tx.send(resync);
+        });
+    }
+
     /// Hosts to sync again: a held-back virtual document became ready, or
     /// an attempt that got no answer finished its retry backoff. Taken once
     /// by the server loop.
@@ -877,7 +887,7 @@ enum Holder {
 
 /// Backoff before retrying an attempt that got no answer: one second,
 /// doubling, at most a minute.
-fn retry_delay(misses: u32) -> Duration {
+pub(crate) fn retry_delay(misses: u32) -> Duration {
     Duration::from_secs((1u64 << misses.saturating_sub(1).min(6)).min(60))
 }
 

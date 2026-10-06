@@ -37,7 +37,10 @@ mod peer;
 mod pool;
 mod prepare_registry;
 pub(crate) use pool::{HostLanguageAdmission, INIT_TIMEOUT_SECS};
-pub(crate) use prepare_registry::{PrepareInput, PrepareLookup, PrepareTarget, PreparedState};
+pub(crate) use prepare_registry::{
+    PrepareInput, PrepareLookup, PrepareTarget, PreparedState, Resync,
+    retry_delay as prepare_retry_delay,
+};
 mod progress_registry;
 mod protocol;
 mod root_markers;

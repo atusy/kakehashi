@@ -516,6 +516,14 @@ impl InjectionCoordinator {
             .await;
     }
 
+    /// [`Self::process_injections`] forwarding didChange, reporting whether
+    /// every send it made could be queued (`false` also when the document
+    /// is gone).
+    pub(crate) async fn process_injections_synchronized(&self, uri: &Url) -> bool {
+        self.process_injections_after_lifecycle_lock(uri, true, None, std::future::ready(()))
+            .await
+    }
+
     pub(crate) async fn process_injections_for_incarnation(
         &self,
         uri: &Url,

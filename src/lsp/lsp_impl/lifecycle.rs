@@ -96,6 +96,10 @@ enum ClientRoot<'a> {
     LegacyPath(&'a str),
 }
 
+/// Times a prepare resync pass whose sends failed is retried (with the
+/// prepare backoff: one second, doubling) before waiting for the next edit.
+const MAX_RESYNC_RETRIES: u32 = 6;
+
 impl ClientRoot<'_> {
     /// How this root's origin reads in the startup log.
     fn source(&self) -> &'static str {
@@ -782,8 +786,12 @@ impl Kakehashi {
         if let Some(mut resync_rx) = self.bridge.take_prepare_resync_rx() {
             let injection = self.injection_coordinator();
             let diagnostics = self.diagnostic_scheduler();
+            let bridge = std::sync::Arc::clone(&self.bridge);
             let token = self.shutdown_token.clone();
             tokio::spawn(async move {
+                // Consecutive passes per host whose sends failed.
+                let mut failures: std::collections::HashMap<Url, u32> =
+                    std::collections::HashMap::new();
                 loop {
                     let first = tokio::select! {
                         _ = token.cancelled() => return,
@@ -801,7 +809,29 @@ impl Kakehashi {
                         *hosts.entry(resync.host_uri).or_default() |= resync.ready;
                     }
                     for (uri, ready) in hosts {
-                        injection.process_injections(&uri, true).await;
+                        // A send the pass could not queue leaves its server
+                        // on the text before, and the answer is cached, so
+                        // no resync would come again: retry with backoff,
+                        // a bounded number of times, while the host is open.
+                        if injection.process_injections_synchronized(&uri).await {
+                            failures.remove(&uri);
+                        } else if injection.document_incarnation(&uri).is_some() {
+                            let failed = failures.entry(uri.clone()).or_default();
+                            *failed += 1;
+                            if *failed <= MAX_RESYNC_RETRIES {
+                                bridge.requeue_prepare_resync(
+                                    crate::lsp::bridge::Resync {
+                                        host_uri: uri.clone(),
+                                        ready,
+                                    },
+                                    crate::lsp::bridge::prepare_retry_delay(*failed),
+                                );
+                            } else {
+                                failures.remove(&uri);
+                            }
+                        } else {
+                            failures.remove(&uri);
+                        }
                         injection.replay_held_save(&uri).await;
                         diagnostics.settle_pull_debt_after_prepare(&uri, ready);
                         // The diagnostic pass that ran when the host opened

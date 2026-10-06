@@ -615,6 +615,16 @@ impl BridgeCoordinator {
         self.prepare_pull_debts.remove(host).is_some()
     }
 
+    /// Sync `resync`'s host again after `delay` (see
+    /// `PrepareRegistry::requeue_resync`).
+    pub(crate) fn requeue_prepare_resync(
+        &self,
+        resync: super::prepare_registry::Resync,
+        delay: std::time::Duration,
+    ) {
+        self.prepare.requeue_resync(resync, delay);
+    }
+
     /// Hosts whose held-back virtual documents finished preparing; the
     /// receiver re-runs their injection pass. Taken once.
     pub(crate) fn take_prepare_resync_rx(
