@@ -167,7 +167,9 @@ saved version.
 - **Cached state follows the configuration.** A settings change that drops
   or retargets a pair's peer must drop what was prepared for it; otherwise
   paths that look a map up by text keep translating unprepared text through
-  it.
+  it. Diagnostics a server pushed go once it is sent a different text than
+  the one they describe — prepared differently, or no longer prepared —
+  even when the virtual text itself is unchanged.
 - **The peer is not awaited under a document's edit lock.** A slow or
   starting peer would otherwise stall the host's edit processing; a document
   whose answer is pending is held — neither opened nor changed, and not

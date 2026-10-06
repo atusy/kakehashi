@@ -92,9 +92,6 @@ struct Entry {
     server_config: Option<Arc<BridgeServerConfig>>,
     current: Generation,
     previous: Option<Generation>,
-    /// Identity of the prepared text the lifecycle pass last sent, so a
-    /// change of it (whose coordinates cached pushes no longer share) shows.
-    sent: Option<u64>,
 }
 
 impl Entry {
@@ -187,10 +184,32 @@ pub(crate) enum PreparedState {
 
 type Entries = DashMap<u64, Entry>;
 
+/// The prepared text the lifecycle pass last sent for a region. Kept apart
+/// from [`Entry`], which a settings change drops: the text a server holds
+/// does not change with the settings, and the next send must still be
+/// compared with it.
+struct Sent {
+    host_uri: String,
+    injection_language: String,
+    region_id: String,
+    /// Identity of the prepared text.
+    prepared: u64,
+}
+
+impl Sent {
+    fn is(&self, host_uri: &str, injection_language: &str, region_id: &str) -> bool {
+        self.host_uri == host_uri
+            && self.injection_language == injection_language
+            && self.region_id == region_id
+    }
+}
+
 pub(crate) struct PrepareRegistry {
     /// Keyed by a hash of (host URI, injection language, region id), so a
     /// lookup allocates nothing; the entry holds the identity it checks.
     entries: Arc<Entries>,
+    /// Keyed like `entries`.
+    sent: DashMap<u64, Sent>,
     /// Whether anything was ever prepared: lets the lookups every bridged
     /// region makes per edit skip the map when no pair has a prepare peer.
     ever_used: AtomicBool,
@@ -215,6 +234,7 @@ impl Default for PrepareRegistry {
         let (resync_tx, resync_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             entries: Arc::default(),
+            sent: DashMap::new(),
             ever_used: AtomicBool::new(false),
             next_revision: std::sync::atomic::AtomicI32::new(1),
             resync_tx,
@@ -424,9 +444,10 @@ impl PrepareRegistry {
     }
 
     /// Note that the lifecycle pass sent `prepared_text` for a region.
-    /// `true` when it differs from the prepared text sent before: diagnostics
-    /// a server pushed for that earlier text are in coordinates no current
-    /// map describes.
+    /// `true` unless it is the prepared text sent last: diagnostics a server
+    /// pushed for any other text — an earlier prepared one, or the
+    /// unprepared one sent while the pair had no peer — are in coordinates
+    /// no current map describes.
     pub(crate) fn note_sent(
         &self,
         host_uri: &Url,
@@ -434,44 +455,58 @@ impl PrepareRegistry {
         region_id: &str,
         prepared_text: &str,
     ) -> bool {
-        let host_uri = host_uri.as_str();
-        let Some(mut entry) = self
-            .entries
-            .get_mut(&region_hash(host_uri, injection_language, region_id))
-            .filter(|entry| entry.is(host_uri, injection_language, region_id))
-        else {
-            return false;
-        };
-        let sent = text_key(prepared_text);
-        entry
-            .sent
-            .replace(sent)
-            .is_some_and(|previous| previous != sent)
+        let prepared = text_key(prepared_text);
+        let host = host_uri.as_str();
+        let key = region_hash(host, injection_language, region_id);
+        if let Some(mut sent) = self.sent.get_mut(&key)
+            && sent.is(host, injection_language, region_id)
+        {
+            return std::mem::replace(&mut sent.prepared, prepared) != prepared;
+        }
+        self.sent.insert(
+            key,
+            Sent {
+                host_uri: host.to_string(),
+                injection_language: injection_language.to_string(),
+                region_id: region_id.to_string(),
+                prepared,
+            },
+        );
+        true
     }
 
     /// Forget one region's document: its pair no longer has a peer, or the
     /// region itself was replaced or invalidated. `injection_language`
-    /// `None` forgets the region under every language.
+    /// `None` forgets the region under every language. `true` when a
+    /// prepared text had been sent for it, whose pushed diagnostics no
+    /// longer describe what is sent next.
     pub(crate) fn forget_region(
         &self,
         host_uri: &Url,
         injection_language: Option<&str>,
         region_id: &str,
-    ) {
+    ) -> bool {
         if !self.ever_used.load(Ordering::Acquire) {
-            return;
+            return false;
         }
         let host_uri = host_uri.as_str();
         match injection_language {
             Some(language) => {
+                let key = region_hash(host_uri, language, region_id);
                 self.entries
-                    .remove_if(&region_hash(host_uri, language, region_id), |_, entry| {
-                        entry.is(host_uri, language, region_id)
-                    });
+                    .remove_if(&key, |_, entry| entry.is(host_uri, language, region_id));
+                self.sent
+                    .remove_if(&key, |_, sent| sent.is(host_uri, language, region_id))
+                    .is_some()
             }
-            None => self
-                .entries
-                .retain(|_, entry| entry.host_uri != host_uri || entry.region_id != region_id),
+            None => {
+                self.entries
+                    .retain(|_, entry| entry.host_uri != host_uri || entry.region_id != region_id);
+                let before = self.sent.len();
+                self.sent
+                    .retain(|_, sent| sent.host_uri != host_uri || sent.region_id != region_id);
+                self.sent.len() != before
+            }
         }
     }
 
@@ -488,12 +523,19 @@ impl PrepareRegistry {
                 || entry.region_id != region_id
                 || Some(entry.injection_language.as_str()) == keep
         });
+        self.sent.retain(|_, sent| {
+            sent.host_uri != host_uri
+                || sent.region_id != region_id
+                || Some(sent.injection_language.as_str()) == keep
+        });
     }
 
     /// Forget a closed host's documents.
     pub(crate) fn forget_host(&self, host_uri: &Url) {
         self.entries
             .retain(|_, entry| entry.host_uri != host_uri.as_str());
+        self.sent
+            .retain(|_, sent| sent.host_uri != host_uri.as_str());
     }
 
     /// The cell answering `input`: the current or previous generation when
@@ -530,7 +572,6 @@ impl PrepareRegistry {
                 server_config: target.config.clone(),
                 current: fresh(),
                 previous: None,
-                sent: None,
             });
         if !entry.is(host_uri, input.injection_language, input.region_id) {
             // A hash collision with another region: take the slot over.
@@ -543,7 +584,6 @@ impl PrepareRegistry {
                 server_config: target.config.clone(),
                 current: fresh(),
                 previous: None,
-                sent: None,
             };
         }
         if entry.current.key == key {
@@ -1015,8 +1055,8 @@ mod tests {
         };
         registry.cell(&target, input, Holder::LifecyclePass);
         assert!(
-            !registry.note_sent(&host, "lua", region, "a"),
-            "the first text"
+            registry.note_sent(&host, "lua", region, "a"),
+            "the first prepared text replaces whatever was sent unprepared"
         );
         assert!(
             !registry.note_sent(&host, "lua", region, "a"),
@@ -1025,6 +1065,39 @@ mod tests {
         assert!(
             registry.note_sent(&host, "lua", region, "  a"),
             "a different text"
+        );
+    }
+
+    #[test]
+    fn the_sent_text_outlives_a_settings_change() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let region = "01J0000000000000000000000A";
+        let input = PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: region,
+            virtual_text: "  a",
+            gaps: &[],
+        };
+        registry.cell(&target, input, Holder::LifecyclePass);
+        registry.note_sent(&host, "lua", region, "a");
+        // A retargeted peer: the entry goes, the server still holds "a".
+        registry.retain(|_, _, _, _| false, false);
+        assert!(
+            registry.note_sent(&host, "lua", region, "  a"),
+            "the new peer's text differs from the one the server holds"
+        );
+        // The peer removed: the region is sent unprepared next.
+        assert!(
+            registry.forget_region(&host, Some("lua"), region),
+            "a prepared text had been sent"
+        );
+        assert!(
+            !registry.forget_region(&host, Some("lua"), region),
+            "nothing prepared is left to replace"
         );
     }
 

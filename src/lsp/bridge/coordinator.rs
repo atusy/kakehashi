@@ -589,9 +589,9 @@ impl BridgeCoordinator {
         host_uri: &Url,
         injection_language: Option<&str>,
         region_id: &str,
-    ) {
+    ) -> bool {
         self.prepare
-            .forget_region(host_uri, injection_language, region_id);
+            .forget_region(host_uri, injection_language, region_id)
     }
 
     /// Drop a replaced region's prepared documents except under the language

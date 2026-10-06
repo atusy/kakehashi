@@ -401,12 +401,16 @@ impl InjectionCoordinator {
             self.experimental,
         ) else {
             // Sent as is from now on: whatever was prepared for it (before a
-            // settings change dropped its peer) no longer describes it.
-            self.bridge.forget_prepared_region(
+            // settings change dropped its peer) no longer describes it, nor
+            // do the diagnostics pushed for the prepared text.
+            if self.bridge.forget_prepared_region(
                 uri,
                 Some(&injection.language),
                 &injection.region_id,
-            );
+            ) {
+                self.diagnostics
+                    .evict_source(uri, &DiagnosticSource::Region(injection.region_id.clone()));
+            }
             return injection;
         };
         let input = crate::lsp::bridge::PrepareInput {
@@ -422,9 +426,10 @@ impl InjectionCoordinator {
             crate::lsp::bridge::PrepareLookup::Ready(prepared) => {
                 // Pushed diagnostics are cached in the coordinates of the
                 // text the server held; once it is sent a different prepared
-                // text, no map translates them any more (the peer may dedent
-                // an unchanged line differently), so they are dropped rather
-                // than misplaced until the server publishes again.
+                // text — or its first, after unprepared text or another
+                // peer's — no map translates them any more (the peer may
+                // dedent an unchanged line differently), so they are dropped
+                // rather than misplaced until the server publishes again.
                 if self.bridge.note_prepared_sent(
                     uri,
                     &injection.language,
