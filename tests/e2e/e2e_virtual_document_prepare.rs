@@ -125,6 +125,17 @@ fn init_client_with(
     placeholder: &str,
     lua_bridge: Value,
 ) -> (LspClient, tempfile::TempDir) {
+    init_client_bridging(combined, placeholder, lua_bridge, false)
+}
+
+/// [`init_client_with`], also bridging python to the mock unprepared when
+/// `unprepared_python`.
+fn init_client_bridging(
+    combined: bool,
+    placeholder: &str,
+    lua_bridge: Value,
+    unprepared_python: bool,
+) -> (LspClient, tempfile::TempDir) {
     let dir = tempfile::TempDir::new().expect("temp dir");
     let tsudoi_config = dir.path().join("tsudoi.config.ts");
     let hook = format!(
@@ -139,6 +150,9 @@ fn init_client_with(
         for (key, value) in extra {
             markdown["bridge"]["lua"][key] = value;
         }
+    }
+    if unprepared_python {
+        markdown["bridge"]["python"] = json!({});
     }
     if combined {
         let query_path = dir.path().join("combined-injections.scm");
@@ -172,7 +186,7 @@ fn init_client_with(
                     },
                     "echo": {
                         "cmd": [mock_formatter_bin(), "echo-document"],
-                        "languages": ["lua"]
+                        "languages": if unprepared_python { json!(["lua", "python"]) } else { json!(["lua"]) }
                     }
                 },
                 "languages": { "markdown": markdown }
@@ -426,6 +440,54 @@ fn an_edit_is_prepared_before_requests_read_it() {
             "start": { "line": 5, "character": 2 },
             "end": { "line": 5, "character": 10 }
         })
+    );
+}
+
+#[test]
+fn an_unprepared_document_answers_promptly_beside_a_prepared_one() {
+    if skip_if_deno_unavailable() {
+        return;
+    }
+    let (mut client, _dir) = init_client_bridging(false, "--\n", json!({}), true);
+    let uri = "file:///prepare/mixed.md";
+    let text = "# t\n\n```lua\n  local x = 1\n```\n\n```python\nx = 1\n```\n";
+    open(&mut client, uri, text);
+    // Something is prepared, and both documents are up.
+    hover_with_retry(&mut client, uri, 3, 4);
+    assert_eq!(
+        hover_text(&hover_with_retry(&mut client, uri, 7, 0)),
+        "x = 1\n"
+    );
+
+    // An edit to the unprepared fence: its requests check the text its
+    // server holds too, which must not hold them up beyond that send.
+    let edited = "# t\n\n```lua\n  local x = 1\n```\n\n```python\nx = 1\ny = 2\n```\n";
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": uri, "version": 2 },
+            "contentChanges": [{ "text": edited }]
+        }),
+    );
+    let started = std::time::Instant::now();
+    let response = client.send_request(
+        "textDocument/hover",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 8, "character": 0 }
+        }),
+    );
+    let elapsed = started.elapsed();
+    assert_eq!(
+        hover_text(&response["result"]),
+        "x = 1\ny = 2\n",
+        "the first request after the edit reads the edited text"
+    );
+    assert!(
+        // Well under the sync budget (`PREPARE_TIMEOUT`, 5 s) a stuck wait
+        // would use up.
+        elapsed < std::time::Duration::from_secs(4),
+        "the unprepared request waited {elapsed:?}"
     );
 }
 
