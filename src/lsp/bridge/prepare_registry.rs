@@ -9,16 +9,22 @@
 //! The lifecycle pass must not wait for the peer under the document's edit
 //! lock, so it only looks up: on a miss it starts the request and holds the
 //! document back, and the finished request asks for the host to be synced
-//! again. Requests are already asynchronous and simply wait for the answer.
+//! again. Requests are already asynchronous and wait for the answer.
+//!
+//! Every attempt runs on its own task, so a cancelled request cannot strand
+//! one half-done, and all waiters share it. An attempt that gets no answer
+//! (the peer not starting in time, crashing, timing out) is retried with
+//! backoff by syncing the host again; one that gets an unusable answer is
+//! final for that revision.
 
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use dashmap::DashMap;
-use tokio::sync::OnceCell;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::time::Instant;
 use url::Url;
 
 use super::pool::LanguageServerPool;
@@ -76,9 +82,38 @@ struct Entry {
     text_key: u64,
     /// The revision sent as `textDocument.version`.
     revision: i32,
-    outcome: Arc<OnceCell<Outcome>>,
-    /// Whether a lookup already started the request for this revision.
-    started: Arc<AtomicBool>,
+    cell: Arc<Cell>,
+}
+
+/// The answer for one revision, and the attempts to get it.
+#[derive(Default)]
+struct Cell {
+    /// Set once an attempt got an answer: `Some` prepared, `None` unusable.
+    outcome: std::sync::OnceLock<Outcome>,
+    /// An attempt is running.
+    in_flight: AtomicBool,
+    /// Attempts that got no answer, for the backoff.
+    misses: AtomicU32,
+    /// No new attempt before this, after a miss.
+    retry_at: std::sync::Mutex<Option<Instant>>,
+    /// Bumped after every attempt, answered or not.
+    attempts: tokio::sync::watch::Sender<u32>,
+}
+
+impl Cell {
+    fn lookup(&self) -> Option<PrepareLookup> {
+        self.outcome.get().map(|outcome| match outcome {
+            Some(prepared) => PrepareLookup::Ready(Arc::clone(prepared)),
+            None => PrepareLookup::Failed,
+        })
+    }
+
+    fn backing_off(&self) -> bool {
+        self.retry_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some_and(|retry_at| Instant::now() < retry_at)
+    }
 }
 
 /// (host URI, injection language, region id).
@@ -132,7 +167,7 @@ impl PrepareRegistry {
             .take()
     }
 
-    /// Look up without waiting; on a miss, start the request in the
+    /// Look up without waiting; on a miss, start an attempt in the
     /// background and report [`PrepareLookup::Pending`].
     pub(crate) fn lookup_or_start(
         &self,
@@ -140,49 +175,95 @@ impl PrepareRegistry {
         target: &PrepareTarget,
         input: PrepareInput<'_>,
     ) -> PrepareLookup {
-        let (outcome, started, revision) = self.cell(target, input);
-        if let Some(outcome) = outcome.get() {
-            return match outcome {
-                Some(prepared) => PrepareLookup::Ready(Arc::clone(prepared)),
-                None => PrepareLookup::Failed,
-            };
+        let (cell, revision) = self.cell(target, input);
+        if let Some(found) = cell.lookup() {
+            return found;
         }
-        if !started.swap(true, Ordering::AcqRel) {
-            let pool = Arc::clone(pool);
-            let target = target.clone();
-            let job = PrepareJob::from(input);
-            let resync_tx = self.resync_tx.clone();
-            tokio::spawn(async move {
-                initialize(
-                    &outcome, &started, &resync_tx, &pool, &target, &job, revision,
-                )
-                .await;
-            });
-        }
+        self.start(&cell, pool, target, input, revision);
         PrepareLookup::Pending
     }
 
-    /// Wait for the prepared document, sharing a request already in flight.
-    /// `None` when the peer could not prepare it.
+    /// Wait for the prepared document, sharing an attempt already running.
+    /// `None` when this revision has no prepared document (yet): the peer
+    /// answered unusably, or the attempt got no answer, or the last one did
+    /// not and the retry is still backing off.
     pub(crate) async fn prepare(
         &self,
-        pool: &LanguageServerPool,
+        pool: &Arc<LanguageServerPool>,
         target: &PrepareTarget,
         input: PrepareInput<'_>,
     ) -> Outcome {
-        let (outcome, started, revision) = self.cell(target, input);
-        started.store(true, Ordering::Release);
+        let (cell, revision) = self.cell(target, input);
+        if let Some(outcome) = cell.outcome.get() {
+            return outcome.clone();
+        }
+        // Subscribe before starting, so the attempt's end cannot be missed.
+        let mut attempts = cell.attempts.subscribe();
+        if !self.start(&cell, pool, target, input, revision)
+            && !cell.in_flight.load(Ordering::Acquire)
+        {
+            // Backing off after a miss: do not queue another attempt per
+            // request, each waiting out its own timeouts.
+            return cell.outcome.get().cloned().flatten();
+        }
+        // The attempt ends (answered or not) with a bump.
+        let _ = attempts.changed().await;
+        cell.outcome.get().cloned().flatten()
+    }
+
+    /// Start an attempt unless one is running, an answer is in, or a miss is
+    /// backing off. `true` when this call started it.
+    fn start(
+        &self,
+        cell: &Arc<Cell>,
+        pool: &Arc<LanguageServerPool>,
+        target: &PrepareTarget,
+        input: PrepareInput<'_>,
+        revision: i32,
+    ) -> bool {
+        if cell.outcome.get().is_some() || cell.backing_off() {
+            return false;
+        }
+        if cell.in_flight.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        let cell = Arc::clone(cell);
+        let pool = Arc::clone(pool);
+        let target = target.clone();
         let job = PrepareJob::from(input);
-        initialize(
-            &outcome,
-            &started,
-            &self.resync_tx,
-            pool,
-            target,
-            &job,
-            revision,
-        )
-        .await
+        let resync_tx = self.resync_tx.clone();
+        tokio::spawn(async move {
+            match run(&pool, &target, &job, revision).await {
+                Ok(outcome) => {
+                    let prepared = outcome.is_some();
+                    let _ = cell.outcome.set(outcome);
+                    if prepared {
+                        // The lifecycle pass held the document meanwhile.
+                        // The receiver is gone only at shutdown.
+                        let _ = resync_tx.send(job.host_uri.clone());
+                    }
+                }
+                Err(()) => {
+                    let misses = cell.misses.fetch_add(1, Ordering::AcqRel) + 1;
+                    let delay = retry_delay(misses);
+                    *cell
+                        .retry_at
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(Instant::now() + delay);
+                    // Nothing else would look the document up again before
+                    // the next edit; sync the host once the backoff ends.
+                    let host_uri = job.host_uri.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        let _ = resync_tx.send(host_uri);
+                    });
+                }
+            }
+            cell.in_flight.store(false, Ordering::Release);
+            cell.attempts.send_modify(|attempts| *attempts += 1);
+        });
+        true
     }
 
     /// How the document with this exact virtual text was sent, for paths
@@ -205,7 +286,7 @@ impl PrepareRegistry {
         if entry.text_key != text_key(virtual_text) {
             return PreparedState::Unavailable;
         }
-        match entry.outcome.get() {
+        match entry.cell.outcome.get() {
             Some(Some(prepared)) => PreparedState::Prepared(prepared.map.clone()),
             Some(None) | None => PreparedState::Unavailable,
         }
@@ -228,11 +309,7 @@ impl PrepareRegistry {
 
     /// The cell answering `input`, replacing a stale one (and bumping the
     /// revision) when the text, gaps or peer changed.
-    fn cell(
-        &self,
-        target: &PrepareTarget,
-        input: PrepareInput<'_>,
-    ) -> (Arc<OnceCell<Outcome>>, Arc<AtomicBool>, i32) {
+    fn cell(&self, target: &PrepareTarget, input: PrepareInput<'_>) -> (Arc<Cell>, i32) {
         let key = input_key(target, input);
         let mut entry = self
             .entries
@@ -247,8 +324,7 @@ impl PrepareRegistry {
                 key,
                 text_key: text_key(input.virtual_text),
                 revision: 1,
-                outcome: Arc::new(OnceCell::new()),
-                started: Arc::new(AtomicBool::new(false)),
+                cell: Arc::default(),
             });
         if entry.key != key {
             entry.host_language = input.host_language.to_string();
@@ -256,15 +332,16 @@ impl PrepareRegistry {
             entry.key = key;
             entry.text_key = text_key(input.virtual_text);
             entry.revision = entry.revision.saturating_add(1);
-            entry.outcome = Arc::new(OnceCell::new());
-            entry.started = Arc::new(AtomicBool::new(false));
+            entry.cell = Arc::default();
         }
-        (
-            Arc::clone(&entry.outcome),
-            Arc::clone(&entry.started),
-            entry.revision,
-        )
+        (Arc::clone(&entry.cell), entry.revision)
     }
+}
+
+/// Backoff before retrying an attempt that got no answer: one second,
+/// doubling, at most a minute.
+fn retry_delay(misses: u32) -> Duration {
+    Duration::from_secs(1 << misses.saturating_sub(1).min(6))
 }
 
 fn input_key(target: &PrepareTarget, input: PrepareInput<'_>) -> u64 {
@@ -305,47 +382,6 @@ impl From<PrepareInput<'_>> for PrepareJob {
     }
 }
 
-/// Fill `outcome` with the peer's answer (or join the request already
-/// filling it).
-///
-/// Only an answer is cached — a prepared document, or a refusal of what the
-/// peer answered. A failure to get an answer (the peer not starting in time,
-/// crashing, timing out) leaves the cell empty so the next lookup asks again;
-/// caching it would keep the document unbridged until its text changed, even
-/// after the peer recovered. The host is synced again once a prepared
-/// document lands, whoever asked for it: the lifecycle pass held the document
-/// meanwhile.
-async fn initialize(
-    outcome: &OnceCell<Outcome>,
-    started: &AtomicBool,
-    resync_tx: &UnboundedSender<Url>,
-    pool: &LanguageServerPool,
-    target: &PrepareTarget,
-    job: &PrepareJob,
-    revision: i32,
-) -> Outcome {
-    let mut answered_here = false;
-    let result = outcome
-        .get_or_try_init(|| async {
-            answered_here = true;
-            run(pool, target, job, revision).await
-        })
-        .await;
-    match result {
-        Ok(prepared) => {
-            if answered_here && prepared.is_some() {
-                // The receiver is gone only at shutdown.
-                let _ = resync_tx.send(job.host_uri.clone());
-            }
-            prepared.clone()
-        }
-        Err(()) => {
-            started.store(false, Ordering::Release);
-            None
-        }
-    }
-}
-
 /// Ask the peer and apply its answer. `Ok(None)` is an answer kakehashi
 /// refused (or the peer refused to give); `Err` is no answer at all. Both
 /// are logged; neither lets the document through unprepared.
@@ -379,8 +415,9 @@ async fn run(
 }
 
 /// The outer `Err` is a failure to get an answer (worth retrying); the
-/// inner one an answer that cannot be used (an error response, a malformed
-/// or refused result, an unusable peer).
+/// inner one is final for the revision: an answer that cannot be used (an
+/// error response, a malformed or refused result) or a peer that cannot
+/// answer (not startable, not advertising the request).
 async fn try_run(
     pool: &LanguageServerPool,
     target: &PrepareTarget,
@@ -424,10 +461,18 @@ async fn try_run(
     );
     let result = match handle.request_virtual_document_prepare(&params).await {
         Ok(result) => result,
-        // An answer that is not a usable result (an error response or a
-        // malformed result).
-        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => return Ok(Err(error)),
-        // No answer: not advertised (yet), timed out, connection gone.
+        // Final for this revision: an unusable answer (an error response or a
+        // malformed result), or a peer that does not answer this request at
+        // all — its advertisement is fixed until it restarts.
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::InvalidData | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            return Ok(Err(error));
+        }
+        // No answer: timed out, cancelled by the peer, connection gone.
         Err(error) => return Err(error),
     };
     Ok(apply_prepare_result(&job.virtual_text, &layout, result)
@@ -505,13 +550,54 @@ mod tests {
         layout("", &[])
     }
 
+    fn unstartable_target() -> PrepareTarget {
+        PrepareTarget {
+            server_name: "peer".to_string(),
+            config: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unusable_peer_is_final_and_asked_once() {
+        let registry = PrepareRegistry::default();
+        let pool = Arc::new(LanguageServerPool::new());
+        let host = Url::parse("file:///host.md").unwrap();
+        let input = PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: "01J0000000000000000000000A",
+            virtual_text: "a",
+            gaps: &[],
+        };
+        let target = unstartable_target();
+        assert!(matches!(
+            registry.lookup_or_start(&pool, &target, input),
+            PrepareLookup::Pending
+        ));
+        // A request joins the attempt and sees its (final) failure.
+        assert!(registry.prepare(&pool, &target, input).await.is_none());
+        assert!(matches!(
+            registry.lookup_or_start(&pool, &target, input),
+            PrepareLookup::Failed
+        ));
+        let (cell, _) = registry.cell(&target, input);
+        assert!(!cell.in_flight.load(Ordering::Acquire));
+        assert_eq!(*cell.attempts.borrow(), 1, "the failure was not retried");
+    }
+
+    #[test]
+    fn retries_back_off_to_a_minute() {
+        assert_eq!(retry_delay(1), Duration::from_secs(1));
+        assert_eq!(retry_delay(2), Duration::from_secs(2));
+        assert_eq!(retry_delay(7), Duration::from_secs(64));
+        assert_eq!(retry_delay(100), Duration::from_secs(64));
+    }
+
     #[test]
     fn a_changed_input_gets_a_new_revision_and_cell() {
         let registry = PrepareRegistry::default();
-        let target = PrepareTarget {
-            server_name: "peer".to_string(),
-            config: None,
-        };
+        let target = unstartable_target();
         let host = Url::parse("file:///host.md").unwrap();
         let input = |text| PrepareInput {
             host_uri: &host,
@@ -521,11 +607,11 @@ mod tests {
             virtual_text: text,
             gaps: &[],
         };
-        let (first, _, revision) = registry.cell(&target, input("a"));
-        let (same, _, same_revision) = registry.cell(&target, input("a"));
+        let (first, revision) = registry.cell(&target, input("a"));
+        let (same, same_revision) = registry.cell(&target, input("a"));
         assert!(Arc::ptr_eq(&first, &same));
         assert_eq!(revision, same_revision);
-        let (changed, _, changed_revision) = registry.cell(&target, input("b"));
+        let (changed, changed_revision) = registry.cell(&target, input("b"));
         assert!(!Arc::ptr_eq(&first, &changed));
         assert_eq!(changed_revision, revision + 1);
         registry.retain(|host_language, _, server| host_language == "markdown" && server == "peer");
