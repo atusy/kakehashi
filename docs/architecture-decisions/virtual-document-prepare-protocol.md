@@ -140,7 +140,10 @@ edit, and requests do not pile further attempts onto a backing-off one.
 The prepare request is made once per document version and its answer is
 shared by every downstream server and every translation path. `didChange`
 to downstream servers stays a full-text sync of the prepared document, so
-open and change need no separate hooks.
+open and change need no separate hooks. While a version's answer is pending, the document is
+held: not opened or changed downstream (nor closed), and a save it misses
+is forwarded once its prepared text is sent, if the host is still at the
+saved version.
 
 ## Invariants
 
