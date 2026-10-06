@@ -78,6 +78,10 @@ pub(crate) async fn collect_region_diagnostics(
 // Pull diagnostics implementation (textDocument/diagnostic)
 // ============================================================================
 
+/// `(region_id, injection_language, current offset, send epoch)` of a region
+/// for the pushFallback fold (see `PrepareRegistry::sent_epoch`).
+type RegionPushMeta = (String, String, RegionOffset, Option<u64>);
+
 impl Kakehashi {
     pub(crate) async fn diagnostic_impl(
         &self,
@@ -232,10 +236,15 @@ impl Kakehashi {
         // current offset)` for the pushFallback fold; the live pull below moves
         // the regions themselves.
         // Cached pushes are in the coordinates of the document the server was
-        // sent; a region whose prepared form is unknown contributes none.
-        let region_meta: Vec<(String, String, RegionOffset)> = virt_regions
+        // sent; a region whose prepared form is unknown contributes none. The
+        // send epoch read before the map lets the fold, which snapshots the
+        // pushes only after the awaits below, skip a region whose sent text
+        // was replaced meanwhile: its newer pushes are not in this map's
+        // coordinates.
+        let region_meta: Vec<RegionPushMeta> = virt_regions
             .iter()
             .filter_map(|r| {
+                let epoch = self.bridge.prepared_sent_epoch(&uri, &r.region.region_id);
                 let prepared = match self.bridge.prepared_state(
                     &uri,
                     &r.injection_language,
@@ -254,6 +263,7 @@ impl Kakehashi {
                         r.line_column_offsets.clone(),
                     )
                     .with_prepared(prepared),
+                    epoch,
                 ))
             })
             .collect();
@@ -626,7 +636,7 @@ impl Kakehashi {
         &self,
         host: &Url,
         language_name: &str,
-        region_meta: Vec<(String, String, RegionOffset)>,
+        region_meta: Vec<RegionPushMeta>,
         host_ctx: Option<&HostRequestContext>,
         virt_items: &mut Vec<Diagnostic>,
         host_items: &mut Vec<Diagnostic>,
@@ -635,6 +645,14 @@ impl Kakehashi {
         // a push arriving across the classifying `await` below cannot land in the
         // folded set while skipping classification (no TOCTOU double-count).
         let mut snapshot = self.diagnostics.snapshot(host);
+        // A region whose sent text was replaced since its offset was read has
+        // pushes in this snapshot that the offset does not describe.
+        let region_meta: Vec<_> = region_meta
+            .into_iter()
+            .filter(|(region_id, _, _, epoch)| {
+                self.bridge.prepared_sent_epoch(host, region_id) == *epoch
+            })
+            .collect();
         let candidates = push_slot_servers(&snapshot);
         if candidates.is_empty() {
             return; // no cached pushes for this host
@@ -664,7 +682,7 @@ impl Kakehashi {
         if crate::lsp::diagnostic_cache::has_region_sources(&snapshot) {
             let injection_languages: HashMap<&str, &str> = region_meta
                 .iter()
-                .map(|(region_id, language, _)| (region_id.as_str(), language.as_str()))
+                .map(|(region_id, language, _, _)| (region_id.as_str(), language.as_str()))
                 .collect();
             let mut allowlist = crate::lsp::lsp_impl::bridge_context::RegionPushAllowlist::new(
                 &self.bridge,
@@ -681,7 +699,7 @@ impl Kakehashi {
 
         let mut region_offsets = HashMap::new();
         let mut push_fallback_by_lang: HashMap<String, bool> = HashMap::new();
-        for (region_id, injection_language, offset) in region_meta {
+        for (region_id, injection_language, offset, _) in region_meta {
             // `get` on the common (cache-hit) path is a single lookup; only the
             // resolving miss touches the map again, moving the owned language key
             // in (no clone).
