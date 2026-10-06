@@ -523,6 +523,20 @@ impl PrepareRegistry {
         if sent.virtual_key != text_key(virtual_text) {
             return PreparedState::Unavailable;
         }
+        // The revision the lifecycle pass works on came back unusable: the
+        // document is held, and a failed document is not bridged at all —
+        // even when only its gaps changed, so that the text servers hold
+        // still matches.
+        if self
+            .entries
+            .get(&region_hash(host, injection_language, region_id))
+            .is_some_and(|entry| {
+                entry.is(host, injection_language, region_id)
+                    && matches!(entry.current.cell.outcome.get(), Some(None))
+            })
+        {
+            return PreparedState::Unavailable;
+        }
         match &sent.prepared {
             Some(prepared) => PreparedState::Prepared(prepared.map.clone()),
             None => PreparedState::Unprepared,
@@ -1650,6 +1664,42 @@ mod tests {
             Some(false),
             "an unusable answer is final"
         );
+    }
+
+    #[test]
+    fn a_failed_revision_is_not_translated_through_the_text_before() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let region = "01J0000000000000000000000A";
+        let gap = |host_text: &str| VirtualGap {
+            virtual_range: 1..2,
+            host_text: host_text.to_string(),
+        };
+        let (gaps_a, gaps_b) = ([gap("a")], [gap("b")]);
+        let input = |gaps| PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: region,
+            virtual_text: "x x",
+            gaps,
+        };
+        let (a, _) = registry.cell(&target, input(&gaps_a), Holder::LifecyclePass);
+        let sent = answer_for("x x", "x0x");
+        let _ = a.outcome.set(Some(Arc::clone(&sent)));
+        registry.note_sent(&host, "lua", region, &sent);
+        assert!(matches!(
+            registry.state(&host, "lua", region, "x x"),
+            PreparedState::Prepared(_)
+        ));
+        // An edit inside the gap, which the peer refuses to prepare.
+        let (b, _) = registry.cell(&target, input(&gaps_b), Holder::LifecyclePass);
+        let _ = b.outcome.set(None);
+        assert!(matches!(
+            registry.state(&host, "lua", region, "x x"),
+            PreparedState::Unavailable
+        ));
     }
 
     #[test]
