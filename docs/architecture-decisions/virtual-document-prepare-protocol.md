@@ -140,10 +140,13 @@ edit, and requests do not pile further attempts onto a backing-off one.
 The prepare request is made once per document version and its answer is
 shared by every downstream server and every translation path. `didChange`
 to downstream servers stays a full-text sync of the prepared document, so
-open and change need no separate hooks. While a version's answer is pending, the document is
-held: not opened or changed downstream (nor closed), and a save it misses
-is forwarded once its prepared text is sent, if the host is still at the
-saved version.
+open and change need no separate hooks. While a version's answer is
+pending, the document is held: not opened or changed downstream (nor
+closed), and a save it misses is forwarded once its prepared text is sent,
+if the host is still at the saved version, to the servers that have the
+document open or opening by then. A server that opens it later opens the
+saved text and gets no `didSave`, as with any server that starts after a
+save.
 
 ## Invariants
 
@@ -247,6 +250,10 @@ answer `null`.
   reach its server, and fails if a newer edit supersedes it first.
 - linkedEditingRange, prepareRename and inbound `workspace/applyEdit` stay
   unavailable on prepared non-contiguous documents.
+- A save made while a document's first answer is pending reaches no server
+  that has not started opening the document by the time the answer
+  arrives; a server whose open is still being scheduled then opens the
+  saved text without a `didSave`.
 
 ### Neutral
 
