@@ -110,6 +110,12 @@ answer from the virt layer, and its pushed diagnostics are dropped. A peer
 that prefers a fallback answers `null` (or catches its own errors and does
 so); kakehashi does not choose one on its behalf.
 
+An unusable answer (an error response, a malformed or refused result) is
+final for that document version. A missing answer (the peer not advertising
+yet, not starting in time, crashing, timing out) is asked again on the next
+lookup, so a peer that recovers prepares the document without waiting for
+an edit.
+
 ### Lifecycle
 
 The prepare request is made once per document version and its answer is
@@ -130,6 +136,16 @@ open and change need no separate hooks.
   alone. Paths that translate a stored region (pushed diagnostics, resolve
   gates, inbound edits) can see newer text than the server holds; pairing
   that text with an older map misplaces every coordinate silently.
+- **A request reads only the prepared text the server holds.** Right after
+  an edit, a request is prepared for the new text while an open document
+  still holds the previous one until the lifecycle pass sends it; reading
+  the old answer through the new map misplaces it. The request must wait
+  for that send (or fail), and must not send the text itself — it could
+  overtake a newer text the lifecycle pass already sent.
+- **Cached state follows the configuration.** A settings change that drops
+  or retargets a pair's peer must drop what was prepared for it; otherwise
+  paths that look a map up by text keep translating unprepared text through
+  it.
 - **The peer is not awaited under a document's edit lock.** A slow or
   starting peer would otherwise stall the host's edit processing; a document
   whose answer is pending is held — neither opened nor changed, and not
