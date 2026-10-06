@@ -43,6 +43,27 @@ pub(crate) struct BridgeInjection {
     pub(crate) held: bool,
 }
 
+/// The launch config of the server a `prepare` field names: a configured,
+/// startable `languageServers` entry. Like every server selection, the `_`
+/// wildcard only supplies defaults — it is neither a server of its own nor
+/// what an unconfigured name resolves to.
+fn prepare_peer_config(
+    settings: &WorkspaceSettings,
+    server_name: &str,
+) -> Option<BridgeServerConfig> {
+    if server_name == crate::config::WILDCARD_KEY
+        || !settings.language_servers.contains_key(server_name)
+    {
+        return None;
+    }
+    resolve_with_wildcard(
+        &settings.language_servers,
+        server_name,
+        merge_bridge_server_configs,
+    )
+    .filter(BridgeServerConfig::is_spawnable)
+}
+
 /// A save that reached a host while some of its virtual documents were held
 /// back for their prepare answers.
 #[derive(Debug, Default)]
@@ -434,13 +455,7 @@ impl BridgeCoordinator {
         {
             return None;
         }
-        let config = resolve_with_wildcard(
-            &settings.language_servers,
-            &server_name,
-            merge_bridge_server_configs,
-        )
-        .filter(|config| config.is_spawnable());
-        let Some(config) = config else {
+        let Some(config) = prepare_peer_config(settings, &server_name) else {
             if self.warned_unusable_prepare.insert(server_name.clone()) {
                 log::warn!(
                     target: "kakehashi::bridge::prepare",
@@ -480,14 +495,7 @@ impl BridgeCoordinator {
                     .is_some_and(|name| name == server)
                     // The same name may now launch differently (or not at
                     // all): its old answers no longer describe what it says.
-                    && resolve_with_wildcard(
-                        &settings.language_servers,
-                        server,
-                        merge_bridge_server_configs,
-                    )
-                    .filter(|config| config.is_spawnable())
-                    .as_ref()
-                        == config
+                    && prepare_peer_config(settings, server).as_ref() == config
             },
             reparsing,
         );
@@ -4370,6 +4378,34 @@ mod tests {
         assert!(target("toml", true).is_none(), "no downstream server");
         let ruby = target("ruby", true).expect("an unstartable peer still holds the document");
         assert!(ruby.config.is_none());
+
+        // Neither an unconfigured name nor the `_` wildcard launches the
+        // wildcard's defaults as a peer.
+        let mut with_wildcard = (*settings).clone();
+        with_wildcard
+            .language_servers
+            .insert("_".to_string(), server(&[]));
+        for name in ["missing", "_"] {
+            with_wildcard
+                .languages
+                .get_mut("markdown")
+                .unwrap()
+                .bridge
+                .as_mut()
+                .unwrap()
+                .insert(
+                    "lua".to_string(),
+                    BridgeLanguageConfig {
+                        prepare: Some(name.to_string()),
+                        ..Default::default()
+                    },
+                );
+            let settings = Arc::new(with_wildcard.clone());
+            let lua = coordinator
+                .prepare_target(&settings, "markdown", "lua", true)
+                .expect("a configured name still holds the document");
+            assert!(lua.config.is_none(), "{name} must not launch `_`");
+        }
     }
 
     #[test]
