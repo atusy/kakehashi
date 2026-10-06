@@ -604,17 +604,21 @@ impl PreparedMap {
         if self.hunk_touches_gap(&old) {
             return None;
         }
-        // A change starting at a P line start that removes or replaces text
-        // covers the whole line in V, its removed indent included: deleting a
-        // dedented line must not leave that indent behind. Its end then keeps
-        // the next line's indent the same way. Anywhere else (an insertion,
-        // or a change joining onto the previous line) a line start maps after
-        // its removed indent, as positions do.
-        // An insertion that opens with a line break counts too: its first
-        // (new) line would otherwise keep the removed indent as trailing
-        // whitespace.
-        let whole_lines = (!old.is_empty() || new_text.starts_with(['\n', '\r']))
-            && is_line_start(self.prepared_lines.text(), old.start);
+        // A change starting at a P line start that removes whole lines (its
+        // old text spans a line break), clears a line, or opens with a line
+        // break covers the whole line in V, its removed indent included:
+        // deleting or clearing a dedented line must not leave that indent
+        // behind as trailing whitespace. Its end then keeps the next line's
+        // indent the same way. Anywhere else (a change within one line's
+        // content, an insertion, a change joining onto the previous line) a
+        // line start maps after its removed indent, as positions do — so a
+        // completion replacing the line's first word keeps the indent.
+        let prepared = self.prepared_lines.text();
+        let clears_line = new_text.is_empty() && is_line_end(prepared, old.end);
+        let whole_lines = is_line_start(prepared, old.start)
+            && (prepared[old.clone()].contains(['\n', '\r'])
+                || clears_line && !old.is_empty()
+                || new_text.starts_with(['\n', '\r']));
         let plain_start = map_offset(&self.runs, old.start, Bias::Start, Side::Prepared);
         // The removed indent right before where the start plainly maps — not
         // one beyond a gap the peer emptied at the same P offset.
@@ -663,10 +667,14 @@ impl PreparedMap {
             // The replaced line's own removed indent comes back.
             Some(run) => FirstIndent::Exact(&virtual_text[run.virtual_.clone()]),
             // Text landing at a V line start that kept no indent before it
-            // (the document end, or a line the peer did not dedent) starts a
-            // line of its own and needs the indent too.
+            // starts a line of its own — at a blank line or the document end,
+            // or when it breaks the line — and needs the indent too. Text that
+            // just joins a non-blank line the peer did not dedent belongs to
+            // that line, which has no indent to restore.
             None if is_line_start(virtual_text, virtual_start)
-                && is_line_start(self.prepared_lines.text(), old.start) =>
+                && is_line_start(self.prepared_lines.text(), old.start)
+                && (is_blank_from(virtual_text, virtual_start)
+                    || new_text.contains(['\n', '\r'])) =>
             {
                 FirstIndent::Uniform
             }
@@ -979,6 +987,18 @@ fn normalize_lone_carriage_returns(text: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(normalized)
 }
 
+fn is_line_end(text: &str, offset: usize) -> bool {
+    offset == text.len() || matches!(text.as_bytes().get(offset), Some(b'\n' | b'\r'))
+}
+
+/// Whether `text` holds only whitespace from `offset` to its line's end.
+fn is_blank_from(text: &str, offset: usize) -> bool {
+    text[offset..]
+        .split(['\n', '\r'])
+        .next()
+        .is_none_or(|rest| rest.trim().is_empty())
+}
+
 fn is_line_start(text: &str, offset: usize) -> bool {
     offset == 0 || matches!(text.as_bytes().get(offset - 1), Some(b'\n' | b'\r'))
 }
@@ -1059,12 +1079,29 @@ fn diff_hunks(old: &str, new: &str) -> Vec<Hunk> {
                 new_index..new_index + new_len,
             ),
         };
-        let old_bytes =
+        let mut old_bytes =
             byte_at(&old_chars, old, old_range.start)..byte_at(&old_chars, old, old_range.end);
-        let new_bytes =
+        let mut new_bytes =
             byte_at(&new_chars, new, new_range.start)..byte_at(&new_chars, new, new_range.end);
+        // A hunk must not split a CRLF: a position between its CR and LF is
+        // past the line's content, where LSP clamps it, so a deletion of
+        // just the CR would apply as nothing. Widen into the equal text on
+        // either side (the same in both texts).
+        let splits_crlf = |text: &str, offset: usize| {
+            offset > 0
+                && text.as_bytes()[offset - 1] == b'\r'
+                && text.as_bytes().get(offset) == Some(&b'\n')
+        };
+        if splits_crlf(old, old_bytes.start) || splits_crlf(new, new_bytes.start) {
+            old_bytes.start -= 1;
+            new_bytes.start -= 1;
+        }
+        if splits_crlf(old, old_bytes.end) || splits_crlf(new, new_bytes.end) {
+            old_bytes.end += 1;
+            new_bytes.end += 1;
+        }
         match hunks.last_mut() {
-            Some(last) if last.old.end == old_bytes.start && last.new.end == new_bytes.start => {
+            Some(last) if last.old.end >= old_bytes.start && last.new.end >= new_bytes.start => {
                 last.old.end = old_bytes.end;
                 last.new.end = new_bytes.end;
             }
@@ -1549,6 +1586,49 @@ mod tests {
         )
         .unwrap();
         std::sync::Arc::try_unwrap(prepared.map.unwrap()).unwrap()
+    }
+
+    #[test]
+    fn an_undedented_line_stays_unindented() {
+        let virtual_text = "  a\nb\n";
+        let layout = VirtualLayout::single(virtual_text);
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &layout,
+            result(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+            ]}]})),
+        )
+        .unwrap();
+        let map = prepared.map.unwrap();
+        let replaced = map.edit_to_virtual(&edit((1, 0), (1, 1), "B")).unwrap();
+        assert_eq!(apply_to(virtual_text, &[replaced]), "  a\nB\n");
+        let formatted = map
+            .edits_to_virtual(&[edit((0, 0), (2, 0), "a\nB\n")])
+            .unwrap();
+        assert_eq!(apply_to(virtual_text, &formatted), "  a\nB\n");
+    }
+
+    #[test]
+    fn replacing_a_dedented_lines_first_word_keeps_its_indent() {
+        let (virtual_text, prepared) = dedented();
+        let map = prepared.map.unwrap();
+        // A completion's replace range over `if` (insert range empty there).
+        let replaced = map.edit_to_virtual(&edit((0, 0), (0, 2), "while")).unwrap();
+        let inserted = map.edit_to_virtual(&edit((0, 0), (0, 0), "while")).unwrap();
+        assert_eq!(replaced.new_text, inserted.new_text);
+        assert_eq!(replaced.range.start, inserted.range.start);
+        assert_eq!(apply_to(&virtual_text, &[replaced]), "  while x:\n    y\n");
+    }
+
+    #[test]
+    fn crlf_to_lf_formatting_changes_the_terminators() {
+        let virtual_text = "  a\r\n  b\r\n";
+        let map = dedent_all(virtual_text, "  ");
+        let formatted = map
+            .edits_to_virtual(&[edit((0, 0), (2, 0), "a\nb\n")])
+            .unwrap();
+        assert_eq!(apply_to(virtual_text, &formatted), "  a\n  b\n");
     }
 
     #[test]
