@@ -157,10 +157,11 @@ save.
   didSave text, the content a lazy open substitutes, and the fingerprints
   that decide whether a change is sent all describe P. Mixing V into any of
   them hands a server text whose coordinates no map describes.
-- **A map is chosen by the exact text it was built for**, never by URI
-  alone — and where two inputs share their virtual text (they differ only
-  inside gaps, which it masks), by the answer the server was sent: two
-  answers can share a prepared text yet map it back differently. Paths
+- **A map is the one servers were sent, for the exact text it was built
+  for**, never chosen by URI alone. An answer that is in but not sent yet
+  describes nothing servers hold, and two inputs can share their virtual
+  text (they differ only inside gaps, which it masks) or even their
+  prepared text while mapping it back differently. Paths
   that translate a stored region (pushed diagnostics, resolve gates,
   inbound edits) can see newer text than the server holds; pairing
   that text with an older map misplaces every coordinate silently.

@@ -177,8 +177,8 @@ pub(crate) enum PreparedState {
     Unprepared,
     /// Sent prepared, with this map.
     Prepared(Option<Arc<super::protocol::PreparedMap>>),
-    /// Prepared for another text, or not (successfully) yet: downstream
-    /// coordinates for this text are unknown.
+    /// Prepared, but servers were sent another text (or none yet):
+    /// downstream coordinates for this text are unknown.
     Unavailable,
 }
 
@@ -393,6 +393,11 @@ impl PrepareRegistry {
     /// How the document with this exact virtual text was sent, for paths
     /// that translate downstream coordinates without the settings that
     /// select a prepare peer (resolve gates, inbound edits).
+    ///
+    /// Only the answer the lifecycle pass last sent describes what servers
+    /// hold: an answer that is in but not sent yet (the next text's, or one
+    /// held back) is not theirs, and neither is any answer once the stored
+    /// text differs from the one it was sent for.
     pub(crate) fn state(
         &self,
         host_uri: &Url,
@@ -404,49 +409,44 @@ impl PrepareRegistry {
             return PreparedState::Unprepared;
         }
         let host_uri = host_uri.as_str();
-        let Some(entry) = self
+        let key = region_hash(host_uri, injection_language, region_id);
+        let sent = self
+            .sent
+            .get(&key)
+            .filter(|sent| sent.is(host_uri, injection_language, region_id))
+            .map(|sent| Arc::clone(&sent.prepared));
+        let entry = self
             .entries
-            .get(&region_hash(host_uri, injection_language, region_id))
-            .filter(|entry| entry.is(host_uri, injection_language, region_id))
-        else {
-            return PreparedState::Unprepared;
+            .get(&key)
+            .filter(|entry| entry.is(host_uri, injection_language, region_id));
+        let (entry, sent) = match (entry, sent) {
+            // Never prepared, or no longer since the pair lost its peer.
+            (None, None) => return PreparedState::Unprepared,
+            // Held since it was prepared: servers hold nothing of it.
+            (Some(_), None) => return PreparedState::Unavailable,
+            // Servers hold a prepared text whose entry a settings change
+            // dropped: no map for it is left.
+            (None, Some(_)) => return PreparedState::Unavailable,
+            (Some(entry), Some(sent)) => (entry, sent),
         };
         let wanted = text_key(virtual_text);
-        let mut matching = entry
+        // Matched by identity: an edit inside a gap changes only the gaps,
+        // which the virtual text masks, and two answers can even share a
+        // prepared text while mapping it back differently.
+        entry
             .generations()
-            .filter(|generation| generation.text_key == wanted);
-        let first = matching.next();
-        let generation = match matching.next() {
-            // Both generations have this text — an edit inside a gap changes
-            // only the gaps, which the virtual text masks — so the text alone
-            // cannot tell which map the server's coordinates follow: the
-            // answer sent last does.
-            Some(second) => {
-                let sent = self
-                    .sent
-                    .get(&region_hash(host_uri, injection_language, region_id))
-                    .filter(|sent| sent.is(host_uri, injection_language, region_id))
-                    .map(|sent| Arc::clone(&sent.prepared));
-                [first, Some(second)]
-                    .into_iter()
-                    .flatten()
-                    .find(|generation| {
-                        generation
-                            .cell
-                            .outcome
-                            .get()
-                            .and_then(Option::as_ref)
-                            .zip(sent.as_ref())
-                            .is_some_and(|(prepared, sent)| Arc::ptr_eq(prepared, sent))
-                    })
-                    .or(first)
-            }
-            None => first,
-        };
-        match generation.and_then(|generation| generation.cell.outcome.get()) {
-            Some(Some(prepared)) => PreparedState::Prepared(prepared.map.clone()),
-            Some(None) | None => PreparedState::Unavailable,
-        }
+            .filter(|generation| generation.text_key == wanted)
+            .find_map(|generation| {
+                generation
+                    .cell
+                    .outcome
+                    .get()
+                    .and_then(Option::as_ref)
+                    .filter(|prepared| Arc::ptr_eq(prepared, &sent))
+            })
+            .map_or(PreparedState::Unavailable, |prepared| {
+                PreparedState::Prepared(prepared.map.clone())
+            })
     }
 
     /// Keep only the entries `keep(host language, injection language, peer,
@@ -1185,6 +1185,46 @@ mod tests {
         assert!(
             Arc::ptr_eq(&map, prepared_a.map.as_ref().unwrap()),
             "the map of the text the server holds, not of the current generation"
+        );
+    }
+
+    #[test]
+    fn only_the_sent_answer_translates() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let region = "01J0000000000000000000000A";
+        let input = |text| PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: region,
+            virtual_text: text,
+            gaps: &[],
+        };
+        let state = |text| registry.state(&host, "lua", region, text);
+        let (old, _) = registry.cell(&target, input("  a"), Holder::LifecyclePass);
+        let _ = old.outcome.set(Some(sent_text("a")));
+        assert!(
+            matches!(state("  a"), PreparedState::Unavailable),
+            "answered but held: servers hold nothing of it"
+        );
+        let sent = Arc::clone(old.outcome.get().unwrap().as_ref().unwrap());
+        registry.note_sent(&host, "lua", region, &sent);
+        assert!(matches!(state("  a"), PreparedState::Prepared(_)));
+        // The next text is answered before the lifecycle pass sends it.
+        let (new, _) = registry.cell(&target, input("b"), Holder::LifecyclePass);
+        let _ = new.outcome.set(Some(sent_text("b")));
+        assert!(
+            matches!(state("b"), PreparedState::Unavailable),
+            "servers still hold the previous answer"
+        );
+        assert!(matches!(state("  a"), PreparedState::Prepared(_)));
+        // A settings change drops the entry; servers still hold "a".
+        registry.retain(|_, _, _, _| false, false);
+        assert!(
+            matches!(state("  a"), PreparedState::Unavailable),
+            "no map is left for the text servers hold"
         );
     }
 
