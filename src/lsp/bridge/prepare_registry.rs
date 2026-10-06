@@ -852,16 +852,13 @@ impl PrepareRegistry {
             .as_ref()
             .filter(|previous| previous.key == key)
         {
-            // An answered previous generation serves anyone. An unanswered
-            // one serves a request (which waits on it) but not the lifecycle
-            // pass, which would hold the document on it: only the current
-            // generation's answer re-syncs, so a text the user returned to
-            // (an undo) gets a new current generation and revision instead.
-            let answered = previous.cell.outcome.get().is_some();
-            if answered && holder == Holder::LifecyclePass {
-                // The lifecycle pass works on it again (an undo): it is the
-                // current generation once more, and the one it displaces —
-                // which may have failed — no longer describes the document.
+            // The lifecycle pass works on it (again, after an undo; or first,
+            // after a request saw the text before the pass did): it becomes
+            // the current generation, so the document is held on it and its
+            // answer — in already, or of the attempt it shares — re-syncs.
+            // The one it displaces, which may have failed, no longer
+            // describes the document.
+            if holder == Holder::LifecyclePass {
                 let entry = &mut *entry;
                 std::mem::swap(
                     &mut entry.current,
@@ -869,9 +866,7 @@ impl PrepareRegistry {
                 );
                 return (Arc::clone(&entry.current.cell), entry.current.revision);
             }
-            if answered || holder == Holder::Request {
-                return (Arc::clone(&previous.cell), previous.revision);
-            }
+            return (Arc::clone(&previous.cell), previous.revision);
         }
         if holder == Holder::Request {
             // A request's text that is neither generation (older than both,
@@ -1263,7 +1258,7 @@ mod tests {
     }
 
     #[test]
-    fn the_lifecycle_pass_never_waits_on_an_unanswered_older_generation() {
+    fn the_lifecycle_pass_shares_and_promotes_an_older_generation() {
         let registry = PrepareRegistry::default();
         let target = unstartable_target();
         let host = Url::parse("file:///host.md").unwrap();
@@ -1275,14 +1270,25 @@ mod tests {
             virtual_text: text,
             gaps: &[],
         };
-        let (v1, v1_revision) = registry.cell(&target, input("v1"), Holder::LifecyclePass);
+        let (v1, _) = registry.cell(&target, input("v1"), Holder::LifecyclePass);
         registry.cell(&target, input("v2"), Holder::LifecyclePass);
-        // Undo to v1 before v1 was answered: a fresh, current generation.
-        let (undone, undone_revision) = registry.cell(&target, input("v1"), Holder::LifecyclePass);
-        assert!(!Arc::ptr_eq(&v1, &undone));
-        assert!(undone_revision > v1_revision);
-        let entry = registry.entries.iter().next().unwrap();
-        assert!(Arc::ptr_eq(&entry.current.cell, &undone));
+        // Undo to v1 before v1 was answered: v1's attempt is shared, and the
+        // document is held on it as the current generation, whose answer
+        // re-syncs.
+        let (undone, _) = registry.cell(&target, input("v1"), Holder::LifecyclePass);
+        assert!(Arc::ptr_eq(&v1, &undone));
+        assert!(Arc::ptr_eq(
+            &registry.entries.iter().next().unwrap().current.cell,
+            &v1
+        ));
+        // A request seeing a text first: the lifecycle pass shares its cell.
+        let (request, _) = registry.cell(&target, input("v3"), Holder::Request);
+        let (pass, _) = registry.cell(&target, input("v3"), Holder::LifecyclePass);
+        assert!(Arc::ptr_eq(&request, &pass));
+        assert!(Arc::ptr_eq(
+            &registry.entries.iter().next().unwrap().current.cell,
+            &pass
+        ));
     }
 
     #[test]
