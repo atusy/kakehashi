@@ -199,6 +199,10 @@ struct Sent {
     prepared: Option<Arc<PreparedDocument>>,
     /// Fingerprint of the text sent, as connections record theirs.
     fingerprint: u64,
+    /// Changes whenever the text sent replaces one in other coordinates, so
+    /// a push admitted against the text before can tell it was replaced
+    /// while it was being recorded.
+    epoch: u64,
 }
 
 impl Sent {
@@ -221,6 +225,9 @@ pub(crate) struct PrepareRegistry {
     /// document forgotten and prepared again (a settings change, a reopen)
     /// never repeats a version the peer saw.
     next_revision: std::sync::atomic::AtomicI32,
+    /// Source of [`Sent::epoch`], shared so a region forgotten and recorded
+    /// again never repeats one.
+    next_epoch: std::sync::atomic::AtomicU64,
     resync_tx: UnboundedSender<Resync>,
     resync_rx: std::sync::Mutex<Option<UnboundedReceiver<Resync>>>,
 }
@@ -241,6 +248,7 @@ impl Default for PrepareRegistry {
             sent: DashMap::new(),
             ever_used: AtomicBool::new(false),
             next_revision: std::sync::atomic::AtomicI32::new(1),
+            next_epoch: std::sync::atomic::AtomicU64::new(1),
             resync_tx,
             resync_rx: std::sync::Mutex::new(Some(resync_rx)),
         }
@@ -551,14 +559,15 @@ impl PrepareRegistry {
         self.record_sent(host_uri, injection_language, region_id, None, fingerprint)
     }
 
-    /// The fingerprint of the text last sent for a region, and the language
-    /// it was sent under, once anything is prepared: a server's push for the
-    /// region is in that text's coordinates only if it holds that text.
+    /// The fingerprint of the text last sent for a region, the language it
+    /// was sent under and its epoch, once anything is prepared: a server's
+    /// push for the region is in that text's coordinates only if it holds
+    /// that text.
     pub(crate) fn sent_fingerprint(
         &self,
         host_uri: &Url,
         region_id: &str,
-    ) -> Option<(u64, String)> {
+    ) -> Option<(u64, String, u64)> {
         if !self.ever_used.load(Ordering::Acquire) {
             return None;
         }
@@ -566,7 +575,22 @@ impl PrepareRegistry {
         self.sent
             .get(&sent_key(host_uri, region_id))
             .filter(|sent| sent.is(host_uri, region_id))
-            .map(|sent| (sent.fingerprint, sent.injection_language.clone()))
+            .map(|sent| {
+                (
+                    sent.fingerprint,
+                    sent.injection_language.clone(),
+                    sent.epoch,
+                )
+            })
+    }
+
+    /// The epoch of the text last sent for a region (see [`Sent::epoch`]).
+    pub(crate) fn sent_epoch(&self, host_uri: &Url, region_id: &str) -> Option<u64> {
+        let host_uri = host_uri.as_str();
+        self.sent
+            .get(&sent_key(host_uri, region_id))
+            .filter(|sent| sent.is(host_uri, region_id))
+            .map(|sent| sent.epoch)
     }
 
     /// Record what is sent for a region; `true` when it replaces a text in
@@ -600,6 +624,9 @@ impl PrepareRegistry {
             }
             sent.prepared = prepared.cloned();
             sent.fingerprint = fingerprint;
+            if replaced {
+                sent.epoch = self.next_epoch.fetch_add(1, Ordering::Relaxed);
+            }
             return replaced;
         }
         self.sent.insert(
@@ -610,6 +637,7 @@ impl PrepareRegistry {
                 region_id: region_id.to_string(),
                 prepared: prepared.cloned(),
                 fingerprint,
+                epoch: self.next_epoch.fetch_add(1, Ordering::Relaxed),
             },
         );
         // Nothing recorded: the first prepared text replaces whatever was
@@ -1429,7 +1457,9 @@ mod tests {
         registry.cell(&target, input, Holder::LifecyclePass);
         registry.note_sent(&host, "lua", region, &sent_text("a"));
         assert_eq!(
-            registry.sent_fingerprint(&host, region),
+            registry
+                .sent_fingerprint(&host, region)
+                .map(|(fingerprint, language, _)| (fingerprint, language)),
             Some((
                 crate::lsp::bridge::pool::content_fingerprint("a"),
                 "lua".to_string()
@@ -1445,15 +1475,29 @@ mod tests {
             PreparedState::Unprepared
         ));
         assert_eq!(
-            registry.sent_fingerprint(&host, region),
+            registry
+                .sent_fingerprint(&host, region)
+                .map(|(fingerprint, language, _)| (fingerprint, language)),
             Some((
                 crate::lsp::bridge::pool::content_fingerprint("  a"),
                 "lua".to_string()
             ))
         );
+        let epoch = registry.sent_epoch(&host, region);
         assert!(
             !registry.note_unprepared_sent(&host, "lua", region, "  b"),
             "an unprepared edit keeps the coordinates pushes are in"
+        );
+        assert_eq!(
+            registry.sent_epoch(&host, region),
+            epoch,
+            "a push admitted before it still describes the text"
+        );
+        registry.note_sent(&host, "lua", region, &sent_text("b"));
+        assert_ne!(
+            registry.sent_epoch(&host, region),
+            epoch,
+            "a prepared text replacing it moves the epoch"
         );
     }
 

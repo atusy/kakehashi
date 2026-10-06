@@ -1005,24 +1005,33 @@ impl DiagnosticPublisher {
         // coordinates. A server pushing late for the text before one it was
         // just sent is not caught here, any more than for an unprepared
         // document: the push carries no text to compare.
-        if !self
+        let Some(epoch) = self
             .bridge
-            .push_matches_sent_text(&host, &region_id, connection_id)
+            .admit_push(&host, &region_id, connection_id)
             .await
-        {
+        else {
             log::debug!(
                 target: LOG_TARGET,
                 "push from {server} for text other than the one last sent, dropping"
             );
             return None;
-        }
-        Some(self.record_push(
+        };
+        let recorded = self.record_push(
             host,
-            DiagnosticSource::Region(region_id),
+            DiagnosticSource::Region(region_id.clone()),
             server,
             connection_id,
             diagnostics,
-        ))
+        );
+        // Admitted against a text the lifecycle pass replaced meanwhile: the
+        // replacement's eviction may have run before this push was recorded.
+        if let Some(epoch) = epoch
+            && self.bridge.prepared_sent_epoch(&recorded.host, &region_id) != Some(epoch)
+        {
+            self.aggregator
+                .evict_source(&recorded.host, &DiagnosticSource::Region(region_id));
+        }
+        Some(recorded)
     }
 
     /// Feed a proactive pull's combined result into the cache and republish.

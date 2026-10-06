@@ -630,24 +630,35 @@ impl BridgeCoordinator {
     /// Whether a push from `connection_id` for a region is in the coordinates
     /// of the text last sent for it: once anything is prepared, a connection
     /// can still hold the text before (a send recorded but not yet, or never,
-    /// delivered), prepared differently or not at all.
-    pub(crate) async fn push_matches_sent_text(
+    /// delivered), prepared differently or not at all. `None` rejects it;
+    /// `Some(epoch)` admits it against the sent text of that epoch (see
+    /// [`Self::prepared_sent_epoch`]), `Some(None)` when nothing is recorded.
+    pub(crate) async fn admit_push(
         &self,
         host_uri: &Url,
         region_id: &str,
         connection_id: crate::lsp::bridge::ProgressConnectionId,
-    ) -> bool {
-        let Some((fingerprint, language)) = self.prepare.sent_fingerprint(host_uri, region_id)
+    ) -> Option<Option<u64>> {
+        let Some((fingerprint, language, epoch)) =
+            self.prepare.sent_fingerprint(host_uri, region_id)
         else {
-            return true;
+            return Some(None);
         };
         let Ok(host_uri) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
-            return false;
+            return None;
         };
         let virtual_uri = super::protocol::VirtualDocumentUri::new(&host_uri, &language, region_id);
         self.pool
             .connection_holds_fingerprint(connection_id, &virtual_uri.to_uri_string(), fingerprint)
             .await
+            .then_some(Some(epoch))
+    }
+
+    /// The epoch of the text last sent for a region: one other than a push
+    /// was admitted against means the text was replaced (and the region's
+    /// pushes evicted) while the push was being recorded.
+    pub(crate) fn prepared_sent_epoch(&self, host_uri: &Url, region_id: &str) -> Option<u64> {
+        self.prepare.sent_epoch(host_uri, region_id)
     }
 
     /// Drop one region's prepared document (see
