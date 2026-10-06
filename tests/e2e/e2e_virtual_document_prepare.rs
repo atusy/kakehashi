@@ -412,3 +412,40 @@ fn a_document_the_peer_cannot_prepare_is_not_bridged() {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
+
+#[test]
+fn diagnostics_arrive_once_the_prepared_text_is_sent() {
+    if skip_if_deno_unavailable() {
+        return;
+    }
+    let (mut client, _dir) = init_client(false, "--\n");
+    let uri = "file:///prepare/diagnostics.md";
+    let text = "# t\n\n```lua\n  local x = 1\n```\n";
+    open(&mut client, uri, text);
+
+    // The diagnostic pass that runs on open skips the region while its
+    // prepare is pending; the one after the answer lands must publish it,
+    // in host coordinates, without any further edit.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let params = client
+            .wait_for_notification("textDocument/publishDiagnostics", remaining)
+            .expect("no diagnostics were published for the prepared region");
+        let Some(diagnostic) = params["diagnostics"]
+            .as_array()
+            .and_then(|items| items.iter().find(|d| d["source"] == "echo-document"))
+        else {
+            continue;
+        };
+        assert_eq!(diagnostic["message"], "local x = 1\n");
+        assert_eq!(
+            diagnostic["range"],
+            json!({
+                "start": { "line": 3, "character": 2 },
+                "end": { "line": 3, "character": 13 }
+            })
+        );
+        return;
+    }
+}

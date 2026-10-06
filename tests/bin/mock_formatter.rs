@@ -20,7 +20,8 @@
 //! - `echo-document` — advertises `hoverProvider` +
 //!   `documentFormattingProvider`; hover answers the full text this server
 //!   holds for the document, ranged over the hovered line in its own
-//!   coordinates; formatting uppercases. Proves what a prepared virtual
+//!   coordinates; formatting uppercases; a pull diagnostic spans the first
+//!   line and carries the full text. Proves what a prepared virtual
 //!   document looks like downstream and how its coordinates map back.
 //! - `definition` — advertises `definitionProvider` + `hoverProvider`;
 //!   answers definition with a fixed Location that **echoes the requested
@@ -325,6 +326,10 @@ fn main() {
                     "echo-document" => json!({
                         "hoverProvider": true,
                         "documentFormattingProvider": true,
+                        "diagnosticProvider": {
+                            "interFileDependencies": false,
+                            "workspaceDiagnostics": false
+                        },
                         "textDocumentSync": 1
                     }),
                     "call-hierarchy-prepare"
@@ -1547,6 +1552,36 @@ fn main() {
                     }
                 }
                 respond(&mut writer, id, json!({ "executed": command }));
+            }
+            "textDocument/diagnostic" if mode == "echo-document" => {
+                // One diagnostic over the document's first line, carrying the
+                // whole text this server holds.
+                let text = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .and_then(|uri| documents.get(uri))
+                    .cloned();
+                let result = match text {
+                    None => json!({ "kind": "full", "items": [] }),
+                    Some(text) => {
+                        let width = text
+                            .lines()
+                            .next()
+                            .map_or(0, |line| line.encode_utf16().count());
+                        json!({
+                            "kind": "full",
+                            "items": [{
+                                "range": {
+                                    "start": { "line": 0, "character": 0 },
+                                    "end": { "line": 0, "character": width }
+                                },
+                                "message": text,
+                                "source": "echo-document"
+                            }]
+                        })
+                    }
+                };
+                respond(&mut writer, id, result);
             }
             "textDocument/diagnostic" => {
                 if mode == "diagnostics-save" {

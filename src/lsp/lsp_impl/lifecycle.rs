@@ -777,9 +777,11 @@ impl Kakehashi {
 
         // Virtual documents held back for a prepare peer's answer are sent
         // once it arrives: the finished request names the host, and the
-        // injection pass re-run for it now finds the prepared text.
+        // injection pass re-run for it now finds the prepared text. (A failed
+        // attempt names the host again after its retry backoff.)
         if let Some(mut resync_rx) = self.bridge.take_prepare_resync_rx() {
             let injection = self.injection_coordinator();
+            let diagnostics = self.diagnostic_scheduler();
             let token = self.shutdown_token.clone();
             tokio::spawn(async move {
                 loop {
@@ -797,6 +799,10 @@ impl Kakehashi {
                     }
                     for uri in hosts {
                         injection.process_injections(&uri, true).await;
+                        // The diagnostic pass that ran when the host opened
+                        // or changed skipped the held regions; run it again
+                        // now that they reached their servers.
+                        diagnostics.schedule_debounced_diagnostic(uri);
                     }
                 }
             });
