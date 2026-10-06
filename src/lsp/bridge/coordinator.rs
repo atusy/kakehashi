@@ -13,8 +13,8 @@ use ulid::Ulid;
 use url::Url;
 
 use crate::config::{
-    WorkspaceSettings, merge_bridge_language_configs, merge_bridge_server_configs,
-    resolve_with_wildcard, settings::BridgeServerConfig,
+    WorkspaceSettings, merge_bridge_server_configs, resolve_with_wildcard,
+    settings::BridgeServerConfig,
 };
 use crate::language::node_tracker::{EditInfo, NodeTracker};
 use crate::lsp::request_id::CancelForwarder;
