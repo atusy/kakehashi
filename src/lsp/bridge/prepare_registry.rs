@@ -706,6 +706,18 @@ impl PrepareRegistry {
             // outlive it.
             || entry.server_config.as_deref() != target.config.as_deref()
         {
+            if holder == Holder::Request
+                && entry.is(host_uri, input.injection_language, input.region_id)
+            {
+                // A request does not take the slot over: under settings
+                // older than the entry's it would displace the generation
+                // the lifecycle pass holds the document on, whose answer
+                // alone re-syncs. Its cell belongs to no entry, so its
+                // attempt is not admitted and the request answers nothing;
+                // under newer settings, the lifecycle pass they bring takes
+                // the slot over.
+                return (Arc::default(), self.revision());
+            }
             // A hash collision with another region, or another launch config:
             // take the slot over.
             *entry = Entry {
@@ -1365,6 +1377,12 @@ mod tests {
         );
         let (again, _) = registry.cell(&target("bun"), input, Holder::LifecyclePass);
         assert!(Arc::ptr_eq(&new, &again));
+        // A request under the old config leaves the lifecycle pass's
+        // generation in place.
+        let (request, _) = registry.cell(&target("deno"), input, Holder::Request);
+        assert!(!Arc::ptr_eq(&request, &new));
+        let (current, _) = registry.cell(&target("bun"), input, Holder::LifecyclePass);
+        assert!(Arc::ptr_eq(&current, &new));
     }
 
     #[test]
