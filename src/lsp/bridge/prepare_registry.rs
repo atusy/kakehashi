@@ -88,6 +88,8 @@ struct Entry {
     /// change that retargets the pair can drop it.
     host_language: String,
     server_name: String,
+    /// The peer's launch config the answers came from (`None`: unstartable).
+    server_config: Option<Arc<BridgeServerConfig>>,
     current: Generation,
     previous: Option<Generation>,
 }
@@ -385,20 +387,25 @@ impl PrepareRegistry {
         }
     }
 
-    /// Keep only the entries `keep(host language, injection language, peer)`
-    /// accepts — after a settings change, those whose pair still names the
-    /// same peer. With `drop_unusable`, answers cached as final go too: the
+    /// Keep only the entries `keep(host language, injection language, peer,
+    /// peer config)` accepts — after a settings change, those whose pair
+    /// still names the same peer with the same launch config. With `drop_unusable`, answers cached as final go too: the
     /// change may have fixed what made them unusable (a peer's command,
     /// say), and the caller guarantees a pass that asks again — a dropped
     /// entry reads as unprepared until then, which would misread a server
     /// still holding an older prepared text. A dropped entry otherwise reads
     /// as unprepared until prepared again.
-    pub(crate) fn retain(&self, keep: impl Fn(&str, &str, &str) -> bool, drop_unusable: bool) {
+    pub(crate) fn retain(
+        &self,
+        keep: impl Fn(&str, &str, &str, Option<&BridgeServerConfig>) -> bool,
+        drop_unusable: bool,
+    ) {
         self.entries.retain(|_, entry| {
             keep(
                 &entry.host_language,
                 &entry.injection_language,
                 &entry.server_name,
+                entry.server_config.as_deref(),
             ) && !(drop_unusable && matches!(entry.current.cell.outcome.get(), Some(None)))
         });
     }
@@ -466,6 +473,7 @@ impl PrepareRegistry {
                 region_id: input.region_id.to_string(),
                 host_language: input.host_language.to_string(),
                 server_name: target.server_name.clone(),
+                server_config: target.config.clone(),
                 current: fresh(),
                 previous: None,
             });
@@ -477,6 +485,7 @@ impl PrepareRegistry {
                 region_id: input.region_id.to_string(),
                 host_language: input.host_language.to_string(),
                 server_name: target.server_name.clone(),
+                server_config: target.config.clone(),
                 current: fresh(),
                 previous: None,
             };
@@ -500,6 +509,7 @@ impl PrepareRegistry {
         }
         entry.host_language = input.host_language.to_string();
         entry.server_name = target.server_name.clone();
+        entry.server_config = target.config.clone();
         let current = std::mem::replace(&mut entry.current, fresh());
         entry.previous = Some(current);
         (Arc::clone(&entry.current.cell), entry.current.revision)
@@ -887,6 +897,36 @@ mod tests {
     }
 
     #[test]
+    fn retain_sees_the_peer_config_answers_came_from() {
+        let registry = PrepareRegistry::default();
+        let config = |cmd: &str| BridgeServerConfig {
+            cmd: Some(vec![cmd.to_string()]),
+            ..Default::default()
+        };
+        let target = PrepareTarget {
+            server_name: "peer".to_string(),
+            config: Some(Arc::new(config("deno"))),
+        };
+        let host = Url::parse("file:///host.md").unwrap();
+        let input = PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: "01J0000000000000000000000A",
+            virtual_text: "a",
+            gaps: &[],
+        };
+        registry.cell(&target, input, Holder::Request);
+        registry.retain(|_, _, _, seen| seen == Some(&config("deno")), false);
+        assert_eq!(registry.entries.len(), 1);
+        registry.retain(|_, _, _, seen| seen == Some(&config("bun")), false);
+        assert!(
+            registry.entries.is_empty(),
+            "a relaunched peer prepares again"
+        );
+    }
+
+    #[test]
     fn a_settings_change_drops_final_failures() {
         let registry = PrepareRegistry::default();
         let target = unstartable_target();
@@ -901,9 +941,9 @@ mod tests {
         };
         let (cell, _) = registry.cell(&target, input, Holder::Request);
         cell.outcome.set(None).unwrap();
-        registry.retain(|_, _, _| true, false);
+        registry.retain(|_, _, _, _| true, false);
         assert_eq!(registry.entries.len(), 1, "nothing would ask again");
-        registry.retain(|_, _, _| true, true);
+        registry.retain(|_, _, _, _| true, true);
         assert!(
             registry.entries.is_empty(),
             "a fixed config may now prepare it"
@@ -940,11 +980,11 @@ mod tests {
         assert!(!Arc::ptr_eq(&first, &changed));
         assert!(changed_revision > revision);
         registry.retain(
-            |host_language, _, server| host_language == "markdown" && server == "peer",
+            |host_language, _, server, _| host_language == "markdown" && server == "peer",
             true,
         );
         assert_eq!(registry.entries.len(), 1);
-        registry.retain(|_, _, server| server == "other", true);
+        registry.retain(|_, _, server, _| server == "other", true);
         assert!(registry.entries.is_empty());
         registry.cell(&target, input("b"), Holder::Request);
         registry.forget_region(&host, None, "01J0000000000000000000000A");

@@ -461,9 +461,19 @@ impl BridgeCoordinator {
     ) {
         self.warned_unusable_prepare.clear();
         self.prepare.retain(
-            |host_language, injection_language, server| {
+            |host_language, injection_language, server, config| {
                 self.prepare_server_name(settings, host_language, injection_language, experimental)
                     .is_some_and(|name| name == server)
+                    // The same name may now launch differently (or not at
+                    // all): its old answers no longer describe what it says.
+                    && resolve_with_wildcard(
+                        &settings.language_servers,
+                        server,
+                        merge_bridge_server_configs,
+                    )
+                    .filter(|config| config.is_spawnable())
+                    .as_ref()
+                        == config
             },
             reparsing,
         );
