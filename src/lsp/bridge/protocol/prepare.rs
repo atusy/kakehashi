@@ -649,7 +649,13 @@ impl PreparedMap {
             && (prepared[old.clone()].contains(['\n', '\r'])
                 || clears_line && !old.is_empty()
                 || new_text.starts_with(['\n', '\r']));
-        let plain_start = map_offset(&self.runs, old.start, Bias::Start, Side::Prepared);
+        let plain_start = match empty_run(&self.runs, old.start, RunKind::Gap) {
+            // An insertion where the peer emptied a gap goes before the gap's
+            // host text, like a change ending there and an insertion at the
+            // document end: the start bias alone would carry it past.
+            Some(gap) if old.is_empty() => gap.virtual_.start,
+            _ => map_offset(&self.runs, old.start, Bias::Start, Side::Prepared),
+        };
         // The removed indent right before where the start plainly maps — not
         // one beyond a gap the peer emptied at the same P offset.
         let start_indent = whole_lines
@@ -1711,9 +1717,14 @@ mod tests {
         assert_eq!(apply_to(&virtual_text, &formatted), "aB    cd");
         // A range ending there stops before the gap too…
         assert_eq!(map.to_virtual(pos(0, 2), Bias::End), pos(0, 2));
-        // …while an insertion there stays an insertion.
+        // …while an insertion there stays an insertion, before the gap too.
         let inserted = map.edit_to_virtual(&edit((0, 2), (0, 2), "!")).unwrap();
         assert_eq!(inserted.range.start, inserted.range.end);
+        assert_eq!(apply_to(&virtual_text, &[inserted]), "ab!    cd");
+        let formatted = map
+            .edits_to_virtual(&[edit((0, 0), (0, 4), "ab;cd")])
+            .unwrap();
+        assert_eq!(apply_to(&virtual_text, &formatted), "ab;    cd");
     }
 
     fn dedent_by_two(virtual_text: &str) -> PreparedMap {

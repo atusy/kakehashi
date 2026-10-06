@@ -784,7 +784,7 @@ mod tests {
         let offset = RegionOffset::new(10, 0).with_prepared(prepared.map);
         let region_end = Position::new(11, 0);
         // Both carets reach the server at P (0, 3); its insertion there maps
-        // after `${x}`.
+        // before `${x}`.
         let item = || -> CompletionItem {
             serde_json::from_value(json!({
                 "label": "X",
@@ -800,15 +800,15 @@ mod tests {
                 &mut item(),
                 &offset,
                 region_end,
-                Some(Position::new(10, 3))
+                Some(Position::new(10, 7))
             ),
-            "the edit would land after the gap, past the caret before it"
+            "the edit lands before the gap, short of the caret after it"
         );
         assert!(transform_completion_item(
             &mut item(),
             &offset,
             region_end,
-            Some(Position::new(10, 7))
+            Some(Position::new(10, 3))
         ));
     }
 
