@@ -80,7 +80,7 @@ struct Entry {
     key: u64,
     /// Identity of the virtual text alone, for lookups that only know it.
     text_key: u64,
-    /// The revision sent as `textDocument.version`.
+    /// The `textDocument.version` sent for this input.
     revision: i32,
     cell: Arc<Cell>,
 }
@@ -138,6 +138,10 @@ pub(crate) struct PrepareRegistry {
     /// region makes per edit skip the map (and its key allocations) when no
     /// pair has a prepare peer.
     ever_used: AtomicBool,
+    /// Source of `textDocument.version`: shared by all documents, so a
+    /// document forgotten and prepared again (a settings change, a reopen)
+    /// never repeats a version the peer saw.
+    next_revision: std::sync::atomic::AtomicI32,
     resync_tx: UnboundedSender<Url>,
     resync_rx: std::sync::Mutex<Option<UnboundedReceiver<Url>>>,
 }
@@ -156,6 +160,7 @@ impl Default for PrepareRegistry {
         Self {
             entries: DashMap::new(),
             ever_used: AtomicBool::new(false),
+            next_revision: std::sync::atomic::AtomicI32::new(1),
             resync_tx,
             resync_rx: std::sync::Mutex::new(Some(resync_rx)),
         }
@@ -358,7 +363,7 @@ impl PrepareRegistry {
                 server_name: target.server_name.clone(),
                 key,
                 text_key: text_key(input.virtual_text),
-                revision: 1,
+                revision: self.revision(),
                 cell: Arc::default(),
             });
         if entry.key != key {
@@ -366,10 +371,18 @@ impl PrepareRegistry {
             entry.server_name = target.server_name.clone();
             entry.key = key;
             entry.text_key = text_key(input.virtual_text);
-            entry.revision = entry.revision.saturating_add(1);
+            entry.revision = self.revision();
             entry.cell = Arc::default();
         }
         (Arc::clone(&entry.cell), entry.revision)
+    }
+}
+
+impl PrepareRegistry {
+    fn revision(&self) -> i32 {
+        // Wraps after 2^31 prepares; the peer only compares a document's
+        // versions over its lifetime.
+        self.next_revision.fetch_add(1, Ordering::Relaxed)
     }
 }
 
@@ -660,7 +673,7 @@ mod tests {
         assert_eq!(revision, same_revision);
         let (changed, changed_revision) = registry.cell(&target, input("b"));
         assert!(!Arc::ptr_eq(&first, &changed));
-        assert_eq!(changed_revision, revision + 1);
+        assert!(changed_revision > revision);
         registry.retain(|host_language, _, server| host_language == "markdown" && server == "peer");
         assert_eq!(registry.entries.len(), 1);
         registry.retain(|_, _, server| server == "other");
@@ -668,6 +681,12 @@ mod tests {
         registry.cell(&target, input("b"));
         registry.forget_region(&host, None, "01J0000000000000000000000A");
         assert!(registry.entries.is_empty());
+        let (_, again) = registry.cell(&target, input("b"));
+        assert!(
+            again > changed_revision,
+            "a forgotten document never repeats a version"
+        );
+        registry.forget_region(&host, None, "01J0000000000000000000000A");
         registry.cell(&target, input("b"));
         registry.forget_region(&host, Some("python"), "01J0000000000000000000000A");
         assert_eq!(registry.entries.len(), 1, "another language's region stays");
