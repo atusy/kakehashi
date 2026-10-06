@@ -77,9 +77,10 @@ impl VirtualLayout {
     /// Build a layout from adjacent pieces in virtual-text order.
     ///
     /// Adjacent pieces of one kind merge. A gap whose virtual text is empty
-    /// (a stripped line prefix such as a blockquote `> `) is not presented:
-    /// it never reaches downstream servers, so there is nothing to replace,
-    /// and the content around it merges into one segment.
+    /// (stripped host text, such as a blockquote `> `) is not presented on its
+    /// own: between content it never reaches downstream servers, so there is
+    /// nothing to replace, and the content around it merges into one segment.
+    /// Next to a visible gap it is part of that gap's host text.
     pub(crate) fn from_pieces(
         virtual_text: &str,
         pieces: impl IntoIterator<Item = (SegmentKind, Range<usize>, String)>,
@@ -88,7 +89,16 @@ impl VirtualLayout {
         let mut pending_gap_text = String::new();
         for (kind, range, host_text) in pieces {
             if kind == SegmentKind::Gap && range.is_empty() {
-                pending_gap_text.push_str(&host_text);
+                match segments.last_mut() {
+                    // Stripped text right after a visible gap is part of it.
+                    Some(last)
+                        if last.kind == SegmentKind::Gap
+                            && last.virtual_range.end == range.start =>
+                    {
+                        last.text.push_str(&host_text);
+                    }
+                    _ => pending_gap_text.push_str(&host_text),
+                }
                 continue;
             }
             match segments.last_mut() {
@@ -1079,7 +1089,7 @@ mod tests {
             kinds,
             vec![
                 (SegmentKind::Content, 0..4, "a\nb\n"),
-                (SegmentKind::Gap, 4..6, "${"),
+                (SegmentKind::Gap, 4..6, "${}"),
                 (SegmentKind::Content, 6..7, "c"),
             ]
         );
