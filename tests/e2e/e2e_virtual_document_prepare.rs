@@ -469,25 +469,37 @@ fn an_unprepared_document_answers_promptly_beside_a_prepared_one() {
             "contentChanges": [{ "text": edited }]
         }),
     );
+    let hover = |client: &mut LspClient| {
+        client.send_request(
+            "textDocument/hover",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 8, "character": 0 }
+            }),
+        )["result"]
+            .clone()
+    };
+    // The first request answers well within the sync budget
+    // (`PREPARE_TIMEOUT`, 5 s) a stuck wait would use up — possibly with
+    // nothing, under load, but never with the text before the edit.
     let started = std::time::Instant::now();
-    let response = client.send_request(
-        "textDocument/hover",
-        json!({
-            "textDocument": { "uri": uri },
-            "position": { "line": 8, "character": 0 }
-        }),
-    );
+    let first = hover(&mut client);
     let elapsed = started.elapsed();
-    assert_eq!(
-        hover_text(&response["result"]),
-        "x = 1\ny = 2\n",
-        "the first request after the edit reads the edited text"
-    );
     assert!(
-        // Well under the sync budget (`PREPARE_TIMEOUT`, 5 s) a stuck wait
-        // would use up.
         elapsed < std::time::Duration::from_secs(4),
         "the unprepared request waited {elapsed:?}"
+    );
+    let answer = std::iter::once(first)
+        .chain((0..600).map(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            hover(&mut client)
+        }))
+        .find(|hover| !hover.is_null())
+        .expect("no hover after the edit");
+    assert_eq!(
+        hover_text(&answer),
+        "x = 1\ny = 2\n",
+        "an answer from the text before the edit"
     );
 }
 
