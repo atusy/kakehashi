@@ -3,7 +3,11 @@
 //! All translation functions use in-place `&mut` mutation and saturating arithmetic
 //! for race-condition safety (stale region data after document edits).
 
-use tower_lsp_server::ls_types::{Position, Range};
+use std::sync::Arc;
+
+use tower_lsp_server::ls_types::{Position, Range, TextEdit};
+
+use super::prepare::{Bias, PreparedMap};
 
 /// The starting offset of an injection region in the host document.
 ///
@@ -20,6 +24,11 @@ use tower_lsp_server::ls_types::{Position, Range};
 /// row where the included ranges end (the closing-fence line). That row's
 /// real prefix is unrecorded; `workspace_edit_preserves_line_prefixes`
 /// derives its boundary semantics from the region end instead.
+///
+/// When the virtual document was prepared (`kakehashi/virtualDocument/prepare`),
+/// downstream servers see the prepared text, and `prepared` maps between it and
+/// the virtual document. `line`/`columns` always describe the virtual document,
+/// so the translation functions below compose prepared ↔ virtual ↔ host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RegionOffset {
     /// The starting line of the injection region in the host document.
@@ -27,6 +36,9 @@ pub(crate) struct RegionOffset {
     /// Per-virtual-line column offsets (UTF-16 code units).
     /// Index = virtual line number, value = column offset for that line.
     columns: Vec<u32>,
+    /// Prepared ↔ virtual coordinates, when downstream servers see a
+    /// prepared document.
+    prepared: Option<Arc<PreparedMap>>,
 }
 
 impl RegionOffset {
@@ -35,12 +47,39 @@ impl RegionOffset {
         Self {
             line,
             columns: vec![column],
+            prepared: None,
         }
     }
 
     /// Construct a `RegionOffset` with per-line column offsets (blockquote case).
     pub(crate) fn with_per_line_offsets(line: u32, columns: Vec<u32>) -> Self {
-        Self { line, columns }
+        Self {
+            line,
+            columns,
+            prepared: None,
+        }
+    }
+
+    /// Attach the prepared ↔ virtual map of the document downstream servers
+    /// were sent.
+    pub(crate) fn with_prepared(mut self, prepared: Option<Arc<PreparedMap>>) -> Self {
+        self.prepared = prepared;
+        self
+    }
+
+    /// The prepared ↔ virtual map, when downstream servers see a prepared
+    /// document.
+    pub(crate) fn prepared(&self) -> Option<&PreparedMap> {
+        self.prepared.as_deref()
+    }
+
+    /// This offset without its prepared map: virtual ↔ host only.
+    pub(crate) fn unprepared(&self) -> Self {
+        Self {
+            line: self.line,
+            columns: self.columns.clone(),
+            prepared: None,
+        }
     }
 
     /// Get the starting line of the injection region.
@@ -75,6 +114,17 @@ impl RegionOffset {
 /// only line 0 gets a column adjustment (line 1+ falls back to 0).
 /// Uses saturating arithmetic for race-condition safety.
 pub(crate) fn translate_virtual_position_to_host(pos: &mut Position, offset: &RegionOffset) {
+    translate_virtual_position_to_host_biased(pos, offset, Bias::Start);
+}
+
+fn translate_virtual_position_to_host_biased(
+    pos: &mut Position,
+    offset: &RegionOffset,
+    bias: Bias,
+) {
+    if let Some(prepared) = offset.prepared() {
+        *pos = prepared.to_virtual(*pos, bias);
+    }
     let virtual_line = pos.line;
     pos.line = pos.line.saturating_add(offset.line());
     pos.character = pos
@@ -86,8 +136,50 @@ pub(crate) fn translate_virtual_position_to_host(pos: &mut Position, offset: &Re
 ///
 /// Applies position translation to both start and end.
 pub(crate) fn translate_virtual_range_to_host(range: &mut Range, offset: &RegionOffset) {
-    translate_virtual_position_to_host(&mut range.start, offset);
-    translate_virtual_position_to_host(&mut range.end, offset);
+    translate_virtual_position_to_host_biased(&mut range.start, offset, Bias::Start);
+    translate_virtual_position_to_host_biased(&mut range.end, offset, Bias::End);
+}
+
+/// Translate one edit a downstream server made into host coordinates.
+///
+/// Unlike a bare range, an edit to a prepared document must also restore
+/// the indentation its new lines lost and must not touch a gap (host-owned
+/// text), so it goes through [`PreparedMap::edit_to_virtual`]. Returns
+/// `false` — the caller drops the edit or its carrier — when it is refused.
+pub(crate) fn translate_virtual_text_edit_to_host(
+    edit: &mut TextEdit,
+    offset: &RegionOffset,
+) -> bool {
+    if let Some(prepared) = offset.prepared() {
+        let Some(virtual_edit) = prepared.edit_to_virtual(edit) else {
+            return false;
+        };
+        *edit = virtual_edit;
+        translate_virtual_range_to_host(&mut edit.range, &offset.unprepared());
+    } else {
+        translate_virtual_range_to_host(&mut edit.range, offset);
+    }
+    true
+}
+
+/// Translate a whole set of edits to one virtual document (a formatting
+/// result) into host coordinates.
+///
+/// For a prepared document the edits are applied and re-diffed
+/// ([`PreparedMap::edits_to_virtual`]), so a whole-document replacement maps
+/// as precisely as small edits. `None` when the set is refused.
+pub(crate) fn translate_virtual_text_edits_to_host(
+    edits: Vec<TextEdit>,
+    offset: &RegionOffset,
+) -> Option<Vec<TextEdit>> {
+    let (mut edits, offset) = match offset.prepared() {
+        Some(prepared) => (prepared.edits_to_virtual(&edits)?, offset.unprepared()),
+        None => (edits, offset.clone()),
+    };
+    for edit in &mut edits {
+        translate_virtual_range_to_host(&mut edit.range, &offset);
+    }
+    Some(edits)
 }
 
 // =============================================================================
@@ -149,12 +241,23 @@ pub(crate) fn host_position_within_region_bounds(
 /// condition), column offset is NOT applied to avoid compounding the error.
 /// Uses saturating arithmetic for race-condition safety.
 pub(crate) fn translate_host_position_to_virtual(pos: &mut Position, offset: &RegionOffset) {
+    translate_host_position_to_virtual_biased(pos, offset, Bias::Start);
+}
+
+fn translate_host_position_to_virtual_biased(
+    pos: &mut Position,
+    offset: &RegionOffset,
+    bias: Bias,
+) {
     let underflowed = pos.line < offset.line();
     pos.line = pos.line.saturating_sub(offset.line());
     if !underflowed {
         pos.character = pos
             .character
             .saturating_sub(offset.column_for_line(pos.line));
+    }
+    if let Some(prepared) = offset.prepared() {
+        *pos = prepared.to_prepared(*pos, bias);
     }
 }
 
@@ -166,13 +269,61 @@ pub(crate) fn translate_host_position_to_virtual(pos: &mut Position, offset: &Re
 /// will skip column adjustment. This is intentional — each endpoint should
 /// degrade independently rather than coupling their error behavior.
 pub(crate) fn translate_host_range_to_virtual(range: &mut Range, offset: &RegionOffset) {
-    translate_host_position_to_virtual(&mut range.start, offset);
-    translate_host_position_to_virtual(&mut range.end, offset);
+    translate_host_position_to_virtual_biased(&mut range.start, offset, Bias::Start);
+    translate_host_position_to_virtual_biased(&mut range.end, offset, Bias::End);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A region at host line 10, column 4, whose two virtual lines lost a
+    /// two-space indent to the prepare peer.
+    fn prepared_offset() -> RegionOffset {
+        let virtual_text = "  if x:\n    y\n";
+        let layout = super::super::prepare::VirtualLayout::single(virtual_text);
+        let result = serde_json::from_value(serde_json::json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared =
+            super::super::prepare::apply_prepare_result(virtual_text, &layout, Some(result))
+                .unwrap();
+        RegionOffset::new(10, 4).with_prepared(prepared.map)
+    }
+
+    #[test]
+    fn prepared_positions_compose_with_the_region_offset() {
+        let offset = prepared_offset();
+        // P (1, 2) is `y`: V (1, 4), host (11, 4).
+        let mut pos = Position::new(1, 2);
+        translate_virtual_position_to_host(&mut pos, &offset);
+        assert_eq!(pos, Position::new(11, 4));
+        translate_host_position_to_virtual(&mut pos, &offset);
+        assert_eq!(pos, Position::new(1, 2));
+    }
+
+    #[test]
+    fn prepared_text_edit_restores_the_indent_in_host_coordinates() {
+        let offset = prepared_offset();
+        let mut edit = TextEdit {
+            range: Range::new(Position::new(1, 3), Position::new(1, 3)),
+            new_text: "\n  z".to_string(),
+        };
+        assert!(translate_virtual_text_edit_to_host(&mut edit, &offset));
+        assert_eq!(
+            edit.range,
+            Range::new(Position::new(11, 5), Position::new(11, 5))
+        );
+        assert_eq!(edit.new_text, "\n    z");
+    }
+
+    #[test]
+    fn offsets_compare_unequal_once_a_prepared_map_differs() {
+        assert_ne!(prepared_offset(), RegionOffset::new(10, 4));
+        assert_eq!(prepared_offset(), prepared_offset());
+    }
 
     // ======================================================================
     // translate_virtual_position_to_host

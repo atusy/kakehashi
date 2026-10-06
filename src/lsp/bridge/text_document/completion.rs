@@ -19,10 +19,12 @@ use tower_lsp_server::ls_types::{CompletionItem, CompletionList, Position};
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
-use super::super::protocol::translate_virtual_range_to_host;
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request,
     response_has_jsonrpc_error, text_edit_safe_in_region,
+};
+use super::super::protocol::{
+    translate_virtual_range_to_host, translate_virtual_text_edit_to_host,
 };
 use tower_lsp_server::ls_types::TextDocumentPositionParams;
 
@@ -213,12 +215,19 @@ pub(super) fn transform_completion_item(
     // the inserted-lines-land-below shape, mirroring the shared predicate.
     // `None` (the resolve path, which has no position snapshot) falls back to
     // region-wide any-prefix: fail-closed.
-    let prefixed_at_insertion = |host_line: Option<u32>| match host_line {
-        Some(line) => {
-            insertion_point_prefixed(offset, region_end, line)
-                || insertion_point_prefixed(offset, region_end, line.saturating_add(1))
-        }
-        None => offset.columns().iter().any(|&column| column != 0),
+    // A prepared document counts as prefixed throughout: text the client
+    // inserts verbatim (insertText, snippet variables) lands without the
+    // indentation the prepare peer removed. Explicit edits are re-indented by
+    // `translate_virtual_text_edit_to_host` instead.
+    let prefixed_at_insertion = |host_line: Option<u32>| {
+        offset.prepared().is_some()
+            || match host_line {
+                Some(line) => {
+                    insertion_point_prefixed(offset, region_end, line)
+                        || insertion_point_prefixed(offset, region_end, line.saturating_add(1))
+                }
+                None => offset.columns().iter().any(|&column| column != 0),
+            }
     };
     // The literal newline scans below can't see what a SNIPPET expands to at
     // the client: runtime variables (`${CLIPBOARD}`, `$TM_SELECTED_TEXT`) may
@@ -236,16 +245,17 @@ pub(super) fn transform_completion_item(
     if let Some(ref mut text_edit) = item.text_edit {
         match text_edit {
             tower_lsp_server::ls_types::CompletionTextEdit::Edit(edit) => {
-                translate_virtual_range_to_host(&mut edit.range, offset);
-                if !text_edit_safe_in_region(edit, offset, region_end)
+                if !translate_virtual_text_edit_to_host(edit, offset)
+                    || !text_edit_safe_in_region(edit, offset, region_end)
                     || snippet_unsafe(&edit.new_text, Some(edit.range.start.line))
                 {
                     return false;
                 }
             }
             tower_lsp_server::ls_types::CompletionTextEdit::InsertAndReplace(edit) => {
-                translate_virtual_range_to_host(&mut edit.insert, offset);
-                translate_virtual_range_to_host(&mut edit.replace, offset);
+                if !translate_insert_replace_edit_to_host(edit, offset) {
+                    return false;
+                }
                 // Check both ranges through one probe edit, moving new_text in
                 // and out instead of cloning it per range.
                 let mut probe = tower_lsp_server::ls_types::TextEdit {
@@ -297,12 +307,13 @@ pub(super) fn transform_completion_item(
     // semantically incomplete (e.g. without its auto-import) — availability
     // over fidelity, never corruption.
     if let Some(ref mut additional_edits) = item.additional_text_edits {
-        for edit in additional_edits.iter_mut() {
-            translate_virtual_range_to_host(&mut edit.range, offset);
-        }
-        if !additional_edits
-            .iter()
-            .all(|edit| text_edit_safe_in_region(edit, offset, region_end))
+        let translated = additional_edits
+            .iter_mut()
+            .all(|edit| translate_virtual_text_edit_to_host(edit, offset));
+        if !translated
+            || !additional_edits
+                .iter()
+                .all(|edit| text_edit_safe_in_region(edit, offset, region_end))
         {
             log::warn!(
                 target: "kakehashi::bridge",
@@ -312,6 +323,39 @@ pub(super) fn transform_completion_item(
             item.additional_text_edits = None;
         }
     }
+    true
+}
+
+/// Translate both ranges of an insert/replace completion edit. Under a
+/// prepared document both go through the edit translation with the shared
+/// `newText`, which must re-indent identically for either choice the client
+/// makes; `false` when either is refused or they disagree.
+fn translate_insert_replace_edit_to_host(
+    edit: &mut tower_lsp_server::ls_types::InsertReplaceEdit,
+    offset: &RegionOffset,
+) -> bool {
+    if offset.prepared().is_none() {
+        translate_virtual_range_to_host(&mut edit.insert, offset);
+        translate_virtual_range_to_host(&mut edit.replace, offset);
+        return true;
+    }
+    let mut insert = tower_lsp_server::ls_types::TextEdit {
+        range: edit.insert,
+        new_text: edit.new_text.clone(),
+    };
+    let mut replace = tower_lsp_server::ls_types::TextEdit {
+        range: edit.replace,
+        new_text: std::mem::take(&mut edit.new_text),
+    };
+    if !translate_virtual_text_edit_to_host(&mut insert, offset)
+        || !translate_virtual_text_edit_to_host(&mut replace, offset)
+        || insert.new_text != replace.new_text
+    {
+        return false;
+    }
+    edit.insert = insert.range;
+    edit.replace = replace.range;
+    edit.new_text = replace.new_text;
     true
 }
 

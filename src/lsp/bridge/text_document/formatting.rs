@@ -37,7 +37,7 @@ use tower_lsp_server::ls_types::{
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
-use super::super::protocol::translate_virtual_range_to_host;
+use super::super::protocol::translate_virtual_text_edits_to_host;
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, region_host_end,
     response_has_jsonrpc_error, text_edit_safe_in_region,
@@ -270,9 +270,14 @@ pub(super) fn transform_formatting_response_to_host(
         return Ok(Vec::new());
     }
 
-    for edit in &mut edits {
-        translate_virtual_range_to_host(&mut edit.range, offset);
-    }
+    // A prepared document's edits are re-diffed back into the virtual
+    // document; one touching host-owned text (a gap) fails the request
+    // rather than dropping silently, so the user sees why nothing changed.
+    let Some(mut edits) = translate_virtual_text_edits_to_host(edits, offset) else {
+        return Err(io::Error::other(
+            "formatting result edits host-owned text of a prepared virtual document",
+        ));
+    };
 
     // Clamp synthetic-EOF sentinels into the region: the (last line, u32::MAX)
     // sentinel from `clamp_synthetic_eof_anchor` saturates through translation

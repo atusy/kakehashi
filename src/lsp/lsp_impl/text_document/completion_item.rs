@@ -183,6 +183,9 @@ fn completion_geometry_matches(
         // grow with the region and are read live for translation.
         && produced_at.line() == live_offset.line()
         && produced_at.columns().first() == live_offset.columns().first()
+        // An envelope cannot carry a prepared document's map, so its item
+        // cannot be translated back; refuse as stale.
+        && live_offset.prepared().is_none()
         // The region may have been re-routed (a shebang edit under an
         // `unknown` injection) without moving; the item belongs to the
         // language it was produced for.

@@ -46,6 +46,22 @@ pub(crate) fn transform_workspace_edit_to_host(
         }
     }
 
+    // Edits to a prepared document go back to the virtual document first, as
+    // whole edits (restoring indentation, refusing gaps); a refused edit
+    // refuses the whole WorkspaceEdit, since applying the rest of a rename
+    // or fix would corrupt it.
+    let unprepared;
+    let offset = match offset.prepared() {
+        Some(prepared) => {
+            if !request_edits_to_virtual(edit, request_virtual_uri, prepared) {
+                return false;
+            }
+            unprepared = offset.unprepared();
+            &unprepared
+        }
+        None => offset,
+    };
+
     // Transform changes map: { [uri: string]: TextEdit[] }
     if let Some(changes) = &mut edit.changes {
         transform_changes_map(changes, request_virtual_uri, host_uri, offset);
@@ -57,6 +73,44 @@ pub(crate) fn transform_workspace_edit_to_host(
     }
 
     true
+}
+
+/// Rewrite every edit to the request's (prepared) virtual document into
+/// virtual-document coordinates. `false` when any edit is refused.
+fn request_edits_to_virtual(
+    edit: &mut WorkspaceEdit,
+    request_virtual_uri: &str,
+    prepared: &super::prepare::PreparedMap,
+) -> bool {
+    let rewrite = |text_edit: &mut TextEdit| match prepared.edit_to_virtual(text_edit) {
+        Some(virtual_edit) => {
+            *text_edit = virtual_edit;
+            true
+        }
+        None => false,
+    };
+    let rewrite_document_edit = |document_edit: &mut TextDocumentEdit| {
+        document_edit.text_document.uri.as_str() != request_virtual_uri
+            || document_edit.edits.iter_mut().all(|one_of| match one_of {
+                OneOf::Left(text_edit) => rewrite(text_edit),
+                OneOf::Right(annotated) => rewrite(&mut annotated.text_edit),
+            })
+    };
+    let changes_ok = edit.changes.as_mut().is_none_or(|changes| {
+        changes
+            .iter_mut()
+            .filter(|(uri, _)| uri.as_str() == request_virtual_uri)
+            .all(|(_, edits)| edits.iter_mut().all(rewrite))
+    });
+    let document_changes_ok = match &mut edit.document_changes {
+        None => true,
+        Some(DocumentChanges::Edits(edits)) => edits.iter_mut().all(rewrite_document_edit),
+        Some(DocumentChanges::Operations(ops)) => ops.iter_mut().all(|op| match op {
+            DocumentChangeOperation::Edit(document_edit) => rewrite_document_edit(document_edit),
+            DocumentChangeOperation::Op(_) => true,
+        }),
+    };
+    changes_ok && document_changes_ok
 }
 
 /// Whether a `WorkspaceEdit` contains at least one actual change.

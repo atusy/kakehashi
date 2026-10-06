@@ -18,7 +18,7 @@ use url::Url;
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, response_has_jsonrpc_error,
-    text_edit_safe_in_region, translate_host_range_to_virtual, translate_virtual_range_to_host,
+    text_edit_safe_in_region, translate_host_range_to_virtual, translate_virtual_text_edit_to_host,
     virtual_uri_to_lsp_uri,
 };
 
@@ -163,8 +163,9 @@ fn transform_color_presentation_response_to_host(
             }
         }
         if let Some(text_edit) = &mut presentation.text_edit {
-            translate_virtual_range_to_host(&mut text_edit.range, offset);
-            if !text_edit_safe_in_region(text_edit, offset, region_end) {
+            if !translate_virtual_text_edit_to_host(text_edit, offset)
+                || !text_edit_safe_in_region(text_edit, offset, region_end)
+            {
                 return false;
             }
         }
@@ -175,12 +176,13 @@ fn transform_color_presentation_response_to_host(
         // its textEdit still applies, though possibly semantically incomplete
         // — availability over fidelity, never corruption.
         if let Some(additional_edits) = &mut presentation.additional_text_edits {
-            for edit in additional_edits.iter_mut() {
-                translate_virtual_range_to_host(&mut edit.range, offset);
-            }
-            if !additional_edits
-                .iter()
-                .all(|edit| text_edit_safe_in_region(edit, offset, region_end))
+            let translated = additional_edits
+                .iter_mut()
+                .all(|edit| translate_virtual_text_edit_to_host(edit, offset));
+            if !translated
+                || !additional_edits
+                    .iter()
+                    .all(|edit| text_edit_safe_in_region(edit, offset, region_end))
             {
                 log::warn!(
                     target: "kakehashi::bridge",

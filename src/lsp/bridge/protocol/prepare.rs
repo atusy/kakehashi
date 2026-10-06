@@ -333,11 +333,20 @@ pub(crate) fn apply_prepare_result(
     if !changed {
         return Ok(PreparedDocument::unchanged(virtual_text));
     }
+    let fingerprint = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        virtual_text.hash(&mut hasher);
+        text.hash(&mut hasher);
+        runs.hash(&mut hasher);
+        hasher.finish()
+    };
     let map = PreparedMap {
         virtual_lines: LineMap::new(virtual_text.to_string()),
         prepared_lines: LineMap::new(text.clone()),
         runs,
         indents,
+        fingerprint,
     };
     Ok(PreparedDocument {
         text,
@@ -429,7 +438,7 @@ pub(crate) enum Bias {
     End,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum RunKind {
     /// Text present unchanged in both documents.
     Identity,
@@ -439,7 +448,7 @@ enum RunKind {
     Gap,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Run {
     kind: RunKind,
     prepared: Range<usize>,
@@ -474,13 +483,26 @@ impl SegmentIndent {
 }
 
 /// Coordinates between a prepared document (P) and its virtual document (V).
-#[derive(Debug, PartialEq, Eq)]
+///
+/// Equality compares a fingerprint of both texts and the runs between them:
+/// region offsets carrying a map are compared on every resolve gate, which
+/// must not cost a full text comparison.
+#[derive(Debug)]
 pub(crate) struct PreparedMap {
     virtual_lines: LineMap,
     prepared_lines: LineMap,
     runs: Vec<Run>,
     indents: Vec<SegmentIndent>,
+    fingerprint: u64,
 }
+
+impl PartialEq for PreparedMap {
+    fn eq(&self, other: &Self) -> bool {
+        self.fingerprint == other.fingerprint
+    }
+}
+
+impl Eq for PreparedMap {}
 
 impl PreparedMap {
     /// Translate a position in P to V.
@@ -532,34 +554,55 @@ impl PreparedMap {
     pub(crate) fn edits_to_virtual(&self, edits: &[TextEdit]) -> Option<Vec<TextEdit>> {
         let prepared = self.prepared_lines.text();
         let edited = apply_edits(&self.prepared_lines, edits)?;
-        let mut virtual_edits = Vec::new();
-        for hunk in diff_hunks(prepared, &edited) {
-            if self.hunk_touches_gap(&hunk.old) {
-                return None;
-            }
-            let virtual_start = map_offset(&self.runs, hunk.old.start, Bias::Start, Side::Prepared);
-            let virtual_end = map_offset(&self.runs, hunk.old.end, Bias::End, Side::Prepared);
-            let following = edited[hunk.new.end..].chars().next();
-            // Text landing at a V line start that kept no indent before it
-            // (the document end, or a line the peer did not dedent) starts a
-            // line of its own and needs the indent too.
-            let starts_bare_line = is_line_start(self.virtual_lines.text(), virtual_start)
-                && is_line_start(prepared, hunk.old.start);
-            let new_text = self.reindent(
-                virtual_start,
-                starts_bare_line,
-                &edited[hunk.new.clone()],
-                following,
-            )?;
-            virtual_edits.push(TextEdit {
-                range: LspRange::new(
-                    self.virtual_lines.position(virtual_start),
-                    self.virtual_lines.position(virtual_end),
-                ),
-                new_text,
-            });
+        diff_hunks(prepared, &edited)
+            .into_iter()
+            .map(|hunk| {
+                let following = edited[hunk.new.end..].chars().next();
+                self.hunk_to_virtual(hunk.old, &edited[hunk.new], following)
+            })
+            .collect()
+    }
+
+    /// Translate one edit a downstream server made to P into an edit to V,
+    /// keeping its extent (a completion's replace range, say) rather than
+    /// minimizing it. `None` — refuse the edit — under the same rules as
+    /// [`Self::edits_to_virtual`].
+    pub(crate) fn edit_to_virtual(&self, edit: &TextEdit) -> Option<TextEdit> {
+        let start = self.prepared_lines.offset_clamped(edit.range.start);
+        let end = self.prepared_lines.offset_clamped(edit.range.end);
+        if start > end {
+            return None;
         }
-        Some(virtual_edits)
+        let following = self.prepared_lines.text()[end..].chars().next();
+        self.hunk_to_virtual(start..end, &edit.new_text, following)
+    }
+
+    /// Map the replacement of P's `old` bytes by `new_text` onto V.
+    /// `following` is the character after the replacement in the edited P.
+    fn hunk_to_virtual(
+        &self,
+        old: Range<usize>,
+        new_text: &str,
+        following: Option<char>,
+    ) -> Option<TextEdit> {
+        if self.hunk_touches_gap(&old) {
+            return None;
+        }
+        let virtual_start = map_offset(&self.runs, old.start, Bias::Start, Side::Prepared);
+        let virtual_end = map_offset(&self.runs, old.end, Bias::End, Side::Prepared);
+        // Text landing at a V line start that kept no indent before it (the
+        // document end, or a line the peer did not dedent) starts a line of
+        // its own and needs the indent too.
+        let starts_bare_line = is_line_start(self.virtual_lines.text(), virtual_start)
+            && is_line_start(self.prepared_lines.text(), old.start);
+        let new_text = self.reindent(virtual_start, starts_bare_line, new_text, following)?;
+        Some(TextEdit {
+            range: LspRange::new(
+                self.virtual_lines.position(virtual_start),
+                self.virtual_lines.position(virtual_end),
+            ),
+            new_text,
+        })
     }
 
     fn hunk_touches_gap(&self, old: &Range<usize>) -> bool {
@@ -792,14 +835,15 @@ fn is_line_start(text: &str, offset: usize) -> bool {
     offset == 0 || matches!(text.as_bytes().get(offset - 1), Some(b'\n' | b'\r'))
 }
 
-/// Apply LSP edits to `lines`' text; `None` when an edit is out of range or
-/// edits overlap.
+/// Apply LSP edits to `lines`' text; `None` when an edit is reversed or
+/// edits overlap. A column past its line's end means the line's end, as LSP
+/// prescribes.
 fn apply_edits(lines: &LineMap, edits: &[TextEdit]) -> Option<String> {
     let mut ranges = edits
         .iter()
         .map(|edit| {
-            let start = lines.offset_strict(edit.range.start)?;
-            let end = lines.offset_strict(edit.range.end)?;
+            let start = lines.offset_clamped(edit.range.start);
+            let end = lines.offset_clamped(edit.range.end);
             (start <= end).then_some((start..end, edit.new_text.as_str()))
         })
         .collect::<Option<Vec<_>>>()?;
@@ -1247,6 +1291,21 @@ mod tests {
         assert_eq!(
             map.edits_to_virtual(&[edit((0, 0), (2, 0), "x = 1\nprint(x)\n")]),
             None
+        );
+    }
+
+    #[test]
+    fn exact_edit_keeps_its_extent_and_reindents() {
+        let (virtual_text, prepared) = dedented();
+        let map = prepared.map.unwrap();
+        // A completion replacing `y` (P line 1, columns 2..3) keeps its range.
+        let completed = map.edit_to_virtual(&edit((1, 2), (1, 3), "yes")).unwrap();
+        assert_eq!(completed.range, LspRange::new(pos(1, 4), pos(1, 5)));
+        // An inserted block gains the host indent on each new line.
+        let inserted = map.edit_to_virtual(&edit((1, 3), (1, 3), "\n  z")).unwrap();
+        assert_eq!(
+            apply_to(&virtual_text, &[inserted]),
+            "  if x:\n    y\n    z\n"
         );
     }
 
