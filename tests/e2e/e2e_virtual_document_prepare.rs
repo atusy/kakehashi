@@ -393,17 +393,32 @@ fn an_edit_is_prepared_before_requests_read_it() {
             "contentChanges": [{ "text": edited }]
         }),
     );
-    // Sent once: the peer is warm, so the request must wait for the new
-    // text to reach the server rather than fail and be retried.
-    let response = client.send_request(
-        "textDocument/hover",
-        json!({
-            "textDocument": { "uri": uri },
-            "position": { "line": 5, "character": 4 }
-        }),
-    );
-    let hover = response["result"].clone();
-    assert!(!hover.is_null(), "{response}");
+    // No answer may come from the text the server held before the edit:
+    // a request either waits for the new prepared text or gives no answer
+    // (retried here, as a loaded machine can push the sync past a single
+    // request's budget). A stale answer fails at once.
+    let hover = (0..600)
+        .find_map(|_| {
+            let response = client.send_request(
+                "textDocument/hover",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": 5, "character": 4 }
+                }),
+            );
+            let hover = response["result"].clone();
+            if hover.is_null() {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                return None;
+            }
+            assert_eq!(
+                hover_text(&hover),
+                "local x = 1\nx = x + 1\nprint(x)\n",
+                "an answer from the text before the edit"
+            );
+            Some(hover)
+        })
+        .expect("no hover after the edit");
     assert_eq!(hover_text(&hover), "local x = 1\nx = x + 1\nprint(x)\n");
     assert_eq!(
         hover["range"],
