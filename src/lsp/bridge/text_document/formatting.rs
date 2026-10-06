@@ -107,6 +107,7 @@ impl LanguageServerPool {
                     ctx.offset,
                     virtual_line_count,
                     region_end,
+                    Some(virtual_content),
                 )
                 .map(Some)
             },
@@ -204,6 +205,7 @@ pub(super) fn transform_formatting_response_to_host(
     offset: &RegionOffset,
     virtual_line_count: u32,
     region_end: Position,
+    _server_text: Option<&str>,
 ) -> io::Result<Vec<TextEdit>> {
     if response_has_jsonrpc_error(&response, "formatting-style request") {
         return Err(io::Error::other(
@@ -379,7 +381,7 @@ mod tests {
         });
 
         let edits =
-            transform_formatting_response_to_host(response, &offset, 2, region_end).unwrap();
+            transform_formatting_response_to_host(response, &offset, 2, region_end, None).unwrap();
 
         assert!(
             edits.is_empty(),
@@ -407,7 +409,7 @@ mod tests {
         });
 
         let edits =
-            transform_formatting_response_to_host(response, &offset, 2, region_end).unwrap();
+            transform_formatting_response_to_host(response, &offset, 2, region_end, None).unwrap();
 
         assert_eq!(edits.len(), 1, "all-safe response passes: {edits:?}");
         assert_eq!(edits[0].new_text, "safe");
@@ -534,6 +536,7 @@ mod tests {
             &RegionOffset::new(10, 0),
             UNBOUNDED,
             TEST_REGION_END,
+            None,
         )
         .unwrap();
 
@@ -575,6 +578,7 @@ mod tests {
             &RegionOffset::new(5, 4),
             UNBOUNDED,
             TEST_REGION_END,
+            None,
         )
         .unwrap();
 
@@ -604,6 +608,7 @@ mod tests {
             &RegionOffset::new(5, 0),
             UNBOUNDED,
             TEST_REGION_END,
+            None,
         );
         assert!(transformed.is_err());
     }
@@ -624,6 +629,7 @@ mod tests {
             &RegionOffset::new(5, 0),
             UNBOUNDED,
             TEST_REGION_END,
+            None,
         )
         .expect("null result is a handled response, not a failure");
 
@@ -643,6 +649,7 @@ mod tests {
             &RegionOffset::new(5, 0),
             UNBOUNDED,
             TEST_REGION_END,
+            None,
         )
         .unwrap();
         assert!(edits.is_empty());
@@ -670,6 +677,7 @@ mod tests {
             &RegionOffset::new(u32::MAX - 1, 0),
             2,
             TEST_REGION_END,
+            None,
         )
         .unwrap();
 
@@ -717,6 +725,7 @@ mod tests {
             &RegionOffset::new(10, 0),
             3,
             TEST_REGION_END,
+            None,
         )
         .unwrap();
 
@@ -753,6 +762,7 @@ mod tests {
             &RegionOffset::new(10, 0),
             3,
             TEST_REGION_END,
+            None,
         )
         .unwrap();
 
@@ -792,6 +802,7 @@ mod tests {
             &RegionOffset::new(10, 0),
             2,
             TEST_REGION_END,
+            None,
         )
         .unwrap();
 
@@ -823,7 +834,7 @@ mod tests {
         });
 
         let edits =
-            transform_formatting_response_to_host(response, &offset, 1, region_end).unwrap();
+            transform_formatting_response_to_host(response, &offset, 1, region_end, None).unwrap();
 
         assert_eq!(edits.len(), 1, "insertFinalNewline must survive: {edits:?}");
         assert_eq!(edits[0].range.start, region_end);
@@ -881,6 +892,7 @@ mod tests {
             &RegionOffset::new(10, 0),
             1,
             TEST_REGION_END,
+            None,
         )
         .unwrap();
 
@@ -923,6 +935,7 @@ mod tests {
             &RegionOffset::new(0, 0),
             2,
             TEST_REGION_END,
+            None,
         )
         .unwrap();
 
@@ -960,6 +973,7 @@ mod tests {
             &RegionOffset::new(0, 0),
             2,
             TEST_REGION_END,
+            None,
         )
         .unwrap();
 
@@ -999,6 +1013,7 @@ mod tests {
             &RegionOffset::new(10, 0),
             4,
             region_end,
+            None,
         )
         .unwrap();
 
@@ -1040,6 +1055,7 @@ mod tests {
             &offset,
             count_lines(&prepared.text),
             Position::new(13, 0),
+            None,
         )
         .unwrap();
 
@@ -1088,6 +1104,7 @@ mod tests {
             &RegionOffset::new(0, 0),
             2,
             TEST_REGION_END,
+            None,
         )
         .unwrap();
 
