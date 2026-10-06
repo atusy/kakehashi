@@ -919,16 +919,22 @@ fn main() {
                         }),
                     );
                 }
-                let result = if mode == "echo-document" {
-                    // The text this server holds, and the hovered line's
-                    // extent in ITS coordinates: a test can then prove both
-                    // what reached the server and how its positions map back.
-                    let text = message
+                let echoed = (mode == "echo-document").then(|| {
+                    message
                         .pointer("/params/textDocument/uri")
                         .and_then(Value::as_str)
                         .and_then(|uri| documents.get(uri))
                         .cloned()
-                        .unwrap_or_default();
+                });
+                let result = if let Some(text) = echoed {
+                    // The text this server holds, and the hovered line's
+                    // extent in ITS coordinates: a test can then prove both
+                    // what reached the server and how its positions map back.
+                    // A document it never received gets no hover.
+                    let Some(text) = text else {
+                        respond(&mut writer, id, Value::Null);
+                        continue;
+                    };
                     let line = message
                         .pointer("/params/position/line")
                         .and_then(Value::as_u64)

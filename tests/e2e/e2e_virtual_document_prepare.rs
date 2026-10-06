@@ -348,8 +348,13 @@ fn formatting_that_would_rewrite_a_gap_is_refused() {
             "options": { "tabSize": 2, "insertSpaces": true }
         }),
     );
+    // The request fails, or answers no edits; it never edits the host.
+    let failed = response.get("error").is_some();
     let edits = response["result"].as_array().cloned().unwrap_or_default();
-    assert_eq!(apply_edits(text, &edits), text, "{response}");
+    assert!(
+        failed || response["result"].is_null() || edits.is_empty(),
+        "{response}"
+    );
 }
 
 #[test]
@@ -374,7 +379,17 @@ fn an_edit_is_prepared_before_requests_read_it() {
             "contentChanges": [{ "text": edited }]
         }),
     );
-    let hover = hover_with_retry(&mut client, uri, 5, 4);
+    // Sent once: the peer is warm, so the request must wait for the new
+    // text to reach the server rather than fail and be retried.
+    let response = client.send_request(
+        "textDocument/hover",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 5, "character": 4 }
+        }),
+    );
+    let hover = response["result"].clone();
+    assert!(!hover.is_null(), "{response}");
     assert_eq!(hover_text(&hover), "local x = 1\nx = x + 1\nprint(x)\n");
     assert_eq!(
         hover["range"],
