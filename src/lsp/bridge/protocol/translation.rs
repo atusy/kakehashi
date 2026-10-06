@@ -125,6 +125,12 @@ fn translate_virtual_position_to_host_biased(
     if let Some(prepared) = offset.prepared() {
         *pos = prepared.to_virtual(*pos, bias);
     }
+    translate_unprepared_position_to_host(pos, offset);
+}
+
+/// V → host only, ignoring `offset`'s prepared map: for coordinates already
+/// mapped out of the prepared document.
+fn translate_unprepared_position_to_host(pos: &mut Position, offset: &RegionOffset) {
     let virtual_line = pos.line;
     pos.line = pos.line.saturating_add(offset.line());
     pos.character = pos
@@ -162,7 +168,8 @@ pub(crate) fn translate_virtual_text_edit_to_host(
             return false;
         };
         *edit = virtual_edit;
-        translate_virtual_range_to_host(&mut edit.range, &offset.unprepared());
+        translate_unprepared_position_to_host(&mut edit.range.start, offset);
+        translate_unprepared_position_to_host(&mut edit.range.end, offset);
     } else {
         translate_virtual_range_to_host(&mut edit.range, offset);
     }
@@ -179,12 +186,13 @@ pub(crate) fn translate_virtual_text_edits_to_host(
     edits: Vec<TextEdit>,
     offset: &RegionOffset,
 ) -> Option<Vec<TextEdit>> {
-    let (mut edits, offset) = match offset.prepared() {
-        Some(prepared) => (prepared.edits_to_virtual(&edits)?, offset.unprepared()),
-        None => (edits, offset.clone()),
+    let mut edits = match offset.prepared() {
+        Some(prepared) => prepared.edits_to_virtual(&edits)?,
+        None => edits,
     };
     for edit in &mut edits {
-        translate_virtual_range_to_host(&mut edit.range, &offset);
+        translate_unprepared_position_to_host(&mut edit.range.start, offset);
+        translate_unprepared_position_to_host(&mut edit.range.end, offset);
     }
     Some(edits)
 }
