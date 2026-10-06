@@ -560,6 +560,10 @@ impl InjectionCoordinator {
             self.diagnostics
                 .evict_source(uri, &DiagnosticSource::Region(region_id));
         }
+        // Every injected language needs its parser, prepared or not: kakehashi
+        // itself highlights and nests into held regions too.
+        let languages: HashSet<String> =
+            injections.iter().map(|inj| inj.language.clone()).collect();
         // Held injections (prepare pending or failed) count as present above,
         // so their open documents are not closed, but nothing is sent for
         // them: downstream servers never see a document unprepared.
@@ -572,9 +576,6 @@ impl InjectionCoordinator {
         } else {
             true
         };
-
-        let languages: HashSet<String> =
-            injections.iter().map(|inj| inj.language.clone()).collect();
 
         // Re-home the injected-language parser install OFF this task (#480 liveness;
         // the parse-actor ADR's "PR-3"). When a region's injected language has no
