@@ -289,6 +289,37 @@ impl Kakehashi {
                     configs.retain(|c| !incapable_servers.contains(&c.server_name));
                 }
                 if configs.is_empty() {
+                    // Only push-driven servers: nothing to pull, but a region
+                    // the peer could not prepare never reached them either,
+                    // and its pushes are dropped — not a clean result.
+                    let settings = self.settings_manager.load_settings();
+                    // Only a caller counting failures (the CLI, a refresh
+                    // prefetch) waits for the answer to find out.
+                    if request_error_sink.is_some()
+                        && let Some(target) = self.bridge.prepare_target(
+                            &settings,
+                            language_name,
+                            &resolved.injection_language,
+                            self.experimental_enabled(),
+                        )
+                    {
+                        let input = crate::lsp::bridge::PrepareInput {
+                            host_uri: &uri,
+                            host_language: language_name,
+                            injection_language: &resolved.injection_language,
+                            region_id: &resolved.region.region_id,
+                            virtual_text: &resolved.virtual_content,
+                            gaps: &resolved.gaps,
+                        };
+                        if self
+                            .bridge
+                            .prepared_document(&target, input)
+                            .await
+                            .is_none()
+                        {
+                            count_request_errors(&request_error_sink, 1);
+                        }
+                    }
                     continue;
                 }
 

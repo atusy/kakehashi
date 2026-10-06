@@ -288,8 +288,7 @@ pub(crate) fn apply_prepare_result(
     layout: &VirtualLayout,
     result: Option<PrepareResult>,
 ) -> Result<PreparedDocument, PrepareError> {
-    // `null` keeps every segment. It still yields a map when the layout has
-    // gaps: the map is what keeps downstream edits off host-owned text.
+    // `null` keeps every segment, and still yields a map (see below).
     let result = result.unwrap_or_else(|| PrepareResult {
         segments: layout
             .segments
