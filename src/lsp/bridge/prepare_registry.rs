@@ -857,7 +857,19 @@ impl PrepareRegistry {
             // pass, which would hold the document on it: only the current
             // generation's answer re-syncs, so a text the user returned to
             // (an undo) gets a new current generation and revision instead.
-            if previous.cell.outcome.get().is_some() || holder == Holder::Request {
+            let answered = previous.cell.outcome.get().is_some();
+            if answered && holder == Holder::LifecyclePass {
+                // The lifecycle pass works on it again (an undo): it is the
+                // current generation once more, and the one it displaces —
+                // which may have failed — no longer describes the document.
+                let entry = &mut *entry;
+                std::mem::swap(
+                    &mut entry.current,
+                    entry.previous.as_mut().expect("matched"),
+                );
+                return (Arc::clone(&entry.current.cell), entry.current.revision);
+            }
+            if answered || holder == Holder::Request {
                 return (Arc::clone(&previous.cell), previous.revision);
             }
         }
@@ -1699,6 +1711,41 @@ mod tests {
         assert!(matches!(
             registry.state(&host, "lua", region, "x x"),
             PreparedState::Unavailable
+        ));
+    }
+
+    #[test]
+    fn an_undo_to_an_answered_revision_makes_it_current_again() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let region = "01J0000000000000000000000A";
+        let gap = |host_text: &str| VirtualGap {
+            virtual_range: 1..2,
+            host_text: host_text.to_string(),
+        };
+        let (gaps_a, gaps_b) = ([gap("a")], [gap("b")]);
+        let input = |gaps| PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: region,
+            virtual_text: "x x",
+            gaps,
+        };
+        let (a, _) = registry.cell(&target, input(&gaps_a), Holder::LifecyclePass);
+        let sent = answer_for("x x", "x0x");
+        let _ = a.outcome.set(Some(Arc::clone(&sent)));
+        registry.note_sent(&host, "lua", region, &sent);
+        let (b, _) = registry.cell(&target, input(&gaps_b), Holder::LifecyclePass);
+        let _ = b.outcome.set(None);
+        // Undo: the lifecycle pass sends A's answer again.
+        let (again, _) = registry.cell(&target, input(&gaps_a), Holder::LifecyclePass);
+        assert!(Arc::ptr_eq(&again, &a));
+        registry.note_sent(&host, "lua", region, &sent);
+        assert!(matches!(
+            registry.state(&host, "lua", region, "x x"),
+            PreparedState::Prepared(_)
         ));
     }
 
