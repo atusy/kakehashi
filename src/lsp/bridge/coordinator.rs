@@ -486,8 +486,8 @@ impl BridgeCoordinator {
     }
 
     /// The prepared form of a virtual document, without waiting: on a miss
-    /// the request starts in the background and the host is queued for a
-    /// re-sync (see [`Self::take_prepare_resync_rx`]).
+    /// an attempt starts in the background, and the host is queued for a
+    /// re-sync once it lands (see [`Self::take_prepare_resync_rx`]).
     pub(crate) fn prepared_document_now(
         &self,
         target: &super::PrepareTarget,

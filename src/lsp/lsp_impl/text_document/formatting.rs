@@ -241,8 +241,9 @@ impl Kakehashi {
     }
 
     /// Format every safe bridge virtual document (the **virt** layer): resolve
-    /// from the parsed snapshot, skip non-contiguous groups, format each
-    /// remaining document, and concatenate its disjoint edits.
+    /// from the parsed snapshot, skip non-contiguous groups (unless prepared,
+    /// whose map keeps edits off their gaps), format each remaining document,
+    /// and concatenate its disjoint edits.
     #[allow(clippy::too_many_arguments)]
     async fn virt_format_edits(
         &self,

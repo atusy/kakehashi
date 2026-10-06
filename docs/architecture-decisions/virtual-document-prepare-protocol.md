@@ -42,12 +42,17 @@ fields. The named server must advertise
 only prepare requests unless its `languages` also select it as a downstream
 server. The feature is dormant unless `KAKEHASHI_EXPERIMENTAL=true`.
 
+Only pairs that are bridged and have a downstream server for the injection
+language are prepared — a document nobody receives is not worth a peer
+round-trip per edit. An empty name (`prepare = ""`) opts one language out of
+a wildcard's peer.
+
 ### The Request
 
 ```ts
 interface VirtualDocumentPrepareParams {
   // The virtual document as kakehashi built it; `version` increases
-  // whenever its text or segments change.
+  // whenever its text, segments or peer change, and is never reused.
   textDocument: { uri: DocumentUri; languageId: string; version: integer };
   hostTextDocument: { uri: DocumentUri; languageId: string };
   segments: { type: "content" | "gap"; content: string }[];
@@ -66,9 +71,10 @@ injected text, and its `content` is that text. A **gap** is host text inside
 the document's span that is not injected — the text between captures of an
 `injection.combined` pattern — and its `content` is the original host text,
 which the virtual document itself only carries as coordinate-preserving
-whitespace. A host prefix stripped from every line (a blockquote's `> `) is
-not presented: downstream servers never see it, so there is nothing to
-replace. An isolated injection is a single content segment.
+whitespace. Host text the virtual document strips altogether (a blockquote's
+`> `) is not presented on its own: between content, downstream servers never
+see it, so there is nothing to replace; next to a gap it is part of that
+gap's `content`. An isolated injection is a single content segment.
 
 The answer has the same length and the same `type` order:
 
@@ -90,31 +96,44 @@ a map between P and the virtual document (V), and composes it with V's
 existing host translation, so every position, range, diagnostic and folding
 range a server sends or receives is translated through P ↔ V ↔ host.
 
-Edits are mapped as edits, not as two endpoints: an edit is replayed against
-P and the result diffed, each change is mapped onto V, and a line it creates
-inside dedented content regains the content's removed indentation. A change
-that touches a gap is **refused** — the host text a gap stands for is never
-edited through a downstream server. Formatting fails the request when its
-result touches a gap; other edit carriers drop the affected edit, item or
-edit set under their existing all-or-nothing rules. Because the map is what
-keeps edits off gaps, a non-contiguous combined document becomes available
-to edit-producing methods once it is prepared, and a document with gaps
-carries a map even when the peer answered `null`.
+Edits are mapped as edits, not as two endpoints. A formatting result is
+replayed against P and diffed, so a whole-document replacement maps as
+precisely as small edits; any other edit (completion, rename, code action,
+inlay hint, color presentation) is mapped whole, keeping its extent. Either
+way a line the edit creates inside dedented content regains the content's
+removed indentation, and an edit replacing a whole dedented line covers (and
+restores) that line's own indent. A change is **refused** when it touches a
+gap — the host text a gap stands for is never edited through a downstream
+server — or when it creates lines in content whose removed indentation is
+not one uniform string. Formatting fails the request; other edit carriers
+drop the affected edit, item or edit set under their existing
+all-or-nothing rules.
+
+Because the map is what keeps edits off gaps, a non-contiguous combined
+document becomes available to edit-producing methods once it is prepared,
+and every prepared document carries a map, an identity one when the answer
+changed nothing. Two exceptions stay contiguous-only: linkedEditingRange and
+prepareRename answer with bare ranges the client edits verbatim, which no
+map can keep off a gap. An inbound `workspace/applyEdit` on a prepared
+non-contiguous document is likewise still refused: kakehashi cannot verify
+that the server sending it holds the text the map describes.
 
 ### Failure
 
 A document the peer could not prepare is **not sent** — never sent
 unprepared. Every failure counts: no advertisement, an error response, a
 malformed or refused answer, a timeout. Requests on such a document get no
-answer from the virt layer, and its pushed diagnostics are dropped. A peer
+answer from the virt layer, its pushed diagnostics are dropped, and the
+one-shot CLI (`format`, `diagnose`) counts it as a failed request. A peer
 that prefers a fallback answers `null` (or catches its own errors and does
 so); kakehashi does not choose one on its behalf.
 
-An unusable answer (an error response, a malformed or refused result) is
-final for that document version. A missing answer (the peer not advertising
-yet, not starting in time, crashing, timing out) is asked again on the next
-lookup, so a peer that recovers prepares the document without waiting for
-an edit.
+An unusable answer (an error response, a malformed or refused result) or a
+peer that does not advertise the request is final for that document
+version. A missing answer (the peer not starting in time, crashing, timing
+out, or answering with one of LSP's retryable cancellation codes) is retried
+with backoff — one second, doubling to a minute — without waiting for an
+edit, and requests do not pile further attempts onto a backing-off one.
 
 ### Lifecycle
 
@@ -211,11 +230,15 @@ answer `null`.
 - Every new document version waits for a peer round-trip before downstream
   servers see it.
 - `*/resolve` for items from prepared documents is refused (stale).
-- A blockquoted (line-prefixed) region refuses multi-line edits from the
+- A blockquoted (line-prefixed) region refuses any result of the
   concatenated formatting pipeline when prepared, since prefixes are not
   re-applied on that path.
 - Host text the injection query includes in content cannot be protected as
   a gap; only text outside the captured content is.
+- A request issued right after an edit waits for the new prepared text to
+  reach its server, and fails if a newer edit supersedes it first.
+- linkedEditingRange, prepareRename and inbound `workspace/applyEdit` stay
+  unavailable on prepared non-contiguous documents.
 
 ### Neutral
 

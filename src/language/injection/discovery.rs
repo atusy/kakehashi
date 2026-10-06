@@ -927,10 +927,10 @@ pub(crate) struct ResolvedInjection {
     /// gaps and excluded prefix/child bytes. A combined pattern that currently
     /// matches one capture uses the ordinary mapping and remains `true`.
     pub contiguous: bool,
-    /// Host text the virtual document does not carry verbatim, in order:
-    /// masked spans (non-empty `virtual_range`) and stripped line prefixes
-    /// (empty `virtual_range`). Empty for an isolated region, which presents
-    /// as content only.
+    /// Host text outside the injected content, in order: masked spans and
+    /// host-only lines' terminators (non-empty `virtual_range`) and stripped
+    /// text such as line prefixes (empty `virtual_range`). Empty for an
+    /// isolated region, which presents as content only.
     pub gaps: std::sync::Arc<[VirtualGap]>,
 }
 

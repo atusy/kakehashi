@@ -168,8 +168,9 @@ impl Default for PrepareRegistry {
 }
 
 impl PrepareRegistry {
-    /// Host documents whose held-back virtual documents became ready (or
-    /// failed) and must be synced again. Taken once by the server loop.
+    /// Host documents to sync again: a held-back virtual document became
+    /// ready, or an attempt that got no answer finished its retry backoff.
+    /// Taken once by the server loop.
     pub(crate) fn take_resync_rx(&self) -> Option<UnboundedReceiver<Url>> {
         self.resync_rx
             .lock()

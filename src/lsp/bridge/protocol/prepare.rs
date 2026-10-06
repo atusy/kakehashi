@@ -24,13 +24,14 @@ use tower_lsp_server::ls_types::{Position, Range as LspRange, TextEdit};
 /// The request kakehashi sends to the configured prepare peer.
 pub(crate) const PREPARE_METHOD: &str = "kakehashi/virtualDocument/prepare";
 
-/// How long a prepare answer may take. The document is not sent downstream
-/// until it arrives, so this bounds how stale a downstream view can get.
+/// How long one prepare request may wait for its answer (after the peer is
+/// up). A request that times out counts as no answer and is retried with
+/// backoff; the document is held back meanwhile.
 pub(crate) const PREPARE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Upper bound on the diff that maps a downstream edit back through P → V.
-/// A diff that cannot finish in time degrades to coarser hunks, which the gap
-/// check then refuses — slower than this is not worth an edit.
+/// Upper bound on the diff that maps a formatting result back through P → V.
+/// A diff that cannot finish in time degrades to coarser hunks: still
+/// correct, but more likely to span a gap and be refused.
 const EDIT_DIFF_BUDGET: Duration = Duration::from_millis(200);
 
 /// Kind of a virtual-document segment, as named on the wire.

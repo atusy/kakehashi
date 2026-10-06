@@ -272,7 +272,8 @@ pub(super) fn transform_formatting_response_to_host(
 
     // A prepared document's edits are re-diffed back into the virtual
     // document; one touching host-owned text (a gap) fails the request
-    // rather than dropping silently, so the user sees why nothing changed.
+    // rather than reading as "already formatted" (the CLI exits non-zero,
+    // an editor's log shows the failure).
     let Some(mut edits) = translate_virtual_text_edits_to_host(edits, offset) else {
         return Err(io::Error::other(
             "formatting result edits host-owned text of a prepared virtual document",
