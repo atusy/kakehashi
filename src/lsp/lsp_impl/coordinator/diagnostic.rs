@@ -250,7 +250,13 @@ impl DiagnosticScheduler {
     /// The collections that ran while they were held (on open, change or
     /// save) left them out, so this one supersedes any of them for the same
     /// version.
+    ///
+    /// A pull answered while they were held left them out too: its debt is
+    /// consumed with a refresh, so a pull-mode client asks again.
     pub(crate) fn spawn_diagnostic_task_after_prepare(&self, uri: Url) {
+        if self.publisher.take_degraded_pull(&uri) {
+            self.publisher.request_pull_diagnostic_refresh(true);
+        }
         let snapshot_data = self.prepare_diagnostic_snapshot(&uri);
         self.spawn_prepared_synthetic_diagnostic_task(
             uri,

@@ -276,6 +276,9 @@ impl Kakehashi {
         // Virt layer: 2-level aggregation —
         //   Inner: dispatch per region (fans out to all servers for that region)
         //   Outer: collect across regions
+        // A region left out because its peer has not prepared it (or could
+        // not): the answer is incomplete until that document is sent.
+        let prepare_skipped = std::sync::atomic::AtomicBool::new(false);
         let virt_fut = async {
             let mut outer_join_set: JoinSet<Vec<Diagnostic>> = JoinSet::new();
             for resolved in virt_regions.iter() {
@@ -356,6 +359,7 @@ impl Kakehashi {
                     // The peer could not prepare the region: it goes
                     // undiagnosed, which the CLI must not report as success.
                     count_request_errors(&request_error_sink, 1);
+                    prepare_skipped.store(true, std::sync::atomic::Ordering::Relaxed);
                     continue;
                 };
                 let pool = Arc::clone(&pool);
@@ -480,6 +484,11 @@ impl Kakehashi {
             // `DiagnosticAggregator::degraded_pulls`).
             self.diagnostics.record_degraded_pull(&uri, coverage_stamp);
             self.recover_degraded_pull(&uri);
+        } else if prepare_skipped.load(std::sync::atomic::Ordering::Relaxed) {
+            // Recovered once the region's prepared text is sent (the
+            // prepare resync consumes the debt), not right away: a re-pull
+            // now would find the region still waiting on its peer.
+            self.diagnostics.record_degraded_pull(&uri, coverage_stamp);
         } else {
             // A failed/partial fan-out (`!pull_clean`) still advances the
             // coverage version but clears neither the pull-view lag nor the
