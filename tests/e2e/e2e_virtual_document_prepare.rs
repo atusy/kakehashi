@@ -18,7 +18,8 @@
 use crate::helpers::lsp_client::LspClient;
 use serde_json::{Value, json};
 
-/// The published tsudoi build the hook runs on.
+/// The published tsudoi build the hook runs on (CI pre-caches this exact
+/// specifier; keep `.github/workflows/ci.yaml` in sync).
 const TSUDOI: &str = "npm:@atusy/tsudoi-language-server@0.1.0-alpha.2/cli";
 
 /// The prepare hook, as a tsudoi config: dedent content, fill gaps with
@@ -41,6 +42,10 @@ export default async () => ({
 });
 
 function prepare(segments: { type: string; content: string }[]) {
+  // Lets a test exercise a peer that fails: an error response.
+  if (segments.some((segment) => segment.content.includes("FAIL"))) {
+    throw new Error("refusing to prepare");
+  }
   // A content segment's first line starts a line when the document starts
   // there or the host text before it (a gap) ended one.
   const startsLine = segments.map((_, index) =>
@@ -378,4 +383,32 @@ fn an_edit_is_prepared_before_requests_read_it() {
             "end": { "line": 5, "character": 10 }
         })
     );
+}
+
+#[test]
+fn a_document_the_peer_cannot_prepare_is_not_bridged() {
+    if skip_if_deno_unavailable() {
+        return;
+    }
+    let (mut client, _dir) = init_client(false, "--\n");
+    let uri = "file:///prepare/failure.md";
+    let text = "```lua\nprint(1)\n```\n\n```lua\nprint('FAIL')\n```\n";
+    open(&mut client, uri, text);
+
+    // The first block prepares, so the peer and the mock are up…
+    let hover = hover_with_retry(&mut client, uri, 1, 1);
+    assert_eq!(hover_text(&hover), "print(1)\n");
+    // …and the second, whose prepare the peer answers with an error, is never
+    // sent downstream: no answer for it, rather than one from unprepared text.
+    for _ in 0..5 {
+        let response = client.send_request(
+            "textDocument/hover",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 5, "character": 1 }
+            }),
+        );
+        assert!(response["result"].is_null(), "{response}");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
