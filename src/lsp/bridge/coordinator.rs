@@ -603,6 +603,42 @@ impl BridgeCoordinator {
             .note_sent(host_uri, injection_language, region_id, prepared)
     }
 
+    /// Note a region's virtual text is sent unprepared; `true` when it
+    /// replaces a prepared one (see `PrepareRegistry::note_unprepared_sent`).
+    pub(crate) fn note_unprepared_sent(
+        &self,
+        host_uri: &Url,
+        injection_language: &str,
+        region_id: &str,
+        virtual_text: &str,
+    ) -> bool {
+        self.prepare
+            .note_unprepared_sent(host_uri, injection_language, region_id, virtual_text)
+    }
+
+    /// Whether a push from `connection_id` for a region is in the coordinates
+    /// of the text last sent for it: once anything is prepared, a connection
+    /// can still hold the text before (a send recorded but not yet, or never,
+    /// delivered), prepared differently or not at all.
+    pub(crate) async fn push_matches_sent_text(
+        &self,
+        host_uri: &Url,
+        region_id: &str,
+        connection_id: crate::lsp::bridge::ProgressConnectionId,
+    ) -> bool {
+        let Some((fingerprint, language)) = self.prepare.sent_fingerprint(host_uri, region_id)
+        else {
+            return true;
+        };
+        let Ok(host_uri) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
+            return false;
+        };
+        let virtual_uri = super::protocol::VirtualDocumentUri::new(&host_uri, &language, region_id);
+        self.pool
+            .connection_holds_fingerprint(connection_id, &virtual_uri.to_uri_string(), fingerprint)
+            .await
+    }
+
     /// Drop one region's prepared document (see
     /// `PrepareRegistry::forget_region`).
     pub(crate) fn forget_prepared_region(

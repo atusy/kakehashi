@@ -184,25 +184,26 @@ pub(crate) enum PreparedState {
 
 type Entries = DashMap<u64, Entry>;
 
-/// The prepared text the lifecycle pass last sent for a region. Kept apart
-/// from [`Entry`], which a settings change drops: the text a server holds
-/// does not change with the settings, and the next send must still be
-/// compared with it.
+/// The text the lifecycle pass last sent for a region, once anything is
+/// prepared. Kept apart from [`Entry`], which a settings change drops: the
+/// text a server holds does not change with the settings, and the next send
+/// must still be compared with it.
 struct Sent {
     host_uri: String,
     injection_language: String,
     region_id: String,
-    /// The answer sent: its map is the one the server's coordinates
-    /// follow, which its text alone does not identify (two answers may
-    /// differ only in where a gap's replacement maps back to).
-    prepared: Arc<PreparedDocument>,
+    /// The answer sent, or `None` for the virtual text sent unprepared. An
+    /// answer's map is the one the server's coordinates follow, which its
+    /// text alone does not identify (two answers may differ only in where a
+    /// gap's replacement maps back to).
+    prepared: Option<Arc<PreparedDocument>>,
+    /// Fingerprint of the text sent, as connections record theirs.
+    fingerprint: u64,
 }
 
 impl Sent {
-    fn is(&self, host_uri: &str, injection_language: &str, region_id: &str) -> bool {
-        self.host_uri == host_uri
-            && self.injection_language == injection_language
-            && self.region_id == region_id
+    fn is(&self, host_uri: &str, region_id: &str) -> bool {
+        self.host_uri == host_uri && self.region_id == region_id
     }
 }
 
@@ -210,7 +211,8 @@ pub(crate) struct PrepareRegistry {
     /// Keyed by a hash of (host URI, injection language, region id), so a
     /// lookup allocates nothing; the entry holds the identity it checks.
     entries: Arc<Entries>,
-    /// Keyed like `entries`.
+    /// Keyed by a hash of (host URI, region id): a region is sent under one
+    /// language at a time, and a push names only its region.
     sent: DashMap<u64, Sent>,
     /// Whether anything was ever prepared: lets the lookups every bridged
     /// region makes per edit skip the map when no pair has a prepare peer.
@@ -417,18 +419,19 @@ impl PrepareRegistry {
             return PreparedState::Unprepared;
         }
         let host_uri = host_uri.as_str();
-        let key = region_hash(host_uri, injection_language, region_id);
         let sent = self
             .sent
-            .get(&key)
-            .filter(|sent| sent.is(host_uri, injection_language, region_id))
-            .map(|sent| Arc::clone(&sent.prepared));
+            .get(&sent_key(host_uri, region_id))
+            .filter(|sent| {
+                sent.is(host_uri, region_id) && sent.injection_language == injection_language
+            })
+            .and_then(|sent| sent.prepared.clone());
         let entry = self
             .entries
-            .get(&key)
+            .get(&region_hash(host_uri, injection_language, region_id))
             .filter(|entry| entry.is(host_uri, injection_language, region_id));
         let (entry, sent) = match (entry, sent) {
-            // Never prepared, or no longer since the pair lost its peer.
+            // Never prepared, or sent unprepared since the pair lost its peer.
             (None, None) => return PreparedState::Unprepared,
             // Held since it was prepared: servers hold nothing of it.
             (Some(_), None) => return PreparedState::Unavailable,
@@ -480,11 +483,11 @@ impl PrepareRegistry {
         });
     }
 
-    /// Note that the lifecycle pass sent `prepared` for a region.
-    /// `true` unless its text is the prepared text sent last: diagnostics a server
-    /// pushed for any other text — an earlier prepared one, or the
-    /// unprepared one sent while the pair had no peer — are in coordinates
-    /// no current map describes.
+    /// Note that the lifecycle pass sends `prepared` for a region. `true`
+    /// unless its text is the prepared text sent last: diagnostics a server
+    /// pushed for any other text — an earlier prepared one, or the unprepared
+    /// one sent while the pair had no peer — are in coordinates no current
+    /// map describes.
     pub(crate) fn note_sent(
         &self,
         host_uri: &Url,
@@ -492,16 +495,90 @@ impl PrepareRegistry {
         region_id: &str,
         prepared: &Arc<PreparedDocument>,
     ) -> bool {
+        let fingerprint = super::pool::content_fingerprint(&prepared.text);
+        self.record_sent(
+            host_uri,
+            injection_language,
+            region_id,
+            Some(prepared),
+            fingerprint,
+        )
+    }
+
+    /// Note that the lifecycle pass sends a region's virtual text unprepared
+    /// (its pair has no peer, or no longer): whatever was prepared for it no
+    /// longer describes it. `true` when a prepared text had been sent for it,
+    /// whose pushed diagnostics no longer describe what is sent now. Nothing
+    /// is recorded until anything is prepared.
+    pub(crate) fn note_unprepared_sent(
+        &self,
+        host_uri: &Url,
+        injection_language: &str,
+        region_id: &str,
+        virtual_text: &str,
+    ) -> bool {
+        if !self.ever_used.load(Ordering::Acquire) {
+            return false;
+        }
         let host = host_uri.as_str();
-        let key = region_hash(host, injection_language, region_id);
+        self.entries.remove_if(
+            &region_hash(host, injection_language, region_id),
+            |_, entry| entry.is(host, injection_language, region_id),
+        );
+        let fingerprint = super::pool::content_fingerprint(virtual_text);
+        self.record_sent(host_uri, injection_language, region_id, None, fingerprint)
+    }
+
+    /// The fingerprint of the text last sent for a region, and the language
+    /// it was sent under, once anything is prepared: a server's push for the
+    /// region is in that text's coordinates only if it holds that text.
+    pub(crate) fn sent_fingerprint(
+        &self,
+        host_uri: &Url,
+        region_id: &str,
+    ) -> Option<(u64, String)> {
+        if !self.ever_used.load(Ordering::Acquire) {
+            return None;
+        }
+        let host_uri = host_uri.as_str();
+        self.sent
+            .get(&sent_key(host_uri, region_id))
+            .filter(|sent| sent.is(host_uri, region_id))
+            .map(|sent| (sent.fingerprint, sent.injection_language.clone()))
+    }
+
+    /// Record what is sent for a region; `true` when it replaces a text in
+    /// other coordinates: another prepared one, a prepared one replacing an
+    /// unprepared one (or none), an unprepared one replacing a prepared one,
+    /// or either under another language.
+    fn record_sent(
+        &self,
+        host_uri: &Url,
+        injection_language: &str,
+        region_id: &str,
+        prepared: Option<&Arc<PreparedDocument>>,
+        fingerprint: u64,
+    ) -> bool {
+        let host = host_uri.as_str();
+        let key = sent_key(host, region_id);
         if let Some(mut sent) = self.sent.get_mut(&key)
-            && sent.is(host, injection_language, region_id)
+            && sent.is(host, region_id)
         {
-            if Arc::ptr_eq(&sent.prepared, prepared) {
-                return false;
+            let same_language = sent.injection_language == injection_language;
+            let replaced = match (&sent.prepared, prepared) {
+                (Some(previous), Some(prepared)) => {
+                    !same_language
+                        || !Arc::ptr_eq(previous, prepared) && sent.fingerprint != fingerprint
+                }
+                (None, None) => !same_language,
+                _ => true,
+            };
+            if !same_language {
+                sent.injection_language = injection_language.to_string();
             }
-            let previous = std::mem::replace(&mut sent.prepared, Arc::clone(prepared));
-            return previous.text != prepared.text;
+            sent.prepared = prepared.cloned();
+            sent.fingerprint = fingerprint;
+            return replaced;
         }
         self.sent.insert(
             key,
@@ -509,10 +586,13 @@ impl PrepareRegistry {
                 host_uri: host.to_string(),
                 injection_language: injection_language.to_string(),
                 region_id: region_id.to_string(),
-                prepared: Arc::clone(prepared),
+                prepared: prepared.cloned(),
+                fingerprint,
             },
         );
-        true
+        // Nothing recorded: the first prepared text replaces whatever was
+        // sent before anything was prepared.
+        prepared.is_some()
     }
 
     /// Forget one region's document: its pair no longer has a peer, or the
@@ -532,20 +612,24 @@ impl PrepareRegistry {
         let host_uri = host_uri.as_str();
         match injection_language {
             Some(language) => {
-                let key = region_hash(host_uri, language, region_id);
                 self.entries
-                    .remove_if(&key, |_, entry| entry.is(host_uri, language, region_id));
+                    .remove_if(&region_hash(host_uri, language, region_id), |_, entry| {
+                        entry.is(host_uri, language, region_id)
+                    });
                 self.sent
-                    .remove_if(&key, |_, sent| sent.is(host_uri, language, region_id))
-                    .is_some()
+                    .remove_if(&sent_key(host_uri, region_id), |_, sent| {
+                        sent.is(host_uri, region_id) && sent.injection_language == language
+                    })
+                    .is_some_and(|(_, sent)| sent.prepared.is_some())
             }
             None => {
                 self.entries
                     .retain(|_, entry| entry.host_uri != host_uri || entry.region_id != region_id);
-                let before = self.sent.len();
                 self.sent
-                    .retain(|_, sent| sent.host_uri != host_uri || sent.region_id != region_id);
-                self.sent.len() != before
+                    .remove_if(&sent_key(host_uri, region_id), |_, sent| {
+                        sent.is(host_uri, region_id)
+                    })
+                    .is_some_and(|(_, sent)| sent.prepared.is_some())
             }
         }
     }
@@ -708,6 +792,12 @@ fn input_key(target: &PrepareTarget, input: PrepareInput<'_>) -> u64 {
     input.host_language.hash(&mut hasher);
     input.virtual_text.hash(&mut hasher);
     input.gaps.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn sent_key(host_uri: &str, region_id: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (host_uri, region_id).hash(&mut hasher);
     hasher.finish()
 }
 
@@ -1275,6 +1365,56 @@ mod tests {
         );
         let (again, _) = registry.cell(&target("bun"), input, Holder::LifecyclePass);
         assert!(Arc::ptr_eq(&new, &again));
+    }
+
+    #[test]
+    fn unprepared_sends_are_recorded_once_anything_is_prepared() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let region = "01J0000000000000000000000A";
+        assert!(!registry.note_unprepared_sent(&host, "lua", region, "  a"));
+        assert!(
+            registry.sent_fingerprint(&host, region).is_none(),
+            "nothing is recorded before anything is prepared"
+        );
+        let input = PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: region,
+            virtual_text: "  a",
+            gaps: &[],
+        };
+        registry.cell(&target, input, Holder::LifecyclePass);
+        registry.note_sent(&host, "lua", region, &sent_text("a"));
+        assert_eq!(
+            registry.sent_fingerprint(&host, region),
+            Some((
+                crate::lsp::bridge::pool::content_fingerprint("a"),
+                "lua".to_string()
+            ))
+        );
+        // The pair loses its peer: the virtual text goes out unprepared.
+        assert!(
+            registry.note_unprepared_sent(&host, "lua", region, "  a"),
+            "the prepared text it replaces had pushes of its own"
+        );
+        assert!(matches!(
+            registry.state(&host, "lua", region, "  a"),
+            PreparedState::Unprepared
+        ));
+        assert_eq!(
+            registry.sent_fingerprint(&host, region),
+            Some((
+                crate::lsp::bridge::pool::content_fingerprint("  a"),
+                "lua".to_string()
+            ))
+        );
+        assert!(
+            !registry.note_unprepared_sent(&host, "lua", region, "  b"),
+            "an unprepared edit keeps the coordinates pushes are in"
+        );
     }
 
     #[test]

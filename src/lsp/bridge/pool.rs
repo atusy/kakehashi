@@ -16,6 +16,7 @@ mod connection_key;
 mod connection_state;
 mod crash_recovery;
 mod document_tracker;
+pub(crate) use document_tracker::content_fingerprint;
 mod dynamic_capability_registry;
 mod execute;
 mod handshake;
@@ -2015,6 +2016,28 @@ impl LanguageServerPool {
         self.document_tracker
             .document_version(virtual_uri, connection_key)
             .await
+    }
+
+    /// Whether the live connection `connection_id` was last sent text with
+    /// `fingerprint` for `virtual_uri`; `false` when no live connection has
+    /// that id.
+    pub(super) async fn connection_holds_fingerprint(
+        &self,
+        connection_id: super::ProgressConnectionId,
+        virtual_uri: &str,
+        fingerprint: u64,
+    ) -> bool {
+        let key = {
+            let connections = self.connections.lock().await;
+            connections
+                .values()
+                .find(|handle| handle.connection_id() == Some(connection_id))
+                .map(|handle| handle.key().clone())
+        };
+        key.is_some_and(|key| {
+            self.document_tracker
+                .sent_fingerprint_is(virtual_uri, &key, fingerprint)
+        })
     }
 
     /// Whether `content` is the text last sent for `virtual_uri` on

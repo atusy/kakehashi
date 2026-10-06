@@ -999,6 +999,23 @@ impl DiagnosticPublisher {
             );
             return None;
         }
+        // Cached pushes are placed through the answer last sent for the
+        // region; one from a connection that does not hold that text (its
+        // didChange recorded but not yet, or never, delivered) is in other
+        // coordinates. A server pushing late for the text before one it was
+        // just sent is not caught here, any more than for an unprepared
+        // document: the push carries no text to compare.
+        if !self
+            .bridge
+            .push_matches_sent_text(&host, &region_id, connection_id)
+            .await
+        {
+            log::debug!(
+                target: LOG_TARGET,
+                "push from {server} for text other than the one last sent, dropping"
+            );
+            return None;
+        }
         Some(self.record_push(
             host,
             DiagnosticSource::Region(region_id),

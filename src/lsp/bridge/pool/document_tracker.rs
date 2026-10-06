@@ -116,7 +116,7 @@ impl VirtualUriObserver {
 /// and skip its re-sync: the downstream then analyzes stale content until a *later*
 /// edit happens to hash differently, and if no further edit occurs it stays stale.
 /// This is the standard fingerprint-guard tradeoff, accepted for the collision odds.
-pub(super) fn content_fingerprint(content: &str) -> u64 {
+pub(crate) fn content_fingerprint(content: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     content.hash(&mut hasher);

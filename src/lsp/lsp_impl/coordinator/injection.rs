@@ -446,10 +446,11 @@ impl InjectionCoordinator {
                     &injection.region_id,
                     prepared,
                 ),
-                None => self.bridge.forget_prepared_region(
+                None => self.bridge.note_unprepared_sent(
                     uri,
-                    Some(&injection.language),
+                    &injection.language,
                     &injection.region_id,
+                    &injection.content,
                 ),
             };
             if replaced {

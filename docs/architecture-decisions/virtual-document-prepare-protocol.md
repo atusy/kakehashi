@@ -184,6 +184,13 @@ save.
   checks. The request must wait for that send (or fail), and must not send
   the text itself — it could overtake a newer text the lifecycle pass
   already sent.
+- **A push is kept only from a server holding the text last sent.** The
+  sent text is recorded before its didChange reaches every connection (and
+  a send can fail); a push from a connection still holding another text —
+  prepared differently, or not at all — is in coordinates the recorded
+  answer does not describe. A push computed for the previous text but
+  arriving after the new one was sent cannot be told apart, as for any
+  unprepared document.
 - **Cached state follows the configuration.** A settings change that drops
   or retargets a pair's peer must drop what was prepared for it; otherwise
   paths that look a map up by text keep translating unprepared text through
