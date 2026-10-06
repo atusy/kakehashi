@@ -148,6 +148,17 @@ fn transform_color_presentation_response_to_host(
     // additionalTextEdits are merely stripped.
     let before = presentations.len();
     presentations.retain_mut(|presentation| {
+        // On a prepared document the request range can cover a gap the
+        // label would overwrite; make the implicit edit explicit (in
+        // prepared coordinates) so it is mapped and checked like any other.
+        if presentation.text_edit.is_none() && offset.prepared().is_some() {
+            let mut range = host_request_range;
+            translate_host_range_to_virtual(&mut range, offset);
+            presentation.text_edit = Some(tower_lsp_server::ls_types::TextEdit {
+                range,
+                new_text: presentation.label.clone(),
+            });
+        }
         // No textEdit: the client replaces the REQUEST range with the label
         // (LSP 3.18). Guard that implicit edit exactly like an explicit one —
         // a synthetic TextEdit over the (host) request range with the label
@@ -737,6 +748,44 @@ mod tests {
 
         assert_eq!(presentations.len(), 1, "region-escaping presentation drops");
         assert_eq!(presentations[0].label, "contained");
+    }
+
+    #[test]
+    fn a_label_over_a_prepared_gap_is_dropped() {
+        use super::super::super::protocol::{SegmentKind, VirtualLayout, apply_prepare_result};
+        // `color: #${c};` prepared as `color: #ff0000;`.
+        let virtual_text = "color: #    ;";
+        let layout = VirtualLayout::from_pieces(
+            virtual_text,
+            [
+                (SegmentKind::Content, 0..8, String::new()),
+                (SegmentKind::Gap, 8..12, "${c}".to_string()),
+                (SegmentKind::Content, 12..13, String::new()),
+            ],
+        );
+        let result = serde_json::from_value(json!({"segments": [
+            {"type": "content"}, {"type": "gap", "content": "ff0000"}, {"type": "content"}
+        ]}))
+        .unwrap();
+        let prepared = apply_prepare_result(virtual_text, &layout, Some(result)).unwrap();
+        let offset = RegionOffset::new(0, 0).with_prepared(prepared.map);
+        let response = json!({"jsonrpc": "2.0", "id": 1, "result": [
+            {"label": "#00ff00"},
+            {"label": "x", "textEdit": {
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}},
+                "newText": "shade"
+            }}
+        ]});
+        // The editor's request range is the interpolation itself.
+        let request = Range::new(Position::new(0, 8), Position::new(0, 12));
+        let kept = transform_color_presentation_response_to_host(
+            response,
+            &offset,
+            Position::new(0, 13),
+            request,
+        );
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[0].label, "x");
     }
 
     #[test]
