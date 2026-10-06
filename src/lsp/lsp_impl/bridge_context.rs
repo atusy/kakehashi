@@ -58,6 +58,8 @@ fn capability_prefilter_applies(method: &str) -> bool {
 /// range, including inter-capture gaps, stripped line prefixes, and excluded
 /// child ranges. Until edit translation carries the exact allowed spans,
 /// forwarding these methods could apply virtual whitespace over real host text.
+/// A prepared document's map is such a carrier for the methods that return
+/// edits ([`method_edits_bare_ranges`] excepted), so it lifts this rule.
 fn method_requires_contiguous_injection(method: &str) -> bool {
     matches!(
         method,
@@ -70,6 +72,23 @@ fn method_requires_contiguous_injection(method: &str) -> bool {
             | "textDocument/prepareRename"
             | "textDocument/rename"
     )
+}
+
+/// Whether a method answers with bare ranges the client edits verbatim
+/// (linked-editing ranges, the rename range), rather than with edits. A
+/// prepared map refuses edits that touch a gap, but a bare range over one
+/// translates like any range, so these stay contiguous-only even prepared.
+fn method_edits_bare_ranges(method: &str) -> bool {
+    matches!(
+        method,
+        "textDocument/linkedEditingRange" | "textDocument/prepareRename"
+    )
+}
+
+/// Whether a non-contiguous document is closed to `method`: it needs one
+/// contiguous span, and a prepared map (`prepared`) cannot stand in.
+fn non_contiguous_refuses(method: &str, prepared: bool) -> bool {
+    method_requires_contiguous_injection(method) && (!prepared || method_edits_bare_ranges(method))
 }
 
 /// The region-boundary rule a method's position resolves under.
@@ -1169,8 +1188,10 @@ impl Kakehashi {
         // gaps, unless a prepare peer's map will (checked again once the
         // context is prepared).
         if !resolved.contiguous
-            && method_requires_contiguous_injection(method_name)
-            && !self.prepares(&language_name, &resolved.injection_language)
+            && non_contiguous_refuses(
+                method_name,
+                self.prepares(&language_name, &resolved.injection_language),
+            )
         {
             return None;
         }
@@ -1417,10 +1438,7 @@ impl Kakehashi {
         .await?;
         // A prepared document's map keeps edits off its gaps; without one, a
         // non-contiguous document stays closed to edit-producing methods.
-        if !ctx.resolved.contiguous
-            && ctx.prepared.is_none()
-            && method_requires_contiguous_injection(method_name)
-        {
+        if !ctx.resolved.contiguous && non_contiguous_refuses(method_name, ctx.prepared.is_some()) {
             return None;
         }
         Some(ctx)
@@ -2003,8 +2021,10 @@ impl Kakehashi {
         let mut contexts = Vec::new();
         for resolved in regions {
             if !resolved.contiguous
-                && method_requires_contiguous_injection(method_name)
-                && !self.prepares(&language_name, &resolved.injection_language)
+                && non_contiguous_refuses(
+                    method_name,
+                    self.prepares(&language_name, &resolved.injection_language),
+                )
             {
                 continue;
             }
@@ -3482,6 +3502,25 @@ mod tests {
                 "{method} must be prefiltered"
             );
         }
+    }
+
+    #[test]
+    fn a_prepared_map_opens_edit_methods_but_not_bare_ranges() {
+        for method in [
+            "textDocument/rename",
+            "textDocument/completion",
+            "textDocument/codeAction",
+        ] {
+            assert!(non_contiguous_refuses(method, false), "{method}");
+            assert!(!non_contiguous_refuses(method, true), "{method}");
+        }
+        for method in [
+            "textDocument/linkedEditingRange",
+            "textDocument/prepareRename",
+        ] {
+            assert!(non_contiguous_refuses(method, true), "{method}");
+        }
+        assert!(!non_contiguous_refuses("textDocument/hover", false));
     }
 
     #[test]
