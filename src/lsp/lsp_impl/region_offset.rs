@@ -141,7 +141,7 @@ impl Kakehashi {
         // server the region now routes to. An envelope with no language
         // (cleared by the client) names no region.
         .is_some_and(|(live_offset, _, _, live_language)| {
-            live_offset == RegionOffset::from(offset) && live_language == injection_language
+            offset.describes(&live_offset) && live_language == injection_language
         })
     }
 }
