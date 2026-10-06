@@ -136,8 +136,15 @@ fn translate_virtual_position_to_host_biased(
 ///
 /// Applies position translation to both start and end.
 pub(crate) fn translate_virtual_range_to_host(range: &mut Range, offset: &RegionOffset) {
+    let empty = range.start == range.end;
     translate_virtual_position_to_host_biased(&mut range.start, offset, Bias::Start);
-    translate_virtual_position_to_host_biased(&mut range.end, offset, Bias::End);
+    // An empty range stays empty: biasing its end differently from its start
+    // could turn it inside out at a prepared gap.
+    if empty {
+        range.end = range.start;
+    } else {
+        translate_virtual_position_to_host_biased(&mut range.end, offset, Bias::End);
+    }
 }
 
 /// Translate one edit a downstream server made into host coordinates.
@@ -269,8 +276,13 @@ fn translate_host_position_to_virtual_biased(
 /// will skip column adjustment. This is intentional — each endpoint should
 /// degrade independently rather than coupling their error behavior.
 pub(crate) fn translate_host_range_to_virtual(range: &mut Range, offset: &RegionOffset) {
+    let empty = range.start == range.end;
     translate_host_position_to_virtual_biased(&mut range.start, offset, Bias::Start);
-    translate_host_position_to_virtual_biased(&mut range.end, offset, Bias::End);
+    if empty {
+        range.end = range.start;
+    } else {
+        translate_host_position_to_virtual_biased(&mut range.end, offset, Bias::End);
+    }
 }
 
 #[cfg(test)]

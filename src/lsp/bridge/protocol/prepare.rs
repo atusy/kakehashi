@@ -594,14 +594,46 @@ impl PreparedMap {
         if self.hunk_touches_gap(&old) {
             return None;
         }
-        let virtual_start = map_offset(&self.runs, old.start, Bias::Start, Side::Prepared);
-        let virtual_end = map_offset(&self.runs, old.end, Bias::End, Side::Prepared);
-        // Text landing at a V line start that kept no indent before it (the
-        // document end, or a line the peer did not dedent) starts a line of
-        // its own and needs the indent too.
-        let starts_bare_line = is_line_start(self.virtual_lines.text(), virtual_start)
-            && is_line_start(self.prepared_lines.text(), old.start);
-        let new_text = self.reindent(virtual_start, starts_bare_line, new_text, following)?;
+        // A change starting at a P line start that removes or replaces text
+        // covers the whole line in V, its removed indent included: deleting a
+        // dedented line must not leave that indent behind. Its end then keeps
+        // the next line's indent the same way. Anywhere else (an insertion,
+        // or a change joining onto the previous line) a line start maps after
+        // its removed indent, as positions do.
+        let whole_lines = !old.is_empty() && is_line_start(self.prepared_lines.text(), old.start);
+        let deleted_indent_at = |offset: usize| {
+            whole_lines
+                .then(|| empty_run(&self.runs, offset, RunKind::Deleted))
+                .flatten()
+        };
+        let start_indent = deleted_indent_at(old.start);
+        let virtual_start = start_indent.map_or_else(
+            || map_offset(&self.runs, old.start, Bias::Start, Side::Prepared),
+            |run| run.virtual_.start,
+        );
+        let virtual_end = if old.is_empty() {
+            virtual_start
+        } else {
+            deleted_indent_at(old.end).map_or_else(
+                || map_offset(&self.runs, old.end, Bias::End, Side::Prepared),
+                |run| run.virtual_.start,
+            )
+        };
+        let virtual_text = self.virtual_lines.text();
+        let first = match start_indent {
+            // The replaced line's own removed indent comes back.
+            Some(run) => FirstIndent::Exact(&virtual_text[run.virtual_.clone()]),
+            // Text landing at a V line start that kept no indent before it
+            // (the document end, or a line the peer did not dedent) starts a
+            // line of its own and needs the indent too.
+            None if is_line_start(virtual_text, virtual_start)
+                && is_line_start(self.prepared_lines.text(), old.start) =>
+            {
+                FirstIndent::Uniform
+            }
+            None => FirstIndent::None,
+        };
+        let new_text = self.reindent(virtual_start, first, new_text, following)?;
         Some(TextEdit {
             range: LspRange::new(
                 self.virtual_lines.position(virtual_start),
@@ -627,47 +659,67 @@ impl PreparedMap {
     }
 
     /// Re-insert the segment's lost indentation at the start of every
-    /// non-empty line the text begins: after each line break, and at the
-    /// very start when `starts_bare_line`.
+    /// non-empty line the text begins: after each line break (the segment's
+    /// uniform indent), and at the very start as `first` says.
     fn reindent(
         &self,
         virtual_start: usize,
-        starts_bare_line: bool,
+        first: FirstIndent<'_>,
         text: &str,
         following: Option<char>,
     ) -> Option<String> {
         let begins_line =
             |next: Option<char>| next.is_some_and(|next| next != '\n' && next != '\r');
-        let indents_first = starts_bare_line && begins_line(text.chars().next().or(following));
-        if !indents_first && !text.contains(['\n', '\r']) {
+        let breaks_line = text.contains(['\n', '\r']);
+        let first = if begins_line(text.chars().next().or(following)) {
+            first
+        } else {
+            FirstIndent::None
+        };
+        if matches!(first, FirstIndent::None) && !breaks_line {
             return Some(text.to_string());
         }
-        let indent = self
-            .indents
-            .iter()
-            .find(|indent| {
-                indent.virtual_range.start <= virtual_start
-                    && virtual_start <= indent.virtual_range.end
-            })
-            .map_or(Some(""), |indent| indent.uniform.as_deref())?;
-        if indent.is_empty() {
-            return Some(text.to_string());
-        }
-        let mut output = String::with_capacity(text.len() + indent.len());
-        if indents_first {
-            output.push_str(indent);
-        }
+        let uniform = || {
+            self.indents
+                .iter()
+                .find(|indent| {
+                    indent.virtual_range.start <= virtual_start
+                        && virtual_start <= indent.virtual_range.end
+                })
+                .map_or(Some(""), |indent| indent.uniform.as_deref())
+        };
+        let first_indent = match first {
+            FirstIndent::None => "",
+            FirstIndent::Exact(indent) => indent,
+            FirstIndent::Uniform => uniform()?,
+        };
+        let line_indent = if breaks_line { uniform()? } else { "" };
+        let mut output = String::with_capacity(text.len() + first_indent.len() + line_indent.len());
+        output.push_str(first_indent);
         let mut chars = text.chars().peekable();
         while let Some(character) = chars.next() {
             output.push(character);
             let line_break =
                 character == '\n' || (character == '\r' && chars.peek() != Some(&'\n'));
             if line_break && begins_line(chars.peek().copied().or(following)) {
-                output.push_str(indent);
+                output.push_str(line_indent);
             }
         }
         Some(output)
     }
+}
+
+/// The indentation a mapped edit's first line regains.
+#[derive(Clone, Copy)]
+enum FirstIndent<'a> {
+    /// None: the edit starts after an indent V still has.
+    None,
+    /// The segment's uniform indent: the edit starts a line V never indented
+    /// (the document end, or a line the peer did not dedent).
+    Uniform,
+    /// Exactly this: the edit replaces a whole line including the indent the
+    /// peer removed from it.
+    Exact(&'a str),
 }
 
 #[derive(Clone, Copy)]
@@ -694,6 +746,14 @@ impl Side {
 /// *starts* there wins, so a P line start maps after the indent V deleted
 /// there: the host keeps its indentation and the edit lands on the content.
 fn map_offset(runs: &[Run], offset: usize, bias: Bias, from: Side) -> usize {
+    // The end of a P range that reaches a gap the peer replaced with nothing
+    // stops before that gap: the range covers none of its host text.
+    if bias == Bias::End
+        && matches!(from, Side::Prepared)
+        && let Some(gap) = empty_run(runs, offset, RunKind::Gap)
+    {
+        return gap.virtual_.start;
+    }
     for run in runs {
         let (source, target) = from.ranges(run);
         if source.start <= offset && offset < source.end {
@@ -718,6 +778,12 @@ fn map_offset(runs: &[Run], offset: usize, bias: Bias, from: Side) -> usize {
         return from.ranges(run).1.start;
     }
     runs.last().map_or(0, |run| from.ranges(run).1.end)
+}
+
+/// The `kind` run that is empty in P and sits at P `offset`.
+fn empty_run(runs: &[Run], offset: usize, kind: RunKind) -> Option<&Run> {
+    runs.iter()
+        .find(|run| run.kind == kind && run.prepared.is_empty() && run.prepared.start == offset)
 }
 
 // =============================================================================
@@ -1318,6 +1384,63 @@ mod tests {
             apply_to(&virtual_text, &[inserted]),
             "  if x:\n    y\n    z\n"
         );
+    }
+
+    /// `ab${x}cd` with the interpolation (a gap) replaced by nothing.
+    fn emptied_gap() -> (String, PreparedMap) {
+        let virtual_text = "ab    cd".to_string();
+        let layout = VirtualLayout::from_pieces(
+            &virtual_text,
+            [
+                (SegmentKind::Content, 0..2, String::new()),
+                (SegmentKind::Gap, 2..6, "${x}".to_string()),
+                (SegmentKind::Content, 6..8, String::new()),
+            ],
+        );
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &layout,
+            result(json!({"segments": [{"type": "content"}, {"type": "gap", "content": ""}, {"type": "content"}]})),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "abcd");
+        (
+            virtual_text,
+            std::sync::Arc::try_unwrap(prepared.map.unwrap()).unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_change_before_an_emptied_gap_keeps_the_gap() {
+        let (virtual_text, map) = emptied_gap();
+        // Deleting `b` must not reach over the gap's host text.
+        let deleted = map.edit_to_virtual(&edit((0, 1), (0, 2), "")).unwrap();
+        assert_eq!(apply_to(&virtual_text, &[deleted]), "a    cd");
+        let formatted = map
+            .edits_to_virtual(&[edit((0, 0), (0, 4), "aBcd")])
+            .unwrap();
+        assert_eq!(apply_to(&virtual_text, &formatted), "aB    cd");
+        // A range ending there stops before the gap too…
+        assert_eq!(map.to_virtual(pos(0, 2), Bias::End), pos(0, 2));
+        // …while an insertion there stays an insertion.
+        let inserted = map.edit_to_virtual(&edit((0, 2), (0, 2), "!")).unwrap();
+        assert_eq!(inserted.range.start, inserted.range.end);
+    }
+
+    #[test]
+    fn deleting_a_dedented_line_takes_its_indent() {
+        let (virtual_text, prepared) = dedented();
+        let map = prepared.map.unwrap();
+        let deleted = map.edit_to_virtual(&edit((1, 0), (2, 0), "")).unwrap();
+        assert_eq!(apply_to(&virtual_text, &[deleted]), "  if x:\n");
+        let cleared = map.edit_to_virtual(&edit((1, 0), (1, 3), "")).unwrap();
+        assert_eq!(apply_to(&virtual_text, &[cleared]), "  if x:\n\n");
+        let replaced = map.edit_to_virtual(&edit((1, 0), (1, 3), "z")).unwrap();
+        assert_eq!(apply_to(&virtual_text, &[replaced]), "  if x:\n  z\n");
+        let formatted = map
+            .edits_to_virtual(&[edit((0, 0), (2, 0), "if x:\n")])
+            .unwrap();
+        assert_eq!(apply_to(&virtual_text, &formatted), "  if x:\n");
     }
 
     #[test]
