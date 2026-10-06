@@ -165,6 +165,31 @@ pub(super) fn resolve_region_offset(
         .map(|(geometry, ())| geometry)
 }
 
+/// Whether `connection` holds the text `offset`'s coordinates describe, so
+/// coordinates it sent unprompted (an inbound edit, a showDocument
+/// selection) can be translated with `offset`.
+///
+/// A prepared region's map describes the prepared text the lifecycle pass
+/// sent last, which can still be on its way while the connection holds the
+/// one before. Once anything is prepared, an unprepared region's connection
+/// must likewise hold `virtual_text`: right after a pair loses its peer, it
+/// may still hold the prepared text, whose coordinates the unprepared offset
+/// does not describe.
+pub(super) fn sent_text_held(
+    bridge: &BridgeCoordinator,
+    offset: &RegionOffset,
+    virtual_text: &str,
+    virtual_uri: &str,
+    connection: &crate::lsp::bridge::ConnectionKey,
+) -> bool {
+    let expected = match offset.prepared() {
+        Some(prepared) => prepared.prepared_text(),
+        None if bridge.prepare_ever_used() => virtual_text,
+        None => return true,
+    };
+    bridge.virtual_document_holds(virtual_uri, connection, expected)
+}
+
 /// [`resolve_region_offset`], also returning the virtual text it was built
 /// for.
 pub(super) fn resolve_region_offset_and_text(

@@ -2003,6 +2003,7 @@ fn spawn_upstream_request(
             }
             UpstreamRequest::ShowDocument {
                 params,
+                connection,
                 reply,
                 cancel,
             } => {
@@ -2013,7 +2014,12 @@ fn spawn_upstream_request(
                 // rebuilt); only a non-virtual/unresolvable URI is forwarded
                 // unchanged. See `ShowDocumentTranslator::translate`.
                 let params = match &translators {
-                    Some(translators) => translators.show_document.translate(params).await,
+                    Some(translators) => {
+                        translators
+                            .show_document
+                            .translate(params, &connection)
+                            .await
+                    }
                     None => params,
                 };
                 let id = client.next_request_id();
@@ -4760,6 +4766,7 @@ mod tests {
             .send(UpstreamRequest::ShowDocument {
                 params: serde_json::from_value(serde_json::json!({ "uri": "file:///x.rs" }))
                     .unwrap(),
+                connection: crate::lsp::bridge::ConnectionKey::for_server("test"),
                 reply: reply_tx,
                 cancel: test_forwarded_cancel(),
             })

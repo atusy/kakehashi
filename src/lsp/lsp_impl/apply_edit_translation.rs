@@ -85,7 +85,7 @@ use crate::lsp::bridge::{
     workspace_edit_preserves_line_prefixes, workspace_edit_within_region,
 };
 
-use super::region_offset::resolve_region_offset_and_text;
+use super::region_offset::{resolve_region_offset_and_text, sent_text_held};
 
 /// Translates `workspace/applyEdit` params whose edit targets a virtual
 /// document back to the host document + host coordinates. Holds shared
@@ -195,15 +195,8 @@ impl ApplyEditTranslator {
         Ok(params)
     }
 
-    /// A prepared region's map describes the prepared text the lifecycle
-    /// pass sent last, which can still be on its way while `connection`
-    /// holds the one before (an unversioned edit skips the version check,
-    /// and a versioned one can pass it just before the send): the edit's
-    /// coordinates are only this map's if the connection holds exactly that
-    /// text. Once anything is prepared, an unprepared region's connection
-    /// must likewise hold `virtual_text` — right after a pair loses its
-    /// peer, it may still hold the prepared text, whose coordinates the
-    /// unprepared offset does not describe.
+    /// See [`sent_text_held`]: an unversioned edit skips the version check,
+    /// and a versioned one can pass it just before the send.
     fn ensure_sent_text_held(
         &self,
         offset: &RegionOffset,
@@ -211,15 +204,7 @@ impl ApplyEditTranslator {
         virtual_uri: &str,
         connection: &ConnectionKey,
     ) -> Result<(), String> {
-        let expected = match offset.prepared() {
-            Some(prepared) => prepared.prepared_text(),
-            None if self.bridge.prepare_ever_used() => virtual_text,
-            None => return Ok(()),
-        };
-        if self
-            .bridge
-            .virtual_document_holds(virtual_uri, connection, expected)
-        {
+        if sent_text_held(&self.bridge, offset, virtual_text, virtual_uri, connection) {
             Ok(())
         } else {
             Err(
