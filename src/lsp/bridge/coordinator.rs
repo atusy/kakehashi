@@ -552,6 +552,17 @@ impl BridgeCoordinator {
         self.prepare.lookup_or_start(&self.pool, target, input)
     }
 
+    /// [`Self::prepared_document_now`] for a request that cannot wait (see
+    /// `PrepareRegistry::lookup_or_start_for_request`).
+    pub(crate) fn prepared_document_now_for_request(
+        &self,
+        target: &super::PrepareTarget,
+        input: super::PrepareInput<'_>,
+    ) -> super::PrepareLookup {
+        self.prepare
+            .lookup_or_start_for_request(&self.pool, target, input)
+    }
+
     /// The prepared form of a virtual document, waiting for the peer.
     /// `None` when it could not be prepared: send nothing.
     pub(crate) async fn prepared_document(

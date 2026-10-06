@@ -264,16 +264,38 @@ impl PrepareRegistry {
             .take()
     }
 
-    /// Look up without waiting; on a miss, start an attempt in the
-    /// background and report [`PrepareLookup::Pending`].
+    /// Look up for the lifecycle pass without waiting; on a miss, start an
+    /// attempt in the background and report [`PrepareLookup::Pending`].
     pub(crate) fn lookup_or_start(
         &self,
         pool: &Arc<LanguageServerPool>,
         target: &PrepareTarget,
         input: PrepareInput<'_>,
     ) -> PrepareLookup {
+        self.lookup_now(pool, target, input, Holder::LifecyclePass)
+    }
+
+    /// [`Self::lookup_or_start`] for a request that cannot wait: like
+    /// [`Self::prepare`], it never takes the generation the lifecycle pass
+    /// holds the document on.
+    pub(crate) fn lookup_or_start_for_request(
+        &self,
+        pool: &Arc<LanguageServerPool>,
+        target: &PrepareTarget,
+        input: PrepareInput<'_>,
+    ) -> PrepareLookup {
+        self.lookup_now(pool, target, input, Holder::Request)
+    }
+
+    fn lookup_now(
+        &self,
+        pool: &Arc<LanguageServerPool>,
+        target: &PrepareTarget,
+        input: PrepareInput<'_>,
+        holder: Holder,
+    ) -> PrepareLookup {
         pool.note_prepare_used();
-        let (cell, revision) = self.cell(target, input, Holder::LifecyclePass);
+        let (cell, revision) = self.cell(target, input, holder);
         if let Some(found) = cell.lookup() {
             return found;
         }
@@ -1433,6 +1455,38 @@ mod tests {
             !registry.note_unprepared_sent(&host, "lua", region, "  b"),
             "an unprepared edit keeps the coordinates pushes are in"
         );
+    }
+
+    #[tokio::test]
+    async fn a_request_that_cannot_wait_leaves_the_lifecycle_generation() {
+        let registry = PrepareRegistry::default();
+        let pool = Arc::new(LanguageServerPool::new());
+        let config = |command: &str| BridgeServerConfig {
+            cmd: Some(vec![command.to_string()]),
+            ..Default::default()
+        };
+        let target = |command: &str| PrepareTarget {
+            server_name: "peer".to_string(),
+            config: Some(Arc::new(config(command))),
+        };
+        let host = Url::parse("file:///host.md").unwrap();
+        let input = PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: "01J0000000000000000000000A",
+            virtual_text: "a",
+            gaps: &[],
+        };
+        let (current, _) = registry.cell(&target("bun"), input, Holder::LifecyclePass);
+        let _ = current.outcome.set(None);
+        // A diagnostic snapshot still carrying the settings before a change.
+        assert!(matches!(
+            registry.lookup_or_start_for_request(&pool, &target("deno"), input),
+            PrepareLookup::Pending
+        ));
+        let (still, _) = registry.cell(&target("bun"), input, Holder::LifecyclePass);
+        assert!(Arc::ptr_eq(&still, &current));
     }
 
     #[test]

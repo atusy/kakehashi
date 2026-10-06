@@ -265,7 +265,7 @@ pub(crate) fn prepare_request_context_now(
     ) else {
         return Some(ctx);
     };
-    match bridge.prepared_document_now(&target, prepare_input(&ctx, host_language)) {
+    match bridge.prepared_document_now_for_request(&target, prepare_input(&ctx, host_language)) {
         crate::lsp::bridge::PrepareLookup::Ready(prepared) => Some(with_prepared(ctx, &prepared)),
         crate::lsp::bridge::PrepareLookup::Failed | crate::lsp::bridge::PrepareLookup::Pending => {
             None
