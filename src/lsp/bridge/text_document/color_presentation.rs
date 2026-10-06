@@ -177,7 +177,14 @@ fn transform_color_presentation_response_to_host(
         if let Some(additional_edits) = &mut presentation.additional_text_edits {
             let translated = additional_edits
                 .iter_mut()
-                .all(|edit| translate_virtual_text_edit_to_host(edit, offset));
+                .all(|edit| translate_virtual_text_edit_to_host(edit, offset))
+                && !(offset.prepared().is_some()
+                    && super::super::protocol::ranges_overlap(
+                        additional_edits
+                            .iter()
+                            .map(|edit| &edit.range)
+                            .chain(presentation.text_edit.as_ref().map(|edit| &edit.range)),
+                    ));
             if !translated
                 || !additional_edits
                     .iter()

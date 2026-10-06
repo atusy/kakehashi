@@ -176,6 +176,16 @@ pub(crate) fn translate_virtual_text_edit_to_host(
     true
 }
 
+/// Whether any two of `ranges` overlap (touching is fine), as LSP forbids
+/// within one edit set. Edits mapped one by one out of a prepared document
+/// can come to overlap: a change at a dedented line's start also covers the
+/// indent the peer removed, which an edit ending there covers too.
+pub(crate) fn ranges_overlap<'a>(ranges: impl IntoIterator<Item = &'a Range>) -> bool {
+    let mut ranges: Vec<&Range> = ranges.into_iter().collect();
+    ranges.sort_by_key(|range| (range.start, range.end));
+    ranges.windows(2).any(|pair| pair[0].end > pair[1].start)
+}
+
 /// Translate a whole set of edits to one virtual document (a formatting
 /// result) into host coordinates.
 ///

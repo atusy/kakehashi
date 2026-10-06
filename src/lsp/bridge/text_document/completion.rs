@@ -24,7 +24,7 @@ use super::super::protocol::{
     response_has_jsonrpc_error, text_edit_safe_in_region,
 };
 use super::super::protocol::{
-    translate_virtual_range_to_host, translate_virtual_text_edit_to_host,
+    ranges_overlap, translate_virtual_range_to_host, translate_virtual_text_edit_to_host,
 };
 use tower_lsp_server::ls_types::TextDocumentPositionParams;
 
@@ -310,7 +310,24 @@ pub(super) fn transform_completion_item(
         let translated = additional_edits
             .iter_mut()
             .all(|edit| translate_virtual_text_edit_to_host(edit, offset));
+        // Mapped one by one out of a prepared document, the edits (the
+        // primary one included) can come to overlap.
+        let primary: Vec<&tower_lsp_server::ls_types::Range> = match &item.text_edit {
+            Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(edit)) => vec![&edit.range],
+            Some(tower_lsp_server::ls_types::CompletionTextEdit::InsertAndReplace(edit)) => {
+                vec![&edit.replace]
+            }
+            None => Vec::new(),
+        };
+        let overlapping = offset.prepared().is_some()
+            && ranges_overlap(
+                additional_edits
+                    .iter()
+                    .map(|edit| &edit.range)
+                    .chain(primary),
+            );
         if !translated
+            || overlapping
             || !additional_edits
                 .iter()
                 .all(|edit| text_edit_safe_in_region(edit, offset, region_end))

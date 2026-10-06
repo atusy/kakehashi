@@ -834,7 +834,11 @@ fn transform_inlay_hint_to_host(
     if let Some(text_edits) = &mut hint.text_edits {
         let translated = text_edits
             .iter_mut()
-            .all(|edit| translate_virtual_text_edit_to_host(edit, offset));
+            .all(|edit| translate_virtual_text_edit_to_host(edit, offset))
+            && !(offset.prepared().is_some()
+                && super::super::protocol::ranges_overlap(
+                    text_edits.iter().map(|edit| &edit.range),
+                ));
         if !translated
             || !text_edits
                 .iter()
