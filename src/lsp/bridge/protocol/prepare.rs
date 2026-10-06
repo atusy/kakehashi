@@ -700,6 +700,16 @@ impl PreparedMap {
             None => FirstIndent::None,
         };
         let new_text = self.reindent(virtual_start, first, new_text, following, tail)?;
+        // Host text a gap stands for that starts a line (a closing fence and
+        // what follows it, between combined code blocks) must keep starting
+        // one: a change ending right before it either ends with a line break
+        // or deletes whole lines, as at the region's own end.
+        if self.gap_starts_line_at(virtual_end)
+            && !(new_text.ends_with(['\n', '\r'])
+                || new_text.is_empty() && is_line_start(virtual_text, virtual_start))
+        {
+            return None;
+        }
         Some(TextEdit {
             range: LspRange::new(
                 self.virtual_lines.position(virtual_start),
@@ -707,6 +717,18 @@ impl PreparedMap {
             ),
             new_text,
         })
+    }
+
+    /// Whether a gap starts at V offset `offset`, at a line start.
+    fn gap_starts_line_at(&self, offset: usize) -> bool {
+        if !is_line_start(self.virtual_lines.text(), offset) {
+            return false;
+        }
+        let first = self.runs.partition_point(|run| run.virtual_.start < offset);
+        self.runs[first..]
+            .iter()
+            .take_while(|run| run.virtual_.start == offset)
+            .any(|run| run.kind == RunKind::Gap)
     }
 
     /// The V ranges of the gaps: host-owned text in the virtual document.
@@ -1181,6 +1203,49 @@ mod tests {
 
     fn apply_to(text: &str, edits: &[TextEdit]) -> String {
         apply_edits(&LineMap::new(text.to_string()), edits).unwrap()
+    }
+
+    /// Two combined fenced blocks: the closing fence, the prose and the
+    /// opening fence between them are a gap starting a line.
+    fn fenced() -> (String, VirtualLayout) {
+        let virtual_text = "foo()\n\n\n\nbar()\n".to_string();
+        let layout = VirtualLayout::from_pieces(
+            &virtual_text,
+            [
+                (SegmentKind::Content, 0..6, String::new()),
+                (SegmentKind::Gap, 6..9, "```\ntext\n```lua\n".to_string()),
+                (SegmentKind::Content, 9..15, String::new()),
+            ],
+        );
+        (virtual_text, layout)
+    }
+
+    #[test]
+    fn a_change_keeps_the_line_break_before_a_gap_starting_a_line() {
+        let (virtual_text, layout) = fenced();
+        for gap in [
+            json!({"type": "gap"}),
+            json!({"type": "gap", "content": ""}),
+        ] {
+            let prepared = apply_prepare_result(
+                &virtual_text,
+                &layout,
+                result(json!({"segments": [{"type": "content"}, gap, {"type": "content"}]})),
+            )
+            .unwrap();
+            let map = prepared.map.unwrap();
+            // Joining `foo()` onto the closing fence.
+            assert_eq!(map.edit_to_virtual(&edit((0, 5), (1, 0), "")), None);
+            assert_eq!(map.edits_to_virtual(&[edit((0, 5), (1, 0), "")]), None);
+            assert_eq!(map.edit_to_virtual(&edit((0, 5), (1, 0), ";")), None);
+            // Whole lines, or text ending with a line break, keep it.
+            assert!(map.edit_to_virtual(&edit((0, 0), (1, 0), "")).is_some());
+            assert!(
+                map.edit_to_virtual(&edit((0, 0), (1, 0), "baz()\n"))
+                    .is_some()
+            );
+            assert!(map.edit_to_virtual(&edit((0, 5), (0, 5), ";")).is_some());
+        }
     }
 
     /// `x = ${a}\nprint(x)\n` as a combined document: the interpolation is a

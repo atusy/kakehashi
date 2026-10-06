@@ -102,16 +102,22 @@ precisely as small edits. A workspace edit's edits to one document (rename,
 code action) are replayed together too — mapped one by one, adjacent edits
 could both claim a dedented line's removed indent — but each is first
 checked, as sent, against the gaps. Any other edit (completion, inlay hint,
-color presentation) is mapped whole, keeping its extent. Either
-way a line the edit creates inside dedented content regains the content's
-removed indentation, and an edit replacing a whole dedented line covers (and
-restores) that line's own indent. A change is **refused** when it touches a
-gap (for formatting, when the diff does: a formatter's whole-document
-replacement rewrites every gap's replacement unchanged) — the host text a gap stands for is never edited through a downstream
-server — or when it creates lines in content whose removed indentation is
-not one uniform string. Formatting fails the request; other edit carriers
-drop the affected edit, item or edit set under their existing
-all-or-nothing rules.
+color presentation) is mapped whole, keeping its extent. In every case a
+line the edit creates inside dedented content regains the content's removed
+indentation, and an edit replacing a whole dedented line covers (and
+restores) that line's own indent. A change is **refused** when:
+
+- it touches a gap (for formatting, when the diff does: a formatter's
+  whole-document replacement rewrites every gap's replacement unchanged) —
+  the host text a gap stands for is never edited through a downstream
+  server;
+- it would join text onto a gap that starts a line (a closing fence
+  between combined blocks), by the same rule as at the region's own end;
+- it creates lines in content whose removed indentation is not one uniform
+  string.
+
+Formatting fails the request; other edit carriers drop the affected edit,
+item or edit set under their existing all-or-nothing rules.
 
 Because the map is what keeps edits off gaps, a non-contiguous combined
 document becomes available to edit-producing methods once it is prepared,
