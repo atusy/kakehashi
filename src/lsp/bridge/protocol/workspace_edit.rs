@@ -50,6 +50,7 @@ pub(crate) fn transform_workspace_edit_to_host(
     // whole edits (restoring indentation, refusing gaps); a refused edit
     // refuses the whole WorkspaceEdit, since applying the rest of a rename
     // or fix would corrupt it.
+    let prepared = offset.prepared().is_some();
     let unprepared;
     let offset = match offset.prepared() {
         Some(prepared) => {
@@ -72,7 +73,42 @@ pub(crate) fn transform_workspace_edit_to_host(
         transform_document_changes(doc_changes, request_virtual_uri, host_uri, offset);
     }
 
-    true
+    // A prepared document's edits gain removed indents when mapped, so the
+    // host edits they merge with (a server editing the host URI directly)
+    // can come to overlap them.
+    !(prepared && host_edits_overlap(edit, host_uri))
+}
+
+/// Whether the edits a `WorkspaceEdit` makes to `host_uri` overlap.
+fn host_edits_overlap(edit: &WorkspaceEdit, host_uri: &Uri) -> bool {
+    let changes = edit
+        .changes
+        .as_ref()
+        .and_then(|changes| changes.get(host_uri))
+        .into_iter()
+        .flatten()
+        .map(|edit| &edit.range);
+    let document_edits: Vec<&TextDocumentEdit> = match &edit.document_changes {
+        None => Vec::new(),
+        Some(DocumentChanges::Edits(edits)) => edits.iter().collect(),
+        Some(DocumentChanges::Operations(ops)) => ops
+            .iter()
+            .filter_map(|op| match op {
+                DocumentChangeOperation::Edit(edit) => Some(edit),
+                DocumentChangeOperation::Op(_) => None,
+            })
+            .collect(),
+    };
+    let document_changes = document_edits
+        .into_iter()
+        .filter(|document_edit| &document_edit.text_document.uri == host_uri)
+        .flat_map(|document_edit| {
+            document_edit.edits.iter().map(|one_of| match one_of {
+                OneOf::Left(text_edit) => &text_edit.range,
+                OneOf::Right(annotated) => &annotated.text_edit.range,
+            })
+        });
+    super::translation::ranges_overlap(changes.chain(document_changes))
 }
 
 /// Rewrite every edit to the request's (prepared) virtual document into
@@ -747,6 +783,43 @@ mod tests {
             text.replace_range(start..end, &edit.new_text);
         }
         assert_eq!(text, "  c\n");
+    }
+
+    #[test]
+    fn prepared_edits_overlapping_host_edits_refuse_the_whole_edit() {
+        use super::super::prepare::{VirtualLayout, apply_prepare_result};
+        let virtual_text = "  a\n";
+        let result = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(result),
+        )
+        .unwrap();
+        let offset = RegionOffset::new(0, 0).with_prepared(prepared.map);
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        // The server also edits the host's indentation directly; the virtual
+        // edit, clearing the dedented line, maps over that indent.
+        let mut edit = parse_workspace_edit(json!({
+            "changes": {
+                virtual_uri.clone(): [
+                    {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "newText": ""}
+                ],
+                host_uri.as_str(): [
+                    {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": "\t"}
+                ]
+            }
+        }));
+        assert!(!transform_workspace_edit_to_host(
+            &mut edit,
+            &virtual_uri,
+            &host_uri,
+            &offset,
+        ));
     }
 
     #[test]
