@@ -613,8 +613,17 @@ impl PrepareRegistry {
                 current: fresh(),
                 previous: None,
             });
-        if !entry.is(host_uri, input.injection_language, input.region_id) {
-            // A hash collision with another region: take the slot over.
+        if !entry.is(host_uri, input.injection_language, input.region_id)
+            // The same peer launched differently answers differently, and
+            // the config is no part of the input key: a lookup made under
+            // other settings than the entry's (one still in flight across a
+            // settings change, which may even have recreated the entry after
+            // the prune) must not see its answers, and its own must not
+            // outlive it.
+            || entry.server_config.as_deref() != target.config.as_deref()
+        {
+            // A hash collision with another region, or another launch config:
+            // take the slot over.
             *entry = Entry {
                 host_uri: host_uri.to_string(),
                 injection_language: input.injection_language.to_string(),
@@ -1234,6 +1243,38 @@ mod tests {
             matches!(state("  a"), PreparedState::Unavailable),
             "no map is left for the text servers hold"
         );
+    }
+
+    #[test]
+    fn another_peer_config_never_reuses_an_answer() {
+        let registry = PrepareRegistry::default();
+        let config = |command: &str| BridgeServerConfig {
+            cmd: Some(vec![command.to_string()]),
+            ..Default::default()
+        };
+        let target = |command: &str| PrepareTarget {
+            server_name: "peer".to_string(),
+            config: Some(Arc::new(config(command))),
+        };
+        let host = Url::parse("file:///host.md").unwrap();
+        let input = PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: "01J0000000000000000000000A",
+            virtual_text: "a",
+            gaps: &[],
+        };
+        let (old, _) = registry.cell(&target("deno"), input, Holder::LifecyclePass);
+        let _ = old.outcome.set(None);
+        let (new, _) = registry.cell(&target("bun"), input, Holder::LifecyclePass);
+        assert!(!Arc::ptr_eq(&old, &new));
+        assert!(
+            new.outcome.get().is_none(),
+            "the old launch's failure is not reused"
+        );
+        let (again, _) = registry.cell(&target("bun"), input, Holder::LifecyclePass);
+        assert!(Arc::ptr_eq(&new, &again));
     }
 
     #[test]
