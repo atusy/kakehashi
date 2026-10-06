@@ -17,6 +17,11 @@
 //!   uppercases the text. Exercises the pipeline's capability-based
 //!   whole-region rangeFormatting fallback (concatenated-formatting-pipeline
 //!   Decision point 3.2).
+//! - `echo-document` — advertises `hoverProvider` +
+//!   `documentFormattingProvider`; hover answers the full text this server
+//!   holds for the document, ranged over the hovered line in its own
+//!   coordinates; formatting uppercases. Proves what a prepared virtual
+//!   document looks like downstream and how its coordinates map back.
 //! - `definition` — advertises `definitionProvider` + `hoverProvider`;
 //!   answers definition with a fixed Location that **echoes the requested
 //!   URI** (and hover with the URI in the contents), but only for documents
@@ -315,6 +320,11 @@ fn main() {
                     "definition" => json!({
                         "definitionProvider": true,
                         "hoverProvider": true,
+                        "textDocumentSync": 1
+                    }),
+                    "echo-document" => json!({
+                        "hoverProvider": true,
+                        "documentFormattingProvider": true,
                         "textDocumentSync": 1
                     }),
                     "call-hierarchy-prepare"
@@ -904,7 +914,32 @@ fn main() {
                         }),
                     );
                 }
-                let result = if mode == "inlay-hint-marker-resolve" {
+                let result = if mode == "echo-document" {
+                    // The text this server holds, and the hovered line's
+                    // extent in ITS coordinates: a test can then prove both
+                    // what reached the server and how its positions map back.
+                    let text = message
+                        .pointer("/params/textDocument/uri")
+                        .and_then(Value::as_str)
+                        .and_then(|uri| documents.get(uri))
+                        .cloned()
+                        .unwrap_or_default();
+                    let line = message
+                        .pointer("/params/position/line")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let width = text
+                        .lines()
+                        .nth(line as usize)
+                        .map_or(0, |content| content.encode_utf16().count());
+                    json!({
+                        "contents": text,
+                        "range": {
+                            "start": { "line": line, "character": 0 },
+                            "end": { "line": line, "character": width }
+                        }
+                    })
+                } else if mode == "inlay-hint-marker-resolve" {
                     let observation = json!({
                         "uri": message.pointer("/params/textDocument/uri"),
                         "position": message.pointer("/params/position"),
