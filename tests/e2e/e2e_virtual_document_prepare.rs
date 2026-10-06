@@ -116,6 +116,15 @@ fn skip_if_deno_unavailable() -> bool {
 /// `echo-document` mock. `combined` swaps in [`COMBINED_QUERY`]; gaps are
 /// replaced with `placeholder`.
 fn init_client(combined: bool, placeholder: &str) -> (LspClient, tempfile::TempDir) {
+    init_client_with(combined, placeholder, json!({}))
+}
+
+/// [`init_client`] with extra `bridge.lua` settings merged in.
+fn init_client_with(
+    combined: bool,
+    placeholder: &str,
+    lua_bridge: Value,
+) -> (LspClient, tempfile::TempDir) {
     let dir = tempfile::TempDir::new().expect("temp dir");
     let tsudoi_config = dir.path().join("tsudoi.config.ts");
     let hook = format!(
@@ -126,6 +135,11 @@ fn init_client(combined: bool, placeholder: &str) -> (LspClient, tempfile::TempD
     let config_path = dir.path().join("kakehashi.toml");
     std::fs::write(&config_path, "").expect("write kakehashi config");
     let mut markdown = json!({ "bridge": { "lua": { "prepare": "tsudoi" } } });
+    if let Value::Object(extra) = lua_bridge {
+        for (key, value) in extra {
+            markdown["bridge"]["lua"][key] = value;
+        }
+    }
     if combined {
         let query_path = dir.path().join("combined-injections.scm");
         std::fs::write(&query_path, COMBINED_QUERY).expect("write combined query");
@@ -463,4 +477,29 @@ fn diagnostics_arrive_once_the_prepared_text_is_sent() {
         );
         return;
     }
+}
+
+#[test]
+fn the_concatenated_formatting_pipeline_maps_back_through_the_prepared_map() {
+    if skip_if_deno_unavailable() {
+        return;
+    }
+    let (mut client, _dir) = init_client_with(
+        false,
+        "--\n",
+        json!({
+            "aggregation": {
+                "textDocument/formatting": { "strategy": "concatenated", "priorities": ["echo"] }
+            }
+        }),
+    );
+    let uri = "file:///prepare/pipeline.md";
+    let text = "# t\n\n```lua\n  local x = 1\n  print(x)\n```\n";
+    open(&mut client, uri, text);
+
+    let edits = format_with_retry(&mut client, uri);
+    assert_eq!(
+        apply_edits(text, &edits),
+        "# t\n\n```lua\n  LOCAL X = 1\n  PRINT(X)\n```\n"
+    );
 }
