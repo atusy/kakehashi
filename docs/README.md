@@ -873,6 +873,62 @@ The `bridge` map in language configuration controls which injection languages ar
 | `{}` | Disable bridging entirely for this host language |
 | `null` or omitted | Bridge all configured languages (default) |
 
+**Preparing Virtual Documents (`prepare`, experimental):**
+
+Embedded code is not always valid as written: a Nix indented string's
+content is indented by the host, and its `${…}` interpolations leave holes.
+`bridge.<lang>.prepare` names a language server that rewrites each virtual
+document before the downstream servers see it, via
+`kakehashi/virtualDocument/prepare`
+(see virtual-document-prepare-protocol). The server must advertise
+`experimental.kakehashi.virtualDocumentPrepare`, and the feature requires
+`KAKEHASHI_EXPERIMENTAL=true`.
+
+```toml
+[languages.nix.bridge._]
+prepare = "tsudoi"
+
+[languageServers.tsudoi]
+cmd = ["deno", "run", "-A", "npm:@atusy/tsudoi-language-server@0.1.0-alpha.2/cli", "--config", "/path/to/tsudoi.config.ts"]
+languages = []          # only prepares; analyzes nothing itself
+```
+
+The request presents the document as ordered segments: `content` (the
+injected text) and `gap` (host text between `injection.combined` captures,
+such as an interpolation). The answer may delete leading whitespace from
+content lines and replace any gap with text of any length:
+
+```ts
+// tsudoi.config.ts
+export default async () => ({
+  methods: {
+    initialize: async (context: any) => ({
+      ...context.preparedResult,
+      capabilities: {
+        ...context.preparedResult.capabilities,
+        experimental: { kakehashi: { virtualDocumentPrepare: true } },
+      },
+    }),
+  },
+  customMethods: {
+    "kakehashi/virtualDocument/prepare": (_context: any, params: any) =>
+      Promise.resolve({
+        result: {
+          segments: params.segments.map((segment: any) =>
+            segment.type === "gap" ? { type: "gap", content: "null" } : { type: "content" }
+          ),
+        },
+      }),
+  },
+});
+```
+
+kakehashi translates every position, range and edit between the prepared
+and the original document. Edits that would touch a gap are refused, which
+also makes formatting and other edit-producing methods available for
+combined documents. A document the server fails to prepare is not sent
+downstream at all; answer `null` to keep a document unchanged.
+
 ### Configuration Files
 
 kakehashi loads configuration from `~/.config/kakehashi/kakehashi.toml` (user config) and `./kakehashi.toml` (project config). Both use the same TOML format:
