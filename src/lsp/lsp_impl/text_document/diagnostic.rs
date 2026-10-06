@@ -293,9 +293,9 @@ impl Kakehashi {
                     // the peer could not prepare never reached them either,
                     // and its pushes are dropped — not a clean result.
                     let settings = self.settings_manager.load_settings();
-                    // Only a caller counting failures (the CLI, a refresh
-                    // prefetch) waits for the answer to find out.
-                    if request_error_sink.is_some()
+                    // Only a caller counting failures (CLI diagnose) waits
+                    // for the answer to find out; an editor's pull does not.
+                    if external_error_sink.is_some()
                         && let Some(target) = self.bridge.prepare_target(
                             &settings,
                             language_name,
