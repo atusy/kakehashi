@@ -552,6 +552,12 @@ impl PreparedMap {
         self.virtual_lines.position(mapped)
     }
 
+    /// Whether two P positions name the same offset once clamped onto P (a
+    /// column past a line's end means its end).
+    pub(crate) fn same_prepared_offset(&self, a: Position, b: Position) -> bool {
+        self.prepared_lines.offset_clamped(a) == self.prepared_lines.offset_clamped(b)
+    }
+
     /// Translate a position in V to P.
     pub(crate) fn to_prepared(&self, position: Position, bias: Bias) -> Position {
         let offset = self.virtual_lines.offset_clamped(position);

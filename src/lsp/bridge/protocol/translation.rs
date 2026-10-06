@@ -142,7 +142,12 @@ fn translate_unprepared_position_to_host(pos: &mut Position, offset: &RegionOffs
 ///
 /// Applies position translation to both start and end.
 pub(crate) fn translate_virtual_range_to_host(range: &mut Range, offset: &RegionOffset) {
-    let empty = range.start == range.end;
+    // Empty as the prepared document reads it: endpoints past a line's end
+    // clamp onto one offset, which opposite biases would map apart.
+    let empty = range.start == range.end
+        || offset
+            .prepared()
+            .is_some_and(|prepared| prepared.same_prepared_offset(range.start, range.end));
     translate_virtual_position_to_host_biased(&mut range.start, offset, Bias::Start);
     // An empty range stays empty: biasing its end differently from its start
     // could turn it inside out at a prepared gap.
@@ -421,6 +426,30 @@ mod tests {
             Position::new(10, 4),
             &offset
         ));
+    }
+
+    #[test]
+    fn a_range_clamping_to_one_prepared_offset_stays_empty() {
+        use super::super::prepare::{SegmentKind, VirtualLayout, apply_prepare_result};
+        // `ab${x}` on host line 10, the interpolation prepared as nothing.
+        let virtual_text = "ab    \ncd";
+        let layout = VirtualLayout::from_pieces(
+            virtual_text,
+            [
+                (SegmentKind::Content, 0..2, String::new()),
+                (SegmentKind::Gap, 2..6, "${x}".to_string()),
+                (SegmentKind::Content, 6..9, String::new()),
+            ],
+        );
+        let result = serde_json::from_value(serde_json::json!({"segments": [
+            {"type": "content"}, {"type": "gap", "content": ""}, {"type": "content"}
+        ]}))
+        .unwrap();
+        let prepared = apply_prepare_result(virtual_text, &layout, Some(result)).unwrap();
+        let offset = RegionOffset::new(10, 0).with_prepared(prepared.map);
+        let mut range = Range::new(Position::new(0, 2), Position::new(0, 100));
+        translate_virtual_range_to_host(&mut range, &offset);
+        assert_eq!(range.start, range.end, "{range:?}");
     }
 
     #[test]
