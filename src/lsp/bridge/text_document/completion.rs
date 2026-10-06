@@ -95,7 +95,7 @@ impl LanguageServerPool {
                     response,
                     ctx.offset,
                     region_end,
-                    Some(host_position.line),
+                    Some(host_position),
                     origin.has_capability("completionItem/resolve"),
                     &EnvelopeContext {
                         server_name,
@@ -142,7 +142,7 @@ fn transform_completion_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,
     region_end: Position,
-    request_host_line: Option<u32>,
+    request_host_position: Option<Position>,
     server_resolves: bool,
     envelope_ctx: &EnvelopeContext<'_>,
 ) -> Option<CompletionList> {
@@ -177,7 +177,7 @@ fn transform_completion_response_to_host(
     // under the same policy as the host layer.
     let before = list.items.len();
     list.items.retain_mut(|item| {
-        if !transform_completion_item(item, offset, region_end, request_host_line) {
+        if !transform_completion_item(item, offset, region_end, request_host_position) {
             return false;
         }
         if should_envelope(item.data.as_ref(), server_resolves) {
@@ -213,8 +213,19 @@ pub(super) fn transform_completion_item(
     item: &mut CompletionItem,
     offset: &RegionOffset,
     region_end: Position,
-    request_host_line: Option<u32>,
+    request_host_position: Option<Position>,
 ) -> bool {
+    let request_host_line = request_host_position.map(|position| position.line);
+    // LSP requires an item's edit ranges to contain the requested position.
+    // Out of a prepared document a range can map past it: the server saw
+    // the caret where the prepared text has no position of its own (removed
+    // indentation, an emptied gap's boundary), and an edit anchored there
+    // maps back to the far side of what the peer removed.
+    let contains_request = |range: &tower_lsp_server::ls_types::Range| {
+        offset.prepared().is_none()
+            || request_host_position
+                .is_none_or(|position| range.start <= position && position <= range.end)
+    };
     // A multi-line insertion is unsafe only where its INSERTION POINT's
     // neighborhood is prefixed — a mixed region (single-element `[n]` offsets:
     // line 0 starts mid-host-line, later lines are whole and unprefixed)
@@ -253,6 +264,7 @@ pub(super) fn transform_completion_item(
         match text_edit {
             tower_lsp_server::ls_types::CompletionTextEdit::Edit(edit) => {
                 if !translate_virtual_text_edit_to_host(edit, offset)
+                    || !contains_request(&edit.range)
                     || !text_edit_safe_in_region(edit, offset, region_end)
                     || snippet_unsafe(&edit.new_text, Some(edit.range.start.line))
                 {
@@ -260,7 +272,10 @@ pub(super) fn transform_completion_item(
                 }
             }
             tower_lsp_server::ls_types::CompletionTextEdit::InsertAndReplace(edit) => {
-                if !translate_insert_replace_edit_to_host(edit, offset) {
+                if !translate_insert_replace_edit_to_host(edit, offset)
+                    || !contains_request(&edit.insert)
+                    || !contains_request(&edit.replace)
+                {
                     return false;
                 }
                 // Check both ranges through one probe edit, moving new_text in
@@ -719,6 +734,55 @@ mod tests {
     use rstest::rstest;
     use serde_json::json;
 
+    #[test]
+    fn a_prepared_item_must_contain_the_requested_caret() {
+        use super::super::super::protocol::{SegmentKind, VirtualLayout, apply_prepare_result};
+        // `foo${x}bar` at host line 10, the interpolation emptied: `foobar`.
+        let virtual_text = "foo    bar\n";
+        let layout = VirtualLayout::from_pieces(
+            virtual_text,
+            [
+                (SegmentKind::Content, 0..3, String::new()),
+                (SegmentKind::Gap, 3..7, "${x}".to_string()),
+                (SegmentKind::Content, 7..11, String::new()),
+            ],
+        );
+        let result = serde_json::from_value(json!({"segments": [
+            {"type": "content"}, {"type": "gap", "content": ""}, {"type": "content"}
+        ]}))
+        .unwrap();
+        let prepared = apply_prepare_result(virtual_text, &layout, Some(result)).unwrap();
+        let offset = RegionOffset::new(10, 0).with_prepared(prepared.map);
+        let region_end = Position::new(11, 0);
+        // Both carets reach the server at P (0, 3); its insertion there maps
+        // after `${x}`.
+        let item = || -> CompletionItem {
+            serde_json::from_value(json!({
+                "label": "X",
+                "textEdit": {
+                    "range": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 3}},
+                    "newText": "X"
+                }
+            }))
+            .unwrap()
+        };
+        assert!(
+            !transform_completion_item(
+                &mut item(),
+                &offset,
+                region_end,
+                Some(Position::new(10, 3))
+            ),
+            "the edit would land after the gap, past the caret before it"
+        );
+        assert!(transform_completion_item(
+            &mut item(),
+            &offset,
+            region_end,
+            Some(Position::new(10, 7))
+        ));
+    }
+
     /// `  if x:\n    y\n` at host line 10, dedented by two by a prepare peer.
     fn dedented_offset() -> RegionOffset {
         use super::super::super::protocol::{VirtualLayout, apply_prepare_result};
@@ -810,7 +874,7 @@ mod tests {
             response,
             offset,
             region_end,
-            request_host_line,
+            request_host_line.map(|line| Position::new(line, 0)),
             server_resolves,
             &EnvelopeContext {
                 server_name: "lua-ls",
