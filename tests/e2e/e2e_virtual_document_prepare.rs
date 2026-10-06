@@ -557,6 +557,21 @@ fn a_save_while_preparing_reaches_the_server_with_the_prepared_text() {
             .and_then(|message| message.split_once("echo-document saved: "))
         {
             assert_eq!(saved, "local x = 2\n");
+            break;
+        }
+    }
+    // The save's diagnostic pass ran while the region was held; the one after
+    // its prepared text was sent must still publish it.
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let params = client
+            .wait_for_notification("textDocument/publishDiagnostics", remaining)
+            .expect("no diagnostics for the saved prepared text");
+        if params["diagnostics"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|d| d["source"] == "echo-document" && d["message"] == "local x = 2\n")
+        }) {
             return;
         }
     }

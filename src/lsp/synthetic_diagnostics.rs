@@ -37,6 +37,10 @@ pub(crate) enum SyntheticDiagnosticTrigger {
     Open,
     Change,
     Save,
+    /// Regions held for their prepare answers reached their servers: any
+    /// earlier collection of this version left them out, so this one wins
+    /// over all of them.
+    Prepared,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

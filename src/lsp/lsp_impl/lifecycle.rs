@@ -807,7 +807,7 @@ impl Kakehashi {
                         // or changed skipped the held regions; run it again
                         // now that they reached their servers.
                         if ready {
-                            diagnostics.schedule_debounced_diagnostic(uri);
+                            diagnostics.spawn_diagnostic_task_after_prepare(uri);
                         }
                     }
                 }
