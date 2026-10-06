@@ -187,9 +187,39 @@ impl ApplyEditTranslator {
             );
         };
         ensure_editable_region(contiguous)?;
+        self.ensure_prepared_text_held(&offset, virtual_uri, connection)?;
 
         transform_params_to_host(&mut params, virtual_uri, &host_uri, &offset, region_end)?;
         Ok(params)
+    }
+
+    /// A prepared region's map describes the prepared text the lifecycle
+    /// pass sent last, which can still be on its way while `connection`
+    /// holds the one before (an unversioned edit skips the version check,
+    /// and a versioned one can pass it just before the send): the edit's
+    /// coordinates are only this map's if the connection holds exactly that
+    /// text.
+    fn ensure_prepared_text_held(
+        &self,
+        offset: &RegionOffset,
+        virtual_uri: &str,
+        connection: &ConnectionKey,
+    ) -> Result<(), String> {
+        match offset.prepared() {
+            Some(prepared)
+                if !self.bridge.virtual_document_holds(
+                    virtual_uri,
+                    connection,
+                    prepared.prepared_text(),
+                ) =>
+            {
+                Err(
+                    "kakehashi: the injected region changed before the edit could be applied"
+                        .to_string(),
+                )
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Validate every versioned `TextDocumentEdit` targeting a VIRTUAL
@@ -656,6 +686,51 @@ mod tests {
             .register_opened_document_for_test(&host_url, &typed_uri, connection)
             .await;
         (bridge, typed_uri)
+    }
+
+    #[tokio::test]
+    async fn a_prepared_map_needs_the_connection_to_hold_its_text() {
+        use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
+        let connection = test_connection();
+        let (bridge, typed_uri) =
+            bridge_with_open_document("01ARZ3NDEKTSV4RRFFQ69G5FAV", &connection).await;
+        let virtual_text = "  a\n";
+        let result = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(result),
+        )
+        .unwrap();
+        let offset = RegionOffset::new(0, 0).with_prepared(prepared.map);
+        let translator = translator_with_bridge(Arc::clone(&bridge));
+        let uri = typed_uri.to_uri_string();
+        // The server still holds the text before this map's.
+        bridge
+            .record_sent_content_for_test(&typed_uri, &connection, "  a\n")
+            .await;
+        assert!(
+            translator
+                .ensure_prepared_text_held(&offset, &uri, &connection)
+                .is_err()
+        );
+        bridge
+            .record_sent_content_for_test(&typed_uri, &connection, "a\n")
+            .await;
+        assert!(
+            translator
+                .ensure_prepared_text_held(&offset, &uri, &connection)
+                .is_ok()
+        );
+        // An unprepared region has no map to mismatch.
+        assert!(
+            translator
+                .ensure_prepared_text_held(&RegionOffset::new(0, 0), &uri, &connection)
+                .is_ok()
+        );
     }
 
     #[tokio::test]

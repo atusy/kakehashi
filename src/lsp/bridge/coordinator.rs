@@ -411,6 +411,18 @@ impl BridgeCoordinator {
             .await
     }
 
+    /// Whether `content` is the text last sent for `virtual_uri` on
+    /// `connection_key`.
+    pub(crate) fn virtual_document_holds(
+        &self,
+        virtual_uri: &str,
+        connection_key: &crate::lsp::bridge::pool::ConnectionKey,
+        content: &str,
+    ) -> bool {
+        self.pool
+            .virtual_document_holds(virtual_uri, connection_key, content)
+    }
+
     /// Access the underlying node tracker.
     ///
     /// Used by handlers for `InjectionResolver::resolve_at_byte_offset()`.
@@ -938,6 +950,20 @@ impl BridgeCoordinator {
     ) -> Option<i32> {
         self.pool
             .increment_document_version(virtual_uri, connection_key)
+            .await
+    }
+
+    /// Record `content` as the text sent for a virtual document, as a
+    /// didOpen or didChange forward would.
+    #[cfg(test)]
+    pub(crate) async fn record_sent_content_for_test(
+        &self,
+        virtual_uri: &crate::lsp::bridge::protocol::VirtualDocumentUri,
+        connection_key: &crate::lsp::bridge::pool::ConnectionKey,
+        content: &str,
+    ) {
+        self.pool
+            .record_sent_content_fingerprint(virtual_uri, connection_key, content)
             .await
     }
 

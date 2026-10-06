@@ -578,6 +578,11 @@ impl PreparedMap {
             .collect()
     }
 
+    /// The prepared text this map was built for.
+    pub(crate) fn prepared_text(&self) -> &str {
+        self.prepared_lines.text()
+    }
+
     /// Whether any of these P edits, as sent, reaches into a gap. Mapping a
     /// set through the diff ([`Self::edits_to_virtual`]) checks only what
     /// changed: an edit that rewrites a gap's replacement with the same text

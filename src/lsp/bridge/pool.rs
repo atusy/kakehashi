@@ -2003,6 +2003,21 @@ impl LanguageServerPool {
             .await
     }
 
+    /// Whether `content` is the text last sent for `virtual_uri` on
+    /// `connection_key`.
+    pub(super) fn virtual_document_holds(
+        &self,
+        virtual_uri: &str,
+        connection_key: &ConnectionKey,
+        content: &str,
+    ) -> bool {
+        self.document_tracker.sent_fingerprint_is(
+            virtual_uri,
+            connection_key,
+            document_tracker::content_fingerprint(content),
+        )
+    }
+
     /// Find ALL connections (`(server, root)` keys) that have opened a given
     /// virtual document URI.
     ///
