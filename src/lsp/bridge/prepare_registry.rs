@@ -311,7 +311,17 @@ impl PrepareRegistry {
                     .get(&region)
                     .is_some_and(|entry| Arc::ptr_eq(&entry.current.cell, &cell))
             };
-            match run(&pool, &target, &job, revision).await {
+            // A settings change or close that dropped this cell's entry
+            // revokes the attempt: it must not start (or replace) a peer
+            // the settings no longer name.
+            let admitted = || {
+                entries.get(&region).is_some_and(|entry| {
+                    entry
+                        .generations()
+                        .any(|generation| Arc::ptr_eq(&generation.cell, &cell))
+                })
+            };
+            match run(&pool, &target, &job, revision, &admitted).await {
                 Ok(outcome) => {
                     let prepared = outcome.is_some();
                     let _ = cell.outcome.set(outcome);
@@ -618,6 +628,7 @@ async fn run(
     target: &PrepareTarget,
     job: &PrepareJob,
     revision: i32,
+    admitted: &(dyn Fn() -> bool + Sync),
 ) -> Result<Outcome, ()> {
     let log_failure = |error: &dyn std::fmt::Display| {
         log::warn!(
@@ -629,7 +640,7 @@ async fn run(
             error
         );
     };
-    match try_run(pool, target, job, revision).await {
+    match try_run(pool, target, job, revision, admitted).await {
         Ok(Ok(prepared)) => Ok(Some(Arc::new(prepared))),
         Ok(Err(refused)) => {
             log_failure(&refused);
@@ -651,6 +662,7 @@ async fn try_run(
     target: &PrepareTarget,
     job: &PrepareJob,
     revision: i32,
+    admitted: &(dyn Fn() -> bool + Sync),
 ) -> std::io::Result<std::io::Result<PreparedDocument>> {
     let Some(config) = target.config.as_deref() else {
         return Ok(Err(std::io::Error::other(format!(
@@ -664,7 +676,7 @@ async fn try_run(
             config,
             Some(&job.host_uri),
             Duration::from_secs(super::INIT_TIMEOUT_SECS),
-            None,
+            Some(admitted),
             None,
         )
         .await?;
@@ -978,6 +990,46 @@ mod tests {
             registry.entries.is_empty(),
             "a fixed config may now prepare it"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_forgotten_attempt_does_not_start_its_peer() {
+        let registry = PrepareRegistry::default();
+        let pool = Arc::new(LanguageServerPool::new());
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("spawned");
+        let target = PrepareTarget {
+            server_name: "peer".to_string(),
+            config: Some(Arc::new(BridgeServerConfig {
+                cmd: Some(vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("touch '{}'", marker.display()),
+                ]),
+                ..Default::default()
+            })),
+        };
+        let host = Url::parse("file:///host.md").unwrap();
+        let input = PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: "01J0000000000000000000000A",
+            virtual_text: "a",
+            gaps: &[],
+        };
+        // The attempt is spawned but (on this single-threaded runtime) has
+        // not run yet when its entry is forgotten — the host closed, say.
+        registry.lookup_or_start(&pool, &target, input);
+        let (cell, _) = registry.cell(&target, input, Holder::Request);
+        let mut attempts = cell.attempts.subscribe();
+        registry.forget_host(&host);
+        tokio::time::timeout(Duration::from_secs(10), attempts.changed())
+            .await
+            .expect("the attempt ends")
+            .unwrap();
+        assert!(!marker.exists(), "a revoked attempt started its peer");
     }
 
     #[test]
