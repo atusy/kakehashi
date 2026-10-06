@@ -262,7 +262,7 @@ mod tests {
             virtual_content: "x".to_string(),
             line_column_offsets: vec![3],
             contiguous: true,
-            gaps: Vec::new(),
+            gaps: Default::default(),
         };
 
         let (_, region_end, _, _) = resolved_region_geometry(resolved);

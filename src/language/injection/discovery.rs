@@ -931,7 +931,7 @@ pub(crate) struct ResolvedInjection {
     /// masked spans (non-empty `virtual_range`) and stripped line prefixes
     /// (empty `virtual_range`). Empty for an isolated region, which presents
     /// as content only.
-    pub gaps: Vec<VirtualGap>,
+    pub gaps: std::sync::Arc<[VirtualGap]>,
 }
 
 /// Host text standing between (or inside) injected content of a combined
@@ -1118,7 +1118,7 @@ impl InjectionResolver {
             virtual_content,
             line_column_offsets,
             contiguous: true,
-            gaps: Vec::new(),
+            gaps: Default::default(),
         })
     }
 
@@ -1171,7 +1171,7 @@ impl InjectionResolver {
                 virtual_content,
                 line_column_offsets,
                 contiguous: true,
-                gaps: Vec::new(),
+                gaps: Default::default(),
             });
         }
         let included_sets: Vec<_> = regions
@@ -1213,7 +1213,7 @@ impl InjectionResolver {
                 virtual_content,
                 line_column_offsets,
                 contiguous: true,
-                gaps: Vec::new(),
+                gaps: Default::default(),
             });
         }
         let anchor_index = active_indices.iter().copied().min_by_key(|&index| {
@@ -1270,7 +1270,7 @@ impl InjectionResolver {
             virtual_content,
             line_column_offsets,
             contiguous,
-            gaps,
+            gaps: gaps.into(),
         })
     }
 
@@ -1488,7 +1488,7 @@ impl InjectionResolver {
                     virtual_content,
                     line_column_offsets,
                     contiguous: true,
-                    gaps: Vec::new(),
+                    gaps: Default::default(),
                 });
             } else {
                 let (tracker, uri, incarnation) =

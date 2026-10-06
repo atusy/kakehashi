@@ -263,7 +263,7 @@ mod tests {
                 virtual_content: String::new(),
                 line_column_offsets: vec![],
                 contiguous: true,
-                gaps: Vec::new(),
+                gaps: Default::default(),
             },
             region_end: None,
             configs: vec![ResolvedServerConfig {

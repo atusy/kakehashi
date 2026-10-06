@@ -121,7 +121,7 @@ pub(crate) struct DiscoveredBridgeRegion {
     /// The host text `content` does not carry verbatim (see
     /// `ResolvedInjection::gaps`), for presenting the document as
     /// content/gap segments.
-    pub gaps: Vec<crate::language::injection::VirtualGap>,
+    pub gaps: std::sync::Arc<[crate::language::injection::VirtualGap]>,
 }
 
 /// One pre-parsed injection layer of a document, in document-order DFS —
