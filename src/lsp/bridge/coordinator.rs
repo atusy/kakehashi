@@ -451,13 +451,22 @@ impl BridgeCoordinator {
     /// After a settings change, drop prepared documents whose (host,
     /// injection) pair no longer names the peer that prepared them, so no
     /// path keeps translating through a map for text no longer sent.
-    pub(crate) fn prune_prepared(&self, settings: &WorkspaceSettings, experimental: bool) {
+    /// `reparsing`: the change re-runs every host's injection pass, so
+    /// answers cached as unusable can go too and be asked again.
+    pub(crate) fn prune_prepared(
+        &self,
+        settings: &WorkspaceSettings,
+        experimental: bool,
+        reparsing: bool,
+    ) {
         self.warned_unusable_prepare.clear();
-        self.prepare
-            .retain(|host_language, injection_language, server| {
+        self.prepare.retain(
+            |host_language, injection_language, server| {
                 self.prepare_server_name(settings, host_language, injection_language, experimental)
                     .is_some_and(|name| name == server)
-            });
+            },
+            reparsing,
+        );
     }
 
     /// The peer name `bridge.<injection>.prepare` resolves to for a bridged

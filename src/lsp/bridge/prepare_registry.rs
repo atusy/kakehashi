@@ -237,7 +237,7 @@ impl PrepareRegistry {
         target: &PrepareTarget,
         input: PrepareInput<'_>,
     ) -> PrepareLookup {
-        let (cell, revision) = self.cell(target, input);
+        let (cell, revision) = self.cell(target, input, Holder::LifecyclePass);
         if let Some(found) = cell.lookup() {
             return found;
         }
@@ -255,7 +255,7 @@ impl PrepareRegistry {
         target: &PrepareTarget,
         input: PrepareInput<'_>,
     ) -> Outcome {
-        let (cell, revision) = self.cell(target, input);
+        let (cell, revision) = self.cell(target, input, Holder::Request);
         if let Some(outcome) = cell.outcome.get() {
             return outcome.clone();
         }
@@ -387,16 +387,19 @@ impl PrepareRegistry {
 
     /// Keep only the entries `keep(host language, injection language, peer)`
     /// accepts — after a settings change, those whose pair still names the
-    /// same peer. Answers cached as final also go: the change may have fixed
-    /// what made them unusable (a peer's command, say). A dropped entry
-    /// reads as unprepared until prepared again.
-    pub(crate) fn retain(&self, keep: impl Fn(&str, &str, &str) -> bool) {
+    /// same peer. With `drop_unusable`, answers cached as final go too: the
+    /// change may have fixed what made them unusable (a peer's command,
+    /// say), and the caller guarantees a pass that asks again — a dropped
+    /// entry reads as unprepared until then, which would misread a server
+    /// still holding an older prepared text. A dropped entry otherwise reads
+    /// as unprepared until prepared again.
+    pub(crate) fn retain(&self, keep: impl Fn(&str, &str, &str) -> bool, drop_unusable: bool) {
         self.entries.retain(|_, entry| {
             keep(
                 &entry.host_language,
                 &entry.injection_language,
                 &entry.server_name,
-            ) && !matches!(entry.current.cell.outcome.get(), Some(None))
+            ) && !(drop_unusable && matches!(entry.current.cell.outcome.get(), Some(None)))
         });
     }
 
@@ -435,7 +438,12 @@ impl PrepareRegistry {
     /// The cell answering `input`: the current or previous generation when
     /// either matches, else a new current generation (with a new revision)
     /// that demotes the current one.
-    fn cell(&self, target: &PrepareTarget, input: PrepareInput<'_>) -> (Arc<Cell>, i32) {
+    fn cell(
+        &self,
+        target: &PrepareTarget,
+        input: PrepareInput<'_>,
+        holder: Holder,
+    ) -> (Arc<Cell>, i32) {
         self.ever_used.store(true, Ordering::Release);
         let key = input_key(target, input);
         let host_uri = input.host_uri.as_str();
@@ -473,8 +481,22 @@ impl PrepareRegistry {
                 previous: None,
             };
         }
-        if let Some(generation) = entry.generations().find(|generation| generation.key == key) {
-            return (Arc::clone(&generation.cell), generation.revision);
+        if entry.current.key == key {
+            return (Arc::clone(&entry.current.cell), entry.current.revision);
+        }
+        if let Some(previous) = entry
+            .previous
+            .as_ref()
+            .filter(|previous| previous.key == key)
+        {
+            // An answered previous generation serves anyone. An unanswered
+            // one serves a request (which waits on it) but not the lifecycle
+            // pass, which would hold the document on it: only the current
+            // generation's answer re-syncs, so a text the user returned to
+            // (an undo) gets a new current generation and revision instead.
+            if previous.cell.outcome.get().is_some() || holder == Holder::Request {
+                return (Arc::clone(&previous.cell), previous.revision);
+            }
         }
         entry.host_language = input.host_language.to_string();
         entry.server_name = target.server_name.clone();
@@ -488,6 +510,17 @@ impl PrepareRegistry {
         // versions over its lifetime.
         self.next_revision.fetch_add(1, Ordering::Relaxed)
     }
+}
+
+/// Who looks a document up: what an unanswered older generation is good for
+/// depends on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Holder {
+    /// The lifecycle pass, which holds the document until the answer
+    /// re-syncs it.
+    LifecyclePass,
+    /// A request, which waits for the answer itself.
+    Request,
 }
 
 /// Backoff before retrying an attempt that got no answer: one second,
@@ -739,7 +772,7 @@ mod tests {
             registry.lookup_or_start(&pool, &target, input),
             PrepareLookup::Failed
         ));
-        let (cell, _) = registry.cell(&target, input);
+        let (cell, _) = registry.cell(&target, input, Holder::Request);
         assert!(!cell.in_flight.load(Ordering::Acquire));
         assert_eq!(*cell.attempts.borrow(), 1, "the failure was not retried");
     }
@@ -779,7 +812,7 @@ mod tests {
         };
         // No answer: not cached, so the document is still pending…
         assert!(registry.prepare(&pool, &target, input).await.is_none());
-        let (cell, _) = registry.cell(&target, input);
+        let (cell, _) = registry.cell(&target, input, Holder::Request);
         assert!(cell.outcome.get().is_none());
         assert_eq!(cell.misses.load(Ordering::Acquire), 1);
         // …but backing off: neither a lookup nor a request starts another
@@ -816,18 +849,41 @@ mod tests {
             virtual_text: text,
             gaps: &[],
         };
-        let (old, _) = registry.cell(&target, input("v1"));
-        let (current, _) = registry.cell(&target, input("v2"));
+        let (old, _) = registry.cell(&target, input("v1"), Holder::Request);
+        let (current, _) = registry.cell(&target, input("v2"), Holder::Request);
         // A request still on v1 gets v1's cell, and v2 stays current.
-        let (again, _) = registry.cell(&target, input("v1"));
+        let (again, _) = registry.cell(&target, input("v1"), Holder::Request);
         assert!(Arc::ptr_eq(&old, &again));
         let entry = registry.entries.iter().next().unwrap();
         assert!(Arc::ptr_eq(&entry.current.cell, &current));
         drop(entry);
         // A third text drops the oldest.
-        registry.cell(&target, input("v3"));
-        let (fresh, _) = registry.cell(&target, input("v1"));
+        registry.cell(&target, input("v3"), Holder::Request);
+        let (fresh, _) = registry.cell(&target, input("v1"), Holder::Request);
         assert!(!Arc::ptr_eq(&old, &fresh));
+    }
+
+    #[test]
+    fn the_lifecycle_pass_never_waits_on_an_unanswered_older_generation() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let input = |text| PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: "01J0000000000000000000000A",
+            virtual_text: text,
+            gaps: &[],
+        };
+        let (v1, v1_revision) = registry.cell(&target, input("v1"), Holder::LifecyclePass);
+        registry.cell(&target, input("v2"), Holder::LifecyclePass);
+        // Undo to v1 before v1 was answered: a fresh, current generation.
+        let (undone, undone_revision) = registry.cell(&target, input("v1"), Holder::LifecyclePass);
+        assert!(!Arc::ptr_eq(&v1, &undone));
+        assert!(undone_revision > v1_revision);
+        let entry = registry.entries.iter().next().unwrap();
+        assert!(Arc::ptr_eq(&entry.current.cell, &undone));
     }
 
     #[test]
@@ -843,9 +899,11 @@ mod tests {
             virtual_text: "a",
             gaps: &[],
         };
-        let (cell, _) = registry.cell(&target, input);
+        let (cell, _) = registry.cell(&target, input, Holder::Request);
         cell.outcome.set(None).unwrap();
-        registry.retain(|_, _, _| true);
+        registry.retain(|_, _, _| true, false);
+        assert_eq!(registry.entries.len(), 1, "nothing would ask again");
+        registry.retain(|_, _, _| true, true);
         assert!(
             registry.entries.is_empty(),
             "a fixed config may now prepare it"
@@ -874,27 +932,30 @@ mod tests {
             virtual_text: text,
             gaps: &[],
         };
-        let (first, revision) = registry.cell(&target, input("a"));
-        let (same, same_revision) = registry.cell(&target, input("a"));
+        let (first, revision) = registry.cell(&target, input("a"), Holder::Request);
+        let (same, same_revision) = registry.cell(&target, input("a"), Holder::Request);
         assert!(Arc::ptr_eq(&first, &same));
         assert_eq!(revision, same_revision);
-        let (changed, changed_revision) = registry.cell(&target, input("b"));
+        let (changed, changed_revision) = registry.cell(&target, input("b"), Holder::Request);
         assert!(!Arc::ptr_eq(&first, &changed));
         assert!(changed_revision > revision);
-        registry.retain(|host_language, _, server| host_language == "markdown" && server == "peer");
+        registry.retain(
+            |host_language, _, server| host_language == "markdown" && server == "peer",
+            true,
+        );
         assert_eq!(registry.entries.len(), 1);
-        registry.retain(|_, _, server| server == "other");
+        registry.retain(|_, _, server| server == "other", true);
         assert!(registry.entries.is_empty());
-        registry.cell(&target, input("b"));
+        registry.cell(&target, input("b"), Holder::Request);
         registry.forget_region(&host, None, "01J0000000000000000000000A");
         assert!(registry.entries.is_empty());
-        let (_, again) = registry.cell(&target, input("b"));
+        let (_, again) = registry.cell(&target, input("b"), Holder::Request);
         assert!(
             again > changed_revision,
             "a forgotten document never repeats a version"
         );
         registry.forget_region(&host, None, "01J0000000000000000000000A");
-        registry.cell(&target, input("b"));
+        registry.cell(&target, input("b"), Holder::Request);
         registry.forget_region(&host, Some("python"), "01J0000000000000000000000A");
         assert_eq!(registry.entries.len(), 1, "another language's region stays");
         registry.forget_host(&host);

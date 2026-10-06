@@ -382,7 +382,7 @@ pub(super) async fn apply_shared_settings_locked(
         (None, false) => {}
     }
     let settings = settings_manager.load_settings();
-    bridge.prune_prepared(&settings, crate::experimental::enabled());
+    bridge.prune_prepared(&settings, crate::experimental::enabled(), reload_languages);
     // Update the reader-side copy before propagating downstream settings so a
     // newly suppressed log cannot occupy the bounded window queue after this
     // configuration application completes.
