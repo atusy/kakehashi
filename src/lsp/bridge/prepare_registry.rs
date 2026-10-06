@@ -1013,6 +1013,11 @@ mod tests {
         registry.cell(&target, input("b"), Holder::Request);
         registry.forget_region(&host, Some("python"), "01J0000000000000000000000A");
         assert_eq!(registry.entries.len(), 1, "another language's region stays");
+        registry.forget_region_except(&host, "01J0000000000000000000000A", Some("lua"));
+        assert_eq!(registry.entries.len(), 1, "the current language stays");
+        registry.forget_region_except(&host, "01J0000000000000000000000A", Some("ruby"));
+        assert!(registry.entries.is_empty());
+        registry.cell(&target, input("b"), Holder::Request);
         registry.forget_host(&host);
         assert!(registry.entries.is_empty());
     }
