@@ -82,7 +82,18 @@ fn request_edits_to_virtual(
     request_virtual_uri: &str,
     prepared: &super::prepare::PreparedMap,
 ) -> bool {
-    let rewrite = |text_edit: &mut TextEdit| match prepared.edit_to_virtual(text_edit) {
+    // One document's edits map together, through the prepared text: mapped
+    // one by one, adjacent edits at a dedented line could both claim its
+    // removed indent and overlap. Annotated edits must keep their identity,
+    // so they map one by one, and a set that comes to overlap is refused.
+    let rewrite_set = |edits: &mut Vec<TextEdit>| match prepared.edits_to_virtual(edits) {
+        Some(mapped) => {
+            *edits = mapped;
+            true
+        }
+        None => false,
+    };
+    let rewrite_one = |text_edit: &mut TextEdit| match prepared.edit_to_virtual(text_edit) {
         Some(virtual_edit) => {
             *text_edit = virtual_edit;
             true
@@ -90,25 +101,41 @@ fn request_edits_to_virtual(
         None => false,
     };
     let rewrite_document_edit = |document_edit: &mut TextDocumentEdit| {
-        document_edit.text_document.uri.as_str() != request_virtual_uri
-            || (document_edit.edits.iter_mut().all(|one_of| match one_of {
-                OneOf::Left(text_edit) => rewrite(text_edit),
-                OneOf::Right(annotated) => rewrite(&mut annotated.text_edit),
-            }) && !super::translation::ranges_overlap(document_edit.edits.iter().map(
-                |one_of| match one_of {
-                    OneOf::Left(text_edit) => &text_edit.range,
-                    OneOf::Right(annotated) => &annotated.text_edit.range,
-                },
-            )))
+        if document_edit.text_document.uri.as_str() != request_virtual_uri {
+            return true;
+        }
+        if document_edit
+            .edits
+            .iter()
+            .all(|one_of| matches!(one_of, OneOf::Left(_)))
+        {
+            let mut edits: Vec<TextEdit> = document_edit
+                .edits
+                .drain(..)
+                .filter_map(|one_of| match one_of {
+                    OneOf::Left(text_edit) => Some(text_edit),
+                    OneOf::Right(_) => None,
+                })
+                .collect();
+            let mapped = rewrite_set(&mut edits);
+            document_edit.edits = edits.into_iter().map(OneOf::Left).collect();
+            return mapped;
+        }
+        document_edit.edits.iter_mut().all(|one_of| match one_of {
+            OneOf::Left(text_edit) => rewrite_one(text_edit),
+            OneOf::Right(annotated) => rewrite_one(&mut annotated.text_edit),
+        }) && !super::translation::ranges_overlap(document_edit.edits.iter().map(|one_of| {
+            match one_of {
+                OneOf::Left(text_edit) => &text_edit.range,
+                OneOf::Right(annotated) => &annotated.text_edit.range,
+            }
+        }))
     };
     let changes_ok = edit.changes.as_mut().is_none_or(|changes| {
         changes
             .iter_mut()
             .filter(|(uri, _)| uri.as_str() == request_virtual_uri)
-            .all(|(_, edits)| {
-                edits.iter_mut().all(rewrite)
-                    && !super::translation::ranges_overlap(edits.iter().map(|edit| &edit.range))
-            })
+            .all(|(_, edits)| rewrite_set(edits))
     });
     let document_changes_ok = match &mut edit.document_changes {
         None => true,
@@ -669,12 +696,13 @@ mod tests {
     }
 
     #[test]
-    fn prepared_edits_that_would_overlap_refuse_the_whole_edit() {
+    fn adjacent_prepared_line_edits_map_as_one_set() {
         use super::super::prepare::{VirtualLayout, apply_prepare_result};
-        let virtual_text = "  a\n  b\n";
+        let virtual_text = "  a\n  b\n  c\n";
         let result = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
             {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
-            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
         ]}]}))
         .unwrap();
         let prepared = apply_prepare_result(
@@ -683,23 +711,42 @@ mod tests {
             Some(result),
         )
         .unwrap();
-        let offset = RegionOffset::new(10, 0).with_prepared(prepared.map);
+        let offset = RegionOffset::new(0, 0).with_prepared(prepared.map);
         let virtual_uri = make_virtual_uri_string();
         let host_uri = make_host_uri();
-        // Adjacent in the prepared document; both cover `b`'s removed indent
-        // once mapped.
+        // Two adjacent line deletions: mapped one by one, both would claim
+        // `b`'s removed indent.
         let mut edit = parse_workspace_edit(json!({
             "changes": { virtual_uri.clone(): [
                 {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""},
-                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 1}}, "newText": "c"}
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""}
             ]}
         }));
-        assert!(!transform_workspace_edit_to_host(
+        assert!(transform_workspace_edit_to_host(
             &mut edit,
             &virtual_uri,
             &host_uri,
             &offset,
         ));
+        let edits = &edit.changes.unwrap()[&host_uri];
+        assert!(!super::super::translation::ranges_overlap(
+            edits.iter().map(|e| &e.range)
+        ));
+        let mut text = virtual_text.to_string();
+        let mut sorted: Vec<_> = edits.iter().collect();
+        sorted.sort_by_key(|edit| std::cmp::Reverse(edit.range.start));
+        for edit in sorted {
+            let offset_of = |position: Position| {
+                text.split_inclusive('\n')
+                    .take(position.line as usize)
+                    .map(str::len)
+                    .sum::<usize>()
+                    + position.character as usize
+            };
+            let (start, end) = (offset_of(edit.range.start), offset_of(edit.range.end));
+            text.replace_range(start..end, &edit.new_text);
+        }
+        assert_eq!(text, "  c\n");
     }
 
     #[test]
