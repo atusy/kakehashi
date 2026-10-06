@@ -652,23 +652,23 @@ impl PrepareRegistry {
     }
 
     /// Whether the text last sent for a region under `injection_language`
-    /// was its unprepared virtual text.
-    pub(crate) fn sent_unprepared(
+    /// was a prepared one. Every prepared send is recorded, so anything else
+    /// — an unprepared record, or none (sent before anything was prepared,
+    /// or nothing sent) — is not.
+    pub(crate) fn sent_prepared(
         &self,
         host_uri: &Url,
         injection_language: &str,
         region_id: &str,
     ) -> bool {
         let host = host_uri.as_str();
-        self.ever_used.load(Ordering::Acquire)
-            && self
-                .sent
-                .get(&sent_key(host, region_id))
-                .is_some_and(|sent| {
-                    sent.is(host, region_id)
-                        && sent.injection_language == injection_language
-                        && sent.prepared.is_none()
-                })
+        self.sent
+            .get(&sent_key(host, region_id))
+            .is_some_and(|sent| {
+                sent.is(host, region_id)
+                    && sent.injection_language == injection_language
+                    && sent.prepared.is_some()
+            })
     }
 
     /// Forget what was last sent for a region, whose documents were closed:
@@ -1785,7 +1785,7 @@ mod tests {
     }
 
     #[test]
-    fn a_region_sent_unprepared_is_known_until_its_documents_close() {
+    fn only_a_recorded_prepared_send_counts_as_prepared() {
         let registry = PrepareRegistry::default();
         let target = unstartable_target();
         let host = Url::parse("file:///host.md").unwrap();
@@ -1803,10 +1803,14 @@ mod tests {
         registry.cell(&target, input, Holder::LifecyclePass);
         registry.note_unprepared_sent(&host, "lua", region, "  a");
         registry.cell(&target, input, Holder::LifecyclePass);
-        assert!(registry.sent_unprepared(&host, "lua", region));
-        assert!(!registry.sent_unprepared(&host, "python", region));
+        assert!(!registry.sent_prepared(&host, "lua", region));
+        registry.note_sent(&host, "lua", region, &sent_text("a"));
+        assert!(registry.sent_prepared(&host, "lua", region));
+        assert!(!registry.sent_prepared(&host, "python", region));
+        registry.note_unprepared_sent(&host, "lua", region, "  a");
+        registry.cell(&target, input, Holder::LifecyclePass);
         registry.forget_sent(&host, region);
-        assert!(!registry.sent_unprepared(&host, "lua", region));
+        assert!(!registry.sent_prepared(&host, "lua", region));
         assert!(
             matches!(
                 registry.state(&host, "lua", region, "  a"),

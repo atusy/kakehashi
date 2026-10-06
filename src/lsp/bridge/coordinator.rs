@@ -1750,9 +1750,10 @@ impl BridgeCoordinator {
 
     /// Close the documents of `held` regions (`(injection language, region
     /// id)`) whose servers still hold the unprepared text sent before their
-    /// pair gained a prepare peer: until the peer answers (or if it fails)
-    /// that text would stay bridged, which a prepared pair never is. Their
-    /// send records go too. Returns the regions closed.
+    /// pair gained a prepare peer — any text not recorded as prepared: until
+    /// the peer answers (or if it fails) that text would stay bridged, which
+    /// a prepared pair never is. Their send records go too. Returns the
+    /// regions closed.
     pub(crate) async fn close_unprepared_held_docs(
         &self,
         uri: &Url,
@@ -1761,7 +1762,7 @@ impl BridgeCoordinator {
         let stale: std::collections::HashSet<(&str, &str)> = held
             .iter()
             .copied()
-            .filter(|(language, region_id)| self.prepare.sent_unprepared(uri, language, region_id))
+            .filter(|(language, region_id)| !self.prepare.sent_prepared(uri, language, region_id))
             .collect();
         if stale.is_empty() {
             return Vec::new();
