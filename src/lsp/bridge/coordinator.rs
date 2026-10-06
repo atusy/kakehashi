@@ -303,6 +303,10 @@ struct ConfigMemo {
     virt: DashMap<String, Vec<VirtMemoEntry>>,
     /// `host_language` → `_self` host-bridge configs.
     host: DashMap<String, Arc<Vec<ResolvedServerConfig>>>,
+    /// `host_language` → `(injection_language, prepare target)` pairs, like
+    /// `virt`: resolving a target merges the peer's launch config, which the
+    /// lifecycle pass and every request would otherwise redo per region.
+    prepare: DashMap<String, Vec<(String, Option<super::PrepareTarget>)>>,
 }
 
 impl ConfigMemo {
@@ -311,6 +315,7 @@ impl ConfigMemo {
             settings,
             virt: DashMap::new(),
             host: DashMap::new(),
+            prepare: DashMap::new(),
         }
     }
 }
@@ -468,10 +473,37 @@ impl BridgeCoordinator {
         injection_language: &str,
         experimental: bool,
     ) -> Option<super::PrepareTarget> {
+        if !experimental {
+            return None;
+        }
+        // Memoized per settings snapshot: this runs per bridged region in
+        // every lifecycle pass and request, and resolving the peer's launch
+        // config deep-merges its settings. The memoized `Arc` also lets the
+        // registry compare configs by identity.
+        let memo = self.config_memo_for(settings);
+        if let Some(hit) = memo.prepare.get(host_language)
+            && let Some((_, target)) = hit.iter().find(|(lang, _)| lang == injection_language)
+        {
+            return target.clone();
+        }
+        let target = self.resolve_prepare_target(settings, host_language, injection_language);
+        let mut pairs = memo.prepare.entry(host_language.to_string()).or_default();
+        if !pairs.iter().any(|(lang, _)| lang == injection_language) {
+            pairs.push((injection_language.to_string(), target.clone()));
+        }
+        target
+    }
+
+    fn resolve_prepare_target(
+        &self,
+        settings: &Arc<WorkspaceSettings>,
+        host_language: &str,
+        injection_language: &str,
+    ) -> Option<super::PrepareTarget> {
         let server_name =
-            self.prepare_server_name(settings, host_language, injection_language, experimental)?;
+            self.prepare_server_name(settings, host_language, injection_language, true)?;
         if self
-            .cached_configs_for_injection_language(settings, host_language, injection_language)
+            .get_all_configs_for_language(settings, host_language, injection_language)
             .is_empty()
         {
             return None;
@@ -1424,19 +1456,11 @@ impl BridgeCoordinator {
         (for_server, config)
     }
 
-    /// Memo-resolving front for [`Self::get_all_configs_for_language`] /
-    /// [`Self::get_host_configs_for_language`]: returns the memoized result
-    /// for the current settings snapshot, computing (and caching) it on
-    /// first use. Callers on request paths — especially per-region loops —
-    /// must use this instead of the raw resolvers (see `config_memo`).
-    fn cached_configs(
-        &self,
-        settings: &Arc<WorkspaceSettings>,
-        host_language: &str,
-        injection_language: Option<&str>,
-    ) -> Vec<ResolvedServerConfig> {
+    /// The config memo for this settings snapshot: the current one, or a
+    /// fresh generation anchored to `settings` (see `cached_configs`).
+    fn config_memo_for(&self, settings: &Arc<WorkspaceSettings>) -> Arc<ConfigMemo> {
         let memo = self.config_memo.load();
-        let memo = if memo
+        if memo
             .settings
             .as_ref()
             .is_some_and(|s| Arc::ptr_eq(s, settings))
@@ -1455,7 +1479,21 @@ impl BridgeCoordinator {
             let fresh = Arc::new(ConfigMemo::empty(Some(Arc::clone(settings))));
             self.config_memo.store(Arc::clone(&fresh));
             fresh
-        };
+        }
+    }
+
+    /// Memo-resolving front for [`Self::get_all_configs_for_language`] /
+    /// [`Self::get_host_configs_for_language`]: returns the memoized result
+    /// for the current settings snapshot, computing (and caching) it on
+    /// first use. Callers on request paths — especially per-region loops —
+    /// must use this instead of the raw resolvers (see `config_memo`).
+    fn cached_configs(
+        &self,
+        settings: &Arc<WorkspaceSettings>,
+        host_language: &str,
+        injection_language: Option<&str>,
+    ) -> Vec<ResolvedServerConfig> {
+        let memo = self.config_memo_for(settings);
         match injection_language {
             Some(injection_language) => {
                 if let Some(hit) = memo.virt.get(host_language)
@@ -4577,6 +4615,11 @@ mod tests {
         let lua = target("lua", true).expect("the wildcard peer prepares lua");
         assert_eq!(lua.server_name, "peer");
         assert!(lua.config.is_some());
+        let again = target("lua", true).expect("memoized");
+        assert!(
+            Arc::ptr_eq(lua.config.as_ref().unwrap(), again.config.as_ref().unwrap()),
+            "one settings snapshot resolves the peer config once"
+        );
         assert!(target("lua", false).is_none(), "experimental gate");
         assert!(target("r", true).is_none(), "an empty name opts out");
         assert!(target("python", true).is_none(), "not bridged");

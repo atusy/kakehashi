@@ -846,7 +846,7 @@ impl PrepareRegistry {
             // settings change, which may even have recreated the entry after
             // the prune) must not see its answers, and its own must not
             // outlive it.
-            || entry.server_config.as_deref() != target.config.as_deref()
+            || !same_config(entry.server_config.as_ref(), target.config.as_ref())
         {
             if holder == Holder::Request
                 && entry.is(host_uri, input.injection_language, input.region_id)
@@ -954,6 +954,17 @@ fn input_key(target: &PrepareTarget, input: PrepareInput<'_>) -> u64 {
     input.virtual_text.hash(&mut hasher);
     input.gaps.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Whether two peer launch configs are the same: by identity first (a
+/// target resolved under one settings snapshot shares its `Arc`), by value
+/// across snapshots.
+fn same_config(a: Option<&Arc<BridgeServerConfig>>, b: Option<&Arc<BridgeServerConfig>>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a == b,
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 fn sent_key(host_uri: &str, region_id: &str) -> u64 {
