@@ -651,6 +651,35 @@ impl PrepareRegistry {
             })
     }
 
+    /// Whether the text last sent for a region under `injection_language`
+    /// was its unprepared virtual text.
+    pub(crate) fn sent_unprepared(
+        &self,
+        host_uri: &Url,
+        injection_language: &str,
+        region_id: &str,
+    ) -> bool {
+        let host = host_uri.as_str();
+        self.ever_used.load(Ordering::Acquire)
+            && self
+                .sent
+                .get(&sent_key(host, region_id))
+                .is_some_and(|sent| {
+                    sent.is(host, region_id)
+                        && sent.injection_language == injection_language
+                        && sent.prepared.is_none()
+                })
+    }
+
+    /// Forget what was last sent for a region, whose documents were closed:
+    /// servers hold nothing of it any more.
+    pub(crate) fn forget_sent(&self, host_uri: &Url, region_id: &str) {
+        let host = host_uri.as_str();
+        self.sent.remove_if(&sent_key(host, region_id), |_, sent| {
+            sent.is(host, region_id)
+        });
+    }
+
     /// The epoch of the text last sent for a region (see [`Sent::epoch`]).
     pub(crate) fn sent_epoch(&self, host_uri: &Url, region_id: &str) -> Option<u64> {
         let host_uri = host_uri.as_str();
@@ -1753,6 +1782,38 @@ mod tests {
             registry.state(&host, "lua", region, "x x"),
             PreparedState::Prepared(_)
         ));
+    }
+
+    #[test]
+    fn a_region_sent_unprepared_is_known_until_its_documents_close() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let region = "01J0000000000000000000000A";
+        let input = PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: region,
+            virtual_text: "  a",
+            gaps: &[],
+        };
+        // Something was prepared, and this region went out unprepared; then
+        // its pair gains a peer, whose answer is pending.
+        registry.cell(&target, input, Holder::LifecyclePass);
+        registry.note_unprepared_sent(&host, "lua", region, "  a");
+        registry.cell(&target, input, Holder::LifecyclePass);
+        assert!(registry.sent_unprepared(&host, "lua", region));
+        assert!(!registry.sent_unprepared(&host, "python", region));
+        registry.forget_sent(&host, region);
+        assert!(!registry.sent_unprepared(&host, "lua", region));
+        assert!(
+            matches!(
+                registry.state(&host, "lua", region, "  a"),
+                PreparedState::Unavailable
+            ),
+            "held, with nothing sent: servers hold nothing of it"
+        );
     }
 
     #[test]

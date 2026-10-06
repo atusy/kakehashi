@@ -659,6 +659,20 @@ impl InjectionCoordinator {
         // Held injections (prepare pending or failed) count as present above,
         // so their open documents are not closed, but nothing is sent for
         // them: downstream servers never see a document unprepared.
+        // A held region whose servers still hold the text sent before its
+        // pair gained a peer is closed: held documents otherwise keep the
+        // text sent last, which for them is unprepared.
+        let held: Vec<(&str, &str)> = injections
+            .iter()
+            .filter(|injection| injection.held)
+            .map(|injection| (injection.language.as_str(), injection.region_id.as_str()))
+            .collect();
+        if !held.is_empty() {
+            for region_id in self.bridge.close_unprepared_held_docs(uri, &held).await {
+                self.diagnostics
+                    .evict_source(uri, &DiagnosticSource::Region(region_id));
+            }
+        }
         let injections = sendable_injections(injections);
         self.note_sending(uri, &injections);
 

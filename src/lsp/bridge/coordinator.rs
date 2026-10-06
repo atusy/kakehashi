@@ -1748,6 +1748,39 @@ impl BridgeCoordinator {
         self.pool.close_replaced_docs(uri, injections).await
     }
 
+    /// Close the documents of `held` regions (`(injection language, region
+    /// id)`) whose servers still hold the unprepared text sent before their
+    /// pair gained a prepare peer: until the peer answers (or if it fails)
+    /// that text would stay bridged, which a prepared pair never is. Their
+    /// send records go too. Returns the regions closed.
+    pub(crate) async fn close_unprepared_held_docs(
+        &self,
+        uri: &Url,
+        held: &[(&str, &str)],
+    ) -> Vec<String> {
+        let stale: std::collections::HashSet<(&str, &str)> = held
+            .iter()
+            .copied()
+            .filter(|(language, region_id)| self.prepare.sent_unprepared(uri, language, region_id))
+            .collect();
+        if stale.is_empty() {
+            return Vec::new();
+        }
+        let closed: Vec<String> = self
+            .pool
+            .close_deselected_docs(uri, |doc| {
+                !stale.contains(&(doc.virtual_uri.language(), doc.virtual_uri.region_id()))
+            })
+            .await
+            .into_iter()
+            .map(|doc| doc.virtual_uri.region_id().to_string())
+            .collect();
+        for (_, region_id) in &stale {
+            self.prepare.forget_sent(uri, region_id);
+        }
+        closed
+    }
+
     /// Close the host's virtual documents whose server current settings no
     /// longer select for them — the host's bridge filter turned the injection
     /// language off, or the server stopped being a candidate for it — and
