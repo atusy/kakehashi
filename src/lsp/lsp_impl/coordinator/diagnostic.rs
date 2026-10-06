@@ -254,7 +254,7 @@ impl DiagnosticScheduler {
     /// A pull answered while they were held left them out too: its debt is
     /// consumed with a refresh, so a pull-mode client asks again.
     pub(crate) fn spawn_diagnostic_task_after_prepare(&self, uri: Url) {
-        if self.publisher.take_degraded_pull(&uri) {
+        if self.bridge.take_pull_debt_after_prepare(&uri) {
             self.publisher.request_pull_diagnostic_refresh(true);
         }
         let snapshot_data = self.prepare_diagnostic_snapshot(&uri);

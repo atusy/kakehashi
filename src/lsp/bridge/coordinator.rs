@@ -204,6 +204,10 @@ pub(crate) struct BridgeCoordinator {
     /// settings change: the warning would otherwise repeat per region per
     /// edit.
     warned_unusable_prepare: dashmap::DashSet<String>,
+    /// Hosts owed a `workspace/diagnostic/refresh` once their documents
+    /// waiting for prepare answers are sent (see
+    /// [`Self::owe_pull_after_prepare`]).
+    prepare_pull_debts: dashmap::DashSet<Url>,
     /// Saves a held virtual document missed: forwarded once its prepared
     /// text is sent (if the host is still at the saved version).
     held_saves: DashMap<Url, HeldSave>,
@@ -344,6 +348,7 @@ impl BridgeCoordinator {
             pool,
             prepare: super::prepare_registry::PrepareRegistry::default(),
             warned_unusable_prepare: dashmap::DashSet::new(),
+            prepare_pull_debts: dashmap::DashSet::new(),
             held_saves: DashMap::new(),
             node_tracker: Arc::new(NodeTracker::new()),
             cancel_forwarder,
@@ -373,6 +378,7 @@ impl BridgeCoordinator {
             pool,
             prepare: super::prepare_registry::PrepareRegistry::default(),
             warned_unusable_prepare: dashmap::DashSet::new(),
+            prepare_pull_debts: dashmap::DashSet::new(),
             held_saves: DashMap::new(),
             node_tracker: Arc::new(NodeTracker::new()),
             cancel_forwarder,
@@ -573,6 +579,37 @@ impl BridgeCoordinator {
         self.prepare.prepare(&self.pool, target, input).await
     }
 
+    /// [`Self::prepared_document`], telling a miss a later answer may fix
+    /// (`Err(true)`) from a final failure (`Err(false)`).
+    pub(crate) async fn prepared_document_or_miss(
+        &self,
+        target: &super::PrepareTarget,
+        input: super::PrepareInput<'_>,
+    ) -> Result<Arc<super::protocol::PreparedDocument>, bool> {
+        self.prepare
+            .prepare_or_miss(&self.pool, target, input)
+            .await
+    }
+
+    /// Note that a pull for `host` was answered without documents still
+    /// waiting for their prepare answers; it is owed a
+    /// `workspace/diagnostic/refresh` once they are sent. `true` when none is
+    /// pending any more — the answer came while the pull ran, and the
+    /// caller owes the refresh now (the debt is taken back).
+    pub(crate) fn owe_pull_after_prepare(&self, host: &Url) -> bool {
+        self.prepare_pull_debts.insert(host.clone());
+        if self.prepare.host_has_pending(host) {
+            return false;
+        }
+        self.prepare_pull_debts.remove(host).is_some()
+    }
+
+    /// Take `host`'s debt of a pull answered without documents then waiting
+    /// for their prepare answers (see [`Self::owe_pull_after_prepare`]).
+    pub(crate) fn take_pull_debt_after_prepare(&self, host: &Url) -> bool {
+        self.prepare_pull_debts.remove(host).is_some()
+    }
+
     /// Hosts whose held-back virtual documents finished preparing; the
     /// receiver re-runs their injection pass. Taken once.
     pub(crate) fn take_prepare_resync_rx(
@@ -713,6 +750,7 @@ impl BridgeCoordinator {
 
     /// Drop a closed host's prepared documents.
     pub(crate) fn forget_prepared_host(&self, host_uri: &Url) {
+        self.prepare_pull_debts.remove(host_uri);
         self.held_saves.remove(host_uri);
         self.prepare.forget_host(host_uri);
     }

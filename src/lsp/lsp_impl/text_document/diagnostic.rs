@@ -276,8 +276,9 @@ impl Kakehashi {
         // Virt layer: 2-level aggregation —
         //   Inner: dispatch per region (fans out to all servers for that region)
         //   Outer: collect across regions
-        // A region left out because its peer has not prepared it (or could
-        // not): the answer is incomplete until that document is sent.
+        // A region left out because its peer's answer is not in (yet): the
+        // answer is incomplete until that document is sent. (One the peer
+        // answered unusably is not bridged at all, by design.)
         let prepare_skipped = std::sync::atomic::AtomicBool::new(false);
         let virt_fut = async {
             let mut outer_join_set: JoinSet<Vec<Diagnostic>> = JoinSet::new();
@@ -346,8 +347,8 @@ impl Kakehashi {
                     max_fan_out: agg.max_fan_out,
                     client_progress_token: None,
                 };
-                let Some(region_ctx) =
-                    crate::lsp::lsp_impl::bridge_context::prepare_request_context(
+                let region_ctx =
+                    match crate::lsp::lsp_impl::bridge_context::prepare_request_context_or_miss(
                         &self.bridge,
                         &self.settings_manager.load_settings(),
                         self.experimental_enabled(),
@@ -355,13 +356,19 @@ impl Kakehashi {
                         region_ctx,
                     )
                     .await
-                else {
-                    // The peer could not prepare the region: it goes
-                    // undiagnosed, which the CLI must not report as success.
-                    count_request_errors(&request_error_sink, 1);
-                    prepare_skipped.store(true, std::sync::atomic::Ordering::Relaxed);
-                    continue;
-                };
+                    {
+                        Ok(region_ctx) => region_ctx,
+                        Err(retryable) => {
+                            // The peer could not prepare the region: it goes
+                            // undiagnosed, which the CLI must not report as
+                            // success.
+                            count_request_errors(&request_error_sink, 1);
+                            if retryable {
+                                prepare_skipped.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            continue;
+                        }
+                    };
                 let pool = Arc::clone(&pool);
                 let task_sink = request_error_sink.clone();
 
@@ -485,10 +492,14 @@ impl Kakehashi {
             self.diagnostics.record_degraded_pull(&uri, coverage_stamp);
             self.recover_degraded_pull(&uri);
         } else if prepare_skipped.load(std::sync::atomic::Ordering::Relaxed) {
-            // Recovered once the region's prepared text is sent (the
-            // prepare resync consumes the debt), not right away: a re-pull
-            // now would find the region still waiting on its peer.
-            self.diagnostics.record_degraded_pull(&uri, coverage_stamp);
+            // Owed a refresh once the region's prepared text is sent (the
+            // prepare resync takes the debt), not right away: a re-pull now
+            // would find the region still waiting on its peer. Unless its
+            // answer came while this pull ran, after that resync looked.
+            if self.bridge.owe_pull_after_prepare(&uri) {
+                crate::lsp::lsp_impl::DiagnosticPublisher::new(self)
+                    .request_pull_diagnostic_refresh(true);
+            }
         } else {
             // A failed/partial fan-out (`!pull_clean`) still advances the
             // coverage version but clears neither the pull-view lag nor the

@@ -323,10 +323,28 @@ impl PrepareRegistry {
         target: &PrepareTarget,
         input: PrepareInput<'_>,
     ) -> Outcome {
+        self.prepare_or_miss(pool, target, input).await.ok()
+    }
+
+    /// [`Self::prepare`], telling why there is no prepared document: `true`
+    /// when no answer is in (yet) — the attempt got none, or a retry is
+    /// backing off — and a later one may bring it; `false` when the peer's
+    /// answer was unusable, which is final for this revision.
+    pub(crate) async fn prepare_or_miss(
+        &self,
+        pool: &Arc<LanguageServerPool>,
+        target: &PrepareTarget,
+        input: PrepareInput<'_>,
+    ) -> Result<Arc<PreparedDocument>, bool> {
         pool.note_prepare_used();
         let (cell, revision) = self.cell(target, input, Holder::Request);
-        if let Some(outcome) = cell.outcome.get() {
-            return outcome.clone();
+        let settled = |cell: &Cell| match cell.outcome.get() {
+            Some(Some(prepared)) => Ok(Arc::clone(prepared)),
+            Some(None) => Err(false),
+            None => Err(true),
+        };
+        if cell.outcome.get().is_some() {
+            return settled(&cell);
         }
         // Subscribe before starting, so the attempt's end cannot be missed.
         let mut attempts = cell.attempts.subscribe();
@@ -335,11 +353,20 @@ impl PrepareRegistry {
         {
             // Backing off after a miss: do not queue another attempt per
             // request, each waiting out its own timeouts.
-            return cell.outcome.get().cloned().flatten();
+            return settled(&cell);
         }
         // The attempt ends (answered or not) with a bump.
         let _ = attempts.changed().await;
-        cell.outcome.get().cloned().flatten()
+        settled(&cell)
+    }
+
+    /// Whether any of `host_uri`'s documents the lifecycle pass works on
+    /// still waits for its answer (one is running, or a retry is due).
+    pub(crate) fn host_has_pending(&self, host_uri: &Url) -> bool {
+        self.ever_used.load(Ordering::Acquire)
+            && self.entries.iter().any(|entry| {
+                entry.host_uri == host_uri.as_str() && entry.current.cell.outcome.get().is_none()
+            })
     }
 
     /// Start an attempt unless one is running, an answer is in, or a miss is
@@ -1580,6 +1607,34 @@ mod tests {
                 PreparedState::Unprepared
             ),
             "a request under the old settings must not bring the entry back"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_miss_tells_a_final_failure_from_a_pending_answer() {
+        let registry = PrepareRegistry::default();
+        let pool = Arc::new(LanguageServerPool::new());
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let input = |text| PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: "01J0000000000000000000000A",
+            virtual_text: text,
+            gaps: &[],
+        };
+        let (pending, _) = registry.cell(&target, input("a"), Holder::LifecyclePass);
+        assert!(registry.host_has_pending(&host), "no answer yet");
+        let _ = pending.outcome.set(None);
+        assert!(!registry.host_has_pending(&host));
+        assert_eq!(
+            registry
+                .prepare_or_miss(&pool, &target, input("a"))
+                .await
+                .err(),
+            Some(false),
+            "an unusable answer is final"
         );
     }
 

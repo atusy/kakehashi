@@ -1700,12 +1700,6 @@ impl DiagnosticPublisher {
     /// client that supports pull but not refresh would silently ignore the request,
     /// leaking a tower-lsp pending-request entry plus a parked task — the same gate
     /// the `semantic_tokens_refresh` path uses.
-    /// Consume `host`'s degraded-pull debt (see
-    /// `DiagnosticAggregator::take_degraded_pull`).
-    pub(crate) fn take_degraded_pull(&self, host: &Url) -> bool {
-        self.aggregator.take_degraded_pull(host)
-    }
-
     pub(crate) fn request_pull_diagnostic_refresh(&self, forced: bool) {
         self.request_pull_diagnostic_refresh_inner(forced, true);
     }

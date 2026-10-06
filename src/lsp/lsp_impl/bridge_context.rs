@@ -233,18 +233,33 @@ pub(crate) async fn prepare_request_context(
     host_language: &str,
     ctx: DocumentRequestContext,
 ) -> Option<DocumentRequestContext> {
+    prepare_request_context_or_miss(bridge, settings, experimental, host_language, ctx)
+        .await
+        .ok()
+}
+
+/// [`prepare_request_context`], telling a document whose answer is not in
+/// (yet) — `Err(true)`: a later answer may bring it — from one the peer
+/// answered unusably (`Err(false)`, final).
+pub(crate) async fn prepare_request_context_or_miss(
+    bridge: &crate::lsp::bridge::BridgeCoordinator,
+    settings: &std::sync::Arc<WorkspaceSettings>,
+    experimental: bool,
+    host_language: &str,
+    ctx: DocumentRequestContext,
+) -> Result<DocumentRequestContext, bool> {
     let Some(target) = bridge.prepare_target(
         settings,
         host_language,
         &ctx.resolved.injection_language,
         experimental,
     ) else {
-        return Some(ctx);
+        return Ok(ctx);
     };
     let prepared = bridge
-        .prepared_document(&target, prepare_input(&ctx, host_language))
+        .prepared_document_or_miss(&target, prepare_input(&ctx, host_language))
         .await?;
-    Some(with_prepared(ctx, &prepared))
+    Ok(with_prepared(ctx, &prepared))
 }
 
 /// [`prepare_request_context`] without waiting, for paths that cannot: a
