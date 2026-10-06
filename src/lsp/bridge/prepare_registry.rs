@@ -522,6 +522,18 @@ impl PrepareRegistry {
                 return (Arc::clone(&previous.cell), previous.revision);
             }
         }
+        if holder == Holder::Request {
+            // A request's text that is neither generation (older than both,
+            // or not yet seen by the lifecycle pass) must not take the
+            // current slot: the lifecycle pass holds its document on that
+            // one, and only its answer re-syncs. It takes the previous slot,
+            // where a later lifecycle lookup of the same text still finds an
+            // answer that has arrived.
+            let generation = fresh();
+            let handle = (Arc::clone(&generation.cell), generation.revision);
+            entry.previous = Some(generation);
+            return handle;
+        }
         entry.host_language = input.host_language.to_string();
         entry.server_name = target.server_name.clone();
         entry.server_config = target.config.clone();
@@ -874,18 +886,21 @@ mod tests {
             virtual_text: text,
             gaps: &[],
         };
-        let (old, _) = registry.cell(&target, input("v1"), Holder::Request);
-        let (current, _) = registry.cell(&target, input("v2"), Holder::Request);
+        let (old, _) = registry.cell(&target, input("v1"), Holder::LifecyclePass);
+        let (current, _) = registry.cell(&target, input("v2"), Holder::LifecyclePass);
         // A request still on v1 gets v1's cell, and v2 stays current.
         let (again, _) = registry.cell(&target, input("v1"), Holder::Request);
         assert!(Arc::ptr_eq(&old, &again));
         let entry = registry.entries.iter().next().unwrap();
         assert!(Arc::ptr_eq(&entry.current.cell, &current));
         drop(entry);
-        // A third text drops the oldest.
-        registry.cell(&target, input("v3"), Holder::Request);
+        // The lifecycle pass moving on to a third text drops the oldest.
+        let (third, _) = registry.cell(&target, input("v3"), Holder::LifecyclePass);
         let (fresh, _) = registry.cell(&target, input("v1"), Holder::Request);
         assert!(!Arc::ptr_eq(&old, &fresh));
+        // That stale request did not take the current slot.
+        let entry = registry.entries.iter().next().unwrap();
+        assert!(Arc::ptr_eq(&entry.current.cell, &third));
     }
 
     #[test]
