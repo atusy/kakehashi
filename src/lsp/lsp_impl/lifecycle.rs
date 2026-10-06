@@ -785,24 +785,29 @@ impl Kakehashi {
             let token = self.shutdown_token.clone();
             tokio::spawn(async move {
                 loop {
-                    let uri = tokio::select! {
+                    let first = tokio::select! {
                         _ = token.cancelled() => return,
-                        uri = resync_rx.recv() => match uri {
-                            Some(uri) => uri,
+                        resync = resync_rx.recv() => match resync {
+                            Some(resync) => resync,
                             None => return,
                         },
                     };
-                    // Several documents of one host usually finish together.
-                    let mut hosts = std::collections::HashSet::from([uri]);
-                    while let Ok(uri) = resync_rx.try_recv() {
-                        hosts.insert(uri);
+                    // Several documents of one host usually finish together;
+                    // a host is re-diagnosed when any of its documents became
+                    // ready (a retry coming due sends nothing new yet).
+                    let mut hosts =
+                        std::collections::HashMap::from([(first.host_uri, first.ready)]);
+                    while let Ok(resync) = resync_rx.try_recv() {
+                        *hosts.entry(resync.host_uri).or_default() |= resync.ready;
                     }
-                    for uri in hosts {
+                    for (uri, ready) in hosts {
                         injection.process_injections(&uri, true).await;
                         // The diagnostic pass that ran when the host opened
                         // or changed skipped the held regions; run it again
                         // now that they reached their servers.
-                        diagnostics.schedule_debounced_diagnostic(uri);
+                        if ready {
+                            diagnostics.schedule_debounced_diagnostic(uri);
+                        }
                     }
                 }
             });

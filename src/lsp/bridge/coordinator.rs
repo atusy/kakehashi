@@ -510,7 +510,7 @@ impl BridgeCoordinator {
     /// receiver re-runs their injection pass. Taken once.
     pub(crate) fn take_prepare_resync_rx(
         &self,
-    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<Url>> {
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<super::prepare_registry::Resync>> {
         self.prepare.take_resync_rx()
     }
 

@@ -71,12 +71,43 @@ pub(crate) enum PrepareLookup {
 /// `None` is a prepare the peer answered unusably.
 type Outcome = Option<Arc<PreparedDocument>>;
 
+/// One region's prepared document: the generation the lifecycle pass works
+/// on, and the one before it.
+///
+/// Keeping the previous generation lets a request built on slightly older
+/// text find its answer without evicting the current one (which would
+/// restart the lifecycle pass's attempt and hold the document longer), and
+/// lets a lookup by the text a server still holds succeed while the next
+/// text is being prepared.
 struct Entry {
+    /// The region this entry is for (the map key is their hash).
+    host_uri: String,
+    injection_language: String,
+    region_id: String,
     /// The host language and peer the entry was prepared for, so a settings
     /// change that retargets the pair can drop it.
     host_language: String,
     server_name: String,
-    /// Identity of the input the cell answers (text, gaps, peer).
+    current: Generation,
+    previous: Option<Generation>,
+}
+
+impl Entry {
+    fn is(&self, host_uri: &str, injection_language: &str, region_id: &str) -> bool {
+        self.host_uri == host_uri
+            && self.injection_language == injection_language
+            && self.region_id == region_id
+    }
+
+    fn generations(&self) -> impl Iterator<Item = &Generation> {
+        std::iter::once(&self.current).chain(&self.previous)
+    }
+}
+
+/// The prepared answer for one input (text, gaps, peer).
+#[derive(Clone)]
+struct Generation {
+    /// Identity of the input (text, gaps, peer, host language).
     key: u64,
     /// Identity of the virtual text alone, for lookups that only know it.
     text_key: u64,
@@ -116,8 +147,25 @@ impl Cell {
     }
 }
 
-/// (host URI, injection language, region id).
-type EntryKey = (String, String, String);
+/// Ends an attempt however its task ends — a panic included — so waiters
+/// wake and the next lookup may start another.
+struct AttemptEnd(Arc<Cell>);
+
+impl Drop for AttemptEnd {
+    fn drop(&mut self) {
+        self.0.in_flight.store(false, Ordering::Release);
+        self.0.attempts.send_modify(|attempts| *attempts += 1);
+    }
+}
+
+/// A host to sync again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Resync {
+    pub(crate) host_uri: Url,
+    /// A held document became ready (rather than a retry being due), so the
+    /// host's diagnostics should be collected again too.
+    pub(crate) ready: bool,
+}
 
 /// How a virtual document reached downstream servers, as far as the registry
 /// knows from its text alone.
@@ -125,25 +173,28 @@ type EntryKey = (String, String, String);
 pub(crate) enum PreparedState {
     /// Never prepared: sent as is.
     Unprepared,
-    /// Sent prepared; `None` when the answer changed nothing.
+    /// Sent prepared, with this map.
     Prepared(Option<Arc<super::protocol::PreparedMap>>),
     /// Prepared for another text, or not (successfully) yet: downstream
     /// coordinates for this text are unknown.
     Unavailable,
 }
 
+type Entries = DashMap<u64, Entry>;
+
 pub(crate) struct PrepareRegistry {
-    entries: DashMap<EntryKey, Entry>,
+    /// Keyed by a hash of (host URI, injection language, region id), so a
+    /// lookup allocates nothing; the entry holds the identity it checks.
+    entries: Arc<Entries>,
     /// Whether anything was ever prepared: lets the lookups every bridged
-    /// region makes per edit skip the map (and its key allocations) when no
-    /// pair has a prepare peer.
+    /// region makes per edit skip the map when no pair has a prepare peer.
     ever_used: AtomicBool,
     /// Source of `textDocument.version`: shared by all documents, so a
     /// document forgotten and prepared again (a settings change, a reopen)
     /// never repeats a version the peer saw.
     next_revision: std::sync::atomic::AtomicI32,
-    resync_tx: UnboundedSender<Url>,
-    resync_rx: std::sync::Mutex<Option<UnboundedReceiver<Url>>>,
+    resync_tx: UnboundedSender<Resync>,
+    resync_rx: std::sync::Mutex<Option<UnboundedReceiver<Resync>>>,
 }
 
 impl std::fmt::Debug for PrepareRegistry {
@@ -158,7 +209,7 @@ impl Default for PrepareRegistry {
     fn default() -> Self {
         let (resync_tx, resync_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
-            entries: DashMap::new(),
+            entries: Arc::default(),
             ever_used: AtomicBool::new(false),
             next_revision: std::sync::atomic::AtomicI32::new(1),
             resync_tx,
@@ -168,10 +219,10 @@ impl Default for PrepareRegistry {
 }
 
 impl PrepareRegistry {
-    /// Host documents to sync again: a held-back virtual document became
-    /// ready, or an attempt that got no answer finished its retry backoff.
-    /// Taken once by the server loop.
-    pub(crate) fn take_resync_rx(&self) -> Option<UnboundedReceiver<Url>> {
+    /// Hosts to sync again: a held-back virtual document became ready, or
+    /// an attempt that got no answer finished its retry backoff. Taken once
+    /// by the server loop.
+    pub(crate) fn take_resync_rx(&self) -> Option<UnboundedReceiver<Resync>> {
         self.resync_rx
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -238,20 +289,36 @@ impl PrepareRegistry {
         if cell.in_flight.swap(true, Ordering::AcqRel) {
             return false;
         }
-        let cell = Arc::clone(cell);
+        let end = AttemptEnd(Arc::clone(cell));
+        let entries = Arc::clone(&self.entries);
+        let region = region_hash(
+            input.host_uri.as_str(),
+            input.injection_language,
+            input.region_id,
+        );
         let pool = Arc::clone(pool);
         let target = target.clone();
         let job = PrepareJob::from(input);
         let resync_tx = self.resync_tx.clone();
         tokio::spawn(async move {
+            let cell = Arc::clone(&end.0);
+            // Only the generation the lifecycle pass works on holds a
+            // document back; an older one's answer re-syncs nothing.
+            let current = |entries: &Entries| {
+                entries
+                    .get(&region)
+                    .is_some_and(|entry| Arc::ptr_eq(&entry.current.cell, &cell))
+            };
             match run(&pool, &target, &job, revision).await {
                 Ok(outcome) => {
                     let prepared = outcome.is_some();
                     let _ = cell.outcome.set(outcome);
-                    if prepared {
-                        // The lifecycle pass held the document meanwhile.
+                    if prepared && current(&entries) {
                         // The receiver is gone only at shutdown.
-                        let _ = resync_tx.send(job.host_uri.clone());
+                        let _ = resync_tx.send(Resync {
+                            host_uri: job.host_uri.clone(),
+                            ready: true,
+                        });
                     }
                 }
                 Err(()) => {
@@ -263,16 +330,25 @@ impl PrepareRegistry {
                         .unwrap_or_else(std::sync::PoisonError::into_inner) =
                         Some(Instant::now() + delay);
                     // Nothing else would look the document up again before
-                    // the next edit; sync the host once the backoff ends.
+                    // the next edit; sync the host once the backoff ends,
+                    // unless newer text has taken over by then.
                     let host_uri = job.host_uri.clone();
+                    let cell = Arc::clone(&cell);
                     tokio::spawn(async move {
                         tokio::time::sleep(delay).await;
-                        let _ = resync_tx.send(host_uri);
+                        let still_current = entries
+                            .get(&region)
+                            .is_some_and(|entry| Arc::ptr_eq(&entry.current.cell, &cell));
+                        if still_current {
+                            let _ = resync_tx.send(Resync {
+                                host_uri,
+                                ready: false,
+                            });
+                        }
                     });
                 }
             }
-            cell.in_flight.store(false, Ordering::Release);
-            cell.attempts.send_modify(|attempts| *attempts += 1);
+            drop(end);
         });
         true
     }
@@ -290,17 +366,20 @@ impl PrepareRegistry {
         if !self.ever_used.load(Ordering::Acquire) {
             return PreparedState::Unprepared;
         }
-        let Some(entry) = self.entries.get(&(
-            host_uri.to_string(),
-            injection_language.to_string(),
-            region_id.to_string(),
-        )) else {
+        let host_uri = host_uri.as_str();
+        let Some(entry) = self
+            .entries
+            .get(&region_hash(host_uri, injection_language, region_id))
+            .filter(|entry| entry.is(host_uri, injection_language, region_id))
+        else {
             return PreparedState::Unprepared;
         };
-        if entry.text_key != text_key(virtual_text) {
-            return PreparedState::Unavailable;
-        }
-        match entry.cell.outcome.get() {
+        let text_key = text_key(virtual_text);
+        match entry
+            .generations()
+            .find(|generation| generation.text_key == text_key)
+            .and_then(|generation| generation.cell.outcome.get())
+        {
             Some(Some(prepared)) => PreparedState::Prepared(prepared.map.clone()),
             Some(None) | None => PreparedState::Unavailable,
         }
@@ -308,10 +387,16 @@ impl PrepareRegistry {
 
     /// Keep only the entries `keep(host language, injection language, peer)`
     /// accepts — after a settings change, those whose pair still names the
-    /// same peer. A dropped entry reads as unprepared until prepared again.
+    /// same peer. Answers cached as final also go: the change may have fixed
+    /// what made them unusable (a peer's command, say). A dropped entry
+    /// reads as unprepared until prepared again.
     pub(crate) fn retain(&self, keep: impl Fn(&str, &str, &str) -> bool) {
-        self.entries.retain(|(_, injection_language, _), entry| {
-            keep(&entry.host_language, injection_language, &entry.server_name)
+        self.entries.retain(|_, entry| {
+            keep(
+                &entry.host_language,
+                &entry.injection_language,
+                &entry.server_name,
+            ) && !matches!(entry.current.cell.outcome.get(), Some(None))
         });
     }
 
@@ -327,59 +412,77 @@ impl PrepareRegistry {
         if !self.ever_used.load(Ordering::Acquire) {
             return;
         }
+        let host_uri = host_uri.as_str();
         match injection_language {
             Some(language) => {
-                self.entries.remove(&(
-                    host_uri.to_string(),
-                    language.to_string(),
-                    region_id.to_string(),
-                ));
+                self.entries
+                    .remove_if(&region_hash(host_uri, language, region_id), |_, entry| {
+                        entry.is(host_uri, language, region_id)
+                    });
             }
-            None => self.entries.retain(|(host, _, region), _| {
-                host.as_str() != host_uri.as_str() || region != region_id
-            }),
+            None => self
+                .entries
+                .retain(|_, entry| entry.host_uri != host_uri || entry.region_id != region_id),
         }
     }
 
     /// Forget a closed host's documents.
     pub(crate) fn forget_host(&self, host_uri: &Url) {
         self.entries
-            .retain(|(host, _, _), _| host.as_str() != host_uri.as_str());
+            .retain(|_, entry| entry.host_uri != host_uri.as_str());
     }
 
-    /// The cell answering `input`, replacing a stale one (and bumping the
-    /// revision) when the text, gaps or peer changed.
+    /// The cell answering `input`: the current or previous generation when
+    /// either matches, else a new current generation (with a new revision)
+    /// that demotes the current one.
     fn cell(&self, target: &PrepareTarget, input: PrepareInput<'_>) -> (Arc<Cell>, i32) {
         self.ever_used.store(true, Ordering::Release);
         let key = input_key(target, input);
+        let host_uri = input.host_uri.as_str();
+        let fresh = || Generation {
+            key,
+            text_key: text_key(input.virtual_text),
+            revision: self.revision(),
+            cell: Arc::default(),
+        };
         let mut entry = self
             .entries
-            .entry((
-                input.host_uri.to_string(),
-                input.injection_language.to_string(),
-                input.region_id.to_string(),
+            .entry(region_hash(
+                host_uri,
+                input.injection_language,
+                input.region_id,
             ))
             .or_insert_with(|| Entry {
+                host_uri: host_uri.to_string(),
+                injection_language: input.injection_language.to_string(),
+                region_id: input.region_id.to_string(),
                 host_language: input.host_language.to_string(),
                 server_name: target.server_name.clone(),
-                key,
-                text_key: text_key(input.virtual_text),
-                revision: self.revision(),
-                cell: Arc::default(),
+                current: fresh(),
+                previous: None,
             });
-        if entry.key != key {
-            entry.host_language = input.host_language.to_string();
-            entry.server_name = target.server_name.clone();
-            entry.key = key;
-            entry.text_key = text_key(input.virtual_text);
-            entry.revision = self.revision();
-            entry.cell = Arc::default();
+        if !entry.is(host_uri, input.injection_language, input.region_id) {
+            // A hash collision with another region: take the slot over.
+            *entry = Entry {
+                host_uri: host_uri.to_string(),
+                injection_language: input.injection_language.to_string(),
+                region_id: input.region_id.to_string(),
+                host_language: input.host_language.to_string(),
+                server_name: target.server_name.clone(),
+                current: fresh(),
+                previous: None,
+            };
         }
-        (Arc::clone(&entry.cell), entry.revision)
+        if let Some(generation) = entry.generations().find(|generation| generation.key == key) {
+            return (Arc::clone(&generation.cell), generation.revision);
+        }
+        entry.host_language = input.host_language.to_string();
+        entry.server_name = target.server_name.clone();
+        let current = std::mem::replace(&mut entry.current, fresh());
+        entry.previous = Some(current);
+        (Arc::clone(&entry.current.cell), entry.current.revision)
     }
-}
 
-impl PrepareRegistry {
     fn revision(&self) -> i32 {
         // Wraps after 2^31 prepares; the peer only compares a document's
         // versions over its lifetime.
@@ -390,7 +493,13 @@ impl PrepareRegistry {
 /// Backoff before retrying an attempt that got no answer: one second,
 /// doubling, at most a minute.
 fn retry_delay(misses: u32) -> Duration {
-    Duration::from_secs(1 << misses.saturating_sub(1).min(6))
+    Duration::from_secs((1u64 << misses.saturating_sub(1).min(6)).min(60))
+}
+
+fn region_hash(host_uri: &str, injection_language: &str, region_id: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (host_uri, injection_language, region_id).hash(&mut hasher);
+    hasher.finish()
 }
 
 fn input_key(target: &PrepareTarget, input: PrepareInput<'_>) -> u64 {
@@ -685,15 +794,71 @@ mod tests {
         let resynced = tokio::time::timeout(Duration::from_secs(5), resync.recv())
             .await
             .expect("a re-sync after the backoff");
-        assert_eq!(resynced, Some(host.clone()));
+        assert_eq!(
+            resynced,
+            Some(Resync {
+                host_uri: host.clone(),
+                ready: false
+            })
+        );
+    }
+
+    #[test]
+    fn an_older_text_finds_its_generation_without_evicting_the_current() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let input = |text| PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: "01J0000000000000000000000A",
+            virtual_text: text,
+            gaps: &[],
+        };
+        let (old, _) = registry.cell(&target, input("v1"));
+        let (current, _) = registry.cell(&target, input("v2"));
+        // A request still on v1 gets v1's cell, and v2 stays current.
+        let (again, _) = registry.cell(&target, input("v1"));
+        assert!(Arc::ptr_eq(&old, &again));
+        let entry = registry.entries.iter().next().unwrap();
+        assert!(Arc::ptr_eq(&entry.current.cell, &current));
+        drop(entry);
+        // A third text drops the oldest.
+        registry.cell(&target, input("v3"));
+        let (fresh, _) = registry.cell(&target, input("v1"));
+        assert!(!Arc::ptr_eq(&old, &fresh));
+    }
+
+    #[test]
+    fn a_settings_change_drops_final_failures() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let input = PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: "01J0000000000000000000000A",
+            virtual_text: "a",
+            gaps: &[],
+        };
+        let (cell, _) = registry.cell(&target, input);
+        cell.outcome.set(None).unwrap();
+        registry.retain(|_, _, _| true);
+        assert!(
+            registry.entries.is_empty(),
+            "a fixed config may now prepare it"
+        );
     }
 
     #[test]
     fn retries_back_off_to_a_minute() {
         assert_eq!(retry_delay(1), Duration::from_secs(1));
         assert_eq!(retry_delay(2), Duration::from_secs(2));
-        assert_eq!(retry_delay(7), Duration::from_secs(64));
-        assert_eq!(retry_delay(100), Duration::from_secs(64));
+        assert_eq!(retry_delay(6), Duration::from_secs(32));
+        assert_eq!(retry_delay(7), Duration::from_secs(60));
+        assert_eq!(retry_delay(100), Duration::from_secs(60));
     }
 
     #[test]
