@@ -611,23 +611,30 @@ impl PreparedMap {
         // or a change joining onto the previous line) a line start maps after
         // its removed indent, as positions do.
         let whole_lines = !old.is_empty() && is_line_start(self.prepared_lines.text(), old.start);
-        let deleted_indent_at = |offset: usize| {
-            whole_lines
-                .then(|| empty_run(&self.runs, offset, RunKind::Deleted))
-                .flatten()
-        };
-        let start_indent = deleted_indent_at(old.start);
-        let virtual_start = start_indent.map_or_else(
-            || map_offset(&self.runs, old.start, Bias::Start, Side::Prepared),
-            |run| run.virtual_.start,
-        );
+        let plain_start = map_offset(&self.runs, old.start, Bias::Start, Side::Prepared);
+        // The removed indent right before where the start plainly maps — not
+        // one beyond a gap the peer emptied at the same P offset.
+        let start_indent = whole_lines
+            .then(|| empty_run(&self.runs, old.start, RunKind::Deleted))
+            .flatten()
+            .filter(|run| run.virtual_.end == plain_start);
+        let virtual_start = start_indent.map_or(plain_start, |run| run.virtual_.start);
+        // The end maps plainly: after a removed indent at a line start, which
+        // the change then takes along and `reindent` restores once.
         let virtual_end = if old.is_empty() {
             virtual_start
         } else {
-            deleted_indent_at(old.end).map_or_else(
-                || map_offset(&self.runs, old.end, Bias::End, Side::Prepared),
-                |run| run.virtual_.start,
-            )
+            map_offset(&self.runs, old.end, Bias::End, Side::Prepared)
+        };
+        // Backstop: host text a gap stands for is never inside a mapped change.
+        if self.virtual_range_touches_gap(virtual_start, virtual_end) {
+            return None;
+        }
+        // What follows the change in V: a gap the peer emptied right at its
+        // end is not the text after it in P.
+        let following = match empty_run(&self.runs, old.end, RunKind::Gap) {
+            Some(gap) if gap.virtual_.start == virtual_end => None,
+            _ => following,
         };
         let virtual_text = self.virtual_lines.text();
         let first = match start_indent {
@@ -651,6 +658,23 @@ impl PreparedMap {
             ),
             new_text,
         })
+    }
+
+    /// Whether the V range `start..end` reaches inside a gap's V text (an
+    /// empty range: whether it sits strictly inside one).
+    fn virtual_range_touches_gap(&self, start: usize, end: usize) -> bool {
+        let first = self.runs.partition_point(|run| run.virtual_.end <= start);
+        self.runs[first..]
+            .iter()
+            .take_while(|run| run.virtual_.start <= end)
+            .filter(|run| run.kind == RunKind::Gap)
+            .any(|gap| {
+                if start == end {
+                    gap.virtual_.start < start && start < gap.virtual_.end
+                } else {
+                    gap.virtual_.start < end && start < gap.virtual_.end
+                }
+            })
     }
 
     fn hunk_touches_gap(&self, old: &Range<usize>) -> bool {
@@ -1477,6 +1501,114 @@ mod tests {
         // …while an insertion there stays an insertion.
         let inserted = map.edit_to_virtual(&edit((0, 2), (0, 2), "!")).unwrap();
         assert_eq!(inserted.range.start, inserted.range.end);
+    }
+
+    fn dedent_by_two(virtual_text: &str) -> PreparedMap {
+        let layout = VirtualLayout::single(virtual_text);
+        let changes: Vec<_> = virtual_text
+            .split('\n')
+            .enumerate()
+            .filter(|(_, line)| line.starts_with("  "))
+            .map(|(line, _)| json!({
+                "range": {"start": {"line": line, "character": 0}, "end": {"line": line, "character": 2}},
+                "newText": ""
+            }))
+            .collect();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &layout,
+            result(json!({"segments": [{"type": "content", "changes": changes}]})),
+        )
+        .unwrap();
+        std::sync::Arc::try_unwrap(prepared.map.unwrap()).unwrap()
+    }
+
+    #[test]
+    fn removing_a_line_keeps_the_next_lines_indent_once() {
+        let virtual_text = "  a\n  b\n";
+        let map = dedent_by_two(virtual_text);
+        let removed = map.edit_to_virtual(&edit((0, 0), (1, 0), "")).unwrap();
+        assert_eq!(apply_to(virtual_text, &[removed]), "  b\n");
+        let replaced = map.edit_to_virtual(&edit((0, 0), (1, 0), "x\n")).unwrap();
+        assert_eq!(apply_to(virtual_text, &[replaced]), "  x\n  b\n");
+
+        let imports = "  import os\n  import sys\n\n\n\n  x = 1\n";
+        let map = dedent_by_two(imports);
+        let fixed = map.edit_to_virtual(&edit((0, 0), (1, 0), "")).unwrap();
+        assert_eq!(apply_to(imports, &[fixed]), "  import sys\n\n\n\n  x = 1\n");
+        let formatted = map
+            .edits_to_virtual(&[edit((0, 0), (6, 0), "import os\nimport sys\n\nx = 1\n")])
+            .unwrap();
+        assert_eq!(
+            apply_to(imports, &formatted),
+            "  import os\n  import sys\n\n  x = 1\n"
+        );
+
+        let blank = "  a\n\n  b\n";
+        let map = dedent_by_two(blank);
+        let removed = map.edit_to_virtual(&edit((1, 0), (2, 0), "")).unwrap();
+        assert_eq!(apply_to(blank, &[removed]), "  a\n  b\n");
+    }
+
+    #[test]
+    fn an_emptied_gap_beside_a_removed_indent_survives_line_edits() {
+        // Gap then indent: `  a\n` + gap (host fences) + `  b\n`, all
+        // emptied or dedented.
+        let virtual_text = "  a\n\n\n  b\n".to_string();
+        let layout = VirtualLayout::from_pieces(
+            &virtual_text,
+            [
+                (SegmentKind::Content, 0..4, String::new()),
+                (SegmentKind::Gap, 4..6, "```\n```py\n".to_string()),
+                (SegmentKind::Content, 6..10, String::new()),
+            ],
+        );
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &layout,
+            result(json!({"segments": [
+                {"type": "content", "changes": [{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}]},
+                {"type": "gap", "content": ""},
+                {"type": "content", "changes": [{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}]}
+            ]})),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "a\nb\n");
+        let map = prepared.map.unwrap();
+        let removed = map.edit_to_virtual(&edit((0, 0), (1, 0), "")).unwrap();
+        assert_eq!(apply_to(&virtual_text, &[removed]), "\n\n  b\n");
+        let formatted = map
+            .edits_to_virtual(&[edit((0, 0), (2, 0), "b\n")])
+            .unwrap();
+        assert_eq!(apply_to(&virtual_text, &formatted), "\n\n  b\n");
+
+        // Indent then gap: `\n  foo\n  ${x}b\n` with `${x}` emptied.
+        let virtual_text = "\n  foo\n      b\n".to_string();
+        let layout = VirtualLayout::from_pieces(
+            &virtual_text,
+            [
+                (SegmentKind::Content, 0..9, String::new()),
+                (SegmentKind::Gap, 9..13, "${x}".to_string()),
+                (SegmentKind::Content, 13..15, String::new()),
+            ],
+        );
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &layout,
+            result(json!({"segments": [
+                {"type": "content", "changes": [
+                    {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""},
+                    {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
+                ]},
+                {"type": "gap", "content": ""},
+                {"type": "content"}
+            ]})),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "\nfoo\nb\n");
+        let map = prepared.map.unwrap();
+        let replaced = map.edit_to_virtual(&edit((2, 0), (2, 1), "z")).unwrap();
+        assert_eq!(apply_to(&virtual_text, &[replaced]), "\n  foo\n      z\n");
     }
 
     #[test]
