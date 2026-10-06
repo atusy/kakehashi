@@ -118,6 +118,10 @@ pub(crate) struct DiscoveredBridgeRegion {
     /// prefixes are removed, while an `injection.combined` group preserves host
     /// line numbers with empty lines and uses spaces for later gaps on a line.
     pub content: String,
+    /// The host text `content` does not carry verbatim (see
+    /// `ResolvedInjection::gaps`), for presenting the document as
+    /// content/gap segments.
+    pub gaps: Vec<crate::language::injection::VirtualGap>,
 }
 
 /// One pre-parsed injection layer of a document, in document-order DFS —
