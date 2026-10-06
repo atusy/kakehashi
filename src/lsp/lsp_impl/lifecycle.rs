@@ -813,7 +813,8 @@ impl Kakehashi {
                         // on the text before, and the answer is cached, so
                         // no resync would come again: retry with backoff,
                         // a bounded number of times, while the host is open.
-                        if injection.process_injections_synchronized(&uri).await {
+                        let synchronized = injection.process_injections_synchronized(&uri).await;
+                        if synchronized {
                             failures.remove(&uri);
                         } else if injection.document_incarnation(&uri).is_some() {
                             let failed = failures.entry(uri.clone()).or_default();
@@ -833,7 +834,12 @@ impl Kakehashi {
                             failures.remove(&uri);
                         }
                         injection.replay_held_save(&uri).await;
-                        diagnostics.settle_pull_debt_after_prepare(&uri, ready);
+                        // A pull owed a refresh waits for a pass that reached
+                        // every server: one now would re-pull from a server
+                        // still holding the text before.
+                        if synchronized {
+                            diagnostics.settle_pull_debt_after_prepare(&uri, ready);
+                        }
                         // The diagnostic pass that ran when the host opened
                         // or changed skipped the held regions; run it again
                         // now that they reached their servers.
