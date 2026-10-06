@@ -612,6 +612,68 @@ mod tests {
         serde_json::from_value(value).unwrap()
     }
 
+    /// `x = ${a}` prepared as `x = None` (a gap placeholder), at host line 10.
+    fn interpolated_offset() -> RegionOffset {
+        use super::super::prepare::{SegmentKind, VirtualLayout, apply_prepare_result};
+        let virtual_text = "x =     \n";
+        let layout = VirtualLayout::from_pieces(
+            virtual_text,
+            [
+                (SegmentKind::Content, 0..4, String::new()),
+                (SegmentKind::Gap, 4..8, "${a}".to_string()),
+                (SegmentKind::Content, 8..9, String::new()),
+            ],
+        );
+        let result = serde_json::from_value(json!({"segments": [
+            {"type": "content"}, {"type": "gap", "content": "None"}, {"type": "content"}
+        ]}))
+        .unwrap();
+        let prepared = apply_prepare_result(virtual_text, &layout, Some(result)).unwrap();
+        RegionOffset::new(10, 0).with_prepared(prepared.map)
+    }
+
+    fn rename_of(virtual_uri: &str, start: u32, end: u32) -> WorkspaceEdit {
+        parse_workspace_edit(json!({
+            "changes": { virtual_uri: [{
+                "range": {
+                    "start": { "line": 0, "character": start },
+                    "end": { "line": 0, "character": end }
+                },
+                "newText": "y"
+            }]}
+        }))
+    }
+
+    #[test]
+    fn prepared_edits_map_through_the_prepared_document() {
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let mut edit = rename_of(&virtual_uri, 0, 1);
+        assert!(transform_workspace_edit_to_host(
+            &mut edit,
+            &virtual_uri,
+            &host_uri,
+            &interpolated_offset(),
+        ));
+        let edits = &edit.changes.unwrap()[&host_uri];
+        assert_eq!(edits[0].range.start, Position::new(10, 0));
+        assert_eq!(edits[0].range.end, Position::new(10, 1));
+    }
+
+    #[test]
+    fn a_prepared_edit_touching_a_gap_refuses_the_whole_edit() {
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        // Renaming the placeholder `None` would overwrite `${a}` in the host.
+        let mut edit = rename_of(&virtual_uri, 4, 8);
+        assert!(!transform_workspace_edit_to_host(
+            &mut edit,
+            &virtual_uri,
+            &host_uri,
+            &interpolated_offset(),
+        ));
+    }
+
     #[test]
     fn document_changes_operations_preserves_file_ops_and_transforms_edits() {
         let virtual_uri = make_virtual_uri_string();

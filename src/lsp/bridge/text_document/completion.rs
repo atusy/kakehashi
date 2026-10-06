@@ -684,6 +684,47 @@ mod tests {
     use rstest::rstest;
     use serde_json::json;
 
+    /// `  if x:\n    y\n` at host line 10, dedented by two by a prepare peer.
+    fn dedented_offset() -> RegionOffset {
+        use super::super::super::protocol::{VirtualLayout, apply_prepare_result};
+        let virtual_text = "  if x:\n    y\n";
+        let result = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(result),
+        )
+        .unwrap();
+        RegionOffset::new(10, 0).with_prepared(prepared.map)
+    }
+
+    #[test]
+    fn prepared_insert_replace_edits_map_both_ranges_and_reindent() {
+        // `y` sits at P (1, 2): insert at its start, replace the word.
+        let mut edit = tower_lsp_server::ls_types::InsertReplaceEdit {
+            new_text: "yes\n  z".to_string(),
+            insert: tower_lsp_server::ls_types::Range::new(
+                Position::new(1, 2),
+                Position::new(1, 2),
+            ),
+            replace: tower_lsp_server::ls_types::Range::new(
+                Position::new(1, 2),
+                Position::new(1, 3),
+            ),
+        };
+        assert!(translate_insert_replace_edit_to_host(
+            &mut edit,
+            &dedented_offset()
+        ));
+        assert_eq!(edit.insert.start, Position::new(11, 4));
+        assert_eq!(edit.replace.end, Position::new(11, 5));
+        assert_eq!(edit.new_text, "yes\n    z");
+    }
+
     /// Run the virt transform for a NON-resolving origin, the shape most
     /// coordinate tests want: ranges translate, `data` passes through bare.
     /// (The codeLens and documentLink twins default the other way — their
