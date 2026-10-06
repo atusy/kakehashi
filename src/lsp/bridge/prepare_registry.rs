@@ -361,7 +361,9 @@ impl PrepareRegistry {
         // still decides: no second request for an answered revision, and
         // none inside the backoff that attempt just set.
         if cell.outcome.get().is_some() || cell.backing_off() {
-            cell.in_flight.store(false, Ordering::Release);
+            // Released like an attempt that ran: a request that saw the
+            // claim waits for the bump.
+            drop(AttemptEnd(Arc::clone(cell)));
             return false;
         }
         let end = AttemptEnd(Arc::clone(cell));
