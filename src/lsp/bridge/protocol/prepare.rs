@@ -578,6 +578,11 @@ impl PreparedMap {
             .collect()
     }
 
+    /// The virtual text this map was built for.
+    pub(crate) fn virtual_text(&self) -> &str {
+        self.virtual_lines.text()
+    }
+
     /// The prepared text this map was built for.
     pub(crate) fn prepared_text(&self) -> &str {
         self.prepared_lines.text()
