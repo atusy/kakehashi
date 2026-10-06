@@ -213,8 +213,6 @@ pub(crate) struct DiagnosticPublisher {
     snapshot_preparer: DiagnosticSnapshotPreparer,
     aggregator: Arc<DiagnosticAggregator>,
     shutdown: tokio_util::sync::CancellationToken,
-    /// Experimental features (virtual-document preparation) are on.
-    experimental: bool,
 }
 
 impl DiagnosticPublisher {
@@ -231,7 +229,6 @@ impl DiagnosticPublisher {
             snapshot_preparer: DiagnosticSnapshotPreparer::new(server),
             aggregator: Arc::clone(&server.diagnostics),
             shutdown: server.shutdown_token.clone(),
-            experimental: server.experimental_enabled(),
         }
     }
 
@@ -2022,34 +2019,21 @@ impl DiagnosticPublisher {
                 current.incarnation,
             )),
         };
-        let settings = self.settings_manager.load_settings();
         for resolved in resolved_regions.iter() {
             // A pushed diagnostic is in the coordinates of the document the
-            // server was sent: the prepared one, when the pair has a prepare
-            // peer. A region whose prepared form is not available gets no
-            // offset, so its pushed diagnostics are dropped, not misplaced.
-            let prepared = match self.bridge.prepare_target(
-                &settings,
-                &language_name,
+            // server was sent: the prepared answer last sent, for a region
+            // with a prepare peer — not one that is in but not sent yet. A
+            // region whose sent form is unknown gets no offset, so its pushed
+            // diagnostics are dropped, not misplaced.
+            let prepared = match self.bridge.prepared_state(
+                host,
                 &resolved.injection_language,
-                self.experimental,
+                &resolved.region.region_id,
+                &resolved.virtual_content,
             ) {
-                None => None,
-                Some(target) => {
-                    let input = crate::lsp::bridge::PrepareInput {
-                        host_uri: host,
-                        host_language: &language_name,
-                        injection_language: &resolved.injection_language,
-                        region_id: &resolved.region.region_id,
-                        virtual_text: &resolved.virtual_content,
-                        gaps: &resolved.gaps,
-                    };
-                    match self.bridge.prepared_document_now(&target, input) {
-                        crate::lsp::bridge::PrepareLookup::Ready(prepared) => prepared.map.clone(),
-                        crate::lsp::bridge::PrepareLookup::Failed
-                        | crate::lsp::bridge::PrepareLookup::Pending => continue,
-                    }
-                }
+                crate::lsp::bridge::PreparedState::Unprepared => None,
+                crate::lsp::bridge::PreparedState::Prepared(map) => map,
+                crate::lsp::bridge::PreparedState::Unavailable => continue,
             };
             geometry.offsets.insert(
                 resolved.region.region_id.clone(),
