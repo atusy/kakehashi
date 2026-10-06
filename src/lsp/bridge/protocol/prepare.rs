@@ -653,8 +653,14 @@ impl PreparedMap {
     }
 
     fn hunk_touches_gap(&self, old: &Range<usize>) -> bool {
-        self.runs
+        // Runs tile P in order: only those from the first ending at or after
+        // the change's start can touch it.
+        let first = self
+            .runs
+            .partition_point(|run| run.prepared.end < old.start);
+        self.runs[first..]
             .iter()
+            .take_while(|run| run.prepared.start <= old.end)
             .filter(|run| run.kind == RunKind::Gap)
             .any(|gap| {
                 if gap.prepared.is_empty() {
@@ -689,12 +695,12 @@ impl PreparedMap {
             return Some(text.to_string());
         }
         let uniform = || {
+            let candidate = self
+                .indents
+                .partition_point(|indent| indent.virtual_range.end < virtual_start);
             self.indents
-                .iter()
-                .find(|indent| {
-                    indent.virtual_range.start <= virtual_start
-                        && virtual_start <= indent.virtual_range.end
-                })
+                .get(candidate)
+                .filter(|indent| indent.virtual_range.start <= virtual_start)
                 .map_or(Some(""), |indent| indent.uniform.as_deref())
         };
         let first_indent = match first {
@@ -747,7 +753,7 @@ impl Side {
     }
 }
 
-/// Map a byte offset across the runs.
+/// Map a byte offset across the runs, in O(log runs).
 ///
 /// Inside an identity run the offset moves by the run's shift. Inside an
 /// opaque run (a deleted indent or a gap) it lands on the run's start, or —
@@ -763,9 +769,12 @@ fn map_offset(runs: &[Run], offset: usize, bias: Bias, from: Side) -> usize {
     {
         return gap.virtual_.start;
     }
-    for run in runs {
+    // Runs tile both texts in order, so the run holding `offset` is the
+    // first that ends after it (runs empty on this side never hold one).
+    let index = runs.partition_point(|run| from.ranges(run).0.end <= offset);
+    if let Some(run) = runs.get(index) {
         let (source, target) = from.ranges(run);
-        if source.start <= offset && offset < source.end {
+        if source.start <= offset {
             return match run.kind {
                 RunKind::Identity => target.start + (offset - source.start),
                 _ if offset == source.start => target.start,
@@ -778,21 +787,26 @@ fn map_offset(runs: &[Run], offset: usize, bias: Bias, from: Side) -> usize {
     }
     // Past every run non-empty on this side: the document end, unless a run
     // empty on this side sits exactly here and the caller wants its start.
-    if bias == Bias::Start
-        && let Some(run) = runs.iter().find(|run| {
-            let (source, _) = from.ranges(run);
-            source.is_empty() && source.start == offset
-        })
-    {
-        return from.ranges(run).1.start;
+    if bias == Bias::Start {
+        let first = runs.partition_point(|run| from.ranges(run).0.start < offset);
+        if let Some(run) = runs[first..]
+            .iter()
+            .take_while(|run| from.ranges(run).0.start == offset)
+            .find(|run| from.ranges(run).0.is_empty())
+        {
+            return from.ranges(run).1.start;
+        }
     }
     runs.last().map_or(0, |run| from.ranges(run).1.end)
 }
 
 /// The `kind` run that is empty in P and sits at P `offset`.
 fn empty_run(runs: &[Run], offset: usize, kind: RunKind) -> Option<&Run> {
-    runs.iter()
-        .find(|run| run.kind == kind && run.prepared.is_empty() && run.prepared.start == offset)
+    let first = runs.partition_point(|run| run.prepared.start < offset);
+    runs[first..]
+        .iter()
+        .take_while(|run| run.prepared.start == offset)
+        .find(|run| run.kind == kind && run.prepared.is_empty())
 }
 
 // =============================================================================
@@ -1462,6 +1476,28 @@ mod tests {
         // …while an insertion there stays an insertion.
         let inserted = map.edit_to_virtual(&edit((0, 2), (0, 2), "!")).unwrap();
         assert_eq!(inserted.range.start, inserted.range.end);
+    }
+
+    #[test]
+    fn the_document_end_before_an_emptied_trailing_gap() {
+        let virtual_text = "ab   ".to_string();
+        let layout = VirtualLayout::from_pieces(
+            &virtual_text,
+            [
+                (SegmentKind::Content, 0..2, String::new()),
+                (SegmentKind::Gap, 2..5, "${x}".to_string()),
+            ],
+        );
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &layout,
+            result(json!({"segments": [{"type": "content"}, {"type": "gap", "content": ""}]})),
+        )
+        .unwrap();
+        let map = prepared.map.unwrap();
+        assert_eq!(map.to_virtual(pos(0, 2), Bias::Start), pos(0, 2));
+        assert_eq!(map.to_virtual(pos(0, 1), Bias::Start), pos(0, 1));
+        assert_eq!(map.to_prepared(pos(0, 4), Bias::Start), pos(0, 2));
     }
 
     #[test]
