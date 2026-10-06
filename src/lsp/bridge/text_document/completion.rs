@@ -370,6 +370,17 @@ fn translate_insert_replace_edit_to_host(
     {
         return false;
     }
+    // The two ranges must share their start. Clearing a dedented line's
+    // content maps the replace range over the removed indent, which the
+    // (empty) insert range does not cover: start both after it, as the
+    // shared text was re-indented for.
+    if replace.range.start != insert.range.start {
+        if replace.range.start < insert.range.start && insert.range.start <= replace.range.end {
+            replace.range.start = insert.range.start;
+        } else {
+            return false;
+        }
+    }
     edit.insert = insert.range;
     edit.replace = replace.range;
     edit.new_text = replace.new_text;
@@ -717,6 +728,32 @@ mod tests {
         )
         .unwrap();
         RegionOffset::new(10, 0).with_prepared(prepared.map)
+    }
+
+    #[test]
+    fn prepared_insert_replace_edits_keep_their_shared_start() {
+        // Clearing the whole content of a dedented line (`if x:`): the
+        // replace range covers it, the insert range is empty at its start.
+        let mut edit = tower_lsp_server::ls_types::InsertReplaceEdit {
+            new_text: String::new(),
+            insert: tower_lsp_server::ls_types::Range::new(
+                Position::new(0, 0),
+                Position::new(0, 0),
+            ),
+            replace: tower_lsp_server::ls_types::Range::new(
+                Position::new(0, 0),
+                Position::new(0, 5),
+            ),
+        };
+        assert!(translate_insert_replace_edit_to_host(
+            &mut edit,
+            &dedented_offset()
+        ));
+        assert_eq!(edit.insert.start, edit.replace.start);
+        assert_eq!(
+            edit.replace,
+            tower_lsp_server::ls_types::Range::new(Position::new(10, 2), Position::new(10, 7))
+        );
     }
 
     #[test]
