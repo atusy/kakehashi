@@ -436,6 +436,21 @@ impl PrepareRegistry {
         }
     }
 
+    /// Forget a replaced region's documents under every language but
+    /// `keep` — the language the region resolves to now, whose document may
+    /// already be preparing.
+    pub(crate) fn forget_region_except(&self, host_uri: &Url, region_id: &str, keep: Option<&str>) {
+        if !self.ever_used.load(Ordering::Acquire) {
+            return;
+        }
+        let host_uri = host_uri.as_str();
+        self.entries.retain(|_, entry| {
+            entry.host_uri != host_uri
+                || entry.region_id != region_id
+                || Some(entry.injection_language.as_str()) == keep
+        });
+    }
+
     /// Forget a closed host's documents.
     pub(crate) fn forget_host(&self, host_uri: &Url) {
         self.entries

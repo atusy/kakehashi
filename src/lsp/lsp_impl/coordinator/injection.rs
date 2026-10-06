@@ -556,7 +556,14 @@ impl InjectionCoordinator {
         }
         let replaced_regions = self.bridge.close_replaced_docs(uri, &injections).await;
         for region_id in replaced_regions {
-            self.bridge.forget_prepared_region(uri, None, &region_id);
+            // The region may live on under another language (a shebang edit
+            // re-routing an `unknown` fence), whose document is preparing.
+            let current_language = injections
+                .iter()
+                .find(|injection| injection.region_id == region_id)
+                .map(|injection| injection.language.as_str());
+            self.bridge
+                .forget_replaced_prepared_region(uri, &region_id, current_language);
             self.diagnostics
                 .evict_source(uri, &DiagnosticSource::Region(region_id));
         }

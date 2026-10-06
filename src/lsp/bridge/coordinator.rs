@@ -559,6 +559,18 @@ impl BridgeCoordinator {
             .forget_region(host_uri, injection_language, region_id);
     }
 
+    /// Drop a replaced region's prepared documents except under the language
+    /// it resolves to now (see `PrepareRegistry::forget_region_except`).
+    pub(crate) fn forget_replaced_prepared_region(
+        &self,
+        host_uri: &Url,
+        region_id: &str,
+        current_language: Option<&str>,
+    ) {
+        self.prepare
+            .forget_region_except(host_uri, region_id, current_language);
+    }
+
     /// Drop a closed host's prepared documents.
     pub(crate) fn forget_prepared_host(&self, host_uri: &Url) {
         self.prepare.forget_host(host_uri);
