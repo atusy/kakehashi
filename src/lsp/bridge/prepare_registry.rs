@@ -356,6 +356,14 @@ impl PrepareRegistry {
         if cell.in_flight.swap(true, Ordering::AcqRel) {
             return false;
         }
+        // An attempt that ended between the checks above and the claim
+        // (it sets its outcome or backoff before releasing `in_flight`)
+        // still decides: no second request for an answered revision, and
+        // none inside the backoff that attempt just set.
+        if cell.outcome.get().is_some() || cell.backing_off() {
+            cell.in_flight.store(false, Ordering::Release);
+            return false;
+        }
         let end = AttemptEnd(Arc::clone(cell));
         let entries = Arc::clone(&self.entries);
         let region = region_hash(
