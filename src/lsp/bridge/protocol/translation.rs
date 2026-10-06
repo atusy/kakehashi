@@ -245,6 +245,20 @@ pub(crate) fn host_position_within_region(host_position: Position, offset: &Regi
     host_position.character >= offset.column_for_line(virtual_line)
 }
 
+/// Whether the host range reaches into a gap of the prepared document
+/// `offset` maps to — host-owned text a downstream answer keyed to that
+/// range (a color presentation's label) would overwrite.
+pub(crate) fn host_range_in_prepared_gap(host_range: Range, offset: &RegionOffset) -> bool {
+    let Some(prepared) = offset.prepared() else {
+        return false;
+    };
+    let mut range = host_range;
+    let unprepared = offset.unprepared();
+    translate_host_position_to_virtual(&mut range.start, &unprepared);
+    translate_host_position_to_virtual(&mut range.end, &unprepared);
+    prepared.virtual_range_in_gap(range)
+}
+
 /// Whether `host_position` lies within indentation the prepare peer removed
 /// from the document `offset` maps to. Downstream sees the caret at the
 /// line's content instead, so an edit it anchors there (a completion's

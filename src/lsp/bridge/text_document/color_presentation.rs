@@ -131,6 +131,14 @@ fn transform_color_presentation_response_to_host(
     if result.is_null() {
         return vec![];
     }
+    // A presentation replaces the request range (its label, or an edit the
+    // server keys to that range); over a gap of a prepared document that
+    // range stands for host-owned text no presentation may overwrite — the
+    // prepared range may even be empty, where an edit would only insert
+    // beside the host text it was asked to replace.
+    if super::super::protocol::host_range_in_prepared_gap(host_request_range, offset) {
+        return vec![];
+    }
 
     // Parse into typed Vec<ColorPresentation>
     let mut presentations: Vec<ColorPresentation> = match serde_json::from_value(result) {
@@ -776,16 +784,57 @@ mod tests {
                 "newText": "shade"
             }}
         ]});
-        // The editor's request range is the interpolation itself.
+        // The editor's request range is the interpolation itself: every
+        // presentation stands for replacing it.
         let request = Range::new(Position::new(0, 8), Position::new(0, 12));
         let kept = transform_color_presentation_response_to_host(
-            response,
+            response.clone(),
             &offset,
             Position::new(0, 13),
             request,
         );
-        assert_eq!(kept.len(), 1, "{kept:?}");
-        assert_eq!(kept[0].label, "x");
+        assert!(kept.is_empty(), "{kept:?}");
+        // Requested elsewhere, the explicit edit outside the gap is kept.
+        let kept = transform_color_presentation_response_to_host(
+            response,
+            &offset,
+            Position::new(0, 13),
+            Range::new(Position::new(0, 0), Position::new(0, 5)),
+        );
+        assert_eq!(kept.len(), 2, "{kept:?}");
+    }
+
+    #[test]
+    fn a_presentation_over_an_emptied_gap_is_dropped() {
+        use super::super::super::protocol::{SegmentKind, VirtualLayout, apply_prepare_result};
+        // `color: #${c};` with the interpolation prepared as nothing: the
+        // request range is empty in the prepared document.
+        let virtual_text = "color: #    ;";
+        let layout = VirtualLayout::from_pieces(
+            virtual_text,
+            [
+                (SegmentKind::Content, 0..8, String::new()),
+                (SegmentKind::Gap, 8..12, "${c}".to_string()),
+                (SegmentKind::Content, 12..13, String::new()),
+            ],
+        );
+        let result = serde_json::from_value(json!({"segments": [
+            {"type": "content"}, {"type": "gap", "content": ""}, {"type": "content"}
+        ]}))
+        .unwrap();
+        let prepared = apply_prepare_result(virtual_text, &layout, Some(result)).unwrap();
+        let offset = RegionOffset::new(0, 0).with_prepared(prepared.map);
+        let response = json!({"jsonrpc": "2.0", "id": 1, "result": [{"label": "#00ff00"}]});
+        let kept = transform_color_presentation_response_to_host(
+            response,
+            &offset,
+            Position::new(0, 13),
+            Range::new(Position::new(0, 8), Position::new(0, 12)),
+        );
+        assert!(
+            kept.is_empty(),
+            "the label would only be inserted beside ${{c}}: {kept:?}"
+        );
     }
 
     #[test]
