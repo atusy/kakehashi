@@ -97,6 +97,9 @@ impl Kakehashi {
                         // A prepared document cannot be resent from here (this
                         // would sync the unprepared text) nor its item translated
                         // back through an envelope; leave the item unresolved.
+                        // (Settings decide too: right after a peer is retargeted,
+                        // the registry has no entry yet while servers still hold
+                        // the old peer's text.)
                         if !matches!(
                             self.bridge.prepared_state(
                                 &host_url,
@@ -105,7 +108,12 @@ impl Kakehashi {
                                 &region.virtual_content,
                             ),
                             crate::lsp::bridge::PreparedState::Unprepared
-                        ) {
+                        ) || self
+                            .document_language(&host_url)
+                            .is_some_and(|host_language| {
+                                self.prepares(&host_language, &region.injection_language)
+                            })
+                        {
                             return None;
                         }
                         let text = std::sync::Arc::from(region.virtual_content.as_str());

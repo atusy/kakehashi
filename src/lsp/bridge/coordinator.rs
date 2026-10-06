@@ -528,6 +528,18 @@ impl BridgeCoordinator {
             .state(host_uri, injection_language, region_id, virtual_text)
     }
 
+    /// Drop one region's prepared document (see
+    /// `PrepareRegistry::forget_region`).
+    pub(crate) fn forget_prepared_region(
+        &self,
+        host_uri: &Url,
+        injection_language: Option<&str>,
+        region_id: &str,
+    ) {
+        self.prepare
+            .forget_region(host_uri, injection_language, region_id);
+    }
+
     /// Drop a closed host's prepared documents.
     pub(crate) fn forget_prepared_host(&self, host_uri: &Url) {
         self.prepare.forget_host(host_uri);

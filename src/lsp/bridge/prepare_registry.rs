@@ -134,6 +134,10 @@ pub(crate) enum PreparedState {
 
 pub(crate) struct PrepareRegistry {
     entries: DashMap<EntryKey, Entry>,
+    /// Whether anything was ever prepared: lets the lookups every bridged
+    /// region makes per edit skip the map (and its key allocations) when no
+    /// pair has a prepare peer.
+    ever_used: AtomicBool,
     resync_tx: UnboundedSender<Url>,
     resync_rx: std::sync::Mutex<Option<UnboundedReceiver<Url>>>,
 }
@@ -151,6 +155,7 @@ impl Default for PrepareRegistry {
         let (resync_tx, resync_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             entries: DashMap::new(),
+            ever_used: AtomicBool::new(false),
             resync_tx,
             resync_rx: std::sync::Mutex::new(Some(resync_rx)),
         }
@@ -276,6 +281,9 @@ impl PrepareRegistry {
         region_id: &str,
         virtual_text: &str,
     ) -> PreparedState {
+        if !self.ever_used.load(Ordering::Acquire) {
+            return PreparedState::Unprepared;
+        }
         let Some(entry) = self.entries.get(&(
             host_uri.to_string(),
             injection_language.to_string(),
@@ -301,6 +309,32 @@ impl PrepareRegistry {
         });
     }
 
+    /// Forget one region's document: its pair no longer has a peer, or the
+    /// region itself was replaced or invalidated. `injection_language`
+    /// `None` forgets the region under every language.
+    pub(crate) fn forget_region(
+        &self,
+        host_uri: &Url,
+        injection_language: Option<&str>,
+        region_id: &str,
+    ) {
+        if !self.ever_used.load(Ordering::Acquire) {
+            return;
+        }
+        match injection_language {
+            Some(language) => {
+                self.entries.remove(&(
+                    host_uri.to_string(),
+                    language.to_string(),
+                    region_id.to_string(),
+                ));
+            }
+            None => self.entries.retain(|(host, _, region), _| {
+                host.as_str() != host_uri.as_str() || region != region_id
+            }),
+        }
+    }
+
     /// Forget a closed host's documents.
     pub(crate) fn forget_host(&self, host_uri: &Url) {
         self.entries
@@ -310,6 +344,7 @@ impl PrepareRegistry {
     /// The cell answering `input`, replacing a stale one (and bumping the
     /// revision) when the text, gaps or peer changed.
     fn cell(&self, target: &PrepareTarget, input: PrepareInput<'_>) -> (Arc<Cell>, i32) {
+        self.ever_used.store(true, Ordering::Release);
         let key = input_key(target, input);
         let mut entry = self
             .entries
@@ -587,6 +622,18 @@ mod tests {
     }
 
     #[test]
+    fn an_unused_registry_reads_unprepared_without_entries() {
+        let registry = PrepareRegistry::default();
+        let host = Url::parse("file:///host.md").unwrap();
+        assert!(matches!(
+            registry.state(&host, "lua", "r", "a"),
+            PreparedState::Unprepared
+        ));
+        registry.forget_region(&host, None, "r");
+        assert!(!registry.ever_used.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn retries_back_off_to_a_minute() {
         assert_eq!(retry_delay(1), Duration::from_secs(1));
         assert_eq!(retry_delay(2), Duration::from_secs(2));
@@ -619,6 +666,11 @@ mod tests {
         registry.retain(|_, _, server| server == "other");
         assert!(registry.entries.is_empty());
         registry.cell(&target, input("b"));
+        registry.forget_region(&host, None, "01J0000000000000000000000A");
+        assert!(registry.entries.is_empty());
+        registry.cell(&target, input("b"));
+        registry.forget_region(&host, Some("python"), "01J0000000000000000000000A");
+        assert_eq!(registry.entries.len(), 1, "another language's region stays");
         registry.forget_host(&host);
         assert!(registry.entries.is_empty());
     }

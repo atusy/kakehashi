@@ -172,8 +172,11 @@ impl InjectionCoordinator {
         // no current offset, so the editor never sees stale diagnostics; this
         // reclaims the lingering slot on the edit that orphaned it.
         for ulid in invalidated_ulids {
+            let region_id = ulid.to_string();
+            self.bridge
+                .forget_prepared_region(host_uri, None, &region_id);
             self.diagnostics
-                .evict_source(host_uri, &DiagnosticSource::Region(ulid.to_string()));
+                .evict_source(host_uri, &DiagnosticSource::Region(region_id));
         }
     }
 
@@ -393,6 +396,10 @@ impl InjectionCoordinator {
             self.bridge
                 .prepare_target(&settings, host_language, language, self.experimental)
         else {
+            // Sent as is from now on: whatever was prepared for it (before a
+            // settings change dropped its peer) no longer describes it.
+            self.bridge
+                .forget_prepared_region(uri, Some(language), region_id);
             return injection(content.to_string(), false);
         };
         let input = crate::lsp::bridge::PrepareInput {
@@ -540,6 +547,7 @@ impl InjectionCoordinator {
         }
         let replaced_regions = self.bridge.close_replaced_docs(uri, &injections).await;
         for region_id in replaced_regions {
+            self.bridge.forget_prepared_region(uri, None, &region_id);
             self.diagnostics
                 .evict_source(uri, &DiagnosticSource::Region(region_id));
         }
