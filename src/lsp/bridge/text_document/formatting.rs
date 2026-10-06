@@ -121,9 +121,13 @@ impl LanguageServerPool {
 ///
 /// Returns 1 for the empty string (a single empty line, index 0).
 pub(super) fn count_lines(text: &str) -> u32 {
-    // `matches('\n').count() + 1` gives the number of line "buckets" in the
-    // split — exactly what the LSP position model expects.
-    u32::try_from(text.matches('\n').count())
+    // Line breaks + 1 gives the number of line "buckets" in the split —
+    // exactly what the LSP position model expects, whose line breaks are
+    // `\n`, `\r\n` and a lone `\r` (which a prepare peer's gap placeholder,
+    // say, may contain).
+    let breaks =
+        text.matches('\n').count() + text.matches('\r').count() - text.matches("\r\n").count();
+    u32::try_from(breaks)
         .unwrap_or(u32::MAX - 1)
         .saturating_add(1)
 }
@@ -822,6 +826,8 @@ mod tests {
     #[case::trailing_newline("abc\n", 2)]
     #[case::two_trailing_newlines("abc\n\n", 3)]
     #[case::only_newline("\n", 2)]
+    #[case::crlf("abc\r\ndef", 2)]
+    #[case::lone_cr("abc\rdef\r", 3)]
     fn count_lines_matches_lsp_line_model(#[case] input: &str, #[case] expected: u32) {
         assert_eq!(count_lines(input), expected);
     }
