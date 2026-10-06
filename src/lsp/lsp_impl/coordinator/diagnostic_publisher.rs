@@ -1023,11 +1023,11 @@ impl DiagnosticPublisher {
             connection_id,
             diagnostics,
         );
-        // Admitted against a text the lifecycle pass replaced meanwhile: the
-        // replacement's eviction may have run before this push was recorded.
-        if let Some(epoch) = epoch
-            && self.bridge.prepared_sent_epoch(&recorded.host, &region_id) != Some(epoch)
-        {
+        // Admitted against a text the lifecycle pass replaced meanwhile — or
+        // before the region's first recorded send, which a first prepared
+        // text may have become: the replacement's eviction may have run
+        // before this push was recorded.
+        if self.bridge.prepared_sent_epoch(&recorded.host, &region_id) != epoch {
             self.aggregator
                 .evict_source(&recorded.host, &DiagnosticSource::Region(region_id));
         }
