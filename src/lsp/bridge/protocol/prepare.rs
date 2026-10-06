@@ -272,9 +272,18 @@ pub(crate) fn apply_prepare_result(
     layout: &VirtualLayout,
     result: Option<PrepareResult>,
 ) -> Result<PreparedDocument, PrepareError> {
-    let Some(result) = result else {
-        return Ok(PreparedDocument::unchanged(virtual_text));
-    };
+    // `null` keeps every segment. It still yields a map when the layout has
+    // gaps: the map is what keeps downstream edits off host-owned text.
+    let result = result.unwrap_or_else(|| PrepareResult {
+        segments: layout
+            .segments
+            .iter()
+            .map(|segment| match segment.kind {
+                SegmentKind::Content => WireSegmentResult::Content { changes: None },
+                SegmentKind::Gap => WireSegmentResult::Gap { content: None },
+            })
+            .collect(),
+    });
     if result.segments.len() != layout.segments.len() {
         return Err(PrepareError::SegmentCount {
             expected: layout.segments.len(),
@@ -346,12 +355,9 @@ pub(crate) fn apply_prepare_result(
         }
     }
 
-    let changed = runs.iter().any(|run| match run.kind {
-        RunKind::Identity => false,
-        RunKind::Deleted => true,
-        RunKind::Gap => text[run.prepared.clone()] != virtual_text[run.virtual_.clone()],
-    });
-    if !changed {
+    // Without deletions or gaps P is V and nothing needs mapping or
+    // protecting.
+    if runs.iter().all(|run| run.kind == RunKind::Identity) {
         return Ok(PreparedDocument::unchanged(virtual_text));
     }
     let fingerprint = {
@@ -1040,10 +1046,19 @@ mod tests {
     }
 
     #[test]
-    fn null_answer_keeps_the_virtual_document() {
+    fn null_answer_keeps_the_text_but_still_protects_gaps() {
         let (virtual_text, layout) = interpolated();
         let prepared = apply_prepare_result(&virtual_text, &layout, None).unwrap();
-        assert_eq!(prepared, PreparedDocument::unchanged(&virtual_text));
+        assert_eq!(prepared.text, virtual_text);
+        let map = prepared.map.expect("gaps stay protected");
+        assert_eq!(map.edits_to_virtual(&[edit((0, 5), (0, 6), "1")]), None);
+    }
+
+    #[test]
+    fn null_answer_without_gaps_needs_no_map() {
+        let layout = VirtualLayout::single("a\n");
+        let prepared = apply_prepare_result("a\n", &layout, None).unwrap();
+        assert_eq!(prepared, PreparedDocument::unchanged("a\n"));
     }
 
     #[test]
@@ -1057,7 +1072,7 @@ mod tests {
             ),
         )
         .unwrap();
-        assert_eq!(prepared, PreparedDocument::unchanged(&virtual_text));
+        assert_eq!(prepared.text, virtual_text);
     }
 
     #[test]

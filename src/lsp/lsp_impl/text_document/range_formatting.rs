@@ -182,7 +182,9 @@ impl Kakehashi {
                 // Non-contiguous combined injections contain masked host-only
                 // gaps. Even a covering range may fall back to full formatting,
                 // whose single replacement would overwrite those real gaps.
-                if !resolved.contiguous {
+                if !resolved.contiguous
+                    && !self.prepares(&language_name, &resolved.injection_language)
+                {
                     continue;
                 }
                 // A covering request (its byte span encloses the whole region)
@@ -294,6 +296,9 @@ impl Kakehashi {
                 else {
                     continue;
                 };
+                if !region_ctx.resolved.contiguous && region_ctx.prepared.is_none() {
+                    continue;
+                }
                 // Mint this region's tracked-source token into the shared
                 // aggregator (the per-region map dispatch hands to its winning
                 // downstream).

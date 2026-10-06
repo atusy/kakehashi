@@ -308,8 +308,10 @@ impl Kakehashi {
         for resolved in all_regions.iter() {
             // Non-contiguous combined injections contain masked host-only gaps.
             // A formatter returns a contiguous whole-document replacement, which
-            // would replace those real host gaps as well and corrupt the document.
-            if !resolved.contiguous {
+            // would replace those real host gaps as well and corrupt the document
+            // — unless a prepare peer's map re-diffs the result and refuses any
+            // change to a gap (checked again once the context is prepared).
+            if !resolved.contiguous && !self.prepares(language_name, &resolved.injection_language) {
                 continue;
             }
             let configs = self
@@ -383,6 +385,9 @@ impl Kakehashi {
             else {
                 continue;
             };
+            if !region_ctx.resolved.contiguous && region_ctx.prepared.is_none() {
+                continue;
+            }
             // Decide how this region formats — concatenated pipeline, preferred
             // fan-out, or skip — from its resolved aggregation config. See
             // [`plan_region_format`] for the allowlist rule

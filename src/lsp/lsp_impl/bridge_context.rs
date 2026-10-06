@@ -1165,7 +1165,13 @@ impl Kakehashi {
             return None;
         };
 
-        if !resolved.contiguous && method_requires_contiguous_injection(method_name) {
+        // Edits cannot be validated against a non-contiguous document's masked
+        // gaps, unless a prepare peer's map will (checked again once the
+        // context is prepared).
+        if !resolved.contiguous
+            && method_requires_contiguous_injection(method_name)
+            && !self.prepares(&language_name, &resolved.injection_language)
+        {
             return None;
         }
 
@@ -1401,14 +1407,36 @@ impl Kakehashi {
             max_fan_out: agg.max_fan_out,
             client_progress_token: None,
         };
-        prepare_request_context(
+        let ctx = prepare_request_context(
             &self.bridge,
             &self.settings_manager.load_settings(),
             self.experimental_enabled(),
             &preamble.language_name,
             ctx,
         )
-        .await
+        .await?;
+        // A prepared document's map keeps edits off its gaps; without one, a
+        // non-contiguous document stays closed to edit-producing methods.
+        if !ctx.resolved.contiguous
+            && ctx.prepared.is_none()
+            && method_requires_contiguous_injection(method_name)
+        {
+            return None;
+        }
+        Some(ctx)
+    }
+
+    /// Whether `injection_language` documents in `host_language` hosts go
+    /// through a prepare peer (`bridge.<injection>.prepare`).
+    pub(crate) fn prepares(&self, host_language: &str, injection_language: &str) -> bool {
+        self.bridge
+            .prepare_target(
+                &self.settings_manager.load_settings(),
+                host_language,
+                injection_language,
+                self.experimental_enabled(),
+            )
+            .is_some()
     }
 
     /// Resolve all aggregation settings (strategy, priorities, max_fan_out) for a
@@ -1974,7 +2002,10 @@ impl Kakehashi {
         };
         let mut contexts = Vec::new();
         for resolved in regions {
-            if !resolved.contiguous && method_requires_contiguous_injection(method_name) {
+            if !resolved.contiguous
+                && method_requires_contiguous_injection(method_name)
+                && !self.prepares(&language_name, &resolved.injection_language)
+            {
                 continue;
             }
             // Clamp to the region so the translated range is in-region; skip a

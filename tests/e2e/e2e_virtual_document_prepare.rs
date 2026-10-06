@@ -4,7 +4,7 @@
 //! (`tests/bin/mock_formatter.rs`) reports what reached it.
 //!
 //! The tsudoi hook dedents content by its common indentation and replaces
-//! every gap with a `--` comment line. The mock answers hover with the text
+//! every gap with a placeholder line (`--` unless a test needs another). The mock answers hover with the text
 //! it holds, ranged over the hovered line in its own coordinates, and
 //! formats by uppercasing — so each test proves both directions: the
 //! downstream server sees the prepared text, and its positions and edits map
@@ -21,7 +21,8 @@ use serde_json::{Value, json};
 /// The published tsudoi build the hook runs on.
 const TSUDOI: &str = "npm:@atusy/tsudoi-language-server@0.1.0-alpha.2/cli";
 
-/// The prepare hook, as a tsudoi config: dedent content, fill gaps.
+/// The prepare hook, as a tsudoi config: dedent content, fill gaps with
+/// `PLACEHOLDER` (substituted per test).
 const TSUDOI_CONFIG: &str = r#"
 export default async () => ({
   methods: {
@@ -60,7 +61,7 @@ function prepare(segments: { type: string; content: string }[]) {
   return {
     segments: segments.map((segment, index) =>
       segment.type === "gap"
-        ? { type: "gap", content: "--\n" }
+        ? { type: "gap", content: PLACEHOLDER }
         : {
           type: "content",
           changes: indent === 0 ? [] : lineStarts(index).map(({ line }) => ({
@@ -107,11 +108,16 @@ fn skip_if_deno_unavailable() -> bool {
 }
 
 /// Start kakehashi with tsudoi preparing markdown's lua documents for the
-/// `echo-document` mock. `combined` swaps in [`COMBINED_QUERY`].
-fn init_client(combined: bool) -> (LspClient, tempfile::TempDir) {
+/// `echo-document` mock. `combined` swaps in [`COMBINED_QUERY`]; gaps are
+/// replaced with `placeholder`.
+fn init_client(combined: bool, placeholder: &str) -> (LspClient, tempfile::TempDir) {
     let dir = tempfile::TempDir::new().expect("temp dir");
     let tsudoi_config = dir.path().join("tsudoi.config.ts");
-    std::fs::write(&tsudoi_config, TSUDOI_CONFIG).expect("write tsudoi config");
+    let hook = format!(
+        "const PLACEHOLDER = {};\n{TSUDOI_CONFIG}",
+        serde_json::to_string(placeholder).expect("placeholder as a JS string")
+    );
+    std::fs::write(&tsudoi_config, hook).expect("write tsudoi config");
     let config_path = dir.path().join("kakehashi.toml");
     std::fs::write(&config_path, "").expect("write kakehashi config");
     let mut markdown = json!({ "bridge": { "lua": { "prepare": "tsudoi" } } });
@@ -246,7 +252,7 @@ fn downstream_sees_the_dedented_document_and_maps_back() {
     if skip_if_deno_unavailable() {
         return;
     }
-    let (mut client, _dir) = init_client(false);
+    let (mut client, _dir) = init_client(false, "--\n");
     let uri = "file:///prepare/dedent.md";
     let text = "# t\n\n```lua\n  local x = 1\n  print(x)\n```\n";
     open(&mut client, uri, text);
@@ -276,7 +282,7 @@ fn downstream_sees_gaps_replaced_and_lines_map_back() {
     if skip_if_deno_unavailable() {
         return;
     }
-    let (mut client, _dir) = init_client(true);
+    let (mut client, _dir) = init_client(true, "--\n");
     let uri = "file:///prepare/combined.md";
     let text = "```lua\nlocal a = 1\n```\n\ntext\n\n```lua\nprint(a)\n```\n";
     open(&mut client, uri, text);
@@ -293,4 +299,50 @@ fn downstream_sees_gaps_replaced_and_lines_map_back() {
             "end": { "line": 7, "character": 8 }
         })
     );
+}
+
+#[test]
+fn formatting_a_combined_document_leaves_its_gaps_alone() {
+    if skip_if_deno_unavailable() {
+        return;
+    }
+    let (mut client, _dir) = init_client(true, "--\n");
+    let uri = "file:///prepare/combined-format.md";
+    let text = "```lua\nlocal a = 1\n```\n\ntext\n\n```lua\nprint(a)\n```\n";
+    open(&mut client, uri, text);
+
+    // The mock uppercases the whole prepared document, `--` placeholder
+    // included (it is unchanged by uppercasing); only the two fences'
+    // content may change in the host.
+    let edits = format_with_retry(&mut client, uri);
+    assert_eq!(
+        apply_edits(text, &edits),
+        "```lua\nLOCAL A = 1\n```\n\ntext\n\n```lua\nPRINT(A)\n```\n"
+    );
+}
+
+#[test]
+fn formatting_that_would_rewrite_a_gap_is_refused() {
+    if skip_if_deno_unavailable() {
+        return;
+    }
+    // Uppercasing turns this placeholder into `-- GAP`: an edit to host-owned
+    // text, which must fail the request rather than reach the host.
+    let (mut client, _dir) = init_client(true, "-- gap\n");
+    let uri = "file:///prepare/combined-refused.md";
+    let text = "```lua\nlocal a = 1\n```\n\ntext\n\n```lua\nprint(a)\n```\n";
+    open(&mut client, uri, text);
+    // Wait until the prepared document is served before formatting once.
+    let hover = hover_with_retry(&mut client, uri, 7, 1);
+    assert_eq!(hover_text(&hover), "local a = 1\n-- gap\nprint(a)\n");
+
+    let response = client.send_request(
+        "textDocument/formatting",
+        json!({
+            "textDocument": { "uri": uri },
+            "options": { "tabSize": 2, "insertSpaces": true }
+        }),
+    );
+    let edits = response["result"].as_array().cloned().unwrap_or_default();
+    assert_eq!(apply_edits(text, &edits), text, "{response}");
 }
