@@ -755,6 +755,22 @@ impl PreparedMap {
             })
     }
 
+    /// Whether a V position sits within indentation the peer removed (at
+    /// its start included): P has no position there, and one at the line's
+    /// content stands in for it.
+    pub(crate) fn virtual_position_in_removed_indent(&self, position: Position) -> bool {
+        let offset = self.virtual_lines.offset_clamped(position);
+        let first = self.runs.partition_point(|run| run.virtual_.end <= offset);
+        self.runs[first..]
+            .iter()
+            .take_while(|run| run.virtual_.start <= offset)
+            .any(|run| {
+                run.kind == RunKind::Deleted
+                    && run.virtual_.start <= offset
+                    && offset < run.virtual_.end
+            })
+    }
+
     /// Whether a V position sits strictly inside a gap: host-owned text no
     /// downstream position stands for.
     pub(crate) fn virtual_position_in_gap(&self, position: Position) -> bool {

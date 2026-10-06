@@ -24,7 +24,8 @@ use super::super::protocol::{
     response_has_jsonrpc_error, text_edit_safe_in_region,
 };
 use super::super::protocol::{
-    ranges_overlap, translate_virtual_range_to_host, translate_virtual_text_edit_to_host,
+    host_position_in_removed_indent, ranges_overlap, translate_virtual_range_to_host,
+    translate_virtual_text_edit_to_host,
 };
 use tower_lsp_server::ls_types::TextDocumentPositionParams;
 
@@ -52,6 +53,12 @@ impl LanguageServerPool {
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Option<CompletionList>> {
+        // Inside removed indentation the server sees the caret at the line's
+        // content: its items would replace text after the caret the client
+        // asked at, which LSP requires an edit's range to contain.
+        if host_position_in_removed_indent(host_position, &offset) {
+            return Ok(None);
+        }
         let host_incarnation = self.current_host_incarnation(host_uri);
         let handle = self
             .get_or_create_virtual_connection(
