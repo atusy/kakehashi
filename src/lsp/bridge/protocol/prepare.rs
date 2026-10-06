@@ -580,7 +580,8 @@ impl PreparedMap {
 
     /// Translate one edit a downstream server made to P into an edit to V,
     /// keeping its extent (a completion's replace range, say) rather than
-    /// minimizing it. `None` — refuse the edit — under the same rules as
+    /// minimizing it — except that a change at a dedented line's start also
+    /// covers the indent the peer removed there, which it restores. `None` — refuse the edit — under the same rules as
     /// [`Self::edits_to_virtual`].
     pub(crate) fn edit_to_virtual(&self, edit: &TextEdit) -> Option<TextEdit> {
         let start = self.prepared_lines.offset_clamped(edit.range.start);
@@ -609,7 +610,11 @@ impl PreparedMap {
         // the next line's indent the same way. Anywhere else (an insertion,
         // or a change joining onto the previous line) a line start maps after
         // its removed indent, as positions do.
-        let whole_lines = !old.is_empty() && is_line_start(self.prepared_lines.text(), old.start);
+        // An insertion that opens with a line break counts too: its first
+        // (new) line would otherwise keep the removed indent as trailing
+        // whitespace.
+        let whole_lines = (!old.is_empty() || new_text.starts_with(['\n', '\r']))
+            && is_line_start(self.prepared_lines.text(), old.start);
         let plain_start = map_offset(&self.runs, old.start, Bias::Start, Side::Prepared);
         // The removed indent right before where the start plainly maps — not
         // one beyond a gap the peer emptied at the same P offset.
@@ -621,7 +626,7 @@ impl PreparedMap {
         // The end maps plainly: after a removed indent at a line start, which
         // the change then takes along and `reindent` restores once.
         let virtual_end = if old.is_empty() {
-            virtual_start
+            plain_start
         } else {
             map_offset(&self.runs, old.end, Bias::End, Side::Prepared)
         };
@@ -649,7 +654,15 @@ impl PreparedMap {
             }
             None => FirstIndent::None,
         };
-        let new_text = self.reindent(virtual_start, first, new_text, following)?;
+        // The existing line after a change ending at a P line start keeps its
+        // own removed indent (none, for a line the peer did not dedent), not
+        // the segment's uniform one.
+        let tail = (following.is_some() && is_line_start(self.prepared_lines.text(), old.end))
+            .then(|| {
+                empty_run(&self.runs, old.end, RunKind::Deleted)
+                    .map_or("", |run| &virtual_text[run.virtual_.clone()])
+            });
+        let new_text = self.reindent(virtual_start, first, new_text, following, tail)?;
         Some(TextEdit {
             range: LspRange::new(
                 self.virtual_lines.position(virtual_start),
@@ -699,13 +712,15 @@ impl PreparedMap {
 
     /// Re-insert the segment's lost indentation at the start of every
     /// non-empty line the text begins: after each line break (the segment's
-    /// uniform indent), and at the very start as `first` says.
+    /// uniform indent, or `tail` before the existing line that follows), and
+    /// at the very start as `first` says.
     fn reindent(
         &self,
         virtual_start: usize,
         first: FirstIndent<'_>,
         text: &str,
         following: Option<char>,
+        tail: Option<&str>,
     ) -> Option<String> {
         let begins_line =
             |next: Option<char>| next.is_some_and(|next| next != '\n' && next != '\r');
@@ -741,7 +756,11 @@ impl PreparedMap {
             let line_break =
                 character == '\n' || (character == '\r' && chars.peek() != Some(&'\n'));
             if line_break && begins_line(chars.peek().copied().or(following)) {
-                output.push_str(line_indent);
+                match (chars.peek(), tail) {
+                    // The break before existing text: that line's own indent.
+                    (None, Some(tail)) => output.push_str(tail),
+                    _ => output.push_str(line_indent),
+                }
             }
         }
         Some(output)
@@ -1520,6 +1539,172 @@ mod tests {
         )
         .unwrap();
         std::sync::Arc::try_unwrap(prepared.map.unwrap()).unwrap()
+    }
+
+    #[test]
+    fn inserted_blank_lines_carry_no_indent() {
+        let imports = "  import os\n  x = 1\n";
+        let map = dedent_by_two(imports);
+        let formatted = map
+            .edits_to_virtual(&[edit((0, 0), (2, 0), "import os\n\n\nx = 1\n")])
+            .unwrap();
+        assert_eq!(apply_to(imports, &formatted), "  import os\n\n\n  x = 1\n");
+        let inserted = map.edit_to_virtual(&edit((1, 0), (1, 0), "\n")).unwrap();
+        assert_eq!(apply_to(imports, &[inserted]), "  import os\n\n  x = 1\n");
+    }
+
+    #[test]
+    fn a_line_the_peer_left_alone_gains_no_indent() {
+        // Only the first line was dedented.
+        let virtual_text = "  a\nb\n";
+        let layout = VirtualLayout::single(virtual_text);
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &layout,
+            result(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+            ]}]})),
+        )
+        .unwrap();
+        let map = prepared.map.unwrap();
+        let inserted = map.edit_to_virtual(&edit((1, 0), (1, 0), "x\n")).unwrap();
+        assert_eq!(apply_to(virtual_text, &[inserted]), "  a\n  x\nb\n");
+        let formatted = map
+            .edits_to_virtual(&[edit((0, 0), (2, 0), "a\n\nb\n")])
+            .unwrap();
+        assert_eq!(apply_to(virtual_text, &formatted), "  a\n\nb\n");
+    }
+
+    /// A small deterministic generator for the property test below.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((self.0 >> 33) % n as u64) as usize
+        }
+    }
+
+    /// Every non-empty line of `prepared` indented by `indent`.
+    fn indent_lines(prepared: &str, indent: &str) -> String {
+        let mut output = String::new();
+        let mut at_line_start = true;
+        let mut chars = prepared.chars().peekable();
+        while let Some(character) = chars.next() {
+            if at_line_start && character != '\n' && character != '\r' {
+                output.push_str(indent);
+            }
+            output.push(character);
+            at_line_start = character == '\n' || (character == '\r' && chars.peek() != Some(&'\n'));
+        }
+        output
+    }
+
+    /// A map dedenting every line of `virtual_text` that starts with `indent`.
+    fn dedent_all(virtual_text: &str, indent: &str) -> PreparedMap {
+        let lines = LineMap::new(virtual_text.to_string());
+        let changes: Vec<_> = (0..=virtual_text.len())
+            .filter(|&offset| {
+                virtual_text.is_char_boundary(offset)
+                    && is_line_start(virtual_text, offset)
+                    // Not between the CR and LF of one terminator.
+                    && !(offset > 0
+                        && virtual_text.as_bytes()[offset - 1] == b'\r'
+                        && virtual_text.as_bytes().get(offset) == Some(&b'\n'))
+                    && virtual_text[offset..].starts_with(indent)
+            })
+            .map(|offset| {
+                json!({"range": {
+                    "start": lines.position(offset),
+                    "end": lines.position(offset + indent.len())
+                }, "newText": ""})
+            })
+            .collect();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            result(json!({"segments": [{"type": "content", "changes": changes}]})),
+        )
+        .unwrap();
+        std::sync::Arc::try_unwrap(prepared.map.unwrap()).unwrap()
+    }
+
+    #[test]
+    fn formatting_a_uniformly_dedented_document_reindents_exactly() {
+        // Property: for any document indented uniformly and dedented by the
+        // peer, any formatter result maps back to that result re-indented.
+        let mut random = Lcg(12345);
+        let words = ["a", "bb", "c d", "é", "x(y)", "  deep", "\tt"];
+        for _ in 0..3000 {
+            let eol = ["\n", "\r\n", "\r"][random.below(3)];
+            let indent = ["  ", "\t", "    "][random.below(3)];
+            let mut lines: Vec<String> = (0..1 + random.below(6))
+                .map(|_| {
+                    if random.below(4) == 0 {
+                        String::new()
+                    } else {
+                        words[random.below(words.len())].to_string()
+                    }
+                })
+                .collect();
+            if lines.iter().all(String::is_empty) {
+                continue;
+            }
+            let trailing = random.below(3) != 0;
+            let join = |lines: &[String], trailing: bool| {
+                let mut text = lines.join(eol);
+                if trailing {
+                    text.push_str(eol);
+                }
+                text
+            };
+            let prepared = join(&lines, trailing);
+            let virtual_text = indent_lines(&prepared, indent);
+            let map = dedent_all(&virtual_text, indent);
+            assert_eq!(map.prepared_lines.text(), prepared);
+            for _ in 0..1 + random.below(3) {
+                let len = lines.len();
+                match random.below(5) {
+                    0 if len > 1 => {
+                        lines.remove(random.below(len));
+                    }
+                    1 => lines.insert(
+                        random.below(len + 1),
+                        ["z", "", "q r"][random.below(3)].to_string(),
+                    ),
+                    2 if len > 1 => {
+                        let at = random.below(len - 1);
+                        let next = lines.remove(at + 1);
+                        lines[at].push_str(&next);
+                    }
+                    3 => lines[random.below(len)].insert(0, 'w'),
+                    _ => lines[random.below(len)].clear(),
+                }
+            }
+            let formatted = join(
+                &lines,
+                if random.below(5) == 0 {
+                    !trailing
+                } else {
+                    trailing
+                },
+            );
+            let whole = TextEdit {
+                range: LspRange::new(pos(0, 0), map.prepared_lines.position(prepared.len())),
+                new_text: formatted.clone(),
+            };
+            let edits = map
+                .edits_to_virtual(&[whole])
+                .unwrap_or_else(|| panic!("refused: {virtual_text:?} → {formatted:?}"));
+            assert_eq!(
+                apply_to(&virtual_text, &edits),
+                indent_lines(&formatted, indent),
+                "{virtual_text:?} → {formatted:?}"
+            );
+        }
     }
 
     #[test]
