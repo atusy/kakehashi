@@ -209,7 +209,7 @@ pub(crate) struct DocumentRequestContext {
 /// the region is then not bridged at all, never bridged unprepared.
 pub(crate) async fn prepare_request_context(
     bridge: &crate::lsp::bridge::BridgeCoordinator,
-    settings: &WorkspaceSettings,
+    settings: &std::sync::Arc<WorkspaceSettings>,
     experimental: bool,
     host_language: &str,
     ctx: DocumentRequestContext,
@@ -233,7 +233,7 @@ pub(crate) async fn prepare_request_context(
 /// host is synced again when the answer arrives).
 pub(crate) fn prepare_request_context_now(
     bridge: &crate::lsp::bridge::BridgeCoordinator,
-    settings: &WorkspaceSettings,
+    settings: &std::sync::Arc<WorkspaceSettings>,
     experimental: bool,
     host_language: &str,
     ctx: DocumentRequestContext,

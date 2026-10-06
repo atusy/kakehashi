@@ -882,7 +882,9 @@ document before the downstream servers see it, via
 `kakehashi/virtualDocument/prepare`
 (see virtual-document-prepare-protocol). The server must advertise
 `experimental.kakehashi.virtualDocumentPrepare`, and the feature requires
-`KAKEHASHI_EXPERIMENTAL=true`.
+`KAKEHASHI_EXPERIMENTAL=true`. Only languages that are bridged and have a
+downstream server are prepared; `prepare = ""` opts one language out of a
+wildcard's peer.
 
 ```toml
 [languages.nix.bridge._]
