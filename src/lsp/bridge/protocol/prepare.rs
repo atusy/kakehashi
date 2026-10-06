@@ -641,7 +641,25 @@ impl PreparedMap {
             _ => following,
         };
         let virtual_text = self.virtual_lines.text();
+        // The existing line after a change ending at a P line start keeps its
+        // own removed indent (none, for a line the peer did not dedent), not
+        // the segment's uniform one.
+        let tail = (following.is_some() && is_line_start(self.prepared_lines.text(), old.end))
+            .then(|| {
+                empty_run(&self.runs, old.end, RunKind::Deleted)
+                    .map_or("", |run| &virtual_text[run.virtual_.clone()])
+            });
         let first = match start_indent {
+            // Whole lines replaced by text without a line break, before a
+            // non-blank line: what remains is that existing line, which keeps
+            // its own indent (deleting a line must not re-indent the next).
+            Some(_)
+                if !new_text.contains(['\n', '\r'])
+                    && tail.is_some()
+                    && following.is_some_and(|next| next != '\n' && next != '\r') =>
+            {
+                FirstIndent::Exact(tail.unwrap_or_default())
+            }
             // The replaced line's own removed indent comes back.
             Some(run) => FirstIndent::Exact(&virtual_text[run.virtual_.clone()]),
             // Text landing at a V line start that kept no indent before it
@@ -654,14 +672,6 @@ impl PreparedMap {
             }
             None => FirstIndent::None,
         };
-        // The existing line after a change ending at a P line start keeps its
-        // own removed indent (none, for a line the peer did not dedent), not
-        // the segment's uniform one.
-        let tail = (following.is_some() && is_line_start(self.prepared_lines.text(), old.end))
-            .then(|| {
-                empty_run(&self.runs, old.end, RunKind::Deleted)
-                    .map_or("", |run| &virtual_text[run.virtual_.clone()])
-            });
         let new_text = self.reindent(virtual_start, first, new_text, following, tail)?;
         Some(TextEdit {
             range: LspRange::new(
@@ -1539,6 +1549,25 @@ mod tests {
         )
         .unwrap();
         std::sync::Arc::try_unwrap(prepared.map.unwrap()).unwrap()
+    }
+
+    #[test]
+    fn deleting_a_line_keeps_the_next_lines_own_indent() {
+        // Lines indented differently, each fully dedented by the peer.
+        let virtual_text = "  a\n    b\n";
+        let layout = VirtualLayout::single(virtual_text);
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &layout,
+            result(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 4}}, "newText": ""}
+            ]}]})),
+        )
+        .unwrap();
+        let map = prepared.map.unwrap();
+        let removed = map.edit_to_virtual(&edit((0, 0), (1, 0), "")).unwrap();
+        assert_eq!(apply_to(virtual_text, &[removed]), "    b\n");
     }
 
     #[test]
