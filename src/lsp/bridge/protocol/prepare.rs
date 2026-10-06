@@ -1161,6 +1161,25 @@ struct Hunk {
     new: Range<usize>,
 }
 
+/// `text` with LSP `edits` applied, a column past a line's end meaning the
+/// line's end; `None` when an edit is reversed or edits overlap.
+pub(crate) fn apply_text_edits_clamped(text: &str, edits: &[TextEdit]) -> Option<String> {
+    apply_edits(&LineMap::new(text.to_string()), edits)
+}
+
+/// LSP edits turning `old` into `new`, one per character-level diff hunk —
+/// minimal where a formatter's own answer may be one whole-document edit.
+pub(crate) fn text_edits_between(old: &str, new: &str) -> Vec<TextEdit> {
+    let lines = LineMap::new(old.to_string());
+    diff_hunks(old, new)
+        .into_iter()
+        .map(|hunk| TextEdit {
+            range: LspRange::new(lines.position(hunk.old.start), lines.position(hunk.old.end)),
+            new_text: new[hunk.new].to_string(),
+        })
+        .collect()
+}
+
 /// Character-level diff hunks between `old` and `new`, as byte ranges.
 fn diff_hunks(old: &str, new: &str) -> Vec<Hunk> {
     let old_chars: Vec<(usize, char)> = old.char_indices().collect();
@@ -1272,6 +1291,20 @@ mod tests {
             ],
         );
         (virtual_text, layout)
+    }
+
+    #[test]
+    fn edits_between_two_texts_turn_one_into_the_other() {
+        for (old, new) in [
+            ("\n  {\n  }\n    ", "\n{\n}\n    "),
+            ("a\r\nb\r\n", "a\r\nB\r\nc\r\n"),
+            ("same", "same"),
+            ("", "x"),
+        ] {
+            let edits = text_edits_between(old, new);
+            assert_eq!(apply_to(old, &edits), new, "{old:?} -> {new:?}: {edits:?}");
+        }
+        assert!(text_edits_between("same", "same").is_empty());
     }
 
     #[test]

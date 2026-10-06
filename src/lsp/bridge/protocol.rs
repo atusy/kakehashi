@@ -39,7 +39,7 @@ pub(crate) use lifecycle::*;
 pub(crate) use prepare::{
     Bias, PREPARE_METHOD, PREPARE_TIMEOUT, PrepareHostTextDocument, PrepareParams, PrepareResult,
     PrepareTextDocument, PreparedDocument, PreparedMap, SegmentKind, VirtualLayout,
-    apply_prepare_result, parse_prepare_response,
+    apply_prepare_result, apply_text_edits_clamped, parse_prepare_response, text_edits_between,
 };
 pub(crate) use request::*;
 pub(crate) use request_id::RequestId;

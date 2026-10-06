@@ -155,6 +155,28 @@ fn clamp_synthetic_eof_anchor(
     }
 }
 
+/// `edits` to `server_text`, unless they change its boundary layout (see
+/// [`restore_boundary_layout`]): then the edits from `server_text` to the
+/// formatted text with that layout restored. Edits that do not apply
+/// (reversed or overlapping) are left as they are, for the checks downstream
+/// to judge rather than be laundered.
+///
+/// [`restore_boundary_layout`]: crate::text::layout::restore_boundary_layout
+fn keep_boundary_layout(server_text: &str, edits: Vec<TextEdit>) -> Vec<TextEdit> {
+    if edits.is_empty() {
+        return edits;
+    }
+    let Some(formatted) = super::super::protocol::apply_text_edits_clamped(server_text, &edits)
+    else {
+        return edits;
+    };
+    let restored = crate::text::layout::restore_boundary_layout(server_text, &formatted);
+    if restored == formatted {
+        return edits;
+    }
+    super::super::protocol::text_edits_between(server_text, &restored)
+}
+
 /// Build a JSON-RPC formatting request for a downstream language server.
 ///
 /// Like `documentLink`/`documentSymbol`, formatting carries no position — only
@@ -205,7 +227,7 @@ pub(super) fn transform_formatting_response_to_host(
     offset: &RegionOffset,
     virtual_line_count: u32,
     region_end: Position,
-    _server_text: Option<&str>,
+    server_text: Option<&str>,
 ) -> io::Result<Vec<TextEdit>> {
     if response_has_jsonrpc_error(&response, "formatting-style request") {
         return Err(io::Error::other(
@@ -287,6 +309,14 @@ pub(super) fn transform_formatting_response_to_host(
         );
         return Ok(Vec::new());
     }
+
+    // The document's edges are the host's layout (the line break after a Nix
+    // `''`, the final line break and indentation before the closing `''`),
+    // which a formatter treating the document as a file strips; keep them.
+    let edits = match server_text {
+        Some(server_text) => keep_boundary_layout(server_text, edits),
+        None => edits,
+    };
 
     // A prepared document's edits are re-diffed back into the virtual
     // document; one touching host-owned text (a gap) fails the request
@@ -1078,6 +1108,114 @@ mod tests {
             host = text.split('\n').map(str::to_string).collect();
         }
         assert_eq!(host.join("\n"), "  if true; then\n    echo\n  fi\n");
+    }
+
+    /// `region` (at host line 10, column 0) with host `edits` applied.
+    fn apply_to_region(region: &str, edits: &[TextEdit]) -> String {
+        let mut text = region.to_string();
+        let mut sorted = edits.to_vec();
+        sorted.sort_by_key(|edit| std::cmp::Reverse(edit.range.start));
+        for edit in sorted {
+            let offset_of = |position: Position| {
+                text.split_inclusive('\n')
+                    .take((position.line - 10) as usize)
+                    .map(str::len)
+                    .sum::<usize>()
+                    + position.character as usize
+            };
+            let (start, end) = (offset_of(edit.range.start), offset_of(edit.range.end));
+            text.replace_range(start..end, &edit.new_text);
+        }
+        text
+    }
+
+    fn whole_document(new_text: &str) -> serde_json::Value {
+        json!({"jsonrpc": "2.0", "id": 42, "result": [{
+            "range": {"start": {"line": 0, "character": 0},
+                      "end": {"line": 2147483647, "character": 2147483647}},
+            "newText": new_text
+        }]})
+    }
+
+    #[test]
+    fn formatting_keeps_the_boundary_layout_of_an_unprepared_document() {
+        // `''\n{  }\n    ''` in Nix: the formatter strips the line break after
+        // the opening `''` and the one (with the indentation) before the
+        // closing `''`; only its change to the content is kept.
+        let region = "\n{  }\n    ";
+        let edits = transform_formatting_response_to_host(
+            whole_document("{}"),
+            &RegionOffset::new(10, 0),
+            count_lines(region),
+            Position::new(12, 4),
+            Some(region),
+        )
+        .unwrap();
+        assert_eq!(apply_to_region(region, &edits), "\n{}\n    ");
+    }
+
+    #[test]
+    fn formatting_keeps_the_boundary_layout_of_a_prepared_document() {
+        use super::super::super::protocol::{VirtualLayout, apply_prepare_result};
+        // The JSON in `''\n      {\n        "a":1\n      }\n    ''`, dedented
+        // by six; the formatter fixes the spacing and strips the boundaries.
+        let virtual_text = "\n      {\n        \"a\":1\n      }\n    ";
+        let changes = [1, 2, 3].map(|line| {
+            json!({"range": {"start": {"line": line, "character": 0},
+                             "end": {"line": line, "character": 6}}, "newText": ""})
+        });
+        let result = serde_json::from_value(json!({"segments": [
+            {"type": "content", "changes": changes}
+        ]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(result),
+        )
+        .unwrap();
+        let offset = RegionOffset::new(10, 0).with_prepared(prepared.map);
+        let edits = transform_formatting_response_to_host(
+            whole_document("{\n  \"a\": 1\n}"),
+            &offset,
+            count_lines(&prepared.text),
+            Position::new(14, 4),
+            Some(&prepared.text),
+        )
+        .unwrap();
+        assert_eq!(
+            apply_to_region(virtual_text, &edits),
+            "\n      {\n        \"a\": 1\n      }\n    "
+        );
+    }
+
+    #[test]
+    fn a_formatter_adding_a_final_line_break_does_not_double_it() {
+        let region = "\n{}\n    ";
+        let edits = transform_formatting_response_to_host(
+            whole_document("{}\n"),
+            &RegionOffset::new(10, 0),
+            count_lines(region),
+            Position::new(12, 4),
+            Some(region),
+        )
+        .unwrap();
+        assert_eq!(apply_to_region(region, &edits), region);
+    }
+
+    #[test]
+    fn a_formatter_still_trims_blank_lines_before_the_final_line_break() {
+        // A markdown fence's content: only the last line break is layout.
+        let region = "code\n\n\n";
+        let edits = transform_formatting_response_to_host(
+            whole_document("code\n"),
+            &RegionOffset::new(10, 0),
+            count_lines(region),
+            Position::new(13, 0),
+            Some(region),
+        )
+        .unwrap();
+        assert_eq!(apply_to_region(region, &edits), "code\n");
     }
 
     #[test]
