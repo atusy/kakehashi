@@ -517,8 +517,12 @@ fn a_document_the_peer_cannot_prepare_is_not_bridged() {
     let hover = hover_with_retry(&mut client, uri, 1, 1);
     assert_eq!(hover_text(&hover), "print(1)\n");
     // …and the second, whose prepare the peer answers with an error, is never
-    // sent downstream: no answer for it, rather than one from unprepared text.
-    for _ in 0..5 {
+    // sent downstream: no answer for it, rather than one from unprepared
+    // text. Asserted past the prepare timeout (5 s): a request waits for a
+    // pending prepare, so by then its failure was decided, and a document
+    // let through after it would answer.
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(7);
+    while std::time::Instant::now() < until {
         let response = client.send_request(
             "textDocument/hover",
             json!({
@@ -527,7 +531,7 @@ fn a_document_the_peer_cannot_prepare_is_not_bridged() {
             }),
         );
         assert!(response["result"].is_null(), "{response}");
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(std::time::Duration::from_millis(200));
     }
 }
 
