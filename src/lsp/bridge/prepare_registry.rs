@@ -647,6 +647,47 @@ mod tests {
         assert!(!registry.ever_used.load(Ordering::Acquire));
     }
 
+    #[tokio::test]
+    async fn a_peer_that_cannot_start_is_retried_after_a_backoff() {
+        let registry = PrepareRegistry::default();
+        let mut resync = registry.take_resync_rx().unwrap();
+        let pool = Arc::new(LanguageServerPool::new());
+        let host = Url::parse("file:///host.md").unwrap();
+        let input = PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: "01J0000000000000000000000A",
+            virtual_text: "a",
+            gaps: &[],
+        };
+        let target = PrepareTarget {
+            server_name: "peer".to_string(),
+            config: Some(Arc::new(BridgeServerConfig {
+                cmd: Some(vec!["/nonexistent/kakehashi-prepare-peer".to_string()]),
+                ..Default::default()
+            })),
+        };
+        // No answer: not cached, so the document is still pending…
+        assert!(registry.prepare(&pool, &target, input).await.is_none());
+        let (cell, _) = registry.cell(&target, input);
+        assert!(cell.outcome.get().is_none());
+        assert_eq!(cell.misses.load(Ordering::Acquire), 1);
+        // …but backing off: neither a lookup nor a request starts another
+        // attempt yet.
+        assert!(matches!(
+            registry.lookup_or_start(&pool, &target, input),
+            PrepareLookup::Pending
+        ));
+        assert!(registry.prepare(&pool, &target, input).await.is_none());
+        assert_eq!(*cell.attempts.borrow(), 1);
+        // The host is synced again once the backoff ends.
+        let resynced = tokio::time::timeout(Duration::from_secs(5), resync.recv())
+            .await
+            .expect("a re-sync after the backoff");
+        assert_eq!(resynced, Some(host.clone()));
+    }
+
     #[test]
     fn retries_back_off_to_a_minute() {
         assert_eq!(retry_delay(1), Duration::from_secs(1));

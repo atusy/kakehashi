@@ -2925,6 +2925,29 @@ mod tests {
     }
 
     #[test]
+    fn combined_content_records_stripped_line_prefixes() {
+        // Blockquoted lines: each `> ` sits before the line's first included
+        // byte and is stripped, not masked.
+        let text = "> a\n> b\n";
+        let (content, _, gaps) = build_combined_virtual_content(text, 0..text.len(), &[2..4, 6..8]);
+
+        assert_eq!(content, "a\nb\n");
+        assert_eq!(
+            gaps,
+            vec![
+                VirtualGap {
+                    virtual_range: 0..0,
+                    host_text: "> ".to_string(),
+                },
+                VirtualGap {
+                    virtual_range: 2..2,
+                    host_text: "> ".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn combined_content_records_masked_and_stripped_gaps_in_order() {
         // `${c}` interrupts a line; `ZZ` is a host-only line.
         let text = "ab${c}de\nZZ\nf\n";

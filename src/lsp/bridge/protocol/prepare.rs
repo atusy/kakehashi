@@ -1518,6 +1518,74 @@ mod tests {
     }
 
     #[test]
+    fn crlf_dedent_maps_and_reindents_with_crlf() {
+        let virtual_text = "  a\r\n  b\r\n".to_string();
+        let layout = VirtualLayout::single(&virtual_text);
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &layout,
+            result(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+            ]}]})),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "a\r\nb\r\n");
+        let map = prepared.map.unwrap();
+        assert_eq!(map.to_virtual(pos(1, 1), Bias::Start), pos(1, 3));
+        let inserted = map.edit_to_virtual(&edit((1, 1), (1, 1), "\r\nc")).unwrap();
+        assert_eq!(
+            apply_to(&virtual_text, &[inserted]),
+            "  a\r\n  b\r\n  c\r\n"
+        );
+    }
+
+    #[test]
+    fn lone_cr_lines_are_lines() {
+        let virtual_text = "  a\r  b".to_string();
+        let layout = VirtualLayout::single(&virtual_text);
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &layout,
+            result(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+            ]}]})),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "  a\rb");
+        assert_eq!(
+            prepared.map.unwrap().to_virtual(pos(1, 0), Bias::Start),
+            pos(1, 2)
+        );
+    }
+
+    #[test]
+    fn columns_after_a_placeholder_count_utf16_units() {
+        // `f(${a}, 𝄞é)`: the placeholder shrinks the gap, and the columns
+        // after it on that line count the surrogate pair as two units.
+        let virtual_text = "f(    , 𝄞é)".to_string();
+        let layout = VirtualLayout::from_pieces(
+            &virtual_text,
+            [
+                (SegmentKind::Content, 0..2, String::new()),
+                (SegmentKind::Gap, 2..6, "${a}".to_string()),
+                (SegmentKind::Content, 6..virtual_text.len(), String::new()),
+            ],
+        );
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &layout,
+            result(json!({"segments": [{"type": "content"}, {"type": "gap", "content": "1"}, {"type": "content"}]})),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "f(1, 𝄞é)");
+        let map = prepared.map.unwrap();
+        // `é` is P column 7 (f ( 1 , space 𝄞=2) and V column 10.
+        assert_eq!(map.to_virtual(pos(0, 7), Bias::Start), pos(0, 10));
+        assert_eq!(map.to_prepared(pos(0, 10), Bias::Start), pos(0, 7));
+    }
+
+    #[test]
     fn reindent_refuses_non_uniform_indentation() {
         let virtual_text = "  a\n    b\n".to_string();
         let layout = VirtualLayout::single(&virtual_text);
