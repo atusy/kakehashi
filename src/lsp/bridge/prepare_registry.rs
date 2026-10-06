@@ -740,23 +740,35 @@ impl PrepareRegistry {
             revision: self.revision(),
             cell: Arc::default(),
         };
-        let mut entry = self
-            .entries
-            .entry(region_hash(
-                host_uri,
-                input.injection_language,
-                input.region_id,
-            ))
-            .or_insert_with(|| Entry {
-                host_uri: host_uri.to_string(),
-                injection_language: input.injection_language.to_string(),
-                region_id: input.region_id.to_string(),
-                host_language: input.host_language.to_string(),
-                server_name: target.server_name.clone(),
-                server_config: target.config.clone(),
-                current: fresh(),
-                previous: None,
-            });
+        let region = region_hash(host_uri, input.injection_language, input.region_id);
+        if holder == Holder::Request
+            && !self.entries.contains_key(&region)
+            && self
+                .sent
+                .get(&sent_key(host_uri, input.region_id))
+                .is_some_and(|sent| {
+                    sent.is(host_uri, input.region_id)
+                        && sent.injection_language == input.injection_language
+                        && sent.prepared.is_none()
+                })
+        {
+            // The lifecycle pass sends this region unprepared: its pair has
+            // no peer under the settings it saw. A request still carrying an
+            // older target must not recreate the entry, which would read the
+            // region as prepared but unavailable and, failing, never re-sync;
+            // like any request under stale settings, it answers nothing.
+            return (Arc::default(), self.revision());
+        }
+        let mut entry = self.entries.entry(region).or_insert_with(|| Entry {
+            host_uri: host_uri.to_string(),
+            injection_language: input.injection_language.to_string(),
+            region_id: input.region_id.to_string(),
+            host_language: input.host_language.to_string(),
+            server_name: target.server_name.clone(),
+            server_config: target.config.clone(),
+            current: fresh(),
+            previous: None,
+        });
         if !entry.is(host_uri, input.injection_language, input.region_id)
             // The same peer launched differently answers differently, and
             // the config is no part of the input key: a lookup made under
@@ -1541,6 +1553,35 @@ mod tests {
         ));
         let (still, _) = registry.cell(&target("bun"), input, Holder::LifecyclePass);
         assert!(Arc::ptr_eq(&still, &current));
+    }
+
+    #[test]
+    fn a_stale_request_does_not_recreate_an_unprepared_region() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let region = "01J0000000000000000000000A";
+        let input = PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: region,
+            virtual_text: "  a",
+            gaps: &[],
+        };
+        registry.cell(&target, input, Holder::LifecyclePass);
+        registry.note_sent(&host, "lua", region, &sent_text("a"));
+        // The peer is removed: the lifecycle pass sends the text unprepared.
+        registry.retain(|_, _, _, _| false, false);
+        registry.note_unprepared_sent(&host, "lua", region, "  a");
+        registry.cell(&target, input, Holder::Request);
+        assert!(
+            matches!(
+                registry.state(&host, "lua", region, "  a"),
+                PreparedState::Unprepared
+            ),
+            "a request under the old settings must not bring the entry back"
+        );
     }
 
     #[test]
