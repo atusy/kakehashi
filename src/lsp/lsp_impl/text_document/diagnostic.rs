@@ -504,12 +504,8 @@ impl Kakehashi {
         } else if prepare_skipped.load(std::sync::atomic::Ordering::Relaxed) {
             // Owed a refresh once the region's prepared text is sent (the
             // prepare resync takes the debt), not right away: a re-pull now
-            // would find the region still waiting on its peer. Unless its
-            // answer came while this pull ran, after that resync looked.
-            if self.bridge.owe_pull_after_prepare(&uri) {
-                crate::lsp::lsp_impl::DiagnosticPublisher::new(self)
-                    .request_pull_diagnostic_refresh(true);
-            }
+            // would find the region still waiting on its peer.
+            self.bridge.owe_pull_after_prepare(&uri);
         } else {
             // A failed/partial fan-out (`!pull_clean`) still advances the
             // coverage version but clears neither the pull-view lag nor the

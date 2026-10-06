@@ -593,15 +593,21 @@ impl BridgeCoordinator {
 
     /// Note that a pull for `host` was answered without documents still
     /// waiting for their prepare answers; it is owed a
-    /// `workspace/diagnostic/refresh` once they are sent. `true` when none is
-    /// pending any more — the answer came while the pull ran, and the
-    /// caller owes the refresh now (the debt is taken back).
-    pub(crate) fn owe_pull_after_prepare(&self, host: &Url) -> bool {
+    /// `workspace/diagnostic/refresh` once a resync pass sends them. When
+    /// none is pending any more — the answer came while the pull ran, and
+    /// its resync may already have looked for the debt — the host is synced
+    /// again, so a pass that reaches every server settles it.
+    pub(crate) fn owe_pull_after_prepare(&self, host: &Url) {
         self.prepare_pull_debts.insert(host.clone());
-        if self.prepare.host_has_pending(host) {
-            return false;
+        if !self.prepare.host_has_pending(host) {
+            self.prepare.requeue_resync(
+                super::prepare_registry::Resync {
+                    host_uri: host.clone(),
+                    ready: false,
+                },
+                std::time::Duration::ZERO,
+            );
         }
-        self.prepare_pull_debts.remove(host).is_some()
     }
 
     /// Whether any of `host`'s documents still waits for its prepare answer.
