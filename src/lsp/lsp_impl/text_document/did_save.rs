@@ -161,6 +161,7 @@ impl Kakehashi {
                     .hold_save(uri, saved_incarnation, saved_content_version, held);
             }
             let injections = crate::lsp::lsp_impl::coordinator::sendable_injections(injections);
+            self.injection_coordinator().note_sending(uri, &injections);
             pool.sync_and_forward_did_save_to_virtual_docs(uri, saved_incarnation, &injections)
                 .await;
         }

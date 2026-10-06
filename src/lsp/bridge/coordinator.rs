@@ -41,6 +41,9 @@ pub(crate) struct BridgeInjection {
     /// injection still exists — its open document stays open — but neither
     /// opens nor changes downstream.
     pub(crate) held: bool,
+    /// The prepared answer `content` is, for a prepared document: what the
+    /// lifecycle pass records as sent when it sends it.
+    pub(crate) prepared: Option<Arc<super::protocol::PreparedDocument>>,
 }
 
 /// The launch config of the server a `prepare` field names: a configured,
@@ -3092,6 +3095,7 @@ mod tests {
         let injections = || {
             vec![BridgeInjection {
                 held: false,
+                prepared: None,
                 language: "lua".to_string(),
                 region_id: "region-0".to_string(),
                 content: "print(1)\n".to_string(),
@@ -3157,6 +3161,7 @@ mod tests {
         let injections = || {
             vec![BridgeInjection {
                 held: false,
+                prepared: None,
                 language: "lua".to_string(),
                 region_id: "region-0".to_string(),
                 content: "print(1)\n".to_string(),
@@ -3716,6 +3721,7 @@ mod tests {
 
         let injections = vec![BridgeInjection {
             held: false,
+            prepared: None,
             language: "python".to_string(),
             region_id: "region-0".to_string(),
             content: "import os\n".to_string(),
@@ -3781,6 +3787,7 @@ mod tests {
         let host_uri = Url::parse("file:///doc.md").unwrap();
         let injections = vec![BridgeInjection {
             held: false,
+            prepared: None,
             language: "python".to_string(),
             region_id: "region-0".to_string(),
             content: "import os\n".to_string(),
@@ -3820,6 +3827,7 @@ mod tests {
         let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap();
         let injection = BridgeInjection {
             held: false,
+            prepared: None,
             language: "lua".to_string(),
             region_id: "region-0".to_string(),
             content: "print('hello')".to_string(),
@@ -4204,6 +4212,7 @@ mod tests {
     fn injection(language: &str, region_id: &str) -> BridgeInjection {
         BridgeInjection {
             held: false,
+            prepared: None,
             language: language.to_string(),
             region_id: region_id.to_string(),
             content: String::new(),

@@ -8133,6 +8133,7 @@ mod tests {
         use crate::lsp::bridge::coordinator::BridgeInjection;
         let injections = vec![BridgeInjection {
             held: false,
+            prepared: None,
             language: "lua".to_string(),
             region_id: TEST_ULID_LUA_0.to_string(),
             content: "local x = 42".to_string(),
@@ -8227,6 +8228,7 @@ mod tests {
             1,
             &[super::super::coordinator::BridgeInjection {
                 held: false,
+                prepared: None,
                 language: "lua".to_string(),
                 region_id: TEST_ULID_LUA_0.to_string(),
                 content: "print('current')".to_string(),
@@ -8266,6 +8268,7 @@ mod tests {
             1,
             &[super::super::coordinator::BridgeInjection {
                 held: false,
+                prepared: None,
                 language: "lua".into(),
                 region_id: TEST_ULID_LUA_0.into(),
                 content: "print('previous')".into(),
@@ -8417,6 +8420,7 @@ mod tests {
                 },
                 vec![super::super::coordinator::BridgeInjection {
                     held: false,
+                    prepared: None,
                     language: "lua".to_string(),
                     region_id: TEST_ULID_LUA_0.to_string(),
                     content: "print('old lifetime')".to_string(),
@@ -8465,6 +8469,7 @@ mod tests {
                 },
                 vec![super::super::coordinator::BridgeInjection {
                     held: false,
+                    prepared: None,
                     language: "lua".to_string(),
                     region_id: TEST_ULID_LUA_0.to_string(),
                     content: "print('old lifetime')".to_string(),
@@ -8489,6 +8494,7 @@ mod tests {
             1,
             &[super::super::coordinator::BridgeInjection {
                 held: false,
+                prepared: None,
                 language: "lua".to_string(),
                 region_id: TEST_ULID_LUA_0.to_string(),
                 content: "print('cached')".to_string(),
@@ -11221,6 +11227,7 @@ mod tests {
                     1,
                     &[crate::lsp::bridge::coordinator::BridgeInjection {
                         held: false,
+                        prepared: None,
                         language: "lua".to_string(),
                         region_id: TEST_ULID_LUA_0.to_string(),
                         content: "print('new')".to_string(),
@@ -11295,6 +11302,7 @@ mod tests {
         // Forward didChange
         let injections = vec![crate::lsp::bridge::coordinator::BridgeInjection {
             held: false,
+            prepared: None,
             language: "lua".to_string(),
             region_id: TEST_ULID_LUA_0.to_string(),
             content: "print('hello')".to_string(),
@@ -11368,6 +11376,7 @@ mod tests {
         // Forward didChange
         let injections = vec![crate::lsp::bridge::coordinator::BridgeInjection {
             held: false,
+            prepared: None,
             language: "lua".to_string(),
             region_id: TEST_ULID_LUA_0.to_string(),
             content: "print('hello')".to_string(),

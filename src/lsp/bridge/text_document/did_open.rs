@@ -1027,6 +1027,7 @@ mod tests {
                 },
                 vec![super::super::super::coordinator::BridgeInjection {
                     held: false,
+                    prepared: None,
                     language: "lua".into(),
                     region_id: TEST_ULID_LUA_0.into(),
                     content: "print('old')".into(),
@@ -1073,12 +1074,14 @@ mod tests {
         let injections = vec![
             BridgeInjection {
                 held: false,
+                prepared: None,
                 language: "lua".to_string(),
                 region_id: TEST_ULID_LUA_0.to_string(),
                 content: "print('hello')".to_string(),
             },
             BridgeInjection {
                 held: false,
+                prepared: None,
                 language: "lua".to_string(),
                 region_id: TEST_ULID_LUA_1.to_string(),
                 content: "print('world')".to_string(),
@@ -1163,6 +1166,7 @@ mod tests {
                 },
                 vec![BridgeInjection {
                     held: false,
+                    prepared: None,
                     language: "lua".to_string(),
                     region_id: TEST_ULID_LUA_0.to_string(),
                     content: "print('hello')".to_string(),
@@ -1222,6 +1226,7 @@ mod tests {
                 },
                 vec![BridgeInjection {
                     held: false,
+                    prepared: None,
                     language: "lua".to_string(),
                     region_id: TEST_ULID_LUA_0.to_string(),
                     content: "print('hello')".to_string(),
@@ -1258,6 +1263,7 @@ mod tests {
         use super::super::super::coordinator::BridgeInjection;
         let injections = vec![BridgeInjection {
             held: false,
+            prepared: None,
             language: "lua".to_string(),
             region_id: TEST_ULID_LUA_0.to_string(),
             content: "print('hello')".to_string(),
@@ -1338,6 +1344,7 @@ mod tests {
                 },
                 vec![BridgeInjection {
                     held: false,
+                    prepared: None,
                     language: "lua".to_string(),
                     region_id: TEST_ULID_LUA_0.to_string(),
                     content: "print('hello')".to_string(),
@@ -1387,6 +1394,7 @@ mod tests {
                 },
                 vec![BridgeInjection {
                     held: false,
+                    prepared: None,
                     language: "lua".to_string(),
                     region_id: TEST_ULID_LUA_0.to_string(),
                     content: "print('hello')".to_string(),
@@ -1427,6 +1435,7 @@ mod tests {
         use super::super::super::coordinator::BridgeInjection;
         let injections = vec![BridgeInjection {
             held: false,
+            prepared: None,
             language: "lua".to_string(),
             region_id: TEST_ULID_LUA_0.to_string(),
             content: "print('hello')".to_string(),

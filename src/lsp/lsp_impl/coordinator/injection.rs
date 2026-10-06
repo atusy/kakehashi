@@ -285,6 +285,7 @@ impl InjectionCoordinator {
                             region_id: region.region_id.clone(),
                             content: region.content.clone(),
                             held: false,
+                            prepared: None,
                         },
                         &region.gaps,
                     )
@@ -373,6 +374,7 @@ impl InjectionCoordinator {
                     region_id: region.region.region_id,
                     content: region.virtual_content,
                     held: false,
+                    prepared: None,
                 },
                 &region.gaps,
             )
@@ -400,17 +402,7 @@ impl InjectionCoordinator {
             &injection.language,
             self.experimental,
         ) else {
-            // Sent as is from now on: whatever was prepared for it (before a
-            // settings change dropped its peer) no longer describes it, nor
-            // do the diagnostics pushed for the prepared text.
-            if self.bridge.forget_prepared_region(
-                uri,
-                Some(&injection.language),
-                &injection.region_id,
-            ) {
-                self.diagnostics
-                    .evict_source(uri, &DiagnosticSource::Region(injection.region_id.clone()));
-            }
+            // Sent as is (see `note_sending` for what that forgets).
             return injection;
         };
         let input = crate::lsp::bridge::PrepareInput {
@@ -424,27 +416,47 @@ impl InjectionCoordinator {
         let lookup = self.bridge.prepared_document_now(&target, input);
         (injection.content, injection.held) = match lookup {
             crate::lsp::bridge::PrepareLookup::Ready(prepared) => {
-                // Pushed diagnostics are cached in the coordinates of the
-                // text the server held; once it is sent a different prepared
-                // text — or its first, after unprepared text or another
-                // peer's — no map translates them any more (the peer may
-                // dedent an unchanged line differently), so they are dropped
-                // rather than misplaced until the server publishes again.
-                if self.bridge.note_prepared_sent(
-                    uri,
-                    &injection.language,
-                    &injection.region_id,
-                    &prepared,
-                ) {
-                    self.diagnostics
-                        .evict_source(uri, &DiagnosticSource::Region(injection.region_id.clone()));
-                }
-                (prepared.text.clone(), false)
+                let text = prepared.text.clone();
+                injection.prepared = Some(prepared);
+                (text, false)
             }
             crate::lsp::bridge::PrepareLookup::Failed
             | crate::lsp::bridge::PrepareLookup::Pending => (String::new(), true),
         };
         injection
+    }
+
+    /// Record what is about to be sent for each sendable injection — called
+    /// by the passes that send, never by those that only look (recovery
+    /// probes, routing checks): the stored-region paths translate through
+    /// the answer recorded here, which must be the one servers hold.
+    ///
+    /// Pushed diagnostics are cached in the coordinates of the text the
+    /// server held; once it is sent a different text — another prepared
+    /// one, its first prepared one after unprepared text or another peer's,
+    /// or unprepared text after the pair lost its peer — no map translates
+    /// them any more, so they are dropped rather than misplaced until the
+    /// server publishes again.
+    pub(crate) fn note_sending(&self, uri: &Url, injections: &[BridgeInjection]) {
+        for injection in injections.iter().filter(|injection| !injection.held) {
+            let replaced = match &injection.prepared {
+                Some(prepared) => self.bridge.note_prepared_sent(
+                    uri,
+                    &injection.language,
+                    &injection.region_id,
+                    prepared,
+                ),
+                None => self.bridge.forget_prepared_region(
+                    uri,
+                    Some(&injection.language),
+                    &injection.region_id,
+                ),
+            };
+            if replaced {
+                self.diagnostics
+                    .evict_source(uri, &DiagnosticSource::Region(injection.region_id.clone()));
+            }
+        }
     }
 
     /// Forward a save that `uri`'s held regions missed to those now sent,
@@ -471,6 +483,7 @@ impl InjectionCoordinator {
             .filter(|injection| held.region_ids.contains(&injection.region_id))
             .partition(|injection| !injection.held);
         if !ready.is_empty() {
+            self.note_sending(uri, &ready);
             self.bridge
                 .pool()
                 .sync_and_forward_did_save_to_virtual_docs(uri, held.incarnation, &ready)
@@ -633,6 +646,7 @@ impl InjectionCoordinator {
         // so their open documents are not closed, but nothing is sent for
         // them: downstream servers never see a document unprepared.
         let injections = sendable_injections(injections);
+        self.note_sending(uri, &injections);
 
         let synchronized = if forward_did_change {
             self.bridge
@@ -2576,6 +2590,7 @@ mod tests {
                 &crate::lsp::bridge::ConnectionKey::for_server("not-selected"),
                 vec![super::BridgeInjection {
                     held: false,
+                    prepared: None,
                     language: "python".into(),
                     region_id: "00000000000000000000000000".into(),
                     content: "old()".into(),
