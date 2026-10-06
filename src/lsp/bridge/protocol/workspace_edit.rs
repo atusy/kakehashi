@@ -12,8 +12,8 @@
 use std::collections::HashMap;
 
 use tower_lsp_server::ls_types::{
-    AnnotatedTextEdit, DocumentChangeOperation, DocumentChanges, OneOf, Position, ResourceOp,
-    TextDocumentEdit, TextEdit, Uri, WorkspaceEdit,
+    AnnotatedTextEdit, DocumentChangeOperation, DocumentChanges, OneOf, Position, Range,
+    ResourceOp, TextDocumentEdit, TextEdit, Uri, WorkspaceEdit,
 };
 
 use super::translation::{RegionOffset, translate_virtual_range_to_host};
@@ -51,6 +51,7 @@ pub(crate) fn transform_workspace_edit_to_host(
     // refuses the whole WorkspaceEdit, since applying the rest of a rename
     // or fix would corrupt it.
     let prepared = offset.prepared().is_some();
+    let original = offset;
     let unprepared;
     let offset = match offset.prepared() {
         Some(prepared) => {
@@ -75,12 +76,48 @@ pub(crate) fn transform_workspace_edit_to_host(
 
     // A prepared document's edits gain removed indents when mapped, so the
     // host edits they merge with (a server editing the host URI directly)
-    // can come to overlap them.
-    !(prepared && host_edits_overlap(edit, host_uri))
+    // can come to overlap them. And a server editing the host URI directly
+    // bypasses the prepared map, so its edits must keep off the gaps too.
+    !(prepared
+        && (host_edits_overlap(edit, host_uri) || host_edits_touch_gaps(edit, host_uri, original)))
+}
+
+/// Whether any edit to `host_uri` reaches into a gap of the prepared
+/// document `offset` describes (in host coordinates).
+fn host_edits_touch_gaps(edit: &WorkspaceEdit, host_uri: &Uri, offset: &RegionOffset) -> bool {
+    let Some(prepared) = offset.prepared() else {
+        return false;
+    };
+    let unprepared = offset.unprepared();
+    let gaps: Vec<Range> = prepared
+        .virtual_gap_ranges()
+        .map(|mut gap| {
+            super::translation::translate_virtual_range_to_host(&mut gap, &unprepared);
+            gap
+        })
+        .collect();
+    let touches = |range: &Range| {
+        gaps.iter().any(|gap| {
+            if range.start == range.end {
+                gap.start < range.start && range.start < gap.end
+            } else {
+                gap.start < range.end && range.start < gap.end
+            }
+        })
+    };
+    host_edit_ranges(edit, host_uri).any(touches)
 }
 
 /// Whether the edits a `WorkspaceEdit` makes to `host_uri` overlap.
 fn host_edits_overlap(edit: &WorkspaceEdit, host_uri: &Uri) -> bool {
+    super::translation::ranges_overlap(host_edit_ranges(edit, host_uri))
+}
+
+/// The ranges of every edit a `WorkspaceEdit` makes to `host_uri`.
+fn host_edit_ranges<'a>(
+    edit: &'a WorkspaceEdit,
+    host_uri: &'a Uri,
+) -> impl Iterator<Item = &'a Range> {
     let changes = edit
         .changes
         .as_ref()
@@ -101,14 +138,14 @@ fn host_edits_overlap(edit: &WorkspaceEdit, host_uri: &Uri) -> bool {
     };
     let document_changes = document_edits
         .into_iter()
-        .filter(|document_edit| &document_edit.text_document.uri == host_uri)
+        .filter(move |document_edit| &document_edit.text_document.uri == host_uri)
         .flat_map(|document_edit| {
             document_edit.edits.iter().map(|one_of| match one_of {
                 OneOf::Left(text_edit) => &text_edit.range,
                 OneOf::Right(annotated) => &annotated.text_edit.range,
             })
         });
-    super::translation::ranges_overlap(changes.chain(document_changes))
+    changes.chain(document_changes)
 }
 
 /// Rewrite every edit to the request's (prepared) virtual document into
@@ -819,6 +856,38 @@ mod tests {
             &virtual_uri,
             &host_uri,
             &offset,
+        ));
+    }
+
+    #[test]
+    fn a_host_edit_into_a_prepared_gap_refuses_the_whole_edit() {
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let host_edit = |line: u32, start: u32, end: u32| {
+            parse_workspace_edit(json!({
+                "changes": { host_uri.as_str(): [{
+                    "range": {
+                        "start": { "line": line, "character": start },
+                        "end": { "line": line, "character": end }
+                    },
+                    "newText": "BROKEN"
+                }]}
+            }))
+        };
+        // `${a}` sits at host (10, 4)..(10, 8).
+        let mut into_gap = host_edit(10, 5, 6);
+        assert!(!transform_workspace_edit_to_host(
+            &mut into_gap,
+            &virtual_uri,
+            &host_uri,
+            &interpolated_offset(),
+        ));
+        let mut elsewhere = host_edit(20, 0, 1);
+        assert!(transform_workspace_edit_to_host(
+            &mut elsewhere,
+            &virtual_uri,
+            &host_uri,
+            &interpolated_offset(),
         ));
     }
 

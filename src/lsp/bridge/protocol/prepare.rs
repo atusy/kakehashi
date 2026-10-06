@@ -690,6 +690,19 @@ impl PreparedMap {
         })
     }
 
+    /// The V ranges of the gaps: host-owned text in the virtual document.
+    pub(crate) fn virtual_gap_ranges(&self) -> impl Iterator<Item = LspRange> + '_ {
+        self.runs
+            .iter()
+            .filter(|run| run.kind == RunKind::Gap)
+            .map(|gap| {
+                LspRange::new(
+                    self.virtual_lines.position(gap.virtual_.start),
+                    self.virtual_lines.position(gap.virtual_.end),
+                )
+            })
+    }
+
     /// Whether a V position sits strictly inside a gap: host-owned text no
     /// downstream position stands for.
     pub(crate) fn virtual_position_in_gap(&self, position: Position) -> bool {
