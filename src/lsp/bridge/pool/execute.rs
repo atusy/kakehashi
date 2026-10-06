@@ -60,8 +60,11 @@ impl Drop for RequestHostLifecycle<'_> {
 
 /// How long a request on a prepared document waits for the lifecycle pass
 /// to sync the prepared text it was built for (see
-/// `LanguageServerPool::wait_for_prepared_sync`). Bounded by the prepare
-/// request's own deadline: the sync follows the answer.
+/// `LanguageServerPool::wait_for_prepared_sync`). The answer is already in
+/// by then and the sync follows it within a lifecycle pass; a request whose
+/// text a newer edit superseded never sees its text sent and fails here
+/// (the pool cannot tell supersession from a slow pass, and the editor
+/// usually cancels such a request first).
 const PREPARED_SYNC_WAIT: std::time::Duration = super::super::protocol::PREPARE_TIMEOUT;
 const PREPARED_SYNC_POLL: std::time::Duration = std::time::Duration::from_millis(10);
 
@@ -186,6 +189,13 @@ impl LanguageServerPool {
         // Build virtual document URI
         let virtual_uri = VirtualDocumentUri::new(&host_uri_lsp, injection_language, region_id);
 
+        // Before the host lifecycle guard: the wait can last the whole sync
+        // budget, and a didClose or reopen must not queue behind it.
+        if offset.prepared().is_some() {
+            self.wait_for_prepared_sync(&virtual_uri, connection_key, virtual_content)
+                .await?;
+        }
+
         let host_lifecycle = match expected_incarnation {
             Some(expected) => {
                 self.request_host_lifecycle_for_incarnation(host_uri, expected)
@@ -206,11 +216,6 @@ impl LanguageServerPool {
         }
         self.apply_host_routing_workspace_folders(&routing_uri, connection_key.server(), &handle)
             .await?;
-
-        if offset.prepared().is_some() {
-            self.wait_for_prepared_sync(&virtual_uri, connection_key, virtual_content)
-                .await?;
-        }
 
         // Register in the upstream request registry before downstream router
         // registration for cancel lookup. This relative order matters: if a
@@ -360,14 +365,17 @@ impl LanguageServerPool {
         prepared_text: &str,
     ) -> io::Result<()> {
         let uri_string = virtual_uri.to_uri_string();
+        let fingerprint = super::document_tracker::content_fingerprint(prepared_text);
         let deadline = tokio::time::Instant::now() + PREPARED_SYNC_WAIT;
         loop {
             if !self
                 .document_tracker
                 .is_virtual_doc_open_on_connection(&uri_string, connection_key)
-                || self
-                    .document_tracker
-                    .sent_content_is(virtual_uri, connection_key, prepared_text)
+                || self.document_tracker.sent_fingerprint_is(
+                    &uri_string,
+                    connection_key,
+                    fingerprint,
+                )
             {
                 return Ok(());
             }
