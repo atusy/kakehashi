@@ -814,12 +814,18 @@ impl Kakehashi {
                         // no resync would come again: retry with backoff,
                         // a bounded number of times, while the host is open.
                         let synchronized = injection.process_injections_synchronized(&uri).await;
+                        // A pass the host's regions could not be looked at
+                        // for (a reload in progress) deferred its work to a
+                        // retry that only syncs documents: retried likewise,
+                        // so the diagnostics owed below are not lost.
+                        let looked =
+                            matches!(injection.bridge_injections(&uri), Some((_, Some(_))));
                         // A save the held regions missed is replayed too; one
-                        // the regions could not be looked at for (a reload)
-                        // is kept, and retried like a failed send.
+                        // the regions could not be looked at for is kept.
                         let replayed = injection.replay_held_save(&uri).await;
-                        if synchronized && replayed {
+                        let retrying = if synchronized && looked && replayed {
                             failures.remove(&uri);
+                            false
                         } else if injection.document_incarnation(&uri).is_some() {
                             let failed = failures.entry(uri.clone()).or_default();
                             *failed += 1;
@@ -831,22 +837,26 @@ impl Kakehashi {
                                     },
                                     crate::lsp::bridge::prepare_retry_delay(*failed),
                                 );
+                                true
                             } else {
                                 failures.remove(&uri);
+                                false
                             }
                         } else {
                             failures.remove(&uri);
-                        }
+                            false
+                        };
                         // A pull owed a refresh waits for a pass that reached
                         // every server: one now would re-pull from a server
                         // still holding the text before.
-                        if synchronized {
+                        if synchronized && looked {
                             diagnostics.settle_pull_debt_after_prepare(&uri, ready);
                         }
                         // The diagnostic pass that ran when the host opened
                         // or changed skipped the held regions; run it again
-                        // now that they reached their servers.
-                        if ready {
+                        // now that they reached their servers — or once the
+                        // retry carrying this readiness gets through.
+                        if ready && !retrying {
                             diagnostics.spawn_diagnostic_task_after_prepare(uri);
                         }
                     }
