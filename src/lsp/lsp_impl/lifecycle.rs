@@ -855,8 +855,10 @@ impl Kakehashi {
                         // The diagnostic pass that ran when the host opened
                         // or changed skipped the held regions; run it again
                         // now that they reached their servers — or once the
-                        // retry carrying this readiness gets through.
-                        if ready && !retrying {
+                        // retry carrying this readiness gets through. Not
+                        // after retries ran out: servers may still hold the
+                        // text before, and the next edit collects anyway.
+                        if ready && synchronized && looked && !retrying {
                             diagnostics.spawn_diagnostic_task_after_prepare(uri);
                         }
                     }
