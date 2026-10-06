@@ -53,6 +53,8 @@ jobs:
   prepare-e2e:
     name: Prepare E2E
     runs-on: ubuntu-latest
+    # A hung test otherwise holds the runner for the 6-hour default.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       # The virtual-document prepare peer under test is tsudoi-language-server,
