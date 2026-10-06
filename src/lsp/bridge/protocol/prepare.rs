@@ -855,7 +855,13 @@ fn map_offset(runs: &[Run], offset: usize, bias: Bias, from: Side) -> usize {
             .take_while(|run| from.ranges(run).0.start == offset)
             .find(|run| from.ranges(run).0.is_empty())
         {
-            return from.ranges(run).1.start;
+            let target = from.ranges(run).1;
+            // A removed indent at the very end is passed, as at any line
+            // start; a gap emptied there stays after the position.
+            return match run.kind {
+                RunKind::Deleted => target.end,
+                _ => target.start,
+            };
         }
     }
     runs.last().map_or(0, |run| from.ranges(run).1.end)
@@ -1619,6 +1625,29 @@ mod tests {
         assert_eq!(replaced.new_text, inserted.new_text);
         assert_eq!(replaced.range.start, inserted.range.start);
         assert_eq!(apply_to(&virtual_text, &[replaced]), "  while x:\n    y\n");
+    }
+
+    #[test]
+    fn inserting_on_an_indented_last_line_keeps_one_indent() {
+        let virtual_text = "  a\n  ";
+        let layout = VirtualLayout::single(virtual_text);
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &layout,
+            result(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+            ]}]})),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "a\n");
+        let map = prepared.map.unwrap();
+        let inserted = map.edit_to_virtual(&edit((1, 0), (1, 0), "b")).unwrap();
+        assert_eq!(apply_to(virtual_text, &[inserted]), "  a\n  b");
+        let formatted = map
+            .edits_to_virtual(&[edit((0, 0), (1, 0), "a\nb")])
+            .unwrap();
+        assert_eq!(apply_to(virtual_text, &formatted), "  a\n  b");
     }
 
     #[test]
