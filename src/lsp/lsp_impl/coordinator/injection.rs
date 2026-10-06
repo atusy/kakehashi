@@ -272,15 +272,20 @@ impl InjectionCoordinator {
             host_language,
             self.cache.semantic_token_generation(),
         ) {
+            let settings = self.settings_manager.load_settings();
             let regions = regions
                 .iter()
                 .map(|region| {
                     self.prepared_bridge_injection(
+                        &settings,
                         uri,
                         host_language,
-                        &region.language,
-                        &region.region_id,
-                        &region.content,
+                        BridgeInjection {
+                            language: region.language.clone(),
+                            region_id: region.region_id.clone(),
+                            content: region.content.clone(),
+                            held: false,
+                        },
                         &region.gaps,
                     )
                 })
@@ -348,6 +353,7 @@ impl InjectionCoordinator {
             return settled().then(Vec::new);
         }
 
+        let settings = self.settings_manager.load_settings();
         let resolved = InjectionResolver::resolve_from_regions(
             &self.language,
             self.bridge.node_tracker(),
@@ -359,11 +365,15 @@ impl InjectionCoordinator {
         .into_iter()
         .map(|region| {
             self.prepared_bridge_injection(
+                &settings,
                 uri,
                 host_language,
-                &region.injection_language,
-                &region.region.region_id,
-                &region.virtual_content,
+                BridgeInjection {
+                    language: region.injection_language,
+                    region_id: region.region.region_id,
+                    content: region.virtual_content,
+                    held: false,
+                },
                 &region.gaps,
             )
         })
@@ -378,45 +388,44 @@ impl InjectionCoordinator {
     /// sent. A finished prepare re-runs this pass for the host.
     fn prepared_bridge_injection(
         &self,
+        settings: &std::sync::Arc<crate::config::WorkspaceSettings>,
         uri: &Url,
         host_language: &str,
-        language: &str,
-        region_id: &str,
-        content: &str,
+        mut injection: BridgeInjection,
         gaps: &[crate::language::injection::VirtualGap],
     ) -> BridgeInjection {
-        let settings = self.settings_manager.load_settings();
-        let injection = |content: String, held| BridgeInjection {
-            language: language.to_string(),
-            region_id: region_id.to_string(),
-            content,
-            held,
-        };
-        let Some(target) =
-            self.bridge
-                .prepare_target(&settings, host_language, language, self.experimental)
-        else {
+        let Some(target) = self.bridge.prepare_target(
+            settings,
+            host_language,
+            &injection.language,
+            self.experimental,
+        ) else {
             // Sent as is from now on: whatever was prepared for it (before a
             // settings change dropped its peer) no longer describes it.
-            self.bridge
-                .forget_prepared_region(uri, Some(language), region_id);
-            return injection(content.to_string(), false);
+            self.bridge.forget_prepared_region(
+                uri,
+                Some(&injection.language),
+                &injection.region_id,
+            );
+            return injection;
         };
         let input = crate::lsp::bridge::PrepareInput {
             host_uri: uri,
             host_language,
-            injection_language: language,
-            region_id,
-            virtual_text: content,
+            injection_language: &injection.language,
+            region_id: &injection.region_id,
+            virtual_text: &injection.content,
             gaps,
         };
-        match self.bridge.prepared_document_now(&target, input) {
-            crate::lsp::bridge::PrepareLookup::Ready(prepared) => {
-                injection(prepared.text.clone(), false)
-            }
+        (injection.content, injection.held) = match self
+            .bridge
+            .prepared_document_now(&target, input)
+        {
+            crate::lsp::bridge::PrepareLookup::Ready(prepared) => (prepared.text.clone(), false),
             crate::lsp::bridge::PrepareLookup::Failed
-            | crate::lsp::bridge::PrepareLookup::Pending => injection(String::new(), true),
-        }
+            | crate::lsp::bridge::PrepareLookup::Pending => (String::new(), true),
+        };
+        injection
     }
 
     /// Process injected languages: resolve injection data, optionally forward didChange,
