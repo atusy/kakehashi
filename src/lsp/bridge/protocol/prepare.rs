@@ -209,14 +209,18 @@ pub(crate) struct PrepareResult {
 }
 
 /// Parse the response to [`PREPARE_METHOD`]. An error response or a
-/// malformed result is an `Err` — a failed prepare, never "unchanged".
+/// malformed result is an `InvalidData` error — a failed prepare, never
+/// "unchanged".
 pub(crate) fn parse_prepare_response(
     response: &serde_json::Value,
 ) -> std::io::Result<Option<PrepareResult>> {
+    // Every unusable answer is `InvalidData`, which callers tell apart from
+    // a failure to get an answer at all.
     if let Some(error) = response.get("error").filter(|error| !error.is_null()) {
-        return Err(std::io::Error::other(format!(
-            "bridge: prepare peer answered with an error: {error}"
-        )));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("bridge: prepare peer answered with an error: {error}"),
+        ));
     }
     let result = response.get("result").ok_or_else(|| {
         std::io::Error::new(

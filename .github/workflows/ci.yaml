@@ -60,6 +60,10 @@ jobs:
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
+      # Download the pinned package before the tests: a cold download slower
+      # than the bridge's startup deadline would fail every test. Keep the
+      # specifier in sync with `TSUDOI` in the test module.
+      - run: deno cache npm:@atusy/tsudoi-language-server@0.1.0-alpha.2/cli
       - run: "cargo test --features e2e --test e2e e2e_virtual_document_prepare::"
         env:
           # Fail instead of skipping when Deno is missing.

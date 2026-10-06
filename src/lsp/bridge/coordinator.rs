@@ -402,17 +402,8 @@ impl BridgeCoordinator {
         injection_language: &str,
         experimental: bool,
     ) -> Option<super::PrepareTarget> {
-        if !experimental {
-            return None;
-        }
-        let server_name = settings
-            .resolve_host_language_settings(host_language)?
-            .bridge
-            .as_ref()
-            .and_then(|bridge| {
-                resolve_with_wildcard(bridge, injection_language, merge_bridge_language_configs)
-            })?
-            .prepare?;
+        let server_name =
+            self.prepare_target_quiet(settings, host_language, injection_language, experimental)?;
         let config = resolve_with_wildcard(
             &settings.language_servers,
             &server_name,
@@ -432,13 +423,45 @@ impl BridgeCoordinator {
             // unprepared document through.
             return Some(super::PrepareTarget {
                 server_name,
-                config: Arc::new(BridgeServerConfig::default()),
+                config: None,
             });
         };
         Some(super::PrepareTarget {
             server_name,
-            config: Arc::new(config),
+            config: Some(Arc::new(config)),
         })
+    }
+
+    /// After a settings change, drop prepared documents whose (host,
+    /// injection) pair no longer names the peer that prepared them, so no
+    /// path keeps translating through a map for text no longer sent.
+    pub(crate) fn prune_prepared(&self, settings: &WorkspaceSettings, experimental: bool) {
+        self.prepare
+            .retain(|host_language, injection_language, server| {
+                self.prepare_target_quiet(settings, host_language, injection_language, experimental)
+                    .is_some_and(|name| name == server)
+            });
+    }
+
+    /// The configured peer name of a pair, without the unusable-peer warning.
+    fn prepare_target_quiet(
+        &self,
+        settings: &WorkspaceSettings,
+        host_language: &str,
+        injection_language: &str,
+        experimental: bool,
+    ) -> Option<String> {
+        if !experimental {
+            return None;
+        }
+        settings
+            .resolve_host_language_settings(host_language)?
+            .bridge
+            .as_ref()
+            .and_then(|bridge| {
+                resolve_with_wildcard(bridge, injection_language, merge_bridge_language_configs)
+            })?
+            .prepare
     }
 
     /// The prepared form of a virtual document, without waiting: on a miss

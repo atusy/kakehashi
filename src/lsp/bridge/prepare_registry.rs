@@ -33,7 +33,10 @@ use crate::language::injection::VirtualGap;
 #[derive(Debug, Clone)]
 pub(crate) struct PrepareTarget {
     pub(crate) server_name: String,
-    pub(crate) config: Arc<BridgeServerConfig>,
+    /// `None` when the name is configured but not a startable server: every
+    /// prepare then fails without touching the pool, whose connection for
+    /// that name (if any) belongs to a different launch config.
+    pub(crate) config: Option<Arc<BridgeServerConfig>>,
 }
 
 /// One virtual document to prepare.
@@ -59,10 +62,14 @@ pub(crate) enum PrepareLookup {
     Pending,
 }
 
-/// `None` is a failed prepare.
+/// `None` is a prepare the peer answered unusably.
 type Outcome = Option<Arc<PreparedDocument>>;
 
 struct Entry {
+    /// The host language and peer the entry was prepared for, so a settings
+    /// change that retargets the pair can drop it.
+    host_language: String,
+    server_name: String,
     /// Identity of the input the cell answers (text, gaps, peer).
     key: u64,
     /// Identity of the virtual text alone, for lookups that only know it.
@@ -146,11 +153,10 @@ impl PrepareRegistry {
             let job = PrepareJob::from(input);
             let resync_tx = self.resync_tx.clone();
             tokio::spawn(async move {
-                outcome
-                    .get_or_init(|| run(&pool, &target, &job, revision))
-                    .await;
-                // The receiver is gone only at shutdown.
-                let _ = resync_tx.send(job.host_uri);
+                initialize(
+                    &outcome, &started, &resync_tx, &pool, &target, &job, revision,
+                )
+                .await;
             });
         }
         PrepareLookup::Pending
@@ -167,10 +173,16 @@ impl PrepareRegistry {
         let (outcome, started, revision) = self.cell(target, input);
         started.store(true, Ordering::Release);
         let job = PrepareJob::from(input);
-        outcome
-            .get_or_init(|| run(pool, target, &job, revision))
-            .await
-            .clone()
+        initialize(
+            &outcome,
+            &started,
+            &self.resync_tx,
+            pool,
+            target,
+            &job,
+            revision,
+        )
+        .await
     }
 
     /// How the document with this exact virtual text was sent, for paths
@@ -199,6 +211,15 @@ impl PrepareRegistry {
         }
     }
 
+    /// Keep only the entries `keep(host language, injection language, peer)`
+    /// accepts — after a settings change, those whose pair still names the
+    /// same peer. A dropped entry reads as unprepared until prepared again.
+    pub(crate) fn retain(&self, keep: impl Fn(&str, &str, &str) -> bool) {
+        self.entries.retain(|(_, injection_language, _), entry| {
+            keep(&entry.host_language, injection_language, &entry.server_name)
+        });
+    }
+
     /// Forget a closed host's documents.
     pub(crate) fn forget_host(&self, host_uri: &Url) {
         self.entries
@@ -221,6 +242,8 @@ impl PrepareRegistry {
                 input.region_id.to_string(),
             ))
             .or_insert_with(|| Entry {
+                host_language: input.host_language.to_string(),
+                server_name: target.server_name.clone(),
                 key,
                 text_key: text_key(input.virtual_text),
                 revision: 1,
@@ -228,6 +251,8 @@ impl PrepareRegistry {
                 started: Arc::new(AtomicBool::new(false)),
             });
         if entry.key != key {
+            entry.host_language = input.host_language.to_string();
+            entry.server_name = target.server_name.clone();
             entry.key = key;
             entry.text_key = text_key(input.virtual_text);
             entry.revision = entry.revision.saturating_add(1);
@@ -280,48 +305,108 @@ impl From<PrepareInput<'_>> for PrepareJob {
     }
 }
 
-/// Ask the peer and apply its answer. Every failure is logged and yields
-/// `None`: the document is then not sent, never sent unprepared.
-async fn run(
+/// Fill `outcome` with the peer's answer (or join the request already
+/// filling it).
+///
+/// Only an answer is cached — a prepared document, or a refusal of what the
+/// peer answered. A failure to get an answer (the peer not starting in time,
+/// crashing, timing out) leaves the cell empty so the next lookup asks again;
+/// caching it would keep the document unbridged until its text changed, even
+/// after the peer recovered. The host is synced again once a prepared
+/// document lands, whoever asked for it: the lifecycle pass held the document
+/// meanwhile.
+async fn initialize(
+    outcome: &OnceCell<Outcome>,
+    started: &AtomicBool,
+    resync_tx: &UnboundedSender<Url>,
     pool: &LanguageServerPool,
     target: &PrepareTarget,
     job: &PrepareJob,
     revision: i32,
 ) -> Outcome {
-    match try_run(pool, target, job, revision).await {
-        Ok(prepared) => Some(Arc::new(prepared)),
-        Err(error) => {
-            log::warn!(
-                target: "kakehashi::bridge::prepare",
-                "Not sending the {} virtual document of {}: {} could not prepare it: {}",
-                job.injection_language,
-                job.host_uri,
-                target.server_name,
-                error
-            );
+    let mut answered_here = false;
+    let result = outcome
+        .get_or_try_init(|| async {
+            answered_here = true;
+            run(pool, target, job, revision).await
+        })
+        .await;
+    match result {
+        Ok(prepared) => {
+            if answered_here && prepared.is_some() {
+                // The receiver is gone only at shutdown.
+                let _ = resync_tx.send(job.host_uri.clone());
+            }
+            prepared.clone()
+        }
+        Err(()) => {
+            started.store(false, Ordering::Release);
             None
         }
     }
 }
 
+/// Ask the peer and apply its answer. `Ok(None)` is an answer kakehashi
+/// refused (or the peer refused to give); `Err` is no answer at all. Both
+/// are logged; neither lets the document through unprepared.
+async fn run(
+    pool: &LanguageServerPool,
+    target: &PrepareTarget,
+    job: &PrepareJob,
+    revision: i32,
+) -> Result<Outcome, ()> {
+    let log_failure = |error: &dyn std::fmt::Display| {
+        log::warn!(
+            target: "kakehashi::bridge::prepare",
+            "Not sending the {} virtual document of {}: {} could not prepare it: {}",
+            job.injection_language,
+            job.host_uri,
+            target.server_name,
+            error
+        );
+    };
+    match try_run(pool, target, job, revision).await {
+        Ok(Ok(prepared)) => Ok(Some(Arc::new(prepared))),
+        Ok(Err(refused)) => {
+            log_failure(&refused);
+            Ok(None)
+        }
+        Err(unanswered) => {
+            log_failure(&unanswered);
+            Err(())
+        }
+    }
+}
+
+/// The outer `Err` is a failure to get an answer (worth retrying); the
+/// inner one an answer that cannot be used (an error response, a malformed
+/// or refused result, an unusable peer).
 async fn try_run(
     pool: &LanguageServerPool,
     target: &PrepareTarget,
     job: &PrepareJob,
     revision: i32,
-) -> std::io::Result<PreparedDocument> {
+) -> std::io::Result<std::io::Result<PreparedDocument>> {
+    let Some(config) = target.config.as_deref() else {
+        return Ok(Err(std::io::Error::other(format!(
+            "{} is not a startable language server",
+            target.server_name
+        ))));
+    };
     let handle = pool
         .get_or_create_connection_wait_ready_admitted(
             &target.server_name,
-            &target.config,
+            config,
             Some(&job.host_uri),
             Duration::from_secs(super::INIT_TIMEOUT_SECS),
             None,
             None,
         )
         .await?;
-    let host_uri = crate::lsp::lsp_impl::url_to_uri(&job.host_uri)
-        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let host_uri = match crate::lsp::lsp_impl::url_to_uri(&job.host_uri) {
+        Ok(host_uri) => host_uri,
+        Err(error) => return Ok(Err(std::io::Error::other(error.to_string()))),
+    };
     let virtual_uri =
         VirtualDocumentUri::new(&host_uri, &job.injection_language, &job.region_id).to_uri_string();
     let layout = layout(&job.virtual_text, &job.gaps);
@@ -337,9 +422,16 @@ async fn try_run(
         },
         &layout,
     );
-    let result = handle.request_virtual_document_prepare(&params).await?;
-    apply_prepare_result(&job.virtual_text, &layout, result)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    let result = match handle.request_virtual_document_prepare(&params).await {
+        Ok(result) => result,
+        // An answer that is not a usable result (an error response or a
+        // malformed result).
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => return Ok(Err(error)),
+        // No answer: not advertised (yet), timed out, connection gone.
+        Err(error) => return Err(error),
+    };
+    Ok(apply_prepare_result(&job.virtual_text, &layout, result)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error)))
 }
 
 /// Present a virtual document as content/gap segments: the gaps the
@@ -418,7 +510,7 @@ mod tests {
         let registry = PrepareRegistry::default();
         let target = PrepareTarget {
             server_name: "peer".to_string(),
-            config: Arc::new(BridgeServerConfig::default()),
+            config: None,
         };
         let host = Url::parse("file:///host.md").unwrap();
         let input = |text| PrepareInput {
@@ -436,6 +528,11 @@ mod tests {
         let (changed, _, changed_revision) = registry.cell(&target, input("b"));
         assert!(!Arc::ptr_eq(&first, &changed));
         assert_eq!(changed_revision, revision + 1);
+        registry.retain(|host_language, _, server| host_language == "markdown" && server == "peer");
+        assert_eq!(registry.entries.len(), 1);
+        registry.retain(|_, _, server| server == "other");
+        assert!(registry.entries.is_empty());
+        registry.cell(&target, input("b"));
         registry.forget_host(&host);
         assert!(registry.entries.is_empty());
     }

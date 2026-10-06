@@ -571,11 +571,16 @@ impl ConnectionHandle {
         let mut cleanup = RouterCleanupGuard::new(Arc::clone(self.router()), request_id);
         let request = JsonRpcRequest::new(request_id.as_i64(), PREPARE_METHOD, params);
         self.send_request(request, request_id)
-            .map_err(io::Error::other)?;
+            .map_err(|error| io::Error::new(io::ErrorKind::NotConnected, error))?;
         let mut response_rx = response_rx;
         let response = match tokio::time::timeout(PREPARE_TIMEOUT, &mut response_rx).await {
             Ok(Ok(response)) => response,
-            Ok(Err(_)) => return Err(io::Error::other("bridge: prepare response channel closed")),
+            Ok(Err(_)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "bridge: prepare response channel closed",
+                ));
+            }
             Err(_) => {
                 let cancel = JsonRpcNotification::new(
                     "$/cancelRequest",
