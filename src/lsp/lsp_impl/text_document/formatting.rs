@@ -383,6 +383,9 @@ impl Kakehashi {
             )
             .await
             else {
+                // The peer could not prepare the region: it is left
+                // unformatted, which the CLI must not report as success.
+                count_request_errors(&cancel_state.request_error_sink, 1);
                 continue;
             };
             if !region_ctx.resolved.contiguous && region_ctx.prepared.is_none() {

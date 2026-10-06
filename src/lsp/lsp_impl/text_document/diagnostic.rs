@@ -322,6 +322,9 @@ impl Kakehashi {
                     )
                     .await
                 else {
+                    // The peer could not prepare the region: it goes
+                    // undiagnosed, which the CLI must not report as success.
+                    count_request_errors(&request_error_sink, 1);
                     continue;
                 };
                 let pool = Arc::clone(&pool);
