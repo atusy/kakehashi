@@ -28,7 +28,8 @@ expression: result
       "bridge": {
         "rust": {
           "enabled": true,
-          "aggregation": null
+          "aggregation": null,
+          "prepare": null
         }
       },
       "layers": null,

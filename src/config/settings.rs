@@ -127,6 +127,14 @@ pub struct BridgeLanguageConfig {
     pub enabled: Option<bool>,
     /// Per-method aggregation config. Key = LSP method name or "_" for default.
     pub aggregation: Option<HashMap<String, AggregationConfig>>,
+    /// Name of the language server (a `languageServers` entry) that prepares
+    /// this language's virtual documents before downstream servers see them,
+    /// via `kakehashi/virtualDocument/prepare` (e.g. to dedent them or fill
+    /// host interpolations with placeholders). The server must advertise
+    /// `experimental.kakehashi.virtualDocumentPrepare`. Requires
+    /// `KAKEHASHI_EXPERIMENTAL=true`. Omit to inherit from wildcard (no
+    /// preparation by default).
+    pub prepare: Option<String>,
 }
 
 /// One result layer that can answer an LSP request
@@ -2857,6 +2865,7 @@ kind = "locals""#;
     #[test]
     fn should_resolve_aggregation_priorities_for_specific_method() {
         let config = BridgeLanguageConfig {
+            prepare: None,
             enabled: Some(true),
             aggregation: Some(HashMap::from([
                 (
@@ -2894,6 +2903,7 @@ kind = "locals""#;
             bridge: Some(HashMap::from([(
                 HOST_BRIDGE_KEY.to_string(),
                 BridgeLanguageConfig {
+                    prepare: None,
                     enabled: Some(true),
                     aggregation: None,
                 },
@@ -2915,6 +2925,7 @@ kind = "locals""#;
             bridge: Some(HashMap::from([(
                 WILDCARD_KEY.to_string(),
                 BridgeLanguageConfig {
+                    prepare: None,
                     enabled: Some(true),
                     aggregation: None,
                 },
@@ -2930,6 +2941,7 @@ kind = "locals""#;
             bridge: Some(HashMap::from([(
                 HOST_BRIDGE_KEY.to_string(),
                 BridgeLanguageConfig {
+                    prepare: None,
                     enabled: Some(false),
                     aggregation: None,
                 },
@@ -2947,6 +2959,7 @@ kind = "locals""#;
                 (
                     HOST_BRIDGE_KEY.to_string(),
                     BridgeLanguageConfig {
+                        prepare: None,
                         enabled: Some(true),
                         aggregation: None,
                     },
@@ -2954,6 +2967,7 @@ kind = "locals""#;
                 (
                     WILDCARD_KEY.to_string(),
                     BridgeLanguageConfig {
+                        prepare: None,
                         enabled: None,
                         aggregation: Some(HashMap::from([(
                             "_".to_string(),
@@ -3185,6 +3199,7 @@ kind = "locals""#;
     #[test]
     fn should_resolve_aggregation_priorities_falls_back_to_wildcard() {
         let config = BridgeLanguageConfig {
+            prepare: None,
             enabled: Some(true),
             aggregation: Some(HashMap::from([(
                 WILDCARD_KEY.to_string(),
@@ -3208,6 +3223,7 @@ kind = "locals""#;
     #[test]
     fn routing_priorities_do_not_inherit_the_method_wildcard() {
         let config = BridgeLanguageConfig {
+            prepare: None,
             enabled: Some(true),
             aggregation: Some(HashMap::from([(
                 WILDCARD_KEY.to_string(),
@@ -3236,6 +3252,7 @@ kind = "locals""#;
     #[test]
     fn routing_priorities_come_from_the_routing_key_itself() {
         let config = BridgeLanguageConfig {
+            prepare: None,
             enabled: Some(true),
             aggregation: Some(HashMap::from([
                 (
@@ -3299,10 +3316,12 @@ kind = "locals""#;
             },
         )]);
         let wildcard_language = BridgeLanguageConfig {
+            prepare: None,
             enabled: Some(true),
             aggregation: Some(routing_entry),
         };
         let concrete_language = BridgeLanguageConfig {
+            prepare: None,
             enabled: Some(true),
             aggregation: None,
         };
@@ -3323,6 +3342,7 @@ kind = "locals""#;
     #[test]
     fn routing_priorities_preserve_the_explicit_kill_switch() {
         let config = BridgeLanguageConfig {
+            prepare: None,
             enabled: Some(true),
             aggregation: Some(HashMap::from([(
                 BRIDGE_ROUTING_METHOD.to_string(),
@@ -3355,6 +3375,7 @@ kind = "locals""#;
         // Some(vec![]) is the per-method fan-out kill switch and must survive
         // resolution verbatim, not be replaced with the ["*"] default.
         let config = BridgeLanguageConfig {
+            prepare: None,
             enabled: Some(true),
             aggregation: Some(HashMap::from([(
                 "textDocument/hover".to_string(),
@@ -3371,6 +3392,7 @@ kind = "locals""#;
     #[test]
     fn should_resolve_aggregation_strategy_for_specific_method() {
         let config = BridgeLanguageConfig {
+            prepare: None,
             enabled: Some(true),
             aggregation: Some(HashMap::from([(
                 "textDocument/diagnostic".to_string(),
@@ -3387,6 +3409,7 @@ kind = "locals""#;
     #[test]
     fn should_resolve_aggregation_strategy_falls_back_to_wildcard() {
         let config = BridgeLanguageConfig {
+            prepare: None,
             enabled: Some(true),
             aggregation: Some(HashMap::from([(
                 WILDCARD_KEY.to_string(),
@@ -3412,6 +3435,7 @@ kind = "locals""#;
     fn should_resolve_aggregation_strategy_uses_handler_default_when_strategy_is_none() {
         // Entry exists but strategy = None → falls back to the handler default.
         let config = BridgeLanguageConfig {
+            prepare: None,
             enabled: Some(true),
             aggregation: Some(HashMap::from([(
                 "textDocument/diagnostic".to_string(),
@@ -3429,6 +3453,7 @@ kind = "locals""#;
     #[test]
     fn should_resolve_aggregation_max_fan_out_for_specific_method() {
         let config = BridgeLanguageConfig {
+            prepare: None,
             enabled: Some(true),
             aggregation: Some(HashMap::from([
                 (
@@ -3455,6 +3480,7 @@ kind = "locals""#;
     #[test]
     fn should_resolve_aggregation_max_fan_out_falls_back_to_wildcard() {
         let config = BridgeLanguageConfig {
+            prepare: None,
             enabled: Some(true),
             aggregation: Some(HashMap::from([(
                 WILDCARD_KEY.to_string(),
@@ -3480,6 +3506,7 @@ kind = "locals""#;
         // When a method-specific AggregationConfig exists but has max_fan_out: None,
         // the wildcard's max_fan_out IS applied via field-level merge (wildcard-config-inheritance).
         let config = BridgeLanguageConfig {
+            prepare: None,
             enabled: Some(true),
             aggregation: Some(HashMap::from([
                 (
@@ -3509,6 +3536,7 @@ kind = "locals""#;
     #[test]
     fn should_resolve_aggregation_max_fan_out_negative_as_none() {
         let config = BridgeLanguageConfig {
+            prepare: None,
             enabled: Some(true),
             aggregation: Some(HashMap::from([(
                 WILDCARD_KEY.to_string(),
@@ -3525,6 +3553,7 @@ kind = "locals""#;
     #[test]
     fn should_resolve_aggregation_max_fan_out_zero_as_some_zero() {
         let config = BridgeLanguageConfig {
+            prepare: None,
             enabled: Some(true),
             aggregation: Some(HashMap::from([(
                 WILDCARD_KEY.to_string(),
@@ -3541,6 +3570,7 @@ kind = "locals""#;
     #[test]
     fn should_resolve_aggregation_all_fields_together() {
         let config = BridgeLanguageConfig {
+            prepare: None,
             enabled: Some(true),
             aggregation: Some(HashMap::from([(
                 "textDocument/completion".to_string(),
@@ -3580,6 +3610,7 @@ kind = "locals""#;
 
         // Explicit false on each toggle survives resolution independently.
         let config = BridgeLanguageConfig {
+            prepare: None,
             enabled: Some(true),
             aggregation: Some(HashMap::from([(
                 "textDocument/publishDiagnostics".to_string(),
@@ -3778,6 +3809,7 @@ kind = "locals""#;
         // When no aggregation config exists at all, the default strategy should be
         // Preferred — the hardcoded default when no explicit strategy is configured.
         let config = BridgeLanguageConfig {
+            prepare: None,
             enabled: Some(true),
             aggregation: None,
         };

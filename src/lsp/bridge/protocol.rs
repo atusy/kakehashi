@@ -38,7 +38,11 @@ pub(crate) use jsonrpc::{
     JsonRpcNotification, JsonRpcRequest, jsonrpc_error_summary, response_has_jsonrpc_error,
 };
 pub(crate) use lifecycle::*;
-pub(crate) use prepare::Bias;
+pub(crate) use prepare::{
+    Bias, PREPARE_METHOD, PREPARE_TIMEOUT, PrepareHostTextDocument, PrepareParams, PrepareResult,
+    PrepareTextDocument, PreparedDocument, VirtualLayout, apply_prepare_result,
+    parse_prepare_response,
+};
 pub(crate) use request::*;
 pub(crate) use request_id::RequestId;
 pub(crate) use response::*;

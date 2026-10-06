@@ -986,6 +986,7 @@ print("hello")
                 bridge: Some(HashMap::from([(
                     HOST_BRIDGE_KEY.to_string(),
                     BridgeLanguageConfig {
+                        prepare: None,
                         enabled: Some(true),
                         aggregation: None,
                     },
@@ -2783,6 +2784,7 @@ print("hello")
             bridge.insert(
                 HOST_BRIDGE_KEY.to_string(),
                 BridgeLanguageConfig {
+                    prepare: None,
                     enabled: Some(true),
                     aggregation: Some(HashMap::from([(
                         "textDocument/publishDiagnostics".to_string(),

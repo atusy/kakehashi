@@ -1035,6 +1035,7 @@ mod tests {
             settings: None,
         };
         let self_bridge = BridgeLanguageConfig {
+            prepare: None,
             enabled: Some(true),
             aggregation: Some(HashMap::from([(
                 method.to_string(),

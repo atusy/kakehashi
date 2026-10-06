@@ -96,6 +96,7 @@ pub(crate) fn merge_bridge_language_configs(
 ) -> BridgeLanguageConfig {
     BridgeLanguageConfig {
         enabled: overlay.enabled.or(base.enabled),
+        prepare: overlay.prepare.clone().or_else(|| base.prepare.clone()),
         aggregation: match (&base.aggregation, &overlay.aggregation) {
             (Some(_), Some(overlay_agg)) if overlay_agg.is_empty() => Some(HashMap::new()),
             (Some(base_agg), Some(overlay_agg)) => {
@@ -2354,6 +2355,7 @@ mod tests {
             (
                 "_".to_string(),
                 settings::BridgeLanguageConfig {
+                    prepare: None,
                     enabled: Some(true),
                     aggregation: Some(HashMap::from([(
                         "_".to_string(),
@@ -2367,6 +2369,7 @@ mod tests {
             (
                 "python".to_string(),
                 settings::BridgeLanguageConfig {
+                    prepare: None,
                     enabled: Some(false),
                     aggregation: None,
                 },
@@ -2483,6 +2486,7 @@ mod tests {
             bridge: Some(HashMap::from([(
                 "python".to_string(),
                 settings::BridgeLanguageConfig {
+                    prepare: None,
                     enabled: Some(true),
                     aggregation: Some(HashMap::from([(
                         "_".to_string(),
@@ -2500,6 +2504,7 @@ mod tests {
             bridge: Some(HashMap::from([(
                 "python".to_string(),
                 settings::BridgeLanguageConfig {
+                    prepare: None,
                     enabled: Some(false),
                     aggregation: None,
                 },
@@ -2555,6 +2560,7 @@ mod tests {
             bridge: Some(HashMap::from([(
                 "python".to_string(),
                 settings::BridgeLanguageConfig {
+                    prepare: None,
                     enabled: Some(true),
                     aggregation: Some(HashMap::from([
                         (
@@ -2581,6 +2587,7 @@ mod tests {
             bridge: Some(HashMap::from([(
                 "python".to_string(),
                 settings::BridgeLanguageConfig {
+                    prepare: None,
                     enabled: None,
                     aggregation: Some(HashMap::from([(
                         "textDocument/hover".to_string(),
@@ -2618,6 +2625,7 @@ mod tests {
             bridge: Some(HashMap::from([(
                 "python".to_string(),
                 settings::BridgeLanguageConfig {
+                    prepare: None,
                     enabled: Some(true),
                     aggregation: Some(HashMap::from([(
                         "textDocument/diagnostic".to_string(),
@@ -2636,6 +2644,7 @@ mod tests {
             bridge: Some(HashMap::from([(
                 "python".to_string(),
                 settings::BridgeLanguageConfig {
+                    prepare: None,
                     enabled: None,
                     aggregation: Some(HashMap::from([(
                         "textDocument/diagnostic".to_string(),
@@ -2671,6 +2680,7 @@ mod tests {
             bridge: Some(HashMap::from([(
                 "python".to_string(),
                 settings::BridgeLanguageConfig {
+                    prepare: None,
                     enabled: Some(true),
                     aggregation: Some(HashMap::from([(
                         "_".to_string(),
@@ -2688,6 +2698,7 @@ mod tests {
             bridge: Some(HashMap::from([(
                 "python".to_string(),
                 settings::BridgeLanguageConfig {
+                    prepare: None,
                     enabled: None,
                     aggregation: Some(HashMap::from([(
                         "textDocument/hover".to_string(),
@@ -2718,6 +2729,7 @@ mod tests {
             bridge: Some(HashMap::from([(
                 "python".to_string(),
                 settings::BridgeLanguageConfig {
+                    prepare: None,
                     enabled: Some(true),
                     aggregation: Some(HashMap::from([(
                         "textDocument/hover".to_string(),
@@ -2736,6 +2748,7 @@ mod tests {
             bridge: Some(HashMap::from([(
                 "python".to_string(),
                 settings::BridgeLanguageConfig {
+                    prepare: None,
                     enabled: None,
                     aggregation: Some(HashMap::from([(
                         "textDocument/hover".to_string(),

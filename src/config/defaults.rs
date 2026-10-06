@@ -177,6 +177,7 @@ fn default_languages() -> HashMap<String, LanguageSettings> {
             bridge: Some(HashMap::from([(
                 WILDCARD_KEY.to_string(),
                 BridgeLanguageConfig {
+                    prepare: None,
                     enabled: Some(true),
                     aggregation: Some(HashMap::from([
                         (

@@ -2408,6 +2408,7 @@ mod tests {
             },
         );
         BridgeLanguageConfig {
+            prepare: None,
             enabled: None,
             aggregation: Some(agg),
         }
@@ -2911,6 +2912,7 @@ mod tests {
         bridge.insert(
             "python".to_string(),
             BridgeLanguageConfig {
+                prepare: None,
                 enabled: None,
                 aggregation: Some(agg),
             },
@@ -2945,6 +2947,7 @@ mod tests {
         bridge.insert(
             "python".to_string(),
             BridgeLanguageConfig {
+                prepare: None,
                 enabled: None,
                 aggregation: Some(agg),
             },
@@ -2989,6 +2992,7 @@ mod tests {
         bridge.insert(
             "python".to_string(),
             BridgeLanguageConfig {
+                prepare: None,
                 enabled: None,
                 aggregation: Some(agg),
             },
@@ -3060,6 +3064,7 @@ mod tests {
         bridge.insert(
             "python".to_string(),
             BridgeLanguageConfig {
+                prepare: None,
                 enabled: None,
                 aggregation: Some(python_agg),
             },
@@ -3067,6 +3072,7 @@ mod tests {
         bridge.insert(
             "_".to_string(),
             BridgeLanguageConfig {
+                prepare: None,
                 enabled: None,
                 aggregation: Some(wildcard_agg),
             },
@@ -3102,6 +3108,7 @@ mod tests {
         bridge.insert(
             "python".to_string(),
             BridgeLanguageConfig {
+                prepare: None,
                 enabled: None,
                 aggregation: Some(agg),
             },
@@ -3138,6 +3145,7 @@ mod tests {
         bridge.insert(
             "python".to_string(),
             BridgeLanguageConfig {
+                prepare: None,
                 enabled: None,
                 aggregation: Some(agg),
             },

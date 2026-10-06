@@ -32,9 +32,10 @@ use crate::lsp::bridge::actor::{
 };
 use crate::lsp::bridge::connection::SplitConnectionWriter;
 use crate::lsp::bridge::protocol::{
-    DID_CHANGE_WORKSPACE_FOLDERS_METHOD, JsonRpcNotification, JsonRpcRequest, ROUTING_METHOD,
-    ROUTING_TIMEOUT, RequestId, RoutingAnswer, RoutingParams, build_exit_notification,
-    build_shutdown_request, jsonrpc_error_code, parse_routing_response,
+    DID_CHANGE_WORKSPACE_FOLDERS_METHOD, JsonRpcNotification, JsonRpcRequest, PREPARE_METHOD,
+    PREPARE_TIMEOUT, PrepareParams, PrepareResult, ROUTING_METHOD, ROUTING_TIMEOUT, RequestId,
+    RoutingAnswer, RoutingParams, build_exit_notification, build_shutdown_request,
+    jsonrpc_error_code, parse_prepare_response, parse_routing_response,
 };
 use crate::lsp::bridge::workspace::WorkspaceFolderSet;
 
@@ -139,6 +140,8 @@ pub(crate) struct ConnectionHandle {
     /// bridge-routing protocol. This starts false, is set from the initialize
     /// advertisement, and may be cleared after a downstream MethodNotFound.
     bridge_routing: AtomicBool,
+    /// Whether the downstream advertised `virtualDocumentPrepare`.
+    virtual_document_prepare: AtomicBool,
     type_hierarchy_provider: AtomicBool,
     /// Dynamic capability registrations from server-initiated `client/registerCapability` requests.
     ///
@@ -288,6 +291,7 @@ impl ConnectionHandle {
             next_request_id: AtomicI64::new(2),
             server_capabilities: OnceLock::new(),
             bridge_routing: AtomicBool::new(false),
+            virtual_document_prepare: AtomicBool::new(false),
             type_hierarchy_provider: AtomicBool::new(false),
             dynamic_capabilities,
             connection_key,
@@ -539,6 +543,58 @@ impl ConnectionHandle {
         parse_routing_response(&response)
     }
 
+    /// Ask an advertising peer how to present a virtual document
+    /// (`kakehashi/virtualDocument/prepare`).
+    ///
+    /// `Ok(None)` is the peer's `null` (present unchanged). Every failure —
+    /// no advertisement, an error response, a malformed result, a timeout —
+    /// is an `Err`: the caller must not send the document unprepared. A
+    /// `MethodNotFound` response also clears the advertisement until the
+    /// next handshake.
+    pub(crate) async fn request_virtual_document_prepare(
+        &self,
+        params: &PrepareParams<'_>,
+    ) -> io::Result<Option<PrepareResult>> {
+        if !self.supports_virtual_document_prepare() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "bridge: server does not advertise virtualDocumentPrepare",
+            ));
+        }
+        // Like routing, preparation is control traffic: its own deadline
+        // cancels and retires the router entry, off the liveness timer.
+        let request_id = RequestId::new(self.next_request_id());
+        let response_rx = self
+            .router()
+            .register(request_id)
+            .ok_or_else(|| io::Error::other("bridge: duplicate prepare request ID"))?;
+        let mut cleanup = RouterCleanupGuard::new(Arc::clone(self.router()), request_id);
+        let request = JsonRpcRequest::new(request_id.as_i64(), PREPARE_METHOD, params);
+        self.send_request(request, request_id)
+            .map_err(io::Error::other)?;
+        let mut response_rx = response_rx;
+        let response = match tokio::time::timeout(PREPARE_TIMEOUT, &mut response_rx).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) => return Err(io::Error::other("bridge: prepare response channel closed")),
+            Err(_) => {
+                let cancel = JsonRpcNotification::new(
+                    "$/cancelRequest",
+                    serde_json::json!({"id": request_id.as_i64()}),
+                );
+                let _ = self.send_notification(cancel);
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "bridge: prepare request timeout",
+                ));
+            }
+        };
+        cleanup.disarm();
+        if jsonrpc_error_code(&response) == Some(-32601) {
+            self.set_virtual_document_prepare(false);
+        }
+        parse_prepare_response(&response)
+    }
+
     /// Queue an arbitrary JSON-RPC request for the downstream peer escape hatch.
     ///
     /// Unlike [`Self::send_request`], `method` is runtime data and `params` may
@@ -743,6 +799,17 @@ impl ConnectionHandle {
     pub(super) fn set_bridge_routing(&self, advertised: bool) {
         self.bridge_routing.store(advertised, Ordering::Release);
         debug_assert_eq!(self.supports_bridge_routing(), advertised);
+    }
+
+    /// Store whether the downstream advertised `virtualDocumentPrepare`.
+    pub(super) fn set_virtual_document_prepare(&self, advertised: bool) {
+        self.virtual_document_prepare
+            .store(advertised, Ordering::Release);
+    }
+
+    /// Whether the downstream answers `kakehashi/virtualDocument/prepare`.
+    pub(crate) fn supports_virtual_document_prepare(&self) -> bool {
+        self.virtual_document_prepare.load(Ordering::Acquire)
     }
 
     /// Whether the downstream advertised bridge routing during initialization.

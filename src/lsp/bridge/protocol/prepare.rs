@@ -24,6 +24,10 @@ use tower_lsp_server::ls_types::{Position, Range as LspRange, TextEdit};
 /// The request kakehashi sends to the configured prepare peer.
 pub(crate) const PREPARE_METHOD: &str = "kakehashi/virtualDocument/prepare";
 
+/// How long a prepare answer may take. The document is not sent downstream
+/// until it arrives, so this bounds how stale a downstream view can get.
+pub(crate) const PREPARE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Upper bound on the diff that maps a downstream edit back through P → V.
 /// A diff that cannot finish in time degrades to coarser hunks, which the gap
 /// check then refuses — slower than this is not worth an edit.
@@ -205,6 +209,26 @@ enum WireSegmentResult {
 #[derive(Debug, Deserialize)]
 pub(crate) struct PrepareResult {
     segments: Vec<WireSegmentResult>,
+}
+
+/// Parse the response to [`PREPARE_METHOD`]. An error response or a
+/// malformed result is an `Err` — a failed prepare, never "unchanged".
+pub(crate) fn parse_prepare_response(
+    response: &serde_json::Value,
+) -> std::io::Result<Option<PrepareResult>> {
+    if let Some(error) = response.get("error").filter(|error| !error.is_null()) {
+        return Err(std::io::Error::other(format!(
+            "bridge: prepare peer answered with an error: {error}"
+        )));
+    }
+    let result = response.get("result").ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bridge: prepare response missing result",
+        )
+    })?;
+    serde_json::from_value(result.clone())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 /// Why a prepare answer was refused. A refused answer is a failed prepare:

@@ -4419,7 +4419,7 @@ impl LanguageServerPool {
 
             // Handle initialization result - transition state
             match init_result {
-                Ok(Ok((capabilities, bridge_routing, type_hierarchy_provider))) => {
+                Ok(Ok((capabilities, extensions, type_hierarchy_provider))) => {
                     // Init succeeded - store capabilities and transition to Ready
                     log::info!(
                         target: "kakehashi::bridge::init",
@@ -4434,7 +4434,9 @@ impl LanguageServerPool {
                         .as_ref()
                         .map(|options| options.commands.clone());
                     handle_for_handshake.set_server_capabilities(capabilities);
-                    handle_for_handshake.set_bridge_routing(bridge_routing);
+                    handle_for_handshake.set_bridge_routing(extensions.bridge_routing);
+                    handle_for_handshake
+                        .set_virtual_document_prepare(extensions.virtual_document_prepare);
                     handle_for_handshake.set_type_hierarchy_provider(type_hierarchy_provider);
                     // Path a: push this server's settings now that `initialized`
                     // has been sent, so push-model servers are configured even
