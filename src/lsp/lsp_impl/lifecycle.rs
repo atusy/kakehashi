@@ -803,6 +803,7 @@ impl Kakehashi {
                     for (uri, ready) in hosts {
                         injection.process_injections(&uri, true).await;
                         injection.replay_held_save(&uri).await;
+                        diagnostics.settle_pull_debt_after_prepare(&uri, ready);
                         // The diagnostic pass that ran when the host opened
                         // or changed skipped the held regions; run it again
                         // now that they reached their servers.

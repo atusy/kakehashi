@@ -162,8 +162,9 @@ impl Drop for AttemptEnd {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Resync {
     pub(crate) host_uri: Url,
-    /// A held document became ready (rather than a retry being due), so the
-    /// host's diagnostics should be collected again too.
+    /// A held document became ready (rather than a retry being due, or an
+    /// answer coming back unusable), so the host's diagnostics should be
+    /// collected again too.
     pub(crate) ready: bool,
 }
 
@@ -429,11 +430,14 @@ impl PrepareRegistry {
                 Ok(outcome) => {
                     let prepared = outcome.is_some();
                     let _ = cell.outcome.set(outcome);
-                    if prepared && current(&entries) {
+                    // An unusable answer re-syncs too, unready: nothing more
+                    // is coming for this revision, which a pull owed a
+                    // refresh after waiting on it must learn.
+                    if current(&entries) {
                         // The receiver is gone only at shutdown.
                         let _ = resync_tx.send(Resync {
                             host_uri: job.host_uri.clone(),
-                            ready: true,
+                            ready: prepared,
                         });
                     }
                 }

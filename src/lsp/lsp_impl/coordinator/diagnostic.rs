@@ -246,17 +246,23 @@ impl DiagnosticScheduler {
         );
     }
 
+    /// Refresh pull-mode clients owed one for a pull answered while some of
+    /// `uri`'s documents waited for their prepare answers — once a held
+    /// document was sent (`ready`), or nothing is waiting any more (the
+    /// last answer came back unusable, which sends nothing).
+    pub(crate) fn settle_pull_debt_after_prepare(&self, uri: &Url, ready: bool) {
+        if (ready || !self.bridge.prepare_host_has_pending(uri))
+            && self.bridge.take_pull_debt_after_prepare(uri)
+        {
+            self.publisher.request_pull_diagnostic_refresh(true);
+        }
+    }
+
     /// Collect diagnostics again once held regions reached their servers.
     /// The collections that ran while they were held (on open, change or
     /// save) left them out, so this one supersedes any of them for the same
     /// version.
-    ///
-    /// A pull answered while they were held left them out too: its debt is
-    /// consumed with a refresh, so a pull-mode client asks again.
     pub(crate) fn spawn_diagnostic_task_after_prepare(&self, uri: Url) {
-        if self.bridge.take_pull_debt_after_prepare(&uri) {
-            self.publisher.request_pull_diagnostic_refresh(true);
-        }
         let snapshot_data = self.prepare_diagnostic_snapshot(&uri);
         self.spawn_prepared_synthetic_diagnostic_task(
             uri,

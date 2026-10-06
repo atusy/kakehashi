@@ -604,6 +604,11 @@ impl BridgeCoordinator {
         self.prepare_pull_debts.remove(host).is_some()
     }
 
+    /// Whether any of `host`'s documents still waits for its prepare answer.
+    pub(crate) fn prepare_host_has_pending(&self, host: &Url) -> bool {
+        self.prepare.host_has_pending(host)
+    }
+
     /// Take `host`'s debt of a pull answered without documents then waiting
     /// for their prepare answers (see [`Self::owe_pull_after_prepare`]).
     pub(crate) fn take_pull_debt_after_prepare(&self, host: &Url) -> bool {
