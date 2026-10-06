@@ -270,6 +270,7 @@ impl PrepareRegistry {
         target: &PrepareTarget,
         input: PrepareInput<'_>,
     ) -> PrepareLookup {
+        pool.note_prepare_used();
         let (cell, revision) = self.cell(target, input, Holder::LifecyclePass);
         if let Some(found) = cell.lookup() {
             return found;
@@ -288,6 +289,7 @@ impl PrepareRegistry {
         target: &PrepareTarget,
         input: PrepareInput<'_>,
     ) -> Outcome {
+        pool.note_prepare_used();
         let (cell, revision) = self.cell(target, input, Holder::Request);
         if let Some(outcome) = cell.outcome.get() {
             return outcome.clone();

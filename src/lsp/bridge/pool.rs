@@ -589,6 +589,10 @@ pub struct LanguageServerPool {
     inbound_request_registry: super::InboundRequestRegistry,
     /// Palette command name → origin server (#628 palette-fired executeCommand).
     command_origins: Arc<CommandOriginRegistry>,
+    /// Some virtual document was prepared: from then on a document's text
+    /// a server holds can be prepared or not, and a request must check it is
+    /// the one its coordinates describe (see `wait_for_prepared_sync`).
+    prepare_used: AtomicBool,
 }
 
 impl Default for LanguageServerPool {
@@ -661,7 +665,17 @@ impl LanguageServerPool {
             client_progress_registry: Arc::new(super::ClientProgressRegistry::new()),
             inbound_request_registry: super::InboundRequestRegistry::default(),
             command_origins: Arc::new(CommandOriginRegistry::default()),
+            prepare_used: AtomicBool::new(false),
         }
+    }
+
+    /// Note that a virtual document is being prepared (see `prepare_used`).
+    pub(crate) fn note_prepare_used(&self) {
+        self.prepare_used.store(true, Ordering::Release);
+    }
+
+    fn prepare_used(&self) -> bool {
+        self.prepare_used.load(Ordering::Acquire)
     }
 
     /// What is known about the raw palette command names downstream servers have

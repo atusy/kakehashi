@@ -175,12 +175,15 @@ save.
   that translate a stored region (pushed diagnostics, resolve gates,
   inbound edits) can see newer text than the server holds; pairing
   that text with an older map misplaces every coordinate silently.
-- **A request reads only the prepared text the server holds.** Right after
-  an edit, a request is prepared for the new text while an open document
-  still holds the previous one until the lifecycle pass sends it; reading
-  the old answer through the new map misplaces it. The request must wait
-  for that send (or fail), and must not send the text itself — it could
-  overtake a newer text the lifecycle pass already sent.
+- **A request reads only the text the server holds.** Right after an edit,
+  a request is prepared for the new text while an open document still
+  holds the previous one until the lifecycle pass sends it; reading the old
+  answer through the new map misplaces it. The same holds right after a
+  settings change adds or drops a pair's peer, between prepared and
+  unprepared text, so once anything is prepared every bridged request
+  checks. The request must wait for that send (or fail), and must not send
+  the text itself — it could overtake a newer text the lifecycle pass
+  already sent.
 - **Cached state follows the configuration.** A settings change that drops
   or retargets a pair's peer must drop what was prepared for it; otherwise
   paths that look a map up by text keep translating unprepared text through
@@ -258,7 +261,9 @@ answer `null`.
 - Host text the injection query includes in content cannot be protected as
   a gap; only text outside the captured content is.
 - A request issued right after an edit waits for the new prepared text to
-  reach its server, and fails if a newer edit supersedes it first.
+  reach its server, and fails if a newer edit supersedes it first. Once any
+  document has been prepared, requests on unprepared documents wait the
+  same way.
 - linkedEditingRange, prepareRename and inbound `workspace/applyEdit` stay
   unavailable on prepared non-contiguous documents.
 - A save made while a document's first answer is pending reaches no server

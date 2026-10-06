@@ -190,9 +190,10 @@ impl LanguageServerPool {
         // Build virtual document URI
         let virtual_uri = VirtualDocumentUri::new(&host_uri_lsp, injection_language, region_id);
 
+        let check_held_text = self.checks_held_text(offset);
         // Before the host lifecycle guard: the wait can last the whole sync
         // budget, and a didClose or reopen must not queue behind it.
-        if offset.prepared().is_some() {
+        if check_held_text {
             self.wait_for_prepared_sync(&virtual_uri, connection_key, virtual_content)
                 .await?;
         }
@@ -302,7 +303,7 @@ impl LanguageServerPool {
 
             // A prepared request's map describes `virtual_content` only; the
             // open above may have sent newer cached text instead.
-            if offset.prepared().is_some()
+            if check_held_text
                 && !self.document_tracker.sent_content_is(
                     &virtual_uri,
                     connection_key,
@@ -349,14 +350,25 @@ impl LanguageServerPool {
         Ok(transform_response(response?, &context))
     }
 
-    /// Wait (briefly) until a connection that has the prepared document open
-    /// holds exactly `prepared_text`.
+    /// Whether a request must check that its server holds exactly the text
+    /// its coordinates describe. Once anything is prepared, the text a server
+    /// holds can be prepared or not — and right after a pair gains or loses
+    /// its peer, it can be the other one than the request's.
+    pub(super) fn checks_held_text(&self, offset: &RegionOffset) -> bool {
+        offset.prepared().is_some() || self.prepare_used()
+    }
+
+    /// Wait (briefly) until a connection that has the document open holds
+    /// exactly `prepared_text` — the prepared text, or the virtual text of a
+    /// document no longer prepared.
     ///
     /// A request is prepared for the newest virtual text, while the lifecycle
     /// pass sends that text only once its prepare answer is in — so right
     /// after an edit, an open document can still hold the previous prepared
     /// text, and its answer would be in coordinates the request's map
-    /// misreads. The lifecycle pass is the only sender (a request sending
+    /// misreads. Likewise right after a settings change drops the pair's
+    /// peer: the request is unprepared at once, the document is not until
+    /// the lifecycle pass sends it. The lifecycle pass is the only sender (a request sending
     /// here could overtake a newer text), so the request waits for it and
     /// fails if it does not come.
     async fn wait_for_prepared_sync(
@@ -598,6 +610,21 @@ mod tests {
     use crate::lsp::bridge::pool::test_helpers::*;
     use crate::lsp::bridge::protocol::region_host_end;
     use std::sync::Arc;
+
+    #[test]
+    fn requests_check_the_held_text_once_anything_is_prepared() {
+        let pool = LanguageServerPool::new();
+        let unprepared = RegionOffset::new(0, 0);
+        assert!(
+            !pool.checks_held_text(&unprepared),
+            "without preparation, documents behave as before"
+        );
+        pool.note_prepare_used();
+        assert!(
+            pool.checks_held_text(&unprepared),
+            "a server may still hold the prepared text of a pair that lost its peer"
+        );
+    }
 
     fn start_observed_request(
         pool: Arc<LanguageServerPool>,
