@@ -253,18 +253,9 @@ pub(crate) enum PrepareError {
 pub(crate) struct PreparedDocument {
     /// The text sent downstream.
     pub(crate) text: String,
-    /// `None` when the answer changed nothing: P is V and needs no mapping.
+    /// `Some` for every document that went through a peer, even when its
+    /// answer changed nothing.
     pub(crate) map: Option<std::sync::Arc<PreparedMap>>,
-}
-
-impl PreparedDocument {
-    /// The document unchanged (a `null` answer, or no prepare configured).
-    pub(crate) fn unchanged(virtual_text: &str) -> Self {
-        Self {
-            text: virtual_text.to_string(),
-            map: None,
-        }
-    }
 }
 
 /// Apply a peer answer to the virtual document it was asked about.
@@ -359,11 +350,9 @@ pub(crate) fn apply_prepare_result(
         }
     }
 
-    // Without deletions or gaps P is V and nothing needs mapping or
-    // protecting.
-    if runs.iter().all(|run| run.kind == RunKind::Identity) {
-        return Ok(PreparedDocument::unchanged(virtual_text));
-    }
+    // Even an answer that changed nothing yields a map: the map is how every
+    // later path knows the document went through the peer (and must wait
+    // for the prepared text to reach a server, keep off its gaps, …).
     let fingerprint = {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -1125,10 +1114,14 @@ mod tests {
     }
 
     #[test]
-    fn null_answer_without_gaps_needs_no_map() {
+    fn null_answer_without_gaps_still_maps_identically() {
         let layout = VirtualLayout::single("a\n");
         let prepared = apply_prepare_result("a\n", &layout, None).unwrap();
-        assert_eq!(prepared, PreparedDocument::unchanged("a\n"));
+        assert_eq!(prepared.text, "a\n");
+        let map = prepared
+            .map
+            .expect("a prepared document always carries a map");
+        assert_eq!(map.to_virtual(pos(0, 1), Bias::Start), pos(0, 1));
     }
 
     #[test]
