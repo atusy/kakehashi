@@ -569,6 +569,19 @@ impl BridgeCoordinator {
             .state(host_uri, injection_language, region_id, virtual_text)
     }
 
+    /// Note the prepared text the lifecycle pass sends for a region; `true`
+    /// when it replaced a different one (see `PrepareRegistry::note_sent`).
+    pub(crate) fn note_prepared_sent(
+        &self,
+        host_uri: &Url,
+        injection_language: &str,
+        region_id: &str,
+        prepared_text: &str,
+    ) -> bool {
+        self.prepare
+            .note_sent(host_uri, injection_language, region_id, prepared_text)
+    }
+
     /// Drop one region's prepared document (see
     /// `PrepareRegistry::forget_region`).
     pub(crate) fn forget_prepared_region(

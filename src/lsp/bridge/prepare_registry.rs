@@ -92,6 +92,9 @@ struct Entry {
     server_config: Option<Arc<BridgeServerConfig>>,
     current: Generation,
     previous: Option<Generation>,
+    /// Identity of the prepared text the lifecycle pass last sent, so a
+    /// change of it (whose coordinates cached pushes no longer share) shows.
+    sent: Option<u64>,
 }
 
 impl Entry {
@@ -420,6 +423,32 @@ impl PrepareRegistry {
         });
     }
 
+    /// Note that the lifecycle pass sent `prepared_text` for a region.
+    /// `true` when it differs from the prepared text sent before: diagnostics
+    /// a server pushed for that earlier text are in coordinates no current
+    /// map describes.
+    pub(crate) fn note_sent(
+        &self,
+        host_uri: &Url,
+        injection_language: &str,
+        region_id: &str,
+        prepared_text: &str,
+    ) -> bool {
+        let host_uri = host_uri.as_str();
+        let Some(mut entry) = self
+            .entries
+            .get_mut(&region_hash(host_uri, injection_language, region_id))
+            .filter(|entry| entry.is(host_uri, injection_language, region_id))
+        else {
+            return false;
+        };
+        let sent = text_key(prepared_text);
+        entry
+            .sent
+            .replace(sent)
+            .is_some_and(|previous| previous != sent)
+    }
+
     /// Forget one region's document: its pair no longer has a peer, or the
     /// region itself was replaced or invalidated. `injection_language`
     /// `None` forgets the region under every language.
@@ -501,6 +530,7 @@ impl PrepareRegistry {
                 server_config: target.config.clone(),
                 current: fresh(),
                 previous: None,
+                sent: None,
             });
         if !entry.is(host_uri, input.injection_language, input.region_id) {
             // A hash collision with another region: take the slot over.
@@ -513,6 +543,7 @@ impl PrepareRegistry {
                 server_config: target.config.clone(),
                 current: fresh(),
                 previous: None,
+                sent: None,
             };
         }
         if entry.current.key == key {
@@ -965,6 +996,35 @@ mod tests {
         assert!(
             registry.entries.is_empty(),
             "a relaunched peer prepares again"
+        );
+    }
+
+    #[test]
+    fn a_changed_sent_text_is_noticed() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let region = "01J0000000000000000000000A";
+        let input = PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: region,
+            virtual_text: "  a",
+            gaps: &[],
+        };
+        registry.cell(&target, input, Holder::LifecyclePass);
+        assert!(
+            !registry.note_sent(&host, "lua", region, "a"),
+            "the first text"
+        );
+        assert!(
+            !registry.note_sent(&host, "lua", region, "a"),
+            "the same text"
+        );
+        assert!(
+            registry.note_sent(&host, "lua", region, "  a"),
+            "a different text"
         );
     }
 

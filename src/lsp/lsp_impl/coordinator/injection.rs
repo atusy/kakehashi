@@ -417,11 +417,25 @@ impl InjectionCoordinator {
             virtual_text: &injection.content,
             gaps,
         };
-        (injection.content, injection.held) = match self
-            .bridge
-            .prepared_document_now(&target, input)
-        {
-            crate::lsp::bridge::PrepareLookup::Ready(prepared) => (prepared.text.clone(), false),
+        let lookup = self.bridge.prepared_document_now(&target, input);
+        (injection.content, injection.held) = match lookup {
+            crate::lsp::bridge::PrepareLookup::Ready(prepared) => {
+                // Pushed diagnostics are cached in the coordinates of the
+                // text the server held; once it is sent a different prepared
+                // text, no map translates them any more (the peer may dedent
+                // an unchanged line differently), so they are dropped rather
+                // than misplaced until the server publishes again.
+                if self.bridge.note_prepared_sent(
+                    uri,
+                    &injection.language,
+                    &injection.region_id,
+                    &prepared.text,
+                ) {
+                    self.diagnostics
+                        .evict_source(uri, &DiagnosticSource::Region(injection.region_id.clone()));
+                }
+                (prepared.text.clone(), false)
+            }
             crate::lsp::bridge::PrepareLookup::Failed
             | crate::lsp::bridge::PrepareLookup::Pending => (String::new(), true),
         };
