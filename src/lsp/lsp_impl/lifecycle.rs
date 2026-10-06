@@ -814,7 +814,11 @@ impl Kakehashi {
                         // no resync would come again: retry with backoff,
                         // a bounded number of times, while the host is open.
                         let synchronized = injection.process_injections_synchronized(&uri).await;
-                        if synchronized {
+                        // A save the held regions missed is replayed too; one
+                        // the regions could not be looked at for (a reload)
+                        // is kept, and retried like a failed send.
+                        let replayed = injection.replay_held_save(&uri).await;
+                        if synchronized && replayed {
                             failures.remove(&uri);
                         } else if injection.document_incarnation(&uri).is_some() {
                             let failed = failures.entry(uri.clone()).or_default();
@@ -833,7 +837,6 @@ impl Kakehashi {
                         } else {
                             failures.remove(&uri);
                         }
-                        injection.replay_held_save(&uri).await;
                         // A pull owed a refresh waits for a pass that reached
                         // every server: one now would re-pull from a server
                         // still holding the text before.

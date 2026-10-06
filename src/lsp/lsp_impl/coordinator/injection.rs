@@ -462,10 +462,12 @@ impl InjectionCoordinator {
 
     /// Forward a save that `uri`'s held regions missed to those now sent,
     /// while the host is still at the saved version (under its edit lock,
-    /// like the save itself). Regions still held keep waiting.
-    pub(crate) async fn replay_held_save(&self, uri: &Url) {
+    /// like the save itself). Regions still held keep waiting. `false` when
+    /// the regions could not be looked at (a reload in progress): the save
+    /// is kept for a later attempt.
+    pub(crate) async fn replay_held_save(&self, uri: &Url) -> bool {
         let Some(mut held) = self.bridge.take_held_save(uri) else {
-            return;
+            return true;
         };
         let edit_lock = self.documents.edit_lock(uri);
         let _guard = edit_lock.lock().await;
@@ -474,10 +476,12 @@ impl InjectionCoordinator {
             .get(uri)
             .map(|document| (document.incarnation(), document.content_version()));
         if current != Some((held.incarnation, held.content_version)) {
-            return;
+            return true;
         }
         let Some((_, Some(injections))) = self.bridge_injections(uri) else {
-            return;
+            self.bridge
+                .hold_save(uri, held.incarnation, held.content_version, held.region_ids);
+            return false;
         };
         let (ready, still_held): (Vec<_>, Vec<_>) = injections
             .into_iter()
@@ -498,6 +502,7 @@ impl InjectionCoordinator {
             self.bridge
                 .hold_save(uri, held.incarnation, held.content_version, held.region_ids);
         }
+        true
     }
 
     /// Process injected languages: resolve injection data, optionally forward didChange,
