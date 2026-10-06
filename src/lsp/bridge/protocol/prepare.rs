@@ -690,6 +690,13 @@ impl PreparedMap {
         })
     }
 
+    /// Whether a V position sits strictly inside a gap: host-owned text no
+    /// downstream position stands for.
+    pub(crate) fn virtual_position_in_gap(&self, position: Position) -> bool {
+        let offset = self.virtual_lines.offset_clamped(position);
+        self.virtual_range_touches_gap(offset, offset)
+    }
+
     /// Whether the V range `start..end` reaches inside a gap's V text (an
     /// empty range: whether it sits strictly inside one).
     fn virtual_range_touches_gap(&self, start: usize, end: usize) -> bool {

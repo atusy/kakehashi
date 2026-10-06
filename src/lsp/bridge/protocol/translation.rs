@@ -240,6 +240,22 @@ pub(crate) fn host_position_within_region(host_position: Position, offset: &Regi
     host_position.character >= offset.column_for_line(virtual_line)
 }
 
+/// Whether `host_position` lies strictly inside a gap of the prepared
+/// document `offset` maps to — host-owned text (an interpolation, say) that
+/// no downstream request should be made at: an implicit completion there
+/// would insert into it.
+pub(crate) fn host_position_in_prepared_gap(
+    host_position: Position,
+    offset: &RegionOffset,
+) -> bool {
+    let Some(prepared) = offset.prepared() else {
+        return false;
+    };
+    let mut position = host_position;
+    translate_host_position_to_virtual(&mut position, &offset.unprepared());
+    prepared.virtual_position_in_gap(position)
+}
+
 /// [`host_position_within_region`] plus the trailing bound: the position must
 /// also not lie past `region_end` — the region's end-of-content mapped to host
 /// coordinates (`region_host_end(virtual_content, offset)`).
@@ -321,6 +337,41 @@ mod tests {
             super::super::prepare::apply_prepare_result(virtual_text, &layout, Some(result))
                 .unwrap();
         RegionOffset::new(10, 4).with_prepared(prepared.map)
+    }
+
+    #[test]
+    fn a_host_position_inside_a_prepared_gap_is_recognized() {
+        use super::super::prepare::{SegmentKind, VirtualLayout, apply_prepare_result};
+        // `x = ${a}` at host line 10, the interpolation a gap.
+        let virtual_text = "x =     \n";
+        let layout = VirtualLayout::from_pieces(
+            virtual_text,
+            [
+                (SegmentKind::Content, 0..4, String::new()),
+                (SegmentKind::Gap, 4..8, "${a}".to_string()),
+                (SegmentKind::Content, 8..9, String::new()),
+            ],
+        );
+        let result = serde_json::from_value(serde_json::json!({"segments": [
+            {"type": "content"}, {"type": "gap", "content": "None"}, {"type": "content"}
+        ]}))
+        .unwrap();
+        let prepared = apply_prepare_result(virtual_text, &layout, Some(result)).unwrap();
+        let offset = RegionOffset::new(10, 0).with_prepared(prepared.map);
+        assert!(host_position_in_prepared_gap(Position::new(10, 6), &offset));
+        // Its edges are not inside it.
+        assert!(!host_position_in_prepared_gap(
+            Position::new(10, 4),
+            &offset
+        ));
+        assert!(!host_position_in_prepared_gap(
+            Position::new(10, 8),
+            &offset
+        ));
+        assert!(!host_position_in_prepared_gap(
+            Position::new(10, 2),
+            &offset
+        ));
     }
 
     #[test]
