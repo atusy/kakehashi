@@ -161,7 +161,27 @@ pub(super) fn resolve_region_offset(
     host_url: &Url,
     region_id: &str,
 ) -> Option<(RegionOffset, Position, bool, String)> {
-    resolve_region(documents, language, bridge, host_url, region_id).map(resolved_region_geometry)
+    let resolved = resolve_region(documents, language, bridge, host_url, region_id)?;
+    // Downstream coordinates are in the document the servers were sent: a
+    // prepared one carries its map, and one whose prepared form is unknown
+    // cannot be translated at all.
+    let prepared = match bridge.prepared_state(
+        host_url,
+        &resolved.injection_language,
+        region_id,
+        &resolved.virtual_content,
+    ) {
+        crate::lsp::bridge::PreparedState::Unprepared => None,
+        crate::lsp::bridge::PreparedState::Prepared(map) => map,
+        crate::lsp::bridge::PreparedState::Unavailable => return None,
+    };
+    let (offset, region_end, contiguous, injection_language) = resolved_region_geometry(resolved);
+    Some((
+        offset.with_prepared(prepared),
+        region_end,
+        contiguous,
+        injection_language,
+    ))
 }
 
 /// Resolve geometry and content from the same current snapshot.

@@ -231,17 +231,30 @@ impl Kakehashi {
         // Lightweight per-region metadata `(region_id, injection_language,
         // current offset)` for the pushFallback fold; the live pull below moves
         // the regions themselves.
+        // Cached pushes are in the coordinates of the document the server was
+        // sent; a region whose prepared form is unknown contributes none.
         let region_meta: Vec<(String, String, RegionOffset)> = virt_regions
             .iter()
-            .map(|r| {
-                (
+            .filter_map(|r| {
+                let prepared = match self.bridge.prepared_state(
+                    &uri,
+                    &r.injection_language,
+                    &r.region.region_id,
+                    &r.virtual_content,
+                ) {
+                    crate::lsp::bridge::PreparedState::Unprepared => None,
+                    crate::lsp::bridge::PreparedState::Prepared(map) => map,
+                    crate::lsp::bridge::PreparedState::Unavailable => return None,
+                };
+                Some((
                     r.region.region_id.clone(),
                     r.injection_language.clone(),
                     RegionOffset::with_per_line_offsets(
                         r.region.line_range.start,
                         r.line_column_offsets.clone(),
-                    ),
-                )
+                    )
+                    .with_prepared(prepared),
+                ))
             })
             .collect();
 
@@ -288,6 +301,7 @@ impl Kakehashi {
                 );
                 let strategy = agg.strategy;
                 let region_ctx = DocumentRequestContext {
+                    prepared: None,
                     uri: uri.clone(),
                     resolved: resolved.clone(),
                     region_end: None,
@@ -297,6 +311,18 @@ impl Kakehashi {
                     strategy,
                     max_fan_out: agg.max_fan_out,
                     client_progress_token: None,
+                };
+                let Some(region_ctx) =
+                    crate::lsp::lsp_impl::bridge_context::prepare_request_context(
+                        &self.bridge,
+                        &self.settings_manager.load_settings(),
+                        self.experimental_enabled(),
+                        language_name,
+                        region_ctx,
+                    )
+                    .await
+                else {
+                    continue;
                 };
                 let pool = Arc::clone(&pool);
                 let task_sink = request_error_sink.clone();

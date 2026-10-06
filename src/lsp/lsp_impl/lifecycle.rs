@@ -775,6 +775,33 @@ impl Kakehashi {
             ));
         }
 
+        // Virtual documents held back for a prepare peer's answer are sent
+        // once it arrives: the finished request names the host, and the
+        // injection pass re-run for it now finds the prepared text.
+        if let Some(mut resync_rx) = self.bridge.take_prepare_resync_rx() {
+            let injection = self.injection_coordinator();
+            let token = self.shutdown_token.clone();
+            tokio::spawn(async move {
+                loop {
+                    let uri = tokio::select! {
+                        _ = token.cancelled() => return,
+                        uri = resync_rx.recv() => match uri {
+                            Some(uri) => uri,
+                            None => return,
+                        },
+                    };
+                    // Several documents of one host usually finish together.
+                    let mut hosts = std::collections::HashSet::from([uri]);
+                    while let Ok(uri) = resync_rx.try_recv() {
+                        hosts.insert(uri);
+                    }
+                    for uri in hosts {
+                        injection.process_injections(&uri, true).await;
+                    }
+                }
+            });
+        }
+
         // Ask a pull-capable client for its configuration now that the
         // handshake is complete. Editors that send `didChangeConfiguration`
         // with no usable `settings` have no other way to configure kakehashi

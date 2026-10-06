@@ -83,6 +83,17 @@ pub(crate) struct InjectionCoordinator {
     publisher: super::DiagnosticPublisher,
     settle_retry_waiters: crate::lsp::lsp_impl::settle_retry::SettleRetryWaiters,
     shutdown: tokio_util::sync::CancellationToken,
+    /// Experimental features (virtual-document preparation) are on.
+    experimental: bool,
+}
+
+/// The injections to send downstream: all but the held ones (see
+/// `BridgeInjection::held`).
+pub(crate) fn sendable_injections(injections: Vec<BridgeInjection>) -> Vec<BridgeInjection> {
+    injections
+        .into_iter()
+        .filter(|injection| !injection.held)
+        .collect()
 }
 
 /// What a bounded wait for a current tree actually found.
@@ -127,6 +138,7 @@ impl InjectionCoordinator {
             publisher: super::DiagnosticPublisher::new(server),
             settle_retry_waiters: server.settle_retry_waiters.clone(),
             shutdown: server.shutdown_token.clone(),
+            experimental: server.experimental_enabled(),
         }
     }
 
@@ -259,10 +271,15 @@ impl InjectionCoordinator {
         ) {
             let regions = regions
                 .iter()
-                .map(|region| BridgeInjection {
-                    language: region.language.clone(),
-                    region_id: region.region_id.clone(),
-                    content: region.content.clone(),
+                .map(|region| {
+                    self.prepared_bridge_injection(
+                        uri,
+                        host_language,
+                        &region.language,
+                        &region.region_id,
+                        &region.content,
+                        &region.gaps,
+                    )
                 })
                 .collect();
             return settled().then_some(regions);
@@ -337,13 +354,62 @@ impl InjectionCoordinator {
             incarnation,
         )
         .into_iter()
-        .map(|region| BridgeInjection {
-            language: region.injection_language,
-            region_id: region.region.region_id,
-            content: region.virtual_content,
+        .map(|region| {
+            self.prepared_bridge_injection(
+                uri,
+                host_language,
+                &region.injection_language,
+                &region.region.region_id,
+                &region.virtual_content,
+                &region.gaps,
+            )
         })
         .collect();
         settled().then_some(resolved)
+    }
+
+    /// The bridge payload for one resolved virtual document: its text as
+    /// downstream servers must see it. Under a configured prepare peer that is
+    /// the prepared text — or, while the peer has not answered (or failed),
+    /// nothing: the injection is `held`, kept open where it is open but not
+    /// sent. A finished prepare re-runs this pass for the host.
+    fn prepared_bridge_injection(
+        &self,
+        uri: &Url,
+        host_language: &str,
+        language: &str,
+        region_id: &str,
+        content: &str,
+        gaps: &[crate::language::injection::VirtualGap],
+    ) -> BridgeInjection {
+        let settings = self.settings_manager.load_settings();
+        let injection = |content: String, held| BridgeInjection {
+            language: language.to_string(),
+            region_id: region_id.to_string(),
+            content,
+            held,
+        };
+        let Some(target) =
+            self.bridge
+                .prepare_target(&settings, host_language, language, self.experimental)
+        else {
+            return injection(content.to_string(), false);
+        };
+        let input = crate::lsp::bridge::PrepareInput {
+            host_uri: uri,
+            host_language,
+            injection_language: language,
+            region_id,
+            virtual_text: content,
+            gaps,
+        };
+        match self.bridge.prepared_document_now(&target, input) {
+            crate::lsp::bridge::PrepareLookup::Ready(prepared) => {
+                injection(prepared.text.clone(), false)
+            }
+            crate::lsp::bridge::PrepareLookup::Failed
+            | crate::lsp::bridge::PrepareLookup::Pending => injection(String::new(), true),
+        }
     }
 
     /// Process injected languages: resolve injection data, optionally forward didChange,
@@ -477,6 +543,10 @@ impl InjectionCoordinator {
             self.diagnostics
                 .evict_source(uri, &DiagnosticSource::Region(region_id));
         }
+        // Held injections (prepare pending or failed) count as present above,
+        // so their open documents are not closed, but nothing is sent for
+        // them: downstream servers never see a document unprepared.
+        let injections = sendable_injections(injections);
 
         let synchronized = if forward_did_change {
             self.bridge
@@ -1117,6 +1187,7 @@ impl InjectionCoordinator {
                     let Some(injections) = this.resolve_injection_data(&uri, &host_language) else {
                         continue;
                     };
+                    let injections = sendable_injections(injections);
                     let settings = this.settings_manager.load_settings();
                     let edit_lock = ReopenEditLock::new(&this.documents, &uri);
                     let read = || this.reopen_document_revision(&uri, revision);
@@ -1164,6 +1235,7 @@ impl InjectionCoordinator {
         key: &crate::lsp::bridge::ConnectionKey,
         injections: Vec<BridgeInjection>,
     ) -> crate::lsp::bridge::OpenOutcome {
+        let injections = sendable_injections(injections);
         let edit_lock = ReopenEditLock::new(&self.documents, uri);
         let read = || self.reopen_document_revision(uri, revision);
         let outcome = self
@@ -2420,6 +2492,7 @@ mod tests {
                 revision,
                 &crate::lsp::bridge::ConnectionKey::for_server("not-selected"),
                 vec![super::BridgeInjection {
+                    held: false,
                     language: "python".into(),
                     region_id: "00000000000000000000000000".into(),
                     content: "old()".into(),

@@ -13,8 +13,8 @@ use ulid::Ulid;
 use url::Url;
 
 use crate::config::{
-    WorkspaceSettings, merge_bridge_server_configs, resolve_with_wildcard,
-    settings::BridgeServerConfig,
+    WorkspaceSettings, merge_bridge_language_configs, merge_bridge_server_configs,
+    resolve_with_wildcard, settings::BridgeServerConfig,
 };
 use crate::language::node_tracker::{EditInfo, NodeTracker};
 use crate::lsp::request_id::CancelForwarder;
@@ -36,6 +36,11 @@ pub(crate) struct BridgeInjection {
     pub(crate) region_id: String,
     /// The text content of the bridge virtual document
     pub(crate) content: String,
+    /// Not to be sent: its prepared form is not available
+    /// (`kakehashi/virtualDocument/prepare` pending or failed). A held
+    /// injection still exists — its open document stays open — but neither
+    /// opens nor changes downstream.
+    pub(crate) held: bool,
 }
 
 /// One server's share of an eager-open batch: its spawn config plus the
@@ -160,6 +165,8 @@ pub(crate) struct ForceStartTestControl {
 /// genuinely benefits from a semantic name (e.g., document lifecycle, shutdown).
 pub(crate) struct BridgeCoordinator {
     pool: Arc<LanguageServerPool>,
+    /// Prepared forms of virtual documents (`kakehashi/virtualDocument/prepare`).
+    prepare: super::prepare_registry::PrepareRegistry,
     node_tracker: Arc<NodeTracker>,
     /// Cancel forwarder for upstream cancel notification and downstream forwarding.
     ///
@@ -295,6 +302,7 @@ impl BridgeCoordinator {
         let cancel_forwarder = CancelForwarder::new(Arc::clone(&pool));
         Self {
             pool,
+            prepare: super::prepare_registry::PrepareRegistry::default(),
             node_tracker: Arc::new(NodeTracker::new()),
             cancel_forwarder,
             eager_open_generation: std::sync::atomic::AtomicU64::new(0),
@@ -321,6 +329,7 @@ impl BridgeCoordinator {
     ) -> Self {
         Self {
             pool,
+            prepare: super::prepare_registry::PrepareRegistry::default(),
             node_tracker: Arc::new(NodeTracker::new()),
             cancel_forwarder,
             eager_open_generation: std::sync::atomic::AtomicU64::new(0),
@@ -381,6 +390,103 @@ impl BridgeCoordinator {
     /// Used by handlers for `send_*_request()` methods.
     pub(crate) fn pool(&self) -> &LanguageServerPool {
         &self.pool
+    }
+
+    /// The peer that prepares `injection_language` virtual documents in
+    /// `host_language` hosts (`bridge.<injection>.prepare`), when configured,
+    /// spawnable, and experimental features are on.
+    pub(crate) fn prepare_target(
+        &self,
+        settings: &WorkspaceSettings,
+        host_language: &str,
+        injection_language: &str,
+        experimental: bool,
+    ) -> Option<super::PrepareTarget> {
+        if !experimental {
+            return None;
+        }
+        let server_name = settings
+            .resolve_host_language_settings(host_language)?
+            .bridge
+            .as_ref()
+            .and_then(|bridge| {
+                resolve_with_wildcard(bridge, injection_language, merge_bridge_language_configs)
+            })?
+            .prepare?;
+        let config = resolve_with_wildcard(
+            &settings.language_servers,
+            &server_name,
+            merge_bridge_server_configs,
+        )
+        .filter(|config| config.is_spawnable());
+        let Some(config) = config else {
+            log::warn!(
+                target: "kakehashi::bridge::prepare",
+                "bridge.{}.prepare names {}, which is not a startable language server; {} virtual documents in {} hosts are not sent",
+                escape_terminal_controls(injection_language),
+                escape_terminal_controls(&server_name),
+                escape_terminal_controls(injection_language),
+                escape_terminal_controls(host_language),
+            );
+            // Fail closed: a configured but unusable peer must not let the
+            // unprepared document through.
+            return Some(super::PrepareTarget {
+                server_name,
+                config: Arc::new(BridgeServerConfig::default()),
+            });
+        };
+        Some(super::PrepareTarget {
+            server_name,
+            config: Arc::new(config),
+        })
+    }
+
+    /// The prepared form of a virtual document, without waiting: on a miss
+    /// the request starts in the background and the host is queued for a
+    /// re-sync (see [`Self::take_prepare_resync_rx`]).
+    pub(crate) fn prepared_document_now(
+        &self,
+        target: &super::PrepareTarget,
+        input: super::PrepareInput<'_>,
+    ) -> super::PrepareLookup {
+        self.prepare.lookup_or_start(&self.pool, target, input)
+    }
+
+    /// The prepared form of a virtual document, waiting for the peer.
+    /// `None` when it could not be prepared: send nothing.
+    pub(crate) async fn prepared_document(
+        &self,
+        target: &super::PrepareTarget,
+        input: super::PrepareInput<'_>,
+    ) -> Option<Arc<super::protocol::PreparedDocument>> {
+        self.prepare.prepare(&self.pool, target, input).await
+    }
+
+    /// Hosts whose held-back virtual documents finished preparing; the
+    /// receiver re-runs their injection pass. Taken once.
+    pub(crate) fn take_prepare_resync_rx(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<Url>> {
+        self.prepare.take_resync_rx()
+    }
+
+    /// How the virtual document with this exact text was sent downstream
+    /// (prepared or not), for translating its coordinates where settings are
+    /// not at hand.
+    pub(crate) fn prepared_state(
+        &self,
+        host_uri: &Url,
+        injection_language: &str,
+        region_id: &str,
+        virtual_text: &str,
+    ) -> super::PreparedState {
+        self.prepare
+            .state(host_uri, injection_language, region_id, virtual_text)
+    }
+
+    /// Drop a closed host's prepared documents.
+    pub(crate) fn forget_prepared_host(&self, host_uri: &Url) {
+        self.prepare.forget_host(host_uri);
     }
 
     /// Get a cloneable reference to the pool for use in spawned tasks.
@@ -2804,6 +2910,7 @@ mod tests {
         let host_uri = Url::parse("file:///doc.md").unwrap();
         let injections = || {
             vec![BridgeInjection {
+                held: false,
                 language: "lua".to_string(),
                 region_id: "region-0".to_string(),
                 content: "print(1)\n".to_string(),
@@ -2868,6 +2975,7 @@ mod tests {
         let host_uri = Url::parse("file:///doc.md").unwrap();
         let injections = || {
             vec![BridgeInjection {
+                held: false,
                 language: "lua".to_string(),
                 region_id: "region-0".to_string(),
                 content: "print(1)\n".to_string(),
@@ -3426,6 +3534,7 @@ mod tests {
         });
 
         let injections = vec![BridgeInjection {
+            held: false,
             language: "python".to_string(),
             region_id: "region-0".to_string(),
             content: "import os\n".to_string(),
@@ -3490,6 +3599,7 @@ mod tests {
 
         let host_uri = Url::parse("file:///doc.md").unwrap();
         let injections = vec![BridgeInjection {
+            held: false,
             language: "python".to_string(),
             region_id: "region-0".to_string(),
             content: "import os\n".to_string(),
@@ -3528,6 +3638,7 @@ mod tests {
         let host_uri = Url::parse("file:///doc.md").unwrap();
         let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap();
         let injection = BridgeInjection {
+            held: false,
             language: "lua".to_string(),
             region_id: "region-0".to_string(),
             content: "print('hello')".to_string(),
@@ -3911,6 +4022,7 @@ mod tests {
 
     fn injection(language: &str, region_id: &str) -> BridgeInjection {
         BridgeInjection {
+            held: false,
             language: language.to_string(),
             region_id: region_id.to_string(),
             content: String::new(),

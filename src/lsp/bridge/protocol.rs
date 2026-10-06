@@ -21,8 +21,6 @@ mod client_capabilities;
 mod command_routing;
 mod jsonrpc;
 mod lifecycle;
-// Wired into the bridge by the following changes.
-#[allow(dead_code)]
 mod prepare;
 mod request;
 mod request_id;
@@ -40,8 +38,8 @@ pub(crate) use jsonrpc::{
 pub(crate) use lifecycle::*;
 pub(crate) use prepare::{
     Bias, PREPARE_METHOD, PREPARE_TIMEOUT, PrepareHostTextDocument, PrepareParams, PrepareResult,
-    PrepareTextDocument, PreparedDocument, VirtualLayout, apply_prepare_result,
-    parse_prepare_response,
+    PrepareTextDocument, PreparedDocument, PreparedMap, SegmentKind, VirtualLayout,
+    apply_prepare_result, parse_prepare_response,
 };
 pub(crate) use request::*;
 pub(crate) use request_id::RequestId;

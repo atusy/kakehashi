@@ -63,6 +63,7 @@ pub(crate) struct VirtualLayout {
 
 impl VirtualLayout {
     /// A document that is all content (an isolated injection).
+    #[cfg(test)]
     pub(crate) fn single(virtual_text: &str) -> Self {
         Self {
             segments: vec![Segment {
@@ -126,13 +127,9 @@ impl VirtualLayout {
         Self { segments }
     }
 
+    #[cfg(test)]
     pub(crate) fn segments(&self) -> &[Segment] {
         &self.segments
-    }
-
-    /// Whether the layout presents any gap to the peer.
-    pub(crate) fn has_gaps(&self) -> bool {
-        self.segments.iter().any(|s| s.kind == SegmentKind::Gap)
     }
 }
 
@@ -541,31 +538,6 @@ impl PreparedMap {
         let offset = self.virtual_lines.offset_clamped(position);
         let mapped = map_offset(&self.runs, offset, bias, Side::Virtual);
         self.prepared_lines.position(mapped)
-    }
-
-    /// Translate a range in P to V.
-    pub(crate) fn range_to_virtual(&self, range: LspRange) -> LspRange {
-        LspRange::new(
-            self.to_virtual(range.start, Bias::Start),
-            self.to_virtual(range.end, Bias::End),
-        )
-    }
-
-    /// Translate a range in V to P.
-    pub(crate) fn range_to_prepared(&self, range: LspRange) -> LspRange {
-        LspRange::new(
-            self.to_prepared(range.start, Bias::Start),
-            self.to_prepared(range.end, Bias::End),
-        )
-    }
-
-    /// Whether a V position falls strictly inside a gap — host-owned text no
-    /// downstream position can stand for.
-    pub(crate) fn virtual_position_in_gap(&self, position: Position) -> bool {
-        let offset = self.virtual_lines.offset_clamped(position);
-        self.runs.iter().any(|run| {
-            run.kind == RunKind::Gap && run.virtual_.start < offset && offset < run.virtual_.end
-        })
     }
 
     /// Translate edits a downstream server made to P into edits to V.
@@ -1103,12 +1075,8 @@ mod tests {
         assert_eq!(map.to_virtual(pos(1, 6), Bias::Start), pos(1, 6));
         assert_eq!(map.to_prepared(pos(0, 2), Bias::Start), pos(0, 2));
         // …and a range over the placeholder covers the whole original gap.
-        assert_eq!(
-            map.range_to_virtual(LspRange::new(pos(0, 4), pos(0, 8))),
-            LspRange::new(pos(0, 4), pos(0, 8))
-        );
-        assert!(map.virtual_position_in_gap(pos(0, 5)));
-        assert!(!map.virtual_position_in_gap(pos(0, 4)));
+        assert_eq!(map.to_virtual(pos(0, 4), Bias::Start), pos(0, 4));
+        assert_eq!(map.to_virtual(pos(0, 6), Bias::End), pos(0, 8));
     }
 
     #[test]

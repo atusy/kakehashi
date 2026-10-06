@@ -361,6 +361,7 @@ impl Kakehashi {
                 continue;
             }
             let region_ctx = DocumentRequestContext {
+                prepared: None,
                 uri: uri.clone(),
                 resolved: resolved.clone(),
                 region_end: None,
@@ -370,6 +371,17 @@ impl Kakehashi {
                 strategy: agg.strategy,
                 max_fan_out: agg.max_fan_out,
                 client_progress_token: None,
+            };
+            let Some(region_ctx) = crate::lsp::lsp_impl::bridge_context::prepare_request_context(
+                &self.bridge,
+                &self.settings_manager.load_settings(),
+                self.experimental_enabled(),
+                language_name,
+                region_ctx,
+            )
+            .await
+            else {
+                continue;
             };
             // Decide how this region formats — concatenated pipeline, preferred
             // fan-out, or skip — from its resolved aggregation config. See
@@ -965,8 +977,18 @@ async fn dispatch_concatenated_formatting(
     let offset = RegionOffset::with_per_line_offsets(
         region_ctx.resolved.region.line_range.start,
         region_ctx.resolved.line_column_offsets.clone(),
-    );
+    )
+    .with_prepared(region_ctx.prepared.clone());
     let original_virtual = region_ctx.resolved.virtual_content.clone();
+    // A prepared document's whole-region result goes back through the
+    // prepared map below; precompute its extent (in prepared coordinates)
+    // before `original_virtual` moves into the pipeline.
+    let prepared_failure_sink = request_error_sink.clone();
+    let prepared_end = region_ctx.prepared.as_ref().map(|_| {
+        crate::text::PositionMapper::new(&original_virtual)
+            .byte_to_position(original_virtual.len())
+            .unwrap_or_default()
+    });
     // Precompute the host replacement range now, while we still hold
     // `original_virtual`, so it can be moved into the pipeline below without a
     // second clone. An unresolvable end position means we emit no edit (bounded
@@ -1381,6 +1403,35 @@ async fn dispatch_concatenated_formatting(
     }
 
     let final_text = final_text?;
+    if let Some(prepared_end) = prepared_end {
+        // The pipeline ran over the prepared text; map its result back through
+        // the prepared map, which restores dedented indentation and refuses a
+        // result that rewrote host-owned text (a gap). Host line prefixes are
+        // not re-applied on this path, so a prefixed region fails closed.
+        let edits = if host_line_prefixes.iter().any(|prefix| !prefix.is_empty()) {
+            None
+        } else {
+            crate::lsp::bridge::translate_virtual_text_edits_to_host(
+                vec![TextEdit {
+                    range: tower_lsp_server::ls_types::Range::new(
+                        tower_lsp_server::ls_types::Position::new(0, 0),
+                        prepared_end,
+                    ),
+                    new_text: final_text,
+                }],
+                &offset,
+            )
+        };
+        if edits.is_none() {
+            log::warn!(
+                target: "kakehashi::formatting",
+                "concatenated formatting result for {} edits host-owned text of a prepared virtual document; dropping it",
+                region_ctx.uri
+            );
+            count_request_errors(&prepared_failure_sink, 1);
+        }
+        return edits;
+    }
     // Decision point 4: the virtual output starts at column 0 of the embedded
     // language, so every continuation line must re-gain its host prefix before
     // the whole-region replacement is emitted.

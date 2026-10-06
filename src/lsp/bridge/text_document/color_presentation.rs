@@ -162,12 +162,11 @@ fn transform_color_presentation_response_to_host(
                 return false;
             }
         }
-        if let Some(text_edit) = &mut presentation.text_edit {
-            if !translate_virtual_text_edit_to_host(text_edit, offset)
-                || !text_edit_safe_in_region(text_edit, offset, region_end)
-            {
-                return false;
-            }
+        if let Some(text_edit) = &mut presentation.text_edit
+            && (!translate_virtual_text_edit_to_host(text_edit, offset)
+                || !text_edit_safe_in_region(text_edit, offset, region_end))
+        {
+            return false;
         }
 
         // ALL-OR-NOTHING (same reasoning as completion): the array can carry

@@ -94,6 +94,20 @@ impl Kakehashi {
                             &host_url,
                             &envelope.region_id,
                         )?;
+                        // A prepared document cannot be resent from here (this
+                        // would sync the unprepared text) nor its item translated
+                        // back through an envelope; leave the item unresolved.
+                        if !matches!(
+                            self.bridge.prepared_state(
+                                &host_url,
+                                &region.injection_language,
+                                &envelope.region_id,
+                                &region.virtual_content,
+                            ),
+                            crate::lsp::bridge::PreparedState::Unprepared
+                        ) {
+                            return None;
+                        }
                         let text = std::sync::Arc::from(region.virtual_content.as_str());
                         let (offset, end, contiguous, language) = resolved_region_geometry(region);
                         if !completion_geometry_matches(envelope, &offset, contiguous, &language) {

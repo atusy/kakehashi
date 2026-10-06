@@ -196,6 +196,85 @@ pub(crate) struct DocumentRequestContext {
     /// aggregates the fanned-out downstreams' `$/progress` onto it
     /// (ls-bridge-client-progress); `None` disables client-progress aggregation.
     pub(crate) client_progress_token: Option<tower_lsp_server::ls_types::NumberOrString>,
+    /// Prepared ↔ virtual coordinates when `resolved.virtual_content` holds
+    /// the prepared document downstream servers see (see
+    /// [`prepare_request_context`]).
+    pub(crate) prepared: Option<std::sync::Arc<crate::lsp::bridge::PreparedMap>>,
+}
+
+/// Present `ctx`'s virtual document as downstream servers see it, waiting for
+/// the prepare peer when the (host, injection) pair has one: the context's
+/// virtual content becomes the prepared text and its fan-out translates
+/// through the prepared map. `None` when the document could not be prepared —
+/// the region is then not bridged at all, never bridged unprepared.
+pub(crate) async fn prepare_request_context(
+    bridge: &crate::lsp::bridge::BridgeCoordinator,
+    settings: &WorkspaceSettings,
+    experimental: bool,
+    host_language: &str,
+    ctx: DocumentRequestContext,
+) -> Option<DocumentRequestContext> {
+    let Some(target) = bridge.prepare_target(
+        settings,
+        host_language,
+        &ctx.resolved.injection_language,
+        experimental,
+    ) else {
+        return Some(ctx);
+    };
+    let prepared = bridge
+        .prepared_document(&target, prepare_input(&ctx, host_language))
+        .await?;
+    Some(with_prepared(ctx, &prepared))
+}
+
+/// [`prepare_request_context`] without waiting, for paths that cannot: a
+/// document whose answer is not in yet is skipped like a failed one (its
+/// host is synced again when the answer arrives).
+pub(crate) fn prepare_request_context_now(
+    bridge: &crate::lsp::bridge::BridgeCoordinator,
+    settings: &WorkspaceSettings,
+    experimental: bool,
+    host_language: &str,
+    ctx: DocumentRequestContext,
+) -> Option<DocumentRequestContext> {
+    let Some(target) = bridge.prepare_target(
+        settings,
+        host_language,
+        &ctx.resolved.injection_language,
+        experimental,
+    ) else {
+        return Some(ctx);
+    };
+    match bridge.prepared_document_now(&target, prepare_input(&ctx, host_language)) {
+        crate::lsp::bridge::PrepareLookup::Ready(prepared) => Some(with_prepared(ctx, &prepared)),
+        crate::lsp::bridge::PrepareLookup::Failed | crate::lsp::bridge::PrepareLookup::Pending => {
+            None
+        }
+    }
+}
+
+fn prepare_input<'a>(
+    ctx: &'a DocumentRequestContext,
+    host_language: &'a str,
+) -> crate::lsp::bridge::PrepareInput<'a> {
+    crate::lsp::bridge::PrepareInput {
+        host_uri: &ctx.uri,
+        host_language,
+        injection_language: &ctx.resolved.injection_language,
+        region_id: &ctx.resolved.region.region_id,
+        virtual_text: &ctx.resolved.virtual_content,
+        gaps: &ctx.resolved.gaps,
+    }
+}
+
+fn with_prepared(
+    mut ctx: DocumentRequestContext,
+    prepared: &crate::lsp::bridge::PreparedDocument,
+) -> DocumentRequestContext {
+    ctx.resolved.virtual_content = prepared.text.clone();
+    ctx.prepared = prepared.map.clone();
+    ctx
 }
 
 /// All resolved context needed to send a **host** bridge request
@@ -1310,7 +1389,8 @@ impl Kakehashi {
             method_name,
         );
 
-        Some(DocumentRequestContext {
+        let ctx = DocumentRequestContext {
+            prepared: None,
             uri: preamble.uri,
             resolved: preamble.resolved,
             region_end: Some(preamble.region_end),
@@ -1320,7 +1400,15 @@ impl Kakehashi {
             strategy: agg.strategy,
             max_fan_out: agg.max_fan_out,
             client_progress_token: None,
-        })
+        };
+        prepare_request_context(
+            &self.bridge,
+            &self.settings_manager.load_settings(),
+            self.experimental_enabled(),
+            &preamble.language_name,
+            ctx,
+        )
+        .await
     }
 
     /// Resolve all aggregation settings (strategy, priorities, max_fan_out) for a

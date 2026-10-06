@@ -81,6 +81,8 @@ pub(crate) struct DiagnosticSnapshotPreparer {
     bridge: std::sync::Arc<BridgeCoordinator>,
     settings_manager: std::sync::Arc<SettingsManager>,
     cache: std::sync::Arc<crate::lsp::cache::CacheCoordinator>,
+    /// Experimental features (virtual-document preparation) are on.
+    experimental: bool,
 }
 
 impl DiagnosticSnapshotPreparer {
@@ -91,6 +93,7 @@ impl DiagnosticSnapshotPreparer {
             bridge: std::sync::Arc::clone(&server.bridge),
             settings_manager: std::sync::Arc::clone(&server.settings_manager),
             cache: std::sync::Arc::clone(&server.cache),
+            experimental: server.experimental_enabled(),
         }
     }
 }
@@ -558,7 +561,8 @@ impl DiagnosticSnapshotPreparer {
                             continue;
                         };
 
-                        contexts.push(DocumentRequestContext {
+                        let ctx = DocumentRequestContext {
+                            prepared: None,
                             uri: uri.clone(),
                             resolved: resolved.clone(),
                             region_end: None,
@@ -568,7 +572,21 @@ impl DiagnosticSnapshotPreparer {
                             strategy: agg.strategy,
                             max_fan_out: agg.max_fan_out,
                             client_progress_token: None,
-                        });
+                        };
+                        // The snapshot is built synchronously: a document still
+                        // waiting for its prepare peer skips this cycle (its host
+                        // is synced again when the answer arrives).
+                        if let Some(ctx) =
+                            crate::lsp::lsp_impl::bridge_context::prepare_request_context_now(
+                                &self.bridge,
+                                &settings,
+                                self.experimental,
+                                &language_name,
+                                ctx,
+                            )
+                        {
+                            contexts.push(ctx);
+                        }
                     }
                     contexts
                 })

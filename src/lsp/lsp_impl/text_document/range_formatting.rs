@@ -271,6 +271,7 @@ impl Kakehashi {
                     continue;
                 }
                 let region_ctx = DocumentRequestContext {
+                    prepared: None,
                     uri: uri.clone(),
                     resolved: resolved.clone(),
                     region_end: None,
@@ -280,6 +281,18 @@ impl Kakehashi {
                     strategy: agg.strategy,
                     max_fan_out: agg.max_fan_out,
                     client_progress_token: None,
+                };
+                let Some(region_ctx) =
+                    crate::lsp::lsp_impl::bridge_context::prepare_request_context(
+                        &self.bridge,
+                        &self.settings_manager.load_settings(),
+                        self.experimental_enabled(),
+                        &language_name,
+                        region_ctx,
+                    )
+                    .await
+                else {
+                    continue;
                 };
                 // Mint this region's tracked-source token into the shared
                 // aggregator (the per-region map dispatch hands to its winning

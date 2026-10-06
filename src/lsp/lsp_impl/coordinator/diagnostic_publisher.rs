@@ -213,6 +213,8 @@ pub(crate) struct DiagnosticPublisher {
     snapshot_preparer: DiagnosticSnapshotPreparer,
     aggregator: Arc<DiagnosticAggregator>,
     shutdown: tokio_util::sync::CancellationToken,
+    /// Experimental features (virtual-document preparation) are on.
+    experimental: bool,
 }
 
 impl DiagnosticPublisher {
@@ -229,6 +231,7 @@ impl DiagnosticPublisher {
             snapshot_preparer: DiagnosticSnapshotPreparer::new(server),
             aggregator: Arc::clone(&server.diagnostics),
             shutdown: server.shutdown_token.clone(),
+            experimental: server.experimental_enabled(),
         }
     }
 
@@ -2019,13 +2022,42 @@ impl DiagnosticPublisher {
                 current.incarnation,
             )),
         };
+        let settings = self.settings_manager.load_settings();
         for resolved in resolved_regions.iter() {
+            // A pushed diagnostic is in the coordinates of the document the
+            // server was sent: the prepared one, when the pair has a prepare
+            // peer. A region whose prepared form is not available gets no
+            // offset, so its pushed diagnostics are dropped, not misplaced.
+            let prepared = match self.bridge.prepare_target(
+                &settings,
+                &language_name,
+                &resolved.injection_language,
+                self.experimental,
+            ) {
+                None => None,
+                Some(target) => {
+                    let input = crate::lsp::bridge::PrepareInput {
+                        host_uri: host,
+                        host_language: &language_name,
+                        injection_language: &resolved.injection_language,
+                        region_id: &resolved.region.region_id,
+                        virtual_text: &resolved.virtual_content,
+                        gaps: &resolved.gaps,
+                    };
+                    match self.bridge.prepared_document_now(&target, input) {
+                        crate::lsp::bridge::PrepareLookup::Ready(prepared) => prepared.map.clone(),
+                        crate::lsp::bridge::PrepareLookup::Failed
+                        | crate::lsp::bridge::PrepareLookup::Pending => continue,
+                    }
+                }
+            };
             geometry.offsets.insert(
                 resolved.region.region_id.clone(),
                 RegionOffset::with_per_line_offsets(
                     resolved.region.line_range.start,
                     resolved.line_column_offsets.clone(),
-                ),
+                )
+                .with_prepared(prepared),
             );
         }
         geometry.host_language = Some(language_name);

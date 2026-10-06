@@ -149,6 +149,7 @@ impl Kakehashi {
         if current_lineage == Some((saved_incarnation, saved_content_version))
             && let Some((_, Some(injections))) = self.injection_coordinator().bridge_injections(uri)
         {
+            let injections = crate::lsp::lsp_impl::coordinator::sendable_injections(injections);
             pool.sync_and_forward_did_save_to_virtual_docs(uri, saved_incarnation, &injections)
                 .await;
         }
