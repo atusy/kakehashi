@@ -567,6 +567,12 @@ impl BridgeCoordinator {
         self.prepare.take_resync_rx()
     }
 
+    /// Whether any virtual document was ever prepared (see
+    /// `PrepareRegistry::ever_used`).
+    pub(crate) fn prepare_ever_used(&self) -> bool {
+        self.prepare.ever_used()
+    }
+
     /// How the virtual document with this exact text was sent downstream
     /// (prepared or not), for translating its coordinates where settings are
     /// not at hand.

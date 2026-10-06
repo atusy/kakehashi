@@ -246,6 +246,12 @@ impl Default for PrepareRegistry {
 }
 
 impl PrepareRegistry {
+    /// Whether any document was ever prepared: until then every virtual
+    /// document was sent as is.
+    pub(crate) fn ever_used(&self) -> bool {
+        self.ever_used.load(Ordering::Acquire)
+    }
+
     /// Hosts to sync again: a held-back virtual document became ready, or
     /// an attempt that got no answer finished its retry backoff. Taken once
     /// by the server loop.

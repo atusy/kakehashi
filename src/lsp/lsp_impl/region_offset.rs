@@ -161,6 +161,37 @@ pub(super) fn resolve_region_offset(
     host_url: &Url,
     region_id: &str,
 ) -> Option<(RegionOffset, Position, bool, String)> {
+    resolve_region_offset_then(documents, language, bridge, host_url, region_id, |_| ())
+        .map(|(geometry, ())| geometry)
+}
+
+/// [`resolve_region_offset`], also returning the virtual text it was built
+/// for.
+pub(super) fn resolve_region_offset_and_text(
+    documents: &DocumentStore,
+    language: &Arc<LanguageCoordinator>,
+    bridge: &BridgeCoordinator,
+    host_url: &Url,
+    region_id: &str,
+) -> Option<((RegionOffset, Position, bool, String), String)> {
+    resolve_region_offset_then(
+        documents,
+        language,
+        bridge,
+        host_url,
+        region_id,
+        |resolved| resolved.virtual_content.clone(),
+    )
+}
+
+fn resolve_region_offset_then<T>(
+    documents: &DocumentStore,
+    language: &Arc<LanguageCoordinator>,
+    bridge: &BridgeCoordinator,
+    host_url: &Url,
+    region_id: &str,
+    extract: impl FnOnce(&ResolvedInjection) -> T,
+) -> Option<((RegionOffset, Position, bool, String), T)> {
     let resolved = resolve_region(documents, language, bridge, host_url, region_id)?;
     // Downstream coordinates are in the document the servers were sent: a
     // prepared one carries its map, and one whose prepared form is unknown
@@ -175,12 +206,16 @@ pub(super) fn resolve_region_offset(
         crate::lsp::bridge::PreparedState::Prepared(map) => map,
         crate::lsp::bridge::PreparedState::Unavailable => return None,
     };
+    let extracted = extract(&resolved);
     let (offset, region_end, contiguous, injection_language) = resolved_region_geometry(resolved);
     Some((
-        offset.with_prepared(prepared),
-        region_end,
-        contiguous,
-        injection_language,
+        (
+            offset.with_prepared(prepared),
+            region_end,
+            contiguous,
+            injection_language,
+        ),
+        extracted,
     ))
 }
 
