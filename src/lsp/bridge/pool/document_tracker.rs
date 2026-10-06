@@ -681,6 +681,24 @@ impl DocumentTracker {
         }
     }
 
+    /// Whether `content` is what this connection was last sent (didOpen or
+    /// didChange) for the document.
+    pub(super) fn sent_content_is(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+        content: &str,
+    ) -> bool {
+        let fingerprints = self
+            .document_fingerprints
+            .lock()
+            .recover_poison("DocumentTracker::document_fingerprints");
+        fingerprints
+            .get(connection_key)
+            .and_then(|docs| docs.get(&virtual_uri.to_uri_string()))
+            == Some(&content_fingerprint(content))
+    }
+
     /// Remove a document from `document_versions` and `opened_documents`.
     ///
     /// Does NOT remove from `host_to_virtual` — that cleanup is handled

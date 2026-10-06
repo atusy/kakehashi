@@ -58,6 +58,20 @@ impl Drop for RequestHostLifecycle<'_> {
     }
 }
 
+/// How long a request on a prepared document waits for the lifecycle pass
+/// to sync the prepared text it was built for (see
+/// `LanguageServerPool::wait_for_prepared_sync`). Bounded by the prepare
+/// request's own deadline: the sync follows the answer.
+const PREPARED_SYNC_WAIT: std::time::Duration = super::super::protocol::PREPARE_TIMEOUT;
+const PREPARED_SYNC_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+fn prepared_text_not_synced(connection_key: &super::ConnectionKey) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::WouldBlock,
+        format!("{connection_key} does not hold the prepared text this request was built for"),
+    )
+}
+
 impl LanguageServerPool {
     pub(crate) async fn request_host_lifecycle<'a>(
         &'a self,
@@ -193,6 +207,11 @@ impl LanguageServerPool {
         self.apply_host_routing_workspace_folders(&routing_uri, connection_key.server(), &handle)
             .await?;
 
+        if offset.prepared().is_some() {
+            self.wait_for_prepared_sync(&virtual_uri, connection_key, virtual_content)
+                .await?;
+        }
+
         // Register in the upstream request registry before downstream router
         // registration for cancel lookup. This relative order matters: if a
         // cancel arrives between pool and router registration,
@@ -275,6 +294,22 @@ impl LanguageServerPool {
                 return Err(e);
             }
 
+            // A prepared request's map describes `virtual_content` only; the
+            // open above may have sent newer cached text instead.
+            if offset.prepared().is_some()
+                && !self.document_tracker.sent_content_is(
+                    &virtual_uri,
+                    connection_key,
+                    virtual_content,
+                )
+            {
+                drop(connections);
+                if let Some(ref id) = upstream_request_id {
+                    self.unregister_upstream_request(id, connection_key);
+                }
+                return Err(prepared_text_not_synced(connection_key));
+            }
+
             // Queue the request via single-writer loop (ls-bridge-message-ordering)
             if let Err(e) = handle.send_request(request, request_id) {
                 drop(connections);
@@ -306,6 +341,41 @@ impl LanguageServerPool {
         };
 
         Ok(transform_response(response?, &context))
+    }
+
+    /// Wait (briefly) until a connection that has the prepared document open
+    /// holds exactly `prepared_text`.
+    ///
+    /// A request is prepared for the newest virtual text, while the lifecycle
+    /// pass sends that text only once its prepare answer is in — so right
+    /// after an edit, an open document can still hold the previous prepared
+    /// text, and its answer would be in coordinates the request's map
+    /// misreads. The lifecycle pass is the only sender (a request sending
+    /// here could overtake a newer text), so the request waits for it and
+    /// fails if it does not come.
+    async fn wait_for_prepared_sync(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &super::ConnectionKey,
+        prepared_text: &str,
+    ) -> io::Result<()> {
+        let uri_string = virtual_uri.to_uri_string();
+        let deadline = tokio::time::Instant::now() + PREPARED_SYNC_WAIT;
+        loop {
+            if !self
+                .document_tracker
+                .is_virtual_doc_open_on_connection(&uri_string, connection_key)
+                || self
+                    .document_tracker
+                    .sent_content_is(virtual_uri, connection_key, prepared_text)
+            {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(prepared_text_not_synced(connection_key));
+            }
+            tokio::time::sleep(PREPARED_SYNC_POLL).await;
+        }
     }
 
     /// Like [`execute_bridge_request_with_handle`](Self::execute_bridge_request_with_handle)

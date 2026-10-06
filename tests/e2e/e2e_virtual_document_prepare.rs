@@ -346,3 +346,36 @@ fn formatting_that_would_rewrite_a_gap_is_refused() {
     let edits = response["result"].as_array().cloned().unwrap_or_default();
     assert_eq!(apply_edits(text, &edits), text, "{response}");
 }
+
+#[test]
+fn an_edit_is_prepared_before_requests_read_it() {
+    if skip_if_deno_unavailable() {
+        return;
+    }
+    let (mut client, _dir) = init_client(false, "--\n");
+    let uri = "file:///prepare/edit.md";
+    let text = "# t\n\n```lua\n  local x = 1\n  print(x)\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+
+    // Insert a line above `print(x)`, shifting it down, and hover it at once:
+    // the answer must come from the newly prepared text, not the one the
+    // server held before the edit.
+    let edited = "# t\n\n```lua\n  local x = 1\n  x = x + 1\n  print(x)\n```\n";
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": uri, "version": 2 },
+            "contentChanges": [{ "text": edited }]
+        }),
+    );
+    let hover = hover_with_retry(&mut client, uri, 5, 4);
+    assert_eq!(hover_text(&hover), "local x = 1\nx = x + 1\nprint(x)\n");
+    assert_eq!(
+        hover["range"],
+        json!({
+            "start": { "line": 5, "character": 2 },
+            "end": { "line": 5, "character": 10 }
+        })
+    );
+}
