@@ -215,10 +215,20 @@ pub(crate) fn parse_prepare_response(
     response: &serde_json::Value,
 ) -> std::io::Result<Option<PrepareResult>> {
     // Every unusable answer is `InvalidData`, which callers tell apart from
-    // a failure to get an answer at all.
+    // a failure to get an answer at all. The cancellation codes LSP lets a
+    // client retry (RequestCancelled, ContentModified, ServerCancelled) are
+    // not answers.
     if let Some(error) = response.get("error").filter(|error| !error.is_null()) {
+        let retryable = matches!(
+            error.get("code").and_then(serde_json::Value::as_i64),
+            Some(-32802..=-32800)
+        );
         return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
+            if retryable {
+                std::io::ErrorKind::Interrupted
+            } else {
+                std::io::ErrorKind::InvalidData
+            },
             format!("bridge: prepare peer answered with an error: {error}"),
         ));
     }
@@ -1072,6 +1082,30 @@ mod tests {
                 (SegmentKind::Gap, 4..6, "${"),
                 (SegmentKind::Content, 6..7, "c"),
             ]
+        );
+    }
+
+    #[test]
+    fn error_responses_are_final_unless_retryable() {
+        let kind = |code: i64| {
+            parse_prepare_response(&json!({"error": {"code": code, "message": "x"}}))
+                .unwrap_err()
+                .kind()
+        };
+        assert_eq!(kind(-32603), std::io::ErrorKind::InvalidData);
+        for retryable in [-32800, -32801, -32802] {
+            assert_eq!(kind(retryable), std::io::ErrorKind::Interrupted);
+        }
+        assert_eq!(
+            parse_prepare_response(&json!({"result": {"segments": "x"}}))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert!(
+            parse_prepare_response(&json!({"result": null}))
+                .unwrap()
+                .is_none()
         );
     }
 
