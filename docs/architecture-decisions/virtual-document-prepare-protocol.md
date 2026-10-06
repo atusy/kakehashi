@@ -156,8 +156,10 @@ saved version.
   them hands a server text whose coordinates no map describes.
 - **A map is chosen by the exact text it was built for**, never by URI
   alone — and where two inputs share their virtual text (they differ only
-  inside gaps, which it masks), by the prepared text the server was sent. Paths that translate a stored region (pushed diagnostics, resolve
-  gates, inbound edits) can see newer text than the server holds; pairing
+  inside gaps, which it masks), by the answer the server was sent: two
+  answers can share a prepared text yet map it back differently. Paths
+  that translate a stored region (pushed diagnostics, resolve gates,
+  inbound edits) can see newer text than the server holds; pairing
   that text with an older map misplaces every coordinate silently.
 - **A request reads only the prepared text the server holds.** Right after
   an edit, a request is prepared for the new text while an open document

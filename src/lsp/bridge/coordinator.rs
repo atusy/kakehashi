@@ -576,10 +576,10 @@ impl BridgeCoordinator {
         host_uri: &Url,
         injection_language: &str,
         region_id: &str,
-        prepared_text: &str,
+        prepared: &Arc<super::protocol::PreparedDocument>,
     ) -> bool {
         self.prepare
-            .note_sent(host_uri, injection_language, region_id, prepared_text)
+            .note_sent(host_uri, injection_language, region_id, prepared)
     }
 
     /// Drop one region's prepared document (see

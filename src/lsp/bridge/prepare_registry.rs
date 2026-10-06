@@ -192,8 +192,10 @@ struct Sent {
     host_uri: String,
     injection_language: String,
     region_id: String,
-    /// Identity of the prepared text.
-    prepared: u64,
+    /// The answer sent: its map is the one the server's coordinates
+    /// follow, which its text alone does not identify (two answers may
+    /// differ only in where a gap's replacement maps back to).
+    prepared: Arc<PreparedDocument>,
 }
 
 impl Sent {
@@ -417,14 +419,14 @@ impl PrepareRegistry {
         let generation = match matching.next() {
             // Both generations have this text — an edit inside a gap changes
             // only the gaps, which the virtual text masks — so the text alone
-            // cannot tell which map the server's coordinates follow: the one
-            // whose prepared text was sent last does.
+            // cannot tell which map the server's coordinates follow: the
+            // answer sent last does.
             Some(second) => {
                 let sent = self
                     .sent
                     .get(&region_hash(host_uri, injection_language, region_id))
                     .filter(|sent| sent.is(host_uri, injection_language, region_id))
-                    .map(|sent| sent.prepared);
+                    .map(|sent| Arc::clone(&sent.prepared));
                 [first, Some(second)]
                     .into_iter()
                     .flatten()
@@ -434,7 +436,8 @@ impl PrepareRegistry {
                             .outcome
                             .get()
                             .and_then(Option::as_ref)
-                            .is_some_and(|prepared| Some(text_key(&prepared.text)) == sent)
+                            .zip(sent.as_ref())
+                            .is_some_and(|(prepared, sent)| Arc::ptr_eq(prepared, sent))
                     })
                     .or(first)
             }
@@ -469,8 +472,8 @@ impl PrepareRegistry {
         });
     }
 
-    /// Note that the lifecycle pass sent `prepared_text` for a region.
-    /// `true` unless it is the prepared text sent last: diagnostics a server
+    /// Note that the lifecycle pass sent `prepared` for a region.
+    /// `true` unless its text is the prepared text sent last: diagnostics a server
     /// pushed for any other text — an earlier prepared one, or the
     /// unprepared one sent while the pair had no peer — are in coordinates
     /// no current map describes.
@@ -479,15 +482,18 @@ impl PrepareRegistry {
         host_uri: &Url,
         injection_language: &str,
         region_id: &str,
-        prepared_text: &str,
+        prepared: &Arc<PreparedDocument>,
     ) -> bool {
-        let prepared = text_key(prepared_text);
         let host = host_uri.as_str();
         let key = region_hash(host, injection_language, region_id);
         if let Some(mut sent) = self.sent.get_mut(&key)
             && sent.is(host, injection_language, region_id)
         {
-            return std::mem::replace(&mut sent.prepared, prepared) != prepared;
+            if Arc::ptr_eq(&sent.prepared, prepared) {
+                return false;
+            }
+            let previous = std::mem::replace(&mut sent.prepared, Arc::clone(prepared));
+            return previous.text != prepared.text;
         }
         self.sent.insert(
             key,
@@ -495,7 +501,7 @@ impl PrepareRegistry {
                 host_uri: host.to_string(),
                 injection_language: injection_language.to_string(),
                 region_id: region_id.to_string(),
-                prepared,
+                prepared: Arc::clone(prepared),
             },
         );
         true
@@ -1065,6 +1071,13 @@ mod tests {
         );
     }
 
+    fn sent_text(text: &str) -> Arc<PreparedDocument> {
+        Arc::new(PreparedDocument {
+            text: text.to_string(),
+            map: None,
+        })
+    }
+
     #[test]
     fn a_changed_sent_text_is_noticed() {
         let registry = PrepareRegistry::default();
@@ -1081,15 +1094,15 @@ mod tests {
         };
         registry.cell(&target, input, Holder::LifecyclePass);
         assert!(
-            registry.note_sent(&host, "lua", region, "a"),
+            registry.note_sent(&host, "lua", region, &sent_text("a")),
             "the first prepared text replaces whatever was sent unprepared"
         );
         assert!(
-            !registry.note_sent(&host, "lua", region, "a"),
+            !registry.note_sent(&host, "lua", region, &sent_text("a")),
             "the same text"
         );
         assert!(
-            registry.note_sent(&host, "lua", region, "  a"),
+            registry.note_sent(&host, "lua", region, &sent_text("  a")),
             "a different text"
         );
     }
@@ -1109,11 +1122,11 @@ mod tests {
             gaps: &[],
         };
         registry.cell(&target, input, Holder::LifecyclePass);
-        registry.note_sent(&host, "lua", region, "a");
+        registry.note_sent(&host, "lua", region, &sent_text("a"));
         // A retargeted peer: the entry goes, the server still holds "a".
         registry.retain(|_, _, _, _| false, false);
         assert!(
-            registry.note_sent(&host, "lua", region, "  a"),
+            registry.note_sent(&host, "lua", region, &sent_text("  a")),
             "the new peer's text differs from the one the server holds"
         );
         // The peer removed: the region is sent unprepared next.
@@ -1156,15 +1169,16 @@ mod tests {
             })
         };
         let (a, _) = registry.cell(&target, input(&gaps_a), Holder::LifecyclePass);
-        let prepared_a = answer("xAx");
+        // Both answers have one text; only their maps tell them apart.
+        let prepared_a = answer("x0x");
         let _ = a.outcome.set(Some(Arc::clone(&prepared_a)));
-        registry.note_sent(&host, "lua", region, &prepared_a.text);
+        registry.note_sent(&host, "lua", region, &prepared_a);
         let (b, _) = registry.cell(&target, input(&gaps_b), Holder::LifecyclePass);
-        let _ = b.outcome.set(Some(answer("xBx")));
+        let _ = b.outcome.set(Some(answer("x0x")));
         // Undo the gap edit before b was sent: a's answer is sent again.
         let (undone, _) = registry.cell(&target, input(&gaps_a), Holder::LifecyclePass);
         assert!(Arc::ptr_eq(&undone, &a));
-        registry.note_sent(&host, "lua", region, &prepared_a.text);
+        registry.note_sent(&host, "lua", region, &prepared_a);
         let PreparedState::Prepared(Some(map)) = registry.state(&host, "lua", region, "x x") else {
             panic!("prepared");
         };

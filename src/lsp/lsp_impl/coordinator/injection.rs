@@ -434,7 +434,7 @@ impl InjectionCoordinator {
                     uri,
                     &injection.language,
                     &injection.region_id,
-                    &prepared.text,
+                    &prepared,
                 ) {
                     self.diagnostics
                         .evict_source(uri, &DiagnosticSource::Region(injection.region_id.clone()));
