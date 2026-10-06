@@ -578,6 +578,20 @@ impl PreparedMap {
             .collect()
     }
 
+    /// Whether any of these P edits, as sent, reaches into a gap. Mapping a
+    /// set through the diff ([`Self::edits_to_virtual`]) checks only what
+    /// changed: an edit that rewrites a gap's replacement with the same text
+    /// passes there, which suits a formatter's whole-document result but not
+    /// an edit whose extent states what it replaces (a rename, a code
+    /// action).
+    pub(crate) fn edits_touch_gap(&self, edits: &[TextEdit]) -> bool {
+        edits.iter().any(|edit| {
+            let start = self.prepared_lines.offset_clamped(edit.range.start);
+            let end = self.prepared_lines.offset_clamped(edit.range.end);
+            self.hunk_touches_gap(&(start.min(end)..start.max(end)))
+        })
+    }
+
     /// Translate one edit a downstream server made to P into an edit to V,
     /// keeping its extent (a completion's replace range, say) rather than
     /// minimizing it — except that a change at a dedented line's start also

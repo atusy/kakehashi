@@ -157,14 +157,22 @@ fn request_edits_to_virtual(
 ) -> bool {
     // One document's edits map together, through the prepared text: mapped
     // one by one, adjacent edits at a dedented line could both claim its
-    // removed indent and overlap. Annotated edits must keep their identity,
-    // so they map one by one, and a set that comes to overlap is refused.
-    let rewrite_set = |edits: &mut Vec<TextEdit>| match prepared.edits_to_virtual(edits) {
-        Some(mapped) => {
-            *edits = mapped;
-            true
+    // removed indent and overlap. Their extents are checked against the gaps
+    // first, as sent — the diff would let an edit spanning a gap through as
+    // long as it rewrote the gap's replacement unchanged. Annotated edits
+    // must keep their identity, so they map one by one, and a set that comes
+    // to overlap is refused.
+    let rewrite_set = |edits: &mut Vec<TextEdit>| {
+        if prepared.edits_touch_gap(edits) {
+            return false;
         }
-        None => false,
+        match prepared.edits_to_virtual(edits) {
+            Some(mapped) => {
+                *edits = mapped;
+                true
+            }
+            None => false,
+        }
     };
     let rewrite_one = |text_edit: &mut TextEdit| match prepared.edit_to_virtual(text_edit) {
         Some(virtual_edit) => {
@@ -897,6 +905,29 @@ mod tests {
         let host_uri = make_host_uri();
         // Renaming the placeholder `None` would overwrite `${a}` in the host.
         let mut edit = rename_of(&virtual_uri, 4, 8);
+        assert!(!transform_workspace_edit_to_host(
+            &mut edit,
+            &virtual_uri,
+            &host_uri,
+            &interpolated_offset(),
+        ));
+    }
+
+    #[test]
+    fn a_prepared_edit_spanning_a_gap_unchanged_refuses_the_whole_edit() {
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        // `x = None` → `y = None` as one edit over the placeholder: the
+        // server rewrote the text standing for `${a}`, even if unchanged.
+        let mut edit = parse_workspace_edit(json!({
+            "changes": { virtual_uri.clone(): [{
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 0, "character": 8 }
+                },
+                "newText": "y = None"
+            }]}
+        }));
         assert!(!transform_workspace_edit_to_host(
             &mut edit,
             &virtual_uri,
