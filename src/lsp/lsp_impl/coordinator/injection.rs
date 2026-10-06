@@ -428,6 +428,45 @@ impl InjectionCoordinator {
         injection
     }
 
+    /// Forward a save that `uri`'s held regions missed to those now sent,
+    /// while the host is still at the saved version (under its edit lock,
+    /// like the save itself). Regions still held keep waiting.
+    pub(crate) async fn replay_held_save(&self, uri: &Url) {
+        let Some(mut held) = self.bridge.take_held_save(uri) else {
+            return;
+        };
+        let edit_lock = self.documents.edit_lock(uri);
+        let _guard = edit_lock.lock().await;
+        let current = self
+            .documents
+            .get(uri)
+            .map(|document| (document.incarnation(), document.content_version()));
+        if current != Some((held.incarnation, held.content_version)) {
+            return;
+        }
+        let Some((_, Some(injections))) = self.bridge_injections(uri) else {
+            return;
+        };
+        let (ready, still_held): (Vec<_>, Vec<_>) = injections
+            .into_iter()
+            .filter(|injection| held.region_ids.contains(&injection.region_id))
+            .partition(|injection| !injection.held);
+        if !ready.is_empty() {
+            self.bridge
+                .pool()
+                .sync_and_forward_did_save_to_virtual_docs(uri, held.incarnation, &ready)
+                .await;
+        }
+        if !still_held.is_empty() {
+            held.region_ids = still_held
+                .into_iter()
+                .map(|injection| injection.region_id)
+                .collect();
+            self.bridge
+                .hold_save(uri, held.incarnation, held.content_version, held.region_ids);
+        }
+    }
+
     /// Process injected languages: resolve injection data, optionally forward didChange,
     /// auto-install missing parsers, and eagerly open virtual documents.
     ///

@@ -518,3 +518,46 @@ fn the_concatenated_formatting_pipeline_maps_back_through_the_prepared_map() {
         "# t\n\n```lua\n  LOCAL X = 1\n  PRINT(X)\n```\n"
     );
 }
+
+#[test]
+fn a_save_while_preparing_reaches_the_server_with_the_prepared_text() {
+    if skip_if_deno_unavailable() {
+        return;
+    }
+    let (mut client, _dir) = init_client(false, "--\n");
+    let uri = "file:///prepare/save.md";
+    let text = "# t\n\n```lua\n  local x = 1\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+
+    // Edit and save at once: the edited region is held while the peer
+    // prepares it, and the save must still reach the server — after the new
+    // prepared text, which it describes.
+    let edited = "# t\n\n```lua\n  local x = 2\n```\n";
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": uri, "version": 2 },
+            "contentChanges": [{ "text": edited }]
+        }),
+    );
+    client.send_notification(
+        "textDocument/didSave",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let params = client
+            .wait_for_notification("window/logMessage", remaining)
+            .expect("the server never received the save");
+        // Relayed with the server's name as a prefix.
+        if let Some((_, saved)) = params["message"]
+            .as_str()
+            .and_then(|message| message.split_once("echo-document saved: "))
+        {
+            assert_eq!(saved, "local x = 2\n");
+            return;
+        }
+    }
+}

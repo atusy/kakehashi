@@ -326,11 +326,11 @@ fn main() {
                     "echo-document" => json!({
                         "hoverProvider": true,
                         "documentFormattingProvider": true,
+                        "textDocumentSync": { "openClose": true, "change": 1, "save": true },
                         "diagnosticProvider": {
                             "interFileDependencies": false,
                             "workspaceDiagnostics": false
                         },
-                        "textDocumentSync": 1
                     }),
                     "call-hierarchy-prepare"
                     | "call-hierarchy-replacement"
@@ -849,6 +849,20 @@ fn main() {
                     .as_deref()
                     .and_then(|uri| documents.get(uri))
                     .cloned();
+                if mode == "echo-document" {
+                    // Announce the save with the text this server holds.
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({
+                            "type": 2,
+                            "message": format!(
+                                "echo-document saved: {}",
+                                last_did_save_document_text.clone().unwrap_or_default()
+                            )
+                        }),
+                    );
+                }
             }
             "$/cancelRequest" => {
                 record_mock_event(&mode, "cancel", &message);

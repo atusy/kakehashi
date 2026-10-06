@@ -43,6 +43,15 @@ pub(crate) struct BridgeInjection {
     pub(crate) held: bool,
 }
 
+/// A save that reached a host while some of its virtual documents were held
+/// back for their prepare answers.
+#[derive(Debug, Default)]
+pub(crate) struct HeldSave {
+    pub(crate) incarnation: u64,
+    pub(crate) content_version: u64,
+    pub(crate) region_ids: std::collections::HashSet<String>,
+}
+
 /// One server's share of an eager-open batch: its spawn config plus the
 /// injections to open on it.
 type ServerGroup = (Arc<BridgeServerConfig>, Vec<BridgeInjection>);
@@ -171,6 +180,9 @@ pub(crate) struct BridgeCoordinator {
     /// settings change: the warning would otherwise repeat per region per
     /// edit.
     warned_unusable_prepare: dashmap::DashSet<String>,
+    /// Saves a held virtual document missed: forwarded once its prepared
+    /// text is sent (if the host is still at the saved version).
+    held_saves: DashMap<Url, HeldSave>,
     node_tracker: Arc<NodeTracker>,
     /// Cancel forwarder for upstream cancel notification and downstream forwarding.
     ///
@@ -308,6 +320,7 @@ impl BridgeCoordinator {
             pool,
             prepare: super::prepare_registry::PrepareRegistry::default(),
             warned_unusable_prepare: dashmap::DashSet::new(),
+            held_saves: DashMap::new(),
             node_tracker: Arc::new(NodeTracker::new()),
             cancel_forwarder,
             eager_open_generation: std::sync::atomic::AtomicU64::new(0),
@@ -336,6 +349,7 @@ impl BridgeCoordinator {
             pool,
             prepare: super::prepare_registry::PrepareRegistry::default(),
             warned_unusable_prepare: dashmap::DashSet::new(),
+            held_saves: DashMap::new(),
             node_tracker: Arc::new(NodeTracker::new()),
             cancel_forwarder,
             eager_open_generation: std::sync::atomic::AtomicU64::new(0),
@@ -571,8 +585,35 @@ impl BridgeCoordinator {
             .forget_region_except(host_uri, region_id, current_language);
     }
 
+    /// Remember that a save reached the host while these regions were held,
+    /// so it can be forwarded once they are sent.
+    pub(crate) fn hold_save(
+        &self,
+        host_uri: &Url,
+        incarnation: u64,
+        content_version: u64,
+        region_ids: impl IntoIterator<Item = String>,
+    ) {
+        let mut held = self.held_saves.entry(host_uri.clone()).or_default();
+        if (held.incarnation, held.content_version) != (incarnation, content_version) {
+            // A newer save supersedes what an older one missed.
+            *held = HeldSave {
+                incarnation,
+                content_version,
+                region_ids: Default::default(),
+            };
+        }
+        held.region_ids.extend(region_ids);
+    }
+
+    /// Take the save a host's held regions missed, if any.
+    pub(crate) fn take_held_save(&self, host_uri: &Url) -> Option<HeldSave> {
+        self.held_saves.remove(host_uri).map(|(_, held)| held)
+    }
+
     /// Drop a closed host's prepared documents.
     pub(crate) fn forget_prepared_host(&self, host_uri: &Url) {
+        self.held_saves.remove(host_uri);
         self.prepare.forget_host(host_uri);
     }
 
