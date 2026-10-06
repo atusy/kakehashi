@@ -155,7 +155,8 @@ saved version.
   that decide whether a change is sent all describe P. Mixing V into any of
   them hands a server text whose coordinates no map describes.
 - **A map is chosen by the exact text it was built for**, never by URI
-  alone. Paths that translate a stored region (pushed diagnostics, resolve
+  alone — and where two inputs share their virtual text (they differ only
+  inside gaps, which it masks), by the prepared text the server was sent. Paths that translate a stored region (pushed diagnostics, resolve
   gates, inbound edits) can see newer text than the server holds; pairing
   that text with an older map misplaces every coordinate silently.
 - **A request reads only the prepared text the server holds.** Right after

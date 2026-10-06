@@ -409,12 +409,38 @@ impl PrepareRegistry {
         else {
             return PreparedState::Unprepared;
         };
-        let text_key = text_key(virtual_text);
-        match entry
+        let wanted = text_key(virtual_text);
+        let mut matching = entry
             .generations()
-            .find(|generation| generation.text_key == text_key)
-            .and_then(|generation| generation.cell.outcome.get())
-        {
+            .filter(|generation| generation.text_key == wanted);
+        let first = matching.next();
+        let generation = match matching.next() {
+            // Both generations have this text — an edit inside a gap changes
+            // only the gaps, which the virtual text masks — so the text alone
+            // cannot tell which map the server's coordinates follow: the one
+            // whose prepared text was sent last does.
+            Some(second) => {
+                let sent = self
+                    .sent
+                    .get(&region_hash(host_uri, injection_language, region_id))
+                    .filter(|sent| sent.is(host_uri, injection_language, region_id))
+                    .map(|sent| sent.prepared);
+                [first, Some(second)]
+                    .into_iter()
+                    .flatten()
+                    .find(|generation| {
+                        generation
+                            .cell
+                            .outcome
+                            .get()
+                            .and_then(Option::as_ref)
+                            .is_some_and(|prepared| Some(text_key(&prepared.text)) == sent)
+                    })
+                    .or(first)
+            }
+            None => first,
+        };
+        match generation.and_then(|generation| generation.cell.outcome.get()) {
             Some(Some(prepared)) => PreparedState::Prepared(prepared.map.clone()),
             Some(None) | None => PreparedState::Unavailable,
         }
@@ -1098,6 +1124,53 @@ mod tests {
         assert!(
             !registry.forget_region(&host, Some("lua"), region),
             "nothing prepared is left to replace"
+        );
+    }
+
+    #[test]
+    fn a_gap_only_undo_reads_the_map_that_was_sent() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let region = "01J0000000000000000000000A";
+        let gap = |host_text: &str| VirtualGap {
+            virtual_range: 1..2,
+            host_text: host_text.to_string(),
+        };
+        let (gaps_a, gaps_b) = ([gap("a")], [gap("b")]);
+        let input = |gaps| PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: region,
+            virtual_text: "x x",
+            gaps,
+        };
+        let answer = |text: &str| {
+            let map = apply_prepare_result("x x", &layout("x x", &gaps_a), None)
+                .unwrap()
+                .map;
+            Arc::new(PreparedDocument {
+                text: text.to_string(),
+                map,
+            })
+        };
+        let (a, _) = registry.cell(&target, input(&gaps_a), Holder::LifecyclePass);
+        let prepared_a = answer("xAx");
+        let _ = a.outcome.set(Some(Arc::clone(&prepared_a)));
+        registry.note_sent(&host, "lua", region, &prepared_a.text);
+        let (b, _) = registry.cell(&target, input(&gaps_b), Holder::LifecyclePass);
+        let _ = b.outcome.set(Some(answer("xBx")));
+        // Undo the gap edit before b was sent: a's answer is sent again.
+        let (undone, _) = registry.cell(&target, input(&gaps_a), Holder::LifecyclePass);
+        assert!(Arc::ptr_eq(&undone, &a));
+        registry.note_sent(&host, "lua", region, &prepared_a.text);
+        let PreparedState::Prepared(Some(map)) = registry.state(&host, "lua", region, "x x") else {
+            panic!("prepared");
+        };
+        assert!(
+            Arc::ptr_eq(&map, prepared_a.map.as_ref().unwrap()),
+            "the map of the text the server holds, not of the current generation"
         );
     }
 
