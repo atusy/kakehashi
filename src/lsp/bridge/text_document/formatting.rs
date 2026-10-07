@@ -107,7 +107,7 @@ impl LanguageServerPool {
                     ctx.offset,
                     virtual_line_count,
                     region_end,
-                    Some(virtual_content),
+                    virtual_content,
                 )
                 .map(Some)
             },
@@ -222,12 +222,15 @@ fn build_formatting_request(
 /// first clamped back onto the last real line; any edit with *either* endpoint
 /// still on a line `>= virtual_line_count` is then dropped before translation.
 /// `virtual_line_count` is the LSP line count (1 for empty), from [`count_lines`].
+/// `server_text` is the text the server formatted (a prepared document's
+/// prepared text), whose boundary layout the result keeps
+/// ([`keep_boundary_layout`]).
 pub(super) fn transform_formatting_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,
     virtual_line_count: u32,
     region_end: Position,
-    server_text: Option<&str>,
+    server_text: &str,
 ) -> io::Result<Vec<TextEdit>> {
     if response_has_jsonrpc_error(&response, "formatting-style request") {
         return Err(io::Error::other(
@@ -313,10 +316,7 @@ pub(super) fn transform_formatting_response_to_host(
     // The document's edges are the host's layout (the line break after a Nix
     // `''`, the final line break and indentation before the closing `''`),
     // which a formatter treating the document as a file strips; keep them.
-    let edits = match server_text {
-        Some(server_text) => keep_boundary_layout(server_text, edits),
-        None => edits,
-    };
+    let edits = keep_boundary_layout(server_text, edits);
 
     // A prepared document's edits are re-diffed back into the virtual
     // document; one touching host-owned text (a gap) fails the request
@@ -410,8 +410,15 @@ mod tests {
             ]
         });
 
-        let edits =
-            transform_formatting_response_to_host(response, &offset, 2, region_end, None).unwrap();
+        let edits = transform_formatting_response_to_host(
+            response,
+            &offset,
+            2,
+            region_end,
+            "abcd
+efghijkl",
+        )
+        .unwrap();
 
         assert!(
             edits.is_empty(),
@@ -438,8 +445,15 @@ mod tests {
             ]
         });
 
-        let edits =
-            transform_formatting_response_to_host(response, &offset, 2, region_end, None).unwrap();
+        let edits = transform_formatting_response_to_host(
+            response,
+            &offset,
+            2,
+            region_end,
+            "abcd
+efghijkl",
+        )
+        .unwrap();
 
         assert_eq!(edits.len(), 1, "all-safe response passes: {edits:?}");
         assert_eq!(edits[0].new_text, "safe");
@@ -566,7 +580,11 @@ mod tests {
             &RegionOffset::new(10, 0),
             UNBOUNDED,
             TEST_REGION_END,
-            None,
+            "abcd
+x
+y
+z
+",
         )
         .unwrap();
 
@@ -608,7 +626,8 @@ mod tests {
             &RegionOffset::new(5, 4),
             UNBOUNDED,
             TEST_REGION_END,
-            None,
+            "abcdef
+ghijklmn",
         )
         .unwrap();
 
@@ -638,7 +657,7 @@ mod tests {
             &RegionOffset::new(5, 0),
             UNBOUNDED,
             TEST_REGION_END,
-            None,
+            "a",
         );
         assert!(transformed.is_err());
     }
@@ -659,7 +678,7 @@ mod tests {
             &RegionOffset::new(5, 0),
             UNBOUNDED,
             TEST_REGION_END,
-            None,
+            "a",
         )
         .expect("null result is a handled response, not a failure");
 
@@ -679,7 +698,7 @@ mod tests {
             &RegionOffset::new(5, 0),
             UNBOUNDED,
             TEST_REGION_END,
-            None,
+            "a",
         )
         .unwrap();
         assert!(edits.is_empty());
@@ -707,7 +726,8 @@ mod tests {
             &RegionOffset::new(u32::MAX - 1, 0),
             2,
             TEST_REGION_END,
-            None,
+            "a
+b",
         )
         .unwrap();
 
@@ -745,7 +765,7 @@ mod tests {
                         "start": { "line": 2, "character": 6 },
                         "end": { "line": 3, "character": 0 }
                     },
-                    "newText": "\n"
+                    "newText": "!"
                 }
             ]
         });
@@ -755,12 +775,14 @@ mod tests {
             &RegionOffset::new(10, 0),
             3,
             TEST_REGION_END,
-            None,
+            "a
+b
+xxxxxx",
         )
         .unwrap();
 
         assert_eq!(edits.len(), 1, "synthetic-EOF-anchored edit is kept");
-        assert_eq!(edits[0].new_text, "\n");
+        assert_eq!(edits[0].new_text, "!");
         // start unchanged (still on last real line); end clamped down by one.
         assert_eq!(edits[0].range.start.line, 12);
         assert_eq!(edits[0].range.start.character, 6);
@@ -782,7 +804,7 @@ mod tests {
                         "start": { "line": 2, "character": 6 },
                         "end": { "line": 2, "character": 6 }
                     },
-                    "newText": "\n"
+                    "newText": "!"
                 }
             ]
         });
@@ -792,12 +814,14 @@ mod tests {
             &RegionOffset::new(10, 0),
             3,
             TEST_REGION_END,
-            None,
+            "a
+b
+xxxxxx",
         )
         .unwrap();
 
         assert_eq!(edits.len(), 1, "in-bounds zero-width EOF insert is kept");
-        assert_eq!(edits[0].new_text, "\n");
+        assert_eq!(edits[0].new_text, "!");
     }
 
     #[test]
@@ -832,7 +856,8 @@ mod tests {
             &RegionOffset::new(10, 0),
             2,
             TEST_REGION_END,
-            None,
+            "abcd
+efgh",
         )
         .unwrap();
 
@@ -864,7 +889,7 @@ mod tests {
             &RegionOffset::new(10, 0),
             count_lines(region),
             Position::new(10, 11),
-            Some(region),
+            region,
         )
         .unwrap();
 
@@ -896,7 +921,7 @@ mod tests {
             &RegionOffset::new(10, 0),
             count_lines(region),
             Position::new(11, character),
-            Some(region),
+            region,
         )
         .unwrap();
 
@@ -943,7 +968,7 @@ mod tests {
                         "start": { "line": 1, "character": 0 },
                         "end":   { "line": 1, "character": 0 }
                     },
-                    "newText": "\n"
+                    "newText": "!"
                 }
             ]
         });
@@ -953,12 +978,16 @@ mod tests {
             &RegionOffset::new(10, 0),
             1,
             TEST_REGION_END,
-            None,
+            "local x",
         )
         .unwrap();
 
-        assert_eq!(edits.len(), 1, "canonical insertFinalNewline shape kept");
-        assert_eq!(edits[0].new_text, "\n");
+        assert_eq!(
+            edits.len(),
+            1,
+            "insert at the synthetic next-line anchor kept"
+        );
+        assert_eq!(edits[0].new_text, "!");
         // After clamping virtual (1,0)..(1,0) → (0, u32::MAX)..(0, u32::MAX),
         // then translation adds the region's line offset (10).
         assert_eq!(edits[0].range.start.line, 10);
@@ -996,7 +1025,8 @@ mod tests {
             &RegionOffset::new(0, 0),
             2,
             TEST_REGION_END,
-            None,
+            "ab
+cdefg",
         )
         .unwrap();
 
@@ -1034,7 +1064,8 @@ mod tests {
             &RegionOffset::new(0, 0),
             2,
             TEST_REGION_END,
-            None,
+            "ab
+cd",
         )
         .unwrap();
 
@@ -1074,7 +1105,10 @@ mod tests {
             &RegionOffset::new(10, 0),
             4,
             region_end,
-            None,
+            "if true;then
+    echo
+fi
+",
         )
         .unwrap();
 
@@ -1116,7 +1150,7 @@ mod tests {
             &offset,
             count_lines(&prepared.text),
             Position::new(13, 0),
-            None,
+            &prepared.text,
         )
         .unwrap();
 
@@ -1179,7 +1213,7 @@ mod tests {
             &RegionOffset::new(10, 0),
             count_lines(region),
             Position::new(12, 4),
-            Some(region),
+            region,
         )
         .unwrap();
         assert_eq!(apply_to_region(region, &edits), "\n{}\n    ");
@@ -1211,7 +1245,7 @@ mod tests {
             &offset,
             count_lines(&prepared.text),
             Position::new(14, 4),
-            Some(&prepared.text),
+            &prepared.text,
         )
         .unwrap();
         assert_eq!(
@@ -1228,7 +1262,7 @@ mod tests {
             &RegionOffset::new(10, 0),
             count_lines(region),
             Position::new(12, 4),
-            Some(region),
+            region,
         )
         .unwrap();
         assert_eq!(apply_to_region(region, &edits), region);
@@ -1243,7 +1277,7 @@ mod tests {
             &RegionOffset::new(10, 0),
             count_lines(region),
             Position::new(13, 0),
-            Some(region),
+            region,
         )
         .unwrap();
         assert_eq!(apply_to_region(region, &edits), "code\n");
@@ -1273,7 +1307,8 @@ mod tests {
             &RegionOffset::new(0, 0),
             2,
             TEST_REGION_END,
-            None,
+            "ab
+cd",
         )
         .unwrap();
 
