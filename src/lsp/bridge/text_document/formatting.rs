@@ -156,13 +156,19 @@ fn clamp_synthetic_eof_anchor(
 }
 
 /// `edits` to `server_text`, unless they change its boundary layout (see
-/// [`restore_boundary_layout`]): then the edits from `server_text` to the
-/// formatted text with that layout restored. Edits that do not apply
-/// (reversed or overlapping) are left as they are, for the checks downstream
-/// to judge rather than be laundered.
+/// [`restore_boundary_layout`]), or that of a string joined into it at one
+/// of `joints` ([`restore_joined_layout`]): then the edits from
+/// `server_text` to the formatted text with that layout restored. Edits that
+/// do not apply (reversed or overlapping) are left as they are, for the
+/// checks downstream to judge rather than be laundered.
 ///
 /// [`restore_boundary_layout`]: crate::text::layout::restore_boundary_layout
-fn keep_boundary_layout(server_text: &str, edits: Vec<TextEdit>) -> Vec<TextEdit> {
+/// [`restore_joined_layout`]: super::super::protocol::restore_joined_layout
+fn keep_boundary_layout(
+    server_text: &str,
+    edits: Vec<TextEdit>,
+    joints: impl IntoIterator<Item = usize>,
+) -> Vec<TextEdit> {
     if edits.is_empty() {
         return edits;
     }
@@ -170,7 +176,7 @@ fn keep_boundary_layout(server_text: &str, edits: Vec<TextEdit>) -> Vec<TextEdit
     else {
         return edits;
     };
-    let restored = crate::text::layout::restore_boundary_layout(server_text, &formatted);
+    let restored = super::super::protocol::restore_joined_layout(server_text, &formatted, joints);
     if restored == formatted {
         return edits;
     }
@@ -315,8 +321,13 @@ pub(super) fn transform_formatting_response_to_host(
 
     // The document's edges are the host's layout (the line break after a Nix
     // `''`, the final line break and indentation before the closing `''`),
-    // which a formatter treating the document as a file strips; keep them.
-    let edits = keep_boundary_layout(server_text, edits);
+    // which a formatter treating the document as a file strips; keep them,
+    // and those of each string a prepared document joins.
+    let joints = offset
+        .prepared()
+        .into_iter()
+        .flat_map(super::super::protocol::PreparedMap::emptied_gap_offsets);
+    let edits = keep_boundary_layout(server_text, edits, joints);
 
     // A prepared document's edits are re-diffed back into the virtual
     // document; one touching host-owned text (a gap) fails the request
@@ -1315,6 +1326,118 @@ cd",
         assert!(
             edits.is_empty(),
             "partial edits ending more than one line past EOF must still be dropped"
+        );
+    }
+
+    /// Two Nix strings joined into one JSON document, as kakehashi combines
+    /// `# json` strings: `head` indented by six, `tail` by eight, prepared
+    /// by dedenting each string, emptying the Nix between them and replacing
+    /// interpolations with `0`.
+    fn joined_strings() -> (String, super::super::super::protocol::PreparedDocument) {
+        use super::super::super::protocol::{SegmentKind, VirtualLayout, apply_prepare_result};
+        let pad = |n: usize| " ".repeat(n);
+        let pieces = [
+            (
+                SegmentKind::Content,
+                format!("\n{}{{\n{}\"name\":    \"", pad(6), pad(14)),
+                "",
+            ),
+            (SegmentKind::Gap, pad(11), "${cfg.name}"),
+            (SegmentKind::Content, format!("\",\n{}", pad(4)), ""),
+            (SegmentKind::Gap, format!("{}\n", pad(3)), "'';\n"),
+            (SegmentKind::Gap, String::new(), "  nested = {"),
+            (SegmentKind::Gap, "\n".to_string(), "\n"),
+            (SegmentKind::Gap, String::new(), "      ''"),
+            (SegmentKind::Content, format!("\n{}\"port\":", pad(16)), ""),
+            (SegmentKind::Gap, pad(20), "${toString cfg.port}"),
+            (
+                SegmentKind::Content,
+                format!("\n{}}}\n{}", pad(8), pad(6)),
+                "",
+            ),
+        ];
+        let virtual_text: String = pieces.iter().map(|(_, text, _)| text.as_str()).collect();
+        let mut start = 0;
+        let layout = VirtualLayout::from_pieces(
+            &virtual_text,
+            pieces.iter().map(|(kind, text, host)| {
+                let range = start..start + text.len();
+                start = range.end;
+                (*kind, range, host.to_string())
+            }),
+        );
+        let dedent = |line: u32, width: u32| {
+            json!({"range": {"start": {"line": line, "character": 0},
+                             "end": {"line": line, "character": width}}, "newText": ""})
+        };
+        let result = serde_json::from_value(json!({"segments": [
+            {"type": "content", "changes": [dedent(1, 6), dedent(2, 6)]},
+            {"type": "gap", "content": "0"},
+            {"type": "content"},
+            {"type": "gap", "content": ""},
+            {"type": "content", "changes": [dedent(1, 8)]},
+            {"type": "gap", "content": "0"},
+            {"type": "content", "changes": [dedent(1, 8)]}
+        ]}))
+        .unwrap();
+        let prepared = apply_prepare_result(&virtual_text, &layout, Some(result)).unwrap();
+        assert_eq!(
+            prepared.text,
+            format!(
+                "\n{{\n{}\"name\":    \"0\",\n{}\n{}\"port\":0\n}}\n{}",
+                pad(8),
+                pad(4),
+                pad(8),
+                pad(6)
+            )
+        );
+        (virtual_text, prepared)
+    }
+
+    #[test]
+    fn formatting_keeps_the_layout_between_joined_strings() {
+        // vscode-json-language-server's answer (tabSize 4): it reindents both
+        // strings, and deletes the closing indentation of `head` and the line
+        // break opening `tail`, which are the Nix layout around the gap.
+        let (virtual_text, prepared) = joined_strings();
+        let edit = |start: (u32, u32), end: (u32, u32), new_text: &str| {
+            json!({"range": {"start": {"line": start.0, "character": start.1},
+                             "end": {"line": end.0, "character": end.1}}, "newText": new_text})
+        };
+        let response = json!({"jsonrpc": "2.0", "id": 42, "result": [
+            edit((0, 0), (1, 0), ""),
+            edit((1, 1), (2, 8), "\n    "),
+            edit((2, 15), (2, 19), " "),
+            edit((2, 23), (4, 8), "\n    "),
+            edit((4, 15), (4, 15), " "),
+            edit((5, 1), (6, 6), ""),
+        ]});
+        let offset = RegionOffset::new(10, 0).with_prepared(prepared.map);
+        let edits = transform_formatting_response_to_host(
+            response,
+            &offset,
+            count_lines(&prepared.text),
+            Position::new(17, 6),
+            &prepared.text,
+        )
+        .unwrap();
+        let pad = |n: usize| " ".repeat(n);
+        // Each string keeps its own indentation: `head` six plus four,
+        // `tail` eight plus four, and its closing brace eight.
+        assert_eq!(
+            apply_to_region(&virtual_text, &edits),
+            format!(
+                "\n{}{{\n{}\"name\": \"{}\",\n{}{}\n\n\n{}\"port\": {}\n{}}}\n{}",
+                pad(6),
+                pad(10),
+                pad(11),
+                pad(4),
+                pad(3),
+                pad(12),
+                pad(20),
+                pad(8),
+                pad(6)
+            )
         );
     }
 }
