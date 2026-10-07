@@ -843,17 +843,13 @@ mod tests {
     }
 
     #[test]
-    fn insert_final_newline_survives_a_realistic_region_end() {
-        // Content "local x = 1" (no trailing newline) at host line 3 in a
-        // plain fence: region end is the exact content end (3, 11), NOT a
-        // permissive sentinel. The canonical insertFinalNewline shape — a
-        // zero-width insert at the synthetic next-line anchor — must snap to
-        // the region end and survive containment.
-        let offset = RegionOffset::new(3, 0);
-        let region_end = Position {
-            line: 3,
-            character: 11,
-        };
+    fn insert_final_newline_leaves_a_region_without_a_final_line_break_unchanged() {
+        // Content "local x = 1" (no trailing newline) at host line 3: its end
+        // is the host's layout (a Nix `''local x = 1''`, say), so the
+        // canonical insertFinalNewline shape — a zero-width insert at the
+        // synthetic next-line anchor — must not move the closing delimiter
+        // onto the next line.
+        let region = "local x = 1";
         let response = json!({
             "jsonrpc": "2.0", "id": 42,
             "result": [
@@ -863,13 +859,48 @@ mod tests {
             ]
         });
 
-        let edits =
-            transform_formatting_response_to_host(response, &offset, 1, region_end, None).unwrap();
+        let edits = transform_formatting_response_to_host(
+            response,
+            &RegionOffset::new(10, 0),
+            count_lines(region),
+            Position::new(10, 11),
+            Some(region),
+        )
+        .unwrap();
 
-        assert_eq!(edits.len(), 1, "insertFinalNewline must survive: {edits:?}");
-        assert_eq!(edits[0].range.start, region_end);
-        assert_eq!(edits[0].range.end, region_end);
-        assert_eq!(edits[0].new_text, "\n");
+        assert_eq!(apply_to_region(region, &edits), region, "{edits:?}");
+    }
+
+    #[rstest]
+    #[case::at_the_synthetic_next_line("local x = 1\n", 2, 0)]
+    #[case::after_a_closing_indentation("local x = 1\n    ", 1, 4)]
+    fn insert_final_newline_is_not_doubled_for_a_region_ending_with_a_line_break(
+        #[case] region: &str,
+        #[case] line: u32,
+        #[case] character: u32,
+    ) {
+        // The region already ends with its line break (and, before a Nix
+        // closing `''`, its indentation): a further line break at the end
+        // would add a blank line to the host's layout.
+        let response = json!({
+            "jsonrpc": "2.0", "id": 42,
+            "result": [
+                { "range": { "start": { "line": line, "character": character },
+                             "end": { "line": line, "character": character } },
+                  "newText": "\n" }
+            ]
+        });
+
+        let edits = transform_formatting_response_to_host(
+            response,
+            &RegionOffset::new(10, 0),
+            count_lines(region),
+            Position::new(11, character),
+            Some(region),
+        )
+        .unwrap();
+
+        assert_eq!(apply_to_region(region, &edits), region, "{edits:?}");
     }
 
     #[rstest]
