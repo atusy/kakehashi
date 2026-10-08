@@ -728,8 +728,13 @@ mod tests {
         let host_url = url::Url::parse("file:///project/doc.md").unwrap();
         let _ = bridge.prepared_document_now(
             &crate::lsp::bridge::PrepareTarget {
-                server_name: "peer".to_string(),
-                config: None,
+                candidates: std::sync::Arc::new([crate::lsp::bridge::ResolvedServerConfig {
+                    server_name: "peer".to_string(),
+                    config: std::sync::Arc::new(crate::config::settings::BridgeServerConfig {
+                        cmd: Some(vec!["/nonexistent/kakehashi-prepare-peer".to_string()]),
+                        ..Default::default()
+                    }),
+                }]),
             },
             crate::lsp::bridge::PrepareInput {
                 host_uri: &host_url,

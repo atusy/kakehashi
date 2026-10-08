@@ -26,26 +26,48 @@ the cases someone thought of.
 
 ## Decision
 
-kakehashi asks a configured peer, `kakehashi/virtualDocument/prepare`, how
-to present each virtual document before any downstream server sees it, and
-keeps all coordinate bookkeeping itself. The peer is any language server
-that advertises the request; tsudoi-language-server is the intended one,
-since its handlers are user code.
+kakehashi asks a peer, `kakehashi/virtualDocument/prepare`, how to present
+each virtual document before any downstream server sees it, and keeps all
+coordinate bookkeeping itself. The peer is any language server that
+advertises the request; tsudoi-language-server is the intended one, since
+its handlers are user code.
 
 ### Configuration and Discovery
 
-`languages.<host>.bridge.<injection>.prepare` names a `languageServers`
-entry; the field inherits through the `_` wildcards like the other bridge
-fields. The named server must advertise
-`capabilities.experimental.kakehashi.virtualDocumentPrepare: true` in its
-`initialize` result. It needs no `languages` of its own, and it receives
-only prepare requests unless its `languages` also select it as a downstream
-server. The feature is dormant unless `KAKEHASHI_EXPERIMENTAL=true`.
+The peer is chosen like the servers of any other method, through the
+per-method aggregation map under the method key
+`kakehashi/virtualDocument/prepare`:
 
-Only pairs that are bridged and have a downstream server for the injection
-language are prepared — a document nobody receives is not worth a peer
-round-trip per edit. An empty name (`prepare = ""`) opts one language out of
-a wildcard's peer.
+```toml
+[languages.nix.bridge._.aggregation."kakehashi/virtualDocument/prepare"]
+priorities = ["tsudoi"]
+```
+
+- The candidates are the servers bridged for the injection language — the
+  ones its `languages` select, as for any request — so a peer lists the
+  languages it prepares (or `"*"`), and receives their documents like any
+  downstream server; `priorities` on the other methods (or the `"_"`
+  method entry) keep it out of their fan-out.
+- `priorities` follows aggregation-priorities-wildcard and inherits from
+  the `"_"` method entry like every LSP method: an ordered allowlist,
+  `"*"` for the unlisted rest (by server name), `["*"]` by default, and
+  `[]` opts a language out.
+- The strategy is always `preferred`: the first candidate, in priority
+  order, that advertises
+  `capabilities.experimental.kakehashi.virtualDocumentPrepare: true` in its
+  `initialize` result prepares the document. A candidate still starting is
+  waited for, so the choice does not depend on which server comes up
+  first; one that cannot start, or does not advertise the request, is
+  passed over. Only that candidate is asked, and its answer stands (see
+  Failure). A configured `concatenated` is ignored with a warning.
+- When no candidate advertises the request, the document is sent as is.
+  Each server's advertisement is remembered from its last handshake, so a
+  pair none of whose candidates advertises it is not held back per edit to
+  find that out again.
+
+The feature is dormant unless `KAKEHASHI_EXPERIMENTAL=true`. Only pairs
+that are bridged and have a server for the injection language are
+prepared.
 
 ### The Request
 
@@ -130,17 +152,18 @@ that the server sending it holds the text the map describes.
 
 ### Failure
 
-A document the peer could not prepare is **not sent** — never sent
-unprepared. Every failure counts: no advertisement, an error response, a
-malformed or refused answer, a timeout. Requests on such a document get no
+A document the chosen peer could not prepare is **not sent** — never sent
+unprepared. Every failure of that peer counts: an error response, a
+malformed or refused answer, a timeout. (A pair with no peer at all — no
+candidate advertising the request, or able to start — is a different case:
+there is nothing to prepare the document, and it is sent as is.) Requests on such a document get no
 answer from the virt layer, its pushed diagnostics are dropped, and the
 one-shot CLI (`format`, `diagnose`) counts it as a failed request. A peer
 that prefers a fallback answers `null` (or catches its own errors and does
 so); kakehashi does not choose one on its behalf.
 
-An unusable answer (an error response, a malformed or refused result) or a
-peer that does not advertise the request is final for that document
-version. A missing answer (the peer not starting in time, crashing, timing
+An unusable answer (an error response, a malformed or refused result) is
+final for that document version. A missing answer (the peer not starting in time, crashing, timing
 out, or answering with one of LSP's retryable cancellation codes) is retried
 with backoff — one second, doubling to a minute — without waiting for an
 edit, and requests do not pile further attempts onto a backing-off one.
@@ -243,6 +266,24 @@ has to translate its own coordinates back, and off-the-shelf servers cannot.
 The protocol exists so the peer that presents is not the server that
 analyzes.
 
+### A `prepare` field naming the peer
+
+The first version configured the peer as
+`languages.<host>.bridge.<injection>.prepare = "<server>"`, a field of its
+own, and held a document unsent while the named server could not start.
+Every other per-language server choice is an aggregation `priorities`
+list; a second mechanism for one method had its own inheritance, opt-out
+(`prepare = ""`) and failure rules to learn. Choosing among the
+language's servers by advertisement also means a configuration that never
+mentions preparation still gets it from a server that offers it.
+
+### Fall through to the next advertising candidate
+
+Asking the next candidate when the chosen one fails would let a flaky
+peer switch which preparation servers see from one version to the next.
+The first advertising candidate is the peer, as `preferred` picks one
+answer.
+
 ### Send unprepared text when the peer fails
 
 A server would alternate between two shapes of the same document, and
@@ -262,7 +303,13 @@ answer `null`.
 ### Negative
 
 - Every new document version waits for a peer round-trip before downstream
-  servers see it.
+  servers see it; with experimental features on, a language's first
+  document also waits for its servers' handshakes to learn whether any
+  prepares it.
+- A peer must be bridged for the languages it prepares, so it receives
+  their documents too; keeping it out of other methods takes `priorities`.
+- A peer that cannot start leaves its documents unprepared rather than
+  unsent, so servers may see unprepared text until it is up.
 - `*/resolve` for items from prepared documents is refused (stale).
 - A blockquoted (line-prefixed) region refuses any result of the
   concatenated formatting pipeline when prepared, since prefixes are not

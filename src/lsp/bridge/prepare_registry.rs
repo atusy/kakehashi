@@ -13,9 +13,10 @@
 //!
 //! Every attempt runs on its own task, so a cancelled request cannot strand
 //! one half-done, and all waiters share it. An attempt that gets no answer
-//! (the peer not starting in time, crashing, timing out) is retried with
-//! backoff by syncing the host again; one that gets an unusable answer is
-//! final for that revision.
+//! from the peer it chose (crashing, timing out) is retried with backoff by
+//! syncing the host again; one that gets an unusable answer is final for
+//! that revision, as is one that finds no candidate to ask (the document is
+//! then sent as is).
 
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -27,22 +28,20 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::Instant;
 use url::Url;
 
+use super::ResolvedServerConfig;
 use super::pool::LanguageServerPool;
 use super::protocol::{
     PrepareHostTextDocument, PrepareParams, PrepareTextDocument, PreparedDocument,
     VirtualDocumentUri, VirtualLayout, apply_prepare_result,
 };
-use crate::config::settings::BridgeServerConfig;
 use crate::language::injection::VirtualGap;
 
-/// The peer that prepares one (host, injection) pair's virtual documents.
+/// The servers that may prepare one (host, injection) pair's virtual
+/// documents, in priority order: the first of them advertising the request
+/// prepares each revision (the `preferred` strategy).
 #[derive(Debug, Clone)]
 pub(crate) struct PrepareTarget {
-    pub(crate) server_name: String,
-    /// `None` when the name is configured but not a startable server: every
-    /// prepare then fails without touching the pool, whose connection for
-    /// that name (if any) belongs to a different launch config.
-    pub(crate) config: Option<Arc<BridgeServerConfig>>,
+    pub(crate) candidates: Arc<[ResolvedServerConfig]>,
 }
 
 /// One virtual document to prepare.
@@ -84,12 +83,10 @@ struct Entry {
     host_uri: String,
     injection_language: String,
     region_id: String,
-    /// The host language and peer the entry was prepared for, so a settings
-    /// change that retargets the pair can drop it.
+    /// The host language and candidates the entry was prepared for, so a
+    /// settings change that retargets the pair can drop it.
     host_language: String,
-    server_name: String,
-    /// The peer's launch config the answers came from (`None`: unstartable).
-    server_config: Option<Arc<BridgeServerConfig>>,
+    candidates: Arc<[ResolvedServerConfig]>,
     current: Generation,
     previous: Option<Generation>,
 }
@@ -543,9 +540,9 @@ impl PrepareRegistry {
         }
     }
 
-    /// Keep only the entries `keep(host language, injection language, peer,
-    /// peer config)` accepts — after a settings change, those whose pair
-    /// still names the same peer with the same launch config. With `drop_unusable`, answers cached as final go too: the
+    /// Keep only the entries `keep(host language, injection language,
+    /// candidates)` accepts — after a settings change, those whose pair
+    /// still lists the same servers with the same launch configs. With `drop_unusable`, answers cached as final go too: the
     /// change may have fixed what made them unusable (a peer's command,
     /// say), and the caller guarantees a pass that asks again — a dropped
     /// entry reads as unprepared until then, which would misread a server
@@ -553,15 +550,14 @@ impl PrepareRegistry {
     /// as unprepared until prepared again.
     pub(crate) fn retain(
         &self,
-        keep: impl Fn(&str, &str, &str, Option<&BridgeServerConfig>) -> bool,
+        keep: impl Fn(&str, &str, &[ResolvedServerConfig]) -> bool,
         drop_unusable: bool,
     ) {
         self.entries.retain(|_, entry| {
             keep(
                 &entry.host_language,
                 &entry.injection_language,
-                &entry.server_name,
-                entry.server_config.as_deref(),
+                &entry.candidates,
             ) && !(drop_unusable && matches!(entry.current.cell.outcome.get(), Some(None)))
         });
     }
@@ -834,19 +830,18 @@ impl PrepareRegistry {
             injection_language: input.injection_language.to_string(),
             region_id: input.region_id.to_string(),
             host_language: input.host_language.to_string(),
-            server_name: target.server_name.clone(),
-            server_config: target.config.clone(),
+            candidates: Arc::clone(&target.candidates),
             current: fresh(),
             previous: None,
         });
         if !entry.is(host_uri, input.injection_language, input.region_id)
-            // The same peer launched differently answers differently, and
-            // the config is no part of the input key: a lookup made under
+            // The same servers launched differently answer differently, and
+            // the configs are no part of the input key: a lookup made under
             // other settings than the entry's (one still in flight across a
             // settings change, which may even have recreated the entry after
             // the prune) must not see its answers, and its own must not
             // outlive it.
-            || !same_config(entry.server_config.as_ref(), target.config.as_ref())
+            || !same_candidates(&entry.candidates, &target.candidates)
         {
             if holder == Holder::Request
                 && entry.is(host_uri, input.injection_language, input.region_id)
@@ -867,8 +862,7 @@ impl PrepareRegistry {
                 injection_language: input.injection_language.to_string(),
                 region_id: input.region_id.to_string(),
                 host_language: input.host_language.to_string(),
-                server_name: target.server_name.clone(),
-                server_config: target.config.clone(),
+                candidates: Arc::clone(&target.candidates),
                 current: fresh(),
                 previous: None,
             };
@@ -910,8 +904,7 @@ impl PrepareRegistry {
             return handle;
         }
         entry.host_language = input.host_language.to_string();
-        entry.server_name = target.server_name.clone();
-        entry.server_config = target.config.clone();
+        entry.candidates = Arc::clone(&target.candidates);
         let current = std::mem::replace(&mut entry.current, fresh());
         entry.previous = Some(current);
         (Arc::clone(&entry.current.cell), entry.current.revision)
@@ -949,22 +942,25 @@ fn region_hash(host_uri: &str, injection_language: &str, region_id: &str) -> u64
 
 fn input_key(target: &PrepareTarget, input: PrepareInput<'_>) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    target.server_name.hash(&mut hasher);
+    for candidate in target.candidates.iter() {
+        candidate.server_name.hash(&mut hasher);
+    }
     input.host_language.hash(&mut hasher);
     input.virtual_text.hash(&mut hasher);
     input.gaps.hash(&mut hasher);
     hasher.finish()
 }
 
-/// Whether two peer launch configs are the same: by identity first (a
-/// target resolved under one settings snapshot shares its `Arc`), by value
-/// across snapshots.
-fn same_config(a: Option<&Arc<BridgeServerConfig>>, b: Option<&Arc<BridgeServerConfig>>) -> bool {
-    match (a, b) {
-        (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a == b,
-        (None, None) => true,
-        _ => false,
-    }
+/// Whether two candidate lists are the same servers with the same launch
+/// configs: by identity first (a target resolved under one settings snapshot
+/// shares its `Arc`s), by value across snapshots.
+pub(crate) fn same_candidates(a: &[ResolvedServerConfig], b: &[ResolvedServerConfig]) -> bool {
+    std::ptr::eq(a, b)
+        || a.len() == b.len()
+            && a.iter().zip(b).all(|(a, b)| {
+                a.server_name == b.server_name
+                    && (Arc::ptr_eq(&a.config, &b.config) || a.config == b.config)
+            })
 }
 
 fn sent_key(host_uri: &str, region_id: &str) -> u64 {
@@ -1002,9 +998,11 @@ impl From<PrepareInput<'_>> for PrepareJob {
     }
 }
 
-/// Ask the peer and apply its answer. `Ok(None)` is an answer kakehashi
-/// refused (or the peer refused to give); `Err` is no answer at all. Both
-/// are logged; neither lets the document through unprepared.
+/// Ask the first candidate advertising the request and apply its answer.
+/// `Ok(None)` is an answer kakehashi refused (or the peer refused to give);
+/// `Err` is no answer at all. Both are logged; neither lets the document
+/// through unprepared. A revision no candidate advertises the request for is
+/// sent as is (a document without a map).
 async fn run(
     pool: &LanguageServerPool,
     target: &PrepareTarget,
@@ -1015,10 +1013,9 @@ async fn run(
     let log_failure = |error: &dyn std::fmt::Display| {
         log::warn!(
             target: "kakehashi::bridge::prepare",
-            "Not sending the {} virtual document of {}: {} could not prepare it: {}",
+            "Not sending the {} virtual document of {}: {}",
             job.injection_language,
             job.host_uri,
-            target.server_name,
             error
         );
     };
@@ -1037,8 +1034,13 @@ async fn run(
 
 /// The outer `Err` is a failure to get an answer (worth retrying); the
 /// inner one is final for the revision: an answer that cannot be used (an
-/// error response, a malformed or refused result) or a peer that cannot
-/// answer (not startable, not advertising the request).
+/// error response, a malformed or refused result).
+///
+/// Candidates are asked strictly in priority order: one still starting is
+/// waited for, and one that cannot start, or does not advertise the request,
+/// is passed over. Only the first that advertises it is asked, and its
+/// answer stands — a failure does not fall through to the next, which would
+/// let a flaky peer switch which preparation servers see.
 async fn try_run(
     pool: &LanguageServerPool,
     target: &PrepareTarget,
@@ -1046,22 +1048,6 @@ async fn try_run(
     revision: i32,
     admitted: &(dyn Fn() -> bool + Sync),
 ) -> std::io::Result<std::io::Result<PreparedDocument>> {
-    let Some(config) = target.config.as_deref() else {
-        return Ok(Err(std::io::Error::other(format!(
-            "{} is not a startable language server",
-            target.server_name
-        ))));
-    };
-    let handle = pool
-        .get_or_create_connection_wait_ready_admitted(
-            &target.server_name,
-            config,
-            Some(&job.host_uri),
-            Duration::from_secs(super::INIT_TIMEOUT_SECS),
-            Some(admitted),
-            None,
-        )
-        .await?;
     let host_uri = match crate::lsp::lsp_impl::url_to_uri(&job.host_uri) {
         Ok(host_uri) => host_uri,
         Err(error) => return Ok(Err(std::io::Error::other(error.to_string()))),
@@ -1081,24 +1067,74 @@ async fn try_run(
         },
         &layout,
     );
-    let result = match handle.request_virtual_document_prepare(&params).await {
-        Ok(result) => result,
-        // Final for this revision: an unusable answer (an error response or a
-        // malformed result), or a peer that does not answer this request at
-        // all — its advertisement is fixed until it restarts.
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::InvalidData | std::io::ErrorKind::Unsupported
-            ) =>
-        {
-            return Ok(Err(error));
+    for candidate in target.candidates.iter() {
+        let name = &candidate.server_name;
+        if pool.prepare_advertisement(name) == Some(false) {
+            continue;
         }
-        // No answer: timed out, cancelled by the peer, connection gone.
-        Err(error) => return Err(error),
-    };
-    Ok(apply_prepare_result(&job.virtual_text, &layout, result)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error)))
+        let handle = match pool
+            .get_or_create_connection_wait_ready_admitted(
+                name,
+                &candidate.config,
+                Some(&job.host_uri),
+                Duration::from_secs(super::INIT_TIMEOUT_SECS),
+                Some(admitted),
+                None,
+            )
+            .await
+        {
+            Ok(handle) => handle,
+            // Superseded: no answer for this revision.
+            Err(error) if !admitted() => return Err(error),
+            Err(error) => {
+                log::debug!(
+                    target: "kakehashi::bridge::prepare",
+                    "Prepare candidate {name} for {} did not start: {error}",
+                    job.host_uri
+                );
+                continue;
+            }
+        };
+        if !handle.supports_virtual_document_prepare() {
+            continue;
+        }
+        let result = match handle.request_virtual_document_prepare(&params).await {
+            Ok(result) => result,
+            // It does not answer the request after all (`MethodNotFound`
+            // withdraws the advertisement): as if it had not advertised it.
+            Err(_) if !handle.supports_virtual_document_prepare() => {
+                pool.record_prepare_advertisement(name, false);
+                continue;
+            }
+            // Final for this revision: an unusable answer (an error response
+            // or a malformed result).
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                return Ok(Err(std::io::Error::new(
+                    error.kind(),
+                    format!("{name} could not prepare it: {error}"),
+                )));
+            }
+            // No answer: timed out, cancelled by the peer, connection gone.
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!("{name} did not answer: {error}"),
+                ));
+            }
+        };
+        return Ok(
+            apply_prepare_result(&job.virtual_text, &layout, result).map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{name} answered unusably: {error}"),
+                )
+            }),
+        );
+    }
+    Ok(Ok(PreparedDocument {
+        text: job.virtual_text.clone(),
+        map: None,
+    }))
 }
 
 /// Present a virtual document as content/gap segments: the gaps the
@@ -1135,6 +1171,7 @@ fn layout(virtual_text: &str, gaps: &[VirtualGap]) -> VirtualLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::settings::BridgeServerConfig;
     use crate::lsp::bridge::protocol::SegmentKind;
 
     #[test]
@@ -1172,15 +1209,31 @@ mod tests {
         layout("", &[])
     }
 
-    fn unstartable_target() -> PrepareTarget {
+    /// Candidates named and launched as given, in this order.
+    fn target_of(candidates: &[(&str, &[&str])]) -> PrepareTarget {
         PrepareTarget {
-            server_name: "peer".to_string(),
-            config: None,
+            candidates: candidates
+                .iter()
+                .map(|(name, command)| ResolvedServerConfig {
+                    server_name: name.to_string(),
+                    config: Arc::new(BridgeServerConfig {
+                        cmd: Some(command.iter().map(|part| part.to_string()).collect()),
+                        ..Default::default()
+                    }),
+                })
+                .collect(),
         }
     }
 
+    fn unstartable_target() -> PrepareTarget {
+        target_of(&[("peer", &["/nonexistent/kakehashi-prepare-peer"])])
+    }
+
     #[tokio::test]
-    async fn an_unusable_peer_is_final_and_asked_once() {
+    async fn a_revision_no_candidate_prepares_is_sent_as_is() {
+        // A candidate that cannot start advertises nothing: with no other,
+        // the document goes out unprepared, and that is final for the
+        // revision.
         let registry = PrepareRegistry::default();
         let pool = Arc::new(LanguageServerPool::new());
         let host = Url::parse("file:///host.md").unwrap();
@@ -1197,15 +1250,16 @@ mod tests {
             registry.lookup_or_start(&pool, &target, input),
             PrepareLookup::Pending
         ));
-        // A request joins the attempt and sees its (final) failure.
-        assert!(registry.prepare(&pool, &target, input).await.is_none());
+        let sent = registry.prepare(&pool, &target, input).await.unwrap();
+        assert_eq!(sent.text, "a");
+        assert!(sent.map.is_none());
         assert!(matches!(
             registry.lookup_or_start(&pool, &target, input),
-            PrepareLookup::Failed
+            PrepareLookup::Ready(sent) if sent.map.is_none()
         ));
         let (cell, _) = registry.cell(&target, input, Holder::Request);
         assert!(!cell.in_flight.load(Ordering::Acquire));
-        assert_eq!(*cell.attempts.borrow(), 1, "the failure was not retried");
+        assert_eq!(*cell.attempts.borrow(), 1, "the revision was not retried");
     }
 
     #[test]
@@ -1220,11 +1274,47 @@ mod tests {
         assert!(!registry.ever_used.load(Ordering::Acquire));
     }
 
+    /// A ready connection for `name` that records what it is sent and
+    /// never answers, advertising the prepare request or not.
+    #[cfg(unix)]
+    async fn recording_candidate(
+        pool: &LanguageServerPool,
+        name: &str,
+        advertised: bool,
+        path: &std::path::Path,
+    ) {
+        use crate::lsp::bridge::pool::test_helpers::{
+            advertise_prepare_for_test, create_handle_with_command,
+        };
+        use crate::lsp::bridge::pool::{ConnectionKey, ConnectionState};
+        let (handle, _) = create_handle_with_command(
+            ConnectionState::Ready,
+            ConnectionKey::for_server(name),
+            vec![
+                "sh".into(),
+                "-c".into(),
+                "cat > \"$1\"".into(),
+                "record".into(),
+                path.to_str().unwrap().into(),
+            ],
+            None,
+        )
+        .await;
+        advertise_prepare_for_test(&handle, advertised);
+        pool.insert_connection(handle).await;
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
-    async fn a_peer_that_cannot_start_is_retried_after_a_backoff() {
+    async fn the_first_advertising_candidate_alone_is_asked_and_retried() {
         let registry = PrepareRegistry::default();
         let mut resync = registry.take_resync_rx().unwrap();
         let pool = Arc::new(LanguageServerPool::new());
+        let dir = tempfile::tempdir().unwrap();
+        let sent = |name: &str| std::fs::read_to_string(dir.path().join(name)).unwrap_or_default();
+        recording_candidate(&pool, "quiet", false, &dir.path().join("quiet")).await;
+        recording_candidate(&pool, "first", true, &dir.path().join("first")).await;
+        recording_candidate(&pool, "second", true, &dir.path().join("second")).await;
         let host = Url::parse("file:///host.md").unwrap();
         let input = PrepareInput {
             host_uri: &host,
@@ -1234,15 +1324,17 @@ mod tests {
             virtual_text: "a",
             gaps: &[],
         };
-        let target = PrepareTarget {
-            server_name: "peer".to_string(),
-            config: Some(Arc::new(BridgeServerConfig {
-                cmd: Some(vec!["/nonexistent/kakehashi-prepare-peer".to_string()]),
-                ..Default::default()
-            })),
-        };
-        // No answer: not cached, so the document is still pending…
+        let target = target_of(&[
+            ("quiet", &["quiet"]),
+            ("first", &["first"]),
+            ("second", &["second"]),
+        ]);
+        // `first` never answers: no answer, not cached, so the document is
+        // still pending, and `second` is not asked instead.
         assert!(registry.prepare(&pool, &target, input).await.is_none());
+        assert!(!sent("quiet").contains(crate::lsp::bridge::protocol::PREPARE_METHOD));
+        assert!(sent("first").contains(crate::lsp::bridge::protocol::PREPARE_METHOD));
+        assert!(!sent("second").contains(crate::lsp::bridge::protocol::PREPARE_METHOD));
         let (cell, _) = registry.cell(&target, input, Holder::Request);
         assert!(cell.outcome.get().is_none());
         assert_eq!(cell.misses.load(Ordering::Acquire), 1);
@@ -1334,14 +1426,7 @@ mod tests {
     #[test]
     fn retain_sees_the_peer_config_answers_came_from() {
         let registry = PrepareRegistry::default();
-        let config = |cmd: &str| BridgeServerConfig {
-            cmd: Some(vec![cmd.to_string()]),
-            ..Default::default()
-        };
-        let target = PrepareTarget {
-            server_name: "peer".to_string(),
-            config: Some(Arc::new(config("deno"))),
-        };
+        let target = target_of(&[("peer", &["deno"])]);
         let host = Url::parse("file:///host.md").unwrap();
         let input = PrepareInput {
             host_uri: &host,
@@ -1352,9 +1437,15 @@ mod tests {
             gaps: &[],
         };
         registry.cell(&target, input, Holder::Request);
-        registry.retain(|_, _, _, seen| seen == Some(&config("deno")), false);
+        let same = |command: &str| {
+            let other = target_of(&[("peer", &[command])]);
+            move |_: &str, _: &str, seen: &[ResolvedServerConfig]| {
+                same_candidates(seen, &other.candidates)
+            }
+        };
+        registry.retain(same("deno"), false);
         assert_eq!(registry.entries.len(), 1);
-        registry.retain(|_, _, _, seen| seen == Some(&config("bun")), false);
+        registry.retain(same("bun"), false);
         assert!(
             registry.entries.is_empty(),
             "a relaunched peer prepares again"
@@ -1425,7 +1516,7 @@ mod tests {
         registry.cell(&target, input, Holder::LifecyclePass);
         registry.note_sent(&host, "lua", region, &sent_text("a"));
         // A retargeted peer: the entry goes, the server still holds "a".
-        registry.retain(|_, _, _, _| false, false);
+        registry.retain(|_, _, _| false, false);
         assert!(
             registry.note_sent(&host, "lua", region, &sent_text("  a")),
             "the new peer's text differs from the one the server holds"
@@ -1524,7 +1615,7 @@ mod tests {
         // Its generation evicted by two newer texts, or the entry dropped by
         // a settings change: servers still hold "a", through the same map.
         registry.cell(&target, input("c"), Holder::LifecyclePass);
-        registry.retain(|_, _, _, _| false, false);
+        registry.retain(|_, _, _| false, false);
         let PreparedState::Prepared(Some(map)) = state("  a") else {
             panic!("the sent answer still translates its text");
         };
@@ -1534,14 +1625,7 @@ mod tests {
     #[test]
     fn another_peer_config_never_reuses_an_answer() {
         let registry = PrepareRegistry::default();
-        let config = |command: &str| BridgeServerConfig {
-            cmd: Some(vec![command.to_string()]),
-            ..Default::default()
-        };
-        let target = |command: &str| PrepareTarget {
-            server_name: "peer".to_string(),
-            config: Some(Arc::new(config(command))),
-        };
+        let target = |command: &str| target_of(&[("peer", &[command])]);
         let host = Url::parse("file:///host.md").unwrap();
         let input = PrepareInput {
             host_uri: &host,
@@ -1639,14 +1723,7 @@ mod tests {
     async fn a_request_that_cannot_wait_leaves_the_lifecycle_generation() {
         let registry = PrepareRegistry::default();
         let pool = Arc::new(LanguageServerPool::new());
-        let config = |command: &str| BridgeServerConfig {
-            cmd: Some(vec![command.to_string()]),
-            ..Default::default()
-        };
-        let target = |command: &str| PrepareTarget {
-            server_name: "peer".to_string(),
-            config: Some(Arc::new(config(command))),
-        };
+        let target = |command: &str| target_of(&[("peer", &[command])]);
         let host = Url::parse("file:///host.md").unwrap();
         let input = PrepareInput {
             host_uri: &host,
@@ -1684,7 +1761,7 @@ mod tests {
         registry.cell(&target, input, Holder::LifecyclePass);
         registry.note_sent(&host, "lua", region, &sent_text("a"));
         // The peer is removed: the lifecycle pass sends the text unprepared.
-        registry.retain(|_, _, _, _| false, false);
+        registry.retain(|_, _, _| false, false);
         registry.note_unprepared_sent(&host, "lua", region, "  a");
         registry.cell(&target, input, Holder::Request);
         assert!(
@@ -1846,9 +1923,9 @@ mod tests {
         };
         let (cell, _) = registry.cell(&target, input, Holder::Request);
         cell.outcome.set(None).unwrap();
-        registry.retain(|_, _, _, _| true, false);
+        registry.retain(|_, _, _| true, false);
         assert_eq!(registry.entries.len(), 1, "nothing would ask again");
-        registry.retain(|_, _, _, _| true, true);
+        registry.retain(|_, _, _| true, true);
         assert!(
             registry.entries.is_empty(),
             "a fixed config may now prepare it"
@@ -1862,17 +1939,8 @@ mod tests {
         let pool = Arc::new(LanguageServerPool::new());
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("spawned");
-        let target = PrepareTarget {
-            server_name: "peer".to_string(),
-            config: Some(Arc::new(BridgeServerConfig {
-                cmd: Some(vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    format!("touch '{}'", marker.display()),
-                ]),
-                ..Default::default()
-            })),
-        };
+        let touch = format!("touch '{}'", marker.display());
+        let target = target_of(&[("peer", &["sh", "-c", &touch])]);
         let host = Url::parse("file:///host.md").unwrap();
         let input = PrepareInput {
             host_uri: &host,
@@ -1925,11 +1993,16 @@ mod tests {
         assert!(!Arc::ptr_eq(&first, &changed));
         assert!(changed_revision > revision);
         registry.retain(
-            |host_language, _, server, _| host_language == "markdown" && server == "peer",
+            |host_language, _, candidates| {
+                host_language == "markdown" && candidates[0].server_name == "peer"
+            },
             true,
         );
         assert_eq!(registry.entries.len(), 1);
-        registry.retain(|_, _, server, _| server == "other", true);
+        registry.retain(
+            |_, _, candidates| candidates[0].server_name == "other",
+            true,
+        );
         assert!(registry.entries.is_empty());
         registry.cell(&target, input("b"), Holder::Request);
         registry.forget_region(&host, None, "01J0000000000000000000000A");

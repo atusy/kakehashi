@@ -206,9 +206,6 @@ fn strip_inherited_bridge_language_config(
     current: &settings::BridgeLanguageConfig,
 ) -> settings::BridgeLanguageConfig {
     settings::BridgeLanguageConfig {
-        prepare: (current.prepare != inherited.prepare)
-            .then(|| current.prepare.clone())
-            .flatten(),
         enabled: (current.enabled != inherited.enabled)
             .then_some(current.enabled)
             .flatten(),
@@ -535,7 +532,6 @@ mod tests {
             bridge: Some(HashMap::from([(
                 HOST_BRIDGE_KEY.to_string(),
                 BridgeLanguageConfig {
-                    prepare: None,
                     enabled: Some(enabled),
                     aggregation: None,
                 },

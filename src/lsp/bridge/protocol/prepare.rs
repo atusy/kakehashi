@@ -2,7 +2,7 @@
 //! before downstream servers see it.
 //!
 //! kakehashi splits the virtual document (V) into ordered segments — injected
-//! `content` and host-owned `gap`s — and asks the configured peer how to
+//! `content` and host-owned `gap`s — and asks the peer how to
 //! present them. The answer may delete leading whitespace from content lines
 //! (dedent) and replace any gap with arbitrary text (placeholders). Applying
 //! it yields the prepared document (P) that downstream servers receive, plus
@@ -275,7 +275,8 @@ pub(crate) struct PreparedDocument {
     /// The text sent downstream.
     pub(crate) text: String,
     /// `Some` for every document that went through a peer, even when its
-    /// answer changed nothing.
+    /// answer changed nothing; `None` when no candidate advertises the
+    /// request, and the virtual text is sent as is.
     pub(crate) map: Option<std::sync::Arc<PreparedMap>>,
 }
 

@@ -46,27 +46,6 @@ pub(crate) struct BridgeInjection {
     pub(crate) prepared: Option<Arc<super::protocol::PreparedDocument>>,
 }
 
-/// The launch config of the server a `prepare` field names: a configured,
-/// startable `languageServers` entry. Like every server selection, the `_`
-/// wildcard only supplies defaults — it is neither a server of its own nor
-/// what an unconfigured name resolves to.
-fn prepare_peer_config(
-    settings: &WorkspaceSettings,
-    server_name: &str,
-) -> Option<BridgeServerConfig> {
-    if server_name == crate::config::WILDCARD_KEY
-        || !settings.language_servers.contains_key(server_name)
-    {
-        return None;
-    }
-    resolve_with_wildcard(
-        &settings.language_servers,
-        server_name,
-        merge_bridge_server_configs,
-    )
-    .filter(BridgeServerConfig::is_spawnable)
-}
-
 /// A save that reached a host while some of its virtual documents were held
 /// back for their prepare answers.
 #[derive(Debug, Default)]
@@ -200,10 +179,10 @@ pub(crate) struct BridgeCoordinator {
     pool: Arc<LanguageServerPool>,
     /// Prepared forms of virtual documents (`kakehashi/virtualDocument/prepare`).
     prepare: super::prepare_registry::PrepareRegistry,
-    /// Prepare peers already warned about as unstartable, until the next
-    /// settings change: the warning would otherwise repeat per region per
-    /// edit.
-    warned_unusable_prepare: dashmap::DashSet<String>,
+    /// (host, injection) pairs already warned about for a `prepare`
+    /// strategy other than `preferred`, until the next settings change: the
+    /// warning would otherwise repeat per region per edit.
+    warned_prepare_strategy: dashmap::DashSet<(String, String)>,
     /// Hosts owed a `workspace/diagnostic/refresh` once their documents
     /// waiting for prepare answers are sent (see
     /// [`Self::owe_pull_after_prepare`]).
@@ -304,8 +283,9 @@ struct ConfigMemo {
     /// `host_language` → `_self` host-bridge configs.
     host: DashMap<String, Arc<Vec<ResolvedServerConfig>>>,
     /// `host_language` → `(injection_language, prepare target)` pairs, like
-    /// `virt`: resolving a target merges the peer's launch config, which the
-    /// lifecycle pass and every request would otherwise redo per region.
+    /// `virt`: resolving a target expands the method's priorities over the
+    /// language's servers, which the lifecycle pass and every request would
+    /// otherwise redo per region.
     prepare: DashMap<String, Vec<(String, Option<super::PrepareTarget>)>>,
 }
 
@@ -352,7 +332,7 @@ impl BridgeCoordinator {
         Self {
             pool,
             prepare: super::prepare_registry::PrepareRegistry::default(),
-            warned_unusable_prepare: dashmap::DashSet::new(),
+            warned_prepare_strategy: dashmap::DashSet::new(),
             prepare_pull_debts: dashmap::DashSet::new(),
             held_saves: DashMap::new(),
             node_tracker: Arc::new(NodeTracker::new()),
@@ -382,7 +362,7 @@ impl BridgeCoordinator {
         Self {
             pool,
             prepare: super::prepare_registry::PrepareRegistry::default(),
-            warned_unusable_prepare: dashmap::DashSet::new(),
+            warned_prepare_strategy: dashmap::DashSet::new(),
             prepare_pull_debts: dashmap::DashSet::new(),
             held_saves: DashMap::new(),
             node_tracker: Arc::new(NodeTracker::new()),
@@ -459,13 +439,14 @@ impl BridgeCoordinator {
         &self.pool
     }
 
-    /// The peer that prepares `injection_language` virtual documents in
-    /// `host_language` hosts (`bridge.<injection>.prepare`), when experimental
-    /// features are on, the pair is bridged at all, and some downstream server
-    /// would receive the document — preparing one nobody receives is a peer
-    /// round-trip per edit for nothing. A peer that cannot be started is still
-    /// a target (one whose every prepare fails), so the document stays
-    /// unsent rather than going out unprepared.
+    /// The servers that may prepare `injection_language` virtual documents
+    /// in `host_language` hosts, when experimental features are on: those
+    /// the pair's `kakehashi/virtualDocument/prepare` aggregation
+    /// `priorities` admit among the servers bridged for the language, in
+    /// that order (`"*"` by name). `None` when there are none, or when every
+    /// one is known not to advertise the request — the pair is then not
+    /// prepared at all, rather than each revision being held back to find
+    /// that out again.
     pub(crate) fn prepare_target(
         &self,
         settings: &Arc<WorkspaceSettings>,
@@ -477,21 +458,31 @@ impl BridgeCoordinator {
             return None;
         }
         // Memoized per settings snapshot: this runs per bridged region in
-        // every lifecycle pass and request, and resolving the peer's launch
-        // config deep-merges its settings. The memoized `Arc` also lets the
-        // registry compare configs by identity.
+        // every lifecycle pass and request. The memoized `Arc` also lets the
+        // registry compare candidates by identity.
         let memo = self.config_memo_for(settings);
-        if let Some(hit) = memo.prepare.get(host_language)
-            && let Some((_, target)) = hit.iter().find(|(lang, _)| lang == injection_language)
-        {
-            return target.clone();
-        }
-        let target = self.resolve_prepare_target(settings, host_language, injection_language);
-        let mut pairs = memo.prepare.entry(host_language.to_string()).or_default();
-        if !pairs.iter().any(|(lang, _)| lang == injection_language) {
-            pairs.push((injection_language.to_string(), target.clone()));
-        }
+        let target = match memo.prepare.get(host_language).and_then(|hit| {
+            hit.iter()
+                .find(|(lang, _)| lang == injection_language)
+                .map(|(_, target)| target.clone())
+        }) {
+            Some(target) => target,
+            None => {
+                let target =
+                    self.resolve_prepare_target(settings, host_language, injection_language);
+                let mut pairs = memo.prepare.entry(host_language.to_string()).or_default();
+                if !pairs.iter().any(|(lang, _)| lang == injection_language) {
+                    pairs.push((injection_language.to_string(), target.clone()));
+                }
+                target
+            }
+        }?;
+        let pool = self.pool();
         target
+            .candidates
+            .iter()
+            .any(|candidate| pool.prepare_advertisement(&candidate.server_name) != Some(false))
+            .then_some(target)
     }
 
     fn resolve_prepare_target(
@@ -500,83 +491,67 @@ impl BridgeCoordinator {
         host_language: &str,
         injection_language: &str,
     ) -> Option<super::PrepareTarget> {
-        let server_name =
-            self.prepare_server_name(settings, host_language, injection_language, true)?;
-        if self
-            .get_all_configs_for_language(settings, host_language, injection_language)
-            .is_empty()
-        {
+        use crate::lsp::aggregation::server::priority::{entry_names, expand_priorities};
+        let configs =
+            self.cached_configs_for_injection_language(settings, host_language, injection_language);
+        if configs.is_empty() {
             return None;
         }
-        let Some(config) = prepare_peer_config(settings, &server_name) else {
-            if self.warned_unusable_prepare.insert(server_name.clone()) {
-                log::warn!(
-                    target: "kakehashi::bridge::prepare",
-                    "bridge.{}.prepare names {}, which is not a startable language server; {} virtual documents in {} hosts are not sent",
-                    escape_terminal_controls(injection_language),
-                    escape_terminal_controls(&server_name),
-                    escape_terminal_controls(injection_language),
-                    escape_terminal_controls(host_language),
-                );
-            }
-            return Some(super::PrepareTarget {
-                server_name,
-                config: None,
-            });
-        };
-        Some(super::PrepareTarget {
-            server_name,
-            config: Some(Arc::new(config)),
-        })
+        let aggregation =
+            crate::lsp::lsp_impl::bridge_context::resolve_aggregation_config_from_settings(
+                settings,
+                host_language,
+                injection_language,
+                super::protocol::PREPARE_METHOD,
+            );
+        if aggregation.strategy != crate::config::settings::AggregationStrategy::Preferred
+            && self
+                .warned_prepare_strategy
+                .insert((host_language.to_string(), injection_language.to_string()))
+        {
+            log::warn!(
+                target: "kakehashi::bridge::prepare",
+                "{} in {} hosts: {} is always aggregated as preferred; the configured strategy is ignored",
+                escape_terminal_controls(injection_language),
+                escape_terminal_controls(host_language),
+                super::protocol::PREPARE_METHOD,
+            );
+        }
+        let candidates: Arc<[ResolvedServerConfig]> =
+            entry_names(&expand_priorities(&aggregation.priorities, &configs))
+                .into_iter()
+                .filter_map(|name| configs.iter().find(|config| config.server_name == name))
+                .cloned()
+                .collect();
+        (!candidates.is_empty()).then_some(super::PrepareTarget { candidates })
     }
 
     /// After a settings change, drop prepared documents whose (host,
-    /// injection) pair no longer names the peer that prepared them, so no
-    /// path keeps translating through a map for text no longer sent.
+    /// injection) pair no longer lists the candidates that prepared them,
+    /// so no path keeps translating through a map for text no longer sent.
     /// `reparsing`: the change re-runs every host's injection pass, so
     /// answers cached as unusable can go too and be asked again.
     pub(crate) fn prune_prepared(
         &self,
-        settings: &WorkspaceSettings,
+        settings: &Arc<WorkspaceSettings>,
         experimental: bool,
         reparsing: bool,
     ) {
-        self.warned_unusable_prepare.clear();
+        self.warned_prepare_strategy.clear();
         self.prepare.retain(
-            |host_language, injection_language, server, config| {
-                self.prepare_server_name(settings, host_language, injection_language, experimental)
-                    .is_some_and(|name| name == server)
-                    // The same name may now launch differently (or not at
-                    // all): its old answers no longer describe what it says.
-                    && prepare_peer_config(settings, server).as_ref() == config
+            |host_language, injection_language, candidates| {
+                experimental
+                    // The same names may now launch differently (or not at
+                    // all): their old answers no longer describe what they
+                    // say.
+                    && self
+                        .resolve_prepare_target(settings, host_language, injection_language)
+                        .is_some_and(|target| {
+                            super::prepare_registry::same_candidates(&target.candidates, candidates)
+                        })
             },
             reparsing,
         );
-    }
-
-    /// The peer name `bridge.<injection>.prepare` resolves to for a bridged
-    /// pair (the language's own entry, else the `_` wildcard's). An empty
-    /// name opts the language out of a wildcard's peer.
-    fn prepare_server_name(
-        &self,
-        settings: &WorkspaceSettings,
-        host_language: &str,
-        injection_language: &str,
-        experimental: bool,
-    ) -> Option<String> {
-        if !experimental {
-            return None;
-        }
-        let host_settings = settings.resolve_host_language_settings(host_language)?;
-        if !host_settings.is_language_bridgeable(injection_language) {
-            return None;
-        }
-        let bridge = host_settings.bridge.as_ref()?;
-        let prepare_of = |key: &str| bridge.get(key).and_then(|config| config.prepare.as_ref());
-        prepare_of(injection_language)
-            .or_else(|| prepare_of(crate::config::WILDCARD_KEY))
-            .filter(|name| !name.is_empty())
-            .cloned()
     }
 
     /// The prepared form of a virtual document, without waiting: on a miss
@@ -4571,8 +4546,9 @@ mod tests {
     }
 
     #[test]
-    fn prepare_target_needs_a_bridged_language_with_a_downstream() {
-        use crate::config::settings::{BridgeLanguageConfig, LanguageSettings};
+    fn prepare_target_lists_the_language_servers_by_their_priorities() {
+        use crate::config::settings::{AggregationConfig, BridgeLanguageConfig, LanguageSettings};
+        use crate::lsp::bridge::protocol::PREPARE_METHOD;
         let coordinator = BridgeCoordinator::new();
         let mut settings = WorkspaceSettings {
             languages: crate::config::defaults::default_settings().languages,
@@ -4584,76 +4560,86 @@ mod tests {
             ..Default::default()
         };
         settings.language_servers = HashMap::from([
-            ("peer".to_string(), server(&[])),
+            ("tsudoi".to_string(), server(&["lua", "r", "ruby", "go"])),
             ("lua-ls".to_string(), server(&["lua", "r"])),
+            ("ruby-ls".to_string(), server(&["ruby"])),
+            ("gopls".to_string(), server(&["go"])),
+            ("pyright".to_string(), server(&["python"])),
         ]);
-        let bridge = |prepare: Option<&str>, enabled: Option<bool>| BridgeLanguageConfig {
-            prepare: prepare.map(str::to_string),
-            enabled,
-            ..Default::default()
+        let bridge = |method: &str, priorities: Option<&[&str]>, enabled: Option<bool>| {
+            BridgeLanguageConfig {
+                enabled,
+                aggregation: priorities.map(|priorities| {
+                    HashMap::from([(
+                        method.to_string(),
+                        AggregationConfig {
+                            priorities: Some(priorities.iter().map(|p| p.to_string()).collect()),
+                            ..Default::default()
+                        },
+                    )])
+                }),
+            }
         };
         settings.languages.insert(
             "markdown".to_string(),
             LanguageSettings {
                 bridge: Some(HashMap::from([
-                    ("_".to_string(), bridge(Some("peer"), None)),
-                    ("r".to_string(), bridge(Some(""), None)),
-                    ("ruby".to_string(), bridge(Some("ghost"), None)),
-                    ("python".to_string(), bridge(None, Some(false))),
+                    ("_".to_string(), bridge("_", None, None)),
+                    ("r".to_string(), bridge(PREPARE_METHOD, Some(&[]), None)),
+                    ("ruby".to_string(), bridge("_", Some(&["ruby-ls"]), None)),
+                    (
+                        "go".to_string(),
+                        bridge(PREPARE_METHOD, Some(&["ghost"]), None),
+                    ),
+                    ("python".to_string(), bridge("_", None, Some(false))),
                 ])),
                 ..Default::default()
             },
         );
-        settings
-            .language_servers
-            .insert("ruby-ls".to_string(), server(&["ruby"]));
         let settings = Arc::new(settings);
         let target = |injection: &str, experimental| {
             coordinator.prepare_target(&settings, "markdown", injection, experimental)
         };
+        let names = |target: &super::super::PrepareTarget| {
+            target
+                .candidates
+                .iter()
+                .map(|candidate| candidate.server_name.clone())
+                .collect::<Vec<_>>()
+        };
 
-        let lua = target("lua", true).expect("the wildcard peer prepares lua");
-        assert_eq!(lua.server_name, "peer");
-        assert!(lua.config.is_some());
+        let lua = target("lua", true).expect("`*` lists every lua server");
+        assert_eq!(names(&lua), ["lua-ls", "tsudoi"], "by name within `*`");
         let again = target("lua", true).expect("memoized");
         assert!(
-            Arc::ptr_eq(lua.config.as_ref().unwrap(), again.config.as_ref().unwrap()),
-            "one settings snapshot resolves the peer config once"
+            Arc::ptr_eq(&lua.candidates, &again.candidates),
+            "one settings snapshot resolves the candidates once"
         );
         assert!(target("lua", false).is_none(), "experimental gate");
-        assert!(target("r", true).is_none(), "an empty name opts out");
+        assert!(target("r", true).is_none(), "`[]` opts a language out");
+        let ruby = target("ruby", true).expect("the `_` method entry applies");
+        assert_eq!(names(&ruby), ["ruby-ls"]);
+        assert!(
+            target("go", true).is_none(),
+            "an unlisted name is no candidate"
+        );
         assert!(target("python", true).is_none(), "not bridged");
-        assert!(target("toml", true).is_none(), "no downstream server");
-        let ruby = target("ruby", true).expect("an unstartable peer still holds the document");
-        assert!(ruby.config.is_none());
+        assert!(target("toml", true).is_none(), "no server for the language");
 
-        // Neither an unconfigured name nor the `_` wildcard launches the
-        // wildcard's defaults as a peer.
-        let mut with_wildcard = (*settings).clone();
-        with_wildcard
-            .language_servers
-            .insert("_".to_string(), server(&[]));
-        for name in ["missing", "_"] {
-            with_wildcard
-                .languages
-                .get_mut("markdown")
-                .unwrap()
-                .bridge
-                .as_mut()
-                .unwrap()
-                .insert(
-                    "lua".to_string(),
-                    BridgeLanguageConfig {
-                        prepare: Some(name.to_string()),
-                        ..Default::default()
-                    },
-                );
-            let settings = Arc::new(with_wildcard.clone());
-            let lua = coordinator
-                .prepare_target(&settings, "markdown", "lua", true)
-                .expect("a configured name still holds the document");
-            assert!(lua.config.is_none(), "{name} must not launch `_`");
-        }
+        // Once every candidate is known not to advertise the request, the
+        // pair is not prepared at all rather than held for each revision.
+        coordinator
+            .pool()
+            .record_prepare_advertisement("lua-ls", false);
+        assert!(target("lua", true).is_some(), "tsudoi is not known yet");
+        coordinator
+            .pool()
+            .record_prepare_advertisement("tsudoi", false);
+        assert!(target("lua", true).is_none());
+        coordinator
+            .pool()
+            .record_prepare_advertisement("tsudoi", true);
+        assert!(target("lua", true).is_some(), "a restart may advertise it");
     }
 
     #[test]

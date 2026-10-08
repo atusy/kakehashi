@@ -3266,7 +3266,6 @@ mod tests {
                 bridge: Some(HashMap::from([(
                     HOST_BRIDGE_KEY.to_string(),
                     BridgeLanguageConfig {
-                        prepare: None,
                         enabled: Some(self_enabled),
                         aggregation: None,
                     },

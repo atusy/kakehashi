@@ -145,10 +145,22 @@ fn init_client_bridging(
     std::fs::write(&tsudoi_config, hook).expect("write tsudoi config");
     let config_path = dir.path().join("kakehashi.toml");
     std::fs::write(&config_path, "").expect("write kakehashi config");
-    let mut markdown = json!({ "bridge": { "lua": { "prepare": "tsudoi" } } });
+    // tsudoi prepares lua and answers nothing else: the prepare method names
+    // it, over the `_` method entry that leaves every other method to echo.
+    let mut markdown = json!({ "bridge": { "lua": { "aggregation": {
+        "kakehashi/virtualDocument/prepare": { "priorities": ["tsudoi"] },
+        "_": { "priorities": ["echo"] }
+    } } } });
     if let Value::Object(extra) = lua_bridge {
         for (key, value) in extra {
-            markdown["bridge"]["lua"][key] = value;
+            match (key.as_str(), value) {
+                ("aggregation", Value::Object(methods)) => {
+                    for (method, config) in methods {
+                        markdown["bridge"]["lua"]["aggregation"][method] = config;
+                    }
+                }
+                (_, value) => markdown["bridge"]["lua"][key] = value,
+            }
         }
     }
     if unprepared_python {
@@ -182,7 +194,7 @@ fn init_client_bridging(
                             "deno", "run", "-A", TSUDOI,
                             "--config", tsudoi_config.to_str().expect("UTF-8 tsudoi config"),
                         ],
-                        "languages": []
+                        "languages": ["lua"]
                     },
                     "echo": {
                         "cmd": [mock_formatter_bin(), "echo-document"],

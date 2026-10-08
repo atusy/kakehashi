@@ -877,23 +877,36 @@ The `bridge` map in language configuration controls which injection languages ar
 
 Embedded code is not always valid as written: a Nix indented string's
 content is indented by the host, and its `${…}` interpolations leave holes.
-`bridge.<lang>.prepare` names a language server that rewrites each virtual
-document before the downstream servers see it, via
-`kakehashi/virtualDocument/prepare`
-(see virtual-document-prepare-protocol). The server must advertise
-`experimental.kakehashi.virtualDocumentPrepare`, and the feature requires
-`KAKEHASHI_EXPERIMENTAL=true`. Only languages that are bridged and have a
-downstream server are prepared; `prepare = ""` opts one language out of a
-wildcard's peer.
+A language server can rewrite each virtual document before the downstream
+servers see it, via `kakehashi/virtualDocument/prepare`
+(see virtual-document-prepare-protocol), when it advertises
+`experimental.kakehashi.virtualDocumentPrepare`. The feature requires
+`KAKEHASHI_EXPERIMENTAL=true`.
+
+The server is chosen like those of any other method, by the method's
+aggregation `priorities` among the servers bridged for the language (so the
+server must list the languages it prepares, or `"*"`). The strategy is
+always `preferred`: the first server in priority order that advertises the
+request prepares the document; when none does, the document is sent as is.
+The default `priorities = ["*"]` uses any server that offers it; `[]` opts
+a language out:
 
 ```toml
-[languages.nix.bridge._]
-prepare = "tsudoi"
+# Prepare with tsudoi only
+[languages.nix.bridge._.aggregation."kakehashi/virtualDocument/prepare"]
+priorities = ["tsudoi"]
+
+[languages.nix.bridge.python.aggregation."kakehashi/virtualDocument/prepare"]
+priorities = []         # never prepare python in nix
 
 [languageServers.tsudoi]
 cmd = ["deno", "run", "-A", "npm:@atusy/tsudoi-language-server@0.1.0-alpha.2/cli", "--config", "/path/to/tsudoi.config.ts"]
-languages = []          # only prepares; analyzes nothing itself
+languages = ["*"]       # the languages it prepares
 ```
+
+Being bridged for those languages, the server also receives their
+documents and takes part in their other methods; a method's `priorities`
+that name the servers it should use keep it out.
 
 The request presents the document as ordered segments: `content` (the
 injected text) and `gap` (host text between `injection.combined` captures,

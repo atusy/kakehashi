@@ -594,6 +594,11 @@ pub struct LanguageServerPool {
     /// a server holds can be prepared or not, and a request must check it is
     /// the one its coordinates describe (see `wait_for_prepared_sync`).
     prepare_used: AtomicBool,
+    /// Whether each server (by name) advertised
+    /// `experimental.kakehashi.virtualDocumentPrepare` in its last handshake,
+    /// so a (host, injection) pair none of whose candidates prepares is not
+    /// held back on each revision to find that out again.
+    prepare_advertisements: Arc<DashMap<String, bool>>,
 }
 
 impl Default for LanguageServerPool {
@@ -667,12 +672,28 @@ impl LanguageServerPool {
             inbound_request_registry: super::InboundRequestRegistry::default(),
             command_origins: Arc::new(CommandOriginRegistry::default()),
             prepare_used: AtomicBool::new(false),
+            prepare_advertisements: Arc::new(DashMap::new()),
         }
     }
 
     /// Note that a virtual document is being prepared (see `prepare_used`).
     pub(crate) fn note_prepare_used(&self) {
         self.prepare_used.store(true, Ordering::Release);
+    }
+
+    /// Record whether `server_name` advertises
+    /// `kakehashi/virtualDocument/prepare` (its last handshake, or a
+    /// `MethodNotFound` answer since).
+    pub(crate) fn record_prepare_advertisement(&self, server_name: &str, advertised: bool) {
+        record_prepare_advertisement(&self.prepare_advertisements, server_name, advertised);
+    }
+
+    /// Whether `server_name` advertised `kakehashi/virtualDocument/prepare`
+    /// in its last handshake; `None` before it has had one.
+    pub(crate) fn prepare_advertisement(&self, server_name: &str) -> Option<bool> {
+        self.prepare_advertisements
+            .get(server_name)
+            .map(|advertised| *advertised)
     }
 
     fn prepare_used(&self) -> bool {
@@ -4445,6 +4466,7 @@ impl LanguageServerPool {
         let advertise_configuration = server_config.settings.is_some();
         let handle_for_handshake = Arc::clone(&handle);
         let server_name_for_log = server_name.to_string();
+        let prepare_advertisements = Arc::clone(&self.prepare_advertisements);
         let command_origins = Arc::clone(&self.command_origins);
         let command_registration_key = connection_key.clone();
         let upstream_request_tx = self.upstream_request_tx.clone();
@@ -4489,6 +4511,11 @@ impl LanguageServerPool {
                     handle_for_handshake.set_bridge_routing(extensions.bridge_routing);
                     handle_for_handshake
                         .set_virtual_document_prepare(extensions.virtual_document_prepare);
+                    record_prepare_advertisement(
+                        &prepare_advertisements,
+                        &server_name_for_log,
+                        extensions.virtual_document_prepare,
+                    );
                     handle_for_handshake.set_type_hierarchy_provider(type_hierarchy_provider);
                     // Path a: push this server's settings now that `initialized`
                     // has been sent, so push-model servers are configured even
@@ -5249,6 +5276,19 @@ fn incapable_shared_serves(handle: &ConnectionHandle, root: &Url) -> bool {
             .any(|folder| super::root_markers::same_root_uri(folder.uri.as_str(), root.as_str()))
 }
 
+/// Update a server's advertisement, cloning its name only when first seen.
+fn record_prepare_advertisement(
+    advertisements: &DashMap<String, bool>,
+    server_name: &str,
+    advertised: bool,
+) {
+    match advertisements.get_mut(server_name) {
+        Some(mut entry) => *entry = advertised,
+        None => {
+            advertisements.insert(server_name.to_string(), advertised);
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

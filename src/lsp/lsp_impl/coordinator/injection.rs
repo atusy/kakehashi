@@ -384,10 +384,10 @@ impl InjectionCoordinator {
     }
 
     /// The bridge payload for one resolved virtual document: its text as
-    /// downstream servers must see it. Under a configured prepare peer that is
-    /// the prepared text — or, while the peer has not answered (or failed),
-    /// nothing: the injection is `held`, kept open where it is open but not
-    /// sent. A finished prepare re-runs this pass for the host.
+    /// downstream servers must see it. When the pair has prepare candidates
+    /// that is the prepared text — or, while the peer has not answered (or
+    /// failed), nothing: the injection is `held`, kept open where it is open
+    /// but not sent. A finished prepare re-runs this pass for the host.
     fn prepared_bridge_injection(
         &self,
         settings: &std::sync::Arc<crate::config::WorkspaceSettings>,
@@ -415,6 +415,10 @@ impl InjectionCoordinator {
         };
         let lookup = self.bridge.prepared_document_now(&target, input);
         (injection.content, injection.held) = match lookup {
+            // No candidate prepares it: sent as is, like a pair without one.
+            crate::lsp::bridge::PrepareLookup::Ready(prepared) if prepared.map.is_none() => {
+                return injection;
+            }
             crate::lsp::bridge::PrepareLookup::Ready(prepared) => {
                 let text = prepared.text.clone();
                 injection.prepared = Some(prepared);
