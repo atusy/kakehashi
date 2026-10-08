@@ -167,6 +167,10 @@ pub(crate) fn advertise_routing_for_test(handle: &ConnectionHandle) {
     handle.set_bridge_routing(true);
 }
 
+pub(crate) fn advertise_prepare_for_test(handle: &ConnectionHandle, advertised: bool) {
+    handle.set_virtual_document_prepare(advertised);
+}
+
 pub(in crate::lsp::bridge) async fn create_handle_accepting_textless_did_save(
     key: ConnectionKey,
 ) -> Arc<ConnectionHandle> {

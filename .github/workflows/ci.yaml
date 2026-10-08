@@ -50,6 +50,27 @@ jobs:
           e2e_code_lens_resolve:: e2e_lsp_lua_document_link:: e2e_resolve_reconnect::
           --test-threads=2
 
+  prepare-e2e:
+    name: Prepare E2E
+    runs-on: ubuntu-latest
+    # A hung test otherwise holds the runner for the 6-hour default.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      # The virtual-document prepare peer under test is tsudoi-language-server,
+      # which runs on Deno.
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      # Download the pinned package before the tests: a cold download slower
+      # than the bridge's startup deadline would fail every test. Keep the
+      # specifier in sync with `TSUDOI` in the test module.
+      - run: deno cache npm:@atusy/tsudoi-language-server@0.1.0-alpha.2/cli
+      - run: "cargo test --features e2e --test e2e e2e_virtual_document_prepare::"
+        env:
+          # Fail instead of skipping when Deno is missing.
+          KAKEHASHI_E2E_REQUIRE_DENO: "1"
+
   fmt:
     name: Format
     runs-on: ubuntu-latest

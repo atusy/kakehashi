@@ -94,6 +94,28 @@ impl Kakehashi {
                             &host_url,
                             &envelope.region_id,
                         )?;
+                        // A prepared document cannot be resent from here (this
+                        // would sync the unprepared text) nor its item translated
+                        // back through an envelope; leave the item unresolved.
+                        // (Settings decide too: right after a peer is retargeted,
+                        // the registry has no entry yet while servers still hold
+                        // the old peer's text.)
+                        if !matches!(
+                            self.bridge.prepared_state(
+                                &host_url,
+                                &region.injection_language,
+                                &envelope.region_id,
+                                &region.virtual_content,
+                            ),
+                            crate::lsp::bridge::PreparedState::Unprepared
+                        ) || self
+                            .document_language(&host_url)
+                            .is_some_and(|host_language| {
+                                self.prepares(&host_language, &region.injection_language)
+                            })
+                        {
+                            return None;
+                        }
                         let text = std::sync::Arc::from(region.virtual_content.as_str());
                         let (offset, end, contiguous, language) = resolved_region_geometry(region);
                         if !completion_geometry_matches(envelope, &offset, contiguous, &language) {
@@ -183,6 +205,11 @@ fn completion_geometry_matches(
         // grow with the region and are read live for translation.
         && produced_at.line() == live_offset.line()
         && produced_at.columns().first() == live_offset.columns().first()
+        // An envelope cannot carry a prepared document's map, so its item
+        // cannot be translated back — neither while the region is prepared
+        // nor after it was: refuse as stale.
+        && live_offset.prepared().is_none()
+        && !envelope.offset.prepared
         // The region may have been re-routed (a shebang edit under an
         // `unknown` injection) without moving; the item belongs to the
         // language it was produced for.

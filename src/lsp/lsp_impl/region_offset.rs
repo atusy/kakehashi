@@ -141,7 +141,7 @@ impl Kakehashi {
         // server the region now routes to. An envelope with no language
         // (cleared by the client) names no region.
         .is_some_and(|(live_offset, _, _, live_language)| {
-            live_offset == RegionOffset::from(offset) && live_language == injection_language
+            offset.describes(&live_offset) && live_language == injection_language
         })
     }
 }
@@ -161,7 +161,87 @@ pub(super) fn resolve_region_offset(
     host_url: &Url,
     region_id: &str,
 ) -> Option<(RegionOffset, Position, bool, String)> {
-    resolve_region(documents, language, bridge, host_url, region_id).map(resolved_region_geometry)
+    resolve_region_offset_then(documents, language, bridge, host_url, region_id, |_| ())
+        .map(|(geometry, ())| geometry)
+}
+
+/// Whether `connection` holds the text `offset`'s coordinates describe, so
+/// coordinates it sent unprompted (an inbound edit, a showDocument
+/// selection) can be translated with `offset`.
+///
+/// A prepared region's map describes the prepared text the lifecycle pass
+/// sent last, which can still be on its way while the connection holds the
+/// one before. Once anything is prepared, an unprepared region's connection
+/// must likewise hold `virtual_text`: right after a pair loses its peer, it
+/// may still hold the prepared text, whose coordinates the unprepared offset
+/// does not describe.
+pub(super) fn sent_text_held(
+    bridge: &BridgeCoordinator,
+    offset: &RegionOffset,
+    virtual_text: &str,
+    virtual_uri: &str,
+    connection: &crate::lsp::bridge::ConnectionKey,
+) -> bool {
+    let expected = match offset.prepared() {
+        Some(prepared) => prepared.prepared_text(),
+        None if bridge.prepare_ever_used() => virtual_text,
+        None => return true,
+    };
+    bridge.virtual_document_holds(virtual_uri, connection, expected)
+}
+
+/// [`resolve_region_offset`], also returning the virtual text it was built
+/// for.
+pub(super) fn resolve_region_offset_and_text(
+    documents: &DocumentStore,
+    language: &Arc<LanguageCoordinator>,
+    bridge: &BridgeCoordinator,
+    host_url: &Url,
+    region_id: &str,
+) -> Option<((RegionOffset, Position, bool, String), String)> {
+    resolve_region_offset_then(
+        documents,
+        language,
+        bridge,
+        host_url,
+        region_id,
+        |resolved| resolved.virtual_content.clone(),
+    )
+}
+
+fn resolve_region_offset_then<T>(
+    documents: &DocumentStore,
+    language: &Arc<LanguageCoordinator>,
+    bridge: &BridgeCoordinator,
+    host_url: &Url,
+    region_id: &str,
+    extract: impl FnOnce(&ResolvedInjection) -> T,
+) -> Option<((RegionOffset, Position, bool, String), T)> {
+    let resolved = resolve_region(documents, language, bridge, host_url, region_id)?;
+    // Downstream coordinates are in the document the servers were sent: a
+    // prepared one carries its map, and one whose prepared form is unknown
+    // cannot be translated at all.
+    let prepared = match bridge.prepared_state(
+        host_url,
+        &resolved.injection_language,
+        region_id,
+        &resolved.virtual_content,
+    ) {
+        crate::lsp::bridge::PreparedState::Unprepared => None,
+        crate::lsp::bridge::PreparedState::Prepared(map) => map,
+        crate::lsp::bridge::PreparedState::Unavailable => return None,
+    };
+    let extracted = extract(&resolved);
+    let (offset, region_end, contiguous, injection_language) = resolved_region_geometry(resolved);
+    Some((
+        (
+            offset.with_prepared(prepared),
+            region_end,
+            contiguous,
+            injection_language,
+        ),
+        extracted,
+    ))
 }
 
 /// Resolve geometry and content from the same current snapshot.
@@ -242,6 +322,7 @@ mod tests {
             virtual_content: "x".to_string(),
             line_column_offsets: vec![3],
             contiguous: true,
+            gaps: Default::default(),
         };
 
         let (_, region_end, _, _) = resolved_region_geometry(resolved);

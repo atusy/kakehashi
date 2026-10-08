@@ -252,6 +252,8 @@ mod tests {
 
         let host_uri = Url::parse("file:///test/save.md").unwrap();
         let injection = BridgeInjection {
+            held: false,
+            prepared: None,
             language: "lua".to_string(),
             region_id: ulid::Ulid::generate().to_string(),
             content: "print(1)".to_string(),

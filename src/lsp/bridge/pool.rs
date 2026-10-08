@@ -16,6 +16,7 @@ mod connection_key;
 mod connection_state;
 mod crash_recovery;
 mod document_tracker;
+pub(crate) use document_tracker::content_fingerprint;
 mod dynamic_capability_registry;
 mod execute;
 mod handshake;
@@ -589,6 +590,15 @@ pub struct LanguageServerPool {
     inbound_request_registry: super::InboundRequestRegistry,
     /// Palette command name → origin server (#628 palette-fired executeCommand).
     command_origins: Arc<CommandOriginRegistry>,
+    /// Some virtual document was prepared: from then on a document's text
+    /// a server holds can be prepared or not, and a request must check it is
+    /// the one its coordinates describe (see `wait_for_prepared_sync`).
+    prepare_used: AtomicBool,
+    /// Whether each server (by name) advertised
+    /// `experimental.kakehashi.virtualDocumentPrepare` in its last handshake,
+    /// so a (host, injection) pair none of whose candidates prepares is not
+    /// held back on each revision to find that out again.
+    prepare_advertisements: Arc<DashMap<String, bool>>,
 }
 
 impl Default for LanguageServerPool {
@@ -661,7 +671,33 @@ impl LanguageServerPool {
             client_progress_registry: Arc::new(super::ClientProgressRegistry::new()),
             inbound_request_registry: super::InboundRequestRegistry::default(),
             command_origins: Arc::new(CommandOriginRegistry::default()),
+            prepare_used: AtomicBool::new(false),
+            prepare_advertisements: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Note that a virtual document is being prepared (see `prepare_used`).
+    pub(crate) fn note_prepare_used(&self) {
+        self.prepare_used.store(true, Ordering::Release);
+    }
+
+    /// Record whether `server_name` advertises
+    /// `kakehashi/virtualDocument/prepare` (its last handshake, or a
+    /// `MethodNotFound` answer since).
+    pub(crate) fn record_prepare_advertisement(&self, server_name: &str, advertised: bool) {
+        record_prepare_advertisement(&self.prepare_advertisements, server_name, advertised);
+    }
+
+    /// Whether `server_name` advertised `kakehashi/virtualDocument/prepare`
+    /// in its last handshake; `None` before it has had one.
+    pub(crate) fn prepare_advertisement(&self, server_name: &str) -> Option<bool> {
+        self.prepare_advertisements
+            .get(server_name)
+            .map(|advertised| *advertised)
+    }
+
+    fn prepare_used(&self) -> bool {
+        self.prepare_used.load(Ordering::Acquire)
     }
 
     /// What is known about the raw palette command names downstream servers have
@@ -2001,6 +2037,43 @@ impl LanguageServerPool {
         self.document_tracker
             .document_version(virtual_uri, connection_key)
             .await
+    }
+
+    /// Whether the live connection `connection_id` was last sent text with
+    /// `fingerprint` for `virtual_uri`; `false` when no live connection has
+    /// that id.
+    pub(super) async fn connection_holds_fingerprint(
+        &self,
+        connection_id: super::ProgressConnectionId,
+        virtual_uri: &str,
+        fingerprint: u64,
+    ) -> bool {
+        let key = {
+            let connections = self.connections.lock().await;
+            connections
+                .values()
+                .find(|handle| handle.connection_id() == Some(connection_id))
+                .map(|handle| handle.key().clone())
+        };
+        key.is_some_and(|key| {
+            self.document_tracker
+                .sent_fingerprint_is(virtual_uri, &key, fingerprint)
+        })
+    }
+
+    /// Whether `content` is the text last sent for `virtual_uri` on
+    /// `connection_key`.
+    pub(super) fn virtual_document_holds(
+        &self,
+        virtual_uri: &str,
+        connection_key: &ConnectionKey,
+        content: &str,
+    ) -> bool {
+        self.document_tracker.sent_fingerprint_is(
+            virtual_uri,
+            connection_key,
+            document_tracker::content_fingerprint(content),
+        )
     }
 
     /// Find ALL connections (`(server, root)` keys) that have opened a given
@@ -4393,6 +4466,7 @@ impl LanguageServerPool {
         let advertise_configuration = server_config.settings.is_some();
         let handle_for_handshake = Arc::clone(&handle);
         let server_name_for_log = server_name.to_string();
+        let prepare_advertisements = Arc::clone(&self.prepare_advertisements);
         let command_origins = Arc::clone(&self.command_origins);
         let command_registration_key = connection_key.clone();
         let upstream_request_tx = self.upstream_request_tx.clone();
@@ -4419,7 +4493,7 @@ impl LanguageServerPool {
 
             // Handle initialization result - transition state
             match init_result {
-                Ok(Ok((capabilities, bridge_routing, type_hierarchy_provider))) => {
+                Ok(Ok((capabilities, extensions, type_hierarchy_provider))) => {
                     // Init succeeded - store capabilities and transition to Ready
                     log::info!(
                         target: "kakehashi::bridge::init",
@@ -4434,7 +4508,14 @@ impl LanguageServerPool {
                         .as_ref()
                         .map(|options| options.commands.clone());
                     handle_for_handshake.set_server_capabilities(capabilities);
-                    handle_for_handshake.set_bridge_routing(bridge_routing);
+                    handle_for_handshake.set_bridge_routing(extensions.bridge_routing);
+                    handle_for_handshake
+                        .set_virtual_document_prepare(extensions.virtual_document_prepare);
+                    record_prepare_advertisement(
+                        &prepare_advertisements,
+                        &server_name_for_log,
+                        extensions.virtual_document_prepare,
+                    );
                     handle_for_handshake.set_type_hierarchy_provider(type_hierarchy_provider);
                     // Path a: push this server's settings now that `initialized`
                     // has been sent, so push-model servers are configured even
@@ -5195,6 +5276,19 @@ fn incapable_shared_serves(handle: &ConnectionHandle, root: &Url) -> bool {
             .any(|folder| super::root_markers::same_root_uri(folder.uri.as_str(), root.as_str()))
 }
 
+/// Update a server's advertisement, cloning its name only when first seen.
+fn record_prepare_advertisement(
+    advertisements: &DashMap<String, bool>,
+    server_name: &str,
+    advertised: bool,
+) {
+    match advertisements.get_mut(server_name) {
+        Some(mut entry) => *entry = advertised,
+        None => {
+            advertisements.insert(server_name.to_string(), advertised);
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8101,6 +8195,8 @@ mod tests {
         // ls-bridge-message-ordering: No need to hold a writer lock - sends are channel-based and non-blocking
         use crate::lsp::bridge::coordinator::BridgeInjection;
         let injections = vec![BridgeInjection {
+            held: false,
+            prepared: None,
             language: "lua".to_string(),
             region_id: TEST_ULID_LUA_0.to_string(),
             content: "local x = 42".to_string(),
@@ -8194,6 +8290,8 @@ mod tests {
             &host_uri,
             1,
             &[super::super::coordinator::BridgeInjection {
+                held: false,
+                prepared: None,
                 language: "lua".to_string(),
                 region_id: TEST_ULID_LUA_0.to_string(),
                 content: "print('current')".to_string(),
@@ -8232,6 +8330,8 @@ mod tests {
             &host_uri,
             1,
             &[super::super::coordinator::BridgeInjection {
+                held: false,
+                prepared: None,
                 language: "lua".into(),
                 region_id: TEST_ULID_LUA_0.into(),
                 content: "print('previous')".into(),
@@ -8382,6 +8482,8 @@ mod tests {
                     revision: None,
                 },
                 vec![super::super::coordinator::BridgeInjection {
+                    held: false,
+                    prepared: None,
                     language: "lua".to_string(),
                     region_id: TEST_ULID_LUA_0.to_string(),
                     content: "print('old lifetime')".to_string(),
@@ -8429,6 +8531,8 @@ mod tests {
                     revision: None,
                 },
                 vec![super::super::coordinator::BridgeInjection {
+                    held: false,
+                    prepared: None,
                     language: "lua".to_string(),
                     region_id: TEST_ULID_LUA_0.to_string(),
                     content: "print('old lifetime')".to_string(),
@@ -8452,6 +8556,8 @@ mod tests {
             &host_uri,
             1,
             &[super::super::coordinator::BridgeInjection {
+                held: false,
+                prepared: None,
                 language: "lua".to_string(),
                 region_id: TEST_ULID_LUA_0.to_string(),
                 content: "print('cached')".to_string(),
@@ -11183,6 +11289,8 @@ mod tests {
                     &host_uri,
                     1,
                     &[crate::lsp::bridge::coordinator::BridgeInjection {
+                        held: false,
+                        prepared: None,
                         language: "lua".to_string(),
                         region_id: TEST_ULID_LUA_0.to_string(),
                         content: "print('new')".to_string(),
@@ -11256,6 +11364,8 @@ mod tests {
 
         // Forward didChange
         let injections = vec![crate::lsp::bridge::coordinator::BridgeInjection {
+            held: false,
+            prepared: None,
             language: "lua".to_string(),
             region_id: TEST_ULID_LUA_0.to_string(),
             content: "print('hello')".to_string(),
@@ -11328,6 +11438,8 @@ mod tests {
 
         // Forward didChange
         let injections = vec![crate::lsp::bridge::coordinator::BridgeInjection {
+            held: false,
+            prepared: None,
             language: "lua".to_string(),
             region_id: TEST_ULID_LUA_0.to_string(),
             content: "print('hello')".to_string(),

@@ -1,0 +1,2033 @@
+//! Cache and single flight for `kakehashi/virtualDocument/prepare`.
+//!
+//! Every site that hands a virtual document to downstream servers — the
+//! didOpen/didChange pass, request fan-out, push-diagnostic translation —
+//! looks its prepared form up here by the exact virtual text and gaps it
+//! holds, so a site can never pair one text with another text's map. One
+//! answer per virtual document revision is shared by all of them.
+//!
+//! The lifecycle pass must not wait for the peer under the document's edit
+//! lock, so it only looks up: on a miss it starts the request and holds the
+//! document back, and the finished request asks for the host to be synced
+//! again. Requests are already asynchronous and wait for the answer.
+//!
+//! Every attempt runs on its own task, so a cancelled request cannot strand
+//! one half-done, and all waiters share it. An attempt that gets no answer
+//! from the peer it chose (crashing, timing out) is retried with backoff by
+//! syncing the host again; one that gets an unusable answer is final for
+//! that revision, as is one that finds no candidate to ask (the document is
+//! then sent as is).
+
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::Duration;
+
+use dashmap::DashMap;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::time::Instant;
+use url::Url;
+
+use super::ResolvedServerConfig;
+use super::pool::LanguageServerPool;
+use super::protocol::{
+    PrepareHostTextDocument, PrepareParams, PrepareTextDocument, PreparedDocument,
+    VirtualDocumentUri, VirtualLayout, apply_prepare_result,
+};
+use crate::language::injection::VirtualGap;
+
+/// The servers that may prepare one (host, injection) pair's virtual
+/// documents, in priority order: the first of them advertising the request
+/// prepares each revision (the `preferred` strategy).
+#[derive(Debug, Clone)]
+pub(crate) struct PrepareTarget {
+    pub(crate) candidates: Arc<[ResolvedServerConfig]>,
+}
+
+/// One virtual document to prepare.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PrepareInput<'a> {
+    pub(crate) host_uri: &'a Url,
+    pub(crate) host_language: &'a str,
+    pub(crate) injection_language: &'a str,
+    pub(crate) region_id: &'a str,
+    pub(crate) virtual_text: &'a str,
+    pub(crate) gaps: &'a [VirtualGap],
+}
+
+/// What a lookup found without waiting.
+#[derive(Debug, Clone)]
+pub(crate) enum PrepareLookup {
+    /// The prepared document to send.
+    Ready(Arc<PreparedDocument>),
+    /// The peer could not prepare this revision: send nothing.
+    Failed,
+    /// The answer is not in yet: send nothing now; the host is synced again
+    /// when it arrives.
+    Pending,
+}
+
+/// `None` is a prepare the peer answered unusably.
+type Outcome = Option<Arc<PreparedDocument>>;
+
+/// One region's prepared document: the generation the lifecycle pass works
+/// on, and the one before it.
+///
+/// Keeping the previous generation lets a request built on slightly older
+/// text find its answer without evicting the current one (which would
+/// restart the lifecycle pass's attempt and hold the document longer), and
+/// lets a lookup by the text a server still holds succeed while the next
+/// text is being prepared.
+struct Entry {
+    /// The region this entry is for (the map key is their hash).
+    host_uri: String,
+    injection_language: String,
+    region_id: String,
+    /// The host language and candidates the entry was prepared for, so a
+    /// settings change that retargets the pair can drop it.
+    host_language: String,
+    candidates: Arc<[ResolvedServerConfig]>,
+    current: Generation,
+    previous: Option<Generation>,
+}
+
+impl Entry {
+    fn is(&self, host_uri: &str, injection_language: &str, region_id: &str) -> bool {
+        self.host_uri == host_uri
+            && self.injection_language == injection_language
+            && self.region_id == region_id
+    }
+
+    fn generations(&self) -> impl Iterator<Item = &Generation> {
+        std::iter::once(&self.current).chain(&self.previous)
+    }
+}
+
+/// The prepared answer for one input (text, gaps, peer).
+#[derive(Clone)]
+struct Generation {
+    /// Identity of the input (text, gaps, peer, host language).
+    key: u64,
+    /// The `textDocument.version` sent for this input.
+    revision: i32,
+    cell: Arc<Cell>,
+}
+
+/// The answer for one revision, and the attempts to get it.
+#[derive(Default)]
+struct Cell {
+    /// Set once an attempt got an answer: `Some` prepared, `None` unusable.
+    outcome: std::sync::OnceLock<Outcome>,
+    /// An attempt is running.
+    in_flight: AtomicBool,
+    /// Attempts that got no answer, for the backoff.
+    misses: AtomicU32,
+    /// No new attempt before this, after a miss.
+    retry_at: std::sync::Mutex<Option<Instant>>,
+    /// Bumped after every attempt, answered or not.
+    attempts: tokio::sync::watch::Sender<u32>,
+}
+
+impl Cell {
+    fn lookup(&self) -> Option<PrepareLookup> {
+        self.outcome.get().map(|outcome| match outcome {
+            Some(prepared) => PrepareLookup::Ready(Arc::clone(prepared)),
+            None => PrepareLookup::Failed,
+        })
+    }
+
+    fn backing_off(&self) -> bool {
+        self.retry_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some_and(|retry_at| Instant::now() < retry_at)
+    }
+}
+
+/// Ends an attempt however its task ends — a panic included — so waiters
+/// wake and the next lookup may start another.
+struct AttemptEnd(Arc<Cell>);
+
+impl Drop for AttemptEnd {
+    fn drop(&mut self) {
+        self.0.in_flight.store(false, Ordering::Release);
+        self.0.attempts.send_modify(|attempts| *attempts += 1);
+    }
+}
+
+/// A host to sync again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Resync {
+    pub(crate) host_uri: Url,
+    /// A held document became ready (rather than a retry being due, or an
+    /// answer coming back unusable), so the host's diagnostics should be
+    /// collected again too.
+    pub(crate) ready: bool,
+}
+
+/// How a virtual document reached downstream servers, as far as the registry
+/// knows from its text alone.
+#[derive(Debug, Clone)]
+pub(crate) enum PreparedState {
+    /// Never prepared: sent as is.
+    Unprepared,
+    /// Sent prepared, with this map.
+    Prepared(Option<Arc<super::protocol::PreparedMap>>),
+    /// Prepared, but servers were sent another text (or none yet):
+    /// downstream coordinates for this text are unknown.
+    Unavailable,
+}
+
+type Entries = DashMap<u64, Entry>;
+
+/// The text the lifecycle pass last sent for a region, once anything is
+/// prepared. Kept apart from [`Entry`], which a settings change drops: the
+/// text a server holds does not change with the settings, and the next send
+/// must still be compared with it.
+struct Sent {
+    host_uri: String,
+    injection_language: String,
+    region_id: String,
+    /// The answer sent, or `None` for the virtual text sent unprepared. An
+    /// answer's map is the one the server's coordinates follow, which its
+    /// text alone does not identify (two answers may differ only in where a
+    /// gap's replacement maps back to).
+    prepared: Option<Arc<PreparedDocument>>,
+    /// Fingerprint of the text sent, as connections record theirs.
+    fingerprint: u64,
+    /// Identity of the virtual text the sent text was made from (itself,
+    /// when unprepared): a stored region translates through this send only
+    /// while its text is that one.
+    virtual_key: u64,
+    /// Changes whenever the text sent replaces one in other coordinates, so
+    /// a push admitted against the text before can tell it was replaced
+    /// while it was being recorded.
+    epoch: u64,
+}
+
+impl Sent {
+    fn is(&self, host_uri: &str, region_id: &str) -> bool {
+        self.host_uri == host_uri && self.region_id == region_id
+    }
+}
+
+pub(crate) struct PrepareRegistry {
+    /// Keyed by a hash of (host URI, injection language, region id), so a
+    /// lookup allocates nothing; the entry holds the identity it checks.
+    entries: Arc<Entries>,
+    /// Keyed by a hash of (host URI, region id): a region is sent under one
+    /// language at a time, and a push names only its region.
+    sent: DashMap<u64, Sent>,
+    /// Whether anything was ever prepared: lets the lookups every bridged
+    /// region makes per edit skip the map when no pair has a prepare peer.
+    ever_used: AtomicBool,
+    /// Source of `textDocument.version`: shared by all documents, so a
+    /// document forgotten and prepared again (a settings change, a reopen)
+    /// never repeats a version the peer saw.
+    next_revision: std::sync::atomic::AtomicI32,
+    /// Source of [`Sent::epoch`], shared so a region forgotten and recorded
+    /// again never repeats one.
+    next_epoch: std::sync::atomic::AtomicU64,
+    resync_tx: UnboundedSender<Resync>,
+    resync_rx: std::sync::Mutex<Option<UnboundedReceiver<Resync>>>,
+}
+
+impl std::fmt::Debug for PrepareRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrepareRegistry")
+            .field("entries", &self.entries.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for PrepareRegistry {
+    fn default() -> Self {
+        let (resync_tx, resync_rx) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            entries: Arc::default(),
+            sent: DashMap::new(),
+            ever_used: AtomicBool::new(false),
+            next_revision: std::sync::atomic::AtomicI32::new(1),
+            next_epoch: std::sync::atomic::AtomicU64::new(1),
+            resync_tx,
+            resync_rx: std::sync::Mutex::new(Some(resync_rx)),
+        }
+    }
+}
+
+impl PrepareRegistry {
+    /// Whether any document was ever prepared: until then every virtual
+    /// document was sent as is.
+    pub(crate) fn ever_used(&self) -> bool {
+        self.ever_used.load(Ordering::Acquire)
+    }
+
+    /// Queue `resync` again after `delay` — for a pass whose sends failed,
+    /// which nothing else would repeat. A shutdown drops it.
+    pub(crate) fn requeue_resync(&self, resync: Resync, delay: Duration) {
+        let resync_tx = self.resync_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = resync_tx.send(resync);
+        });
+    }
+
+    /// Hosts to sync again: a held-back virtual document became ready, or
+    /// an attempt that got no answer finished its retry backoff. Taken once
+    /// by the server loop.
+    pub(crate) fn take_resync_rx(&self) -> Option<UnboundedReceiver<Resync>> {
+        self.resync_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// Look up for the lifecycle pass without waiting; on a miss, start an
+    /// attempt in the background and report [`PrepareLookup::Pending`].
+    pub(crate) fn lookup_or_start(
+        &self,
+        pool: &Arc<LanguageServerPool>,
+        target: &PrepareTarget,
+        input: PrepareInput<'_>,
+    ) -> PrepareLookup {
+        self.lookup_now(pool, target, input, Holder::LifecyclePass)
+    }
+
+    /// [`Self::lookup_or_start`] for a request that cannot wait: like
+    /// [`Self::prepare`], it never takes the generation the lifecycle pass
+    /// holds the document on.
+    pub(crate) fn lookup_or_start_for_request(
+        &self,
+        pool: &Arc<LanguageServerPool>,
+        target: &PrepareTarget,
+        input: PrepareInput<'_>,
+    ) -> PrepareLookup {
+        self.lookup_now(pool, target, input, Holder::Request)
+    }
+
+    fn lookup_now(
+        &self,
+        pool: &Arc<LanguageServerPool>,
+        target: &PrepareTarget,
+        input: PrepareInput<'_>,
+        holder: Holder,
+    ) -> PrepareLookup {
+        pool.note_prepare_used();
+        let (cell, revision) = self.cell(target, input, holder);
+        if let Some(found) = cell.lookup() {
+            return found;
+        }
+        self.start(&cell, pool, target, input, revision);
+        PrepareLookup::Pending
+    }
+
+    /// Wait for the prepared document, sharing an attempt already running.
+    /// `None` when this revision has no prepared document (yet): the peer
+    /// answered unusably, or the attempt got no answer, or the last one did
+    /// not and the retry is still backing off.
+    pub(crate) async fn prepare(
+        &self,
+        pool: &Arc<LanguageServerPool>,
+        target: &PrepareTarget,
+        input: PrepareInput<'_>,
+    ) -> Outcome {
+        self.prepare_or_miss(pool, target, input).await.ok()
+    }
+
+    /// [`Self::prepare`], telling why there is no prepared document: `true`
+    /// when no answer is in (yet) — the attempt got none, or a retry is
+    /// backing off — and a later one may bring it; `false` when the peer's
+    /// answer was unusable, which is final for this revision.
+    pub(crate) async fn prepare_or_miss(
+        &self,
+        pool: &Arc<LanguageServerPool>,
+        target: &PrepareTarget,
+        input: PrepareInput<'_>,
+    ) -> Result<Arc<PreparedDocument>, bool> {
+        pool.note_prepare_used();
+        let (cell, revision) = self.cell(target, input, Holder::Request);
+        let settled = |cell: &Cell| match cell.outcome.get() {
+            Some(Some(prepared)) => Ok(Arc::clone(prepared)),
+            Some(None) => Err(false),
+            None => Err(true),
+        };
+        if cell.outcome.get().is_some() {
+            return settled(&cell);
+        }
+        // Subscribe before starting, so the attempt's end cannot be missed.
+        let mut attempts = cell.attempts.subscribe();
+        if !self.start(&cell, pool, target, input, revision)
+            && !cell.in_flight.load(Ordering::Acquire)
+        {
+            // Backing off after a miss: do not queue another attempt per
+            // request, each waiting out its own timeouts.
+            return settled(&cell);
+        }
+        // The attempt ends (answered or not) with a bump.
+        let _ = attempts.changed().await;
+        settled(&cell)
+    }
+
+    /// Whether any of `host_uri`'s documents the lifecycle pass works on
+    /// still waits for its answer (one is running, or a retry is due).
+    pub(crate) fn host_has_pending(&self, host_uri: &Url) -> bool {
+        self.ever_used.load(Ordering::Acquire)
+            && self.entries.iter().any(|entry| {
+                entry.host_uri == host_uri.as_str() && entry.current.cell.outcome.get().is_none()
+            })
+    }
+
+    /// Start an attempt unless one is running, an answer is in, or a miss is
+    /// backing off. `true` when this call started it.
+    fn start(
+        &self,
+        cell: &Arc<Cell>,
+        pool: &Arc<LanguageServerPool>,
+        target: &PrepareTarget,
+        input: PrepareInput<'_>,
+        revision: i32,
+    ) -> bool {
+        if cell.outcome.get().is_some() || cell.backing_off() {
+            return false;
+        }
+        if cell.in_flight.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        // An attempt that ended between the checks above and the claim
+        // (it sets its outcome or backoff before releasing `in_flight`)
+        // still decides: no second request for an answered revision, and
+        // none inside the backoff that attempt just set.
+        if cell.outcome.get().is_some() || cell.backing_off() {
+            // Released like an attempt that ran: a request that saw the
+            // claim waits for the bump.
+            drop(AttemptEnd(Arc::clone(cell)));
+            return false;
+        }
+        let end = AttemptEnd(Arc::clone(cell));
+        let entries = Arc::clone(&self.entries);
+        let region = region_hash(
+            input.host_uri.as_str(),
+            input.injection_language,
+            input.region_id,
+        );
+        let pool = Arc::clone(pool);
+        let target = target.clone();
+        let job = PrepareJob::from(input);
+        let resync_tx = self.resync_tx.clone();
+        tokio::spawn(async move {
+            let cell = Arc::clone(&end.0);
+            // Only the generation the lifecycle pass works on holds a
+            // document back; an older one's answer re-syncs nothing.
+            let current = |entries: &Entries| {
+                entries
+                    .get(&region)
+                    .is_some_and(|entry| Arc::ptr_eq(&entry.current.cell, &cell))
+            };
+            // A settings change or close that dropped this cell's entry
+            // revokes the attempt: it must not start (or replace) a peer
+            // the settings no longer name.
+            let admitted = || {
+                entries.get(&region).is_some_and(|entry| {
+                    entry
+                        .generations()
+                        .any(|generation| Arc::ptr_eq(&generation.cell, &cell))
+                })
+            };
+            match run(&pool, &target, &job, revision, &admitted).await {
+                Ok(outcome) => {
+                    let prepared = outcome.is_some();
+                    let _ = cell.outcome.set(outcome);
+                    // An unusable answer re-syncs too, unready: nothing more
+                    // is coming for this revision, which a pull owed a
+                    // refresh after waiting on it must learn.
+                    if current(&entries) {
+                        // The receiver is gone only at shutdown.
+                        let _ = resync_tx.send(Resync {
+                            host_uri: job.host_uri.clone(),
+                            ready: prepared,
+                        });
+                    }
+                }
+                Err(()) => {
+                    let misses = cell.misses.fetch_add(1, Ordering::AcqRel) + 1;
+                    let delay = retry_delay(misses);
+                    *cell
+                        .retry_at
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(Instant::now() + delay);
+                    // Nothing else would look the document up again before
+                    // the next edit; sync the host once the backoff ends,
+                    // unless newer text has taken over by then.
+                    let host_uri = job.host_uri.clone();
+                    let cell = Arc::clone(&cell);
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        let still_current = entries
+                            .get(&region)
+                            .is_some_and(|entry| Arc::ptr_eq(&entry.current.cell, &cell));
+                        if still_current {
+                            let _ = resync_tx.send(Resync {
+                                host_uri,
+                                ready: false,
+                            });
+                        }
+                    });
+                }
+            }
+            drop(end);
+        });
+        true
+    }
+
+    /// How the document with this exact virtual text was sent, for paths
+    /// that translate downstream coordinates without the settings that
+    /// select a prepare peer (resolve gates, inbound edits, pushes).
+    ///
+    /// Decided by what the lifecycle pass last sent alone, never by the
+    /// cached generations: an answer that is in but not sent yet (the next
+    /// text's, or one held back) describes nothing servers hold, and the
+    /// generation an answer came from may be evicted or the entry pruned
+    /// while servers still hold it. The sent answer stays valid for any input
+    /// with the same virtual text — inputs differing only in their gaps share
+    /// the gaps' positions, which the virtual text masks.
+    pub(crate) fn state(
+        &self,
+        host_uri: &Url,
+        injection_language: &str,
+        region_id: &str,
+        virtual_text: &str,
+    ) -> PreparedState {
+        if !self.ever_used.load(Ordering::Acquire) {
+            return PreparedState::Unprepared;
+        }
+        let host = host_uri.as_str();
+        let Some(sent) = self.sent.get(&sent_key(host, region_id)).filter(|sent| {
+            sent.is(host, region_id) && sent.injection_language == injection_language
+        }) else {
+            // Nothing recorded since anything was prepared: unprepared,
+            // unless a document is being prepared and held — then servers
+            // hold nothing of it.
+            return if self
+                .entries
+                .contains_key(&region_hash(host, injection_language, region_id))
+            {
+                PreparedState::Unavailable
+            } else {
+                PreparedState::Unprepared
+            };
+        };
+        if sent.virtual_key != text_key(virtual_text) {
+            return PreparedState::Unavailable;
+        }
+        // The revision the lifecycle pass works on came back unusable: the
+        // document is held, and a failed document is not bridged at all —
+        // even when only its gaps changed, so that the text servers hold
+        // still matches.
+        if self
+            .entries
+            .get(&region_hash(host, injection_language, region_id))
+            .is_some_and(|entry| {
+                entry.is(host, injection_language, region_id)
+                    && matches!(entry.current.cell.outcome.get(), Some(None))
+            })
+        {
+            return PreparedState::Unavailable;
+        }
+        match &sent.prepared {
+            Some(prepared) => PreparedState::Prepared(prepared.map.clone()),
+            None => PreparedState::Unprepared,
+        }
+    }
+
+    /// Keep only the entries `keep(host language, injection language,
+    /// candidates)` accepts — after a settings change, those whose pair
+    /// still lists the same servers with the same launch configs. With `drop_unusable`, answers cached as final go too: the
+    /// change may have fixed what made them unusable (a peer's command,
+    /// say), and the caller guarantees a pass that asks again — a dropped
+    /// entry reads as unprepared until then, which would misread a server
+    /// still holding an older prepared text. A dropped entry otherwise reads
+    /// as unprepared until prepared again.
+    pub(crate) fn retain(
+        &self,
+        keep: impl Fn(&str, &str, &[ResolvedServerConfig]) -> bool,
+        drop_unusable: bool,
+    ) {
+        self.entries.retain(|_, entry| {
+            keep(
+                &entry.host_language,
+                &entry.injection_language,
+                &entry.candidates,
+            ) && !(drop_unusable && matches!(entry.current.cell.outcome.get(), Some(None)))
+        });
+    }
+
+    /// Note that the lifecycle pass sends `prepared` for a region. `true`
+    /// unless its text is the prepared text sent last: diagnostics a server
+    /// pushed for any other text — an earlier prepared one, or the unprepared
+    /// one sent while the pair had no peer — are in coordinates no current
+    /// map describes.
+    pub(crate) fn note_sent(
+        &self,
+        host_uri: &Url,
+        injection_language: &str,
+        region_id: &str,
+        prepared: &Arc<PreparedDocument>,
+    ) -> bool {
+        let fingerprint = super::pool::content_fingerprint(&prepared.text);
+        // Every prepared document carries its map, built for its virtual
+        // text; one without would match no stored text.
+        let virtual_key = prepared
+            .map
+            .as_ref()
+            .map_or(0, |map| text_key(map.virtual_text()));
+        self.record_sent(
+            host_uri,
+            injection_language,
+            region_id,
+            Some(prepared),
+            fingerprint,
+            virtual_key,
+        )
+    }
+
+    /// Note that the lifecycle pass sends a region's virtual text unprepared
+    /// (its pair has no peer, or no longer): whatever was prepared for it no
+    /// longer describes it. `true` when a prepared text had been sent for it,
+    /// whose pushed diagnostics no longer describe what is sent now. Nothing
+    /// is recorded until anything is prepared.
+    pub(crate) fn note_unprepared_sent(
+        &self,
+        host_uri: &Url,
+        injection_language: &str,
+        region_id: &str,
+        virtual_text: &str,
+    ) -> bool {
+        if !self.ever_used.load(Ordering::Acquire) {
+            return false;
+        }
+        let host = host_uri.as_str();
+        self.entries.remove_if(
+            &region_hash(host, injection_language, region_id),
+            |_, entry| entry.is(host, injection_language, region_id),
+        );
+        let fingerprint = super::pool::content_fingerprint(virtual_text);
+        self.record_sent(
+            host_uri,
+            injection_language,
+            region_id,
+            None,
+            fingerprint,
+            text_key(virtual_text),
+        )
+    }
+
+    /// The fingerprint of the text last sent for a region, the language it
+    /// was sent under and its epoch, once anything is prepared: a server's
+    /// push for the region is in that text's coordinates only if it holds
+    /// that text.
+    pub(crate) fn sent_fingerprint(
+        &self,
+        host_uri: &Url,
+        region_id: &str,
+    ) -> Option<(u64, String, u64)> {
+        if !self.ever_used.load(Ordering::Acquire) {
+            return None;
+        }
+        let host_uri = host_uri.as_str();
+        self.sent
+            .get(&sent_key(host_uri, region_id))
+            .filter(|sent| sent.is(host_uri, region_id))
+            .map(|sent| {
+                (
+                    sent.fingerprint,
+                    sent.injection_language.clone(),
+                    sent.epoch,
+                )
+            })
+    }
+
+    /// Whether the text last sent for a region under `injection_language`
+    /// was a prepared one. Every prepared send is recorded, so anything else
+    /// — an unprepared record, or none (sent before anything was prepared,
+    /// or nothing sent) — is not.
+    pub(crate) fn sent_prepared(
+        &self,
+        host_uri: &Url,
+        injection_language: &str,
+        region_id: &str,
+    ) -> bool {
+        let host = host_uri.as_str();
+        self.sent
+            .get(&sent_key(host, region_id))
+            .is_some_and(|sent| {
+                sent.is(host, region_id)
+                    && sent.injection_language == injection_language
+                    && sent.prepared.is_some()
+            })
+    }
+
+    /// Forget what was last sent for a region, whose documents were closed:
+    /// servers hold nothing of it any more.
+    pub(crate) fn forget_sent(&self, host_uri: &Url, region_id: &str) {
+        let host = host_uri.as_str();
+        self.sent.remove_if(&sent_key(host, region_id), |_, sent| {
+            sent.is(host, region_id)
+        });
+    }
+
+    /// The epoch of the text last sent for a region (see [`Sent::epoch`]).
+    pub(crate) fn sent_epoch(&self, host_uri: &Url, region_id: &str) -> Option<u64> {
+        let host_uri = host_uri.as_str();
+        self.sent
+            .get(&sent_key(host_uri, region_id))
+            .filter(|sent| sent.is(host_uri, region_id))
+            .map(|sent| sent.epoch)
+    }
+
+    /// Record what is sent for a region; `true` when it replaces a text in
+    /// other coordinates: another prepared one, a prepared one replacing an
+    /// unprepared one (or none), an unprepared one replacing a prepared one,
+    /// or either under another language.
+    fn record_sent(
+        &self,
+        host_uri: &Url,
+        injection_language: &str,
+        region_id: &str,
+        prepared: Option<&Arc<PreparedDocument>>,
+        fingerprint: u64,
+        virtual_key: u64,
+    ) -> bool {
+        let host = host_uri.as_str();
+        let key = sent_key(host, region_id);
+        if let Some(mut sent) = self.sent.get_mut(&key)
+            && sent.is(host, region_id)
+        {
+            let same_language = sent.injection_language == injection_language;
+            let replaced = match (&sent.prepared, prepared) {
+                (Some(previous), Some(prepared)) => {
+                    !same_language
+                        || !Arc::ptr_eq(previous, prepared) && sent.fingerprint != fingerprint
+                }
+                (None, None) => !same_language,
+                _ => true,
+            };
+            if !same_language {
+                sent.injection_language = injection_language.to_string();
+            }
+            sent.prepared = prepared.cloned();
+            sent.fingerprint = fingerprint;
+            sent.virtual_key = virtual_key;
+            if replaced {
+                sent.epoch = self.next_epoch.fetch_add(1, Ordering::Relaxed);
+            }
+            return replaced;
+        }
+        self.sent.insert(
+            key,
+            Sent {
+                host_uri: host.to_string(),
+                injection_language: injection_language.to_string(),
+                region_id: region_id.to_string(),
+                prepared: prepared.cloned(),
+                fingerprint,
+                virtual_key,
+                epoch: self.next_epoch.fetch_add(1, Ordering::Relaxed),
+            },
+        );
+        // Nothing recorded: the first prepared text replaces whatever was
+        // sent before anything was prepared.
+        prepared.is_some()
+    }
+
+    /// Forget one region's document: its pair no longer has a peer, or the
+    /// region itself was replaced or invalidated. `injection_language`
+    /// `None` forgets the region under every language. `true` when a
+    /// prepared text had been sent for it, whose pushed diagnostics no
+    /// longer describe what is sent next.
+    pub(crate) fn forget_region(
+        &self,
+        host_uri: &Url,
+        injection_language: Option<&str>,
+        region_id: &str,
+    ) -> bool {
+        if !self.ever_used.load(Ordering::Acquire) {
+            return false;
+        }
+        let host_uri = host_uri.as_str();
+        match injection_language {
+            Some(language) => {
+                self.entries
+                    .remove_if(&region_hash(host_uri, language, region_id), |_, entry| {
+                        entry.is(host_uri, language, region_id)
+                    });
+                self.sent
+                    .remove_if(&sent_key(host_uri, region_id), |_, sent| {
+                        sent.is(host_uri, region_id) && sent.injection_language == language
+                    })
+                    .is_some_and(|(_, sent)| sent.prepared.is_some())
+            }
+            None => {
+                self.entries
+                    .retain(|_, entry| entry.host_uri != host_uri || entry.region_id != region_id);
+                self.sent
+                    .remove_if(&sent_key(host_uri, region_id), |_, sent| {
+                        sent.is(host_uri, region_id)
+                    })
+                    .is_some_and(|(_, sent)| sent.prepared.is_some())
+            }
+        }
+    }
+
+    /// Forget a replaced region's documents under every language but
+    /// `keep` — the language the region resolves to now, whose document may
+    /// already be preparing.
+    pub(crate) fn forget_region_except(&self, host_uri: &Url, region_id: &str, keep: Option<&str>) {
+        if !self.ever_used.load(Ordering::Acquire) {
+            return;
+        }
+        let host_uri = host_uri.as_str();
+        self.entries.retain(|_, entry| {
+            entry.host_uri != host_uri
+                || entry.region_id != region_id
+                || Some(entry.injection_language.as_str()) == keep
+        });
+        self.sent.retain(|_, sent| {
+            sent.host_uri != host_uri
+                || sent.region_id != region_id
+                || Some(sent.injection_language.as_str()) == keep
+        });
+    }
+
+    /// Forget a closed host's documents.
+    pub(crate) fn forget_host(&self, host_uri: &Url) {
+        self.entries
+            .retain(|_, entry| entry.host_uri != host_uri.as_str());
+        self.sent
+            .retain(|_, sent| sent.host_uri != host_uri.as_str());
+    }
+
+    /// The cell answering `input`: the current or previous generation when
+    /// either matches, else a new current generation (with a new revision)
+    /// that demotes the current one.
+    fn cell(
+        &self,
+        target: &PrepareTarget,
+        input: PrepareInput<'_>,
+        holder: Holder,
+    ) -> (Arc<Cell>, i32) {
+        self.ever_used.store(true, Ordering::Release);
+        let key = input_key(target, input);
+        let host_uri = input.host_uri.as_str();
+        let fresh = || Generation {
+            key,
+            revision: self.revision(),
+            cell: Arc::default(),
+        };
+        let region = region_hash(host_uri, input.injection_language, input.region_id);
+        let mut entry = self.entries.entry(region).or_insert_with(|| Entry {
+            host_uri: host_uri.to_string(),
+            injection_language: input.injection_language.to_string(),
+            region_id: input.region_id.to_string(),
+            host_language: input.host_language.to_string(),
+            candidates: Arc::clone(&target.candidates),
+            current: fresh(),
+            previous: None,
+        });
+        if !entry.is(host_uri, input.injection_language, input.region_id)
+            // The same servers launched differently answer differently, and
+            // the configs are no part of the input key: a lookup made under
+            // other settings than the entry's (one still in flight across a
+            // settings change, which may even have recreated the entry after
+            // the prune) must not see its answers, and its own must not
+            // outlive it.
+            || !same_candidates(&entry.candidates, &target.candidates)
+        {
+            if holder == Holder::Request
+                && entry.is(host_uri, input.injection_language, input.region_id)
+            {
+                // A request does not take the slot over: under settings
+                // older than the entry's it would displace the generation
+                // the lifecycle pass holds the document on, whose answer
+                // alone re-syncs. Its cell belongs to no entry, so its
+                // attempt is not admitted and the request answers nothing;
+                // under newer settings, the lifecycle pass they bring takes
+                // the slot over.
+                return (Arc::default(), self.revision());
+            }
+            // A hash collision with another region, or another launch config:
+            // take the slot over.
+            *entry = Entry {
+                host_uri: host_uri.to_string(),
+                injection_language: input.injection_language.to_string(),
+                region_id: input.region_id.to_string(),
+                host_language: input.host_language.to_string(),
+                candidates: Arc::clone(&target.candidates),
+                current: fresh(),
+                previous: None,
+            };
+        }
+        if entry.current.key == key {
+            return (Arc::clone(&entry.current.cell), entry.current.revision);
+        }
+        if let Some(previous) = entry
+            .previous
+            .as_ref()
+            .filter(|previous| previous.key == key)
+        {
+            // The lifecycle pass works on it (again, after an undo; or first,
+            // after a request saw the text before the pass did): it becomes
+            // the current generation, so the document is held on it and its
+            // answer — in already, or of the attempt it shares — re-syncs.
+            // The one it displaces, which may have failed, no longer
+            // describes the document.
+            if holder == Holder::LifecyclePass {
+                let entry = &mut *entry;
+                std::mem::swap(
+                    &mut entry.current,
+                    entry.previous.as_mut().expect("matched"),
+                );
+                return (Arc::clone(&entry.current.cell), entry.current.revision);
+            }
+            return (Arc::clone(&previous.cell), previous.revision);
+        }
+        if holder == Holder::Request {
+            // A request's text that is neither generation (older than both,
+            // or not yet seen by the lifecycle pass) must not take the
+            // current slot: the lifecycle pass holds its document on that
+            // one, and only its answer re-syncs. It takes the previous slot,
+            // where a later lifecycle lookup of the same text still finds an
+            // answer that has arrived.
+            let generation = fresh();
+            let handle = (Arc::clone(&generation.cell), generation.revision);
+            entry.previous = Some(generation);
+            return handle;
+        }
+        entry.host_language = input.host_language.to_string();
+        entry.candidates = Arc::clone(&target.candidates);
+        let current = std::mem::replace(&mut entry.current, fresh());
+        entry.previous = Some(current);
+        (Arc::clone(&entry.current.cell), entry.current.revision)
+    }
+
+    fn revision(&self) -> i32 {
+        // Wraps after 2^31 prepares; the peer only compares a document's
+        // versions over its lifetime.
+        self.next_revision.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+/// Who looks a document up: what an unanswered older generation is good for
+/// depends on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Holder {
+    /// The lifecycle pass, which holds the document until the answer
+    /// re-syncs it.
+    LifecyclePass,
+    /// A request, which waits for the answer itself.
+    Request,
+}
+
+/// Backoff before retrying an attempt that got no answer: one second,
+/// doubling, at most a minute.
+pub(crate) fn retry_delay(misses: u32) -> Duration {
+    Duration::from_secs((1u64 << misses.saturating_sub(1).min(6)).min(60))
+}
+
+fn region_hash(host_uri: &str, injection_language: &str, region_id: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (host_uri, injection_language, region_id).hash(&mut hasher);
+    hasher.finish()
+}
+
+fn input_key(target: &PrepareTarget, input: PrepareInput<'_>) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for candidate in target.candidates.iter() {
+        candidate.server_name.hash(&mut hasher);
+    }
+    input.host_language.hash(&mut hasher);
+    input.virtual_text.hash(&mut hasher);
+    input.gaps.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Whether two candidate lists are the same servers with the same launch
+/// configs: by identity first (a target resolved under one settings snapshot
+/// shares its `Arc`s), by value across snapshots.
+pub(crate) fn same_candidates(a: &[ResolvedServerConfig], b: &[ResolvedServerConfig]) -> bool {
+    std::ptr::eq(a, b)
+        || a.len() == b.len()
+            && a.iter().zip(b).all(|(a, b)| {
+                a.server_name == b.server_name
+                    && (Arc::ptr_eq(&a.config, &b.config) || a.config == b.config)
+            })
+}
+
+fn sent_key(host_uri: &str, region_id: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (host_uri, region_id).hash(&mut hasher);
+    hasher.finish()
+}
+
+fn text_key(virtual_text: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    virtual_text.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// An owned [`PrepareInput`], for the background request.
+struct PrepareJob {
+    host_uri: Url,
+    host_language: String,
+    injection_language: String,
+    region_id: String,
+    virtual_text: String,
+    gaps: Vec<VirtualGap>,
+}
+
+impl From<PrepareInput<'_>> for PrepareJob {
+    fn from(input: PrepareInput<'_>) -> Self {
+        Self {
+            host_uri: input.host_uri.clone(),
+            host_language: input.host_language.to_string(),
+            injection_language: input.injection_language.to_string(),
+            region_id: input.region_id.to_string(),
+            virtual_text: input.virtual_text.to_string(),
+            gaps: input.gaps.to_vec(),
+        }
+    }
+}
+
+/// Ask the first candidate advertising the request and apply its answer.
+/// `Ok(None)` is an answer kakehashi refused (or the peer refused to give);
+/// `Err` is no answer at all. Both are logged; neither lets the document
+/// through unprepared. A revision no candidate advertises the request for is
+/// sent as is (a document without a map).
+async fn run(
+    pool: &LanguageServerPool,
+    target: &PrepareTarget,
+    job: &PrepareJob,
+    revision: i32,
+    admitted: &(dyn Fn() -> bool + Sync),
+) -> Result<Outcome, ()> {
+    let log_failure = |error: &dyn std::fmt::Display| {
+        log::warn!(
+            target: "kakehashi::bridge::prepare",
+            "Not sending the {} virtual document of {}: {}",
+            job.injection_language,
+            job.host_uri,
+            error
+        );
+    };
+    match try_run(pool, target, job, revision, admitted).await {
+        Ok(Ok(prepared)) => Ok(Some(Arc::new(prepared))),
+        Ok(Err(refused)) => {
+            log_failure(&refused);
+            Ok(None)
+        }
+        Err(unanswered) => {
+            log_failure(&unanswered);
+            Err(())
+        }
+    }
+}
+
+/// The outer `Err` is a failure to get an answer (worth retrying); the
+/// inner one is final for the revision: an answer that cannot be used (an
+/// error response, a malformed or refused result).
+///
+/// Candidates are asked strictly in priority order: one still starting is
+/// waited for, and one that cannot start, or does not advertise the request,
+/// is passed over. Only the first that advertises it is asked, and its
+/// answer stands — a failure does not fall through to the next, which would
+/// let a flaky peer switch which preparation servers see.
+async fn try_run(
+    pool: &LanguageServerPool,
+    target: &PrepareTarget,
+    job: &PrepareJob,
+    revision: i32,
+    admitted: &(dyn Fn() -> bool + Sync),
+) -> std::io::Result<std::io::Result<PreparedDocument>> {
+    let host_uri = match crate::lsp::lsp_impl::url_to_uri(&job.host_uri) {
+        Ok(host_uri) => host_uri,
+        Err(error) => return Ok(Err(std::io::Error::other(error.to_string()))),
+    };
+    let virtual_uri =
+        VirtualDocumentUri::new(&host_uri, &job.injection_language, &job.region_id).to_uri_string();
+    let layout = layout(&job.virtual_text, &job.gaps);
+    let params = PrepareParams::new(
+        PrepareTextDocument {
+            uri: &virtual_uri,
+            language_id: &job.injection_language,
+            version: revision,
+        },
+        PrepareHostTextDocument {
+            uri: job.host_uri.as_str(),
+            language_id: &job.host_language,
+        },
+        &layout,
+    );
+    for candidate in target.candidates.iter() {
+        let name = &candidate.server_name;
+        if pool.prepare_advertisement(name) == Some(false) {
+            continue;
+        }
+        let handle = match pool
+            .get_or_create_connection_wait_ready_admitted(
+                name,
+                &candidate.config,
+                Some(&job.host_uri),
+                Duration::from_secs(super::INIT_TIMEOUT_SECS),
+                Some(admitted),
+                None,
+            )
+            .await
+        {
+            Ok(handle) => handle,
+            // Superseded: no answer for this revision.
+            Err(error) if !admitted() => return Err(error),
+            // Advertising nothing until a handshake says otherwise, so later
+            // revisions are not held back to start it again.
+            Err(error) => {
+                log::debug!(
+                    target: "kakehashi::bridge::prepare",
+                    "Prepare candidate {name} for {} did not start: {error}",
+                    job.host_uri
+                );
+                pool.record_prepare_advertisement(name, false);
+                continue;
+            }
+        };
+        if !handle.supports_virtual_document_prepare() {
+            continue;
+        }
+        let result = match handle.request_virtual_document_prepare(&params).await {
+            Ok(result) => result,
+            // It does not answer the request after all (`MethodNotFound`
+            // withdraws the advertisement): as if it had not advertised it.
+            Err(_) if !handle.supports_virtual_document_prepare() => {
+                pool.record_prepare_advertisement(name, false);
+                continue;
+            }
+            // Final for this revision: an unusable answer (an error response
+            // or a malformed result).
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                return Ok(Err(std::io::Error::new(
+                    error.kind(),
+                    format!("{name} could not prepare it: {error}"),
+                )));
+            }
+            // No answer: timed out, cancelled by the peer, connection gone.
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!("{name} did not answer: {error}"),
+                ));
+            }
+        };
+        return Ok(
+            apply_prepare_result(&job.virtual_text, &layout, result).map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{name} answered unusably: {error}"),
+                )
+            }),
+        );
+    }
+    Ok(Ok(PreparedDocument {
+        text: job.virtual_text.clone(),
+        map: None,
+    }))
+}
+
+/// Present a virtual document as content/gap segments: the gaps the
+/// resolver recorded, and content everywhere between them.
+fn layout(virtual_text: &str, gaps: &[VirtualGap]) -> VirtualLayout {
+    use super::protocol::SegmentKind;
+    let mut pieces = Vec::with_capacity(gaps.len() * 2 + 1);
+    let mut cursor = 0;
+    for gap in gaps {
+        if cursor < gap.virtual_range.start {
+            pieces.push((
+                SegmentKind::Content,
+                cursor..gap.virtual_range.start,
+                String::new(),
+            ));
+        }
+        pieces.push((
+            SegmentKind::Gap,
+            gap.virtual_range.clone(),
+            gap.host_text.clone(),
+        ));
+        cursor = cursor.max(gap.virtual_range.end);
+    }
+    if cursor < virtual_text.len() || pieces.is_empty() {
+        pieces.push((
+            SegmentKind::Content,
+            cursor..virtual_text.len(),
+            String::new(),
+        ));
+    }
+    VirtualLayout::from_pieces(virtual_text, pieces)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::settings::BridgeServerConfig;
+    use crate::lsp::bridge::protocol::SegmentKind;
+
+    #[test]
+    fn layout_fills_content_between_gaps() {
+        let virtual_text = "x =     \nprint(x)\n";
+        let gaps = [VirtualGap {
+            virtual_range: 4..8,
+            host_text: "${a}".to_string(),
+        }];
+        let layout = layout(virtual_text, &gaps);
+        let segments: Vec<_> = layout
+            .segments()
+            .iter()
+            .map(|segment| (segment.kind, segment.text.as_str()))
+            .collect();
+        assert_eq!(
+            segments,
+            vec![
+                (SegmentKind::Content, "x = "),
+                (SegmentKind::Gap, "${a}"),
+                (SegmentKind::Content, "\nprint(x)\n"),
+            ]
+        );
+    }
+
+    #[test]
+    fn layout_of_an_isolated_document_is_one_content_segment() {
+        let layout = layout("a\n", &[]);
+        assert_eq!(layout, VirtualLayout::single("a\n"));
+        // An empty document still presents one (empty) content segment.
+        assert_eq!(layout_of_empty().segments().len(), 1);
+    }
+
+    fn layout_of_empty() -> VirtualLayout {
+        layout("", &[])
+    }
+
+    /// Candidates named and launched as given, in this order.
+    fn target_of(candidates: &[(&str, &[&str])]) -> PrepareTarget {
+        PrepareTarget {
+            candidates: candidates
+                .iter()
+                .map(|(name, command)| ResolvedServerConfig {
+                    server_name: name.to_string(),
+                    config: Arc::new(BridgeServerConfig {
+                        cmd: Some(command.iter().map(|part| part.to_string()).collect()),
+                        ..Default::default()
+                    }),
+                })
+                .collect(),
+        }
+    }
+
+    fn unstartable_target() -> PrepareTarget {
+        target_of(&[("peer", &["/nonexistent/kakehashi-prepare-peer"])])
+    }
+
+    #[tokio::test]
+    async fn a_revision_no_candidate_prepares_is_sent_as_is() {
+        // A candidate that cannot start advertises nothing: with no other,
+        // the document goes out unprepared, and that is final for the
+        // revision.
+        let registry = PrepareRegistry::default();
+        let pool = Arc::new(LanguageServerPool::new());
+        let host = Url::parse("file:///host.md").unwrap();
+        let input = PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: "01J0000000000000000000000A",
+            virtual_text: "a",
+            gaps: &[],
+        };
+        let target = unstartable_target();
+        assert!(matches!(
+            registry.lookup_or_start(&pool, &target, input),
+            PrepareLookup::Pending
+        ));
+        let sent = registry.prepare(&pool, &target, input).await.unwrap();
+        assert_eq!(sent.text, "a");
+        assert!(sent.map.is_none());
+        assert!(matches!(
+            registry.lookup_or_start(&pool, &target, input),
+            PrepareLookup::Ready(sent) if sent.map.is_none()
+        ));
+        let (cell, _) = registry.cell(&target, input, Holder::Request);
+        assert!(!cell.in_flight.load(Ordering::Acquire));
+        assert_eq!(*cell.attempts.borrow(), 1, "the revision was not retried");
+        // Not started again for each revision to find that out (its next
+        // handshake, when it is started to be bridged, says otherwise).
+        assert_eq!(pool.prepare_advertisement("peer"), Some(false));
+    }
+
+    #[test]
+    fn an_unused_registry_reads_unprepared_without_entries() {
+        let registry = PrepareRegistry::default();
+        let host = Url::parse("file:///host.md").unwrap();
+        assert!(matches!(
+            registry.state(&host, "lua", "r", "a"),
+            PreparedState::Unprepared
+        ));
+        registry.forget_region(&host, None, "r");
+        assert!(!registry.ever_used.load(Ordering::Acquire));
+    }
+
+    /// A ready connection for `name` that records what it is sent and
+    /// never answers, advertising the prepare request or not.
+    #[cfg(unix)]
+    async fn recording_candidate(
+        pool: &LanguageServerPool,
+        name: &str,
+        advertised: bool,
+        path: &std::path::Path,
+    ) {
+        use crate::lsp::bridge::pool::test_helpers::{
+            advertise_prepare_for_test, create_handle_with_command,
+        };
+        use crate::lsp::bridge::pool::{ConnectionKey, ConnectionState};
+        let (handle, _) = create_handle_with_command(
+            ConnectionState::Ready,
+            ConnectionKey::for_server(name),
+            vec![
+                "sh".into(),
+                "-c".into(),
+                "cat > \"$1\"".into(),
+                "record".into(),
+                path.to_str().unwrap().into(),
+            ],
+            None,
+        )
+        .await;
+        advertise_prepare_for_test(&handle, advertised);
+        pool.insert_connection(handle).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_first_advertising_candidate_alone_is_asked_and_retried() {
+        let registry = PrepareRegistry::default();
+        let mut resync = registry.take_resync_rx().unwrap();
+        let pool = Arc::new(LanguageServerPool::new());
+        let dir = tempfile::tempdir().unwrap();
+        let sent = |name: &str| std::fs::read_to_string(dir.path().join(name)).unwrap_or_default();
+        recording_candidate(&pool, "quiet", false, &dir.path().join("quiet")).await;
+        recording_candidate(&pool, "first", true, &dir.path().join("first")).await;
+        recording_candidate(&pool, "second", true, &dir.path().join("second")).await;
+        let host = Url::parse("file:///host.md").unwrap();
+        let input = PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: "01J0000000000000000000000A",
+            virtual_text: "a",
+            gaps: &[],
+        };
+        let target = target_of(&[
+            ("quiet", &["quiet"]),
+            ("first", &["first"]),
+            ("second", &["second"]),
+        ]);
+        // `first` never answers: no answer, not cached, so the document is
+        // still pending, and `second` is not asked instead.
+        assert!(registry.prepare(&pool, &target, input).await.is_none());
+        assert!(!sent("quiet").contains(crate::lsp::bridge::protocol::PREPARE_METHOD));
+        assert!(sent("first").contains(crate::lsp::bridge::protocol::PREPARE_METHOD));
+        assert!(!sent("second").contains(crate::lsp::bridge::protocol::PREPARE_METHOD));
+        let (cell, _) = registry.cell(&target, input, Holder::Request);
+        assert!(cell.outcome.get().is_none());
+        assert_eq!(cell.misses.load(Ordering::Acquire), 1);
+        // …but backing off: neither a lookup nor a request starts another
+        // attempt yet.
+        assert!(matches!(
+            registry.lookup_or_start(&pool, &target, input),
+            PrepareLookup::Pending
+        ));
+        assert!(registry.prepare(&pool, &target, input).await.is_none());
+        assert_eq!(*cell.attempts.borrow(), 1);
+        // The host is synced again once the backoff ends.
+        let resynced = tokio::time::timeout(Duration::from_secs(5), resync.recv())
+            .await
+            .expect("a re-sync after the backoff");
+        assert_eq!(
+            resynced,
+            Some(Resync {
+                host_uri: host.clone(),
+                ready: false
+            })
+        );
+    }
+
+    #[test]
+    fn an_older_text_finds_its_generation_without_evicting_the_current() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let input = |text| PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: "01J0000000000000000000000A",
+            virtual_text: text,
+            gaps: &[],
+        };
+        let (old, _) = registry.cell(&target, input("v1"), Holder::LifecyclePass);
+        let (current, _) = registry.cell(&target, input("v2"), Holder::LifecyclePass);
+        // A request still on v1 gets v1's cell, and v2 stays current.
+        let (again, _) = registry.cell(&target, input("v1"), Holder::Request);
+        assert!(Arc::ptr_eq(&old, &again));
+        let entry = registry.entries.iter().next().unwrap();
+        assert!(Arc::ptr_eq(&entry.current.cell, &current));
+        drop(entry);
+        // The lifecycle pass moving on to a third text drops the oldest.
+        let (third, _) = registry.cell(&target, input("v3"), Holder::LifecyclePass);
+        let (fresh, _) = registry.cell(&target, input("v1"), Holder::Request);
+        assert!(!Arc::ptr_eq(&old, &fresh));
+        // That stale request did not take the current slot.
+        let entry = registry.entries.iter().next().unwrap();
+        assert!(Arc::ptr_eq(&entry.current.cell, &third));
+    }
+
+    #[test]
+    fn the_lifecycle_pass_shares_and_promotes_an_older_generation() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let input = |text| PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: "01J0000000000000000000000A",
+            virtual_text: text,
+            gaps: &[],
+        };
+        let (v1, _) = registry.cell(&target, input("v1"), Holder::LifecyclePass);
+        registry.cell(&target, input("v2"), Holder::LifecyclePass);
+        // Undo to v1 before v1 was answered: v1's attempt is shared, and the
+        // document is held on it as the current generation, whose answer
+        // re-syncs.
+        let (undone, _) = registry.cell(&target, input("v1"), Holder::LifecyclePass);
+        assert!(Arc::ptr_eq(&v1, &undone));
+        assert!(Arc::ptr_eq(
+            &registry.entries.iter().next().unwrap().current.cell,
+            &v1
+        ));
+        // A request seeing a text first: the lifecycle pass shares its cell.
+        let (request, _) = registry.cell(&target, input("v3"), Holder::Request);
+        let (pass, _) = registry.cell(&target, input("v3"), Holder::LifecyclePass);
+        assert!(Arc::ptr_eq(&request, &pass));
+        assert!(Arc::ptr_eq(
+            &registry.entries.iter().next().unwrap().current.cell,
+            &pass
+        ));
+    }
+
+    #[test]
+    fn retain_sees_the_peer_config_answers_came_from() {
+        let registry = PrepareRegistry::default();
+        let target = target_of(&[("peer", &["deno"])]);
+        let host = Url::parse("file:///host.md").unwrap();
+        let input = PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: "01J0000000000000000000000A",
+            virtual_text: "a",
+            gaps: &[],
+        };
+        registry.cell(&target, input, Holder::Request);
+        let same = |command: &str| {
+            let other = target_of(&[("peer", &[command])]);
+            move |_: &str, _: &str, seen: &[ResolvedServerConfig]| {
+                same_candidates(seen, &other.candidates)
+            }
+        };
+        registry.retain(same("deno"), false);
+        assert_eq!(registry.entries.len(), 1);
+        registry.retain(same("bun"), false);
+        assert!(
+            registry.entries.is_empty(),
+            "a relaunched peer prepares again"
+        );
+    }
+
+    /// An answer for `virtual_text` whose map is real, sent as `text`.
+    fn answer_for(virtual_text: &str, text: &str) -> Arc<PreparedDocument> {
+        let map = apply_prepare_result(virtual_text, &layout(virtual_text, &[]), None)
+            .unwrap()
+            .map;
+        Arc::new(PreparedDocument {
+            text: text.to_string(),
+            map,
+        })
+    }
+
+    fn sent_text(text: &str) -> Arc<PreparedDocument> {
+        Arc::new(PreparedDocument {
+            text: text.to_string(),
+            map: None,
+        })
+    }
+
+    #[test]
+    fn a_changed_sent_text_is_noticed() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let region = "01J0000000000000000000000A";
+        let input = PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: region,
+            virtual_text: "  a",
+            gaps: &[],
+        };
+        registry.cell(&target, input, Holder::LifecyclePass);
+        assert!(
+            registry.note_sent(&host, "lua", region, &sent_text("a")),
+            "the first prepared text replaces whatever was sent unprepared"
+        );
+        assert!(
+            !registry.note_sent(&host, "lua", region, &sent_text("a")),
+            "the same text"
+        );
+        assert!(
+            registry.note_sent(&host, "lua", region, &sent_text("  a")),
+            "a different text"
+        );
+    }
+
+    #[test]
+    fn the_sent_text_outlives_a_settings_change() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let region = "01J0000000000000000000000A";
+        let input = PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: region,
+            virtual_text: "  a",
+            gaps: &[],
+        };
+        registry.cell(&target, input, Holder::LifecyclePass);
+        registry.note_sent(&host, "lua", region, &sent_text("a"));
+        // A retargeted peer: the entry goes, the server still holds "a".
+        registry.retain(|_, _, _| false, false);
+        assert!(
+            registry.note_sent(&host, "lua", region, &sent_text("  a")),
+            "the new peer's text differs from the one the server holds"
+        );
+        // The peer removed: the region is sent unprepared next.
+        assert!(
+            registry.forget_region(&host, Some("lua"), region),
+            "a prepared text had been sent"
+        );
+        assert!(
+            !registry.forget_region(&host, Some("lua"), region),
+            "nothing prepared is left to replace"
+        );
+    }
+
+    #[test]
+    fn a_gap_only_undo_reads_the_map_that_was_sent() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let region = "01J0000000000000000000000A";
+        let gap = |host_text: &str| VirtualGap {
+            virtual_range: 1..2,
+            host_text: host_text.to_string(),
+        };
+        let (gaps_a, gaps_b) = ([gap("a")], [gap("b")]);
+        let input = |gaps| PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: region,
+            virtual_text: "x x",
+            gaps,
+        };
+        let answer = |text: &str| {
+            let map = apply_prepare_result("x x", &layout("x x", &gaps_a), None)
+                .unwrap()
+                .map;
+            Arc::new(PreparedDocument {
+                text: text.to_string(),
+                map,
+            })
+        };
+        let (a, _) = registry.cell(&target, input(&gaps_a), Holder::LifecyclePass);
+        // Both answers have one text; only their maps tell them apart.
+        let prepared_a = answer("x0x");
+        let _ = a.outcome.set(Some(Arc::clone(&prepared_a)));
+        registry.note_sent(&host, "lua", region, &prepared_a);
+        let (b, _) = registry.cell(&target, input(&gaps_b), Holder::LifecyclePass);
+        let _ = b.outcome.set(Some(answer("x0x")));
+        // Undo the gap edit before b was sent: a's answer is sent again.
+        let (undone, _) = registry.cell(&target, input(&gaps_a), Holder::LifecyclePass);
+        assert!(Arc::ptr_eq(&undone, &a));
+        registry.note_sent(&host, "lua", region, &prepared_a);
+        let PreparedState::Prepared(Some(map)) = registry.state(&host, "lua", region, "x x") else {
+            panic!("prepared");
+        };
+        assert!(
+            Arc::ptr_eq(&map, prepared_a.map.as_ref().unwrap()),
+            "the map of the text the server holds, not of the current generation"
+        );
+    }
+
+    #[test]
+    fn only_the_sent_answer_translates() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let region = "01J0000000000000000000000A";
+        let input = |text| PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: region,
+            virtual_text: text,
+            gaps: &[],
+        };
+        let state = |text| registry.state(&host, "lua", region, text);
+        let (old, _) = registry.cell(&target, input("  a"), Holder::LifecyclePass);
+        let _ = old.outcome.set(Some(answer_for("  a", "a")));
+        assert!(
+            matches!(state("  a"), PreparedState::Unavailable),
+            "answered but held: servers hold nothing of it"
+        );
+        let sent = Arc::clone(old.outcome.get().unwrap().as_ref().unwrap());
+        registry.note_sent(&host, "lua", region, &sent);
+        assert!(matches!(state("  a"), PreparedState::Prepared(_)));
+        // The next text is answered before the lifecycle pass sends it.
+        let (new, _) = registry.cell(&target, input("b"), Holder::LifecyclePass);
+        let _ = new.outcome.set(Some(answer_for("b", "b")));
+        assert!(
+            matches!(state("b"), PreparedState::Unavailable),
+            "servers still hold the previous answer"
+        );
+        assert!(matches!(state("  a"), PreparedState::Prepared(_)));
+        // Its generation evicted by two newer texts, or the entry dropped by
+        // a settings change: servers still hold "a", through the same map.
+        registry.cell(&target, input("c"), Holder::LifecyclePass);
+        registry.retain(|_, _, _| false, false);
+        let PreparedState::Prepared(Some(map)) = state("  a") else {
+            panic!("the sent answer still translates its text");
+        };
+        assert!(Arc::ptr_eq(&map, sent.map.as_ref().unwrap()));
+    }
+
+    #[test]
+    fn another_peer_config_never_reuses_an_answer() {
+        let registry = PrepareRegistry::default();
+        let target = |command: &str| target_of(&[("peer", &[command])]);
+        let host = Url::parse("file:///host.md").unwrap();
+        let input = PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: "01J0000000000000000000000A",
+            virtual_text: "a",
+            gaps: &[],
+        };
+        let (old, _) = registry.cell(&target("deno"), input, Holder::LifecyclePass);
+        let _ = old.outcome.set(None);
+        let (new, _) = registry.cell(&target("bun"), input, Holder::LifecyclePass);
+        assert!(!Arc::ptr_eq(&old, &new));
+        assert!(
+            new.outcome.get().is_none(),
+            "the old launch's failure is not reused"
+        );
+        let (again, _) = registry.cell(&target("bun"), input, Holder::LifecyclePass);
+        assert!(Arc::ptr_eq(&new, &again));
+        // A request under the old config leaves the lifecycle pass's
+        // generation in place.
+        let (request, _) = registry.cell(&target("deno"), input, Holder::Request);
+        assert!(!Arc::ptr_eq(&request, &new));
+        let (current, _) = registry.cell(&target("bun"), input, Holder::LifecyclePass);
+        assert!(Arc::ptr_eq(&current, &new));
+    }
+
+    #[test]
+    fn unprepared_sends_are_recorded_once_anything_is_prepared() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let region = "01J0000000000000000000000A";
+        assert!(!registry.note_unprepared_sent(&host, "lua", region, "  a"));
+        assert!(
+            registry.sent_fingerprint(&host, region).is_none(),
+            "nothing is recorded before anything is prepared"
+        );
+        let input = PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: region,
+            virtual_text: "  a",
+            gaps: &[],
+        };
+        registry.cell(&target, input, Holder::LifecyclePass);
+        registry.note_sent(&host, "lua", region, &sent_text("a"));
+        assert_eq!(
+            registry
+                .sent_fingerprint(&host, region)
+                .map(|(fingerprint, language, _)| (fingerprint, language)),
+            Some((
+                crate::lsp::bridge::pool::content_fingerprint("a"),
+                "lua".to_string()
+            ))
+        );
+        // The pair loses its peer: the virtual text goes out unprepared.
+        assert!(
+            registry.note_unprepared_sent(&host, "lua", region, "  a"),
+            "the prepared text it replaces had pushes of its own"
+        );
+        assert!(matches!(
+            registry.state(&host, "lua", region, "  a"),
+            PreparedState::Unprepared
+        ));
+        assert_eq!(
+            registry
+                .sent_fingerprint(&host, region)
+                .map(|(fingerprint, language, _)| (fingerprint, language)),
+            Some((
+                crate::lsp::bridge::pool::content_fingerprint("  a"),
+                "lua".to_string()
+            ))
+        );
+        let epoch = registry.sent_epoch(&host, region);
+        assert!(
+            !registry.note_unprepared_sent(&host, "lua", region, "  b"),
+            "an unprepared edit keeps the coordinates pushes are in"
+        );
+        assert_eq!(
+            registry.sent_epoch(&host, region),
+            epoch,
+            "a push admitted before it still describes the text"
+        );
+        registry.note_sent(&host, "lua", region, &sent_text("b"));
+        assert_ne!(
+            registry.sent_epoch(&host, region),
+            epoch,
+            "a prepared text replacing it moves the epoch"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_that_cannot_wait_leaves_the_lifecycle_generation() {
+        let registry = PrepareRegistry::default();
+        let pool = Arc::new(LanguageServerPool::new());
+        let target = |command: &str| target_of(&[("peer", &[command])]);
+        let host = Url::parse("file:///host.md").unwrap();
+        let input = PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: "01J0000000000000000000000A",
+            virtual_text: "a",
+            gaps: &[],
+        };
+        let (current, _) = registry.cell(&target("bun"), input, Holder::LifecyclePass);
+        let _ = current.outcome.set(None);
+        // A diagnostic snapshot still carrying the settings before a change.
+        assert!(matches!(
+            registry.lookup_or_start_for_request(&pool, &target("deno"), input),
+            PrepareLookup::Pending
+        ));
+        let (still, _) = registry.cell(&target("bun"), input, Holder::LifecyclePass);
+        assert!(Arc::ptr_eq(&still, &current));
+    }
+
+    #[test]
+    fn a_stale_request_does_not_recreate_an_unprepared_region() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let region = "01J0000000000000000000000A";
+        let input = PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: region,
+            virtual_text: "  a",
+            gaps: &[],
+        };
+        registry.cell(&target, input, Holder::LifecyclePass);
+        registry.note_sent(&host, "lua", region, &sent_text("a"));
+        // The peer is removed: the lifecycle pass sends the text unprepared.
+        registry.retain(|_, _, _| false, false);
+        registry.note_unprepared_sent(&host, "lua", region, "  a");
+        registry.cell(&target, input, Holder::Request);
+        assert!(
+            matches!(
+                registry.state(&host, "lua", region, "  a"),
+                PreparedState::Unprepared
+            ),
+            "a request under the old settings must not bring the entry back"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_miss_tells_a_final_failure_from_a_pending_answer() {
+        let registry = PrepareRegistry::default();
+        let pool = Arc::new(LanguageServerPool::new());
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let input = |text| PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: "01J0000000000000000000000A",
+            virtual_text: text,
+            gaps: &[],
+        };
+        let (pending, _) = registry.cell(&target, input("a"), Holder::LifecyclePass);
+        assert!(registry.host_has_pending(&host), "no answer yet");
+        let _ = pending.outcome.set(None);
+        assert!(!registry.host_has_pending(&host));
+        assert_eq!(
+            registry
+                .prepare_or_miss(&pool, &target, input("a"))
+                .await
+                .err(),
+            Some(false),
+            "an unusable answer is final"
+        );
+    }
+
+    #[test]
+    fn a_failed_revision_is_not_translated_through_the_text_before() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let region = "01J0000000000000000000000A";
+        let gap = |host_text: &str| VirtualGap {
+            virtual_range: 1..2,
+            host_text: host_text.to_string(),
+        };
+        let (gaps_a, gaps_b) = ([gap("a")], [gap("b")]);
+        let input = |gaps| PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: region,
+            virtual_text: "x x",
+            gaps,
+        };
+        let (a, _) = registry.cell(&target, input(&gaps_a), Holder::LifecyclePass);
+        let sent = answer_for("x x", "x0x");
+        let _ = a.outcome.set(Some(Arc::clone(&sent)));
+        registry.note_sent(&host, "lua", region, &sent);
+        assert!(matches!(
+            registry.state(&host, "lua", region, "x x"),
+            PreparedState::Prepared(_)
+        ));
+        // An edit inside the gap, which the peer refuses to prepare.
+        let (b, _) = registry.cell(&target, input(&gaps_b), Holder::LifecyclePass);
+        let _ = b.outcome.set(None);
+        assert!(matches!(
+            registry.state(&host, "lua", region, "x x"),
+            PreparedState::Unavailable
+        ));
+    }
+
+    #[test]
+    fn an_undo_to_an_answered_revision_makes_it_current_again() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let region = "01J0000000000000000000000A";
+        let gap = |host_text: &str| VirtualGap {
+            virtual_range: 1..2,
+            host_text: host_text.to_string(),
+        };
+        let (gaps_a, gaps_b) = ([gap("a")], [gap("b")]);
+        let input = |gaps| PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: region,
+            virtual_text: "x x",
+            gaps,
+        };
+        let (a, _) = registry.cell(&target, input(&gaps_a), Holder::LifecyclePass);
+        let sent = answer_for("x x", "x0x");
+        let _ = a.outcome.set(Some(Arc::clone(&sent)));
+        registry.note_sent(&host, "lua", region, &sent);
+        let (b, _) = registry.cell(&target, input(&gaps_b), Holder::LifecyclePass);
+        let _ = b.outcome.set(None);
+        // Undo: the lifecycle pass sends A's answer again.
+        let (again, _) = registry.cell(&target, input(&gaps_a), Holder::LifecyclePass);
+        assert!(Arc::ptr_eq(&again, &a));
+        registry.note_sent(&host, "lua", region, &sent);
+        assert!(matches!(
+            registry.state(&host, "lua", region, "x x"),
+            PreparedState::Prepared(_)
+        ));
+    }
+
+    #[test]
+    fn only_a_recorded_prepared_send_counts_as_prepared() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let region = "01J0000000000000000000000A";
+        let input = PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: region,
+            virtual_text: "  a",
+            gaps: &[],
+        };
+        // Something was prepared, and this region went out unprepared; then
+        // its pair gains a peer, whose answer is pending.
+        registry.cell(&target, input, Holder::LifecyclePass);
+        registry.note_unprepared_sent(&host, "lua", region, "  a");
+        registry.cell(&target, input, Holder::LifecyclePass);
+        assert!(!registry.sent_prepared(&host, "lua", region));
+        registry.note_sent(&host, "lua", region, &sent_text("a"));
+        assert!(registry.sent_prepared(&host, "lua", region));
+        assert!(!registry.sent_prepared(&host, "python", region));
+        registry.note_unprepared_sent(&host, "lua", region, "  a");
+        registry.cell(&target, input, Holder::LifecyclePass);
+        registry.forget_sent(&host, region);
+        assert!(!registry.sent_prepared(&host, "lua", region));
+        assert!(
+            matches!(
+                registry.state(&host, "lua", region, "  a"),
+                PreparedState::Unavailable
+            ),
+            "held, with nothing sent: servers hold nothing of it"
+        );
+    }
+
+    #[test]
+    fn a_settings_change_drops_final_failures() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let input = PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: "01J0000000000000000000000A",
+            virtual_text: "a",
+            gaps: &[],
+        };
+        let (cell, _) = registry.cell(&target, input, Holder::Request);
+        cell.outcome.set(None).unwrap();
+        registry.retain(|_, _, _| true, false);
+        assert_eq!(registry.entries.len(), 1, "nothing would ask again");
+        registry.retain(|_, _, _| true, true);
+        assert!(
+            registry.entries.is_empty(),
+            "a fixed config may now prepare it"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_forgotten_attempt_does_not_start_its_peer() {
+        let registry = PrepareRegistry::default();
+        let pool = Arc::new(LanguageServerPool::new());
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("spawned");
+        let touch = format!("touch '{}'", marker.display());
+        let target = target_of(&[("peer", &["sh", "-c", &touch])]);
+        let host = Url::parse("file:///host.md").unwrap();
+        let input = PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: "01J0000000000000000000000A",
+            virtual_text: "a",
+            gaps: &[],
+        };
+        // The attempt is spawned but (on this single-threaded runtime) has
+        // not run yet when its entry is forgotten — the host closed, say.
+        registry.lookup_or_start(&pool, &target, input);
+        let (cell, _) = registry.cell(&target, input, Holder::Request);
+        let mut attempts = cell.attempts.subscribe();
+        registry.forget_host(&host);
+        tokio::time::timeout(Duration::from_secs(10), attempts.changed())
+            .await
+            .expect("the attempt ends")
+            .unwrap();
+        assert!(!marker.exists(), "a revoked attempt started its peer");
+    }
+
+    #[test]
+    fn retries_back_off_to_a_minute() {
+        assert_eq!(retry_delay(1), Duration::from_secs(1));
+        assert_eq!(retry_delay(2), Duration::from_secs(2));
+        assert_eq!(retry_delay(6), Duration::from_secs(32));
+        assert_eq!(retry_delay(7), Duration::from_secs(60));
+        assert_eq!(retry_delay(100), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn a_changed_input_gets_a_new_revision_and_cell() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let input = |text| PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: "01J0000000000000000000000A",
+            virtual_text: text,
+            gaps: &[],
+        };
+        let (first, revision) = registry.cell(&target, input("a"), Holder::Request);
+        let (same, same_revision) = registry.cell(&target, input("a"), Holder::Request);
+        assert!(Arc::ptr_eq(&first, &same));
+        assert_eq!(revision, same_revision);
+        let (changed, changed_revision) = registry.cell(&target, input("b"), Holder::Request);
+        assert!(!Arc::ptr_eq(&first, &changed));
+        assert!(changed_revision > revision);
+        registry.retain(
+            |host_language, _, candidates| {
+                host_language == "markdown" && candidates[0].server_name == "peer"
+            },
+            true,
+        );
+        assert_eq!(registry.entries.len(), 1);
+        registry.retain(
+            |_, _, candidates| candidates[0].server_name == "other",
+            true,
+        );
+        assert!(registry.entries.is_empty());
+        registry.cell(&target, input("b"), Holder::Request);
+        registry.forget_region(&host, None, "01J0000000000000000000000A");
+        assert!(registry.entries.is_empty());
+        let (_, again) = registry.cell(&target, input("b"), Holder::Request);
+        assert!(
+            again > changed_revision,
+            "a forgotten document never repeats a version"
+        );
+        registry.forget_region(&host, None, "01J0000000000000000000000A");
+        registry.cell(&target, input("b"), Holder::Request);
+        registry.forget_region(&host, Some("python"), "01J0000000000000000000000A");
+        assert_eq!(registry.entries.len(), 1, "another language's region stays");
+        registry.forget_region_except(&host, "01J0000000000000000000000A", Some("lua"));
+        assert_eq!(registry.entries.len(), 1, "the current language stays");
+        registry.forget_region_except(&host, "01J0000000000000000000000A", Some("ruby"));
+        assert!(registry.entries.is_empty());
+        registry.cell(&target, input("b"), Holder::Request);
+        registry.forget_host(&host);
+        assert!(registry.entries.is_empty());
+    }
+}

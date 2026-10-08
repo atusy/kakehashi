@@ -999,13 +999,39 @@ impl DiagnosticPublisher {
             );
             return None;
         }
-        Some(self.record_push(
+        // Cached pushes are placed through the answer last sent for the
+        // region; one from a connection that does not hold that text (its
+        // didChange recorded but not yet, or never, delivered) is in other
+        // coordinates. A server pushing late for the text before one it was
+        // just sent is not caught here, any more than for an unprepared
+        // document: the push carries no text to compare.
+        let Some(epoch) = self
+            .bridge
+            .admit_push(&host, &region_id, connection_id)
+            .await
+        else {
+            log::debug!(
+                target: LOG_TARGET,
+                "push from {server} for text other than the one last sent, dropping"
+            );
+            return None;
+        };
+        let recorded = self.record_push(
             host,
-            DiagnosticSource::Region(region_id),
+            DiagnosticSource::Region(region_id.clone()),
             server,
             connection_id,
             diagnostics,
-        ))
+        );
+        // Admitted against a text the lifecycle pass replaced meanwhile — or
+        // before the region's first recorded send, which a first prepared
+        // text may have become: the replacement's eviction may have run
+        // before this push was recorded.
+        if self.bridge.prepared_sent_epoch(&recorded.host, &region_id) != epoch {
+            self.aggregator
+                .evict_source(&recorded.host, &DiagnosticSource::Region(region_id));
+        }
+        Some(recorded)
     }
 
     /// Feed a proactive pull's combined result into the cache and republish.
@@ -2020,12 +2046,28 @@ impl DiagnosticPublisher {
             )),
         };
         for resolved in resolved_regions.iter() {
+            // A pushed diagnostic is in the coordinates of the document the
+            // server was sent: the prepared answer last sent, for a region
+            // with a prepare peer — not one that is in but not sent yet. A
+            // region whose sent form is unknown gets no offset, so its pushed
+            // diagnostics are dropped, not misplaced.
+            let prepared = match self.bridge.prepared_state(
+                host,
+                &resolved.injection_language,
+                &resolved.region.region_id,
+                &resolved.virtual_content,
+            ) {
+                crate::lsp::bridge::PreparedState::Unprepared => None,
+                crate::lsp::bridge::PreparedState::Prepared(map) => map,
+                crate::lsp::bridge::PreparedState::Unavailable => continue,
+            };
             geometry.offsets.insert(
                 resolved.region.region_id.clone(),
                 RegionOffset::with_per_line_offsets(
                     resolved.region.line_range.start,
                     resolved.line_column_offsets.clone(),
-                ),
+                )
+                .with_prepared(prepared),
             );
         }
         geometry.host_language = Some(language_name);

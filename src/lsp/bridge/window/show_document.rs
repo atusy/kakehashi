@@ -93,6 +93,7 @@ pub(in crate::lsp::bridge) fn handle(
         .upstream_request_tx
         .send(UpstreamRequest::ShowDocument {
             params,
+            connection: deps.connection_key.clone(),
             reply: reply_tx,
             cancel,
         })

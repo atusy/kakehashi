@@ -17,6 +17,12 @@
 //!   uppercases the text. Exercises the pipeline's capability-based
 //!   whole-region rangeFormatting fallback (concatenated-formatting-pipeline
 //!   Decision point 3.2).
+//! - `echo-document` — advertises `hoverProvider` +
+//!   `documentFormattingProvider`; hover answers the full text this server
+//!   holds for the document, ranged over the hovered line in its own
+//!   coordinates; formatting uppercases; a pull diagnostic spans the first
+//!   line and carries the full text. Proves what a prepared virtual
+//!   document looks like downstream and how its coordinates map back.
 //! - `definition` — advertises `definitionProvider` + `hoverProvider`;
 //!   answers definition with a fixed Location that **echoes the requested
 //!   URI** (and hover with the URI in the contents), but only for documents
@@ -316,6 +322,15 @@ fn main() {
                         "definitionProvider": true,
                         "hoverProvider": true,
                         "textDocumentSync": 1
+                    }),
+                    "echo-document" => json!({
+                        "hoverProvider": true,
+                        "documentFormattingProvider": true,
+                        "textDocumentSync": { "openClose": true, "change": 1, "save": true },
+                        "diagnosticProvider": {
+                            "interFileDependencies": false,
+                            "workspaceDiagnostics": false
+                        },
                     }),
                     "call-hierarchy-prepare"
                     | "call-hierarchy-replacement"
@@ -834,6 +849,20 @@ fn main() {
                     .as_deref()
                     .and_then(|uri| documents.get(uri))
                     .cloned();
+                if mode == "echo-document" {
+                    // Announce the save with the text this server holds.
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({
+                            "type": 2,
+                            "message": format!(
+                                "echo-document saved: {}",
+                                last_did_save_document_text.clone().unwrap_or_default()
+                            )
+                        }),
+                    );
+                }
             }
             "$/cancelRequest" => {
                 record_mock_event(&mode, "cancel", &message);
@@ -904,7 +933,38 @@ fn main() {
                         }),
                     );
                 }
-                let result = if mode == "inlay-hint-marker-resolve" {
+                let echoed = (mode == "echo-document").then(|| {
+                    message
+                        .pointer("/params/textDocument/uri")
+                        .and_then(Value::as_str)
+                        .and_then(|uri| documents.get(uri))
+                        .cloned()
+                });
+                let result = if let Some(text) = echoed {
+                    // The text this server holds, and the hovered line's
+                    // extent in ITS coordinates: a test can then prove both
+                    // what reached the server and how its positions map back.
+                    // A document it never received gets no hover.
+                    let Some(text) = text else {
+                        respond(&mut writer, id, Value::Null);
+                        continue;
+                    };
+                    let line = message
+                        .pointer("/params/position/line")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let width = text
+                        .lines()
+                        .nth(line as usize)
+                        .map_or(0, |content| content.encode_utf16().count());
+                    json!({
+                        "contents": text,
+                        "range": {
+                            "start": { "line": line, "character": 0 },
+                            "end": { "line": line, "character": width }
+                        }
+                    })
+                } else if mode == "inlay-hint-marker-resolve" {
                     let observation = json!({
                         "uri": message.pointer("/params/textDocument/uri"),
                         "position": message.pointer("/params/position"),
@@ -1512,6 +1572,36 @@ fn main() {
                     }
                 }
                 respond(&mut writer, id, json!({ "executed": command }));
+            }
+            "textDocument/diagnostic" if mode == "echo-document" => {
+                // One diagnostic over the document's first line, carrying the
+                // whole text this server holds.
+                let text = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .and_then(|uri| documents.get(uri))
+                    .cloned();
+                let result = match text {
+                    None => json!({ "kind": "full", "items": [] }),
+                    Some(text) => {
+                        let width = text
+                            .lines()
+                            .next()
+                            .map_or(0, |line| line.encode_utf16().count());
+                        json!({
+                            "kind": "full",
+                            "items": [{
+                                "range": {
+                                    "start": { "line": 0, "character": 0 },
+                                    "end": { "line": 0, "character": width }
+                                },
+                                "message": text,
+                                "source": "echo-document"
+                            }]
+                        })
+                    }
+                };
+                respond(&mut writer, id, result);
             }
             "textDocument/diagnostic" => {
                 if mode == "diagnostics-save" {

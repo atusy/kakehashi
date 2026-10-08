@@ -48,7 +48,7 @@ use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, decode_command, encode_command,
     response_has_jsonrpc_error, text_edit_safe_in_region, translate_host_position_to_virtual,
     translate_host_range_to_virtual, translate_virtual_position_to_host,
-    translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
+    translate_virtual_range_to_host, translate_virtual_text_edit_to_host, virtual_uri_to_lsp_uri,
 };
 use super::completion::EnvelopeOffset;
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
@@ -832,12 +832,17 @@ fn transform_inlay_hint_to_host(
     translate_virtual_position_to_host(&mut hint.position, offset);
 
     if let Some(text_edits) = &mut hint.text_edits {
-        for edit in text_edits.iter_mut() {
-            translate_virtual_range_to_host(&mut edit.range, offset);
-        }
-        if !text_edits
-            .iter()
-            .all(|edit| text_edit_safe_in_region(edit, offset, region_end))
+        let translated = text_edits
+            .iter_mut()
+            .all(|edit| translate_virtual_text_edit_to_host(edit, offset))
+            && !(offset.prepared().is_some()
+                && super::super::protocol::ranges_overlap(
+                    text_edits.iter().map(|edit| &edit.range),
+                ));
+        if !translated
+            || !text_edits
+                .iter()
+                .all(|edit| text_edit_safe_in_region(edit, offset, region_end))
         {
             log::warn!(
                 target: "kakehashi::bridge",
@@ -1587,6 +1592,7 @@ mod tests {
                 line: 4,
                 column: 2,
                 line_column_offsets: Some(vec![2, 3, 0]),
+                prepared: false,
             },
             inner: None,
             host_layer: false,
@@ -1663,6 +1669,7 @@ mod tests {
                 line: 4,
                 column: 0,
                 line_column_offsets: None,
+                prepared: false,
             },
             inner: None,
             host_layer: false,
@@ -1718,6 +1725,7 @@ mod tests {
                 line: 4,
                 column: 0,
                 line_column_offsets: None,
+                prepared: false,
             },
             inner: None,
             host_layer: false,

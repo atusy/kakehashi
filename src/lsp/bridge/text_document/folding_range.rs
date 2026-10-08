@@ -10,12 +10,12 @@
 use std::io;
 
 use crate::config::settings::BridgeServerConfig;
-use tower_lsp_server::ls_types::FoldingRange;
+use tower_lsp_server::ls_types::{FoldingRange, Position};
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::{
-    DocumentParams, JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
+    Bias, DocumentParams, JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
     build_whole_document_request, response_has_jsonrpc_error,
 };
 
@@ -92,6 +92,26 @@ fn transform_folding_range_response_to_host(
     }
 
     let mut ranges: Vec<FoldingRange> = serde_json::from_value(result).ok()?;
+
+    if let Some(prepared) = offset.prepared() {
+        // Lines of a prepared document need not match the virtual document's
+        // (a gap may have grown or shrunk), so map each endpoint as a
+        // position first; the arithmetic below then works in V.
+        for folding in &mut ranges {
+            let start = prepared.to_virtual(
+                Position::new(folding.start_line, folding.start_character.unwrap_or(0)),
+                Bias::Start,
+            );
+            let end = prepared.to_virtual(
+                Position::new(folding.end_line, folding.end_character.unwrap_or(u32::MAX)),
+                Bias::End,
+            );
+            folding.start_line = start.line;
+            folding.start_character = folding.start_character.map(|_| start.character);
+            folding.end_line = end.line;
+            folding.end_character = folding.end_character.map(|_| end.character);
+        }
+    }
 
     for folding in &mut ranges {
         let virtual_start_line = folding.start_line;

@@ -18,7 +18,7 @@ use url::Url;
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, response_has_jsonrpc_error,
-    text_edit_safe_in_region, translate_host_range_to_virtual, translate_virtual_range_to_host,
+    text_edit_safe_in_region, translate_host_range_to_virtual, translate_virtual_text_edit_to_host,
     virtual_uri_to_lsp_uri,
 };
 
@@ -131,6 +131,14 @@ fn transform_color_presentation_response_to_host(
     if result.is_null() {
         return vec![];
     }
+    // A presentation replaces the request range (its label, or an edit the
+    // server keys to that range); over a gap of a prepared document that
+    // range stands for host-owned text no presentation may overwrite — the
+    // prepared range may even be empty, where an edit would only insert
+    // beside the host text it was asked to replace.
+    if super::super::protocol::host_range_in_prepared_gap(host_request_range, offset) {
+        return vec![];
+    }
 
     // Parse into typed Vec<ColorPresentation>
     let mut presentations: Vec<ColorPresentation> = match serde_json::from_value(result) {
@@ -148,6 +156,17 @@ fn transform_color_presentation_response_to_host(
     // additionalTextEdits are merely stripped.
     let before = presentations.len();
     presentations.retain_mut(|presentation| {
+        // On a prepared document the request range can cover a gap the
+        // label would overwrite; make the implicit edit explicit (in
+        // prepared coordinates) so it is mapped and checked like any other.
+        if presentation.text_edit.is_none() && offset.prepared().is_some() {
+            let mut range = host_request_range;
+            translate_host_range_to_virtual(&mut range, offset);
+            presentation.text_edit = Some(tower_lsp_server::ls_types::TextEdit {
+                range,
+                new_text: presentation.label.clone(),
+            });
+        }
         // No textEdit: the client replaces the REQUEST range with the label
         // (LSP 3.18). Guard that implicit edit exactly like an explicit one —
         // a synthetic TextEdit over the (host) request range with the label
@@ -162,11 +181,11 @@ fn transform_color_presentation_response_to_host(
                 return false;
             }
         }
-        if let Some(text_edit) = &mut presentation.text_edit {
-            translate_virtual_range_to_host(&mut text_edit.range, offset);
-            if !text_edit_safe_in_region(text_edit, offset, region_end) {
-                return false;
-            }
+        if let Some(text_edit) = &mut presentation.text_edit
+            && (!translate_virtual_text_edit_to_host(text_edit, offset)
+                || !text_edit_safe_in_region(text_edit, offset, region_end))
+        {
+            return false;
         }
 
         // ALL-OR-NOTHING (same reasoning as completion): the array can carry
@@ -175,12 +194,20 @@ fn transform_color_presentation_response_to_host(
         // its textEdit still applies, though possibly semantically incomplete
         // — availability over fidelity, never corruption.
         if let Some(additional_edits) = &mut presentation.additional_text_edits {
-            for edit in additional_edits.iter_mut() {
-                translate_virtual_range_to_host(&mut edit.range, offset);
-            }
-            if !additional_edits
-                .iter()
-                .all(|edit| text_edit_safe_in_region(edit, offset, region_end))
+            let translated = additional_edits
+                .iter_mut()
+                .all(|edit| translate_virtual_text_edit_to_host(edit, offset))
+                && !(offset.prepared().is_some()
+                    && super::super::protocol::ranges_overlap(
+                        additional_edits
+                            .iter()
+                            .map(|edit| &edit.range)
+                            .chain(presentation.text_edit.as_ref().map(|edit| &edit.range)),
+                    ));
+            if !translated
+                || !additional_edits
+                    .iter()
+                    .all(|edit| text_edit_safe_in_region(edit, offset, region_end))
             {
                 log::warn!(
                     target: "kakehashi::bridge",
@@ -729,6 +756,85 @@ mod tests {
 
         assert_eq!(presentations.len(), 1, "region-escaping presentation drops");
         assert_eq!(presentations[0].label, "contained");
+    }
+
+    #[test]
+    fn a_label_over_a_prepared_gap_is_dropped() {
+        use super::super::super::protocol::{SegmentKind, VirtualLayout, apply_prepare_result};
+        // `color: #${c};` prepared as `color: #ff0000;`.
+        let virtual_text = "color: #    ;";
+        let layout = VirtualLayout::from_pieces(
+            virtual_text,
+            [
+                (SegmentKind::Content, 0..8, String::new()),
+                (SegmentKind::Gap, 8..12, "${c}".to_string()),
+                (SegmentKind::Content, 12..13, String::new()),
+            ],
+        );
+        let result = serde_json::from_value(json!({"segments": [
+            {"type": "content"}, {"type": "gap", "content": "ff0000"}, {"type": "content"}
+        ]}))
+        .unwrap();
+        let prepared = apply_prepare_result(virtual_text, &layout, Some(result)).unwrap();
+        let offset = RegionOffset::new(0, 0).with_prepared(prepared.map);
+        let response = json!({"jsonrpc": "2.0", "id": 1, "result": [
+            {"label": "#00ff00"},
+            {"label": "x", "textEdit": {
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}},
+                "newText": "shade"
+            }}
+        ]});
+        // The editor's request range is the interpolation itself: every
+        // presentation stands for replacing it.
+        let request = Range::new(Position::new(0, 8), Position::new(0, 12));
+        let kept = transform_color_presentation_response_to_host(
+            response.clone(),
+            &offset,
+            Position::new(0, 13),
+            request,
+        );
+        assert!(kept.is_empty(), "{kept:?}");
+        // Requested elsewhere, the explicit edit outside the gap is kept.
+        let kept = transform_color_presentation_response_to_host(
+            response,
+            &offset,
+            Position::new(0, 13),
+            Range::new(Position::new(0, 0), Position::new(0, 5)),
+        );
+        assert_eq!(kept.len(), 2, "{kept:?}");
+    }
+
+    #[test]
+    fn a_presentation_over_an_emptied_gap_is_dropped() {
+        use super::super::super::protocol::{SegmentKind, VirtualLayout, apply_prepare_result};
+        // `color: #${c};` with the interpolation prepared as nothing: the
+        // request range is empty in the prepared document.
+        let virtual_text = "color: #    ;";
+        let layout = VirtualLayout::from_pieces(
+            virtual_text,
+            [
+                (SegmentKind::Content, 0..8, String::new()),
+                (SegmentKind::Gap, 8..12, "${c}".to_string()),
+                (SegmentKind::Content, 12..13, String::new()),
+            ],
+        );
+        let result = serde_json::from_value(json!({"segments": [
+            {"type": "content"}, {"type": "gap", "content": ""}, {"type": "content"}
+        ]}))
+        .unwrap();
+        let prepared = apply_prepare_result(virtual_text, &layout, Some(result)).unwrap();
+        let offset = RegionOffset::new(0, 0).with_prepared(prepared.map);
+        let response = json!({"jsonrpc": "2.0", "id": 1, "result": [{"label": "#00ff00"}]});
+        let kept = transform_color_presentation_response_to_host(
+            response,
+            &offset,
+            Position::new(0, 13),
+            Range::new(Position::new(0, 8), Position::new(0, 12)),
+        );
+        assert!(
+            kept.is_empty(),
+            "the label would only be inserted beside ${{c}}: {kept:?}"
+        );
     }
 
     #[test]

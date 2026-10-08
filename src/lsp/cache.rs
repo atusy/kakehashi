@@ -504,6 +504,7 @@ impl CacheCoordinator {
                         language: region.injection_language.clone(),
                         region_id: region.region.region_id.clone(),
                         content: region.virtual_content.clone(),
+                        gaps: std::sync::Arc::clone(&region.gaps),
                     })
                     .collect();
                 crate::document::snapshot::ResolvedRegions {

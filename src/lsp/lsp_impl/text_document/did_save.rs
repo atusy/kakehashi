@@ -149,6 +149,19 @@ impl Kakehashi {
         if current_lineage == Some((saved_incarnation, saved_content_version))
             && let Some((_, Some(injections))) = self.injection_coordinator().bridge_injections(uri)
         {
+            // Held documents miss this save; it is forwarded to them once
+            // their prepared text is sent.
+            let held: Vec<String> = injections
+                .iter()
+                .filter(|injection| injection.held)
+                .map(|injection| injection.region_id.clone())
+                .collect();
+            if !held.is_empty() {
+                self.bridge
+                    .hold_save(uri, saved_incarnation, saved_content_version, held);
+            }
+            let injections = crate::lsp::lsp_impl::coordinator::sendable_injections(injections);
+            self.injection_coordinator().note_sending(uri, &injections);
             pool.sync_and_forward_did_save_to_virtual_docs(uri, saved_incarnation, &injections)
                 .await;
         }

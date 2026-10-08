@@ -9,6 +9,7 @@
 //! - `command_routing` - Encode/decode the origin server in a bridged command name
 //! - `jsonrpc` - JSON-RPC message types and error inspection
 //! - `lifecycle` - Initialize/shutdown message builders
+//! - `prepare` - `kakehashi/virtualDocument/prepare` wire types and the prepared↔virtual map
 //! - `request_id` - RequestId type for type-safe request ID handling
 //! - `virtual_uri` - VirtualDocumentUri type for encoding injection region references
 //! - `request` - Request builders for downstream language servers
@@ -20,6 +21,7 @@ mod client_capabilities;
 mod command_routing;
 mod jsonrpc;
 mod lifecycle;
+mod prepare;
 mod request;
 mod request_id;
 mod response;
@@ -34,6 +36,11 @@ pub(crate) use jsonrpc::{
     JsonRpcNotification, JsonRpcRequest, jsonrpc_error_summary, response_has_jsonrpc_error,
 };
 pub(crate) use lifecycle::*;
+pub(crate) use prepare::{
+    Bias, PREPARE_METHOD, PREPARE_TIMEOUT, PrepareHostTextDocument, PrepareParams, PrepareResult,
+    PrepareTextDocument, PreparedDocument, PreparedMap, SegmentKind, VirtualLayout,
+    apply_prepare_result, parse_prepare_response,
+};
 pub(crate) use request::*;
 pub(crate) use request_id::RequestId;
 pub(crate) use response::*;

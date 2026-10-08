@@ -85,7 +85,7 @@ use crate::lsp::bridge::{
     workspace_edit_preserves_line_prefixes, workspace_edit_within_region,
 };
 
-use super::region_offset::resolve_region_offset;
+use super::region_offset::{resolve_region_offset_and_text, sent_text_held};
 
 /// Translates `workspace/applyEdit` params whose edit targets a virtual
 /// document back to the host document + host coordinates. Holds shared
@@ -171,13 +171,15 @@ impl ApplyEditTranslator {
                 "kakehashi: the virtual document's host URI is unmappable: {host_url}"
             ));
         };
-        let Some((offset, region_end, contiguous, _)) = resolve_region_offset(
-            &self.documents,
-            &self.language,
-            &self.bridge,
-            &host_url,
-            &region_id,
-        ) else {
+        let Some(((offset, region_end, contiguous, _), virtual_text)) =
+            resolve_region_offset_and_text(
+                &self.documents,
+                &self.language,
+                &self.bridge,
+                &host_url,
+                &region_id,
+            )
+        else {
             // The region moved or was removed since the downstream produced
             // the edit; translating against a stale offset would edit the
             // wrong host text.
@@ -187,9 +189,29 @@ impl ApplyEditTranslator {
             );
         };
         ensure_editable_region(contiguous)?;
+        self.ensure_sent_text_held(&offset, &virtual_text, virtual_uri, connection)?;
 
         transform_params_to_host(&mut params, virtual_uri, &host_uri, &offset, region_end)?;
         Ok(params)
+    }
+
+    /// See [`sent_text_held`]: an unversioned edit skips the version check,
+    /// and a versioned one can pass it just before the send.
+    fn ensure_sent_text_held(
+        &self,
+        offset: &RegionOffset,
+        virtual_text: &str,
+        virtual_uri: &str,
+        connection: &ConnectionKey,
+    ) -> Result<(), String> {
+        if sent_text_held(&self.bridge, offset, virtual_text, virtual_uri, connection) {
+            Ok(())
+        } else {
+            Err(
+                "kakehashi: the injected region changed before the edit could be applied"
+                    .to_string(),
+            )
+        }
     }
 
     /// Validate every versioned `TextDocumentEdit` targeting a VIRTUAL
@@ -656,6 +678,86 @@ mod tests {
             .register_opened_document_for_test(&host_url, &typed_uri, connection)
             .await;
         (bridge, typed_uri)
+    }
+
+    #[tokio::test]
+    async fn an_inbound_edit_needs_the_connection_to_hold_the_sent_text() {
+        use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
+        let connection = test_connection();
+        let (bridge, typed_uri) =
+            bridge_with_open_document("01ARZ3NDEKTSV4RRFFQ69G5FAV", &connection).await;
+        let virtual_text = "  a\n";
+        let result = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(result),
+        )
+        .unwrap();
+        let offset = RegionOffset::new(0, 0).with_prepared(prepared.map);
+        let translator = translator_with_bridge(Arc::clone(&bridge));
+        let uri = typed_uri.to_uri_string();
+        // The server still holds the text before this map's.
+        bridge
+            .record_sent_content_for_test(&typed_uri, &connection, "  a\n")
+            .await;
+        assert!(
+            translator
+                .ensure_sent_text_held(&offset, "  a\n", &uri, &connection)
+                .is_err()
+        );
+        bridge
+            .record_sent_content_for_test(&typed_uri, &connection, "a\n")
+            .await;
+        assert!(
+            translator
+                .ensure_sent_text_held(&offset, "  a\n", &uri, &connection)
+                .is_ok()
+        );
+        // Nothing prepared yet: an unprepared region is not checked.
+        assert!(
+            translator
+                .ensure_sent_text_held(&RegionOffset::new(0, 0), "  a\n", &uri, &connection)
+                .is_ok()
+        );
+        // Once something is prepared, a region that lost its peer is checked
+        // too: the server still holds the prepared "a\n", not "  a\n".
+        let host_url = url::Url::parse("file:///project/doc.md").unwrap();
+        let _ = bridge.prepared_document_now(
+            &crate::lsp::bridge::PrepareTarget {
+                candidates: std::sync::Arc::new([crate::lsp::bridge::ResolvedServerConfig {
+                    server_name: "peer".to_string(),
+                    config: std::sync::Arc::new(crate::config::settings::BridgeServerConfig {
+                        cmd: Some(vec!["/nonexistent/kakehashi-prepare-peer".to_string()]),
+                        ..Default::default()
+                    }),
+                }]),
+            },
+            crate::lsp::bridge::PrepareInput {
+                host_uri: &host_url,
+                host_language: "markdown",
+                injection_language: "lua",
+                region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+                virtual_text: "",
+                gaps: &[],
+            },
+        );
+        assert!(
+            translator
+                .ensure_sent_text_held(&RegionOffset::new(0, 0), "  a\n", &uri, &connection)
+                .is_err()
+        );
+        bridge
+            .record_sent_content_for_test(&typed_uri, &connection, "  a\n")
+            .await;
+        assert!(
+            translator
+                .ensure_sent_text_held(&RegionOffset::new(0, 0), "  a\n", &uri, &connection)
+                .is_ok()
+        );
     }
 
     #[tokio::test]

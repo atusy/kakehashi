@@ -37,7 +37,7 @@ use tower_lsp_server::ls_types::{
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
-use super::super::protocol::translate_virtual_range_to_host;
+use super::super::protocol::translate_virtual_text_edits_to_host;
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, region_host_end,
     response_has_jsonrpc_error, text_edit_safe_in_region,
@@ -121,9 +121,13 @@ impl LanguageServerPool {
 ///
 /// Returns 1 for the empty string (a single empty line, index 0).
 pub(super) fn count_lines(text: &str) -> u32 {
-    // `matches('\n').count() + 1` gives the number of line "buckets" in the
-    // split — exactly what the LSP position model expects.
-    u32::try_from(text.matches('\n').count())
+    // Line breaks + 1 gives the number of line "buckets" in the split —
+    // exactly what the LSP position model expects, whose line breaks are
+    // `\n`, `\r\n` and a lone `\r` (which a prepare peer's gap placeholder,
+    // say, may contain).
+    let breaks =
+        text.matches('\n').count() + text.matches('\r').count() - text.matches("\r\n").count();
+    u32::try_from(breaks)
         .unwrap_or(u32::MAX - 1)
         .saturating_add(1)
 }
@@ -270,9 +274,15 @@ pub(super) fn transform_formatting_response_to_host(
         return Ok(Vec::new());
     }
 
-    for edit in &mut edits {
-        translate_virtual_range_to_host(&mut edit.range, offset);
-    }
+    // A prepared document's edits are re-diffed back into the virtual
+    // document; one touching host-owned text (a gap) fails the request
+    // rather than reading as "already formatted" (the CLI exits non-zero,
+    // an editor's log shows the failure).
+    let Some(mut edits) = translate_virtual_text_edits_to_host(edits, offset) else {
+        return Err(io::Error::other(
+            "formatting result edits host-owned text of a prepared virtual document",
+        ));
+    };
 
     // Clamp synthetic-EOF sentinels into the region: the (last line, u32::MAX)
     // sentinel from `clamp_synthetic_eof_anchor` saturates through translation
@@ -816,6 +826,8 @@ mod tests {
     #[case::trailing_newline("abc\n", 2)]
     #[case::two_trailing_newlines("abc\n\n", 3)]
     #[case::only_newline("\n", 2)]
+    #[case::crlf("abc\r\ndef", 2)]
+    #[case::lone_cr("abc\rdef\r", 3)]
     fn count_lines_matches_lsp_line_model(#[case] input: &str, #[case] expected: u32) {
         assert_eq!(count_lines(input), expected);
     }

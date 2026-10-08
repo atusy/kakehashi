@@ -17,7 +17,8 @@ use super::{
 };
 use crate::lsp::bridge::actor::RouterCleanupGuard;
 use crate::lsp::bridge::protocol::{
-    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, host_position_within_region_bounds,
+    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, host_position_in_prepared_gap,
+    host_position_within_region_bounds,
 };
 
 /// Context provided to response transformers during bridge request execution.
@@ -56,6 +57,23 @@ impl Drop for RequestHostLifecycle<'_> {
         self.pool
             .remove_host_lifecycle_lock_if_unshared(self.host_uri, &self.lifecycle);
     }
+}
+
+/// How long a request on a prepared document waits for the lifecycle pass
+/// to sync the prepared text it was built for (see
+/// `LanguageServerPool::wait_for_prepared_sync`). The answer is already in
+/// by then and the sync follows it within a lifecycle pass; a request whose
+/// text a newer edit superseded never sees its text sent and fails here
+/// (the pool cannot tell supersession from a slow pass, and the editor
+/// usually cancels such a request first).
+const PREPARED_SYNC_WAIT: std::time::Duration = super::super::protocol::PREPARE_TIMEOUT;
+const PREPARED_SYNC_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+fn prepared_text_not_synced(connection_key: &super::ConnectionKey) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::WouldBlock,
+        format!("{connection_key} does not hold the prepared text this request was built for"),
+    )
 }
 
 impl LanguageServerPool {
@@ -172,6 +190,14 @@ impl LanguageServerPool {
         // Build virtual document URI
         let virtual_uri = VirtualDocumentUri::new(&host_uri_lsp, injection_language, region_id);
 
+        let check_held_text = self.checks_held_text(offset);
+        // Before the host lifecycle guard: the wait can last the whole sync
+        // budget, and a didClose or reopen must not queue behind it.
+        if check_held_text {
+            self.wait_for_prepared_sync(&virtual_uri, connection_key, virtual_content)
+                .await?;
+        }
+
         let host_lifecycle = match expected_incarnation {
             Some(expected) => {
                 self.request_host_lifecycle_for_incarnation(host_uri, expected)
@@ -275,6 +301,22 @@ impl LanguageServerPool {
                 return Err(e);
             }
 
+            // A prepared request's map describes `virtual_content` only; the
+            // open above may have sent newer cached text instead.
+            if check_held_text
+                && !self.document_tracker.sent_content_is(
+                    &virtual_uri,
+                    connection_key,
+                    virtual_content,
+                )
+            {
+                drop(connections);
+                if let Some(ref id) = upstream_request_id {
+                    self.unregister_upstream_request(id, connection_key);
+                }
+                return Err(prepared_text_not_synced(connection_key));
+            }
+
             // Queue the request via single-writer loop (ls-bridge-message-ordering)
             if let Err(e) = handle.send_request(request, request_id) {
                 drop(connections);
@@ -306,6 +348,55 @@ impl LanguageServerPool {
         };
 
         Ok(transform_response(response?, &context))
+    }
+
+    /// Whether a request must check that its server holds exactly the text
+    /// its coordinates describe. Once anything is prepared, the text a server
+    /// holds can be prepared or not — and right after a pair gains or loses
+    /// its peer, it can be the other one than the request's.
+    pub(super) fn checks_held_text(&self, offset: &RegionOffset) -> bool {
+        offset.prepared().is_some() || self.prepare_used()
+    }
+
+    /// Wait (briefly) until a connection that has the document open holds
+    /// exactly `prepared_text` — the prepared text, or the virtual text of a
+    /// document no longer prepared.
+    ///
+    /// A request is prepared for the newest virtual text, while the lifecycle
+    /// pass sends that text only once its prepare answer is in — so right
+    /// after an edit, an open document can still hold the previous prepared
+    /// text, and its answer would be in coordinates the request's map
+    /// misreads. Likewise right after a settings change drops the pair's
+    /// peer: the request is unprepared at once, the document is not until
+    /// the lifecycle pass sends it. The lifecycle pass is the only sender (a request sending
+    /// here could overtake a newer text), so the request waits for it and
+    /// fails if it does not come.
+    async fn wait_for_prepared_sync(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &super::ConnectionKey,
+        prepared_text: &str,
+    ) -> io::Result<()> {
+        let uri_string = virtual_uri.to_uri_string();
+        let fingerprint = super::document_tracker::content_fingerprint(prepared_text);
+        let deadline = tokio::time::Instant::now() + PREPARED_SYNC_WAIT;
+        loop {
+            if !self
+                .document_tracker
+                .is_virtual_doc_open_on_connection(&uri_string, connection_key)
+                || self.document_tracker.sent_fingerprint_is(
+                    &uri_string,
+                    connection_key,
+                    fingerprint,
+                )
+            {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(prepared_text_not_synced(connection_key));
+            }
+            tokio::time::sleep(PREPARED_SYNC_POLL).await;
+        }
     }
 
     /// Like [`execute_bridge_request_with_handle`](Self::execute_bridge_request_with_handle)
@@ -432,8 +523,18 @@ impl LanguageServerPool {
         // the content actually opened — the same in-flight staleness every
         // LSP position request has, which downstream servers clamp. Closing
         // it needs generation-bound opens (issue #996).
-        if !host_position_within_region_bounds(host_position, offset, region_end) {
-            if host_position.line < offset.line() {
+        if !host_position_within_region_bounds(host_position, offset, region_end)
+            || host_position_in_prepared_gap(host_position, offset)
+        {
+            if host_position_in_prepared_gap(host_position, offset) {
+                log::debug!(
+                    target: "kakehashi::bridge",
+                    "{method}: host position (line {}, char {}) is inside a prepared gap; \
+                     aborting request",
+                    host_position.line,
+                    host_position.character,
+                );
+            } else if host_position.line < offset.line() {
                 // Line above the region → almost certainly stale region data
                 // (a concurrent host edit shifted the region). Unexpected.
                 warn!(
@@ -509,6 +610,21 @@ mod tests {
     use crate::lsp::bridge::pool::test_helpers::*;
     use crate::lsp::bridge::protocol::region_host_end;
     use std::sync::Arc;
+
+    #[test]
+    fn requests_check_the_held_text_once_anything_is_prepared() {
+        let pool = LanguageServerPool::new();
+        let unprepared = RegionOffset::new(0, 0);
+        assert!(
+            !pool.checks_held_text(&unprepared),
+            "without preparation, documents behave as before"
+        );
+        pool.note_prepare_used();
+        assert!(
+            pool.checks_held_text(&unprepared),
+            "a server may still hold the prepared text of a pair that lost its peer"
+        );
+    }
 
     fn start_observed_request(
         pool: Arc<LanguageServerPool>,

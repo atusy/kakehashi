@@ -873,6 +873,86 @@ The `bridge` map in language configuration controls which injection languages ar
 | `{}` | Disable bridging entirely for this host language |
 | `null` or omitted | Bridge all configured languages (default) |
 
+**Preparing Virtual Documents (`prepare`, experimental):**
+
+Embedded code is not always valid as written: a Nix indented string's
+content is indented by the host, and its `${…}` interpolations leave holes.
+A language server can rewrite each virtual document before the downstream
+servers see it, via `kakehashi/virtualDocument/prepare`
+(see virtual-document-prepare-protocol), when it advertises
+`experimental.kakehashi.virtualDocumentPrepare`. The feature requires
+`KAKEHASHI_EXPERIMENTAL=true`.
+
+The server is chosen like those of any other method, by the method's
+aggregation `priorities` among the servers bridged for the language (so the
+server must list the languages it prepares, or `"*"`). The strategy is
+always `preferred`: the first server in priority order that advertises the
+request prepares the document; when none does, the document is sent as is.
+The default `priorities = ["*"]` uses any server that offers it; `[]` opts
+a language out:
+
+A server that advertises the request is asked wherever it is bridged, and
+answering `null` still makes a document prepared (held for each answer,
+its `*/resolve` refused), so a peer meant for some hosts only is best
+enabled for those alone:
+
+```toml
+# Prepare nothing by default…
+[languages._.bridge._.aggregation."kakehashi/virtualDocument/prepare"]
+priorities = []
+
+# …except injections in Nix, with tsudoi
+[languages.nix.bridge._.aggregation."kakehashi/virtualDocument/prepare"]
+priorities = ["tsudoi"]
+
+[languageServers.tsudoi]
+cmd = ["deno", "run", "-A", "npm:@atusy/tsudoi-language-server@0.1.0-alpha.2/cli", "--config", "/path/to/tsudoi.config.ts"]
+languages = ["*"]       # the languages it prepares
+```
+
+Being bridged for those languages, the server also receives their
+documents and takes part in their other methods; a method's `priorities`
+that name the servers it should use keep it out.
+
+The request presents the document as ordered segments: `content` (the
+injected text) and `gap` (host text between `injection.combined` captures,
+such as an interpolation). The answer may delete leading whitespace from
+content lines and replace any gap with text of any length:
+
+```ts
+// tsudoi.config.ts
+export default async () => ({
+  methods: {
+    initialize: async (context: any) => ({
+      ...context.preparedResult,
+      capabilities: {
+        ...context.preparedResult.capabilities,
+        experimental: { kakehashi: { virtualDocumentPrepare: true } },
+      },
+    }),
+  },
+  customMethods: {
+    "kakehashi/virtualDocument/prepare": (_context: any, params: any) =>
+      Promise.resolve({
+        result: {
+          segments: params.segments.map((segment: any) =>
+            segment.type === "gap" ? { type: "gap", content: "null" } : { type: "content" }
+          ),
+        },
+      }),
+  },
+});
+```
+
+kakehashi translates every position, range and edit between the prepared
+and the original document. Edits that would touch a gap are refused, which
+also makes formatting and other edit-producing methods available for
+combined documents — except the concatenated formatting pipeline on a
+blockquoted (line-prefixed) region, whose result is refused when prepared,
+and linkedEditingRange and prepareRename, which stay unavailable on
+combined documents. A document the server fails to prepare is not sent
+downstream at all; answer `null` to keep a document unchanged.
+
 ### Configuration Files
 
 kakehashi loads configuration from `~/.config/kakehashi/kakehashi.toml` (user config) and `./kakehashi.toml` (project config). Both use the same TOML format:

@@ -58,6 +58,8 @@ fn capability_prefilter_applies(method: &str) -> bool {
 /// range, including inter-capture gaps, stripped line prefixes, and excluded
 /// child ranges. Until edit translation carries the exact allowed spans,
 /// forwarding these methods could apply virtual whitespace over real host text.
+/// A prepared document's map is such a carrier for the methods that return
+/// edits ([`method_edits_bare_ranges`] excepted), so it lifts this rule.
 fn method_requires_contiguous_injection(method: &str) -> bool {
     matches!(
         method,
@@ -70,6 +72,23 @@ fn method_requires_contiguous_injection(method: &str) -> bool {
             | "textDocument/prepareRename"
             | "textDocument/rename"
     )
+}
+
+/// Whether a method answers with bare ranges the client edits verbatim
+/// (linked-editing ranges, the rename range), rather than with edits. A
+/// prepared map refuses edits that touch a gap, but a bare range over one
+/// translates like any range, so these stay contiguous-only even prepared.
+fn method_edits_bare_ranges(method: &str) -> bool {
+    matches!(
+        method,
+        "textDocument/linkedEditingRange" | "textDocument/prepareRename"
+    )
+}
+
+/// Whether a non-contiguous document is closed to `method`: it needs one
+/// contiguous span, and a prepared map (`prepared`) cannot stand in.
+fn non_contiguous_refuses(method: &str, prepared: bool) -> bool {
+    method_requires_contiguous_injection(method) && (!prepared || method_edits_bare_ranges(method))
 }
 
 /// The region-boundary rule a method's position resolves under.
@@ -196,6 +215,100 @@ pub(crate) struct DocumentRequestContext {
     /// aggregates the fanned-out downstreams' `$/progress` onto it
     /// (ls-bridge-client-progress); `None` disables client-progress aggregation.
     pub(crate) client_progress_token: Option<tower_lsp_server::ls_types::NumberOrString>,
+    /// Prepared ↔ virtual coordinates when `resolved.virtual_content` holds
+    /// the prepared document downstream servers see (see
+    /// [`prepare_request_context`]).
+    pub(crate) prepared: Option<std::sync::Arc<crate::lsp::bridge::PreparedMap>>,
+}
+
+/// Present `ctx`'s virtual document as downstream servers see it, waiting for
+/// the prepare peer when the (host, injection) pair has one: the context's
+/// virtual content becomes the prepared text and its fan-out translates
+/// through the prepared map. `None` when the document could not be prepared —
+/// the region is then not bridged at all, never bridged unprepared.
+pub(crate) async fn prepare_request_context(
+    bridge: &crate::lsp::bridge::BridgeCoordinator,
+    settings: &std::sync::Arc<WorkspaceSettings>,
+    experimental: bool,
+    host_language: &str,
+    ctx: DocumentRequestContext,
+) -> Option<DocumentRequestContext> {
+    prepare_request_context_or_miss(bridge, settings, experimental, host_language, ctx)
+        .await
+        .ok()
+}
+
+/// [`prepare_request_context`], telling a document whose answer is not in
+/// (yet) — `Err(true)`: a later answer may bring it — from one the peer
+/// answered unusably (`Err(false)`, final).
+pub(crate) async fn prepare_request_context_or_miss(
+    bridge: &crate::lsp::bridge::BridgeCoordinator,
+    settings: &std::sync::Arc<WorkspaceSettings>,
+    experimental: bool,
+    host_language: &str,
+    ctx: DocumentRequestContext,
+) -> Result<DocumentRequestContext, bool> {
+    let Some(target) = bridge.prepare_target(
+        settings,
+        host_language,
+        &ctx.resolved.injection_language,
+        experimental,
+    ) else {
+        return Ok(ctx);
+    };
+    let prepared = bridge
+        .prepared_document_or_miss(&target, prepare_input(&ctx, host_language))
+        .await?;
+    Ok(with_prepared(ctx, &prepared))
+}
+
+/// [`prepare_request_context`] without waiting, for paths that cannot: a
+/// document whose answer is not in yet is skipped like a failed one (its
+/// host is synced again when the answer arrives).
+pub(crate) fn prepare_request_context_now(
+    bridge: &crate::lsp::bridge::BridgeCoordinator,
+    settings: &std::sync::Arc<WorkspaceSettings>,
+    experimental: bool,
+    host_language: &str,
+    ctx: DocumentRequestContext,
+) -> Option<DocumentRequestContext> {
+    let Some(target) = bridge.prepare_target(
+        settings,
+        host_language,
+        &ctx.resolved.injection_language,
+        experimental,
+    ) else {
+        return Some(ctx);
+    };
+    match bridge.prepared_document_now_for_request(&target, prepare_input(&ctx, host_language)) {
+        crate::lsp::bridge::PrepareLookup::Ready(prepared) => Some(with_prepared(ctx, &prepared)),
+        crate::lsp::bridge::PrepareLookup::Failed | crate::lsp::bridge::PrepareLookup::Pending => {
+            None
+        }
+    }
+}
+
+fn prepare_input<'a>(
+    ctx: &'a DocumentRequestContext,
+    host_language: &'a str,
+) -> crate::lsp::bridge::PrepareInput<'a> {
+    crate::lsp::bridge::PrepareInput {
+        host_uri: &ctx.uri,
+        host_language,
+        injection_language: &ctx.resolved.injection_language,
+        region_id: &ctx.resolved.region.region_id,
+        virtual_text: &ctx.resolved.virtual_content,
+        gaps: &ctx.resolved.gaps,
+    }
+}
+
+fn with_prepared(
+    mut ctx: DocumentRequestContext,
+    prepared: &crate::lsp::bridge::PreparedDocument,
+) -> DocumentRequestContext {
+    ctx.resolved.virtual_content = prepared.text.clone();
+    ctx.prepared = prepared.map.clone();
+    ctx
 }
 
 /// All resolved context needed to send a **host** bridge request
@@ -1086,7 +1199,15 @@ impl Kakehashi {
             return None;
         };
 
-        if !resolved.contiguous && method_requires_contiguous_injection(method_name) {
+        // Edits cannot be validated against a non-contiguous document's masked
+        // gaps, unless a prepare peer's map will (checked again once the
+        // context is prepared).
+        if !resolved.contiguous
+            && non_contiguous_refuses(
+                method_name,
+                self.prepares(&language_name, &resolved.injection_language),
+            )
+        {
             return None;
         }
 
@@ -1310,7 +1431,8 @@ impl Kakehashi {
             method_name,
         );
 
-        Some(DocumentRequestContext {
+        let ctx = DocumentRequestContext {
+            prepared: None,
             uri: preamble.uri,
             resolved: preamble.resolved,
             region_end: Some(preamble.region_end),
@@ -1320,7 +1442,34 @@ impl Kakehashi {
             strategy: agg.strategy,
             max_fan_out: agg.max_fan_out,
             client_progress_token: None,
-        })
+        };
+        let ctx = prepare_request_context(
+            &self.bridge,
+            &self.settings_manager.load_settings(),
+            self.experimental_enabled(),
+            &preamble.language_name,
+            ctx,
+        )
+        .await?;
+        // A prepared document's map keeps edits off its gaps; without one, a
+        // non-contiguous document stays closed to edit-producing methods.
+        if !ctx.resolved.contiguous && non_contiguous_refuses(method_name, ctx.prepared.is_some()) {
+            return None;
+        }
+        Some(ctx)
+    }
+
+    /// Whether `injection_language` documents in `host_language` hosts go
+    /// through a prepare peer (`bridge.<injection>.prepare`).
+    pub(crate) fn prepares(&self, host_language: &str, injection_language: &str) -> bool {
+        self.bridge
+            .prepare_target(
+                &self.settings_manager.load_settings(),
+                host_language,
+                injection_language,
+                self.experimental_enabled(),
+            )
+            .is_some()
     }
 
     /// Resolve all aggregation settings (strategy, priorities, max_fan_out) for a
@@ -1886,7 +2035,12 @@ impl Kakehashi {
         };
         let mut contexts = Vec::new();
         for resolved in regions {
-            if !resolved.contiguous && method_requires_contiguous_injection(method_name) {
+            if !resolved.contiguous
+                && non_contiguous_refuses(
+                    method_name,
+                    self.prepares(&language_name, &resolved.injection_language),
+                )
+            {
                 continue;
             }
             // Clamp to the region so the translated range is in-region; skip a
@@ -3355,6 +3509,25 @@ mod tests {
                 "{method} must be prefiltered"
             );
         }
+    }
+
+    #[test]
+    fn a_prepared_map_opens_edit_methods_but_not_bare_ranges() {
+        for method in [
+            "textDocument/rename",
+            "textDocument/completion",
+            "textDocument/codeAction",
+        ] {
+            assert!(non_contiguous_refuses(method, false), "{method}");
+            assert!(!non_contiguous_refuses(method, true), "{method}");
+        }
+        for method in [
+            "textDocument/linkedEditingRange",
+            "textDocument/prepareRename",
+        ] {
+            assert!(non_contiguous_refuses(method, true), "{method}");
+        }
+        assert!(!non_contiguous_refuses("textDocument/hover", false));
     }
 
     #[test]

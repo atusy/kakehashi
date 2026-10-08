@@ -367,9 +367,7 @@ fn inlay_hint_region_is_resolvable(
     contiguous: bool,
     live_language: &str,
 ) -> bool {
-    contiguous
-        && *offset == crate::lsp::bridge::RegionOffset::from(&envelope.offset)
-        && envelope.injection_language == live_language
+    contiguous && envelope.offset.describes(offset) && envelope.injection_language == live_language
 }
 
 struct HostInlayHints {

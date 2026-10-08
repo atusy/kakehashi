@@ -116,7 +116,7 @@ impl VirtualUriObserver {
 /// and skip its re-sync: the downstream then analyzes stale content until a *later*
 /// edit happens to hash differently, and if no further edit occurs it stays stale.
 /// This is the standard fingerprint-guard tradeoff, accepted for the collision odds.
-fn content_fingerprint(content: &str) -> u64 {
+pub(crate) fn content_fingerprint(content: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     content.hash(&mut hasher);
@@ -679,6 +679,39 @@ impl DocumentTracker {
                 .or_default()
                 .insert(uri_string, fp);
         }
+    }
+
+    /// Whether `content` is what this connection was last sent (didOpen or
+    /// didChange) for the document.
+    pub(super) fn sent_content_is(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+        content: &str,
+    ) -> bool {
+        self.sent_fingerprint_is(
+            &virtual_uri.to_uri_string(),
+            connection_key,
+            content_fingerprint(content),
+        )
+    }
+
+    /// [`Self::sent_content_is`] for a precomputed URI string and
+    /// [`content_fingerprint`], so a poll hashes nothing under the lock.
+    pub(super) fn sent_fingerprint_is(
+        &self,
+        uri_string: &str,
+        connection_key: &ConnectionKey,
+        fingerprint: u64,
+    ) -> bool {
+        let fingerprints = self
+            .document_fingerprints
+            .lock()
+            .recover_poison("DocumentTracker::document_fingerprints");
+        fingerprints
+            .get(connection_key)
+            .and_then(|docs| docs.get(uri_string))
+            == Some(&fingerprint)
     }
 
     /// Remove a document from `document_versions` and `opened_documents`.

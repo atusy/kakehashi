@@ -139,6 +139,9 @@ pub(crate) struct ParsedInitializeCapabilities {
     pub(crate) capabilities: ServerCapabilities,
     pub(crate) dropped: Vec<DroppedCapability>,
     pub(crate) bridge_routing: bool,
+    /// `experimental.kakehashi.virtualDocumentPrepare`: the server answers
+    /// `kakehashi/virtualDocument/prepare`.
+    pub(crate) virtual_document_prepare: bool,
     pub(crate) type_hierarchy_provider: bool,
 }
 
@@ -197,6 +200,7 @@ pub(crate) fn parse_initialize_response_capabilities(
             capabilities: ServerCapabilities::default(),
             dropped: Vec::new(),
             bridge_routing: false,
+            virtual_document_prepare: false,
             type_hierarchy_provider: false,
         });
     };
@@ -207,12 +211,16 @@ pub(crate) fn parse_initialize_response_capabilities(
         ));
     };
 
-    let bridge_routing = capabilities
-        .get("experimental")
-        .and_then(|experimental| experimental.get("kakehashi"))
-        .and_then(|kakehashi| kakehashi.get("bridgeRouting"))
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+    let kakehashi_flag = |flag: &str| {
+        capabilities
+            .get("experimental")
+            .and_then(|experimental| experimental.get("kakehashi"))
+            .and_then(|kakehashi| kakehashi.get(flag))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    };
+    let bridge_routing = kakehashi_flag("bridgeRouting");
+    let virtual_document_prepare = kakehashi_flag("virtualDocumentPrepare");
 
     let type_hierarchy_provider = capabilities
         .get("typeHierarchyProvider")
@@ -220,6 +228,7 @@ pub(crate) fn parse_initialize_response_capabilities(
     let mut parsed = recover_server_capabilities(capabilities)?;
     parsed.type_hierarchy_provider = type_hierarchy_provider;
     parsed.bridge_routing = bridge_routing;
+    parsed.virtual_document_prepare = virtual_document_prepare;
     Ok(parsed)
 }
 
@@ -264,6 +273,7 @@ fn recover_server_capabilities(
         capabilities,
         dropped,
         bridge_routing: false,
+        virtual_document_prepare: false,
         type_hierarchy_provider: false,
     })
 }
@@ -663,6 +673,30 @@ mod tests {
             .expect("custom routing capability must not affect standard parsing");
         assert_eq!(parsed.bridge_routing, expected);
         assert!(parsed.dropped.is_empty());
+    }
+
+    #[rstest]
+    #[case::advertised(serde_json::json!(true), true)]
+    #[case::not_advertised(serde_json::json!(false), false)]
+    #[case::malformed(serde_json::json!("yes"), false)]
+    fn parses_virtual_document_prepare_advertisement(
+        #[case] advertisement: serde_json::Value,
+        #[case] expected: bool,
+    ) {
+        let response = serde_json::json!({
+            "result": {
+                "capabilities": {
+                    "experimental": {
+                        "kakehashi": {"virtualDocumentPrepare": advertisement}
+                    }
+                }
+            }
+        });
+
+        let parsed = parse_initialize_response_capabilities(&response)
+            .expect("custom prepare capability must not affect standard parsing");
+        assert_eq!(parsed.virtual_document_prepare, expected);
+        assert!(!parsed.bridge_routing);
     }
 
     #[rstest]

@@ -248,6 +248,7 @@ mod tests {
 
     fn virt_ctx_for_server(server: &str) -> DocumentRequestContext {
         DocumentRequestContext {
+            prepared: None,
             uri: Url::parse("file:///t.md").unwrap(),
             resolved: ResolvedInjection {
                 region: CacheableInjectionRegion {
@@ -262,6 +263,7 @@ mod tests {
                 virtual_content: String::new(),
                 line_column_offsets: vec![],
                 contiguous: true,
+                gaps: Default::default(),
             },
             region_end: None,
             configs: vec![ResolvedServerConfig {

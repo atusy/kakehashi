@@ -96,6 +96,10 @@ enum ClientRoot<'a> {
     LegacyPath(&'a str),
 }
 
+/// Times a prepare resync pass whose sends failed is retried (with the
+/// prepare backoff: one second, doubling) before waiting for the next edit.
+const MAX_RESYNC_RETRIES: u32 = 6;
+
 impl ClientRoot<'_> {
     /// How this root's origin reads in the startup log.
     fn source(&self) -> &'static str {
@@ -773,6 +777,93 @@ impl Kakehashi {
                 token,
                 editor_supports_apply_edit,
             ));
+        }
+
+        // Virtual documents held back for a prepare peer's answer are sent
+        // once it arrives: the finished request names the host, and the
+        // injection pass re-run for it now finds the prepared text. (A failed
+        // attempt names the host again after its retry backoff.)
+        if let Some(mut resync_rx) = self.bridge.take_prepare_resync_rx() {
+            let injection = self.injection_coordinator();
+            let diagnostics = self.diagnostic_scheduler();
+            let bridge = std::sync::Arc::clone(&self.bridge);
+            let token = self.shutdown_token.clone();
+            tokio::spawn(async move {
+                // Consecutive passes per host whose sends failed.
+                let mut failures: std::collections::HashMap<Url, u32> =
+                    std::collections::HashMap::new();
+                loop {
+                    let first = tokio::select! {
+                        _ = token.cancelled() => return,
+                        resync = resync_rx.recv() => match resync {
+                            Some(resync) => resync,
+                            None => return,
+                        },
+                    };
+                    // Several documents of one host usually finish together;
+                    // a host is re-diagnosed when any of its documents became
+                    // ready (a retry coming due sends nothing new yet).
+                    let mut hosts =
+                        std::collections::HashMap::from([(first.host_uri, first.ready)]);
+                    while let Ok(resync) = resync_rx.try_recv() {
+                        *hosts.entry(resync.host_uri).or_default() |= resync.ready;
+                    }
+                    for (uri, ready) in hosts {
+                        // A send the pass could not queue leaves its server
+                        // on the text before, and the answer is cached, so
+                        // no resync would come again: retry with backoff,
+                        // a bounded number of times, while the host is open.
+                        let synchronized = injection.process_injections_synchronized(&uri).await;
+                        // A pass the host's regions could not be looked at
+                        // for (a reload in progress) deferred its work to a
+                        // retry that only syncs documents: retried likewise,
+                        // so the diagnostics owed below are not lost.
+                        let looked =
+                            matches!(injection.bridge_injections(&uri), Some((_, Some(_))));
+                        // A save the held regions missed is replayed too; one
+                        // the regions could not be looked at for is kept.
+                        let replayed = injection.replay_held_save(&uri).await;
+                        let retrying = if synchronized && looked && replayed {
+                            failures.remove(&uri);
+                            false
+                        } else if injection.document_incarnation(&uri).is_some() {
+                            let failed = failures.entry(uri.clone()).or_default();
+                            *failed += 1;
+                            if *failed <= MAX_RESYNC_RETRIES {
+                                bridge.requeue_prepare_resync(
+                                    crate::lsp::bridge::Resync {
+                                        host_uri: uri.clone(),
+                                        ready,
+                                    },
+                                    crate::lsp::bridge::prepare_retry_delay(*failed),
+                                );
+                                true
+                            } else {
+                                failures.remove(&uri);
+                                false
+                            }
+                        } else {
+                            failures.remove(&uri);
+                            false
+                        };
+                        // A pull owed a refresh waits for a pass that reached
+                        // every server: one now would re-pull from a server
+                        // still holding the text before.
+                        if synchronized && looked {
+                            diagnostics.settle_pull_debt_after_prepare(&uri, ready);
+                        }
+                        // The diagnostic pass that ran when the host opened
+                        // or changed skipped the held regions; run it again
+                        // now that they reached their servers — or once the
+                        // retry carrying this readiness gets through. Not
+                        // after retries ran out: servers may still hold the
+                        // text before, and the next edit collects anyway.
+                        if ready && synchronized && looked && !retrying {
+                            diagnostics.spawn_diagnostic_task_after_prepare(uri);
+                        }
+                    }
+                }
+            });
         }
 
         // Ask a pull-capable client for its configuration now that the
@@ -1964,6 +2055,7 @@ fn spawn_upstream_request(
             }
             UpstreamRequest::ShowDocument {
                 params,
+                connection,
                 reply,
                 cancel,
             } => {
@@ -1974,7 +2066,12 @@ fn spawn_upstream_request(
                 // rebuilt); only a non-virtual/unresolvable URI is forwarded
                 // unchanged. See `ShowDocumentTranslator::translate`.
                 let params = match &translators {
-                    Some(translators) => translators.show_document.translate(params).await,
+                    Some(translators) => {
+                        translators
+                            .show_document
+                            .translate(params, &connection)
+                            .await
+                    }
                     None => params,
                 };
                 let id = client.next_request_id();
@@ -4721,6 +4818,7 @@ mod tests {
             .send(UpstreamRequest::ShowDocument {
                 params: serde_json::from_value(serde_json::json!({ "uri": "file:///x.rs" }))
                     .unwrap(),
+                connection: crate::lsp::bridge::ConnectionKey::for_server("test"),
                 reply: reply_tx,
                 cancel: test_forwarded_cancel(),
             })
