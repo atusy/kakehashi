@@ -891,13 +891,19 @@ request prepares the document; when none does, the document is sent as is.
 The default `priorities = ["*"]` uses any server that offers it; `[]` opts
 a language out:
 
+A server that advertises the request is asked wherever it is bridged, and
+answering `null` still makes a document prepared (held for each answer,
+its `*/resolve` refused), so a peer meant for some hosts only is best
+enabled for those alone:
+
 ```toml
-# Prepare with tsudoi only
+# Prepare nothing by default…
+[languages._.bridge._.aggregation."kakehashi/virtualDocument/prepare"]
+priorities = []
+
+# …except injections in Nix, with tsudoi
 [languages.nix.bridge._.aggregation."kakehashi/virtualDocument/prepare"]
 priorities = ["tsudoi"]
-
-[languages.nix.bridge.python.aggregation."kakehashi/virtualDocument/prepare"]
-priorities = []         # never prepare python in nix
 
 [languageServers.tsudoi]
 cmd = ["deno", "run", "-A", "npm:@atusy/tsudoi-language-server@0.1.0-alpha.2/cli", "--config", "/path/to/tsudoi.config.ts"]

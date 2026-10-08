@@ -310,6 +310,10 @@ answer `null`.
   their documents too; keeping it out of other methods takes `priorities`.
 - A peer that cannot start leaves its documents unprepared rather than
   unsent, so servers may see unprepared text until it is up.
+- A peer bridged for every language (`"*"`) prepares every injection it
+  can under the default `priorities`, and declining with `null` still
+  makes a document prepared; restricting it takes `priorities = []` where
+  it should not apply.
 - `*/resolve` for items from prepared documents is refused (stale).
 - A blockquoted (line-prefixed) region refuses any result of the
   concatenated formatting pipeline when prepared, since prefixes are not
