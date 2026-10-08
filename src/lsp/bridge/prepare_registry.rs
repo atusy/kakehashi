@@ -1086,12 +1086,15 @@ async fn try_run(
             Ok(handle) => handle,
             // Superseded: no answer for this revision.
             Err(error) if !admitted() => return Err(error),
+            // Advertising nothing until a handshake says otherwise, so later
+            // revisions are not held back to start it again.
             Err(error) => {
                 log::debug!(
                     target: "kakehashi::bridge::prepare",
                     "Prepare candidate {name} for {} did not start: {error}",
                     job.host_uri
                 );
+                pool.record_prepare_advertisement(name, false);
                 continue;
             }
         };
@@ -1260,6 +1263,9 @@ mod tests {
         let (cell, _) = registry.cell(&target, input, Holder::Request);
         assert!(!cell.in_flight.load(Ordering::Acquire));
         assert_eq!(*cell.attempts.borrow(), 1, "the revision was not retried");
+        // Not started again for each revision to find that out (its next
+        // handshake, when it is started to be bridged, says otherwise).
+        assert_eq!(pool.prepare_advertisement("peer"), Some(false));
     }
 
     #[test]
