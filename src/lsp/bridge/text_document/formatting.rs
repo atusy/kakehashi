@@ -245,11 +245,23 @@ pub(super) fn transform_formatting_response_to_host(
     // standard past-end-of-line clamping snaps them to the line's actual
     // length. Skipped for empty virtual docs (virtual_line_count == 0 is
     // never produced by count_lines, but guard against it just in case).
+    //
+    // A whole-document replacement — from the document start to an end past
+    // EOF, often an "end of document" sentinel such as (2^31-1, 2^31-1), as
+    // bash-language-server's shfmt answer uses — is clamped the same way:
+    // its new text is the whole document, so ending it at the document end
+    // touches nothing beyond the region. A partial edit ending past EOF stays
+    // malformed and is dropped below.
     if virtual_line_count > 0 {
         let last_real_line = virtual_line_count - 1;
         for edit in &mut edits {
             clamp_synthetic_eof_anchor(&mut edit.range.start, last_real_line, virtual_line_count);
             clamp_synthetic_eof_anchor(&mut edit.range.end, last_real_line, virtual_line_count);
+            let document_start = tower_lsp_server::ls_types::Position::new(0, 0);
+            if edit.range.start == document_start && edit.range.end.line >= virtual_line_count {
+                edit.range.end.line = last_real_line;
+                edit.range.end.character = u32::MAX;
+            }
         }
     }
 
@@ -959,10 +971,11 @@ mod tests {
     }
 
     #[test]
-    fn formatting_response_still_drops_edits_two_or_more_lines_past_eof() {
-        // Regression guard: the new "synthetic-line-0" exception only relaxes
-        // a single-line overshoot. An edit ending two lines past EOF is still
-        // malformed and must be dropped to protect host content.
+    fn a_whole_document_replacement_ending_past_eof_ends_at_the_region_end() {
+        // bash-language-server (shfmt) and others answer with one edit from
+        // the document start to an "end of document" sentinel far past EOF.
+        // Its new text is the whole document, so clamping its end to the
+        // region end touches nothing beyond the region.
         let response = json!({
             "jsonrpc": "2.0",
             "id": 42,
@@ -970,6 +983,99 @@ mod tests {
                 {
                     "range": {
                         "start": { "line": 0, "character": 0 },
+                        "end":   { "line": 2147483647, "character": 2147483647 }
+                    },
+                    "newText": "if true; then\n  echo\nfi\n"
+                }
+            ]
+        });
+        let region_end = Position {
+            line: 13,
+            character: 0,
+        };
+
+        let edits = transform_formatting_response_to_host(
+            response,
+            &RegionOffset::new(10, 0),
+            4,
+            region_end,
+        )
+        .unwrap();
+
+        assert_eq!(edits.len(), 1, "{edits:?}");
+        assert_eq!(edits[0].range.start, Position::new(10, 0));
+        assert_eq!(edits[0].range.end, region_end);
+        assert_eq!(edits[0].new_text, "if true; then\n  echo\nfi\n");
+    }
+
+    #[test]
+    fn a_whole_document_replacement_ending_past_eof_maps_through_a_prepared_document() {
+        use super::super::super::protocol::{VirtualLayout, apply_prepare_result};
+        // `  if true; then\n      echo\n  fi\n` at host line 10, dedented by
+        // two: the formatter sees `if true; then\n    echo\nfi\n`.
+        let virtual_text = "  if true; then\n      echo\n  fi\n";
+        let changes = [0, 1, 2].map(|line| {
+            json!({"range": {"start": {"line": line, "character": 0},
+                             "end": {"line": line, "character": 2}}, "newText": ""})
+        });
+        let result = serde_json::from_value(json!({"segments": [
+            {"type": "content", "changes": changes}
+        ]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(result),
+        )
+        .unwrap();
+        let offset = RegionOffset::new(10, 0).with_prepared(prepared.map);
+        let response = json!({"jsonrpc": "2.0", "id": 42, "result": [{
+            "range": {"start": {"line": 0, "character": 0},
+                      "end": {"line": 2147483647, "character": 2147483647}},
+            "newText": "if true; then\n  echo\nfi\n"
+        }]});
+
+        let edits = transform_formatting_response_to_host(
+            response,
+            &offset,
+            count_lines(&prepared.text),
+            Position::new(13, 0),
+        )
+        .unwrap();
+
+        // Applied to the host region, the echo line is re-indented to the
+        // formatter's two spaces plus the two the peer removed.
+        let mut host: Vec<String> = virtual_text.split('\n').map(str::to_string).collect();
+        let mut sorted = edits.clone();
+        sorted.sort_by_key(|edit| std::cmp::Reverse(edit.range.start));
+        for edit in sorted {
+            let mut text = host.join("\n");
+            let offset_of = |position: Position| {
+                text.split_inclusive('\n')
+                    .take((position.line - 10) as usize)
+                    .map(str::len)
+                    .sum::<usize>()
+                    + position.character as usize
+            };
+            let (start, end) = (offset_of(edit.range.start), offset_of(edit.range.end));
+            text.replace_range(start..end, &edit.new_text);
+            host = text.split('\n').map(str::to_string).collect();
+        }
+        assert_eq!(host.join("\n"), "  if true; then\n    echo\n  fi\n");
+    }
+
+    #[test]
+    fn formatting_response_still_drops_a_partial_edit_two_or_more_lines_past_eof() {
+        // Regression guard: only a whole-document replacement may end past
+        // EOF. An edit from the middle of the document ending two lines past
+        // EOF is still malformed and must be dropped to protect host content.
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": [
+                {
+                    "range": {
+                        "start": { "line": 1, "character": 0 },
                         "end":   { "line": 5, "character": 0 }
                     },
                     "newText": "wrong"
@@ -987,7 +1093,7 @@ mod tests {
 
         assert!(
             edits.is_empty(),
-            "edits ending more than one line past EOF must still be dropped"
+            "partial edits ending more than one line past EOF must still be dropped"
         );
     }
 }
