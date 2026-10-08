@@ -107,6 +107,7 @@ impl LanguageServerPool {
                     ctx.offset,
                     virtual_line_count,
                     region_end,
+                    virtual_content,
                 )
                 .map(Some)
             },

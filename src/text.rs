@@ -7,6 +7,7 @@
 mod char_boundary;
 pub(crate) mod edit;
 mod hash;
+pub(crate) mod layout;
 pub(crate) mod position;
 pub(crate) mod terminal;
 

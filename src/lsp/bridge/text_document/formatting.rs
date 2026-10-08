@@ -107,6 +107,7 @@ impl LanguageServerPool {
                     ctx.offset,
                     virtual_line_count,
                     region_end,
+                    virtual_content,
                 )
                 .map(Some)
             },
@@ -154,6 +155,34 @@ fn clamp_synthetic_eof_anchor(
     }
 }
 
+/// `edits` to `server_text`, unless they change its boundary layout (see
+/// [`restore_boundary_layout`]), or that of a string joined into it at one
+/// of `joints` ([`restore_joined_layout`]): then the edits from
+/// `server_text` to the formatted text with that layout restored. Edits that
+/// do not apply (reversed or overlapping) are left as they are, for the
+/// checks downstream to judge rather than be laundered.
+///
+/// [`restore_boundary_layout`]: crate::text::layout::restore_boundary_layout
+/// [`restore_joined_layout`]: super::super::protocol::restore_joined_layout
+fn keep_boundary_layout(
+    server_text: &str,
+    edits: Vec<TextEdit>,
+    joints: impl IntoIterator<Item = usize>,
+) -> Vec<TextEdit> {
+    if edits.is_empty() {
+        return edits;
+    }
+    let Some(formatted) = super::super::protocol::apply_text_edits_clamped(server_text, &edits)
+    else {
+        return edits;
+    };
+    let restored = super::super::protocol::restore_joined_layout(server_text, &formatted, joints);
+    if restored == formatted {
+        return edits;
+    }
+    super::super::protocol::text_edits_between(server_text, &restored)
+}
+
 /// Build a JSON-RPC formatting request for a downstream language server.
 ///
 /// Like `documentLink`/`documentSymbol`, formatting carries no position — only
@@ -199,11 +228,15 @@ fn build_formatting_request(
 /// first clamped back onto the last real line; any edit with *either* endpoint
 /// still on a line `>= virtual_line_count` is then dropped before translation.
 /// `virtual_line_count` is the LSP line count (1 for empty), from [`count_lines`].
+/// `server_text` is the text the server formatted (a prepared document's
+/// prepared text), whose boundary layout the result keeps
+/// ([`keep_boundary_layout`]).
 pub(super) fn transform_formatting_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,
     virtual_line_count: u32,
     region_end: Position,
+    server_text: &str,
 ) -> io::Result<Vec<TextEdit>> {
     if response_has_jsonrpc_error(&response, "formatting-style request") {
         return Err(io::Error::other(
@@ -285,6 +318,16 @@ pub(super) fn transform_formatting_response_to_host(
         );
         return Ok(Vec::new());
     }
+
+    // The document's edges are the host's layout (the line break after a Nix
+    // `''`, the final line break and indentation before the closing `''`),
+    // which a formatter treating the document as a file strips; keep them,
+    // and those of each string a prepared document joins.
+    let joints = offset
+        .prepared()
+        .into_iter()
+        .flat_map(super::super::protocol::PreparedMap::emptied_gap_offsets);
+    let edits = keep_boundary_layout(server_text, edits, joints);
 
     // A prepared document's edits are re-diffed back into the virtual
     // document; one touching host-owned text (a gap) fails the request
@@ -378,8 +421,15 @@ mod tests {
             ]
         });
 
-        let edits =
-            transform_formatting_response_to_host(response, &offset, 2, region_end).unwrap();
+        let edits = transform_formatting_response_to_host(
+            response,
+            &offset,
+            2,
+            region_end,
+            "abcd
+efghijkl",
+        )
+        .unwrap();
 
         assert!(
             edits.is_empty(),
@@ -406,8 +456,15 @@ mod tests {
             ]
         });
 
-        let edits =
-            transform_formatting_response_to_host(response, &offset, 2, region_end).unwrap();
+        let edits = transform_formatting_response_to_host(
+            response,
+            &offset,
+            2,
+            region_end,
+            "abcd
+efghijkl",
+        )
+        .unwrap();
 
         assert_eq!(edits.len(), 1, "all-safe response passes: {edits:?}");
         assert_eq!(edits[0].new_text, "safe");
@@ -534,6 +591,11 @@ mod tests {
             &RegionOffset::new(10, 0),
             UNBOUNDED,
             TEST_REGION_END,
+            "abcd
+x
+y
+z
+",
         )
         .unwrap();
 
@@ -575,6 +637,8 @@ mod tests {
             &RegionOffset::new(5, 4),
             UNBOUNDED,
             TEST_REGION_END,
+            "abcdef
+ghijklmn",
         )
         .unwrap();
 
@@ -604,6 +668,7 @@ mod tests {
             &RegionOffset::new(5, 0),
             UNBOUNDED,
             TEST_REGION_END,
+            "a",
         );
         assert!(transformed.is_err());
     }
@@ -624,6 +689,7 @@ mod tests {
             &RegionOffset::new(5, 0),
             UNBOUNDED,
             TEST_REGION_END,
+            "a",
         )
         .expect("null result is a handled response, not a failure");
 
@@ -643,6 +709,7 @@ mod tests {
             &RegionOffset::new(5, 0),
             UNBOUNDED,
             TEST_REGION_END,
+            "a",
         )
         .unwrap();
         assert!(edits.is_empty());
@@ -670,6 +737,8 @@ mod tests {
             &RegionOffset::new(u32::MAX - 1, 0),
             2,
             TEST_REGION_END,
+            "a
+b",
         )
         .unwrap();
 
@@ -707,7 +776,7 @@ mod tests {
                         "start": { "line": 2, "character": 6 },
                         "end": { "line": 3, "character": 0 }
                     },
-                    "newText": "\n"
+                    "newText": "!"
                 }
             ]
         });
@@ -717,11 +786,14 @@ mod tests {
             &RegionOffset::new(10, 0),
             3,
             TEST_REGION_END,
+            "a
+b
+xxxxxx",
         )
         .unwrap();
 
         assert_eq!(edits.len(), 1, "synthetic-EOF-anchored edit is kept");
-        assert_eq!(edits[0].new_text, "\n");
+        assert_eq!(edits[0].new_text, "!");
         // start unchanged (still on last real line); end clamped down by one.
         assert_eq!(edits[0].range.start.line, 12);
         assert_eq!(edits[0].range.start.character, 6);
@@ -743,7 +815,7 @@ mod tests {
                         "start": { "line": 2, "character": 6 },
                         "end": { "line": 2, "character": 6 }
                     },
-                    "newText": "\n"
+                    "newText": "!"
                 }
             ]
         });
@@ -753,11 +825,14 @@ mod tests {
             &RegionOffset::new(10, 0),
             3,
             TEST_REGION_END,
+            "a
+b
+xxxxxx",
         )
         .unwrap();
 
         assert_eq!(edits.len(), 1, "in-bounds zero-width EOF insert is kept");
-        assert_eq!(edits[0].new_text, "\n");
+        assert_eq!(edits[0].new_text, "!");
     }
 
     #[test]
@@ -792,6 +867,8 @@ mod tests {
             &RegionOffset::new(10, 0),
             2,
             TEST_REGION_END,
+            "abcd
+efgh",
         )
         .unwrap();
 
@@ -802,17 +879,13 @@ mod tests {
     }
 
     #[test]
-    fn insert_final_newline_survives_a_realistic_region_end() {
-        // Content "local x = 1" (no trailing newline) at host line 3 in a
-        // plain fence: region end is the exact content end (3, 11), NOT a
-        // permissive sentinel. The canonical insertFinalNewline shape — a
-        // zero-width insert at the synthetic next-line anchor — must snap to
-        // the region end and survive containment.
-        let offset = RegionOffset::new(3, 0);
-        let region_end = Position {
-            line: 3,
-            character: 11,
-        };
+    fn insert_final_newline_leaves_a_region_without_a_final_line_break_unchanged() {
+        // Content "local x = 1" (no trailing newline) at host line 3: its end
+        // is the host's layout (a Nix `''local x = 1''`, say), so the
+        // canonical insertFinalNewline shape — a zero-width insert at the
+        // synthetic next-line anchor — must not move the closing delimiter
+        // onto the next line.
+        let region = "local x = 1";
         let response = json!({
             "jsonrpc": "2.0", "id": 42,
             "result": [
@@ -822,13 +895,48 @@ mod tests {
             ]
         });
 
-        let edits =
-            transform_formatting_response_to_host(response, &offset, 1, region_end).unwrap();
+        let edits = transform_formatting_response_to_host(
+            response,
+            &RegionOffset::new(10, 0),
+            count_lines(region),
+            Position::new(10, 11),
+            region,
+        )
+        .unwrap();
 
-        assert_eq!(edits.len(), 1, "insertFinalNewline must survive: {edits:?}");
-        assert_eq!(edits[0].range.start, region_end);
-        assert_eq!(edits[0].range.end, region_end);
-        assert_eq!(edits[0].new_text, "\n");
+        assert_eq!(apply_to_region(region, &edits), region, "{edits:?}");
+    }
+
+    #[rstest]
+    #[case::at_the_synthetic_next_line("local x = 1\n", 2, 0)]
+    #[case::after_a_closing_indentation("local x = 1\n    ", 1, 4)]
+    fn insert_final_newline_is_not_doubled_for_a_region_ending_with_a_line_break(
+        #[case] region: &str,
+        #[case] line: u32,
+        #[case] character: u32,
+    ) {
+        // The region already ends with its line break (and, before a Nix
+        // closing `''`, its indentation): a further line break at the end
+        // would add a blank line to the host's layout.
+        let response = json!({
+            "jsonrpc": "2.0", "id": 42,
+            "result": [
+                { "range": { "start": { "line": line, "character": character },
+                             "end": { "line": line, "character": character } },
+                  "newText": "\n" }
+            ]
+        });
+
+        let edits = transform_formatting_response_to_host(
+            response,
+            &RegionOffset::new(10, 0),
+            count_lines(region),
+            Position::new(11, character),
+            region,
+        )
+        .unwrap();
+
+        assert_eq!(apply_to_region(region, &edits), region, "{edits:?}");
     }
 
     #[rstest]
@@ -871,7 +979,7 @@ mod tests {
                         "start": { "line": 1, "character": 0 },
                         "end":   { "line": 1, "character": 0 }
                     },
-                    "newText": "\n"
+                    "newText": "!"
                 }
             ]
         });
@@ -881,11 +989,16 @@ mod tests {
             &RegionOffset::new(10, 0),
             1,
             TEST_REGION_END,
+            "local x",
         )
         .unwrap();
 
-        assert_eq!(edits.len(), 1, "canonical insertFinalNewline shape kept");
-        assert_eq!(edits[0].new_text, "\n");
+        assert_eq!(
+            edits.len(),
+            1,
+            "insert at the synthetic next-line anchor kept"
+        );
+        assert_eq!(edits[0].new_text, "!");
         // After clamping virtual (1,0)..(1,0) → (0, u32::MAX)..(0, u32::MAX),
         // then translation adds the region's line offset (10).
         assert_eq!(edits[0].range.start.line, 10);
@@ -923,6 +1036,8 @@ mod tests {
             &RegionOffset::new(0, 0),
             2,
             TEST_REGION_END,
+            "ab
+cdefg",
         )
         .unwrap();
 
@@ -960,6 +1075,8 @@ mod tests {
             &RegionOffset::new(0, 0),
             2,
             TEST_REGION_END,
+            "ab
+cd",
         )
         .unwrap();
 
@@ -999,6 +1116,10 @@ mod tests {
             &RegionOffset::new(10, 0),
             4,
             region_end,
+            "if true;then
+    echo
+fi
+",
         )
         .unwrap();
 
@@ -1040,6 +1161,7 @@ mod tests {
             &offset,
             count_lines(&prepared.text),
             Position::new(13, 0),
+            &prepared.text,
         )
         .unwrap();
 
@@ -1062,6 +1184,114 @@ mod tests {
             host = text.split('\n').map(str::to_string).collect();
         }
         assert_eq!(host.join("\n"), "  if true; then\n    echo\n  fi\n");
+    }
+
+    /// `region` (at host line 10, column 0) with host `edits` applied.
+    fn apply_to_region(region: &str, edits: &[TextEdit]) -> String {
+        let mut text = region.to_string();
+        let mut sorted = edits.to_vec();
+        sorted.sort_by_key(|edit| std::cmp::Reverse(edit.range.start));
+        for edit in sorted {
+            let offset_of = |position: Position| {
+                text.split_inclusive('\n')
+                    .take((position.line - 10) as usize)
+                    .map(str::len)
+                    .sum::<usize>()
+                    + position.character as usize
+            };
+            let (start, end) = (offset_of(edit.range.start), offset_of(edit.range.end));
+            text.replace_range(start..end, &edit.new_text);
+        }
+        text
+    }
+
+    fn whole_document(new_text: &str) -> serde_json::Value {
+        json!({"jsonrpc": "2.0", "id": 42, "result": [{
+            "range": {"start": {"line": 0, "character": 0},
+                      "end": {"line": 2147483647, "character": 2147483647}},
+            "newText": new_text
+        }]})
+    }
+
+    #[test]
+    fn formatting_keeps_the_boundary_layout_of_an_unprepared_document() {
+        // `''\n{  }\n    ''` in Nix: the formatter strips the line break after
+        // the opening `''` and the one (with the indentation) before the
+        // closing `''`; only its change to the content is kept.
+        let region = "\n{  }\n    ";
+        let edits = transform_formatting_response_to_host(
+            whole_document("{}"),
+            &RegionOffset::new(10, 0),
+            count_lines(region),
+            Position::new(12, 4),
+            region,
+        )
+        .unwrap();
+        assert_eq!(apply_to_region(region, &edits), "\n{}\n    ");
+    }
+
+    #[test]
+    fn formatting_keeps_the_boundary_layout_of_a_prepared_document() {
+        use super::super::super::protocol::{VirtualLayout, apply_prepare_result};
+        // The JSON in `''\n      {\n        "a":1\n      }\n    ''`, dedented
+        // by six; the formatter fixes the spacing and strips the boundaries.
+        let virtual_text = "\n      {\n        \"a\":1\n      }\n    ";
+        let changes = [1, 2, 3].map(|line| {
+            json!({"range": {"start": {"line": line, "character": 0},
+                             "end": {"line": line, "character": 6}}, "newText": ""})
+        });
+        let result = serde_json::from_value(json!({"segments": [
+            {"type": "content", "changes": changes}
+        ]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(result),
+        )
+        .unwrap();
+        let offset = RegionOffset::new(10, 0).with_prepared(prepared.map);
+        let edits = transform_formatting_response_to_host(
+            whole_document("{\n  \"a\": 1\n}"),
+            &offset,
+            count_lines(&prepared.text),
+            Position::new(14, 4),
+            &prepared.text,
+        )
+        .unwrap();
+        assert_eq!(
+            apply_to_region(virtual_text, &edits),
+            "\n      {\n        \"a\": 1\n      }\n    "
+        );
+    }
+
+    #[test]
+    fn a_formatter_adding_a_final_line_break_does_not_double_it() {
+        let region = "\n{}\n    ";
+        let edits = transform_formatting_response_to_host(
+            whole_document("{}\n"),
+            &RegionOffset::new(10, 0),
+            count_lines(region),
+            Position::new(12, 4),
+            region,
+        )
+        .unwrap();
+        assert_eq!(apply_to_region(region, &edits), region);
+    }
+
+    #[test]
+    fn a_formatter_still_trims_blank_lines_before_the_final_line_break() {
+        // A markdown fence's content: only the last line break is layout.
+        let region = "code\n\n\n";
+        let edits = transform_formatting_response_to_host(
+            whole_document("code\n"),
+            &RegionOffset::new(10, 0),
+            count_lines(region),
+            Position::new(13, 0),
+            region,
+        )
+        .unwrap();
+        assert_eq!(apply_to_region(region, &edits), "code\n");
     }
 
     #[test]
@@ -1088,12 +1318,126 @@ mod tests {
             &RegionOffset::new(0, 0),
             2,
             TEST_REGION_END,
+            "ab
+cd",
         )
         .unwrap();
 
         assert!(
             edits.is_empty(),
             "partial edits ending more than one line past EOF must still be dropped"
+        );
+    }
+
+    /// Two Nix strings joined into one JSON document, as kakehashi combines
+    /// `# json` strings: `head` indented by six, `tail` by eight, prepared
+    /// by dedenting each string, emptying the Nix between them and replacing
+    /// interpolations with `0`.
+    fn joined_strings() -> (String, super::super::super::protocol::PreparedDocument) {
+        use super::super::super::protocol::{SegmentKind, VirtualLayout, apply_prepare_result};
+        let pad = |n: usize| " ".repeat(n);
+        let pieces = [
+            (
+                SegmentKind::Content,
+                format!("\n{}{{\n{}\"name\":    \"", pad(6), pad(14)),
+                "",
+            ),
+            (SegmentKind::Gap, pad(11), "${cfg.name}"),
+            (SegmentKind::Content, format!("\",\n{}", pad(4)), ""),
+            (SegmentKind::Gap, format!("{}\n", pad(3)), "'';\n"),
+            (SegmentKind::Gap, String::new(), "  nested = {"),
+            (SegmentKind::Gap, "\n".to_string(), "\n"),
+            (SegmentKind::Gap, String::new(), "      ''"),
+            (SegmentKind::Content, format!("\n{}\"port\":", pad(16)), ""),
+            (SegmentKind::Gap, pad(20), "${toString cfg.port}"),
+            (
+                SegmentKind::Content,
+                format!("\n{}}}\n{}", pad(8), pad(6)),
+                "",
+            ),
+        ];
+        let virtual_text: String = pieces.iter().map(|(_, text, _)| text.as_str()).collect();
+        let mut start = 0;
+        let layout = VirtualLayout::from_pieces(
+            &virtual_text,
+            pieces.iter().map(|(kind, text, host)| {
+                let range = start..start + text.len();
+                start = range.end;
+                (*kind, range, host.to_string())
+            }),
+        );
+        let dedent = |line: u32, width: u32| {
+            json!({"range": {"start": {"line": line, "character": 0},
+                             "end": {"line": line, "character": width}}, "newText": ""})
+        };
+        let result = serde_json::from_value(json!({"segments": [
+            {"type": "content", "changes": [dedent(1, 6), dedent(2, 6)]},
+            {"type": "gap", "content": "0"},
+            {"type": "content"},
+            {"type": "gap", "content": ""},
+            {"type": "content", "changes": [dedent(1, 8)]},
+            {"type": "gap", "content": "0"},
+            {"type": "content", "changes": [dedent(1, 8)]}
+        ]}))
+        .unwrap();
+        let prepared = apply_prepare_result(&virtual_text, &layout, Some(result)).unwrap();
+        assert_eq!(
+            prepared.text,
+            format!(
+                "\n{{\n{}\"name\":    \"0\",\n{}\n{}\"port\":0\n}}\n{}",
+                pad(8),
+                pad(4),
+                pad(8),
+                pad(6)
+            )
+        );
+        (virtual_text, prepared)
+    }
+
+    #[test]
+    fn formatting_keeps_the_layout_between_joined_strings() {
+        // vscode-json-language-server's answer (tabSize 4): it reindents both
+        // strings, and deletes the closing indentation of `head` and the line
+        // break opening `tail`, which are the Nix layout around the gap.
+        let (virtual_text, prepared) = joined_strings();
+        let edit = |start: (u32, u32), end: (u32, u32), new_text: &str| {
+            json!({"range": {"start": {"line": start.0, "character": start.1},
+                             "end": {"line": end.0, "character": end.1}}, "newText": new_text})
+        };
+        let response = json!({"jsonrpc": "2.0", "id": 42, "result": [
+            edit((0, 0), (1, 0), ""),
+            edit((1, 1), (2, 8), "\n    "),
+            edit((2, 15), (2, 19), " "),
+            edit((2, 23), (4, 8), "\n    "),
+            edit((4, 15), (4, 15), " "),
+            edit((5, 1), (6, 6), ""),
+        ]});
+        let offset = RegionOffset::new(10, 0).with_prepared(prepared.map);
+        let edits = transform_formatting_response_to_host(
+            response,
+            &offset,
+            count_lines(&prepared.text),
+            Position::new(17, 6),
+            &prepared.text,
+        )
+        .unwrap();
+        let pad = |n: usize| " ".repeat(n);
+        // Each string keeps its own indentation: `head` six plus four,
+        // `tail` eight plus four, and its closing brace eight.
+        assert_eq!(
+            apply_to_region(&virtual_text, &edits),
+            format!(
+                "\n{}{{\n{}\"name\": \"{}\",\n{}{}\n\n\n{}\"port\": {}\n{}}}\n{}",
+                pad(6),
+                pad(10),
+                pad(11),
+                pad(4),
+                pad(3),
+                pad(12),
+                pad(20),
+                pad(8),
+                pad(6)
+            )
         );
     }
 }

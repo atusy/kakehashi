@@ -1230,6 +1230,18 @@ Markdown) is sent to the servers configured for its language, and the edits
 are applied back to the host file. Configuration comes from the usual config
 files (`./kakehashi.toml` etc.) or `--config-file`.
 
+A region's edges belong to the host's layout, so formatting keeps them: a
+line break the region opens with (right after a Nix `''`) and the final line
+break plus the indentation after it (before a closing `''`) stay as they
+were. In particular, a formatter's insertFinalNewline neither adds a line
+break to a region that ends without one (`''local x = 1''` keeps its closing
+`''` on the same line) nor doubles one a region already ends with. Blank
+lines before the final line break are the formatter's: it may trim them (at
+the end of a markdown fence, say), but not add more than the region had.
+This applies to the editor's formatting requests too, and, in a document a
+`prepare` server joins from several strings (the Nix between them emptied),
+to the edges of each string.
+
 ```bash
 # Format files in place
 kakehashi format README.md docs/

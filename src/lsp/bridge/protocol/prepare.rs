@@ -585,6 +585,16 @@ impl PreparedMap {
             .collect()
     }
 
+    /// The P offsets of the gaps the peer emptied, in order: where host text
+    /// sits that P does not show at all, such as the Nix between two joined
+    /// strings.
+    pub(crate) fn emptied_gap_offsets(&self) -> impl Iterator<Item = usize> + '_ {
+        self.runs
+            .iter()
+            .filter(|run| run.kind == RunKind::Gap && run.prepared.is_empty())
+            .map(|gap| gap.prepared.start)
+    }
+
     /// The virtual text this map was built for.
     pub(crate) fn virtual_text(&self) -> &str {
         self.virtual_lines.text()
@@ -1161,6 +1171,115 @@ struct Hunk {
     new: Range<usize>,
 }
 
+/// `text` with LSP `edits` applied, a column past a line's end meaning the
+/// line's end; `None` when an edit is reversed or edits overlap.
+pub(crate) fn apply_text_edits_clamped(text: &str, edits: &[TextEdit]) -> Option<String> {
+    apply_edits(&LineMap::new(text.to_string()), edits)
+}
+
+/// LSP edits turning `old` into `new`, one per character-level diff hunk —
+/// minimal where a formatter's own answer may be one whole-document edit.
+pub(crate) fn text_edits_between(old: &str, new: &str) -> Vec<TextEdit> {
+    let lines = LineMap::new(old.to_string());
+    diff_hunks(old, new)
+        .into_iter()
+        .map(|hunk| TextEdit {
+            range: LspRange::new(lines.position(hunk.old.start), lines.position(hunk.old.end)),
+            new_text: new[hunk.new].to_string(),
+        })
+        .collect()
+}
+
+/// `formatted` with the boundary layout (see [`restore_boundary_layout`])
+/// of every piece of `prepared` between `joints` restored, a joint being an
+/// emptied gap within blank text that spans a line break: the closing
+/// indentation of one joined string and the line break opening the next are
+/// host layout, as a document's edges are. A joint whose surrounding blank
+/// text has no counterpart in `formatted` (the text around it changed) does
+/// not split, and an edit crossing it is left for the gap checks to refuse.
+///
+/// [`restore_boundary_layout`]: crate::text::layout::restore_boundary_layout
+pub(crate) fn restore_joined_layout(
+    prepared: &str,
+    formatted: &str,
+    joints: impl IntoIterator<Item = usize>,
+) -> String {
+    use crate::text::layout::restore_boundary_layout;
+    let is_blank = |c: char| matches!(c, ' ' | '\t' | '\n' | '\r');
+    let mut joints = joints.into_iter().peekable();
+    if joints.peek().is_none() {
+        return restore_boundary_layout(prepared, formatted);
+    }
+    let hunks = diff_hunks(prepared, formatted);
+    // Where an unchanged character of `prepared` is in `formatted`.
+    let unchanged = |offset: usize| -> Option<usize> {
+        let mut shifted = offset;
+        for hunk in &hunks {
+            if hunk.old.end <= offset {
+                shifted = shifted + hunk.new.len() - hunk.old.len();
+            } else if hunk.old.start <= offset {
+                return None;
+            } else {
+                break;
+            }
+        }
+        Some(shifted)
+    };
+    let mut splits: Vec<(usize, usize)> = Vec::new();
+    for joint in joints {
+        let start = prepared[..joint].trim_end_matches(is_blank).len();
+        let end = joint
+            + (prepared[joint..].len() - prepared[joint..].trim_start_matches(is_blank).len());
+        if start == 0 || end == prepared.len() || !prepared[start..end].contains(['\n', '\r']) {
+            continue;
+        }
+        let Some(before) = prepared[..start].chars().next_back() else {
+            continue;
+        };
+        let (Some(blank_start), Some(blank_end)) = (
+            unchanged(start - before.len_utf8()).map(|offset| offset + before.len_utf8()),
+            unchanged(end),
+        ) else {
+            continue;
+        };
+        if blank_start > blank_end || !formatted[blank_start..blank_end].chars().all(is_blank) {
+            continue;
+        }
+        // The next string's line break, with the indentation a formatter
+        // gave its first line, opens it; any blank text before that ends the
+        // previous string.
+        let blank = &formatted[blank_start..blank_end];
+        let split = blank_start
+            + blank.rfind(['\n', '\r']).map_or(0, |last| {
+                if last > 0 && blank[last..].starts_with('\n') && blank[..last].ends_with('\r') {
+                    last - 1
+                } else {
+                    last
+                }
+            });
+        if splits
+            .last()
+            .is_some_and(|&(previous, previous_split)| joint <= previous || split < previous_split)
+        {
+            continue;
+        }
+        splits.push((joint, split));
+    }
+    let mut restored = String::with_capacity(formatted.len());
+    let (mut piece, mut formatted_piece) = (0, 0);
+    for (joint, split) in splits
+        .into_iter()
+        .chain([(prepared.len(), formatted.len())])
+    {
+        restored.push_str(&restore_boundary_layout(
+            &prepared[piece..joint],
+            &formatted[formatted_piece..split],
+        ));
+        (piece, formatted_piece) = (joint, split);
+    }
+    restored
+}
+
 /// Character-level diff hunks between `old` and `new`, as byte ranges.
 fn diff_hunks(old: &str, new: &str) -> Vec<Hunk> {
     let old_chars: Vec<(usize, char)> = old.char_indices().collect();
@@ -1272,6 +1391,66 @@ mod tests {
             ],
         );
         (virtual_text, layout)
+    }
+
+    #[test]
+    fn each_joined_string_keeps_its_boundary_layout() {
+        // `{"a":1,` + `''; b = ''` + `"b":2}`: the closing indentation of
+        // the first string and the line break opening the second are layout.
+        let prepared = "\n{\n  \"a\":1,\n  \n    \"b\":2\n}\n  ";
+        let joint = prepared.find("\n    \"b\"").unwrap();
+        let formatted = "{\n    \"a\": 1,\n    \"b\": 2\n}";
+        assert_eq!(
+            restore_joined_layout(prepared, formatted, [joint]),
+            "\n{\n    \"a\": 1,\n  \n    \"b\": 2\n}\n  "
+        );
+        // Without the joint, only the document's edges are kept.
+        assert_eq!(
+            restore_joined_layout(prepared, formatted, []),
+            "\n{\n    \"a\": 1,\n    \"b\": 2\n}\n  "
+        );
+    }
+
+    #[test]
+    fn a_joint_within_a_line_is_left_to_the_formatter() {
+        // An emptied interpolation between tokens on one line is no layout.
+        assert_eq!(restore_joined_layout("\na b\n", "a\nb", [2]), "\na\nb\n");
+    }
+
+    #[test]
+    fn a_joint_whose_surroundings_changed_does_not_split() {
+        // The token before the joint was rewritten: there is no telling which
+        // blank text of the formatted text stands where the joint was.
+        let prepared = "\nx,\n  \ny\n";
+        let joint = prepared.find("\ny").unwrap();
+        assert_eq!(
+            restore_joined_layout(prepared, "\nz;\ny\n", [joint]),
+            "\nz;\ny\n"
+        );
+    }
+
+    #[test]
+    fn joined_strings_keep_crlf_layout() {
+        let prepared = "\r\nx,\r\n  \r\n  y\r\n  ";
+        let joint = prepared.find("\r\n  y").unwrap();
+        assert_eq!(
+            restore_joined_layout(prepared, "x,\r\ny", [joint]),
+            "\r\nx,\r\n  \r\ny\r\n  "
+        );
+    }
+
+    #[test]
+    fn edits_between_two_texts_turn_one_into_the_other() {
+        for (old, new) in [
+            ("\n  {\n  }\n    ", "\n{\n}\n    "),
+            ("a\r\nb\r\n", "a\r\nB\r\nc\r\n"),
+            ("same", "same"),
+            ("", "x"),
+        ] {
+            let edits = text_edits_between(old, new);
+            assert_eq!(apply_to(old, &edits), new, "{old:?} -> {new:?}: {edits:?}");
+        }
+        assert!(text_edits_between("same", "same").is_empty());
     }
 
     #[test]
