@@ -7,9 +7,9 @@
 //! blank lines at the document's edges, and replaces every gap with a
 //! placeholder line (`--` unless a test needs another). The mock answers
 //! hover with the text it holds, ranged over the hovered line in its own
-//! coordinates, and formats by uppercasing — so each test proves both directions: the
-//! downstream server sees the prepared text, and its positions and edits map
-//! back onto the host.
+//! coordinates, and formats by uppercasing — so each test proves both
+//! directions: the downstream server sees the prepared text, and its
+//! positions and edits map back onto the host.
 //!
 //! Skipped (with a `SKIP:` line) when `deno` is not on PATH, except under
 //! `KAKEHASHI_E2E_REQUIRE_DENO` (CI's `prepare-e2e` job). The first run
@@ -66,11 +66,13 @@ function prepare(segments: { type: string; content: string }[]) {
   const indent = indents.length > 0 ? Math.min(...indents) : 0;
   // Whole blank lines at the document's edges, as a string syntax dropping
   // them would: from the first segment's start, and before the last
-  // segment's end (or before a last line holding only indentation).
+  // segment's end (or before a last line holding only indentation). A
+  // segment of blank lines only sits beside a gap unless it is the only one.
   const edgeLines = (index: number) => {
     const lines = segments[index].content.split("\n");
     const last = lines.length - 1;
     const blank = (line: number) => lines[line].trim() === "";
+    if (segments.length > 1 && lines.every((_, line) => blank(line))) return [];
     let leading = 0;
     while (index === 0 && leading < last && blank(leading)) leading++;
     let trailing = last;
