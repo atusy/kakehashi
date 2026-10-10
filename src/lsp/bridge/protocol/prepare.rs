@@ -907,12 +907,15 @@ impl PreparedMap {
         // Past where the document's deleted closing lines start, V holds only
         // what P dropped (those lines and the closing indent after them), up
         // to its very end: P's end maps to that start, nowhere later.
+        // Those are the runs empty in P at its end; the closing lines may
+        // be several runs, deleted one by one.
         if let Some(lines) = self
             .runs
             .iter()
             .rev()
-            .take(2)
-            .find(|run| run.kind == RunKind::TrailingLines)
+            .take_while(|run| run.prepared.is_empty())
+            .filter(|run| run.kind == RunKind::TrailingLines)
+            .last()
             && offset > lines.virtual_.start
         {
             return true;
@@ -2106,6 +2109,24 @@ mod tests {
         assert!(!map.virtual_position_in_removed_indent(pos(1, 0)));
         assert!(map.virtual_position_in_removed_indent(pos(2, 0)));
         assert!(map.virtual_position_in_removed_indent(pos(2, 2)));
+    }
+
+    #[test]
+    fn closing_lines_deleted_one_by_one_are_removed_from_the_first() {
+        let virtual_text = "a\n\n\n".to_string();
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &VirtualLayout::single(&virtual_text),
+            result(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""},
+                {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 3, "character": 0}}, "newText": ""}
+            ]}]})),
+        )
+        .unwrap();
+        let map = prepared.map.unwrap();
+        assert!(!map.virtual_position_in_removed_indent(pos(1, 0)));
+        assert!(map.virtual_position_in_removed_indent(pos(2, 0)));
+        assert!(map.virtual_position_in_removed_indent(pos(3, 0)));
     }
 
     #[test]
