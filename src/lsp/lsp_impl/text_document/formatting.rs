@@ -424,9 +424,11 @@ impl Kakehashi {
                     // Capture the region's per-line host prefixes now, while
                     // the host snapshot is at hand: the pipeline's whole-region
                     // replacement must re-apply them to its multi-line output
-                    // (Decision point 4, `reapply_host_line_prefixes`).
-                    let virtual_line_count =
-                        region_ctx.resolved.virtual_content.matches('\n').count() + 1;
+                    // (Decision point 4, `reapply_host_line_prefixes`). The
+                    // prefixes are per host line, so count the virtual
+                    // document's lines: a prepared one may have fewer, its
+                    // edge blank lines deleted.
+                    let virtual_line_count = resolved.virtual_content.matches('\n').count() + 1;
                     let mapper = host_mapper
                         .get_or_insert_with(|| crate::text::PositionMapper::new(snapshot.text()));
                     let host_line_prefixes = extract_host_line_prefixes(
