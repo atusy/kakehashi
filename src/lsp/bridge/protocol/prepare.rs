@@ -506,6 +506,20 @@ fn content_deletions(
         *kind = RunKind::TrailingLines;
         trailing_start = range.start;
     }
+    // A segment with no content left beside its deleted lines puts them
+    // beside the gap that follows (or precedes) it.
+    let is_blank = |text: &str| text.trim_matches([' ', '\t', '\n', '\r']).is_empty();
+    let beside_gap = (!edges.end
+        && leading_end > segment_start
+        && is_blank(&virtual_text[leading_end..segment_end]))
+        || (!edges.start
+            && deletions
+                .iter()
+                .any(|(_, kind)| *kind == RunKind::TrailingLines)
+            && is_blank(&virtual_text[segment_start..trailing_start]));
+    if beside_gap {
+        return Err("content changes may only delete blank lines at the document's edges");
+    }
     Ok(deletions)
 }
 
@@ -2178,6 +2192,40 @@ mod tests {
             (
                 2,
                 json!([{"type": "content"}, {"type": "gap"}, {"type": "content", "changes": opening}]),
+            ),
+        ] {
+            assert_eq!(
+                apply_prepare_result(
+                    &virtual_text,
+                    &layout,
+                    result(json!({"segments": segments}))
+                ),
+                Err(PrepareError::InvalidChange {
+                    index,
+                    reason: "content changes may only delete blank lines at the document's edges"
+                })
+            );
+        }
+        // A first or last segment that is all blank lines is beside the gap
+        // too, though it holds the document's edge.
+        let virtual_text = "\n\n\n\n".to_string();
+        let layout = VirtualLayout::from_pieces(
+            &virtual_text,
+            [
+                (SegmentKind::Content, 0..1, String::new()),
+                (SegmentKind::Gap, 1..3, "```\n```lua\n".to_string()),
+                (SegmentKind::Content, 3..4, String::new()),
+            ],
+        );
+        let whole = json!([{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""}]);
+        for (index, segments) in [
+            (
+                0,
+                json!([{"type": "content", "changes": whole}, {"type": "gap"}, {"type": "content"}]),
+            ),
+            (
+                2,
+                json!([{"type": "content"}, {"type": "gap"}, {"type": "content", "changes": whole}]),
             ),
         ] {
             assert_eq!(
