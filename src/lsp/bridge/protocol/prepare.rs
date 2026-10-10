@@ -754,14 +754,19 @@ impl PreparedMap {
             && (prepared[old.clone()].contains(['\n', '\r'])
                 || clears_line && !old.is_empty()
                 || new_text.starts_with(['\n', '\r']));
+        // An insertion where the peer deleted the document's closing blank
+        // lines goes on the content, before them — though a kept closing
+        // indent starts there, unless it is text joining that indent's line.
+        let closing_lines = empty_run(&self.runs, old.start, RunKind::TrailingLines).filter(|_| {
+            old.is_empty()
+                && (new_text.ends_with(['\n', '\r'])
+                    || !prepared_text_starts_at(&self.runs, old.start))
+        });
         let plain_start = match (
-            empty_run(&self.runs, old.start, RunKind::TrailingLines),
+            closing_lines,
             empty_run(&self.runs, old.start, RunKind::Gap),
         ) {
-            // An insertion where the peer deleted the document's closing
-            // blank lines goes on the content, before them, though a kept
-            // closing indent starts there.
-            (Some(lines), _) if old.is_empty() => lines.virtual_.start,
+            (Some(lines), _) => lines.virtual_.start,
             // An insertion where the peer emptied a gap goes before the gap's
             // host text, like a change ending there and an insertion at the
             // document end: the start bias alone would carry it past.
@@ -788,8 +793,10 @@ impl PreparedMap {
         }
         // What follows the change in V: a gap the peer emptied right at its
         // end is not the text after it in P.
+        // Nor are the closing lines an insertion lands before.
         let following = match empty_run(&self.runs, old.end, RunKind::Gap) {
             Some(gap) if gap.virtual_.start == virtual_end => None,
+            _ if closing_lines.is_some() => self.virtual_lines.text()[virtual_end..].chars().next(),
             _ => following,
         };
         let virtual_text = self.virtual_lines.text();
@@ -1983,6 +1990,34 @@ mod tests {
         // refused there, start included.
         assert!(map.virtual_position_in_removed_indent(pos(1, 0)));
         assert!(!map.virtual_position_in_removed_indent(pos(2, 0)));
+        // Text joining the indent's line stays on it.
+        let joined = map.edit_to_virtual(&edit((1, 0), (1, 0), "x")).unwrap();
+        assert_eq!(apply_to(&virtual_text, &[joined]), "  a\n\nx\t\t");
+    }
+
+    #[test]
+    fn a_line_inserted_before_a_kept_dedented_closing_indent_takes_no_tail() {
+        // The closing indent is dedented and kept: a line inserted above it
+        // goes before the deleted blank line, which takes no indent.
+        let virtual_text = "    a\n\n    ".to_string();
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &VirtualLayout::single(&virtual_text),
+            result(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""},
+                {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
+            ]}]})),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "  a\n  ");
+        let map = prepared.map.unwrap();
+        let inserted = map.edit_to_virtual(&edit((1, 0), (1, 0), "b\n")).unwrap();
+        assert_eq!(apply_to(&virtual_text, &[inserted]), "    a\n  b\n\n    ");
+        let inserted = map
+            .edits_to_virtual(&[edit((1, 0), (1, 0), "b\n")])
+            .unwrap();
+        assert_eq!(apply_to(&virtual_text, &inserted), "    a\n  b\n\n    ");
     }
 
     #[test]
