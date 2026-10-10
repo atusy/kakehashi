@@ -861,6 +861,19 @@ impl PreparedMap {
         {
             return None;
         }
+        // A CR and an LF meeting across the change's edges would fuse two
+        // line breaks into one CRLF, dropping a line P keeps apart from them
+        // (a deleted edge line's break beside the new text).
+        let cr_before = virtual_text[..virtual_start].ends_with('\r');
+        let lf_after = virtual_text[virtual_end..].starts_with('\n');
+        let fuses = if new_text.is_empty() {
+            cr_before && lf_after
+        } else {
+            cr_before && new_text.starts_with('\n') || lf_after && new_text.ends_with('\r')
+        };
+        if fuses {
+            return None;
+        }
         Some(TextEdit {
             range: LspRange::new(
                 self.virtual_lines.position(virtual_start),
@@ -2148,6 +2161,35 @@ mod tests {
         let map = prepared.map.unwrap();
         let appended = map.edit_to_virtual(&edit((1, 0), (1, 0), "b\n")).unwrap();
         assert_eq!(apply_to(&virtual_text, &[appended]), "a    \nb\n\n  ");
+    }
+
+    #[test]
+    fn a_change_fusing_a_cr_and_lf_across_deleted_lines_is_refused() {
+        // A CR the change ends with, before a deleted line's LF, or an LF
+        // it starts with, after a deleted line's CR, would make one CRLF of
+        // two line breaks and drop a host line.
+        let prepare = |virtual_text: &str, changes: serde_json::Value| {
+            apply_prepare_result(
+                virtual_text,
+                &VirtualLayout::single(virtual_text),
+                result(json!({"segments": [{"type": "content", "changes": changes}]})),
+            )
+            .unwrap()
+            .map
+            .unwrap()
+        };
+        let map = prepare(
+            "a\n\n",
+            json!([{"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""}]),
+        );
+        assert_eq!(map.edit_to_virtual(&edit((1, 0), (1, 0), "b\r")), None);
+        assert_eq!(map.edits_to_virtual(&[edit((1, 0), (1, 0), "b\r")]), None);
+        let map = prepare(
+            "\ra",
+            json!([{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""}]),
+        );
+        assert_eq!(map.edit_to_virtual(&edit((0, 0), (0, 0), "\nb")), None);
+        assert_eq!(map.edits_to_virtual(&[edit((0, 0), (0, 0), "\nb")]), None);
     }
 
     #[test]
