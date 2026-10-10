@@ -139,8 +139,10 @@ color presentation) is mapped whole, keeping its extent. In every case a
 line the edit creates inside dedented content regains the content's removed
 indentation, and an edit replacing a whole dedented line covers (and
 restores) that line's own indent. Deleted edge blank lines stay in V: P's
-start maps after the leading ones and P's end before the trailing ones, so
-a change at either edge lands on the content. A change is **refused** when:
+start maps after the leading ones, and P's end, a range ending where the
+trailing ones were or an insertion there before them, so a change at
+either edge lands on the content (a closing indent the peer kept keeps its
+own line). A change is **refused** when:
 
 - it touches a gap (for formatting, when the diff does: a formatter's
   whole-document replacement rewrites every gap's replacement unchanged) —
