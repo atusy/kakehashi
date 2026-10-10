@@ -4,7 +4,7 @@
 //! (`tests/bin/mock_formatter.rs`) reports what reached it.
 //!
 //! The tsudoi hook dedents content by its common indentation, deletes the
-//! blank lines at a segment's edges, and replaces every gap with a
+//! blank lines at the document's edges, and replaces every gap with a
 //! placeholder line (`--` unless a test needs another). The mock answers hover with the text
 //! it holds, ranged over the hovered line in its own coordinates, and
 //! formats by uppercasing — so each test proves both directions: the
@@ -64,17 +64,19 @@ function prepare(segments: { type: string; content: string }[]) {
       : []
   );
   const indent = indents.length > 0 ? Math.min(...indents) : 0;
-  // Whole blank lines at a segment's edges, as a string syntax dropping
-  // them would: from its start when it starts a line, and before its end
-  // (or before a last line holding only indentation).
+  // Whole blank lines at the document's edges, as a string syntax dropping
+  // them would: from the first segment's start, and before the last
+  // segment's end (or before a last line holding only indentation).
   const edgeLines = (index: number) => {
     const lines = segments[index].content.split("\n");
     const last = lines.length - 1;
     const blank = (line: number) => lines[line].trim() === "";
     let leading = 0;
-    while (startsLine[index] && leading < last && blank(leading)) leading++;
+    while (index === 0 && leading < last && blank(leading)) leading++;
     let trailing = last;
-    while (blank(last) && trailing > leading && blank(trailing - 1)) trailing--;
+    while (
+      index === segments.length - 1 && blank(last) && trailing > leading && blank(trailing - 1)
+    ) trailing--;
     const whole = (from: number, to: number) => ({
       range: { start: { line: from, character: 0 }, end: { line: to, character: 0 } },
       newText: "",

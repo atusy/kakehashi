@@ -103,13 +103,13 @@ The answer has the same length and the same `type` order:
 - A content segment's `changes` are segment-relative `TextEdit`s that may
   only **delete whitespace**, in two shapes. Omitted means unchanged.
   - Leading whitespace of a line: the dedent case.
-  - Whole blank lines, line start to line start, at the segment's
-    **edges**: the lines opening it (when it starts a line in V), or those
-    ending it (before a last line holding only indentation). That is what
-    a host string drops from its value: the line break after a Nix `''`,
-    Lua `[[` or `indoc!`, and the blank lines a YAML `|` block clips.
-    Without it, a shebang, a Dockerfile parser directive or an XML
-    declaration sits on line 2.
+  - Whole blank lines, line start to line start, at the **document's
+    edges**: the lines opening the first segment, or those ending the last
+    (before a last line holding only indentation). That is what a host
+    string drops from its value: the line break after a Nix `''`, Lua `[[`
+    or `indoc!`, and the blank lines a YAML `|` block clips. Without it, a
+    shebang, a Dockerfile parser directive or an XML declaration sits on
+    line 2. Blank lines beside a gap are inside the document, so they stay.
 - A gap's `content` is its replacement, of **any length** — a placeholder,
   nothing, or the default. Omitted keeps the coordinate-preserving
   whitespace.
@@ -117,8 +117,8 @@ The answer has the same length and the same `type` order:
 
 kakehashi validates the whole answer; a wrong length or order, or a content
 change of any other shape, refuses it. That includes a blank line between
-lines that stay, and the line break opening a segment that starts mid-line
-in V (the second of two joined strings, after the Nix joining them).
+lines that stay, and blank lines ending or opening a segment beside a gap
+(the line break opening the second of two joined strings, say).
 
 ### Coordinates
 

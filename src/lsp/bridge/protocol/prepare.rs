@@ -4,7 +4,7 @@
 //! kakehashi splits the virtual document (V) into ordered segments — injected
 //! `content` and host-owned `gap`s — and asks the peer how to present them.
 //! The answer may delete leading whitespace from content lines (dedent) and
-//! whole blank lines at a content segment's edges, and replace any gap with
+//! whole blank lines at the document's edges, and replace any gap with
 //! arbitrary text (placeholders). Applying it yields the prepared document
 //! (P) that downstream servers receive, plus a [`PreparedMap`] translating
 //! coordinates between P and V. V keeps its existing host translation
@@ -311,6 +311,7 @@ pub(crate) fn apply_prepare_result(
     let mut text = String::with_capacity(virtual_text.len());
     let mut runs: Vec<Run> = Vec::new();
     let mut indents: Vec<SegmentIndent> = Vec::new();
+    let last_index = layout.segments.len().saturating_sub(1);
     for (index, (segment, answer)) in layout.segments.iter().zip(result.segments).enumerate() {
         let virtual_segment = &virtual_text[segment.virtual_range.clone()];
         match (segment.kind, answer) {
@@ -320,6 +321,10 @@ pub(crate) fn apply_prepare_result(
                     segment.virtual_range.start,
                     virtual_segment,
                     changes.unwrap_or_default(),
+                    DocumentEdges {
+                        start: index == 0,
+                        end: index == last_index,
+                    },
                 )
                 .map_err(|reason| PrepareError::InvalidChange { index, reason })?;
                 let mut cursor = segment.virtual_range.start;
@@ -398,6 +403,13 @@ pub(crate) fn apply_prepare_result(
     })
 }
 
+/// Which of the document's edges a content segment holds.
+#[derive(Clone, Copy)]
+struct DocumentEdges {
+    start: bool,
+    end: bool,
+}
+
 /// Validate a content segment's changes and return the byte ranges (in V)
 /// they delete, sorted, each with the kind of run it becomes.
 fn content_deletions(
@@ -405,6 +417,7 @@ fn content_deletions(
     segment_start: usize,
     segment_text: &str,
     changes: Vec<TextEdit>,
+    edges: DocumentEdges,
 ) -> Result<Vec<(Range<usize>, RunKind)>, &'static str> {
     let segment_lines = LineMap::new(segment_text.to_string());
     let mut deletions = Vec::with_capacity(changes.len());
@@ -455,14 +468,16 @@ fn content_deletions(
     {
         return Err("content changes overlap");
     }
-    // Whole lines go only from the segment's edges, where the host's string
-    // syntax drops them (the line break after a Nix `''`, the blank lines a
-    // YAML `|` block clips): those running from its start, then those
-    // running to its end — before a last line without a line break, which
-    // only indentation fills (the indentation before a closing `''`).
+    // Whole lines go only from the document's edges, where the host's
+    // string syntax drops them (the line break after a Nix `''`, the blank
+    // lines a YAML `|` block clips): those running from its start, then
+    // those running to its end — before a last line without a line break,
+    // which only indentation fills (the indentation before a closing `''`).
+    // Beside a gap they are inside the document, where a formatter may add
+    // a blank line back at the join and the host would hold it twice.
     let mut leading_end = segment_start;
     for (range, kind) in &deletions {
-        if *kind == RunKind::LeadingLines && range.start == leading_end {
+        if edges.start && *kind == RunKind::LeadingLines && range.start == leading_end {
             leading_end = range.end;
         }
     }
@@ -480,8 +495,8 @@ fn content_deletions(
         if *kind != RunKind::LeadingLines || range.end <= leading_end {
             continue;
         }
-        if range.end != trailing_start {
-            return Err("content changes may only delete blank lines at the segment's edges");
+        if !edges.end || range.end != trailing_start {
+            return Err("content changes may only delete blank lines at the document's edges");
         }
         *kind = RunKind::TrailingLines;
         trailing_start = range.start;
@@ -1905,7 +1920,7 @@ mod tests {
     }
 
     #[test]
-    fn only_blank_lines_at_the_segment_edges_may_be_deleted() {
+    fn only_blank_lines_at_the_document_edges_may_be_deleted() {
         let virtual_text = "\n\na\n\nb\n\n\n".to_string();
         let layout = VirtualLayout::single(&virtual_text);
         let refused = |changes: serde_json::Value| {
@@ -1927,7 +1942,7 @@ mod tests {
         // So do both trailing lines.
         let trailing = json!([{"range": {"start": {"line": 5, "character": 0}, "end": {"line": 7, "character": 0}}, "newText": ""}]);
         assert_eq!(refused(trailing), Ok("\n\na\n\nb\n".to_string()));
-        let reason = "content changes may only delete blank lines at the segment's edges";
+        let reason = "content changes may only delete blank lines at the document's edges";
         for changes in [
             // A blank line after one that stays.
             json!([{"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""}]),
@@ -1970,6 +1985,45 @@ mod tests {
             assert_eq!(
                 apply_to(&virtual_text, &formatted),
                 format!("{eol}  a{eol}  c{eol}{eol}")
+            );
+        }
+    }
+
+    #[test]
+    fn blank_lines_beside_a_gap_stay() {
+        // Two combined fences: the blank lines around the host text between
+        // them are inside the document, whatever segment they end or open.
+        let virtual_text = "foo\n\n\n\n\nbar\n".to_string();
+        let layout = VirtualLayout::from_pieces(
+            &virtual_text,
+            [
+                (SegmentKind::Content, 0..5, String::new()),
+                (SegmentKind::Gap, 5..7, "```\n```lua\n".to_string()),
+                (SegmentKind::Content, 7..12, String::new()),
+            ],
+        );
+        let line = json!([{"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""}]);
+        let opening = json!([{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""}]);
+        for (index, segments) in [
+            (
+                0,
+                json!([{"type": "content", "changes": line}, {"type": "gap"}, {"type": "content"}]),
+            ),
+            (
+                2,
+                json!([{"type": "content"}, {"type": "gap"}, {"type": "content", "changes": opening}]),
+            ),
+        ] {
+            assert_eq!(
+                apply_prepare_result(
+                    &virtual_text,
+                    &layout,
+                    result(json!({"segments": segments}))
+                ),
+                Err(PrepareError::InvalidChange {
+                    index,
+                    reason: "content changes may only delete blank lines at the document's edges"
+                })
             );
         }
     }
