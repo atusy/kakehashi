@@ -3,12 +3,13 @@
 //! prepares markdown's lua virtual documents, and the `echo-document` mock
 //! (`tests/bin/mock_formatter.rs`) reports what reached it.
 //!
-//! The tsudoi hook dedents content by its common indentation and replaces
-//! every gap with a placeholder line (`--` unless a test needs another). The mock answers hover with the text
-//! it holds, ranged over the hovered line in its own coordinates, and
-//! formats by uppercasing — so each test proves both directions: the
-//! downstream server sees the prepared text, and its positions and edits map
-//! back onto the host.
+//! The tsudoi hook dedents content by its common indentation, deletes the
+//! blank lines at the document's edges, and replaces every gap with a
+//! placeholder line (`--` unless a test needs another). The mock answers
+//! hover with the text it holds, ranged over the hovered line in its own
+//! coordinates, and formats by uppercasing — so each test proves both
+//! directions: the downstream server sees the prepared text, and its
+//! positions and edits map back onto the host.
 //!
 //! Skipped (with a `SKIP:` line) when `deno` is not on PATH, except under
 //! `KAKEHASHI_E2E_REQUIRE_DENO` (CI's `prepare-e2e` job). The first run
@@ -22,8 +23,8 @@ use serde_json::{Value, json};
 /// specifier; keep `.github/workflows/ci.yaml` in sync).
 const TSUDOI: &str = "npm:@atusy/tsudoi-language-server@0.1.0-alpha.2/cli";
 
-/// The prepare hook, as a tsudoi config: dedent content, fill gaps with
-/// `PLACEHOLDER` (substituted per test).
+/// The prepare hook, as a tsudoi config: dedent content, delete its edge
+/// blank lines, fill gaps with `PLACEHOLDER` (substituted per test).
 const TSUDOI_CONFIG: &str = r#"
 export default async () => ({
   methods: {
@@ -63,19 +64,61 @@ function prepare(segments: { type: string; content: string }[]) {
       : []
   );
   const indent = indents.length > 0 ? Math.min(...indents) : 0;
+  // Whole blank lines at the document's edges, as a string syntax dropping
+  // them would: from the first segment's start, and before the last
+  // segment's end (or before a last line holding only indentation). A
+  // segment of blank lines only, beside a gap starting or ending a line,
+  // puts them beside that gap, unless it is the only segment.
+  const edgeLines = (index: number) => {
+    const lines = segments[index].content.split("\n");
+    const last = lines.length - 1;
+    const blank = (line: number) => lines[line].trim() === "";
+    const besideGap = index === 0
+      ? segments[index].content.endsWith("\n")
+      : startsLine[index];
+    if (segments.length > 1 && besideGap && lines.every((_, line) => blank(line))) {
+      return [];
+    }
+    let leading = 0;
+    while (index === 0 && leading < last && blank(leading)) leading++;
+    let trailing = last;
+    while (
+      index === segments.length - 1 && blank(last) && trailing > leading && blank(trailing - 1)
+    ) trailing--;
+    const whole = (from: number, to: number) => ({
+      range: { start: { line: from, character: 0 }, end: { line: to, character: 0 } },
+      newText: "",
+    });
+    // The closing line's indentation goes with the closing lines.
+    const closingIndent = {
+      range: {
+        start: { line: last, character: 0 },
+        end: { line: last, character: lines[last].length },
+      },
+      newText: "",
+    };
+    return [
+      ...(leading > 0 ? [whole(0, leading)] : []),
+      ...(trailing < last ? [whole(trailing, last)] : []),
+      ...(trailing < last && lines[last] !== "" ? [closingIndent] : []),
+    ];
+  };
   return {
     segments: segments.map((segment, index) =>
       segment.type === "gap"
         ? { type: "gap", content: PLACEHOLDER }
         : {
           type: "content",
-          changes: indent === 0 ? [] : lineStarts(index).map(({ line }) => ({
-            range: {
-              start: { line, character: 0 },
-              end: { line, character: indent },
-            },
-            newText: "",
-          })),
+          changes: [
+            ...edgeLines(index),
+            ...(indent === 0 ? [] : lineStarts(index).map(({ line }) => ({
+              range: {
+                start: { line, character: 0 },
+                end: { line, character: indent },
+              },
+              newText: "",
+            }))),
+          ],
         }
     ),
   };
@@ -319,6 +362,46 @@ fn downstream_sees_the_dedented_document_and_maps_back() {
     assert_eq!(
         apply_edits(text, &edits),
         "# t\n\n```lua\n  LOCAL X = 1\n  PRINT(X)\n```\n"
+    );
+}
+
+#[test]
+fn downstream_sees_edge_blank_lines_deleted_and_the_host_keeps_them() {
+    if skip_if_deno_unavailable() {
+        return;
+    }
+    let (mut client, _dir) = init_client(false, "--\n");
+    let uri = "file:///prepare/edges.md";
+    let text = "# t\n\n```lua\n\n  #!/usr/bin/env lua\n  print(1)\n\n```\n";
+    open(&mut client, uri, text);
+
+    // The shebang is the first line downstream.
+    let hover = hover_with_retry(&mut client, uri, 4, 4);
+    assert_eq!(hover_text(&hover), "#!/usr/bin/env lua\nprint(1)\n");
+    // Downstream has no deleted line: a hover there is not answered for
+    // the next one.
+    let response = client.send_request(
+        "textDocument/hover",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 3, "character": 0 }
+        }),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    assert!(response["result"].is_null(), "{response}");
+    assert_eq!(
+        hover["range"],
+        json!({
+            "start": { "line": 4, "character": 2 },
+            "end": { "line": 4, "character": 20 }
+        })
+    );
+
+    // Formatting keeps the host's blank lines and indentation.
+    let edits = format_with_retry(&mut client, uri);
+    assert_eq!(
+        apply_edits(text, &edits),
+        "# t\n\n```lua\n\n  #!/USR/BIN/ENV LUA\n  PRINT(1)\n\n```\n"
     );
 }
 

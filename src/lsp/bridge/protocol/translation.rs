@@ -259,9 +259,10 @@ pub(crate) fn host_range_in_prepared_gap(host_range: Range, offset: &RegionOffse
     prepared.virtual_range_in_gap(range)
 }
 
-/// Whether `host_position` lies within indentation the prepare peer removed
-/// from the document `offset` maps to. Downstream sees the caret at the
-/// line's content instead, so an edit it anchors there (a completion's
+/// Whether `host_position` lies within indentation or blank lines the
+/// prepare peer removed from the document `offset` maps to. Downstream sees
+/// the caret elsewhere instead (at the line's content, the document's start,
+/// or the content's end), so an edit it anchors there (a completion's
 /// replace range) would not contain the caret the client asked at.
 pub(crate) fn host_position_in_removed_indent(
     host_position: Position,
@@ -273,6 +274,22 @@ pub(crate) fn host_position_in_removed_indent(
     let mut position = host_position;
     translate_host_position_to_virtual(&mut position, &offset.unprepared());
     prepared.virtual_position_in_removed_indent(position)
+}
+
+/// Whether `host_position` lies on blank lines the prepare peer deleted from
+/// the edges of the document `offset` maps to. Downstream has no such line:
+/// a request there would be answered for another line (a hover range
+/// highlighting text away from the cursor).
+pub(crate) fn host_position_in_removed_edge_lines(
+    host_position: Position,
+    offset: &RegionOffset,
+) -> bool {
+    let Some(prepared) = offset.prepared() else {
+        return false;
+    };
+    let mut position = host_position;
+    translate_host_position_to_virtual(&mut position, &offset.unprepared());
+    prepared.virtual_position_in_removed_lines(position)
 }
 
 /// Whether `host_position` lies strictly inside a gap of the prepared
@@ -438,6 +455,40 @@ mod tests {
         ));
         assert!(!host_position_in_removed_indent(
             Position::new(10, 4),
+            &offset
+        ));
+    }
+
+    #[test]
+    fn a_position_on_removed_edge_lines_is_recognised() {
+        use super::super::prepare::{VirtualLayout, apply_prepare_result};
+        // `''\n  foo\n''` at host line 10: the opening line goes, and the
+        // indent of `foo`.
+        let virtual_text = "\n  foo\n";
+        let result = serde_json::from_value(serde_json::json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(result),
+        )
+        .unwrap();
+        let offset = RegionOffset::new(10, 0).with_prepared(prepared.map);
+        assert!(host_position_in_removed_edge_lines(
+            Position::new(10, 0),
+            &offset
+        ));
+        // A removed indent is no removed line: a request there stands for
+        // the line's content.
+        assert!(!host_position_in_removed_edge_lines(
+            Position::new(11, 0),
+            &offset
+        ));
+        assert!(!host_position_in_removed_edge_lines(
+            Position::new(11, 3),
             &offset
         ));
     }

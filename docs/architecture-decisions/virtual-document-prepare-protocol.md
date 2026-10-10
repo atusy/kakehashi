@@ -101,15 +101,29 @@ gap's `content`. An isolated injection is a single content segment.
 The answer has the same length and the same `type` order:
 
 - A content segment's `changes` are segment-relative `TextEdit`s that may
-  only **delete leading whitespace** of a line (the dedent case). Omitted
+  only **delete whitespace**, each change in one of two shapes. Omitted
   means unchanged.
+  - Leading whitespace of a line: the dedent case.
+  - Whole blank lines, line start to line start, at the **document's
+    edges**: the lines opening the first segment, or those ending the last.
+    When the last ends in a line holding only indentation (the indent
+    before a closing `''`), deleting the lines before it takes deleting
+    all of that indentation too, as a change of its own. That is what a
+    host string drops from its value: the line break after a Nix `''`, Lua
+    `[[` or `indoc!`, the closing line, and the blank lines a YAML `|` block
+    clips. Without it, a shebang, a Dockerfile parser directive or an XML
+    declaration sits on line 2. Blank lines beside a gap are inside the
+    document, so they stay. A blank line and the next line's indent are two
+    changes, not one.
 - A gap's `content` is its replacement, of **any length** — a placeholder,
   nothing, or the default. Omitted keeps the coordinate-preserving
   whitespace.
 - `null` keeps every segment.
 
 kakehashi validates the whole answer; a wrong length or order, or a content
-change other than a leading-whitespace deletion, refuses it.
+change of any other shape, refuses it. That includes a blank line between
+lines that stay, and blank lines ending or opening a segment beside a gap
+(the line break opening the second of two joined strings, say).
 
 ### Coordinates
 
@@ -127,14 +141,17 @@ checked, as sent, against the gaps. Any other edit (completion, inlay hint,
 color presentation) is mapped whole, keeping its extent. In every case a
 line the edit creates inside dedented content regains the content's removed
 indentation, and an edit replacing a whole dedented line covers (and
-restores) that line's own indent. A change is **refused** when:
+restores) that line's own indent. Deleted edge blank lines stay in V: P's
+start maps after the leading ones and P's end before the trailing ones, so
+a change at either edge lands on the content. A change is **refused** when:
 
 - it touches a gap (for formatting, when the diff does: a formatter's
   whole-document replacement rewrites every gap's replacement unchanged) —
   the host text a gap stands for is never edited through a downstream
   server;
 - it would join text onto a gap that starts a line (a closing fence
-  between combined blocks), by the same rule as at the region's own end;
+  between combined blocks), or onto the document's deleted closing lines
+  after P's end, by the same rule as at the region's own end;
 - it creates lines in content whose removed indentation is not one uniform
   string.
 
@@ -249,8 +266,22 @@ answers state the correspondence instead.
 
 Every position-bearing response — hover ranges, diagnostics, locations,
 symbols — needs translating, not only edits, so post hooks would multiply
-per method. Restricting content changes to leading-whitespace deletion makes
-every edit mappable without asking the peer again.
+per method. Restricting content changes to deleting whitespace — leading
+whitespace, and blank lines at the edges — makes every edit mappable
+without asking the peer again.
+
+### Deleting any blank line, or inserting text into content
+
+Deleting a blank line between lines that stay leaves a join in P where a
+formatter may add a blank line back, which the host would then hold twice;
+no host string drops interior blank lines anyway, and in some embedded
+languages (HTTP, Markdown) they carry meaning. Inserting text (a module
+docstring, a shebang) adds P-only text that a formatter's diff can
+attribute either way, and an edit beside it may belong to it or to the
+content. Silencing diagnostics that way belongs to filtering them (a peer
+pulling diagnostics through `kakehashi/bridge/peer/request`), and removing
+non-whitespace prefixes (rustdoc's `# `, doctest's `>>> `) to the parser
+and queries, as a blockquote's `> ` already is.
 
 ### Gap replacements of the original width
 

@@ -424,9 +424,15 @@ impl Kakehashi {
                     // Capture the region's per-line host prefixes now, while
                     // the host snapshot is at hand: the pipeline's whole-region
                     // replacement must re-apply them to its multi-line output
-                    // (Decision point 4, `reapply_host_line_prefixes`).
+                    // (Decision point 4, `reapply_host_line_prefixes`). The
+                    // prefixes are per host line, so count the virtual
+                    // document's lines: a prepared one may have fewer, its
+                    // edge blank lines deleted, and the prepared path,
+                    // re-applying none, refuses a result if any line has one.
+                    // Counted as LSP does: LF, CRLF and a lone CR each end a
+                    // line.
                     let virtual_line_count =
-                        region_ctx.resolved.virtual_content.matches('\n').count() + 1;
+                        crate::lsp::bridge::count_lines(&resolved.virtual_content) as usize;
                     let mapper = host_mapper
                         .get_or_insert_with(|| crate::text::PositionMapper::new(snapshot.text()));
                     let host_line_prefixes = extract_host_line_prefixes(
