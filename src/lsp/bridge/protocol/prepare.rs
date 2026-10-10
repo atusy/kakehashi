@@ -809,9 +809,9 @@ impl PreparedMap {
             })
     }
 
-    /// Whether a V position sits within indentation the peer removed (at
-    /// its start included): P has no position there, and one at the line's
-    /// content stands in for it.
+    /// Whether a V position sits within indentation or a blank line the
+    /// peer removed (at its start included): P has no position there, and
+    /// one at the line's content stands in for it.
     pub(crate) fn virtual_position_in_removed_indent(&self, position: Position) -> bool {
         let offset = self.virtual_lines.offset_clamped(position);
         let first = self.runs.partition_point(|run| run.virtual_.end <= offset);
@@ -819,7 +819,7 @@ impl PreparedMap {
             .iter()
             .take_while(|run| run.virtual_.start <= offset)
             .any(|run| {
-                run.kind == RunKind::Deleted
+                matches!(run.kind, RunKind::Deleted | RunKind::LeadingLines)
                     && run.virtual_.start <= offset
                     && offset < run.virtual_.end
             })
@@ -1763,6 +1763,17 @@ mod tests {
         // A V position on the deleted line lands on P's start.
         assert_eq!(map.to_prepared(pos(0, 0), Bias::Start), pos(0, 0));
         assert_eq!(map.to_prepared(pos(2, 3), Bias::Start), pos(1, 1));
+    }
+
+    #[test]
+    fn a_position_on_a_deleted_line_is_in_removed_indent() {
+        let (_, prepared) = leading_blank_dedented();
+        let map = prepared.map.unwrap();
+        // P has no position on the deleted line either: a caret there
+        // stands in for one at P's first content.
+        assert!(map.virtual_position_in_removed_indent(pos(0, 0)));
+        assert!(map.virtual_position_in_removed_indent(pos(1, 1)));
+        assert!(!map.virtual_position_in_removed_indent(pos(1, 2)));
     }
 
     #[test]
