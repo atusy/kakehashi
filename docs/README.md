@@ -1240,7 +1240,8 @@ break to a region that ends without one (`''local x = 1''` keeps its closing
 `''` on the same line) nor doubles one a region already ends with. Blank
 lines before the final line break are the formatter's: it may trim them (at
 the end of a markdown fence, say), but not add more than the region had.
-This applies to the editor's formatting requests too, and, in a document a
+Blank lines a `prepare` server deleted never reach the formatter, so they
+stay as they are. This applies to the editor's formatting requests too, and, in a document a
 `prepare` server joins from several strings (the Nix between them emptied),
 to the edges of each string.
 
