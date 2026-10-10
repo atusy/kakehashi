@@ -352,12 +352,15 @@ pub(crate) fn apply_prepare_result(
                         virtual_text,
                         "",
                     );
-                    // The indentation-only line ending the document (the
-                    // indent before a closing `''`) indents no content line,
-                    // so it says nothing of the indent new lines regain —
-                    // unless the document has no content line at all.
+                    // The indentation-only line ending the document after
+                    // the last segment's line breaks (the indent before a
+                    // closing `''`) indents no content line, so it says
+                    // nothing of the indent new lines regain — unless the
+                    // document has no content line at all. A segment's only
+                    // line is no such closing line: it is the segment's own.
                     let closing_indent = index == last_index
                         && deletion.end == segment.virtual_range.end
+                        && deletion.start > segment.virtual_range.start
                         && has_content;
                     if kind == RunKind::Deleted && !closing_indent {
                         deleted.push(&virtual_text[deletion.clone()]);
@@ -2190,6 +2193,42 @@ mod tests {
         );
         assert_eq!(map.edit_to_virtual(&edit((0, 0), (0, 0), "\nb")), None);
         assert_eq!(map.edits_to_virtual(&[edit((0, 0), (0, 0), "\nb")]), None);
+    }
+
+    #[test]
+    fn a_blank_last_segment_of_one_line_keeps_its_dedent() {
+        // A last segment holding only an indented line of its own (no line
+        // break before it in the segment) is no closing indent after
+        // content lines: its indent is what new lines there regain.
+        let virtual_text = "a\n\n\n  ".to_string();
+        let layout = VirtualLayout::from_pieces(
+            &virtual_text,
+            [
+                (SegmentKind::Content, 0..2, String::new()),
+                (SegmentKind::Gap, 2..4, "```\n```py\n".to_string()),
+                (SegmentKind::Content, 4..6, String::new()),
+            ],
+        );
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &layout,
+            result(json!({"segments": [
+                {"type": "content"},
+                {"type": "gap"},
+                {"type": "content", "changes": [
+                    {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+                ]}
+            ]})),
+        )
+        .unwrap();
+        let map = prepared.map.unwrap();
+        let edits = map
+            .edits_to_virtual(&[edit((3, 0), (3, 0), "if True:\n  pass\nprint(1)")])
+            .unwrap();
+        assert_eq!(
+            apply_to(&virtual_text, &edits),
+            "a\n\n\n  if True:\n    pass\n  print(1)"
+        );
     }
 
     #[test]
