@@ -507,16 +507,20 @@ fn content_deletions(
         trailing_start = range.start;
     }
     // A segment with no content left beside its deleted lines puts them
-    // beside the gap that follows (or precedes) it.
+    // beside the gap that follows (or precedes) it — when that gap starts
+    // (or ends) a line: within a line, the blank text left is that line's
+    // indent or line break (`''\n  ${x}/bin/foo''`).
     let is_blank = |text: &str| text.trim_matches([' ', '\t', '\n', '\r']).is_empty();
     let beside_gap = (!edges.end
         && leading_end > segment_start
-        && is_blank(&virtual_text[leading_end..segment_end]))
+        && is_blank(&virtual_text[leading_end..segment_end])
+        && is_line_start(virtual_text, segment_end))
         || (!edges.start
             && deletions
                 .iter()
                 .any(|(_, kind)| *kind == RunKind::TrailingLines)
-            && is_blank(&virtual_text[segment_start..trailing_start]));
+            && is_blank(&virtual_text[segment_start..trailing_start])
+            && is_line_start(virtual_text, segment_start));
     if beside_gap {
         return Err("content changes may only delete blank lines at the document's edges");
     }
@@ -2242,6 +2246,47 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn edge_lines_beside_a_gap_within_a_line_go() {
+        // `''\n  ${x}/bin/foo\n''` and `''\n  a\n  ${x}\n\n''`: the gap
+        // sits within a line, so the blank text left beside it is that
+        // line's indent or line break, not blank lines beside the gap.
+        let first = "\n      /bin/foo\n";
+        let layout = VirtualLayout::from_pieces(
+            first,
+            [
+                (SegmentKind::Content, 0..3, String::new()),
+                (SegmentKind::Gap, 3..7, "${x}".to_string()),
+                (SegmentKind::Content, 7..16, String::new()),
+            ],
+        );
+        let opening = json!([{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""}]);
+        let prepared = apply_prepare_result(
+            first,
+            &layout,
+            result(json!({"segments": [{"type": "content", "changes": opening}, {"type": "gap"}, {"type": "content"}]})),
+        )
+        .map(|prepared| prepared.text);
+        assert_eq!(prepared, Ok("      /bin/foo\n".to_string()));
+        let last = "\n  a\n      \n\n";
+        let layout = VirtualLayout::from_pieces(
+            last,
+            [
+                (SegmentKind::Content, 0..7, String::new()),
+                (SegmentKind::Gap, 7..11, "${x}".to_string()),
+                (SegmentKind::Content, 11..13, String::new()),
+            ],
+        );
+        let closing = json!([{"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""}]);
+        let prepared = apply_prepare_result(
+            last,
+            &layout,
+            result(json!({"segments": [{"type": "content"}, {"type": "gap"}, {"type": "content", "changes": closing}]})),
+        )
+        .map(|prepared| prepared.text);
+        assert_eq!(prepared, Ok("\n  a\n      \n".to_string()));
     }
 
     #[test]

@@ -67,12 +67,18 @@ function prepare(segments: { type: string; content: string }[]) {
   // Whole blank lines at the document's edges, as a string syntax dropping
   // them would: from the first segment's start, and before the last
   // segment's end (or before a last line holding only indentation). A
-  // segment of blank lines only sits beside a gap unless it is the only one.
+  // segment of blank lines only, beside a gap starting or ending a line,
+  // puts them beside that gap, unless it is the only segment.
   const edgeLines = (index: number) => {
     const lines = segments[index].content.split("\n");
     const last = lines.length - 1;
     const blank = (line: number) => lines[line].trim() === "";
-    if (segments.length > 1 && lines.every((_, line) => blank(line))) return [];
+    const besideGap = index === 0
+      ? segments[index].content.endsWith("\n")
+      : startsLine[index];
+    if (segments.length > 1 && besideGap && lines.every((_, line) => blank(line))) {
+      return [];
+    }
     let leading = 0;
     while (index === 0 && leading < last && blank(leading)) leading++;
     let trailing = last;
