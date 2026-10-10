@@ -865,14 +865,14 @@ impl PreparedMap {
         // deleted edge line's, which P does not show, that drops a line P
         // keeps apart from it; one P has too is the edit's own doing.
         let prepared = self.prepared_lines.text();
-        let cr_before =
-            virtual_text[..virtual_start].ends_with('\r') && !prepared[..old.start].ends_with('\r');
-        let lf_after =
-            virtual_text[virtual_end..].starts_with('\n') && !prepared[old.end..].starts_with('\n');
+        let cr_before = virtual_text[..virtual_start].ends_with('\r');
+        let lf_after = virtual_text[virtual_end..].starts_with('\n');
+        let cr_hidden = cr_before && !prepared[..old.start].ends_with('\r');
+        let lf_hidden = lf_after && !prepared[old.end..].starts_with('\n');
         let fuses = if new_text.is_empty() {
-            cr_before && lf_after
+            cr_before && lf_after && (cr_hidden || lf_hidden)
         } else {
-            cr_before && new_text.starts_with('\n') || lf_after && new_text.ends_with('\r')
+            cr_hidden && new_text.starts_with('\n') || lf_hidden && new_text.ends_with('\r')
         };
         if fuses {
             return None;
@@ -2193,6 +2193,13 @@ mod tests {
         );
         assert_eq!(map.edit_to_virtual(&edit((0, 0), (0, 0), "\nb")), None);
         assert_eq!(map.edits_to_virtual(&[edit((0, 0), (0, 0), "\nb")]), None);
+        // Deleting what keeps a hidden CR from a visible LF fuses them too.
+        let map = prepare(
+            "\ra\n",
+            json!([{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""}]),
+        );
+        assert_eq!(map.edit_to_virtual(&edit((0, 0), (0, 1), "")), None);
+        assert_eq!(map.edits_to_virtual(&[edit((0, 0), (0, 1), "")]), None);
         // A CRLF the edit makes from line breaks P has is the edit's own.
         let map = prepare("a\n", json!([]));
         let crlf = map.edit_to_virtual(&edit((0, 1), (0, 1), "\r")).unwrap();
