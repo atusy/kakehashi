@@ -101,7 +101,8 @@ gap's `content`. An isolated injection is a single content segment.
 The answer has the same length and the same `type` order:
 
 - A content segment's `changes` are segment-relative `TextEdit`s that may
-  only **delete whitespace**, in two shapes. Omitted means unchanged.
+  only **delete whitespace**, each change in one of two shapes. Omitted
+  means unchanged.
   - Leading whitespace of a line: the dedent case.
   - Whole blank lines, line start to line start, at the **document's
     edges**: the lines opening the first segment, or those ending the last
@@ -110,6 +111,7 @@ The answer has the same length and the same `type` order:
     or `indoc!`, and the blank lines a YAML `|` block clips. Without it, a
     shebang, a Dockerfile parser directive or an XML declaration sits on
     line 2. Blank lines beside a gap are inside the document, so they stay.
+    A blank line and the next line's indent are two changes, not one.
 - A gap's `content` is its replacement, of **any length** — a placeholder,
   nothing, or the default. Omitted keeps the coordinate-preserving
   whitespace.
