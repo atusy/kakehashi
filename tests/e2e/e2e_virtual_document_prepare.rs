@@ -89,9 +89,18 @@ function prepare(segments: { type: string; content: string }[]) {
       range: { start: { line: from, character: 0 }, end: { line: to, character: 0 } },
       newText: "",
     });
+    // The closing line's indentation goes with the closing lines.
+    const closingIndent = {
+      range: {
+        start: { line: last, character: 0 },
+        end: { line: last, character: lines[last].length },
+      },
+      newText: "",
+    };
     return [
       ...(leading > 0 ? [whole(0, leading)] : []),
       ...(trailing < last ? [whole(trailing, last)] : []),
+      ...(trailing < last && lines[last] !== "" ? [closingIndent] : []),
     ];
   };
   return {

@@ -496,6 +496,7 @@ fn content_deletions(
                 .is_empty()
         })
         .unwrap_or(segment_end);
+    let closing_line = trailing_start;
     for (range, kind) in deletions.iter_mut().rev() {
         if *kind != RunKind::LeadingLines || range.end <= leading_end {
             continue;
@@ -505,6 +506,22 @@ fn content_deletions(
         }
         *kind = RunKind::TrailingLines;
         trailing_start = range.start;
+    }
+    // The closing line's indentation is no part of the value either, and
+    // with it gone P ends where the deleted lines were: no kept text starts
+    // there in P that positions or edits at P's end could belong to.
+    let has_trailing = deletions
+        .iter()
+        .any(|(_, kind)| *kind == RunKind::TrailingLines);
+    if has_trailing
+        && closing_line < segment_end
+        && !deletions
+            .iter()
+            .any(|(range, kind)| *kind == RunKind::Deleted && *range == (closing_line..segment_end))
+    {
+        return Err(
+            "content changes may only delete closing blank lines with all of the closing line's indentation",
+        );
     }
     // A segment with no content left beside its deleted lines puts them
     // beside the gap that follows (or precedes) it — when that gap starts
@@ -516,9 +533,7 @@ fn content_deletions(
         && is_blank(&virtual_text[leading_end..segment_end])
         && is_line_start(virtual_text, segment_end))
         || (!edges.start
-            && deletions
-                .iter()
-                .any(|(_, kind)| *kind == RunKind::TrailingLines)
+            && has_trailing
             && is_blank(&virtual_text[segment_start..trailing_start])
             && is_line_start(virtual_text, segment_start));
     if beside_gap {
@@ -1964,60 +1979,54 @@ mod tests {
     }
 
     #[test]
-    fn a_tab_indented_closing_line_ends_the_trailing_lines() {
+    fn a_tab_indented_closing_line_goes_with_the_trailing_lines() {
         let virtual_text = "  a\n\n\t\t".to_string();
         let prepared = apply_prepare_result(
             &virtual_text,
             &VirtualLayout::single(&virtual_text),
             result(json!({"segments": [{"type": "content", "changes": [
-                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""}
-            ]}]})),
-        )
-        .unwrap();
-        assert_eq!(prepared.text, "  a\n\t\t");
-        // The kept closing indent starts a line of its own: trimming it, as
-        // formatters do, keeps the blank line the peer deleted before it,
-        // and a line inserted there lands above that blank line.
-        let map = prepared.map.unwrap();
-        let trimmed = map.edits_to_virtual(&[edit((1, 0), (1, 2), "")]).unwrap();
-        assert_eq!(apply_to(&virtual_text, &trimmed), "  a\n\n");
-        let trimmed = map.edit_to_virtual(&edit((1, 0), (1, 2), "")).unwrap();
-        assert_eq!(apply_to(&virtual_text, &[trimmed]), "  a\n\n");
-        let inserted = map.edit_to_virtual(&edit((1, 0), (1, 0), "b\n")).unwrap();
-        assert_eq!(apply_to(&virtual_text, &[inserted]), "  a\nb\n\n\t\t");
-        assert_eq!(map.to_virtual(pos(1, 1), Bias::Start), pos(2, 1));
-        // A caret on the deleted line maps onto the indent's line, so it is
-        // refused there, start included.
-        assert!(map.virtual_position_in_removed_indent(pos(1, 0)));
-        assert!(!map.virtual_position_in_removed_indent(pos(2, 0)));
-        // Text joining the indent's line stays on it.
-        let joined = map.edit_to_virtual(&edit((1, 0), (1, 0), "x")).unwrap();
-        assert_eq!(apply_to(&virtual_text, &[joined]), "  a\n\nx\t\t");
-    }
-
-    #[test]
-    fn a_line_inserted_before_a_kept_dedented_closing_indent_takes_no_tail() {
-        // The closing indent is dedented and kept: a line inserted above it
-        // goes before the deleted blank line, which takes no indent.
-        let virtual_text = "    a\n\n    ".to_string();
-        let prepared = apply_prepare_result(
-            &virtual_text,
-            &VirtualLayout::single(&virtual_text),
-            result(json!({"segments": [{"type": "content", "changes": [
-                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
                 {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""},
                 {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
             ]}]})),
         )
-        .unwrap();
-        assert_eq!(prepared.text, "  a\n  ");
-        let map = prepared.map.unwrap();
-        let inserted = map.edit_to_virtual(&edit((1, 0), (1, 0), "b\n")).unwrap();
-        assert_eq!(apply_to(&virtual_text, &[inserted]), "    a\n  b\n\n    ");
-        let inserted = map
-            .edits_to_virtual(&[edit((1, 0), (1, 0), "b\n")])
-            .unwrap();
-        assert_eq!(apply_to(&virtual_text, &inserted), "    a\n  b\n\n    ");
+        .map(|prepared| prepared.text);
+        assert_eq!(prepared, Ok("  a\n".to_string()));
+    }
+
+    #[test]
+    fn trailing_lines_go_only_with_the_whole_closing_indent() {
+        // The indentation before a closing `''` is no part of the string's
+        // value either: a peer deleting the closing blank lines deletes it
+        // too, so P ends where they were.
+        let reason = "content changes may only delete closing blank lines with all of the closing line's indentation";
+        for (virtual_text, changes) in [
+            // The closing indent kept.
+            (
+                "  a\n\n\t\t",
+                json!([
+                    {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""}
+                ]),
+            ),
+            // Only part of it deleted.
+            (
+                "    a\n\n    ",
+                json!([
+                    {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+                    {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""},
+                    {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
+                ]),
+            ),
+        ] {
+            assert_eq!(
+                apply_prepare_result(
+                    virtual_text,
+                    &VirtualLayout::single(virtual_text),
+                    result(json!({"segments": [{"type": "content", "changes": changes}]})),
+                ),
+                Err(PrepareError::InvalidChange { index: 0, reason }),
+                "{virtual_text:?}"
+            );
+        }
     }
 
     #[test]
@@ -2163,11 +2172,12 @@ mod tests {
                 &virtual_text,
                 &VirtualLayout::single(&virtual_text),
                 result(json!({"segments": [{"type": "content", "changes": [
-                    {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 3, "character": 0}}, "newText": ""}
+                    {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 3, "character": 0}}, "newText": ""},
+                    {"range": {"start": {"line": 3, "character": 0}, "end": {"line": 3, "character": 2}}, "newText": ""}
                 ]}]})),
             )
             .unwrap();
-            assert_eq!(prepared.text, format!("{eol}  a{eol}  "));
+            assert_eq!(prepared.text, format!("{eol}  a{eol}"));
         }
     }
 
