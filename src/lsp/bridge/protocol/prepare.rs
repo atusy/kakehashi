@@ -1861,6 +1861,9 @@ mod tests {
         assert_eq!(map.to_virtual(pos(1, 0), Bias::Start), pos(1, 0));
         assert_eq!(map.to_virtual(pos(1, 0), Bias::End), pos(1, 0));
         assert_eq!(map.to_prepared(pos(2, 0), Bias::Start), pos(1, 0));
+        // V → P keeps to the content: P's end rule is for P offsets only.
+        assert_eq!(map.to_prepared(pos(0, 2), Bias::Start), pos(0, 0));
+        assert_eq!(map.to_prepared(pos(0, 3), Bias::Start), pos(0, 1));
     }
 
     #[test]
