@@ -857,9 +857,11 @@ impl PreparedMap {
             })
     }
 
-    /// Whether a V position sits within indentation or a blank line the
-    /// peer removed (at its start included): P has no position there, and
-    /// one at the line's content stands in for it.
+    /// Whether a V position sits within indentation or blank lines the peer
+    /// removed: P has no position there, and one at the line's content (or
+    /// the content's end) stands in for it. An indent's or opening lines'
+    /// start counts; the closing lines' start does not, since P's end maps
+    /// exactly there.
     pub(crate) fn virtual_position_in_removed_indent(&self, position: Position) -> bool {
         let offset = self.virtual_lines.offset_clamped(position);
         let first = self.runs.partition_point(|run| run.virtual_.end <= offset);
@@ -867,11 +869,12 @@ impl PreparedMap {
             .iter()
             .take_while(|run| run.virtual_.start <= offset)
             .any(|run| {
-                matches!(
-                    run.kind,
-                    RunKind::Deleted | RunKind::LeadingLines | RunKind::TrailingLines
-                ) && run.virtual_.start <= offset
-                    && offset < run.virtual_.end
+                let from = match run.kind {
+                    RunKind::Deleted | RunKind::LeadingLines => run.virtual_.start,
+                    RunKind::TrailingLines => run.virtual_.start + 1,
+                    RunKind::Identity | RunKind::Gap => return false,
+                };
+                from <= offset && offset < run.virtual_.end
             })
     }
 
@@ -1899,6 +1902,17 @@ mod tests {
         let map = prepared.map.unwrap();
         let changed = map.edit_to_virtual(&edit((0, 0), (1, 0), "b\n")).unwrap();
         assert_eq!(apply_to(&virtual_text, &[changed]), "  b\n\n  ");
+    }
+
+    #[test]
+    fn a_caret_right_after_the_content_is_not_in_removed_lines() {
+        let (_, prepared) = trailing_blank_dedented();
+        let map = prepared.map.unwrap();
+        // V (1, 0) is where the deleted lines start, and P's end maps
+        // there: a caret on it is at the content's end.
+        assert!(!map.virtual_position_in_removed_indent(pos(1, 0)));
+        assert!(map.virtual_position_in_removed_indent(pos(1, 1)));
+        assert!(map.virtual_position_in_removed_indent(pos(2, 0)));
     }
 
     #[test]

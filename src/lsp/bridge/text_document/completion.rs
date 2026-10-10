@@ -53,9 +53,10 @@ impl LanguageServerPool {
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Option<CompletionList>> {
-        // Inside removed indentation the server sees the caret at the line's
-        // content: its items would replace text after the caret the client
-        // asked at, which LSP requires an edit's range to contain.
+        // Inside removed indentation or blank lines the server sees the
+        // caret elsewhere (the line's content, the document's edge): its
+        // items would replace text away from the caret the client asked at,
+        // which LSP requires an edit's range to contain.
         if host_position_in_removed_indent(host_position, &offset) {
             return Ok(None);
         }
