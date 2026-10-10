@@ -346,7 +346,12 @@ pub(crate) fn apply_prepare_result(
                         virtual_text,
                         "",
                     );
-                    if kind == RunKind::Deleted {
+                    // The indentation-only line ending the document (the
+                    // indent before a closing `''`) indents no content line,
+                    // so it says nothing of the indent new lines regain.
+                    let closing_indent =
+                        index == last_index && deletion.end == segment.virtual_range.end;
+                    if kind == RunKind::Deleted && !closing_indent {
                         deleted.push(&virtual_text[deletion.clone()]);
                     }
                     cursor = deletion.end;
@@ -1994,6 +1999,45 @@ mod tests {
             .edits_to_virtual(&[edit((1, 0), (1, 0), "b\n")])
             .unwrap();
         assert_eq!(apply_to(&virtual_text, &appended), "  a\n  b\n   \n  ");
+    }
+
+    #[test]
+    fn a_deleted_closing_indent_is_no_dedent() {
+        // The indent before a closing `''` is usually shallower than the
+        // content's, and deleting it removes no indent from a content line:
+        // new lines still regain the content's.
+        let virtual_text = "\n    a\n\n  ".to_string();
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &VirtualLayout::single(&virtual_text),
+            result(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""},
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 4}}, "newText": ""},
+                {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 3, "character": 0}}, "newText": ""},
+                {"range": {"start": {"line": 3, "character": 0}, "end": {"line": 3, "character": 2}}, "newText": ""}
+            ]}]})),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "a\n");
+        let map = prepared.map.unwrap();
+        let formatted = map
+            .edits_to_virtual(&[edit((0, 0), (1, 0), "a\nb\n")])
+            .unwrap();
+        assert_eq!(apply_to(&virtual_text, &formatted), "\n    a\n    b\n\n  ");
+        // Without a dedent, a new line gains none either.
+        let virtual_text = "  a\n\n\t\t".to_string();
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &VirtualLayout::single(&virtual_text),
+            result(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""},
+                {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
+            ]}]})),
+        )
+        .unwrap();
+        let map = prepared.map.unwrap();
+        let appended = map.edit_to_virtual(&edit((1, 0), (1, 0), "b\n")).unwrap();
+        assert_eq!(apply_to(&virtual_text, &[appended]), "  a\nb\n\n\t\t");
     }
 
     #[test]
