@@ -427,7 +427,8 @@ impl Kakehashi {
                     // (Decision point 4, `reapply_host_line_prefixes`). The
                     // prefixes are per host line, so count the virtual
                     // document's lines: a prepared one may have fewer, its
-                    // edge blank lines deleted.
+                    // edge blank lines deleted, and the prepared path,
+                    // re-applying none, refuses a result if any line has one.
                     let virtual_line_count = resolved.virtual_content.matches('\n').count() + 1;
                     let mapper = host_mapper
                         .get_or_insert_with(|| crate::text::PositionMapper::new(snapshot.text()));

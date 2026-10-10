@@ -568,11 +568,12 @@ enum RunKind {
     Identity,
     /// Leading whitespace of a content line, absent from P.
     Deleted,
-    /// Whole blank lines opening a content segment, absent from P.
+    /// Whole blank lines opening the document (its first content segment),
+    /// absent from P.
     LeadingLines,
-    /// Whole blank lines ending a content segment, absent from P. P's
-    /// content ends before them, so positions and edits there map before
-    /// them too.
+    /// Whole blank lines ending the document (its last content segment),
+    /// absent from P. P's content ends before them, so P's end, range ends
+    /// and insertions there map before them too.
     TrailingLines,
     /// A host-owned gap, with any text in P.
     Gap,
@@ -1048,8 +1049,9 @@ impl Side {
 /// boundary the run that *starts* there wins, so a P line start maps after
 /// the indent V deleted there: the host keeps its indentation and the edit
 /// lands on the content. Likewise P's start maps after the lines deleted
-/// from the document's start; P's end, whatever the bias, before those
-/// deleted from its end.
+/// from the document's start, and where those deleted from its end were,
+/// P's end and range ends map before them — a start-biased offset on a
+/// closing indent the peer kept stays on that indent's line.
 fn map_offset(runs: &[Run], offset: usize, bias: Bias, from: Side) -> usize {
     // Where blank lines P no longer has followed its content: the content
     // ends there in V too, before them — unless a kept closing indent

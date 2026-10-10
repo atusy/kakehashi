@@ -261,9 +261,9 @@ pub(crate) fn host_range_in_prepared_gap(host_range: Range, offset: &RegionOffse
 
 /// Whether `host_position` lies within indentation or blank lines the
 /// prepare peer removed from the document `offset` maps to. Downstream sees
-/// the caret elsewhere instead (at the line's content, or the document's
-/// edge), so an edit it anchors there (a completion's replace range) would
-/// not contain the caret the client asked at.
+/// the caret elsewhere instead (at the line's content, the document's start,
+/// or the content's end), so an edit it anchors there (a completion's
+/// replace range) would not contain the caret the client asked at.
 pub(crate) fn host_position_in_removed_indent(
     host_position: Position,
     offset: &RegionOffset,
