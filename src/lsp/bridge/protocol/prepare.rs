@@ -847,8 +847,9 @@ impl PreparedMap {
         // Host text a gap stands for that starts a line (a closing fence and
         // what follows it, between combined code blocks) must keep starting
         // one: a change ending right before it either ends with a line break
-        // or deletes whole lines, as at the region's own end.
-        if self.gap_starts_line_at(virtual_end)
+        // or deletes whole lines, as at the region's own end. So must the
+        // document's deleted closing lines, kept in V after P's end.
+        if (self.gap_starts_line_at(virtual_end) || self.closing_lines_start_at(virtual_end))
             && !(new_text.ends_with(['\n', '\r'])
                 || new_text.is_empty() && is_line_start(virtual_text, virtual_start))
         {
@@ -872,6 +873,15 @@ impl PreparedMap {
                 run.kind == RunKind::Gap && is_line_start(virtual_text, run.virtual_.start)
             })
             .map(|gap| self.virtual_lines.position(gap.virtual_.start))
+    }
+
+    /// Whether the document's deleted closing lines start at V `offset`.
+    fn closing_lines_start_at(&self, offset: usize) -> bool {
+        let first = self.runs.partition_point(|run| run.virtual_.start < offset);
+        self.runs[first..]
+            .iter()
+            .take_while(|run| run.virtual_.start == offset)
+            .any(|run| run.kind == RunKind::TrailingLines)
     }
 
     /// Whether a gap starts at V offset `offset`, at a line start.
@@ -2066,6 +2076,40 @@ mod tests {
             apply_to(&virtual_text, &formatted),
             "  if True:\n    pass\n  print(1)"
         );
+    }
+
+    #[test]
+    fn a_change_at_p_end_must_end_its_line() {
+        // The deleted closing lines start a line in V, as P's end does: a
+        // change ending there without a line break would join the host's
+        // first blank line (its whitespace onto a heredoc terminator, say).
+        let virtual_text = "  cat <<'EOF'\n  \n\n".to_string();
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &VirtualLayout::single(&virtual_text),
+            result(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 3, "character": 0}}, "newText": ""}
+            ]}]})),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "cat <<'EOF'\n");
+        let map = prepared.map.unwrap();
+        for refused in [
+            edit((1, 0), (1, 0), "hello\nEOF"),
+            edit((0, 0), (1, 0), "x"),
+        ] {
+            assert_eq!(map.edit_to_virtual(&refused), None, "{refused:?}");
+            assert_eq!(map.edits_to_virtual(&[refused]), None);
+        }
+        // Ending its line, or deleting whole lines, is fine.
+        let appended = map.edit_to_virtual(&edit((1, 0), (1, 0), "EOF\n")).unwrap();
+        assert_eq!(
+            apply_to(&virtual_text, &[appended]),
+            "  cat <<'EOF'\n  EOF\n  \n\n"
+        );
+        let deleted = map.edit_to_virtual(&edit((0, 0), (1, 0), "")).unwrap();
+        assert_eq!(apply_to(&virtual_text, &[deleted]), "  \n\n");
     }
 
     #[test]
