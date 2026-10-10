@@ -5,9 +5,9 @@
 //!
 //! The tsudoi hook dedents content by its common indentation, deletes the
 //! blank lines at the document's edges, and replaces every gap with a
-//! placeholder line (`--` unless a test needs another). The mock answers hover with the text
-//! it holds, ranged over the hovered line in its own coordinates, and
-//! formats by uppercasing — so each test proves both directions: the
+//! placeholder line (`--` unless a test needs another). The mock answers
+//! hover with the text it holds, ranged over the hovered line in its own
+//! coordinates, and formats by uppercasing — so each test proves both directions: the
 //! downstream server sees the prepared text, and its positions and edits map
 //! back onto the host.
 //!
