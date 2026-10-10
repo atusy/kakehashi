@@ -2032,13 +2032,26 @@ mod tests {
             .unwrap();
             assert_eq!(prepared.text, format!("a{eol}b{eol}"));
             let map = prepared.map.unwrap();
+            // A line added at P's end lands before the deleted line,
+            // indented: both need the line break recognized as one.
             let formatted = map
-                .edits_to_virtual(&[edit((0, 0), (2, 0), &format!("a{eol}c{eol}"))])
+                .edits_to_virtual(&[edit((0, 0), (2, 0), &format!("a{eol}b{eol}c{eol}"))])
                 .unwrap();
             assert_eq!(
                 apply_to(&virtual_text, &formatted),
-                format!("{eol}  a{eol}  c{eol}{eol}")
+                format!("{eol}  a{eol}  b{eol}  c{eol}{eol}")
             );
+            // A closing indent after the deleted line ends it there too.
+            let virtual_text = format!("{eol}  a{eol}{eol}  ");
+            let prepared = apply_prepare_result(
+                &virtual_text,
+                &VirtualLayout::single(&virtual_text),
+                result(json!({"segments": [{"type": "content", "changes": [
+                    {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 3, "character": 0}}, "newText": ""}
+                ]}]})),
+            )
+            .unwrap();
+            assert_eq!(prepared.text, format!("{eol}  a{eol}  "));
         }
     }
 
