@@ -1328,7 +1328,13 @@ fi
             {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""},
             {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 4, "character": 0}}, "newText": ""}
         ]);
-        assert_eq!(format_prepared(&once, changes, "a\nb\n"), once);
+        assert_eq!(format_prepared(&once, changes.clone(), "a\nb\n"), once);
+        // A line the formatter appends at P's end goes on the content,
+        // before the host's blank lines.
+        assert_eq!(
+            format_prepared(&once, changes, "a\nb\nc\n"),
+            "  a\n  b\n  c\n\n\n"
+        );
     }
 
     #[test]
