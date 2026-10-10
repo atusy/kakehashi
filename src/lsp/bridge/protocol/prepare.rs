@@ -323,7 +323,7 @@ pub(crate) fn apply_prepare_result(
                 .map_err(|reason| PrepareError::InvalidChange { index, reason })?;
                 let mut cursor = segment.virtual_range.start;
                 let mut deleted: Vec<&str> = Vec::new();
-                for deletion in deletions {
+                for (deletion, kind) in deletions {
                     push_run(
                         &mut runs,
                         &mut text,
@@ -335,12 +335,14 @@ pub(crate) fn apply_prepare_result(
                     push_run(
                         &mut runs,
                         &mut text,
-                        RunKind::Deleted,
+                        kind,
                         deletion.clone(),
                         virtual_text,
                         "",
                     );
-                    deleted.push(&virtual_text[deletion.clone()]);
+                    if kind == RunKind::Deleted {
+                        deleted.push(&virtual_text[deletion.clone()]);
+                    }
                     cursor = deletion.end;
                 }
                 push_run(
@@ -396,13 +398,13 @@ pub(crate) fn apply_prepare_result(
 }
 
 /// Validate a content segment's changes and return the byte ranges (in V)
-/// they delete, sorted.
+/// they delete, sorted, each with the kind of run it becomes.
 fn content_deletions(
     virtual_text: &str,
     segment_start: usize,
     segment_text: &str,
     changes: Vec<TextEdit>,
-) -> Result<Vec<Range<usize>>, &'static str> {
+) -> Result<Vec<(Range<usize>, RunKind)>, &'static str> {
     let segment_lines = LineMap::new(segment_text.to_string());
     let mut deletions = Vec::with_capacity(changes.len());
     for change in changes {
@@ -431,10 +433,13 @@ fn content_deletions(
         if !at_line_start {
             return Err("content changes may only delete leading whitespace");
         }
-        deletions.push(absolute..segment_start + end);
+        deletions.push((absolute..segment_start + end, RunKind::Deleted));
     }
-    deletions.sort_by_key(|range| range.start);
-    if deletions.windows(2).any(|pair| pair[0].end > pair[1].start) {
+    deletions.sort_by_key(|(range, _)| range.start);
+    if deletions
+        .windows(2)
+        .any(|pair| pair[0].0.end > pair[1].0.start)
+    {
         return Err("content changes overlap");
     }
     Ok(deletions)
