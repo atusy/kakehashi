@@ -312,12 +312,6 @@ pub(crate) fn apply_prepare_result(
     let mut runs: Vec<Run> = Vec::new();
     let mut indents: Vec<SegmentIndent> = Vec::new();
     let last_index = layout.segments.len().saturating_sub(1);
-    let has_content = layout.segments.iter().any(|segment| {
-        segment.kind == SegmentKind::Content
-            && !virtual_text[segment.virtual_range.clone()]
-                .trim()
-                .is_empty()
-    });
     for (index, (segment, answer)) in layout.segments.iter().zip(result.segments).enumerate() {
         let virtual_segment = &virtual_text[segment.virtual_range.clone()];
         match (segment.kind, answer) {
@@ -335,6 +329,9 @@ pub(crate) fn apply_prepare_result(
                 .map_err(|reason| PrepareError::InvalidChange { index, reason })?;
                 let mut cursor = segment.virtual_range.start;
                 let mut deleted: Vec<&str> = Vec::new();
+                let deletes_closing_lines = deletions
+                    .iter()
+                    .any(|(_, kind)| *kind == RunKind::TrailingLines);
                 for (deletion, kind) in deletions {
                     push_run(
                         &mut runs,
@@ -352,16 +349,15 @@ pub(crate) fn apply_prepare_result(
                         virtual_text,
                         "",
                     );
-                    // The indentation-only line ending the document after
-                    // the last segment's line breaks (the indent before a
-                    // closing `''`) indents no content line, so it says
-                    // nothing of the indent new lines regain — unless the
-                    // document has no content line at all. A segment's only
-                    // line is no such closing line: it is the segment's own.
-                    let closing_indent = index == last_index
-                        && deletion.end == segment.virtual_range.end
-                        && deletion.start > segment.virtual_range.start
-                        && has_content;
+                    // The closing indent deleted with the document's closing
+                    // lines (the indent before a closing `''`, which must go
+                    // with them) indents no content line, so it says nothing
+                    // of the indent new lines regain. Without closing lines
+                    // deleted, an indentation-only last line may be content
+                    // of its own, and counts as any line does.
+                    let closing_indent = deletes_closing_lines
+                        && index == last_index
+                        && deletion.end == segment.virtual_range.end;
                     if kind == RunKind::Deleted && !closing_indent {
                         deleted.push(&virtual_text[deletion.clone()]);
                     }
@@ -2236,6 +2232,36 @@ mod tests {
         assert_eq!(
             apply_to(&virtual_text, &edits),
             "a\n\n\n  if True:\n    pass\n  print(1)"
+        );
+        // Nor is one after a blank line in it, when no closing lines go.
+        let virtual_text = "a\n\n\n\n  ".to_string();
+        let layout = VirtualLayout::from_pieces(
+            &virtual_text,
+            [
+                (SegmentKind::Content, 0..2, String::new()),
+                (SegmentKind::Gap, 2..4, "```\n```py\n".to_string()),
+                (SegmentKind::Content, 4..7, String::new()),
+            ],
+        );
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &layout,
+            result(json!({"segments": [
+                {"type": "content"},
+                {"type": "gap"},
+                {"type": "content", "changes": [
+                    {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+                ]}
+            ]})),
+        )
+        .unwrap();
+        let map = prepared.map.unwrap();
+        let edits = map
+            .edits_to_virtual(&[edit((4, 0), (4, 0), "if True:\n  pass\nprint(1)")])
+            .unwrap();
+        assert_eq!(
+            apply_to(&virtual_text, &edits),
+            "a\n\n\n\n  if True:\n    pass\n  print(1)"
         );
     }
 
