@@ -424,16 +424,24 @@ fn content_deletions(
             continue;
         }
         let deleted = &segment_text[start..end];
-        if !deleted.bytes().all(|byte| byte == b' ' || byte == b'\t') {
-            return Err("content changes may only delete spaces and tabs");
-        }
         let absolute = segment_start + start;
-        let at_line_start =
-            absolute == 0 || matches!(virtual_text.as_bytes()[absolute - 1], b'\n' | b'\r');
-        if !at_line_start {
-            return Err("content changes may only delete leading whitespace");
-        }
-        deletions.push((absolute..segment_start + end, RunKind::Deleted));
+        let at_line_start = is_line_start(virtual_text, absolute);
+        let kind = if deleted.bytes().all(|byte| byte == b' ' || byte == b'\t') {
+            if !at_line_start {
+                return Err("content changes may only delete leading whitespace");
+            }
+            RunKind::Deleted
+        } else if deleted
+            .bytes()
+            .all(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
+            && at_line_start
+            && is_line_start(virtual_text, segment_start + end)
+        {
+            RunKind::LeadingLines
+        } else {
+            return Err("content changes may only delete spaces and tabs");
+        };
+        deletions.push((absolute..segment_start + end, kind));
     }
     deletions.sort_by_key(|(range, _)| range.start);
     if deletions
@@ -441,6 +449,17 @@ fn content_deletions(
         .any(|pair| pair[0].0.end > pair[1].0.start)
     {
         return Err("content changes overlap");
+    }
+    // Whole lines go only from the segment's start, where the host's string
+    // syntax drops them (the line break after a Nix `''`).
+    let mut leading_end = segment_start;
+    for (range, kind) in &deletions {
+        if *kind == RunKind::LeadingLines {
+            if range.start != leading_end {
+                return Err("content changes may only delete blank lines at the segment's start");
+            }
+            leading_end = range.end;
+        }
     }
     Ok(deletions)
 }
@@ -455,7 +474,7 @@ fn push_run(
 ) {
     let prepared_text = match kind {
         RunKind::Identity => &virtual_text[virtual_range.clone()],
-        RunKind::Deleted => "",
+        RunKind::Deleted | RunKind::LeadingLines => "",
         RunKind::Gap => replacement,
     };
     if kind == RunKind::Identity && virtual_range.is_empty() {
@@ -490,6 +509,8 @@ enum RunKind {
     Identity,
     /// Leading whitespace of a content line, absent from P.
     Deleted,
+    /// Whole blank lines opening a content segment, absent from P.
+    LeadingLines,
     /// A host-owned gap, with any text in P.
     Gap,
 }
@@ -1711,6 +1732,94 @@ mod tests {
         assert_eq!(map.to_prepared(pos(1, 1), Bias::Start), pos(1, 0));
         // A P line start maps after the deleted indent.
         assert_eq!(map.to_virtual(pos(1, 0), Bias::Start), pos(1, 2));
+    }
+
+    /// A Nix `''` string's content: the line break right after `''`, then
+    /// indented lines. The peer deletes the leading blank line and dedents.
+    fn leading_blank_dedented() -> (String, PreparedDocument) {
+        let virtual_text = "\n  a\n  b\n".to_string();
+        let layout = VirtualLayout::single(&virtual_text);
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &layout,
+            result(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""},
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""},
+                {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
+            ]}]})),
+        )
+        .unwrap();
+        (virtual_text, prepared)
+    }
+
+    #[test]
+    fn leading_blank_lines_are_deleted() {
+        let (_, prepared) = leading_blank_dedented();
+        assert_eq!(prepared.text, "a\nb\n");
+        let map = prepared.map.unwrap();
+        // P's first line is V's second, after its removed indent.
+        assert_eq!(map.to_virtual(pos(0, 0), Bias::Start), pos(1, 2));
+        assert_eq!(map.to_virtual(pos(1, 1), Bias::Start), pos(2, 3));
+        // A V position on the deleted line lands on P's start.
+        assert_eq!(map.to_prepared(pos(0, 0), Bias::Start), pos(0, 0));
+        assert_eq!(map.to_prepared(pos(2, 3), Bias::Start), pos(1, 1));
+    }
+
+    #[test]
+    fn edits_keep_a_deleted_leading_blank_line() {
+        let (virtual_text, prepared) = leading_blank_dedented();
+        let map = prepared.map.unwrap();
+        // A formatter's whole-document answer re-indents under the host's
+        // line break.
+        let formatted = map
+            .edits_to_virtual(&[edit((0, 0), (2, 0), "if a:\n  b\n")])
+            .unwrap();
+        assert_eq!(apply_to(&virtual_text, &formatted), "\n  if a:\n    b\n");
+        // Replacing P's whole first line restores that line's indent only.
+        let replaced = map
+            .edits_to_virtual(&[edit((0, 0), (1, 0), "c\n")])
+            .unwrap();
+        assert_eq!(apply_to(&virtual_text, &replaced), "\n  c\n  b\n");
+        // A line inserted before P's first goes after the deleted line.
+        let inserted = map.edit_to_virtual(&edit((0, 0), (0, 0), "z\n")).unwrap();
+        assert_eq!(apply_to(&virtual_text, &[inserted]), "\n  z\n  a\n  b\n");
+    }
+
+    #[test]
+    fn only_blank_lines_opening_the_segment_may_be_deleted() {
+        let virtual_text = "\n\na\n\nb\n".to_string();
+        let layout = VirtualLayout::single(&virtual_text);
+        let refused = |changes: serde_json::Value| {
+            apply_prepare_result(
+                &virtual_text,
+                &layout,
+                result(json!({"segments": [{"type": "content", "changes": changes}]})),
+            )
+            .map(|prepared| prepared.text)
+        };
+        // Both leading lines, in one edit or one each, go.
+        let both = json!([{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""}]);
+        assert_eq!(refused(both), Ok("a\n\nb\n".to_string()));
+        let each = json!([
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""},
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""}
+        ]);
+        assert_eq!(refused(each), Ok("a\n\nb\n".to_string()));
+        let reason = "content changes may only delete blank lines at the segment's start";
+        for changes in [
+            // A blank line after one that stays.
+            json!([{"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""}]),
+            // A blank line between content lines.
+            json!([{"range": {"start": {"line": 3, "character": 0}, "end": {"line": 4, "character": 0}}, "newText": ""}]),
+        ] {
+            assert_eq!(
+                refused(changes),
+                Err(PrepareError::InvalidChange { index: 0, reason })
+            );
+        }
+        // A line break alone, joining a line onto the previous one.
+        let joining = json!([{"range": {"start": {"line": 2, "character": 1}, "end": {"line": 3, "character": 0}}, "newText": ""}]);
+        assert!(refused(joining).is_err());
     }
 
     #[test]
