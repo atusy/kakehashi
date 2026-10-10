@@ -451,7 +451,11 @@ fn content_deletions(
                 return Err("content changes may only delete leading whitespace");
             }
             RunKind::Deleted
-        } else if at_line_start && is_line_start(virtual_text, segment_start + end) {
+        } else if at_line_start
+            && is_line_start(virtual_text, segment_start + end)
+            && !splits_crlf(virtual_text, absolute)
+            && !splits_crlf(virtual_text, segment_start + end)
+        {
             // Classified as leading or trailing below.
             RunKind::LeadingLines
         } else {
@@ -1215,6 +1219,14 @@ fn is_blank_from(text: &str, offset: usize) -> bool {
         .is_none_or(|rest| rest.trim().is_empty())
 }
 
+/// Whether `offset` sits between the CR and LF of a CRLF: past its line's
+/// content, where LSP clamps a position, yet a distinct byte offset.
+fn splits_crlf(text: &str, offset: usize) -> bool {
+    offset > 0
+        && text.as_bytes()[offset - 1] == b'\r'
+        && text.as_bytes().get(offset) == Some(&b'\n')
+}
+
 fn is_line_start(text: &str, offset: usize) -> bool {
     offset == 0 || matches!(text.as_bytes().get(offset - 1), Some(b'\n' | b'\r'))
 }
@@ -1412,11 +1424,6 @@ fn diff_hunks(old: &str, new: &str) -> Vec<Hunk> {
         // past the line's content, where LSP clamps it, so a deletion of
         // just the CR would apply as nothing. Widen into the equal text on
         // either side (the same in both texts).
-        let splits_crlf = |text: &str, offset: usize| {
-            offset > 0
-                && text.as_bytes()[offset - 1] == b'\r'
-                && text.as_bytes().get(offset) == Some(&b'\n')
-        };
         if splits_crlf(old, old_bytes.start) || splits_crlf(new, new_bytes.start) {
             old_bytes.start -= 1;
             new_bytes.start -= 1;
@@ -1991,6 +1998,36 @@ mod tests {
             assert_eq!(
                 apply_to(&virtual_text, &formatted),
                 format!("{eol}  a{eol}  c{eol}{eol}")
+            );
+        }
+    }
+
+    #[test]
+    fn a_deletion_splitting_a_crlf_is_refused() {
+        // LSP treats CRLF as one line break, but a position between its CR
+        // and LF still names an offset: deleting up to or from there would
+        // leave a lone CR or LF the map does not count.
+        for (virtual_text, start, end) in [
+            ("\r\nfoo", (0, 0), (0, 1)),
+            ("  \r\nfoo", (0, 0), (0, 3)),
+            ("foo\r\n\r\n", (0, 4), (2, 0)),
+            ("a\r\n\r\n  ", (1, 1), (2, 0)),
+        ] {
+            let change = json!({"range": {
+                "start": {"line": start.0, "character": start.1},
+                "end": {"line": end.0, "character": end.1}
+            }, "newText": ""});
+            assert_eq!(
+                apply_prepare_result(
+                    virtual_text,
+                    &VirtualLayout::single(virtual_text),
+                    result(json!({"segments": [{"type": "content", "changes": [change]}]})),
+                ),
+                Err(PrepareError::InvalidChange {
+                    index: 0,
+                    reason: "content changes may only delete whole blank lines"
+                }),
+                "{virtual_text:?} {start:?}-{end:?}"
             );
         }
     }
