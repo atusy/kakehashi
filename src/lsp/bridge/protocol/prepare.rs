@@ -1946,6 +1946,34 @@ mod tests {
     }
 
     #[test]
+    fn edge_blank_lines_end_with_any_line_break() {
+        for eol in ["\r\n", "\r"] {
+            let virtual_text = format!("{eol}  a{eol}  b{eol}{eol}");
+            let layout = VirtualLayout::single(&virtual_text);
+            let prepared = apply_prepare_result(
+                &virtual_text,
+                &layout,
+                result(json!({"segments": [{"type": "content", "changes": [
+                    {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""},
+                    {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""},
+                    {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""},
+                    {"range": {"start": {"line": 3, "character": 0}, "end": {"line": 4, "character": 0}}, "newText": ""}
+                ]}]})),
+            )
+            .unwrap();
+            assert_eq!(prepared.text, format!("a{eol}b{eol}"));
+            let map = prepared.map.unwrap();
+            let formatted = map
+                .edits_to_virtual(&[edit((0, 0), (2, 0), &format!("a{eol}c{eol}"))])
+                .unwrap();
+            assert_eq!(
+                apply_to(&virtual_text, &formatted),
+                format!("{eol}  a{eol}  c{eol}{eol}")
+            );
+        }
+    }
+
+    #[test]
     fn a_line_break_opening_a_segment_mid_line_stays() {
         // `''\n  a\n'' + ''\n  b\n''`: the second string opens after the
         // joining Nix on the same line, so its line break is no whole line.
