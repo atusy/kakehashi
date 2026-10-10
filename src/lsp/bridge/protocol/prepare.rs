@@ -348,9 +348,11 @@ pub(crate) fn apply_prepare_result(
                     );
                     // The indentation-only line ending the document (the
                     // indent before a closing `''`) indents no content line,
-                    // so it says nothing of the indent new lines regain.
-                    let closing_indent =
-                        index == last_index && deletion.end == segment.virtual_range.end;
+                    // so it says nothing of the indent new lines regain —
+                    // unless the document has no content line at all.
+                    let closing_indent = index == last_index
+                        && deletion.end == segment.virtual_range.end
+                        && !virtual_segment.trim().is_empty();
                     if kind == RunKind::Deleted && !closing_indent {
                         deleted.push(&virtual_text[deletion.clone()]);
                     }
@@ -2041,6 +2043,29 @@ mod tests {
         let map = prepared.map.unwrap();
         let appended = map.edit_to_virtual(&edit((1, 0), (1, 0), "b\n")).unwrap();
         assert_eq!(apply_to(&virtual_text, &[appended]), "  a\nb\n\n\t\t");
+    }
+
+    #[test]
+    fn a_whitespace_only_document_keeps_its_dedent() {
+        // With no content line, the only line's indent is all a new line
+        // can regain.
+        let virtual_text = "  ".to_string();
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &VirtualLayout::single(&virtual_text),
+            result(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+            ]}]})),
+        )
+        .unwrap();
+        let map = prepared.map.unwrap();
+        let formatted = map
+            .edits_to_virtual(&[edit((0, 0), (0, 0), "if True:\n  pass\nprint(1)")])
+            .unwrap();
+        assert_eq!(
+            apply_to(&virtual_text, &formatted),
+            "  if True:\n    pass\n  print(1)"
+        );
     }
 
     #[test]
