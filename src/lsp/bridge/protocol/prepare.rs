@@ -769,23 +769,11 @@ impl PreparedMap {
             && (prepared[old.clone()].contains(['\n', '\r'])
                 || clears_line && !old.is_empty()
                 || new_text.starts_with(['\n', '\r']));
-        // An insertion where the peer deleted the document's closing blank
-        // lines goes on the content, before them — though a kept closing
-        // indent starts there, unless it is text joining that indent's line.
-        let closing_lines = empty_run(&self.runs, old.start, RunKind::TrailingLines).filter(|_| {
-            old.is_empty()
-                && (new_text.ends_with(['\n', '\r'])
-                    || !prepared_text_starts_at(&self.runs, old.start))
-        });
-        let plain_start = match (
-            closing_lines,
-            empty_run(&self.runs, old.start, RunKind::Gap),
-        ) {
-            (Some(lines), _) => lines.virtual_.start,
+        let plain_start = match empty_run(&self.runs, old.start, RunKind::Gap) {
             // An insertion where the peer emptied a gap goes before the gap's
             // host text, like a change ending there and an insertion at the
             // document end: the start bias alone would carry it past.
-            (_, Some(gap)) if old.is_empty() => gap.virtual_.start,
+            Some(gap) if old.is_empty() => gap.virtual_.start,
             _ => map_offset(&self.runs, old.start, Bias::Start, Side::Prepared),
         };
         // The removed indent right before where the start plainly maps — not
@@ -808,10 +796,8 @@ impl PreparedMap {
         }
         // What follows the change in V: a gap the peer emptied right at its
         // end is not the text after it in P.
-        // Nor are the closing lines an insertion lands before.
         let following = match empty_run(&self.runs, old.end, RunKind::Gap) {
             Some(gap) if gap.virtual_.start == virtual_end => None,
-            _ if closing_lines.is_some() => self.virtual_lines.text()[virtual_end..].chars().next(),
             _ => following,
         };
         let virtual_text = self.virtual_lines.text();
@@ -909,8 +895,8 @@ impl PreparedMap {
     /// Whether a V position sits within indentation or blank lines the peer
     /// removed: P has no position there, and one at the line's content (or
     /// the content's end) stands in for it. An indent's or opening lines'
-    /// start counts; the closing lines' start does not when P's end maps
-    /// exactly there (no closing indent kept after them).
+    /// start counts; the closing lines' start does not, since P's end maps
+    /// exactly there.
     pub(crate) fn virtual_position_in_removed_indent(&self, position: Position) -> bool {
         let offset = self.virtual_lines.offset_clamped(position);
         let first = self.runs.partition_point(|run| run.virtual_.end <= offset);
@@ -920,13 +906,7 @@ impl PreparedMap {
             .any(|run| {
                 let from = match run.kind {
                     RunKind::Deleted | RunKind::LeadingLines => run.virtual_.start,
-                    // P's end maps to its start, unless a kept closing
-                    // indent's line starts there in P.
-                    RunKind::TrailingLines
-                        if prepared_text_starts_at(&self.runs, run.prepared.start) =>
-                    {
-                        run.virtual_.start
-                    }
+                    // P's end maps to its start.
                     RunKind::TrailingLines => run.virtual_.start + 1,
                     RunKind::Identity | RunKind::Gap => return false,
                 };
@@ -1086,12 +1066,10 @@ impl Side {
 /// P's end and range ends map before them — a start-biased offset on a
 /// closing indent the peer kept stays on that indent's line.
 fn map_offset(runs: &[Run], offset: usize, bias: Bias, from: Side) -> usize {
-    // Where blank lines P no longer has followed its content: the content
-    // ends there in V too, before them — unless a kept closing indent
-    // starts there, whose own line a start-biased offset is on.
+    // P's end, where the document's deleted closing lines were: the
+    // content ends there in V too, before them.
     if matches!(from, Side::Prepared)
         && let Some(lines) = empty_run(runs, offset, RunKind::TrailingLines)
-        && (bias == Bias::End || !prepared_text_starts_at(runs, offset))
     {
         return lines.virtual_.start;
     }
@@ -1144,15 +1122,6 @@ fn map_offset(runs: &[Run], offset: usize, bias: Bias, from: Side) -> usize {
         }
     }
     runs.last().map_or(0, |run| from.ranges(run).1.end)
-}
-
-/// Whether a run with text in P starts at P `offset`.
-fn prepared_text_starts_at(runs: &[Run], offset: usize) -> bool {
-    let first = runs.partition_point(|run| run.prepared.start < offset);
-    runs[first..]
-        .iter()
-        .take_while(|run| run.prepared.start == offset)
-        .any(|run| !run.prepared.is_empty())
 }
 
 /// The `kind` run that is empty in P and sits at P `offset`.
@@ -1991,6 +1960,32 @@ mod tests {
         )
         .map(|prepared| prepared.text);
         assert_eq!(prepared, Ok("  a\n".to_string()));
+    }
+
+    #[test]
+    fn a_line_appended_above_a_deleted_whitespace_line_takes_no_tail() {
+        // The deleted closing line holds whitespace, and the closing indent
+        // after it is deleted too: a line appended at P's end goes above
+        // that line, which keeps its own text.
+        let virtual_text = "  a\n   \n  ".to_string();
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &VirtualLayout::single(&virtual_text),
+            result(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""},
+                {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
+            ]}]})),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "a\n");
+        let map = prepared.map.unwrap();
+        let appended = map.edit_to_virtual(&edit((1, 0), (1, 0), "b\n")).unwrap();
+        assert_eq!(apply_to(&virtual_text, &[appended]), "  a\n  b\n   \n  ");
+        let appended = map
+            .edits_to_virtual(&[edit((1, 0), (1, 0), "b\n")])
+            .unwrap();
+        assert_eq!(apply_to(&virtual_text, &appended), "  a\n  b\n   \n  ");
     }
 
     #[test]
