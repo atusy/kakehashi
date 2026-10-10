@@ -2,17 +2,18 @@
 //! before downstream servers see it.
 //!
 //! kakehashi splits the virtual document (V) into ordered segments — injected
-//! `content` and host-owned `gap`s — and asks the peer how to
-//! present them. The answer may delete leading whitespace from content lines
-//! (dedent) and replace any gap with arbitrary text (placeholders). Applying
-//! it yields the prepared document (P) that downstream servers receive, plus
-//! a [`PreparedMap`] translating coordinates between P and V. V keeps its
-//! existing host translation ([`super::RegionOffset`]), so host ↔ P is the
-//! composition of the two.
+//! `content` and host-owned `gap`s — and asks the peer how to present them.
+//! The answer may delete leading whitespace from content lines (dedent) and
+//! whole blank lines at a content segment's edges, and replace any gap with
+//! arbitrary text (placeholders). Applying it yields the prepared document
+//! (P) that downstream servers receive, plus a [`PreparedMap`] translating
+//! coordinates between P and V. V keeps its existing host translation
+//! ([`super::RegionOffset`]), so host ↔ P is the composition of the two.
 //!
-//! Content may only lose leading whitespace so that every edit a downstream
-//! server makes in P can be mapped back unambiguously; gaps are opaque, so an
-//! edit touching one is refused rather than guessed.
+//! Content may only lose leading whitespace and edge blank lines so that
+//! every edit a downstream server makes in P can be mapped back
+//! unambiguously; gaps are opaque, so an edit touching one is refused rather
+//! than guessed.
 
 use std::ops::Range;
 use std::time::{Duration, Instant};

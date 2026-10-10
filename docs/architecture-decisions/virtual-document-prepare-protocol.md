@@ -101,15 +101,24 @@ gap's `content`. An isolated injection is a single content segment.
 The answer has the same length and the same `type` order:
 
 - A content segment's `changes` are segment-relative `TextEdit`s that may
-  only **delete leading whitespace** of a line (the dedent case). Omitted
-  means unchanged.
+  only **delete whitespace**, in two shapes. Omitted means unchanged.
+  - Leading whitespace of a line: the dedent case.
+  - Whole blank lines, line start to line start, at the segment's
+    **edges**: the lines opening it (when it starts a line in V), or those
+    ending it (before a last line holding only indentation). That is what
+    a host string drops from its value: the line break after a Nix `''`,
+    Lua `[[` or `indoc!`, and the blank lines a YAML `|` block clips.
+    Without it, a shebang, a Dockerfile parser directive or an XML
+    declaration sits on line 2.
 - A gap's `content` is its replacement, of **any length** — a placeholder,
   nothing, or the default. Omitted keeps the coordinate-preserving
   whitespace.
 - `null` keeps every segment.
 
 kakehashi validates the whole answer; a wrong length or order, or a content
-change other than a leading-whitespace deletion, refuses it.
+change of any other shape, refuses it. That includes a blank line between
+lines that stay, and the line break opening a segment that starts mid-line
+in V (the second of two joined strings, after the Nix joining them).
 
 ### Coordinates
 
@@ -127,7 +136,9 @@ checked, as sent, against the gaps. Any other edit (completion, inlay hint,
 color presentation) is mapped whole, keeping its extent. In every case a
 line the edit creates inside dedented content regains the content's removed
 indentation, and an edit replacing a whole dedented line covers (and
-restores) that line's own indent. A change is **refused** when:
+restores) that line's own indent. Deleted edge blank lines stay in V: P's
+start maps after the leading ones and P's end before the trailing ones, so
+a change at either edge lands on the content. A change is **refused** when:
 
 - it touches a gap (for formatting, when the diff does: a formatter's
   whole-document replacement rewrites every gap's replacement unchanged) —
@@ -249,8 +260,22 @@ answers state the correspondence instead.
 
 Every position-bearing response — hover ranges, diagnostics, locations,
 symbols — needs translating, not only edits, so post hooks would multiply
-per method. Restricting content changes to leading-whitespace deletion makes
-every edit mappable without asking the peer again.
+per method. Restricting content changes to deleting whitespace — leading
+whitespace, and blank lines at the edges — makes every edit mappable
+without asking the peer again.
+
+### Deleting any blank line, or inserting text into content
+
+Deleting a blank line between lines that stay leaves a join in P where a
+formatter may add a blank line back, which the host would then hold twice;
+no host string drops interior blank lines anyway, and in some embedded
+languages (HTTP, Markdown) they carry meaning. Inserting text (a module
+docstring, a shebang) adds P-only text that a formatter's diff can
+attribute either way, and an edit beside it may belong to it or to the
+content. Silencing diagnostics that way belongs to filtering them (a peer
+pulling diagnostics through `kakehashi/bridge/peer/request`), and removing
+non-whitespace prefixes (rustdoc's `# `, doctest's `>>> `) to the parser
+and queries, as a blockquote's `> ` already is.
 
 ### Gap replacements of the original width
 

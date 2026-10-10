@@ -917,7 +917,9 @@ that name the servers it should use keep it out.
 The request presents the document as ordered segments: `content` (the
 injected text) and `gap` (host text between `injection.combined` captures,
 such as an interpolation). The answer may delete leading whitespace from
-content lines and replace any gap with text of any length:
+content lines, delete whole blank lines at a segment's edges (the line
+break after a Nix `''`, say, so a shebang is the first line), and replace
+any gap with text of any length:
 
 ```ts
 // tsudoi.config.ts
