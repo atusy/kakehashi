@@ -1054,18 +1054,24 @@ fn map_offset(runs: &[Run], offset: usize, bias: Bias, from: Side) -> usize {
     // empty on this side sits exactly here and the caller wants its start.
     if bias == Bias::Start {
         let first = runs.partition_point(|run| from.ranges(run).0.start < offset);
-        if let Some(run) = runs[first..]
+        let mut passed = None;
+        for run in runs[first..]
             .iter()
             .take_while(|run| from.ranges(run).0.start == offset)
-            .find(|run| from.ranges(run).0.is_empty())
+            .filter(|run| from.ranges(run).0.is_empty())
         {
             let target = from.ranges(run).1;
-            // A removed indent at the very end is passed, as at any line
-            // start; a gap emptied there stays after the position.
-            return match run.kind {
-                RunKind::Deleted => target.end,
-                _ => target.start,
-            };
+            // Lines deleted from the document's start and a removed indent
+            // at the very end are passed, as at any line start; a gap
+            // emptied there stays after the position.
+            match run.kind {
+                RunKind::LeadingLines => passed = Some(target.end),
+                RunKind::Deleted => return target.end,
+                _ => return target.start,
+            }
+        }
+        if let Some(end) = passed {
+            return end;
         }
     }
     runs.last().map_or(0, |run| from.ranges(run).1.end)
@@ -1987,6 +1993,26 @@ mod tests {
                 format!("{eol}  a{eol}  c{eol}{eol}")
             );
         }
+    }
+
+    #[test]
+    fn an_all_blank_document_starts_after_its_deleted_lines() {
+        // An empty Nix `''\n''`: the peer deletes its one line, so P is
+        // empty, and P's start is still after the host's line break.
+        let virtual_text = "\n".to_string();
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &VirtualLayout::single(&virtual_text),
+            result(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""}
+            ]}]})),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "");
+        let map = prepared.map.unwrap();
+        assert_eq!(map.to_virtual(pos(0, 0), Bias::Start), pos(1, 0));
+        let inserted = map.edit_to_virtual(&edit((0, 0), (0, 0), "x\n")).unwrap();
+        assert_eq!(apply_to(&virtual_text, &[inserted]), "\nx\n");
     }
 
     #[test]
