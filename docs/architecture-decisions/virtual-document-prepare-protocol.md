@@ -105,13 +105,16 @@ The answer has the same length and the same `type` order:
   means unchanged.
   - Leading whitespace of a line: the dedent case.
   - Whole blank lines, line start to line start, at the **document's
-    edges**: the lines opening the first segment, or those ending the last
-    (before a last line holding only indentation). That is what a host
-    string drops from its value: the line break after a Nix `''`, Lua `[[`
-    or `indoc!`, and the blank lines a YAML `|` block clips. Without it, a
-    shebang, a Dockerfile parser directive or an XML declaration sits on
-    line 2. Blank lines beside a gap are inside the document, so they stay.
-    A blank line and the next line's indent are two changes, not one.
+    edges**: the lines opening the first segment, or those ending the last.
+    When the last ends in a line holding only indentation (the indent
+    before a closing `''`), deleting the lines before it takes deleting
+    all of that indentation too, as a change of its own. That is what a
+    host string drops from its value: the line break after a Nix `''`, Lua
+    `[[` or `indoc!`, the closing line, and the blank lines a YAML `|` block
+    clips. Without it, a shebang, a Dockerfile parser directive or an XML
+    declaration sits on line 2. Blank lines beside a gap are inside the
+    document, so they stay. A blank line and the next line's indent are two
+    changes, not one.
 - A gap's `content` is its replacement, of **any length** — a placeholder,
   nothing, or the default. Omitted keeps the coordinate-preserving
   whitespace.
@@ -139,10 +142,8 @@ color presentation) is mapped whole, keeping its extent. In every case a
 line the edit creates inside dedented content regains the content's removed
 indentation, and an edit replacing a whole dedented line covers (and
 restores) that line's own indent. Deleted edge blank lines stay in V: P's
-start maps after the leading ones, and P's end, a range ending where the
-trailing ones were or an insertion there before them, so a change at
-either edge lands on the content (a closing indent the peer kept keeps its
-own line). A change is **refused** when:
+start maps after the leading ones and P's end before the trailing ones, so
+a change at either edge lands on the content. A change is **refused** when:
 
 - it touches a gap (for formatting, when the diff does: a formatter's
   whole-document replacement rewrites every gap's replacement unchanged) —
