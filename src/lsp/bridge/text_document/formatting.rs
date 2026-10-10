@@ -121,7 +121,7 @@ impl LanguageServerPool {
 /// trailing newline introduces an extra (empty) line.
 ///
 /// Returns 1 for the empty string (a single empty line, index 0).
-pub(super) fn count_lines(text: &str) -> u32 {
+pub(crate) fn count_lines(text: &str) -> u32 {
     // Line breaks + 1 gives the number of line "buckets" in the split —
     // exactly what the LSP position model expects, whose line breaks are
     // `\n`, `\r\n` and a lone `\r` (which a prepare peer's gap placeholder,

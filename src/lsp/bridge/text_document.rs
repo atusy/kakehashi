@@ -38,6 +38,7 @@ pub(crate) use document_link::{envelope_host_document_links, extract_document_li
 mod document_symbol;
 mod folding_range;
 mod formatting;
+pub(crate) use formatting::count_lines;
 pub(super) mod host;
 mod hover;
 mod implementation;

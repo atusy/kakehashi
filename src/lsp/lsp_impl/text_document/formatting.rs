@@ -429,7 +429,10 @@ impl Kakehashi {
                     // document's lines: a prepared one may have fewer, its
                     // edge blank lines deleted, and the prepared path,
                     // re-applying none, refuses a result if any line has one.
-                    let virtual_line_count = resolved.virtual_content.matches('\n').count() + 1;
+                    // Counted as LSP does: LF, CRLF and a lone CR each end a
+                    // line.
+                    let virtual_line_count =
+                        crate::lsp::bridge::count_lines(&resolved.virtual_content) as usize;
                     let mapper = host_mapper
                         .get_or_insert_with(|| crate::text::PositionMapper::new(snapshot.text()));
                     let host_line_prefixes = extract_host_line_prefixes(
