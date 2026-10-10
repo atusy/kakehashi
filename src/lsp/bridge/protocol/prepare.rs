@@ -865,10 +865,14 @@ impl PreparedMap {
             return None;
         }
         // A CR and an LF meeting across the change's edges would fuse two
-        // line breaks into one CRLF, dropping a line P keeps apart from them
-        // (a deleted edge line's break beside the new text).
-        let cr_before = virtual_text[..virtual_start].ends_with('\r');
-        let lf_after = virtual_text[virtual_end..].starts_with('\n');
+        // line breaks into one CRLF. When the one beside the change is a
+        // deleted edge line's, which P does not show, that drops a line P
+        // keeps apart from it; one P has too is the edit's own doing.
+        let prepared = self.prepared_lines.text();
+        let cr_before =
+            virtual_text[..virtual_start].ends_with('\r') && !prepared[..old.start].ends_with('\r');
+        let lf_after =
+            virtual_text[virtual_end..].starts_with('\n') && !prepared[old.end..].starts_with('\n');
         let fuses = if new_text.is_empty() {
             cr_before && lf_after
         } else {
@@ -2193,6 +2197,10 @@ mod tests {
         );
         assert_eq!(map.edit_to_virtual(&edit((0, 0), (0, 0), "\nb")), None);
         assert_eq!(map.edits_to_virtual(&[edit((0, 0), (0, 0), "\nb")]), None);
+        // A CRLF the edit makes from line breaks P has is the edit's own.
+        let map = prepare("a\n", json!([]));
+        let crlf = map.edit_to_virtual(&edit((0, 1), (0, 1), "\r")).unwrap();
+        assert_eq!(apply_to("a\n", &[crlf]), "a\r\n");
     }
 
     #[test]
