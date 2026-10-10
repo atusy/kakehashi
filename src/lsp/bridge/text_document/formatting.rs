@@ -1265,6 +1265,72 @@ fi
         );
     }
 
+    /// Format `region` (at host line 10) through a document prepared with
+    /// `changes`, the formatter answering `formatted` for the whole of it.
+    fn format_prepared(region: &str, changes: serde_json::Value, formatted: &str) -> String {
+        use super::super::super::protocol::{VirtualLayout, apply_prepare_result};
+        let result = serde_json::from_value(json!({"segments": [
+            {"type": "content", "changes": changes}
+        ]}))
+        .unwrap();
+        let prepared =
+            apply_prepare_result(region, &VirtualLayout::single(region), Some(result)).unwrap();
+        let offset = RegionOffset::new(10, 0).with_prepared(prepared.map);
+        let region_end = region_host_end(&prepared.text, &offset);
+        let edits = transform_formatting_response_to_host(
+            whole_document(formatted),
+            &offset,
+            count_lines(&prepared.text),
+            region_end,
+            &prepared.text,
+        )
+        .unwrap();
+        apply_to_region(region, &edits)
+    }
+
+    #[test]
+    fn formatting_keeps_a_leading_blank_line_the_peer_deleted() {
+        // `''\n      {"a":1}\n    ''` in Nix, prepared as the string's
+        // value: the opening line break goes, and the content's indent. The
+        // formatter breaks the object into lines, which regain that indent.
+        let region = "\n      {\"a\":1}\n    ";
+        let changes = json!([
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 6}}, "newText": ""}
+        ]);
+        let formatted = "{\n  \"a\": 1\n}\n";
+        let once = format_prepared(region, changes, formatted);
+        assert_eq!(once, "\n      {\n        \"a\": 1\n      }\n    ");
+        // Formatting again, prepared the same way, changes nothing.
+        let mut changes = vec![json!(
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""}
+        )];
+        changes.extend([1, 2, 3].map(|line| json!(
+            {"range": {"start": {"line": line, "character": 0}, "end": {"line": line, "character": 6}}, "newText": ""}
+        )));
+        assert_eq!(format_prepared(&once, json!(changes), formatted), once);
+    }
+
+    #[test]
+    fn formatting_keeps_trailing_blank_lines_the_peer_deleted() {
+        // A YAML `run: |` block whose blank lines the block clips. The
+        // formatter splits the line; the new one regains the indent.
+        let region = "  a; b\n\n\n";
+        let changes = json!([
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 3, "character": 0}}, "newText": ""}
+        ]);
+        let once = format_prepared(region, changes, "a\nb\n");
+        assert_eq!(once, "  a\n  b\n\n\n");
+        // Formatting again, prepared the same way, changes nothing.
+        let changes = json!([
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 4, "character": 0}}, "newText": ""}
+        ]);
+        assert_eq!(format_prepared(&once, changes, "a\nb\n"), once);
+    }
+
     #[test]
     fn a_formatter_adding_a_final_line_break_does_not_double_it() {
         let region = "\n{}\n    ";
