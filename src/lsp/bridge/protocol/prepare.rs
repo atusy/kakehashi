@@ -312,6 +312,12 @@ pub(crate) fn apply_prepare_result(
     let mut runs: Vec<Run> = Vec::new();
     let mut indents: Vec<SegmentIndent> = Vec::new();
     let last_index = layout.segments.len().saturating_sub(1);
+    let has_content = layout.segments.iter().any(|segment| {
+        segment.kind == SegmentKind::Content
+            && !virtual_text[segment.virtual_range.clone()]
+                .trim()
+                .is_empty()
+    });
     for (index, (segment, answer)) in layout.segments.iter().zip(result.segments).enumerate() {
         let virtual_segment = &virtual_text[segment.virtual_range.clone()];
         match (segment.kind, answer) {
@@ -352,7 +358,7 @@ pub(crate) fn apply_prepare_result(
                     // unless the document has no content line at all.
                     let closing_indent = index == last_index
                         && deletion.end == segment.virtual_range.end
-                        && !virtual_segment.trim().is_empty();
+                        && has_content;
                     if kind == RunKind::Deleted && !closing_indent {
                         deleted.push(&virtual_text[deletion.clone()]);
                     }
@@ -2110,6 +2116,38 @@ mod tests {
         );
         let deleted = map.edit_to_virtual(&edit((0, 0), (1, 0), "")).unwrap();
         assert_eq!(apply_to(&virtual_text, &[deleted]), "  \n\n");
+    }
+
+    #[test]
+    fn a_blank_last_segment_after_content_takes_no_closing_dedent() {
+        // `''a${x}\n\n  ''`: the last segment is blank, but the document
+        // has content, so its closing indent is no dedent.
+        let virtual_text = "a    \n\n  ".to_string();
+        let layout = VirtualLayout::from_pieces(
+            &virtual_text,
+            [
+                (SegmentKind::Content, 0..1, String::new()),
+                (SegmentKind::Gap, 1..5, "${x}".to_string()),
+                (SegmentKind::Content, 5..9, String::new()),
+            ],
+        );
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &layout,
+            result(json!({"segments": [
+                {"type": "content"},
+                {"type": "gap", "content": "x"},
+                {"type": "content", "changes": [
+                    {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""},
+                    {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
+                ]}
+            ]})),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "ax\n");
+        let map = prepared.map.unwrap();
+        let appended = map.edit_to_virtual(&edit((1, 0), (1, 0), "b\n")).unwrap();
+        assert_eq!(apply_to(&virtual_text, &[appended]), "a    \nb\n\n  ");
     }
 
     #[test]
