@@ -450,16 +450,36 @@ fn content_deletions(
     {
         return Err("content changes overlap");
     }
-    // Whole lines go only from the segment's start, where the host's string
-    // syntax drops them (the line break after a Nix `''`).
+    // Whole lines go only from the segment's edges, where the host's string
+    // syntax drops them (the line break after a Nix `''`, the blank lines a
+    // YAML `|` block clips): those running from its start, then those
+    // running to its end — before a last line without a line break, which
+    // only indentation fills (the indentation before a closing `''`).
     let mut leading_end = segment_start;
     for (range, kind) in &deletions {
-        if *kind == RunKind::LeadingLines {
-            if range.start != leading_end {
-                return Err("content changes may only delete blank lines at the segment's start");
-            }
+        if *kind == RunKind::LeadingLines && range.start == leading_end {
             leading_end = range.end;
         }
+    }
+    let segment_end = segment_start + segment_text.len();
+    let mut trailing_start = segment_text
+        .rfind(['\n', '\r'])
+        .map(|last| segment_start + last + 1)
+        .filter(|&last_line| {
+            virtual_text[last_line..segment_end]
+                .trim_matches([' ', '\t'])
+                .is_empty()
+        })
+        .unwrap_or(segment_end);
+    for (range, kind) in deletions.iter_mut().rev() {
+        if *kind != RunKind::LeadingLines || range.end <= leading_end {
+            continue;
+        }
+        if range.end != trailing_start {
+            return Err("content changes may only delete blank lines at the segment's edges");
+        }
+        *kind = RunKind::TrailingLines;
+        trailing_start = range.start;
     }
     Ok(deletions)
 }
@@ -474,7 +494,7 @@ fn push_run(
 ) {
     let prepared_text = match kind {
         RunKind::Identity => &virtual_text[virtual_range.clone()],
-        RunKind::Deleted | RunKind::LeadingLines => "",
+        RunKind::Deleted | RunKind::LeadingLines | RunKind::TrailingLines => "",
         RunKind::Gap => replacement,
     };
     if kind == RunKind::Identity && virtual_range.is_empty() {
@@ -511,6 +531,10 @@ enum RunKind {
     Deleted,
     /// Whole blank lines opening a content segment, absent from P.
     LeadingLines,
+    /// Whole blank lines ending a content segment, absent from P. P's
+    /// content ends before them, so positions and edits there map before
+    /// them too.
+    TrailingLines,
     /// A host-owned gap, with any text in P.
     Gap,
 }
@@ -819,8 +843,10 @@ impl PreparedMap {
             .iter()
             .take_while(|run| run.virtual_.start <= offset)
             .any(|run| {
-                matches!(run.kind, RunKind::Deleted | RunKind::LeadingLines)
-                    && run.virtual_.start <= offset
+                matches!(
+                    run.kind,
+                    RunKind::Deleted | RunKind::LeadingLines | RunKind::TrailingLines
+                ) && run.virtual_.start <= offset
                     && offset < run.virtual_.end
             })
     }
@@ -973,6 +999,13 @@ impl Side {
 /// *starts* there wins, so a P line start maps after the indent V deleted
 /// there: the host keeps its indentation and the edit lands on the content.
 fn map_offset(runs: &[Run], offset: usize, bias: Bias, from: Side) -> usize {
+    // P's content end, where blank lines it no longer has followed: the
+    // content ends there in V too, before them.
+    if matches!(from, Side::Prepared)
+        && let Some(lines) = empty_run(runs, offset, RunKind::TrailingLines)
+    {
+        return lines.virtual_.start;
+    }
     // The end of a P range that reaches a gap the peer replaced with nothing
     // stops before that gap: the range covers none of its host text.
     if bias == Bias::End
@@ -1765,6 +1798,76 @@ mod tests {
         assert_eq!(map.to_prepared(pos(2, 3), Bias::Start), pos(1, 1));
     }
 
+    /// A YAML `|` block's content: the blank lines ending it are not part
+    /// of the value (clip). The peer deletes them and dedents.
+    fn trailing_blank_dedented() -> (String, PreparedDocument) {
+        let virtual_text = "  a\n  \n\n".to_string();
+        let layout = VirtualLayout::single(&virtual_text);
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &layout,
+            result(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 3, "character": 0}}, "newText": ""}
+            ]}]})),
+        )
+        .unwrap();
+        (virtual_text, prepared)
+    }
+
+    #[test]
+    fn trailing_blank_lines_are_deleted() {
+        let (_, prepared) = trailing_blank_dedented();
+        assert_eq!(prepared.text, "a\n");
+        let map = prepared.map.unwrap();
+        assert_eq!(map.to_virtual(pos(0, 1), Bias::Start), pos(0, 3));
+        // P's end is the content's end, before the deleted lines.
+        assert_eq!(map.to_virtual(pos(1, 0), Bias::Start), pos(1, 0));
+        assert_eq!(map.to_virtual(pos(1, 0), Bias::End), pos(1, 0));
+        assert_eq!(map.to_prepared(pos(2, 0), Bias::Start), pos(1, 0));
+    }
+
+    #[test]
+    fn edits_keep_deleted_trailing_blank_lines() {
+        let (virtual_text, prepared) = trailing_blank_dedented();
+        let map = prepared.map.unwrap();
+        let formatted = map
+            .edits_to_virtual(&[edit((0, 0), (1, 0), "if a:\n  b\n")])
+            .unwrap();
+        assert_eq!(
+            apply_to(&virtual_text, &formatted),
+            "  if a:\n    b\n  \n\n"
+        );
+        // A change reaching P's end stops before the deleted lines.
+        let changed = map.edit_to_virtual(&edit((0, 0), (1, 0), "b\n")).unwrap();
+        assert_eq!(apply_to(&virtual_text, &[changed]), "  b\n  \n\n");
+        // An append at P's end goes before them, indented.
+        let appended = map.edit_to_virtual(&edit((1, 0), (1, 0), "c\n")).unwrap();
+        assert_eq!(apply_to(&virtual_text, &[appended]), "  a\n  c\n  \n\n");
+    }
+
+    #[test]
+    fn trailing_blank_lines_go_before_a_closing_indent() {
+        // A Nix `''` string ending in a blank line, then the indentation
+        // before the closing `''`.
+        let virtual_text = "  a\n\n  ".to_string();
+        let layout = VirtualLayout::single(&virtual_text);
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &layout,
+            result(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""},
+                {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
+            ]}]})),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "a\n");
+        let map = prepared.map.unwrap();
+        let changed = map.edit_to_virtual(&edit((0, 0), (1, 0), "b\n")).unwrap();
+        assert_eq!(apply_to(&virtual_text, &[changed]), "  b\n\n  ");
+    }
+
     #[test]
     fn a_position_on_a_deleted_line_is_in_removed_indent() {
         let (_, prepared) = leading_blank_dedented();
@@ -1797,8 +1900,8 @@ mod tests {
     }
 
     #[test]
-    fn only_blank_lines_opening_the_segment_may_be_deleted() {
-        let virtual_text = "\n\na\n\nb\n".to_string();
+    fn only_blank_lines_at_the_segment_edges_may_be_deleted() {
+        let virtual_text = "\n\na\n\nb\n\n\n".to_string();
         let layout = VirtualLayout::single(&virtual_text);
         let refused = |changes: serde_json::Value| {
             apply_prepare_result(
@@ -1810,18 +1913,23 @@ mod tests {
         };
         // Both leading lines, in one edit or one each, go.
         let both = json!([{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""}]);
-        assert_eq!(refused(both), Ok("a\n\nb\n".to_string()));
+        assert_eq!(refused(both), Ok("a\n\nb\n\n\n".to_string()));
         let each = json!([
             {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""},
             {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""}
         ]);
-        assert_eq!(refused(each), Ok("a\n\nb\n".to_string()));
-        let reason = "content changes may only delete blank lines at the segment's start";
+        assert_eq!(refused(each), Ok("a\n\nb\n\n\n".to_string()));
+        // So do both trailing lines.
+        let trailing = json!([{"range": {"start": {"line": 5, "character": 0}, "end": {"line": 7, "character": 0}}, "newText": ""}]);
+        assert_eq!(refused(trailing), Ok("\n\na\n\nb\n".to_string()));
+        let reason = "content changes may only delete blank lines at the segment's edges";
         for changes in [
             // A blank line after one that stays.
             json!([{"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""}]),
             // A blank line between content lines.
             json!([{"range": {"start": {"line": 3, "character": 0}, "end": {"line": 4, "character": 0}}, "newText": ""}]),
+            // A blank line before one that stays.
+            json!([{"range": {"start": {"line": 5, "character": 0}, "end": {"line": 6, "character": 0}}, "newText": ""}]),
         ] {
             assert_eq!(
                 refused(changes),
