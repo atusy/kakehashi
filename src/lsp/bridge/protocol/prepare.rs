@@ -899,18 +899,27 @@ impl PreparedMap {
     /// exactly there.
     pub(crate) fn virtual_position_in_removed_indent(&self, position: Position) -> bool {
         let offset = self.virtual_lines.offset_clamped(position);
+        // Past where the document's deleted closing lines start, V holds only
+        // what P dropped (those lines and the closing indent after them), up
+        // to its very end: P's end maps to that start, nowhere later.
+        if let Some(lines) = self
+            .runs
+            .iter()
+            .rev()
+            .take(2)
+            .find(|run| run.kind == RunKind::TrailingLines)
+            && offset > lines.virtual_.start
+        {
+            return true;
+        }
         let first = self.runs.partition_point(|run| run.virtual_.end <= offset);
         self.runs[first..]
             .iter()
             .take_while(|run| run.virtual_.start <= offset)
             .any(|run| {
-                let from = match run.kind {
-                    RunKind::Deleted | RunKind::LeadingLines => run.virtual_.start,
-                    // P's end maps to its start.
-                    RunKind::TrailingLines => run.virtual_.start + 1,
-                    RunKind::Identity | RunKind::Gap => return false,
-                };
-                from <= offset && offset < run.virtual_.end
+                matches!(run.kind, RunKind::Deleted | RunKind::LeadingLines)
+                    && run.virtual_.start <= offset
+                    && offset < run.virtual_.end
             })
     }
 
@@ -2033,6 +2042,27 @@ mod tests {
         assert!(!map.virtual_position_in_removed_indent(pos(1, 0)));
         assert!(map.virtual_position_in_removed_indent(pos(1, 1)));
         assert!(map.virtual_position_in_removed_indent(pos(2, 0)));
+    }
+
+    #[test]
+    fn a_caret_at_the_end_of_a_deleted_closing_indent_is_removed() {
+        // `''\n  a\n\n  ''`'s value ends after `a`: a caret right before the
+        // closing `''` stands for P's end, which maps above the blank line.
+        let virtual_text = "  a\n\n  ".to_string();
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &VirtualLayout::single(&virtual_text),
+            result(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""},
+                {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
+            ]}]})),
+        )
+        .unwrap();
+        let map = prepared.map.unwrap();
+        assert!(!map.virtual_position_in_removed_indent(pos(1, 0)));
+        assert!(map.virtual_position_in_removed_indent(pos(2, 0)));
+        assert!(map.virtual_position_in_removed_indent(pos(2, 2)));
     }
 
     #[test]
