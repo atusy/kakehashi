@@ -426,20 +426,24 @@ fn content_deletions(
         let deleted = &segment_text[start..end];
         let absolute = segment_start + start;
         let at_line_start = is_line_start(virtual_text, absolute);
-        let kind = if deleted.bytes().all(|byte| byte == b' ' || byte == b'\t') {
+        if !deleted
+            .bytes()
+            .all(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
+        {
+            return Err("content changes may only delete whitespace");
+        }
+        let kind = if !deleted.contains(['\n', '\r']) {
             if !at_line_start {
                 return Err("content changes may only delete leading whitespace");
             }
             RunKind::Deleted
-        } else if deleted
-            .bytes()
-            .all(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
-            && at_line_start
-            && is_line_start(virtual_text, segment_start + end)
-        {
+        } else if at_line_start && is_line_start(virtual_text, segment_start + end) {
+            // Classified as leading or trailing below.
             RunKind::LeadingLines
         } else {
-            return Err("content changes may only delete spaces and tabs");
+            // Lines in V: a segment opening after a gap on the same line
+            // (the second of two joined strings) cannot drop its line break.
+            return Err("content changes may only delete whole blank lines");
         };
         deletions.push((absolute..segment_start + end, kind));
     }
@@ -1942,6 +1946,38 @@ mod tests {
     }
 
     #[test]
+    fn a_line_break_opening_a_segment_mid_line_stays() {
+        // `''\n  a\n'' + ''\n  b\n''`: the second string opens after the
+        // joining Nix on the same line, so its line break is no whole line.
+        let virtual_text = "\n  a\n       \n  b\n".to_string();
+        let layout = VirtualLayout::from_pieces(
+            &virtual_text,
+            [
+                (SegmentKind::Content, 0..5, String::new()),
+                (SegmentKind::Gap, 5..12, "'' + ''".to_string()),
+                (SegmentKind::Content, 12..17, String::new()),
+            ],
+        );
+        assert_eq!(
+            apply_prepare_result(
+                &virtual_text,
+                &layout,
+                result(json!({"segments": [
+                    {"type": "content"},
+                    {"type": "gap"},
+                    {"type": "content", "changes": [
+                        {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""}
+                    ]}
+                ]})),
+            ),
+            Err(PrepareError::InvalidChange {
+                index: 2,
+                reason: "content changes may only delete whole blank lines"
+            })
+        );
+    }
+
+    #[test]
     fn content_change_must_be_leading_whitespace_deletion() {
         let virtual_text = "  a b\n".to_string();
         let layout = VirtualLayout::single(&virtual_text);
@@ -1956,7 +1992,7 @@ mod tests {
             ),
             (
                 json!({"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}}, "newText": ""}),
-                "content changes may only delete spaces and tabs",
+                "content changes may only delete whitespace",
             ),
             (
                 json!({"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 99}}, "newText": ""}),
