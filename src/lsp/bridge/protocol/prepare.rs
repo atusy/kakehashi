@@ -887,8 +887,8 @@ impl PreparedMap {
     /// Whether a V position sits within indentation or blank lines the peer
     /// removed: P has no position there, and one at the line's content (or
     /// the content's end) stands in for it. An indent's or opening lines'
-    /// start counts; the closing lines' start does not, since P's end maps
-    /// exactly there.
+    /// start counts; the closing lines' start does not when P's end maps
+    /// exactly there (no closing indent kept after them).
     pub(crate) fn virtual_position_in_removed_indent(&self, position: Position) -> bool {
         let offset = self.virtual_lines.offset_clamped(position);
         let first = self.runs.partition_point(|run| run.virtual_.end <= offset);
@@ -898,6 +898,13 @@ impl PreparedMap {
             .any(|run| {
                 let from = match run.kind {
                     RunKind::Deleted | RunKind::LeadingLines => run.virtual_.start,
+                    // P's end maps to its start, unless a kept closing
+                    // indent's line starts there in P.
+                    RunKind::TrailingLines
+                        if prepared_text_starts_at(&self.runs, run.prepared.start) =>
+                    {
+                        run.virtual_.start
+                    }
                     RunKind::TrailingLines => run.virtual_.start + 1,
                     RunKind::Identity | RunKind::Gap => return false,
                 };
@@ -1972,6 +1979,10 @@ mod tests {
         let inserted = map.edit_to_virtual(&edit((1, 0), (1, 0), "b\n")).unwrap();
         assert_eq!(apply_to(&virtual_text, &[inserted]), "  a\nb\n\n\t\t");
         assert_eq!(map.to_virtual(pos(1, 1), Bias::Start), pos(2, 1));
+        // A caret on the deleted line maps onto the indent's line, so it is
+        // refused there, start included.
+        assert!(map.virtual_position_in_removed_indent(pos(1, 0)));
+        assert!(!map.virtual_position_in_removed_indent(pos(2, 0)));
     }
 
     #[test]
