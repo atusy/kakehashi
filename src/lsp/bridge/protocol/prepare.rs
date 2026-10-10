@@ -459,8 +459,9 @@ fn content_deletions(
             // Classified as leading or trailing below.
             RunKind::LeadingLines
         } else {
-            // Lines in V: a segment opening after a gap on the same line
-            // (the second of two joined strings) cannot drop its line break.
+            // Not whole lines in V: a line break deleted mid-line, such as
+            // the one opening a segment that starts after a gap on the same
+            // line, or a deletion ending mid-line or inside a CRLF.
             return Err("content changes may only delete whole blank lines");
         };
         deletions.push((absolute..segment_start + end, kind));
@@ -1021,10 +1022,13 @@ impl Side {
 /// Map a byte offset across the runs, in O(log runs).
 ///
 /// Inside an identity run the offset moves by the run's shift. Inside an
-/// opaque run (a deleted indent or a gap) it lands on the run's start, or —
-/// strictly inside, with [`Bias::End`] — its end. On a boundary the run that
-/// *starts* there wins, so a P line start maps after the indent V deleted
-/// there: the host keeps its indentation and the edit lands on the content.
+/// opaque run (a deleted indent, deleted edge lines or a gap) it lands on
+/// the run's start, or — strictly inside, with [`Bias::End`] — its end. On a
+/// boundary the run that *starts* there wins, so a P line start maps after
+/// the indent V deleted there: the host keeps its indentation and the edit
+/// lands on the content. Likewise P's start maps after the lines deleted
+/// from the document's start; P's end, whatever the bias, before those
+/// deleted from its end.
 fn map_offset(runs: &[Run], offset: usize, bias: Bias, from: Side) -> usize {
     // P's content end, where blank lines it no longer has followed: the
     // content ends there in V too, before them.
@@ -2194,7 +2198,7 @@ mod tests {
     }
 
     #[test]
-    fn content_change_must_be_leading_whitespace_deletion() {
+    fn content_change_must_delete_leading_whitespace_or_whole_lines() {
         let virtual_text = "  a b\n".to_string();
         let layout = VirtualLayout::single(&virtual_text);
         for (change, reason) in [
