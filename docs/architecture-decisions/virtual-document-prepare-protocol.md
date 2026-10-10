@@ -150,7 +150,8 @@ a change at either edge lands on the content. A change is **refused** when:
   the host text a gap stands for is never edited through a downstream
   server;
 - it would join text onto a gap that starts a line (a closing fence
-  between combined blocks), by the same rule as at the region's own end;
+  between combined blocks), or onto the document's deleted closing lines
+  after P's end, by the same rule as at the region's own end;
 - it creates lines in content whose removed indentation is not one uniform
   string.
 
