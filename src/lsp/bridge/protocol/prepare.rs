@@ -911,14 +911,14 @@ impl PreparedMap {
 
     /// Whether a V position sits within indentation or blank lines the peer
     /// removed: P has no position there, and one at the line's content (or
-    /// the content's end) stands in for it. An indent's or opening lines'
-    /// start counts; the closing lines' start does not, since P's end maps
-    /// exactly there.
+    /// the content's end) stands in for it, starts included.
     pub(crate) fn virtual_position_in_removed_indent(&self, position: Position) -> bool {
         let offset = self.virtual_lines.offset_clamped(position);
-        // Past where the document's deleted closing lines start, V holds only
+        // From where the document's deleted closing lines start, V holds only
         // what P dropped (those lines and the closing indent after them), up
-        // to its very end: P's end maps to that start, nowhere later.
+        // to its very end. P's end maps to that start, but what a client
+        // inserts at a caret there (a completion without a text edit) joins
+        // the first of those lines, which P does not have.
         // Those are the runs empty in P at its end; the closing lines may
         // be several runs, deleted one by one.
         if let Some(lines) = self
@@ -928,7 +928,7 @@ impl PreparedMap {
             .take_while(|run| run.prepared.is_empty())
             .filter(|run| run.kind == RunKind::TrailingLines)
             .last()
-            && offset > lines.virtual_.start
+            && offset >= lines.virtual_.start
         {
             return true;
         }
@@ -2149,12 +2149,14 @@ mod tests {
     }
 
     #[test]
-    fn a_caret_right_after_the_content_is_not_in_removed_lines() {
+    fn a_caret_on_the_first_deleted_closing_line_is_removed() {
         let (_, prepared) = trailing_blank_dedented();
         let map = prepared.map.unwrap();
         // V (1, 0) is where the deleted lines start, and P's end maps
-        // there: a caret on it is at the content's end.
-        assert!(!map.virtual_position_in_removed_indent(pos(1, 0)));
+        // there, but what the client inserts at a caret there joins the
+        // first of those lines, which P does not have.
+        assert!(!map.virtual_position_in_removed_indent(pos(0, 3)));
+        assert!(map.virtual_position_in_removed_indent(pos(1, 0)));
         assert!(map.virtual_position_in_removed_indent(pos(1, 1)));
         assert!(map.virtual_position_in_removed_indent(pos(2, 0)));
     }
@@ -2175,7 +2177,8 @@ mod tests {
         )
         .unwrap();
         let map = prepared.map.unwrap();
-        assert!(!map.virtual_position_in_removed_indent(pos(1, 0)));
+        assert!(!map.virtual_position_in_removed_indent(pos(0, 3)));
+        assert!(map.virtual_position_in_removed_indent(pos(1, 0)));
         assert!(map.virtual_position_in_removed_indent(pos(2, 0)));
         assert!(map.virtual_position_in_removed_indent(pos(2, 2)));
     }
@@ -2193,7 +2196,8 @@ mod tests {
         )
         .unwrap();
         let map = prepared.map.unwrap();
-        assert!(!map.virtual_position_in_removed_indent(pos(1, 0)));
+        assert!(!map.virtual_position_in_removed_indent(pos(0, 1)));
+        assert!(map.virtual_position_in_removed_indent(pos(1, 0)));
         assert!(map.virtual_position_in_removed_indent(pos(2, 0)));
         assert!(map.virtual_position_in_removed_indent(pos(3, 0)));
     }
