@@ -936,13 +936,29 @@ impl PreparedMap {
     /// the content's end) stands in for it, starts included.
     pub(crate) fn virtual_position_in_removed_indent(&self, position: Position) -> bool {
         let offset = self.virtual_lines.offset_clamped(position);
+        self.offset_in_removed_lines(offset)
+            || self.runs_at_virtual(offset).any(|run| {
+                run.kind == RunKind::Deleted
+                    && run.virtual_.start <= offset
+                    && offset < run.virtual_.end
+            })
+    }
+
+    /// Whether a V position sits on the blank lines the peer deleted from
+    /// the document's edges (starts included): those lines are not in P at
+    /// all, so a request there would be answered for another line.
+    pub(crate) fn virtual_position_in_removed_lines(&self, position: Position) -> bool {
+        self.offset_in_removed_lines(self.virtual_lines.offset_clamped(position))
+    }
+
+    fn offset_in_removed_lines(&self, offset: usize) -> bool {
         // From where the document's deleted closing lines start, V holds only
         // what P dropped (those lines and the closing indent after them), up
         // to its very end. P's end maps to that start, but what a client
         // inserts at a caret there (a completion without a text edit) joins
-        // the first of those lines, which P does not have.
-        // Those are the runs empty in P at its end; the closing lines may
-        // be several runs, deleted one by one.
+        // the first of those lines, which P does not have. Those are the runs
+        // empty in P at its end; the closing lines may be several runs,
+        // deleted one by one.
         if let Some(lines) = self
             .runs
             .iter()
@@ -954,15 +970,19 @@ impl PreparedMap {
         {
             return true;
         }
+        self.runs_at_virtual(offset).any(|run| {
+            run.kind == RunKind::LeadingLines
+                && run.virtual_.start <= offset
+                && offset < run.virtual_.end
+        })
+    }
+
+    /// The runs whose V range may hold V `offset`.
+    fn runs_at_virtual(&self, offset: usize) -> impl Iterator<Item = &Run> {
         let first = self.runs.partition_point(|run| run.virtual_.end <= offset);
         self.runs[first..]
             .iter()
-            .take_while(|run| run.virtual_.start <= offset)
-            .any(|run| {
-                matches!(run.kind, RunKind::Deleted | RunKind::LeadingLines)
-                    && run.virtual_.start <= offset
-                    && offset < run.virtual_.end
-            })
+            .take_while(move |run| run.virtual_.start <= offset)
     }
 
     /// Whether the V range reaches inside a gap's host text (an empty range:

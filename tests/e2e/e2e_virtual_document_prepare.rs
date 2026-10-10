@@ -378,6 +378,17 @@ fn downstream_sees_edge_blank_lines_deleted_and_the_host_keeps_them() {
     // The shebang is the first line downstream.
     let hover = hover_with_retry(&mut client, uri, 4, 4);
     assert_eq!(hover_text(&hover), "#!/usr/bin/env lua\nprint(1)\n");
+    // Downstream has no deleted line: a hover there is not answered for
+    // the next one.
+    let response = client.send_request(
+        "textDocument/hover",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 3, "character": 0 }
+        }),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    assert!(response["result"].is_null(), "{response}");
     assert_eq!(
         hover["range"],
         json!({

@@ -18,7 +18,7 @@ use super::{
 use crate::lsp::bridge::actor::RouterCleanupGuard;
 use crate::lsp::bridge::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, host_position_in_prepared_gap,
-    host_position_within_region_bounds,
+    host_position_in_removed_edge_lines, host_position_within_region_bounds,
 };
 
 /// Context provided to response transformers during bridge request execution.
@@ -525,12 +525,23 @@ impl LanguageServerPool {
         // it needs generation-bound opens (issue #996).
         if !host_position_within_region_bounds(host_position, offset, region_end)
             || host_position_in_prepared_gap(host_position, offset)
+            || host_position_in_removed_edge_lines(host_position, offset)
         {
             if host_position_in_prepared_gap(host_position, offset) {
                 log::debug!(
                     target: "kakehashi::bridge",
                     "{method}: host position (line {}, char {}) is inside a prepared gap; \
                      aborting request",
+                    host_position.line,
+                    host_position.character,
+                );
+            } else if host_position_in_removed_edge_lines(host_position, offset) {
+                // A blank line the prepare peer deleted: downstream has no
+                // such line, and would answer for the next one.
+                log::debug!(
+                    target: "kakehashi::bridge",
+                    "{method}: host position (line {}, char {}) is on a blank line the prepare \
+                     peer deleted; aborting request",
                     host_position.line,
                     host_position.character,
                 );
