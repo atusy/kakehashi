@@ -1908,6 +1908,20 @@ mod tests {
     }
 
     #[test]
+    fn a_tab_indented_closing_line_ends_the_trailing_lines() {
+        let virtual_text = "  a\n\n\t\t".to_string();
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &VirtualLayout::single(&virtual_text),
+            result(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""}
+            ]}]})),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "  a\n\t\t");
+    }
+
+    #[test]
     fn a_caret_right_after_the_content_is_not_in_removed_lines() {
         let (_, prepared) = trailing_blank_dedented();
         let map = prepared.map.unwrap();
