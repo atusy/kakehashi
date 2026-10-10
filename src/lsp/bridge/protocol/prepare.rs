@@ -1949,26 +1949,31 @@ mod tests {
     #[test]
     fn only_blank_lines_at_the_document_edges_may_be_deleted() {
         let virtual_text = "\n\na\n\nb\n\n\n".to_string();
-        let layout = VirtualLayout::single(&virtual_text);
-        let refused = |changes: serde_json::Value| {
+        let prepare = |virtual_text: &str, changes: serde_json::Value| {
             apply_prepare_result(
-                &virtual_text,
-                &layout,
+                virtual_text,
+                &VirtualLayout::single(virtual_text),
                 result(json!({"segments": [{"type": "content", "changes": changes}]})),
             )
             .map(|prepared| prepared.text)
         };
+        let prepared_text = |changes| prepare(&virtual_text, changes);
         // Both leading lines, in one edit or one each, go.
         let both = json!([{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""}]);
-        assert_eq!(refused(both), Ok("a\n\nb\n\n\n".to_string()));
+        assert_eq!(prepared_text(both), Ok("a\n\nb\n\n\n".to_string()));
         let each = json!([
             {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""},
             {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""}
         ]);
-        assert_eq!(refused(each), Ok("a\n\nb\n\n\n".to_string()));
-        // So do both trailing lines.
+        assert_eq!(prepared_text(each), Ok("a\n\nb\n\n\n".to_string()));
+        // So do both trailing lines, in one edit or one each.
         let trailing = json!([{"range": {"start": {"line": 5, "character": 0}, "end": {"line": 7, "character": 0}}, "newText": ""}]);
-        assert_eq!(refused(trailing), Ok("\n\na\n\nb\n".to_string()));
+        assert_eq!(prepared_text(trailing), Ok("\n\na\n\nb\n".to_string()));
+        let each = json!([
+            {"range": {"start": {"line": 5, "character": 0}, "end": {"line": 6, "character": 0}}, "newText": ""},
+            {"range": {"start": {"line": 6, "character": 0}, "end": {"line": 7, "character": 0}}, "newText": ""}
+        ]);
+        assert_eq!(prepared_text(each), Ok("\n\na\n\nb\n".to_string()));
         let reason = "content changes may only delete blank lines at the document's edges";
         for changes in [
             // A blank line after one that stays.
@@ -1979,13 +1984,34 @@ mod tests {
             json!([{"range": {"start": {"line": 5, "character": 0}, "end": {"line": 6, "character": 0}}, "newText": ""}]),
         ] {
             assert_eq!(
-                refused(changes),
+                prepared_text(changes),
                 Err(PrepareError::InvalidChange { index: 0, reason })
             );
         }
-        // A line break alone, joining a line onto the previous one.
-        let joining = json!([{"range": {"start": {"line": 2, "character": 1}, "end": {"line": 3, "character": 0}}, "newText": ""}]);
-        assert!(refused(joining).is_err());
+        // Before a last line with content, a blank line is no closing one.
+        let before_content = json!([{"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""}]);
+        assert_eq!(
+            prepare("a\n\nb", before_content),
+            Err(PrepareError::InvalidChange { index: 0, reason })
+        );
+        let reason = "content changes may only delete whole blank lines";
+        for (virtual_text, changes) in [
+            // A line break alone, joining a line onto the previous one.
+            (
+                virtual_text.as_str(),
+                json!([{"range": {"start": {"line": 2, "character": 1}, "end": {"line": 3, "character": 0}}, "newText": ""}]),
+            ),
+            // A blank line and part of the next line's indent.
+            (
+                "\n  a\n",
+                json!([{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 1}}, "newText": ""}]),
+            ),
+        ] {
+            assert_eq!(
+                prepare(virtual_text, changes),
+                Err(PrepareError::InvalidChange { index: 0, reason })
+            );
+        }
     }
 
     #[test]
