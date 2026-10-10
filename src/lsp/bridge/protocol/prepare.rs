@@ -735,11 +735,18 @@ impl PreparedMap {
             && (prepared[old.clone()].contains(['\n', '\r'])
                 || clears_line && !old.is_empty()
                 || new_text.starts_with(['\n', '\r']));
-        let plain_start = match empty_run(&self.runs, old.start, RunKind::Gap) {
+        let plain_start = match (
+            empty_run(&self.runs, old.start, RunKind::TrailingLines),
+            empty_run(&self.runs, old.start, RunKind::Gap),
+        ) {
+            // An insertion where the peer deleted the document's closing
+            // blank lines goes on the content, before them, though a kept
+            // closing indent starts there.
+            (Some(lines), _) if old.is_empty() => lines.virtual_.start,
             // An insertion where the peer emptied a gap goes before the gap's
             // host text, like a change ending there and an insertion at the
             // document end: the start bias alone would carry it past.
-            Some(gap) if old.is_empty() => gap.virtual_.start,
+            (_, Some(gap)) if old.is_empty() => gap.virtual_.start,
             _ => map_offset(&self.runs, old.start, Bias::Start, Side::Prepared),
         };
         // The removed indent right before where the start plainly maps — not
@@ -1030,10 +1037,12 @@ impl Side {
 /// from the document's start; P's end, whatever the bias, before those
 /// deleted from its end.
 fn map_offset(runs: &[Run], offset: usize, bias: Bias, from: Side) -> usize {
-    // P's content end, where blank lines it no longer has followed: the
-    // content ends there in V too, before them.
+    // Where blank lines P no longer has followed its content: the content
+    // ends there in V too, before them — unless a kept closing indent
+    // starts there, whose own line a start-biased offset is on.
     if matches!(from, Side::Prepared)
         && let Some(lines) = empty_run(runs, offset, RunKind::TrailingLines)
+        && (bias == Bias::End || !prepared_text_starts_at(runs, offset))
     {
         return lines.virtual_.start;
     }
@@ -1086,6 +1095,15 @@ fn map_offset(runs: &[Run], offset: usize, bias: Bias, from: Side) -> usize {
         }
     }
     runs.last().map_or(0, |run| from.ranges(run).1.end)
+}
+
+/// Whether a run with text in P starts at P `offset`.
+fn prepared_text_starts_at(runs: &[Run], offset: usize) -> bool {
+    let first = runs.partition_point(|run| run.prepared.start < offset);
+    runs[first..]
+        .iter()
+        .take_while(|run| run.prepared.start == offset)
+        .any(|run| !run.prepared.is_empty())
 }
 
 /// The `kind` run that is empty in P and sits at P `offset`.
@@ -1923,6 +1941,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(prepared.text, "  a\n\t\t");
+        // The kept closing indent starts a line of its own: trimming it, as
+        // formatters do, keeps the blank line the peer deleted before it,
+        // and a line inserted there lands above that blank line.
+        let map = prepared.map.unwrap();
+        let trimmed = map.edits_to_virtual(&[edit((1, 0), (1, 2), "")]).unwrap();
+        assert_eq!(apply_to(&virtual_text, &trimmed), "  a\n\n");
+        let trimmed = map.edit_to_virtual(&edit((1, 0), (1, 2), "")).unwrap();
+        assert_eq!(apply_to(&virtual_text, &[trimmed]), "  a\n\n");
+        let inserted = map.edit_to_virtual(&edit((1, 0), (1, 0), "b\n")).unwrap();
+        assert_eq!(apply_to(&virtual_text, &[inserted]), "  a\nb\n\n\t\t");
+        assert_eq!(map.to_virtual(pos(1, 1), Bias::Start), pos(2, 1));
     }
 
     #[test]
