@@ -1204,8 +1204,9 @@ async fn dispatch_concatenated_formatting(
                     //
                     // Per-step host-transform interaction: `send_formatting_request`
                     // runs `transform_formatting_response_to_host`, which clamps
-                    // ends past EOF and drops any edit starting past
-                    // `virtual_line_count` for *this step's* `current_text`. Because we pass
+                    // ends past EOF and drops the whole response if an edit
+                    // starts past EOF (other than the insertFinalNewline
+                    // anchor) for *this step's* `current_text`. Because we pass
                     // `RegionOffset::new(0, 0)` (an identity translation) and the
                     // step's own current text, those edits come back already
                     // EOF-clamped and host-translated by a zero offset — i.e. still
