@@ -309,17 +309,13 @@ pub(super) fn transform_formatting_response_to_host(
     // last content line", which IS the region end. Without this, the host
     // line may run on past the region (an inline region's closing quote) and
     // the exact containment check below would drop every canonical
-    // insertFinalNewline response. Restricted to the last content line: a
-    // column past the region anywhere else stays put and fails containment
+    // insertFinalNewline response. Only positions on the region end's own
+    // line are snapped: one past the region on a later line could only come
+    // from a line count disagreeing with `region_end`, and fails containment
     // (fail-closed).
-    let last_real_host_line = offset
-        .line()
-        .saturating_add(virtual_line_count.saturating_sub(1));
     for edit in &mut edits {
         for pos in [&mut edit.range.start, &mut edit.range.end] {
-            if pos.line == last_real_host_line
-                && (pos.line, pos.character) > (region_end.line, region_end.character)
-            {
+            if pos.line == region_end.line && pos.character > region_end.character {
                 *pos = region_end;
             }
         }
