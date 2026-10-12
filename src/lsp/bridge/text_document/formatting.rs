@@ -150,6 +150,23 @@ fn clamp_synthetic_eof_anchor(
     }
 }
 
+/// If the range end `pos` lies on any line past `last_real_line`, rewrite it
+/// to the same (last_real_line, u32::MAX) end-of-document sentinel. An end is
+/// a bound, not a location: like an editor clamping a past-EOF position, read
+/// it as the document end. Covers the "end of document" sentinels servers
+/// send for a whole-document replacement, e.g. bash-language-server's
+/// (2^31-1, 2^31-1).
+fn clamp_end_past_eof(
+    pos: &mut tower_lsp_server::ls_types::Position,
+    last_real_line: u32,
+    virtual_line_count: u32,
+) {
+    if pos.line >= virtual_line_count {
+        pos.line = last_real_line;
+        pos.character = u32::MAX;
+    }
+}
+
 /// Build a JSON-RPC formatting request for a downstream language server.
 ///
 /// Like `documentLink`/`documentSymbol`, formatting carries no position — only
@@ -190,10 +207,11 @@ fn build_formatting_request(
 /// Downstream formatters often emit edits past the virtual EOF (e.g. enforce a
 /// trailing newline) as if it were a real file; the host bytes immediately past
 /// that EOF are the surrounding markdown/string-literal container, so applying
-/// such edits would corrupt the closing fence or quotes. The canonical
-/// insert-final-newline anchor (column 0 of the synthetic line just past EOF) is
-/// first clamped back onto the last real line; any edit with *either* endpoint
-/// still on a line `>= virtual_line_count` is then dropped before translation.
+/// such edits would corrupt the closing fence or quotes. An end past EOF is
+/// therefore clamped to the end of the last real line, as is a start at the
+/// canonical insert-final-newline anchor (column 0 of the synthetic line just
+/// past EOF); any edit whose start is still on a line `>= virtual_line_count`
+/// is then dropped before translation.
 /// `virtual_line_count` is the LSP line count (1 for empty), from [`count_lines`].
 pub(super) fn transform_formatting_response_to_host(
     mut response: serde_json::Value,
@@ -241,20 +259,22 @@ pub(super) fn transform_formatting_response_to_host(
     // standard past-end-of-line clamping snaps them to the line's actual
     // length. Skipped for empty virtual docs (virtual_line_count == 0 is
     // never produced by count_lines, but guard against it just in case).
+    //
+    // Any other end past EOF is clamped the same way: the edit then replaces
+    // up to the region end and nothing beyond it. Only a start further past
+    // EOF stays malformed and is dropped below.
     if virtual_line_count > 0 {
         let last_real_line = virtual_line_count - 1;
         for edit in &mut edits {
             clamp_synthetic_eof_anchor(&mut edit.range.start, last_real_line, virtual_line_count);
-            clamp_synthetic_eof_anchor(&mut edit.range.end, last_real_line, virtual_line_count);
+            clamp_end_past_eof(&mut edit.range.end, last_real_line, virtual_line_count);
         }
     }
 
-    // Drop edits whose start OR end position is still past the virtual
-    // document's last line after clamping. Such edits would corrupt host
-    // content beyond the injection region after offset translation (see
-    // function-level docs). Checking both endpoints handles both the common
-    // "formatter overshoots EOF" case and the malformed `start > virtual_eof`
-    // shape that would otherwise sneak through with an in-bounds `end`.
+    // Drop edits whose start is still past the virtual document's last line
+    // after clamping (the end check only matters for the empty-document guard
+    // above). Such edits would corrupt host content beyond the injection
+    // region after offset translation (see function-level docs).
     // ALL-OR-NOTHING (like the prefix gate below): a formatter answer is one
     // atomic diff, so applying only its in-bounds edits could pair-break a
     // deletion/insertion and duplicate or lose content.
@@ -740,8 +760,8 @@ mod tests {
 
     #[test]
     fn formatting_response_with_an_out_of_bounds_edit_drops_whole() {
-        // Mixed batch: a valid edit on line 0 and a malformed edit whose end
-        // extends past EOF. A formatter answer is one atomic diff, so the
+        // Mixed batch: a valid edit on line 0 and a malformed edit whose start
+        // lies past EOF. A formatter answer is one atomic diff, so the
         // WHOLE response drops — applying only the valid half could
         // duplicate or lose content.
         let response = json!({
@@ -757,8 +777,8 @@ mod tests {
                 },
                 {
                     "range": {
-                        "start": { "line": 1, "character": 0 },
-                        "end": { "line": 5, "character": 0 }
+                        "start": { "line": 5, "character": 0 },
+                        "end": { "line": 6, "character": 0 }
                     },
                     "newText": "wrong"
                 }
@@ -947,10 +967,43 @@ mod tests {
     }
 
     #[test]
-    fn formatting_response_still_drops_edits_two_or_more_lines_past_eof() {
-        // Regression guard: the new "synthetic-line-0" exception only relaxes
-        // a single-line overshoot. An edit ending two lines past EOF is still
-        // malformed and must be dropped to protect host content.
+    fn formatting_response_ends_an_edit_ending_past_eof_at_the_region_end() {
+        // An end past EOF is a bound, not a location: like an editor, read it
+        // as the document end. A partial edit from the middle of the document
+        // replaces up to the region end and nothing beyond it.
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": [
+                {
+                    "range": {
+                        "start": { "line": 1, "character": 0 },
+                        "end":   { "line": 5, "character": 0 }
+                    },
+                    "newText": "b\n"
+                }
+            ]
+        });
+        let region_end = Position::new(11, 3);
+
+        let edits = transform_formatting_response_to_host(
+            response,
+            &RegionOffset::new(10, 0),
+            2,
+            region_end,
+        )
+        .unwrap();
+
+        assert_eq!(edits.len(), 1, "{edits:?}");
+        assert_eq!(edits[0].range.start, Position::new(11, 0));
+        assert_eq!(edits[0].range.end, region_end);
+        assert_eq!(edits[0].new_text, "b\n");
+    }
+
+    #[test]
+    fn formatting_response_ends_an_end_of_document_sentinel_at_the_region_end() {
+        // bash-language-server (shfmt) answers with one edit from the
+        // document start to an "end of document" sentinel, (2^31-1, 2^31-1).
         let response = json!({
             "jsonrpc": "2.0",
             "id": 42,
@@ -958,6 +1011,40 @@ mod tests {
                 {
                     "range": {
                         "start": { "line": 0, "character": 0 },
+                        "end":   { "line": 2147483647, "character": 2147483647 }
+                    },
+                    "newText": "if true; then\n  echo\nfi\n"
+                }
+            ]
+        });
+        let region_end = Position::new(13, 0);
+
+        let edits = transform_formatting_response_to_host(
+            response,
+            &RegionOffset::new(10, 0),
+            4,
+            region_end,
+        )
+        .unwrap();
+
+        assert_eq!(edits.len(), 1, "{edits:?}");
+        assert_eq!(edits[0].range.start, Position::new(10, 0));
+        assert_eq!(edits[0].range.end, region_end);
+        assert_eq!(edits[0].new_text, "if true; then\n  echo\nfi\n");
+    }
+
+    #[test]
+    fn formatting_response_drops_edit_starting_two_or_more_lines_past_eof() {
+        // Only the end is a bound. A start two lines past EOF names no
+        // location in the document and must be dropped to protect host
+        // content (one line past, column 0, is the insertFinalNewline anchor).
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": [
+                {
+                    "range": {
+                        "start": { "line": 3, "character": 0 },
                         "end":   { "line": 5, "character": 0 }
                     },
                     "newText": "wrong"
@@ -975,7 +1062,7 @@ mod tests {
 
         assert!(
             edits.is_empty(),
-            "edits ending more than one line past EOF must still be dropped"
+            "edits starting more than one line past EOF must still be dropped"
         );
     }
 }
