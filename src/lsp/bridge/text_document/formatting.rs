@@ -260,17 +260,15 @@ pub(super) fn transform_formatting_response_to_host(
 
     // Some formatters emit "insert final newline" as a zero-width edit
     // anchored at column 0 of the synthetic line *after* the last real line
-    // (end.line == virtual_line_count && end.character == 0). That is one
-    // past EOF in line space but cannot corrupt host bytes because the
-    // payload is inserted at end-of-content, not over any existing range.
-    // Clamp those anchors down to (last_real_line, u32::MAX) so the editor's
-    // standard past-end-of-line clamping snaps them to the line's actual
-    // length. Skipped for empty virtual docs (virtual_line_count == 0 is
-    // never produced by count_lines, but guard against it just in case).
-    //
-    // Any other end past EOF is clamped the same way: the edit then replaces
-    // up to the region end and nothing beyond it. Only a start further past
-    // EOF stays malformed and is dropped below.
+    // (line == virtual_line_count && character == 0). That is one past EOF
+    // in line space but cannot corrupt host bytes because the payload is
+    // inserted at end-of-content, not over any existing range. A start at
+    // that anchor, and any end past EOF, is clamped to the
+    // (last_real_line, u32::MAX) sentinel, which is snapped to the region end
+    // after translation: such an edit replaces up to the region end and
+    // nothing beyond it. Any other start past EOF stays malformed and is
+    // dropped below. Skipped for empty virtual docs (virtual_line_count == 0
+    // is never produced by count_lines, but guard against it just in case).
     if virtual_line_count > 0 {
         let last_real_line = virtual_line_count - 1;
         for edit in &mut edits {
