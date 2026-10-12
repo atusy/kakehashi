@@ -267,8 +267,9 @@ pub(super) fn transform_formatting_response_to_host(
     // (last_real_line, u32::MAX) sentinel, which is snapped to the region end
     // after translation: such an edit replaces up to the region end and
     // nothing beyond it. Any other start past EOF stays malformed and is
-    // dropped below. Skipped for empty virtual docs (virtual_line_count == 0
-    // is never produced by count_lines, but guard against it just in case).
+    // dropped below. Skipped when virtual_line_count == 0 (never produced by
+    // count_lines, which returns 1 for empty text, but guarded just in case):
+    // the drop below then rejects every edit.
     if virtual_line_count > 0 {
         let last_real_line = virtual_line_count - 1;
         for edit in &mut edits {
@@ -278,15 +279,16 @@ pub(super) fn transform_formatting_response_to_host(
     }
 
     // Drop edits whose start is still past the virtual document's last line
-    // after clamping (the end check only matters for the empty-document guard
-    // above). Such edits would corrupt host content beyond the injection
-    // region after offset translation (see function-level docs).
+    // after clamping; every end is in bounds by now. Such edits would corrupt
+    // host content beyond the injection region after offset translation (see
+    // function-level docs).
     // ALL-OR-NOTHING (like the prefix gate below): a formatter answer is one
     // atomic diff, so applying only its in-bounds edits could pair-break a
     // deletion/insertion and duplicate or lose content.
-    if !edits.iter().all(|edit| {
-        edit.range.start.line < virtual_line_count && edit.range.end.line < virtual_line_count
-    }) {
+    if !edits
+        .iter()
+        .all(|edit| edit.range.start.line < virtual_line_count)
+    {
         warn!(
             target: "kakehashi::bridge",
             "Dropped a formatting response ({} edit(s)): an edit starts past virtual EOF (line {}) and would corrupt host content beyond the injection region",
