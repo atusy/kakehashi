@@ -300,21 +300,22 @@ pub(super) fn transform_formatting_response_to_host(
         translate_virtual_range_to_host(&mut edit.range, offset);
     }
 
-    // Clamp synthetic-EOF sentinels into the region: the (last line, u32::MAX)
-    // sentinel from `clamp_synthetic_eof_anchor` saturates through translation
-    // and would otherwise fail the exact containment check below, dropping
-    // every canonical insertFinalNewline response. Clamping to `region_end`
-    // (the content-precise host end) is exact — the sentinel means "end of
-    // the region's last content line", which IS the region end. Restricted to
-    // the last content line: a stray u32::MAX character anywhere else stays
-    // put and fails containment (fail-closed).
+    // Clamp positions past the end of the last content line into the region:
+    // a character past the line length defaults back to the line length, so
+    // such a position — the (last line, u32::MAX) sentinel from the EOF
+    // clamps, or a server's own large column — means "end of the region's
+    // last content line", which IS the region end. Without this, the host
+    // line may run on past the region (an inline region's closing quote) and
+    // the exact containment check below would drop every canonical
+    // insertFinalNewline response. Restricted to the last content line: a
+    // column past the region anywhere else stays put and fails containment
+    // (fail-closed).
     let last_real_host_line = offset
         .line()
         .saturating_add(virtual_line_count.saturating_sub(1));
     for edit in &mut edits {
         for pos in [&mut edit.range.start, &mut edit.range.end] {
-            if pos.character == u32::MAX
-                && pos.line == last_real_host_line
+            if pos.line == last_real_host_line
                 && (pos.line, pos.character) > (region_end.line, region_end.character)
             {
                 *pos = region_end;
@@ -1069,6 +1070,40 @@ mod tests {
 
         assert_eq!(edits.len(), 1, "{edits:?}");
         assert_eq!(edits[0].range.start, Position::new(11, 1));
+        assert_eq!(edits[0].range.end, region_end);
+    }
+
+    #[test]
+    fn formatting_response_ends_an_end_past_the_last_line_length_at_the_region_end() {
+        // A character past the line length defaults back to the line length,
+        // so a column past the last line's end is the document end too. In an
+        // inline region the host line runs on past it (here the closing
+        // quote), so the end must stop at the region end, not the line end.
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": [
+                {
+                    "range": {
+                        "start": { "line": 0, "character": 0 },
+                        "end":   { "line": 0, "character": 2147483647 }
+                    },
+                    "newText": "x = 1"
+                }
+            ]
+        });
+        let region_end = Position::new(4, 12);
+
+        let edits = transform_formatting_response_to_host(
+            response,
+            &RegionOffset::new(4, 7),
+            1,
+            region_end,
+        )
+        .unwrap();
+
+        assert_eq!(edits.len(), 1, "{edits:?}");
+        assert_eq!(edits[0].range.start, Position::new(4, 7));
         assert_eq!(edits[0].range.end, region_end);
     }
 
