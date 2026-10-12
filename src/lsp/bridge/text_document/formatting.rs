@@ -1041,6 +1041,38 @@ mod tests {
     }
 
     #[test]
+    fn formatting_response_ends_an_end_one_line_past_eof_mid_line_at_the_region_end() {
+        // Only column 0 of the line just past EOF is the insertFinalNewline
+        // anchor; a later column on that line is past EOF all the same.
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": [
+                {
+                    "range": {
+                        "start": { "line": 1, "character": 1 },
+                        "end":   { "line": 2, "character": 5 }
+                    },
+                    "newText": ""
+                }
+            ]
+        });
+        let region_end = Position::new(11, 3);
+
+        let edits = transform_formatting_response_to_host(
+            response,
+            &RegionOffset::new(10, 0),
+            2,
+            region_end,
+        )
+        .unwrap();
+
+        assert_eq!(edits.len(), 1, "{edits:?}");
+        assert_eq!(edits[0].range.start, Position::new(11, 1));
+        assert_eq!(edits[0].range.end, region_end);
+    }
+
+    #[test]
     fn formatting_response_ends_an_end_of_document_sentinel_at_the_region_end() {
         // bash-language-server (shfmt) answers with one edit from the
         // document start to an "end of document" sentinel, (2^31-1, 2^31-1).
