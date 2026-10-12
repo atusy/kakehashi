@@ -699,8 +699,9 @@ mod tests {
         // (3, 0) is the synthetic "next line column 0" anchor that formatters
         // emit for insertFinalNewline / preserveFinalNewline. Per LSP position
         // clamping it's equivalent to (2, eol-of-line-2), so clamp the end
-        // down to (2, u32::MAX) and let the editor snap it. The edit is kept
-        // (not dropped) — previous behavior was overly conservative.
+        // down to the (2, u32::MAX) sentinel, which the transform snaps to the
+        // region end (unbounded here, so the sentinel survives). The edit is
+        // kept (not dropped) — previous behavior was overly conservative.
         let response = json!({
             "jsonrpc": "2.0",
             "id": 42,
@@ -889,8 +890,9 @@ mod tests {
     // boundary guard would drop these as "past EOF", even though they are
     // structurally safe — they insert at the very end of the virtual content
     // without overwriting any host bytes. Treat them as inserts at the last
-    // column of the last real line and let the editor's standard
-    // past-end-of-line clamping snap them into place.
+    // column of the last real line: the (last line, u32::MAX) sentinel, which
+    // the transform snaps to the region end (unbounded in these tests, so the
+    // sentinel survives).
 
     #[test]
     fn formatting_response_clamps_zero_width_insert_on_synthetic_eof_line() {
