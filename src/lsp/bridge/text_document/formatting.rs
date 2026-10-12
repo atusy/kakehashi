@@ -289,7 +289,7 @@ pub(super) fn transform_formatting_response_to_host(
     }) {
         warn!(
             target: "kakehashi::bridge",
-            "Dropped a formatting response ({} edit(s)): an edit extends past virtual EOF (line {}) and would corrupt host content beyond the injection region",
+            "Dropped a formatting response ({} edit(s)): an edit starts past virtual EOF (line {}) and would corrupt host content beyond the injection region",
             edits.len(),
             virtual_line_count
         );
