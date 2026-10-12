@@ -1141,6 +1141,35 @@ mod tests {
     }
 
     #[test]
+    fn formatting_response_drops_edit_starting_one_line_past_eof_mid_line() {
+        // Only column 0 of the line just past EOF is the insertFinalNewline
+        // anchor; a start later on that line names no document location.
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": [
+                {
+                    "range": {
+                        "start": { "line": 2, "character": 3 },
+                        "end":   { "line": 2, "character": 3 }
+                    },
+                    "newText": "wrong"
+                }
+            ]
+        });
+
+        let edits = transform_formatting_response_to_host(
+            response,
+            &RegionOffset::new(0, 0),
+            2,
+            TEST_REGION_END,
+        )
+        .unwrap();
+
+        assert!(edits.is_empty(), "{edits:?}");
+    }
+
+    #[test]
     fn formatting_response_drops_edit_starting_two_or_more_lines_past_eof() {
         // Only the end is a bound. A start two lines past EOF names no
         // location in the document and must be dropped to protect host
