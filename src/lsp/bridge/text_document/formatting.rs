@@ -117,13 +117,21 @@ impl LanguageServerPool {
 }
 
 /// Count the number of lines in `text`, with the LSP convention that a
-/// trailing newline introduces an extra (empty) line.
+/// trailing line terminator introduces an extra (empty) line. Like
+/// `PositionMapper`, a lone CR ends a line too, and CRLF ends one.
 ///
 /// Returns 1 for the empty string (a single empty line, index 0).
 pub(super) fn count_lines(text: &str) -> u32 {
-    // `matches('\n').count() + 1` gives the number of line "buckets" in the
-    // split — exactly what the LSP position model expects.
-    u32::try_from(text.matches('\n').count())
+    // Every LF ends a line; a CR ends one unless an LF follows it.
+    let bytes = text.as_bytes();
+    let terminators = bytes
+        .iter()
+        .enumerate()
+        .filter(|&(index, &byte)| {
+            byte == b'\n' || (byte == b'\r' && bytes.get(index + 1) != Some(&b'\n'))
+        })
+        .count();
+    u32::try_from(terminators)
         .unwrap_or(u32::MAX - 1)
         .saturating_add(1)
 }
@@ -829,6 +837,36 @@ mod tests {
         assert_eq!(edits[0].new_text, "\n");
     }
 
+    #[test]
+    fn an_end_past_eof_over_lone_cr_content_ends_at_the_region_end() {
+        // A lone CR ends an LSP line, so "a\rb" has two lines. Counting only
+        // LF would leave the clamped end on line 0, short of the region end,
+        // and the whole-document replacement would keep the trailing "b".
+        let virtual_content = "a\rb";
+        let offset = RegionOffset::new(10, 0);
+        let response = json!({
+            "jsonrpc": "2.0", "id": 42,
+            "result": [
+                { "range": { "start": { "line": 0, "character": 0 },
+                             "end": { "line": 2147483647, "character": 2147483647 } },
+                  "newText": "A\rB" }
+            ]
+        });
+        let region_end = region_host_end(virtual_content, &offset);
+
+        let edits = transform_formatting_response_to_host(
+            response,
+            &offset,
+            count_lines(virtual_content),
+            region_end,
+        )
+        .unwrap();
+
+        assert_eq!(edits.len(), 1, "{edits:?}");
+        assert_eq!(edits[0].range.start, Position::new(10, 0));
+        assert_eq!(edits[0].range.end, Position::new(11, 1));
+    }
+
     #[rstest]
     #[case::empty("", 1)]
     #[case::single_line("abc", 1)]
@@ -836,6 +874,10 @@ mod tests {
     #[case::trailing_newline("abc\n", 2)]
     #[case::two_trailing_newlines("abc\n\n", 3)]
     #[case::only_newline("\n", 2)]
+    #[case::crlf("abc\r\ndef", 2)]
+    #[case::lone_cr("abc\rdef", 2)]
+    #[case::trailing_lone_cr("abc\r", 2)]
+    #[case::mixed_terminators("a\rb\r\nc\nd", 4)]
     fn count_lines_matches_lsp_line_model(#[case] input: &str, #[case] expected: u32) {
         assert_eq!(count_lines(input), expected);
     }
