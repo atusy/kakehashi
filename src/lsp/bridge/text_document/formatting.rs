@@ -180,8 +180,8 @@ fn clamp_end_past_eof(
 
 /// Keep the region's edge layout through a formatting answer (see
 /// [`restore_edge_layout`]): when the answer changes the edges, it is replaced
-/// by one edit from `virtual_content` to the formatted text with the edges
-/// restored, or by none when only the edges changed.
+/// by the edits from `virtual_content` to the formatted text with the edges
+/// restored (see [`edits_between`]), or by none when only the edges changed.
 ///
 /// Edits that do not apply in order (reversed or overlapping) leave the
 /// formatted text undefined, so they pass as received, edges and all.
@@ -202,10 +202,84 @@ fn keep_edge_layout(
     if restored == virtual_content {
         return Vec::new();
     }
+    if let Some(edits) = edits_between(virtual_content, &restored) {
+        return edits;
+    }
     // Forward-looking: every offset `replacement_between` maps is a char
     // boundary within `virtual_content`, so a position always exists today.
     // Should one not, the answer passes as received rather than being lost.
     replacement_between(virtual_content, &restored).map_or(edits, |edit| vec![edit])
+}
+
+/// How long [`edits_between`] may search for the smallest diff before
+/// settling for a coarser one. A formatting request already waits on a
+/// server round trip; this bounds the extra time a whole-region rewrite of a
+/// large region can add.
+const EDGE_DIFF_DEADLINE: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// The edits turning `original` into `replacement`, one per run of changed
+/// characters. Changes apart stay apart, so an answer whose edits each kept
+/// to their own line (behind a blockquote's `> ` prefixes) still does after
+/// its edges are restored. `None` when the edits do not reproduce
+/// `replacement`, for [`replacement_between`] to cover.
+fn edits_between(original: &str, replacement: &str) -> Option<Vec<TextEdit>> {
+    use similar::{ChangeTag, TextDiff};
+
+    let diff = TextDiff::configure()
+        .deadline(std::time::Instant::now() + EDGE_DIFF_DEADLINE)
+        .diff_chars(original, replacement);
+    // (start, end) bytes in `original`, and the text replacing them.
+    let mut byte_edits: Vec<(usize, usize, String)> = Vec::new();
+    let mut pending: Option<(usize, usize, String)> = None;
+    let mut old_byte = 0;
+    for change in diff.iter_all_changes() {
+        let value = change.value();
+        match change.tag() {
+            ChangeTag::Equal => {
+                byte_edits.extend(pending.take());
+                old_byte += value.len();
+            }
+            ChangeTag::Delete => {
+                let edit = pending.get_or_insert_with(|| (old_byte, old_byte, String::new()));
+                old_byte += value.len();
+                edit.1 = old_byte;
+            }
+            ChangeTag::Insert => {
+                let edit = pending.get_or_insert_with(|| (old_byte, old_byte, String::new()));
+                edit.2.push_str(value);
+            }
+        }
+    }
+    byte_edits.extend(pending);
+
+    // Never split a CRLF: a position between its CR and LF names no column.
+    // The CR or LF taken in is unchanged, so the new text takes it in too.
+    for (start, end, new_text) in &mut byte_edits {
+        if original[..*start].ends_with('\r') && original[*start..].starts_with('\n') {
+            *start -= 1;
+            new_text.insert(0, '\r');
+        }
+        if original[..*end].ends_with('\r') && original[*end..].starts_with('\n') {
+            *end += 1;
+            new_text.push('\n');
+        }
+    }
+
+    let mapper = PositionMapper::new(original);
+    let edits = byte_edits
+        .into_iter()
+        .map(|(start, end, new_text)| {
+            Some(TextEdit {
+                range: Range {
+                    start: mapper.byte_to_position(start)?,
+                    end: mapper.byte_to_position(end)?,
+                },
+                new_text,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (edits_apply_in_order(&edits) && apply_text_edits(original, &edits) == replacement)
+        .then_some(edits)
 }
 
 /// Whether every range is ordered and none overlaps another.
@@ -1074,6 +1148,33 @@ mod tests {
     }
 
     #[test]
+    fn a_blockquoted_region_keeps_its_formatter_edits_apart() {
+        // Each trailing-space deletion stays on its line behind the `> `
+        // prefix. Restoring the closing indentation the formatter trimmed
+        // must not merge them into one edit spanning a prefix, which the
+        // prefix guard would drop with the whole answer.
+        let host = "> ```lua\n> a  \n> b  \n>   ";
+        let virtual_content = "a  \nb  \n  ";
+        let result = json!([
+            { "range": { "start": { "line": 0, "character": 1 },
+                         "end": { "line": 0, "character": 3 } }, "newText": "" },
+            { "range": { "start": { "line": 1, "character": 1 },
+                         "end": { "line": 1, "character": 3 } }, "newText": "" },
+            { "range": { "start": { "line": 2, "character": 0 },
+                         "end": { "line": 2, "character": 2 } }, "newText": "" }
+        ]);
+
+        let formatted = format_host(
+            host,
+            RegionOffset::with_per_line_offsets(1, vec![2, 2, 2]),
+            virtual_content,
+            result,
+        );
+
+        assert_eq!(formatted, "> ```lua\n> a\n> b\n>   ");
+    }
+
+    #[test]
     fn a_region_without_a_final_line_break_gains_none() {
         // This Nix string's value ends without a line break; adding one, as
         // shfmt does, would change the value and move the closing delimiter.
@@ -1115,6 +1216,33 @@ mod tests {
         assert_eq!(edit.new_text, new_text);
         assert_eq!(
             crate::text::edit::apply_text_edits(original, &[edit]),
+            replacement
+        );
+    }
+
+    #[rstest]
+    #[case::changes_apart_stay_apart("a  \nb  \n", "a\nb\n", &[((0, 1), (0, 3)), ((1, 1), (1, 3))])]
+    // An LF turned into a CRLF: the edit takes in the unchanged LF, so no
+    // edit ends between a CR and its LF.
+    #[case::crlf_never_split("x\r\ny", "x\r\r\ny", &[((0, 1), (1, 0))])]
+    #[case::utf16_columns("é\u{1F600}a", "é\u{1F600}b", &[((0, 3), (0, 4))])]
+    fn edits_between_keeps_each_change_to_its_own_edit(
+        #[case] original: &str,
+        #[case] replacement: &str,
+        #[case] ranges: &[Span],
+    ) {
+        let edits = edits_between(original, replacement).unwrap();
+
+        let actual: Vec<Span> = edits
+            .iter()
+            .map(|edit| {
+                let Range { start, end } = edit.range;
+                ((start.line, start.character), (end.line, end.character))
+            })
+            .collect();
+        assert_eq!(actual, ranges);
+        assert_eq!(
+            crate::text::edit::apply_text_edits(original, &edits),
             replacement
         );
     }
