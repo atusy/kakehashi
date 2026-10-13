@@ -32,7 +32,7 @@ use log::warn;
 use crate::config::settings::BridgeServerConfig;
 use crate::text::PositionMapper;
 use crate::text::edge_layout::{EdgeRestore, restore_edges};
-use crate::text::edit::apply_text_edits;
+use crate::text::position::positions_to_bytes_clamped;
 use tower_lsp_server::ls_types::{
     DocumentFormattingParams, FormattingOptions, NumberOrString, Position, Range,
     TextDocumentIdentifier, TextEdit, WorkDoneProgressParams,
@@ -200,8 +200,7 @@ fn keep_edge_layout(
     if edits_stay_inside_content(virtual_content, &edits) {
         return edits;
     }
-    let mapper = PositionMapper::new(virtual_content);
-    let Some(applied) = AppliedEdits::new(virtual_content, &mapper, &edits) else {
+    let Some(applied) = AppliedEdits::new(virtual_content, &edits) else {
         return edits;
     };
     let edges = restore_edges(virtual_content, &applied.formatted, offset.opens_mid_line());
@@ -212,11 +211,8 @@ fn keep_edge_layout(
     if restored == virtual_content {
         return Vec::new();
     }
-    // The composed edits are checked against the restored text; should they
-    // miss it, one edit covering every change stands in.
-    if let Some(kept) = applied.with_edges(virtual_content, &mapper, &edits, &edges)
-        && apply_text_edits(virtual_content, &kept) == restored
-    {
+    let mapper = PositionMapper::new(virtual_content);
+    if let Some(kept) = applied.with_edges(virtual_content, &mapper, &edits, &edges, &restored) {
         return kept;
     }
     // Forward-looking: every offset `replacement_between` maps is a char
@@ -265,17 +261,24 @@ struct AppliedSpan {
 }
 
 impl AppliedEdits {
-    /// Apply `edits` as [`apply_text_edits`] does. `None` when two of them
-    /// overlap once their positions are clamped to the text.
-    fn new(text: &str, mapper: &PositionMapper, edits: &[TextEdit]) -> Option<Self> {
-        let byte = |position| text.floor_char_boundary(mapper.position_to_byte_clamped(position));
-        let mut spans: Vec<AppliedSpan> = edits
+    /// Apply `edits` as [`crate::text::edit::apply_text_edits`] does, mapping
+    /// their positions in one pass. `None` when two of them overlap once their
+    /// positions are clamped to the text.
+    fn new(text: &str, edits: &[TextEdit]) -> Option<Self> {
+        let positions: Vec<Position> = edits
+            .iter()
+            .flat_map(|edit| [edit.range.start, edit.range.end])
+            .collect();
+        let bytes = positions_to_bytes_clamped(text, &positions);
+        let mut spans: Vec<AppliedSpan> = bytes
+            .as_chunks::<2>()
+            .0
             .iter()
             .enumerate()
-            .map(|(index, edit)| AppliedSpan {
+            .map(|(index, &[start, end])| AppliedSpan {
                 index,
-                start: byte(edit.range.start),
-                end: byte(edit.range.end),
+                start,
+                end,
                 formatted_start: 0,
                 formatted_end: 0,
             })
@@ -297,16 +300,18 @@ impl AppliedEdits {
         Some(Self { formatted, spans })
     }
 
-    /// The answer with `edges` restored: the edits away from the edges as
-    /// sent, and for each changed edge one edit from the text's start (or to
-    /// its end) through every edit reaching into that edge. `None` when one
-    /// edit reaches into both edges, which one edit then covers.
+    /// The answer with `edges` restored into `restored`: the edits away from
+    /// the edges as sent, and for each changed edge one edit from the text's
+    /// start (or to its end) through every edit reaching into that edge.
+    /// `None` when one edit reaches into both edges, or should the edits miss
+    /// `restored`; one edit then covers the changes.
     fn with_edges(
         &self,
         text: &str,
         mapper: &PositionMapper,
         edits: &[TextEdit],
         edges: &EdgeRestore,
+        restored: &str,
     ) -> Option<Vec<TextEdit>> {
         let formatted = self.formatted.as_str();
         // How far the edits before `count` moved the text after them.
@@ -376,15 +381,35 @@ impl AppliedEdits {
         {
             return None;
         }
+        let middle = &self.spans[first_kept..kept_end];
+
+        // Check the composition in bytes, as positions would take a scan each.
+        let mut composed = String::with_capacity(restored.len());
+        let mut cursor = 0;
+        if let Some((_, end, new_text)) = &head {
+            composed.push_str(new_text);
+            cursor = *end;
+        }
+        for span in middle {
+            composed.push_str(text.get(cursor..span.start)?);
+            composed.push_str(&edits[span.index].new_text);
+            cursor = span.end;
+        }
+        if let Some((start, _, new_text)) = &tail {
+            composed.push_str(text.get(cursor..*start)?);
+            composed.push_str(new_text);
+            cursor = text.len();
+        }
+        composed.push_str(text.get(cursor..)?);
+        if composed != restored {
+            return None;
+        }
+
         let mut kept = Vec::with_capacity(kept_end - first_kept + 2);
         if let Some((start, end, new_text)) = head {
             kept.extend(trimmed_edit(text, mapper, start, end, &new_text)?);
         }
-        kept.extend(
-            self.spans[first_kept..kept_end]
-                .iter()
-                .map(|span| edits[span.index].clone()),
-        );
+        kept.extend(middle.iter().map(|span| edits[span.index].clone()));
         if let Some((start, end, new_text)) = tail {
             kept.extend(trimmed_edit(text, mapper, start, end, &new_text)?);
         }
