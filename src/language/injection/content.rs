@@ -56,32 +56,56 @@ pub(super) fn compute_line_column_offsets(
             // Each gap range starts at a known point with a column value.
             // The column value represents how many columns of prefix exist
             // before the actual code on that line.
+            //
+            // Lines are LSP lines, as the virtual document is read: a lone CR
+            // ends one too (the markdown grammar ends a blockquote line there),
+            // while tree-sitter rows split only at LF. So the lines and line
+            // starts come from scanning the host bytes, not from the ranges'
+            // Points. Gaps arrive in document order, so one forward scan serves
+            // them all.
+            let bytes = host_text.as_bytes();
+            let mut scanned = byte_range.start;
+            let mut line = 0usize;
+            let mut line_start = byte_range.start;
+            let mut advance_to = |to: usize, line: &mut usize, line_start: &mut usize| {
+                let to = to.min(bytes.len());
+                while scanned < to {
+                    let byte = bytes[scanned];
+                    scanned += 1;
+                    if byte == b'\n' || (byte == b'\r' && bytes.get(scanned) != Some(&b'\n')) {
+                        *line += 1;
+                        *line_start = scanned;
+                    }
+                }
+            };
             let mut offsets = Vec::new();
             for range in ranges {
-                let gap_start_line = range.start_point.row;
-                let gap_end_line = range.end_point.row;
-                // Only the gap's start line carries a column offset; the rest of
-                // its spanned rows stay at the default 0. Gaps arrive in document
-                // order (ascending, non-overlapping rows), so resizing once to
-                // `gap_end_line + 1` only grows `offsets` — equivalent to the
-                // previous per-row resize loop, without re-resizing each row.
-                offsets.resize(gap_end_line + 1, 0);
+                let gap_abs_byte = byte_range.start.saturating_add(range.start_byte);
+                advance_to(gap_abs_byte, &mut line, &mut line_start);
+                let gap_start_line = line;
                 // The column offset is the gap's start column within the host line.
-                // For the first line (row 0) of the content node, use start_column
+                // For the first line of the content node, use start_column
                 // (which accounts for the full prefix from the line start).
-                // For subsequent lines, the start_point.column from
-                // compute_included_ranges is already the raw byte column
-                // within the line — convert to UTF-16.
-                if gap_start_line == 0 {
-                    offsets[gap_start_line] = start_column;
+                // For subsequent lines, the prefix runs from the line start to
+                // the gap — convert its bytes to UTF-16.
+                let column = if gap_start_line == 0 {
+                    start_column
                 } else {
-                    // Convert byte column to UTF-16 code units.
-                    // The gap's start_byte is relative to content node start.
-                    // The line starts at the byte after the previous newline.
-                    let gap_abs_byte = byte_range.start.saturating_add(range.start_byte);
-                    let line_start_byte = gap_abs_byte.saturating_sub(range.start_point.column);
-                    let prefix = clamped_slice(host_text, line_start_byte..gap_abs_byte);
-                    offsets[gap_start_line] = prefix.encode_utf16().count() as u32;
+                    let prefix = clamped_slice(host_text, line_start..gap_abs_byte);
+                    prefix.encode_utf16().count() as u32
+                };
+                advance_to(
+                    byte_range.start.saturating_add(range.end_byte),
+                    &mut line,
+                    &mut line_start,
+                );
+                // Only the gap's start line carries a column offset; the rest of
+                // its spanned lines stay at the default 0.
+                if offsets.len() <= line {
+                    offsets.resize(line + 1, 0);
+                }
+                if let Some(slot) = offsets.get_mut(gap_start_line) {
+                    *slot = column;
                 }
             }
             if offsets.is_empty() {
@@ -444,6 +468,21 @@ mod tests {
     }
 
     #[test]
+    fn compute_line_column_offsets_counts_a_lone_cr_as_a_line_end() {
+        // A lone CR ends an LSP line, and the markdown grammar ends a
+        // blockquote line there too, but tree-sitter rows split only at LF.
+        // Offsets are read per LSP line of the virtual document, so every
+        // line after the lone CR must still carry its "> " prefix.
+        let text = "> ```lua\n> local x = 1\r> local y = 2\n> local z = 3\n> ```\n";
+        let (byte_range, start_column, included_ranges) = blockquote_injection_data(text);
+
+        let offsets =
+            compute_line_column_offsets(text, byte_range, start_column, included_ranges.as_deref());
+
+        assert_eq!(offsets[..3], [2, 2, 2], "{offsets:?}");
+    }
+
+    #[test]
     fn compute_line_column_offsets_converts_non_ascii_prefix_to_utf16() {
         // The offsets contract is UTF-16 code units. A fullwidth prefix
         // "\u{ff1e} " is 4 UTF-8 bytes but 2 UTF-16 units — a byte-derived
@@ -475,9 +514,11 @@ mod tests {
         // via encode_utf16 from the line-0 prefix).
         let offsets = compute_line_column_offsets(text, 0..30, 2, Some(&included_ranges));
 
+        // A third, zero slot covers the line the second range's newline
+        // ends on.
         assert_eq!(
-            offsets,
-            vec![2, 2],
+            offsets[..2],
+            [2, 2],
             "line 1 must mint the UTF-16 width (2), not the 4-byte width"
         );
     }
@@ -603,11 +644,12 @@ mod tests {
 
     #[test]
     fn compute_line_column_offsets_oversized_column_does_not_panic() {
-        // A non-first line whose start_point.column exceeds its absolute byte
-        // position would underflow `gap_abs_byte - column` and slice past the end.
+        // A stale range whose Point claims a later row and an oversized
+        // column must not underflow or slice past the end. Lines and line
+        // starts come from the bytes, so the range sits on line 0.
         let ranges = [range_at(2, 3, 1, 100)];
         let offsets = compute_line_column_offsets("hello", 0..5, 0, Some(&ranges));
-        assert_eq!(offsets.len(), 2);
+        assert_eq!(offsets, vec![0]);
     }
 
     #[test]
