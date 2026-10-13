@@ -1518,6 +1518,22 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_nix_string_keeps_its_delimiter_lines() {
+        // Its whole text is the host's layout: deleting it would join `''`
+        // and `'';`.
+        let host = "let x = ''\n  '';\n";
+        let virtual_content = "\n  ";
+        let result = json!([
+            { "range": { "start": { "line": 0, "character": 0 },
+                         "end": { "line": 1, "character": 2 } }, "newText": "" }
+        ]);
+
+        let formatted = format_host(host, RegionOffset::new(0, 10), virtual_content, result);
+
+        assert_eq!(formatted, host);
+    }
+
+    #[test]
     fn a_region_without_a_final_line_break_gains_none() {
         // This Nix string's value ends without a line break; adding one, as
         // shfmt does, would change the value and move the closing delimiter.

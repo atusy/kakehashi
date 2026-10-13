@@ -19,8 +19,10 @@
 ///   is the absence of a final line break. Blank lines before it stay the
 ///   formatter's to trim, but no more of them than `original` had.
 ///
-/// A whitespace-only `original` or `formatted` has no content between its
-/// edges, so it is returned as formatted.
+/// A whitespace-only `original` is all layout (an empty Nix `''` string's
+/// line breaks), so it is kept as it is. A whitespace-only `formatted` has
+/// no content between its edges to restore them around, so it is returned
+/// as formatted.
 pub(crate) fn restore_edge_layout(original: &str, formatted: &str, opens_mid_line: bool) -> String {
     restore_edges(original, formatted, opens_mid_line).apply(formatted)
 }
@@ -60,7 +62,12 @@ impl EdgeRestore {
 /// The [`EdgeRestore`] that [`restore_edge_layout`] applies.
 pub(crate) fn restore_edges(original: &str, formatted: &str, opens_mid_line: bool) -> EdgeRestore {
     let mut edges = EdgeRestore::unchanged(formatted);
-    if original.trim().is_empty() || formatted.trim().is_empty() {
+    if original.trim().is_empty() {
+        edges.head_end = formatted.len();
+        edges.head = original.to_string();
+        return narrowed(edges, formatted);
+    }
+    if formatted.trim().is_empty() {
         return edges;
     }
     let formatted_tail_start = tail_start(formatted);
@@ -105,8 +112,13 @@ pub(crate) fn restore_edges(original: &str, formatted: &str, opens_mid_line: boo
         }
     }
 
-    // Each edge replaces only what differs from the formatter's own: the
-    // rest stays formatted text, so the formatter's edits there are kept.
+    narrowed(edges, formatted)
+}
+
+/// `edges` with each edge replacing only what differs from the formatter's
+/// own text: the rest stays formatted text, so the formatter's edits there
+/// are kept.
+fn narrowed(mut edges: EdgeRestore, formatted: &str) -> EdgeRestore {
     // Neither boundary splits a CRLF of the formatted text: a position
     // between its CR and LF names no column.
     let splits_crlf =
@@ -240,7 +252,7 @@ mod tests {
     #[case::mixed_leading_breaks_left_alone("\r\n\na", "\r\n\na", true, "\r\n\na")]
     #[case::lone_cr_tail_left_alone("a\n\r", "a\n\r", false, "a\n\r")]
     #[case::edges_already_match("\n  x\n  ", "\n  y;\n  ", true, "\n  y;\n  ")]
-    #[case::whitespace_only_original("\n  ", "", true, "")]
+    #[case::whitespace_only_original_is_all_layout("\n  ", "", true, "\n  ")]
     #[case::whitespace_only_formatted("\n  x\n  ", "\n", true, "\n")]
     fn restores_edge_layout(
         #[case] original: &str,

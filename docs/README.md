@@ -1157,7 +1157,8 @@ closing fence). A formatter can still remove a leading blank line from a
 fence, whose content opens at a line start. It can also trim blank lines
 next to those edges. It cannot add a final line break to a region that ends
 without one, or add blank lines before its final line break or after an
-opening delimiter's line break. This applies to full and range formatting,
+opening delimiter's line break. A region holding only whitespace, such as an
+empty Nix `''` string, is left as it is. This applies to full and range formatting,
 in the editor as well as here. On-type formatting is left as the server
 answers: it reformats the line being typed, which at the end of an unclosed
 fence is the region's last line.
