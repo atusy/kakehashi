@@ -1638,7 +1638,7 @@ fn build_combined_virtual_content(
         host_line_start = line_end;
     }
 
-    if output.ends_with('\n') {
+    if output.ends_with(['\n', '\r']) {
         offsets.push(0);
     }
     (output, offsets)
@@ -2905,6 +2905,17 @@ mod tests {
             build_combined_virtual_content(text, 0..text.len(), &[2..4, 6..text.len()]);
 
         assert_eq!(content, "a\rb\n");
+        assert_eq!(offsets, vec![2, 2, 0]);
+    }
+
+    #[rstest]
+    #[case::lf("> a\n> b\n")]
+    #[case::lone_cr("> a\r> b\r")]
+    fn combined_content_records_the_empty_line_after_a_final_line_end(#[case] text: &str) {
+        // A trailing line end opens one more (empty) virtual line, whichever
+        // terminator it is.
+        let (_, offsets) = build_combined_virtual_content(text, 2..text.len(), &[2..4, 6..8]);
+
         assert_eq!(offsets, vec![2, 2, 0]);
     }
 
