@@ -26,7 +26,7 @@ use crate::language::injection::{
     CacheableInjectionRegion, InjectionRegionInfo, MAX_INJECTION_DEPTH, byte_to_point,
     byte_to_point_anchored, compute_included_ranges, compute_included_ranges_clipped,
     effective_content_range, intersect_included_ranges, parse_with_ranges,
-    sub_select_included_ranges,
+    sub_select_included_ranges, tree_start_position,
 };
 use crate::text::position::byte_to_utf16_col;
 
@@ -773,7 +773,11 @@ fn discover_single_region(
                 &cacheable_owned
             }
         };
-        let eligible = cacheable.start_column == 0 && prefix_byte_widths.is_empty();
+        // The tokens carry tree-sitter rows and columns, so the re-anchor
+        // origin is the tree-sitter position of the content start.
+        let (tree_start_row, tree_start_column) =
+            tree_start_position(injection, inj_start_byte, text);
+        let eligible = tree_start_column == 0 && prefix_byte_widths.is_empty();
         // Content-addressed cache key: content hash folded with the resolved
         // language (one shared definition — populate's eviction sweep must
         // compute the same fold).
@@ -783,7 +787,7 @@ fn discover_single_region(
         );
         Some(DiscoveredRegionCache {
             validity_hash,
-            line_start: cacheable.line_range.start,
+            line_start: tree_start_row,
             eligible,
         })
     });

@@ -166,6 +166,38 @@ fn position_of_byte(
     (row as u32, column)
 }
 
+/// The (tree-sitter row, UTF-16 column) of `start_byte`, the start of
+/// `info`'s effective content range ([`effective_content_range`]).
+///
+/// Tree-sitter reports columns as byte offsets, but LSP positions use UTF-16.
+/// For ASCII they're identical, but non-ASCII prefixes (CJK, emoji) differ.
+/// tree-sitter's `column` is a byte offset from the line start, so
+/// `start_byte() - column` correctly recovers the line-start byte even when
+/// the line contains multi-byte UTF-8 characters before the node.
+pub(crate) fn tree_start_position(
+    info: &InjectionRegionInfo<'_>,
+    start_byte: usize,
+    text: &str,
+) -> (u32, u32) {
+    let node = &info.content_node;
+    if start_byte == node.start_byte() {
+        let byte_column = node.start_position().column;
+        let line_start_byte = node.start_byte().saturating_sub(byte_column);
+        let line_prefix = clamped_slice(text, line_start_byte..node.start_byte());
+        (
+            node.start_position().row as u32,
+            line_prefix.encode_utf16().count() as u32,
+        )
+    } else {
+        position_of_byte(
+            text,
+            start_byte,
+            node.start_byte(),
+            node.start_position().row,
+        )
+    }
+}
+
 /// The effective runtime-directive byte span of `info`'s content node within
 /// `text`, snapped to in-bounds UTF-8 char boundaries.
 ///
@@ -298,28 +330,7 @@ impl CacheableInjectionRegion {
         } = effective_content_range(info, text);
         let content = &text[start_byte..end_byte];
 
-        // Convert tree-sitter byte column to UTF-16 code units for LSP compatibility.
-        // Tree-sitter reports columns as byte offsets, but LSP positions use UTF-16.
-        // For ASCII they're identical, but non-ASCII prefixes (CJK, emoji) differ.
-        // tree-sitter's `column` is a byte offset from the line start, so
-        // `start_byte() - column` correctly recovers the line-start byte even
-        // when the line contains multi-byte UTF-8 characters before the node.
-        let (start_line, start_column) = if start_byte == node.start_byte() {
-            let byte_column = node.start_position().column;
-            let line_start_byte = node.start_byte().saturating_sub(byte_column);
-            let line_prefix = clamped_slice(text, line_start_byte..node.start_byte());
-            (
-                node.start_position().row as u32,
-                line_prefix.encode_utf16().count() as u32,
-            )
-        } else {
-            position_of_byte(
-                text,
-                start_byte,
-                node.start_byte(),
-                node.start_position().row,
-            )
-        };
+        let (start_line, start_column) = tree_start_position(info, start_byte, text);
 
         // end_position() points past the last byte. When that position is mid-line
         // (column > 0), the node still occupies that row → exclusive end is row + 1.
