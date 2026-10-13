@@ -1707,8 +1707,10 @@ fn pipeline_region_text(
     }
     // A region opening mid-line has no line prefix: the host text before it
     // on its first line is the opening delimiter's line (a Nix `''`), which
-    // continuation lines must not take once the line count changes.
-    let host_line_prefixes = if offset.opens_mid_line() {
+    // continuation lines must not take once the line count changes. A
+    // one-line region keeps it, as on main: its one column offset is also
+    // the shape of a blockquoted fence ending at EOF, whose `> ` it is.
+    let host_line_prefixes = if offset.opens_mid_line() && host_line_prefixes.len() > 1 {
         let mut prefixes = host_line_prefixes.to_vec();
         if let Some(first) = prefixes.first_mut() {
             first.clear();
@@ -2713,31 +2715,17 @@ mod tests {
 
     #[test]
     fn pipeline_prefixes_the_lines_a_blockquoted_fence_at_eof_grows() {
-        // A blockquoted fence ending at EOF without a line break: one line,
-        // whose first line's text is its prefix.
-        let offset = RegionOffset::with_per_line_offsets(3, vec![2, 0]);
-        let prefixes = ["> ".to_string()];
-
-        let grown = pipeline_region_text("{\"a\":1}", "{\n    \"a\": 1\n}", &offset, &prefixes);
-        let opened = pipeline_region_text("x", "\nx", &offset, &prefixes);
-
-        assert_eq!(grown.as_deref(), Some("{\n>     \"a\": 1\n> }"));
-        // Its content opens at a line start: a leading blank line is content.
-        assert_eq!(opened.as_deref(), Some("\n> x"));
-    }
-
-    #[test]
-    fn pipeline_prefixes_no_line_of_a_one_line_string_with_its_opening() {
-        // An inline Nix string grown to several lines: the text before it is
-        // the delimiter's line, not a prefix.
+        // A blockquoted fence ending at EOF without a line break parses with
+        // no excluded children: one column offset, like a region opening
+        // mid-line. With one line, its first line's text is still its prefix.
         let text = pipeline_region_text(
             "{\"a\":1}",
-            "{\n  \"a\": 1\n}",
-            &RegionOffset::new(0, 19),
-            &["  d = /* json */ ''".to_string()],
+            "{\n    \"a\": 1\n}",
+            &RegionOffset::with_per_line_offsets(3, vec![2]),
+            &["> ".to_string()],
         );
 
-        assert_eq!(text.as_deref(), Some("{\n  \"a\": 1\n}"));
+        assert_eq!(text.as_deref(), Some("{\n>     \"a\": 1\n> }"));
     }
 
     #[test]

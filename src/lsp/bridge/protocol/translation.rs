@@ -55,8 +55,11 @@ impl RegionOffset {
 
     /// Whether the region opens mid-line, after a host delimiter on the same
     /// line (a Nix `''`), rather than at a line start. A region with one
-    /// column offset past 0 does; a prefixed (blockquote) region has at least
-    /// two, a column per line and one for the row after a one-line region.
+    /// column offset past 0 does; a prefixed (blockquote) region has a column
+    /// per line, and one opening with a line break spans at least two lines.
+    ///
+    /// One line is ambiguous: a blockquoted fence ending at EOF without a
+    /// line break has one column offset too, and reads as opening mid-line.
     pub(crate) fn opens_mid_line(&self) -> bool {
         matches!(self.columns.as_slice(), [column] if *column > 0)
     }
