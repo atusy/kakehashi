@@ -1792,9 +1792,17 @@ fn split_lsp_lines(text: &str) -> Vec<(&str, &str)> {
     lines
 }
 
-/// The number of LSP lines in `text` (1 for empty text).
+/// The number of LSP lines in `text` (1 for empty text): one more than its
+/// line ends, as [`split_lsp_lines`] splits them, counted without collecting.
 fn lsp_line_count(text: &str) -> usize {
-    split_lsp_lines(text).len()
+    let bytes = text.as_bytes();
+    1 + bytes
+        .iter()
+        .enumerate()
+        .filter(|&(index, &byte)| {
+            byte == b'\n' || (byte == b'\r' && bytes.get(index + 1) != Some(&b'\n'))
+        })
+        .count()
 }
 
 /// Longest common prefix of all strings, on char boundaries. Empty input or
