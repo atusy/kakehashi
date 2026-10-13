@@ -5,6 +5,7 @@
 //! - Content hashing for caching
 
 mod char_boundary;
+pub(crate) mod edge_layout;
 pub(crate) mod edit;
 mod hash;
 mod lone_cr;

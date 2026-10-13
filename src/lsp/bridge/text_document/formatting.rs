@@ -30,9 +30,12 @@ use std::io;
 use log::warn;
 
 use crate::config::settings::BridgeServerConfig;
+use crate::text::PositionMapper;
+use crate::text::edge_layout::restore_edge_layout;
+use crate::text::edit::apply_text_edits;
 use tower_lsp_server::ls_types::{
-    DocumentFormattingParams, FormattingOptions, NumberOrString, Position, TextDocumentIdentifier,
-    TextEdit, WorkDoneProgressParams,
+    DocumentFormattingParams, FormattingOptions, NumberOrString, Position, Range,
+    TextDocumentIdentifier, TextEdit, WorkDoneProgressParams,
 };
 use url::Url;
 
@@ -174,6 +177,87 @@ fn clamp_end_past_eof(
     }
 }
 
+/// Keep the region's edge layout through a formatting answer (see
+/// [`restore_edge_layout`]): when the answer changes the edges, it is replaced
+/// by one edit from `virtual_content` to the formatted text with the edges
+/// restored, or by none when only the edges changed.
+///
+/// Edits that do not apply in order (reversed or overlapping) leave the
+/// formatted text undefined; they pass as received, to the checks after this.
+fn keep_edge_layout(
+    edits: Vec<TextEdit>,
+    virtual_content: &str,
+    offset: &RegionOffset,
+) -> Vec<TextEdit> {
+    if !edits_apply_in_order(&edits) {
+        return edits;
+    }
+    // A region with one column offset past 0 opens mid-line, after a host
+    // delimiter. A prefixed (blockquote) region has a column per line, and one
+    // opening with a line break spans at least two lines.
+    let opens_mid_line = matches!(offset.columns(), [column] if *column > 0);
+    let formatted = apply_text_edits(virtual_content, &edits);
+    let restored = restore_edge_layout(virtual_content, &formatted, opens_mid_line);
+    if restored == formatted {
+        return edits;
+    }
+    match replacement_between(virtual_content, &restored) {
+        Some(edit) => vec![edit],
+        None if virtual_content == restored => Vec::new(),
+        None => edits,
+    }
+}
+
+/// Whether every range is ordered and none overlaps another.
+fn edits_apply_in_order(edits: &[TextEdit]) -> bool {
+    let key = |position: Position| (position.line, position.character);
+    let mut ranges: Vec<_> = edits.iter().map(|edit| edit.range).collect();
+    ranges.sort_by_key(|range| key(range.start));
+    ranges
+        .iter()
+        .all(|range| key(range.start) <= key(range.end))
+        && ranges
+            .windows(2)
+            .all(|pair| key(pair[0].end) <= key(pair[1].start))
+}
+
+/// One edit turning `original` into `replacement`, spanning only what differs.
+/// `None` when they are equal, or when a position cannot be expressed.
+fn replacement_between(original: &str, replacement: &str) -> Option<TextEdit> {
+    if original == replacement {
+        return None;
+    }
+    let common_len = |a: &mut dyn Iterator<Item = (char, char)>| {
+        a.take_while(|(x, y)| x == y)
+            .map(|(x, _)| x.len_utf8())
+            .sum::<usize>()
+    };
+    let mut start = common_len(&mut original.chars().zip(replacement.chars()));
+    // Never split a CRLF: a position between its CR and LF names no column.
+    if original[..start].ends_with('\r') && original[start..].starts_with('\n') {
+        start -= 1;
+    }
+    let mut suffix = common_len(
+        &mut original[start..]
+            .chars()
+            .rev()
+            .zip(replacement[start..].chars().rev()),
+    );
+    let end = original.len() - suffix;
+    if original[..end].ends_with('\r') && original[end..].starts_with('\n') {
+        suffix -= 1;
+    }
+    let end = original.len() - suffix;
+    let mapper = PositionMapper::new(original);
+    Some(TextEdit {
+        range: Range {
+            start: mapper.byte_to_position(start)?,
+            end: mapper.byte_to_position(end)?,
+        },
+        new_text: replacement[start..replacement.len() - suffix].to_string(),
+    })
+}
+
 /// Build a JSON-RPC formatting request for a downstream language server.
 ///
 /// Like `documentLink`/`documentSymbol`, formatting carries no position — only
@@ -297,6 +381,8 @@ pub(super) fn transform_formatting_response_to_host(
         );
         return Ok(Vec::new());
     }
+
+    let mut edits = keep_edge_layout(edits, virtual_content, offset);
 
     for edit in &mut edits {
         translate_virtual_range_to_host(&mut edit.range, offset);
@@ -713,6 +799,8 @@ mod tests {
         // down to the (2, u32::MAX) sentinel, which the transform snaps to the
         // region end (unbounded here, so the sentinel survives). The edit is
         // kept (not dropped) — previous behavior was overly conservative.
+        // It inserts no line break, which the region's edge layout would
+        // refuse (see `insert_final_newline_leaves_a_region_as_is`).
         let response = json!({
             "jsonrpc": "2.0",
             "id": 42,
@@ -722,7 +810,7 @@ mod tests {
                         "start": { "line": 2, "character": 6 },
                         "end": { "line": 3, "character": 0 }
                     },
-                    "newText": "\n"
+                    "newText": ";"
                 }
             ]
         });
@@ -736,7 +824,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(edits.len(), 1, "synthetic-EOF-anchored edit is kept");
-        assert_eq!(edits[0].new_text, "\n");
+        assert_eq!(edits[0].new_text, ";");
         // start unchanged (still on last real line); end clamped down by one.
         assert_eq!(edits[0].range.start.line, 12);
         assert_eq!(edits[0].range.start.character, 6);
@@ -746,9 +834,9 @@ mod tests {
 
     #[test]
     fn formatting_response_keeps_zero_width_edit_at_virtual_eof() {
-        // The common "insert trailing newline at EOF" pattern: zero-width edit
-        // anchored at the last column of the last virtual line. Stays in
-        // bounds (end.line == last valid line index) so it must be preserved.
+        // A zero-width edit anchored at the last column of the last virtual
+        // line, the shape of an "insert at EOF". Stays in bounds (end.line ==
+        // last valid line index) so it must be preserved.
         let response = json!({
             "jsonrpc": "2.0",
             "id": 42,
@@ -758,7 +846,7 @@ mod tests {
                         "start": { "line": 2, "character": 6 },
                         "end": { "line": 2, "character": 6 }
                     },
-                    "newText": "\n"
+                    "newText": ";"
                 }
             ]
         });
@@ -772,7 +860,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(edits.len(), 1, "in-bounds zero-width EOF insert is kept");
-        assert_eq!(edits[0].new_text, "\n");
+        assert_eq!(edits[0].new_text, ";");
     }
 
     #[test]
@@ -817,12 +905,12 @@ mod tests {
     }
 
     #[test]
-    fn insert_final_newline_survives_a_realistic_region_end() {
-        // Content "local x = 1" (no trailing newline) at host line 3 in a
-        // plain fence: region end is the exact content end (3, 11), NOT a
-        // permissive sentinel. The canonical insertFinalNewline shape — a
-        // zero-width insert at the synthetic next-line anchor — must snap to
-        // the region end and survive containment.
+    fn an_insert_at_the_synthetic_next_line_survives_a_realistic_region_end() {
+        // Content "local x = 1" (no trailing newline) at host line 3: region
+        // end is the exact content end (3, 11), NOT a permissive sentinel. A
+        // zero-width insert at the synthetic next-line anchor (the canonical
+        // insertFinalNewline shape) must snap to the region end and survive
+        // containment.
         let offset = RegionOffset::new(3, 0);
         let region_end = Position {
             line: 3,
@@ -833,7 +921,7 @@ mod tests {
             "result": [
                 { "range": { "start": { "line": 1, "character": 0 },
                              "end": { "line": 1, "character": 0 } },
-                  "newText": "\n" }
+                  "newText": ";" }
             ]
         });
 
@@ -841,10 +929,191 @@ mod tests {
             transform_formatting_response_to_host(response, &offset, "local x = 1", region_end)
                 .unwrap();
 
-        assert_eq!(edits.len(), 1, "insertFinalNewline must survive: {edits:?}");
+        assert_eq!(
+            edits.len(),
+            1,
+            "the anchored insert must survive: {edits:?}"
+        );
         assert_eq!(edits[0].range.start, region_end);
         assert_eq!(edits[0].range.end, region_end);
-        assert_eq!(edits[0].new_text, "\n");
+        assert_eq!(edits[0].new_text, ";");
+    }
+
+    #[rstest]
+    #[case::without_a_final_line_break("local x = 1", Position::new(1, 0))]
+    #[case::with_a_final_line_break("local x = 1\n", Position::new(2, 0))]
+    fn insert_final_newline_leaves_a_region_as_is(
+        #[case] virtual_content: &str,
+        #[case] anchor: Position,
+    ) {
+        // The final line break is the host's layout: insertFinalNewline adds
+        // none to a region ending without one (its closing delimiter shares
+        // the line), and doubles none.
+        let offset = RegionOffset::new(3, 0);
+        let response = json!({
+            "jsonrpc": "2.0", "id": 42,
+            "result": [{ "range": { "start": anchor, "end": anchor }, "newText": "\n" }]
+        });
+
+        let edits = transform_formatting_response_to_host(
+            response,
+            &offset,
+            virtual_content,
+            region_host_end(virtual_content, &offset),
+        )
+        .unwrap();
+
+        assert_eq!(edits, Vec::new());
+    }
+
+    // ==========================================================================
+    // Edge layout: a region's edges belong to the host
+    // ==========================================================================
+
+    /// Format the region of `host` that starts at `offset` and spans
+    /// `virtual_content`, and return the host text after the answer applies.
+    fn format_host(
+        host: &str,
+        offset: RegionOffset,
+        virtual_content: &str,
+        result: serde_json::Value,
+    ) -> String {
+        let response = json!({ "jsonrpc": "2.0", "id": 42, "result": result });
+        let edits = transform_formatting_response_to_host(
+            response,
+            &offset,
+            virtual_content,
+            region_host_end(virtual_content, &offset),
+        )
+        .unwrap();
+        crate::text::edit::apply_text_edits(host, &edits)
+    }
+
+    #[test]
+    fn a_nix_string_keeps_its_delimiter_lines_when_its_edges_are_stripped() {
+        // jsonls formats `''…''` content as a file of its own: it drops the
+        // line break after `''` and the final line break with the closing
+        // indentation, which would join both delimiters onto the JSON.
+        let host = "{\n  a = /* json */ ''\n    {\n      \"a\":   1\n    }\n  '';\n}\n";
+        let virtual_content = "\n    {\n      \"a\":   1\n    }\n  ";
+        let result = json!([
+            { "range": { "start": { "line": 0, "character": 0 },
+                         "end": { "line": 4, "character": 2 } },
+              "newText": "{\n    \"a\": 1\n}" }
+        ]);
+
+        let formatted = format_host(host, RegionOffset::new(1, 19), virtual_content, result);
+
+        assert_eq!(
+            formatted,
+            "{\n  a = /* json */ ''\n{\n    \"a\": 1\n}\n  '';\n}\n"
+        );
+    }
+
+    #[test]
+    fn a_nix_string_keeps_its_delimiter_lines_through_a_whole_document_sentinel() {
+        // bash-language-server (shfmt) replaces the whole document up to the
+        // end-of-document sentinel, ending its text with a single line break.
+        let host = "{\n  b = /* bash */ ''\n    if true;then echo hi;fi\n  '';\n}\n";
+        let virtual_content = "\n    if true;then echo hi;fi\n  ";
+        let result = json!([
+            { "range": { "start": { "line": 0, "character": 0 },
+                         "end": { "line": 2147483647, "character": 2147483647 } },
+              "newText": "if true; then echo hi; fi\n" }
+        ]);
+
+        let formatted = format_host(host, RegionOffset::new(1, 19), virtual_content, result);
+
+        assert_eq!(
+            formatted,
+            "{\n  b = /* bash */ ''\nif true; then echo hi; fi\n  '';\n}\n"
+        );
+    }
+
+    #[test]
+    fn a_markdown_fence_keeps_its_final_line_break() {
+        // jsonls's answer, verbatim: its last edit deletes the final line
+        // break, which would merge the closing fence into the JSON.
+        let host = "```json\n{\"a\":   1}\n```\n";
+        let virtual_content = "{\"a\":   1}\n";
+        let result = json!([
+            { "range": { "start": { "line": 0, "character": 1 },
+                         "end": { "line": 0, "character": 1 } }, "newText": "\n    " },
+            { "range": { "start": { "line": 0, "character": 5 },
+                         "end": { "line": 0, "character": 8 } }, "newText": " " },
+            { "range": { "start": { "line": 0, "character": 9 },
+                         "end": { "line": 0, "character": 9 } }, "newText": "\n" },
+            { "range": { "start": { "line": 0, "character": 10 },
+                         "end": { "line": 1, "character": 0 } }, "newText": "" }
+        ]);
+
+        let formatted = format_host(host, RegionOffset::new(1, 0), virtual_content, result);
+
+        assert_eq!(formatted, "```json\n{\n    \"a\": 1\n}\n```\n");
+    }
+
+    #[test]
+    fn a_markdown_fence_lets_the_formatter_remove_a_leading_blank_line() {
+        // A fence's content opens at a line start, so its leading line break
+        // is a blank line of content, not the host's layout.
+        let host = "```sh\n\nif x; then y; fi\n```\n";
+        let virtual_content = "\nif x; then y; fi\n";
+        let result = json!([
+            { "range": { "start": { "line": 0, "character": 0 },
+                         "end": { "line": 2147483647, "character": 2147483647 } },
+              "newText": "if x; then y; fi\n" }
+        ]);
+
+        let formatted = format_host(host, RegionOffset::new(1, 0), virtual_content, result);
+
+        assert_eq!(formatted, "```sh\nif x; then y; fi\n```\n");
+    }
+
+    #[test]
+    fn a_region_without_a_final_line_break_gains_none() {
+        // This Nix string's value ends without a line break; adding one, as
+        // shfmt does, would change the value and move the closing delimiter.
+        let host = "{\n  c = /* bash */ ''\n    echo  hi'';\n}\n";
+        let virtual_content = "\n    echo  hi";
+        let result = json!([
+            { "range": { "start": { "line": 0, "character": 0 },
+                         "end": { "line": 2147483647, "character": 2147483647 } },
+              "newText": "echo hi\n" }
+        ]);
+
+        let formatted = format_host(host, RegionOffset::new(1, 19), virtual_content, result);
+
+        assert_eq!(formatted, "{\n  c = /* bash */ ''\necho hi'';\n}\n");
+    }
+
+    #[test]
+    fn edits_that_overlap_are_left_to_the_other_checks() {
+        // Overlapping edits apply in no defined order, so the formatted text,
+        // and the edges with it, are unknown: the edits pass as received.
+        let virtual_content = "\n    x\n  ";
+        let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [
+            { "range": { "start": { "line": 0, "character": 0 },
+                         "end": { "line": 1, "character": 5 } }, "newText": "x" },
+            { "range": { "start": { "line": 1, "character": 0 },
+                         "end": { "line": 2, "character": 2 } }, "newText": "y" }
+        ]});
+        let offset = RegionOffset::new(1, 19);
+
+        let edits = transform_formatting_response_to_host(
+            response,
+            &offset,
+            virtual_content,
+            region_host_end(virtual_content, &offset),
+        )
+        .unwrap();
+
+        assert_eq!(
+            edits
+                .iter()
+                .map(|edit| edit.new_text.as_str())
+                .collect::<Vec<_>>(),
+            ["x", "y"]
+        );
     }
 
     #[test]
@@ -905,8 +1174,9 @@ mod tests {
     #[test]
     fn formatting_response_clamps_zero_width_insert_on_synthetic_eof_line() {
         // virtual_line_count = 1 (e.g., "foo" with no trailing newline) →
-        // formatter emits (1,0)..(1,0) → "\n". Must be clamped to a zero-width
-        // insert on line 0 rather than dropped.
+        // formatter emits (1,0)..(1,0). Must be clamped to a zero-width
+        // insert on line 0 rather than dropped. The insert is no line break,
+        // which the region's edge layout would refuse.
         let response = json!({
             "jsonrpc": "2.0",
             "id": 42,
@@ -916,7 +1186,7 @@ mod tests {
                         "start": { "line": 1, "character": 0 },
                         "end":   { "line": 1, "character": 0 }
                     },
-                    "newText": "\n"
+                    "newText": ";"
                 }
             ]
         });
@@ -930,7 +1200,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(edits.len(), 1, "canonical insertFinalNewline shape kept");
-        assert_eq!(edits[0].new_text, "\n");
+        assert_eq!(edits[0].new_text, ";");
         // After clamping virtual (1,0)..(1,0) → (0, u32::MAX)..(0, u32::MAX),
         // then translation adds the region's line offset (10).
         assert_eq!(edits[0].range.start.line, 10);
@@ -1029,7 +1299,7 @@ mod tests {
                         "start": { "line": 1, "character": 0 },
                         "end":   { "line": 5, "character": 0 }
                     },
-                    "newText": "b\n"
+                    "newText": "b;"
                 }
             ]
         });
@@ -1046,7 +1316,7 @@ mod tests {
         assert_eq!(edits.len(), 1, "{edits:?}");
         assert_eq!(edits[0].range.start, Position::new(11, 0));
         assert_eq!(edits[0].range.end, region_end);
-        assert_eq!(edits[0].new_text, "b\n");
+        assert_eq!(edits[0].new_text, "b;");
     }
 
     #[test]
