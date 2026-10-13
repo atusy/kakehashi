@@ -142,8 +142,9 @@ fn count_lines(text: &str) -> u32 {
 /// immediately after `last_real_line`), rewrite it to (last_real_line,
 /// u32::MAX) — a sentinel the transform later snaps to the region's
 /// content-precise host end (see `transform_formatting_response_to_host`).
-/// Used to accept the canonical insertFinalNewline shape without dropping it
-/// as past-EOF.
+/// Used to let the canonical insertFinalNewline shape past the past-EOF
+/// drop; whether a line break is then added is the region's edge layout's to
+/// decide (see `keep_edge_layout`).
 ///
 /// `virtual_line_count` is the synthetic-line index — i.e., the value that
 /// would be `last_real_line + 1` for non-empty docs. Passed in to avoid
@@ -341,7 +342,8 @@ pub(super) fn transform_formatting_response_to_host(
     // anchored at column 0 of the synthetic line *after* the last real line
     // (line == virtual_line_count && character == 0). That is one past EOF
     // in line space but cannot corrupt host bytes because the payload is
-    // inserted at end-of-content, not over any existing range. A start at
+    // inserted at end-of-content, not over any existing range; the edge
+    // layout below then decides whether its line break is kept. A start at
     // that anchor, and any end past EOF, is clamped to the
     // (last_real_line, u32::MAX) sentinel, which is snapped to the region end
     // after translation: such an edit replaces up to the region end and
@@ -389,8 +391,9 @@ pub(super) fn transform_formatting_response_to_host(
     // clamps, or a server's own large column — means "end of the region's
     // last content line", which IS the region end. Without this, the host
     // line may run on past the region (an inline region's closing quote) and
-    // the exact containment check below would drop every canonical
-    // insertFinalNewline response. Only positions on the region end's own
+    // the exact containment check below would drop every edit ending there,
+    // such as shfmt's whole-document replacement up to its end-of-document
+    // sentinel. Only positions on the region end's own
     // line are snapped: one past the region on a later line could only come
     // from a line count disagreeing with `region_end`, and fails containment
     // (fail-closed).
@@ -1164,7 +1167,8 @@ mod tests {
     // without overwriting any host bytes. Treat them as inserts at the last
     // column of the last real line: the (last line, u32::MAX) sentinel, which
     // the transform snaps to the region end (unbounded in these tests, so the
-    // sentinel survives).
+    // sentinel survives). These tests insert no line break, which the edge
+    // layout decides on (`insert_final_newline_leaves_a_region_as_is`).
 
     #[test]
     fn formatting_response_clamps_zero_width_insert_on_synthetic_eof_line() {
@@ -1194,7 +1198,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(edits.len(), 1, "canonical insertFinalNewline shape kept");
+        assert_eq!(edits.len(), 1, "the synthetic-EOF anchored insert is kept");
         assert_eq!(edits[0].new_text, ";");
         // After clamping virtual (1,0)..(1,0) → (0, u32::MAX)..(0, u32::MAX),
         // then translation adds the region's line offset (10).
