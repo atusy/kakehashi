@@ -31,10 +31,13 @@ pub(crate) struct DiscoveredRegionCache {
     /// cache's content-addressed key (parse-snapshot ADR §3 companion
     /// decision), needing no tracker identity at all.
     pub validity_hash: u64,
-    /// The region's first host line, added back on token re-anchor.
+    /// The tree-sitter row of the region's effective content start, added back
+    /// on token re-anchor (not `CacheableInjectionRegion::line_range`, which is
+    /// in LSP lines).
     pub line_start: u32,
     /// Whether the region satisfied the token-reuse translation predicate
-    /// (`start_column == 0` ∧ no per-row prefixes ∧ not combined) at discovery.
+    /// (a tree-sitter column-0 content start ∧ no per-row prefixes ∧ not
+    /// combined) at discovery.
     pub eligible: bool,
 }
 
