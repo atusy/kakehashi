@@ -1150,6 +1150,15 @@ Markdown) is sent to the servers configured for its language, and the edits
 are applied back to the host file. Configuration comes from the usual config
 files (`./kakehashi.toml` etc.) or `--config-file`.
 
+A region's edges belong to the host, and formatting keeps them. They are the
+line break after an opening delimiter on the same line (a Nix `''`), and the
+final line break with the indentation after it (before a closing `''`, or the
+closing fence). A formatter can still remove a leading blank line from a
+fence, whose content opens at a line start. It can also trim blank lines
+before the final line break. It cannot add a final line break to a region
+that ends without one, or add blank lines at its end. This applies to full,
+range and on-type formatting, in the editor as well as here.
+
 ```bash
 # Format files in place
 kakehashi format README.md docs/
