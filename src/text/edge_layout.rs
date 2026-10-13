@@ -107,13 +107,23 @@ pub(crate) fn restore_edges(original: &str, formatted: &str, opens_mid_line: boo
 
     // Each edge replaces only what differs from the formatter's own: the
     // rest stays formatted text, so the formatter's edits there are kept.
-    let same_suffix = common_len(
+    // Neither boundary splits a CRLF of the formatted text: a position
+    // between its CR and LF names no column.
+    let splits_crlf =
+        |at: usize| formatted[..at].ends_with('\r') && formatted[at..].starts_with('\n');
+    let mut same_suffix = common_len(
         edges.head.chars().rev(),
         formatted[..edges.head_end].chars().rev(),
     );
+    if splits_crlf(edges.head_end - same_suffix) {
+        same_suffix -= 1;
+    }
     edges.head_end -= same_suffix;
     edges.head.truncate(edges.head.len() - same_suffix);
-    let same_prefix = common_len(edges.tail.chars(), formatted[edges.tail_start..].chars());
+    let mut same_prefix = common_len(edges.tail.chars(), formatted[edges.tail_start..].chars());
+    if splits_crlf(edges.tail_start + same_prefix) {
+        same_prefix -= 1;
+    }
     edges.tail_start += same_prefix;
     edges.tail.drain(..same_prefix);
     edges

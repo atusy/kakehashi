@@ -444,7 +444,7 @@ fn replacement_between(original: &str, replacement: &str) -> Option<TextEdit> {
 
 /// The edit replacing `text[start..end]` with `new_text`, narrowed to what
 /// differs: `Some(None)` when nothing does, and `None` when a position cannot
-/// be expressed.
+/// be expressed (one between a CR and its LF names no column).
 fn trimmed_edit(
     text: &str,
     mapper: &PositionMapper,
@@ -480,6 +480,11 @@ fn trimmed_edit(
     if new_end < new_text.len() && text[..end].ends_with('\r') && text[end..].starts_with('\n') {
         end += 1;
         new_end += 1;
+    }
+    // A CRLF split outside the common part cannot be widened over: no edit.
+    let splits_crlf = |at: usize| text[..at].ends_with('\r') && text[at..].starts_with('\n');
+    if splits_crlf(start) || splits_crlf(end) {
+        return None;
     }
     Some(Some(TextEdit {
         range: Range {
@@ -1423,6 +1428,22 @@ mod tests {
         );
 
         assert_eq!(formatted, "> ```lua\n> a\n> \n> \n>   ");
+    }
+
+    #[test]
+    fn a_blank_line_removed_next_to_a_crlf_keeps_the_final_line_break() {
+        // The formatter removes the lone-CR blank line; the restored tail
+        // shares only the CR of a CRLF with the formatted one, and an edit
+        // must not end between them.
+        let host = "x\r\n\r  ";
+        let result = json!([
+            { "range": { "start": { "line": 1, "character": 0 },
+                         "end": { "line": 2, "character": 0 } }, "newText": "" }
+        ]);
+
+        let formatted = format_host(host, RegionOffset::new(0, 0), host, result);
+
+        assert_eq!(formatted, "x\r  ");
     }
 
     #[test]
