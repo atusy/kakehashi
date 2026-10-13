@@ -1380,7 +1380,7 @@ async fn dispatch_concatenated_formatting(
         &final_text?,
         &offset,
         &host_line_prefixes,
-    );
+    )?;
     Some(vec![TextEdit {
         range: replacement_range,
         new_text: final_text,
@@ -1685,13 +1685,14 @@ fn extract_host_line_prefixes(
 }
 
 /// The host text replacing the region after the concatenated pipeline
-/// formatted `original_virtual` into `final_text`.
+/// formatted `original_virtual` into `final_text`, or `None` when the region
+/// is left as it was.
 fn pipeline_region_text(
     original_virtual: &str,
     final_text: &str,
     offset: &RegionOffset,
     host_line_prefixes: &[String],
-) -> String {
+) -> Option<String> {
     // Each step keeps the edge layout of its own text, but formats with a zero
     // offset, which reads as a region opening at a line start: only the
     // region's real offset tells whether its leading line break is layout.
@@ -1700,10 +1701,14 @@ fn pipeline_region_text(
         final_text,
         offset.opens_mid_line(),
     );
+    // The steps may have changed only what the restore just put back.
+    if final_text == original_virtual {
+        return None;
+    }
     // Decision point 4: the virtual output starts at column 0 of the embedded
     // language, so every continuation line must re-gain its host prefix before
     // the whole-region replacement is emitted.
-    reapply_host_line_prefixes(&final_text, host_line_prefixes)
+    Some(reapply_host_line_prefixes(&final_text, host_line_prefixes))
 }
 
 /// Re-apply the region's host per-line prefixes to the pipeline's final text
@@ -2642,14 +2647,25 @@ mod tests {
 
         let text = pipeline_region_text(original, "{\n}\n  ", &RegionOffset::new(1, 19), &[]);
 
-        assert_eq!(text, "\n{\n}\n  ");
+        assert_eq!(text.as_deref(), Some("\n{\n}\n  "));
+    }
+
+    #[test]
+    fn pipeline_emits_nothing_when_only_the_layout_changed() {
+        // The steps stripped a Nix `''` string's leading line break and
+        // nothing else; once restored, the region is as it was.
+        let original = "\n    {}\n  ";
+
+        let text = pipeline_region_text(original, "    {}\n  ", &RegionOffset::new(1, 19), &[]);
+
+        assert_eq!(text, None);
     }
 
     #[test]
     fn pipeline_lets_a_fence_lose_its_leading_blank_line() {
         let text = pipeline_region_text("\nx\n", "x\n", &RegionOffset::new(1, 0), &[]);
 
-        assert_eq!(text, "x\n");
+        assert_eq!(text.as_deref(), Some("x\n"));
     }
 
     #[test]
