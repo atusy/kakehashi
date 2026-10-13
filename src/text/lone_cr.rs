@@ -41,12 +41,20 @@ impl LoneCarriageReturns {
             return (tree_row, tree_column);
         }
         // A lone CR precedes `byte`, so it may also start `byte`'s LSP line:
-        // measure the column from the nearest line end, LF or CR. The scan is
-        // bounded by that LSP line's length.
+        // measure the column from the nearest line end, an LF or a lone CR.
+        // The scan is bounded by that LSP line's length.
         let byte = text.floor_char_boundary(byte.min(text.len()));
-        let line_start = text[..byte]
-            .rfind(['\n', '\r'])
-            .map_or(0, |index| index + 1);
+        let bytes = text.as_bytes();
+        let mut search_end = byte;
+        let line_start = loop {
+            match text[..search_end].rfind(['\n', '\r']) {
+                // The CR of a CRLF ends no line by itself; `byte` is its LF.
+                Some(index) if bytes[index] == b'\r' && bytes.get(index + 1) == Some(&b'\n') => {
+                    search_end = index;
+                }
+                found => break found.map_or(0, |index| index + 1),
+            }
+        };
         let column = text[line_start..byte].encode_utf16().count() as u32;
         let line = tree_row.saturating_add(u32::try_from(before).unwrap_or(u32::MAX));
         (line, column)
@@ -90,6 +98,7 @@ mod tests {
     #[case::at_a_lone_cr("ab\rcd", 2)]
     #[case::non_ascii_after_a_lone_cr("ab\r\u{3042}\u{3044}x", 9)]
     #[case::mixed_terminators("a\rb\r\nc\nd\re", 10)]
+    #[case::inside_a_crlf_after_a_lone_cr("a\rb\r\nc", 4)]
     fn lsp_position_matches_position_mapper(#[case] text: &str, #[case] byte: usize) {
         let (tree_row, tree_column) = tree_position(text, byte);
         let expected = PositionMapper::new(text)
