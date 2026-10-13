@@ -4923,6 +4923,7 @@ local y = "duplicate"
     #[rstest]
     #[case::lone_cr_earlier_on_the_same_row("fn a() {}\rfn main() { let s = \"x\"; }")]
     #[case::lone_cr_inside_the_region("fn main() { let s = \"a\rb\"; }")]
+    #[case::ending_right_after_a_lone_cr("fn main() { let s = \"a\r\"; }")]
     fn from_region_info_origin_is_the_lsp_position_after_an_offset(#[case] text: &str) {
         // `#offset!` moves the start off the node, through `position_of_byte`.
         let cacheable = rust_string_regions(
