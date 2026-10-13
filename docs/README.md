@@ -1156,8 +1156,9 @@ final line break with the indentation after it (before a closing `''`, or the
 closing fence). A formatter can still remove a leading blank line from a
 fence, whose content opens at a line start. It can also trim blank lines
 next to those edges. It cannot add a final line break to a region that ends
-without one, or add blank lines at either end. This applies to full, range
-and on-type formatting, in the editor as well as here.
+without one, or add blank lines before its final line break or after an
+opening delimiter's line break. This applies to full, range and on-type
+formatting, in the editor as well as here.
 
 ```bash
 # Format files in place
