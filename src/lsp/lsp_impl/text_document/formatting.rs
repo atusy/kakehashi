@@ -1375,11 +1375,12 @@ async fn dispatch_concatenated_formatting(
         return None;
     }
 
-    let final_text = final_text?;
-    // Decision point 4: the virtual output starts at column 0 of the embedded
-    // language, so every continuation line must re-gain its host prefix before
-    // the whole-region replacement is emitted.
-    let final_text = reapply_host_line_prefixes(&final_text, &host_line_prefixes);
+    let final_text = pipeline_region_text(
+        &region_ctx.resolved.virtual_content,
+        &final_text?,
+        &offset,
+        &host_line_prefixes,
+    )?;
     Some(vec![TextEdit {
         range: replacement_range,
         new_text: final_text,
@@ -1681,6 +1682,54 @@ fn extract_host_line_prefixes(
             }
         })
         .collect()
+}
+
+/// The host text replacing the region after the concatenated pipeline
+/// formatted `original_virtual` into `final_text`, or `None` when the region
+/// is left as it was.
+fn pipeline_region_text(
+    original_virtual: &str,
+    final_text: &str,
+    offset: &RegionOffset,
+    host_line_prefixes: &[String],
+) -> Option<String> {
+    // A region opening mid-line, after a delimiter on its first line (a Nix
+    // `''`), has its leading line break as layout and no line prefix: the
+    // host text before it is the delimiter's line. One column offset is also
+    // the shape of a blockquoted or list-item fence ending at EOF, which
+    // opens at a line start behind its prefix; a line prefix is made of
+    // container markers and indentation only, a delimiter's line is not.
+    let opens_after_a_delimiter = offset.opens_mid_line()
+        && host_line_prefixes
+            .first()
+            .is_some_and(|text| text.chars().any(|c| !(c == '>' || c.is_whitespace())));
+    // Each step keeps the edge layout of its own text, but formats with a zero
+    // offset, which reads as a region opening at a line start: only the
+    // region tells whether its leading line break is layout.
+    let final_text = crate::text::edge_layout::restore_edge_layout(
+        original_virtual,
+        final_text,
+        opens_after_a_delimiter,
+    );
+    // The steps may have changed only what the restore just put back.
+    if final_text == original_virtual {
+        return None;
+    }
+    // Continuation lines must not take a delimiter's line as their prefix
+    // once the line count changes.
+    let host_line_prefixes = if opens_after_a_delimiter {
+        let mut prefixes = host_line_prefixes.to_vec();
+        if let Some(first) = prefixes.first_mut() {
+            first.clear();
+        }
+        std::borrow::Cow::Owned(prefixes)
+    } else {
+        std::borrow::Cow::Borrowed(host_line_prefixes)
+    };
+    // Decision point 4: the virtual output starts at column 0 of the embedded
+    // language, so every continuation line must re-gain its host prefix before
+    // the whole-region replacement is emitted.
+    Some(reapply_host_line_prefixes(&final_text, &host_line_prefixes))
 }
 
 /// Re-apply the region's host per-line prefixes to the pipeline's final text
@@ -2610,6 +2659,176 @@ mod tests {
     // (concatenated-formatting-pipeline Decision point 4: multi-line output
     // must re-gain the host prefix per line)
     // ==========================================================================
+
+    /// The host prefixes of a Nix `''` string of `lines` lines opening at
+    /// `  a = /* json */ ''`: the delimiter's line, then none.
+    fn nix_prefixes(lines: usize) -> Vec<String> {
+        let mut prefixes = vec![String::new(); lines];
+        prefixes[0] = "  a = /* json */ ''".to_string();
+        prefixes
+    }
+
+    #[test]
+    fn pipeline_keeps_the_leading_line_break_of_a_region_opening_mid_line() {
+        // Steps format with a zero offset, which reads as a line start, so a
+        // Nix `''` string's leading line break comes back stripped.
+        let original = "\n    {\n    }\n  ";
+
+        let text = pipeline_region_text(
+            original,
+            "{\n}\n  ",
+            &RegionOffset::new(1, 19),
+            &nix_prefixes(4),
+        );
+
+        assert_eq!(text.as_deref(), Some("\n{\n}\n  "));
+    }
+
+    #[test]
+    fn pipeline_emits_nothing_when_only_the_layout_changed() {
+        // The steps stripped a Nix `''` string's leading line break and
+        // nothing else; once restored, the region is as it was.
+        let original = "\n    {}\n  ";
+
+        let text = pipeline_region_text(
+            original,
+            "    {}\n  ",
+            &RegionOffset::new(1, 19),
+            &nix_prefixes(3),
+        );
+
+        assert_eq!(text, None);
+    }
+
+    #[test]
+    fn pipeline_prefixes_no_line_with_the_opening_delimiter_line() {
+        // The text before a Nix `''` string on its first line is no line
+        // prefix: once the line count changes, it must not repeat on every
+        // continuation line.
+        let original = "\n    {\"a\":1}\n  ";
+        let prefixes = [
+            "  a = /* json */ ''".to_string(),
+            String::new(),
+            String::new(),
+        ];
+
+        let text = pipeline_region_text(
+            original,
+            "{\n    \"a\": 1\n}\n  ",
+            &RegionOffset::new(1, 19),
+            &prefixes,
+        );
+
+        assert_eq!(text.as_deref(), Some("\n{\n    \"a\": 1\n}\n  "));
+    }
+
+    #[test]
+    fn pipeline_prefixes_the_lines_a_one_line_blockquoted_fence_grows() {
+        // A blockquoted fence with one content line has no continuation line
+        // to take the `> ` prefix from: its first line's prefix is the one.
+        let prefixes = ["> ".to_string(), String::new()];
+
+        let text = pipeline_region_text(
+            "{\"a\":1}\n",
+            "{\n    \"a\": 1\n}\n",
+            &RegionOffset::with_per_line_offsets(3, vec![2, 0]),
+            &prefixes,
+        );
+
+        assert_eq!(text.as_deref(), Some("{\n>     \"a\": 1\n> }\n"));
+    }
+
+    #[test]
+    fn pipeline_prefixes_the_lines_a_blockquoted_fence_at_eof_grows() {
+        // A blockquoted fence ending at EOF without a line break parses with
+        // no excluded children: one column offset, like a region opening
+        // mid-line. With one line, its first line's text is still its prefix.
+        let text = pipeline_region_text(
+            "{\"a\":1}",
+            "{\n    \"a\": 1\n}",
+            &RegionOffset::with_per_line_offsets(3, vec![2]),
+            &["> ".to_string()],
+        );
+
+        assert_eq!(text.as_deref(), Some("{\n>     \"a\": 1\n> }"));
+
+        // Ending with a line break adds only the synthetic line after it.
+        let text = pipeline_region_text(
+            "{\"a\":1}\n",
+            "{\n    \"a\": 1\n}\n",
+            &RegionOffset::with_per_line_offsets(3, vec![2]),
+            &["> ".to_string(), String::new()],
+        );
+
+        assert_eq!(text.as_deref(), Some("{\n>     \"a\": 1\n> }\n"));
+    }
+
+    #[test]
+    fn pipeline_keeps_the_indentation_of_a_list_fence_at_eof() {
+        // A list-item fence at EOF with trailing blank lines: one column
+        // offset, its first line's indentation its prefix.
+        let text = pipeline_region_text(
+            "{\"a\":1}\n\n",
+            "{\n    \"a\": 1\n}\n\n",
+            &RegionOffset::with_per_line_offsets(1, vec![2]),
+            &["  ".to_string(), String::new(), String::new()],
+        );
+
+        assert_eq!(text.as_deref(), Some("{\n      \"a\": 1\n  }\n\n"));
+    }
+
+    #[test]
+    fn pipeline_prefixes_no_line_of_a_one_line_script_it_grows() {
+        // A Nix string with one script line, which shfmt splits: the text
+        // before the string is the delimiter's line, not a prefix.
+        let text = pipeline_region_text(
+            "\n    if x; then y; fi\n  ",
+            "if x; then\n  y\nfi\n",
+            &RegionOffset::new(1, 19),
+            &[
+                "  b = /* bash */ ''".to_string(),
+                String::new(),
+                String::new(),
+            ],
+        );
+
+        assert_eq!(text.as_deref(), Some("\nif x; then\n  y\nfi\n  "));
+    }
+
+    #[test]
+    fn pipeline_prefixes_no_line_of_a_one_line_string_it_grows() {
+        // An inline Nix string grown to several lines: one column offset, as
+        // a fence at EOF has, but the text before it is a delimiter's line.
+        let text = pipeline_region_text(
+            "{\"a\":1}",
+            "{\n  \"a\": 1\n}",
+            &RegionOffset::new(0, 19),
+            &["  d = /* json */ ''".to_string()],
+        );
+
+        assert_eq!(text.as_deref(), Some("{\n  \"a\": 1\n}"));
+    }
+
+    #[test]
+    fn pipeline_keeps_a_blank_line_added_to_a_blockquoted_fence_at_eof() {
+        // One column offset, as a region opening mid-line has, but its
+        // content opens at a line start: the blank line is content.
+        let text = pipeline_region_text(
+            "x",
+            "\nx",
+            &RegionOffset::with_per_line_offsets(3, vec![2]),
+            &["> ".to_string()],
+        );
+
+        assert_eq!(text.as_deref(), Some("\n> x"));
+    }
+
+    #[test]
+    fn pipeline_lets_a_fence_lose_its_leading_blank_line() {
+        let text = pipeline_region_text("\nx\n", "x\n", &RegionOffset::new(1, 0), &[]);
+
+        assert_eq!(text.as_deref(), Some("x\n"));
+    }
 
     #[test]
     fn reapply_uses_per_line_prefixes_when_line_count_is_preserved() {

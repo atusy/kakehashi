@@ -32,7 +32,7 @@ use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, region_host_end,
     translate_host_range_to_virtual,
 };
-use super::formatting::{count_lines, transform_formatting_response_to_host};
+use super::formatting::transform_formatting_response_to_host;
 
 impl LanguageServerPool {
     /// Send a `textDocument/rangeFormatting` request and wait for the response.
@@ -76,7 +76,6 @@ impl LanguageServerPool {
         if !handle.has_capability("textDocument/rangeFormatting") {
             return Ok(None);
         }
-        let virtual_line_count = count_lines(virtual_content);
         let region_end = region_host_end(virtual_content, &offset);
         let offset_for_request = offset.clone();
         self.execute_bridge_request_observed(
@@ -105,7 +104,7 @@ impl LanguageServerPool {
                 transform_formatting_response_to_host(
                     response,
                     ctx.offset,
-                    virtual_line_count,
+                    virtual_content,
                     region_end,
                 )
                 .map(Some)

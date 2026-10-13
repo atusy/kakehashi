@@ -53,6 +53,52 @@ fn normalize_lone_carriage_returns(text: &str) -> Cow<'_, str> {
     Cow::Owned(unsafe { String::from_utf8_unchecked(normalized) })
 }
 
+/// [`PositionMapper::position_to_byte_clamped`] for many positions in one
+/// pass over `text`, floored to char boundaries: one position at a time
+/// scans its line's UTF-16 columns each time, quadratic on a long line.
+/// `positions` may come in any order; the bytes come back in that order.
+pub(crate) fn positions_to_bytes_clamped(text: &str, positions: &[Position]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..positions.len()).collect();
+    order.sort_by_key(|&index| (positions[index].line, positions[index].character));
+    let mut bytes = vec![0; positions.len()];
+    let mut chars = text.char_indices().peekable();
+    // The position reached so far and its byte.
+    let (mut line, mut column, mut byte) = (0u32, 0u32, 0usize);
+    for index in order {
+        let target = positions[index];
+        while line < target.line || column < target.character {
+            let Some(&(at, ch)) = chars.peek() else {
+                break;
+            };
+            if ch == '\n' || ch == '\r' {
+                // A position past its line's content ends at the content.
+                if line == target.line {
+                    break;
+                }
+                chars.next();
+                if ch == '\r' && chars.peek().is_some_and(|&(_, next)| next == '\n') {
+                    chars.next();
+                }
+                line += 1;
+                column = 0;
+                byte = chars.peek().map_or(text.len(), |&(next, _)| next);
+                continue;
+            }
+            let width = ch.len_utf16() as u32;
+            // A column inside a surrogate pair floors to the pair's start.
+            if line == target.line && column + width > target.character {
+                break;
+            }
+            chars.next();
+            column += width;
+            byte = at + ch.len_utf8();
+        }
+        // A line past the last one clamps to the end of the text.
+        bytes[index] = if line < target.line { text.len() } else { byte };
+    }
+    bytes
+}
+
 impl PositionMapper<'_> {
     /// Convert LSP Position to byte offset in the document
     pub fn position_to_byte(&self, position: Position) -> Option<usize> {
@@ -99,8 +145,14 @@ impl PositionMapper<'_> {
                     .map(|line| line.strip_suffix('\r').unwrap_or(line))
                     .unwrap_or_else(|| line.strip_suffix('\r').unwrap_or(line));
                 let line_end = line_start + content.len();
+                // A line has no more UTF-16 units than bytes, so capping the
+                // character at the byte length keeps every column on the line
+                // while `line_start + character` can no longer overflow.
+                let character = position
+                    .character
+                    .min(u32::try_from(content.len()).unwrap_or(u32::MAX));
                 let byte = self
-                    .position_to_byte(position)
+                    .position_to_byte(Position::new(position.line, character))
                     .unwrap_or(line_end)
                     .min(line_end);
                 self.text.floor_char_boundary(byte)
@@ -480,6 +532,18 @@ mod tests {
     }
 
     #[test]
+    fn clamped_snaps_the_largest_character_to_line_end() {
+        // The end-of-line sentinel (line, u32::MAX) is a valid LSP position;
+        // adding it to the line start must not overflow.
+        let text = "hello\nworld";
+        let mapper = PositionMapper::new(text);
+        assert_eq!(
+            mapper.position_to_byte_clamped(Position::new(1, u32::MAX)),
+            11
+        );
+    }
+
+    #[test]
     fn clamped_snaps_overlong_character_before_lone_carriage_return() {
         let text = "hello\rworld";
         let mapper = PositionMapper::new(text);
@@ -492,6 +556,41 @@ mod tests {
         let mapper = PositionMapper::new(text);
 
         assert_eq!(mapper.position_to_byte_clamped(Position::new(0, 999)), 5);
+    }
+
+    #[test]
+    fn batch_clamping_matches_one_position_at_a_time() {
+        for text in [
+            "",
+            "abc",
+            "abc\n",
+            "a\r\nbc\r\n",
+            "a\rb\r",
+            "\u{1F44B}x\né\u{1F600}\n  ",
+            "\n\n",
+        ] {
+            let mapper = PositionMapper::new(text);
+            let mut positions = Vec::new();
+            for line in 0..5 {
+                for character in (0..8).chain([u32::MAX]) {
+                    positions.push(Position::new(line, character));
+                }
+            }
+            // Not in order: the batch sorts them itself.
+            positions.reverse();
+            let one_by_one: Vec<usize> = positions
+                .iter()
+                .map(|&position| {
+                    text.floor_char_boundary(mapper.position_to_byte_clamped(position))
+                })
+                .collect();
+
+            assert_eq!(
+                positions_to_bytes_clamped(text, &positions),
+                one_by_one,
+                "{text:?}"
+            );
+        }
     }
 
     #[test]

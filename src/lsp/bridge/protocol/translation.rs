@@ -53,6 +53,17 @@ impl RegionOffset {
         &self.columns
     }
 
+    /// Whether the region opens mid-line, after a host delimiter on the same
+    /// line (a Nix `''`), rather than at a line start. A region with one
+    /// column offset past 0 does; a prefixed (blockquote) region has a column
+    /// per line, and one opening with a line break spans at least two lines.
+    ///
+    /// One line is ambiguous: a blockquoted fence ending at EOF without a
+    /// line break has one column offset too, and reads as opening mid-line.
+    pub(crate) fn opens_mid_line(&self) -> bool {
+        matches!(self.columns.as_slice(), [column] if *column > 0)
+    }
+
     /// Get the column offset for the given virtual line.
     ///
     /// Returns the per-line offset if available, otherwise 0.
@@ -173,6 +184,17 @@ pub(crate) fn translate_host_range_to_virtual(range: &mut Range, offset: &Region
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_region_opens_mid_line_only_after_a_delimiter_on_its_line() {
+        // A Nix `''` string's content follows the delimiter on its line.
+        assert!(RegionOffset::new(1, 19).opens_mid_line());
+        // A fence's content opens at a line start.
+        assert!(!RegionOffset::new(1, 0).opens_mid_line());
+        // Blockquoted and list-item fences: a prefix column per line.
+        assert!(!RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]).opens_mid_line());
+        assert!(!RegionOffset::with_per_line_offsets(3, vec![2, 0]).opens_mid_line());
+    }
 
     // ======================================================================
     // translate_virtual_position_to_host

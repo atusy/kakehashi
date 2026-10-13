@@ -3,7 +3,7 @@
 //! Position-based like hover/completion, but returns `TextEdit[]` that must be
 //! translated virtual→host like formatting — so the request side reuses
 //! [`build_text_document_position_params`] and the response side reuses
-//! [`super::formatting::transform_formatting_response_to_host`].
+//! [`super::formatting::transform_on_type_formatting_response_to_host`].
 //!
 //! # Double filter (#354)
 //!
@@ -27,7 +27,7 @@ use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
     build_text_document_position_params,
 };
-use super::formatting::{count_lines, transform_formatting_response_to_host};
+use super::formatting::transform_on_type_formatting_response_to_host;
 
 impl LanguageServerPool {
     /// Send an onTypeFormatting request and wait for the response.
@@ -87,7 +87,6 @@ impl LanguageServerPool {
             );
             return Ok(None);
         }
-        let virtual_line_count = count_lines(virtual_content);
         self.execute_position_bridge_request_with_handle(
             handle,
             host_uri,
@@ -113,10 +112,10 @@ impl LanguageServerPool {
             // malformed payloads to `Err` (request failure) — only the
             // capability/trigger early returns above yield `Ok(None)`.
             |response, ctx| {
-                transform_formatting_response_to_host(
+                transform_on_type_formatting_response_to_host(
                     response,
                     ctx.offset,
-                    virtual_line_count,
+                    virtual_content,
                     region_end,
                 )
                 .map(Some)
