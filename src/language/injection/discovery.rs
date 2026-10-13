@@ -864,16 +864,12 @@ fn find_injection_at_position<'a>(
     }
 }
 
-/// Whether the byte offset `end` sits mid-line — i.e. tree-sitter would report
-/// a non-zero column there.
+/// Whether the byte offset `end` sits mid-line — i.e. at a non-zero LSP
+/// column.
 ///
-/// Applies tree-sitter's column rule (a column counted from the last `\n`) to
-/// `text`, rather than the LSP one, so it stays consistent with the
-/// coordinate-translation pipeline, which shares that convention. The
-/// divergence that follows — a region ending right after a LONE `\r`, an LSP
-/// line break but not a tree-sitter one, reads as mid-line — is preserved on
-/// purpose and tracked as #996 item 4; fixing it here alone would only split
-/// the lookup from translation.
+/// Applies the LSP line rule, as region origins and coordinate translation
+/// do: LF, CRLF, and a lone `\r` each end a line. So a region ending right
+/// after a lone `\r` ends at a line start, not mid-line.
 ///
 /// Reads `text` rather than the node's parse-time `end_position()`, because an
 /// `#offset!`-shifted boundary has no tree-sitter `Point` to consult. On a
@@ -884,7 +880,11 @@ fn find_injection_at_position<'a>(
 /// column 0. The `end > 0` guard keeps the function total — without it
 /// `end - 1` underflows — and `false` is also the right answer at byte 0.
 fn ends_mid_line(text: &str, end: usize) -> bool {
-    end > 0 && text.as_bytes().get(end - 1).is_some_and(|&b| b != b'\n')
+    let bytes = text.as_bytes();
+    end > 0
+        && bytes.get(end - 1).is_some_and(|&previous| {
+            previous != b'\n' && (previous != b'\r' || bytes.get(end) == Some(&b'\n'))
+        })
 }
 
 /// How [`InjectionResolver::resolve_at_byte_offset`] treats a region's end
@@ -3786,6 +3786,53 @@ mod tests {
         )
         .expect("caret fallback must resolve the mid-line region end");
         assert_eq!(resolved.region.language, "lua");
+    }
+
+    /// Same as [`caret_end_fallback_keeps_fence_line_outside`] with a lone CR
+    /// before the closing fence: the content ends at the start of an LSP
+    /// line, so the caret there is on the fence line too.
+    #[test]
+    fn caret_end_fallback_keeps_fence_line_after_a_lone_cr_outside() {
+        let md_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&md_language).expect("set md language");
+        let text = "```lua\nprint(1)\r```\n";
+        let tree = parser.parse(text, None).expect("parse markdown");
+        let query = Query::new(
+            &md_language,
+            r#"
+                ((fenced_code_block
+                   (info_string (language) @injection.language)
+                   (code_fence_content) @injection.content))
+            "#,
+        )
+        .expect("valid query");
+        let coordinator = test_coordinator();
+        let tracker = NodeTracker::new();
+        let uri = test_uri("caret_end_fence_lone_cr");
+        let resolve_at = |byte| {
+            InjectionResolver::resolve_at_byte_offset(
+                &coordinator,
+                &tracker,
+                &uri,
+                &tree,
+                text,
+                &query,
+                byte,
+                0,
+                RegionBoundary::CaretEndFallback,
+            )
+        };
+
+        let fence_line_start = text.find("\r```").expect("closing fence") + 1;
+        assert!(
+            resolve_at(fence_line_start - 1).is_some(),
+            "the content's last byte is inside"
+        );
+        assert!(
+            resolve_at(fence_line_start).is_none(),
+            "a region ending at the start of an LSP line keeps the caret there outside"
+        );
     }
 
     /// A region ending at column 0 (fenced-block shape): the caret at that
