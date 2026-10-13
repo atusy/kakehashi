@@ -1587,6 +1587,7 @@ fn build_combined_virtual_content(
 
     while line_start < span.end {
         let remaining = clamped_slice(text, line_start..span.end);
+        let mut cr_cut_from_lf = false;
         let (content_end, line_end) = match remaining.find(['\n', '\r']) {
             None => (span.end, span.end),
             Some(index) => {
@@ -1599,7 +1600,8 @@ fn build_combined_virtual_content(
                     (line_break, line_break + 2)
                 } else {
                     // The span ends between CR and LF: the CR is the span's
-                    // last content byte.
+                    // last content byte, and ends no line in the host.
+                    cr_cut_from_lf = true;
                     (span.end, span.end)
                 }
             }
@@ -1633,6 +1635,13 @@ fn build_combined_virtual_content(
         } else {
             offsets.push(0);
             output.push_str(clamped_slice(text, content_end..line_end));
+        }
+
+        if cr_cut_from_lf && output.ends_with('\r') {
+            // A CR the virtual document keeps would end a line there; keep
+            // its one column as whitespace instead.
+            output.pop();
+            output.push(' ');
         }
 
         line_start = line_end;
@@ -2918,6 +2927,20 @@ mod tests {
         let (_, offsets) = build_combined_virtual_content(text, 2..text.len(), &[2..4, 6..8]);
 
         assert_eq!(offsets, vec![2, 2, 0]);
+    }
+
+    #[test]
+    fn combined_content_keeps_a_cr_cut_from_its_lf_on_its_line() {
+        // The span ends between CR and LF: in the host that CR ends no line,
+        // so the virtual document must not end a line there either. It keeps
+        // the CR's one column as whitespace.
+        let text = "> a\r\n";
+
+        let (content, offsets) =
+            build_combined_virtual_content(text, 0..4, std::slice::from_ref(&(2..4)));
+
+        assert_eq!(content, "a ");
+        assert_eq!(offsets, vec![2]);
     }
 
     #[test]
