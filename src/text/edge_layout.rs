@@ -38,17 +38,14 @@ pub(crate) fn restore_edge_layout(original: &str, formatted: &str, opens_mid_lin
             restored.extend(formatted_head);
         } else if let Some((layout, original_blank_lines)) = original_head.split_first() {
             // The original's line break ending the delimiter's line, then the
-            // blank lines the formatter kept, no more than the original had,
-            // each ending with that line break (see the trailing layout).
+            // blank lines the formatter kept, no more than the original had.
             restored.push_str(layout);
-            let line_break = layout.trim_start_matches([' ', '\t']);
             for line in formatted_head
                 .iter()
                 .skip(1)
                 .take(original_blank_lines.len())
             {
-                restored.push_str(line.trim_end_matches(['\r', '\n']));
-                restored.push_str(line_break);
+                push_line(&mut restored, line);
             }
         }
     }
@@ -62,20 +59,25 @@ pub(crate) fn restore_edge_layout(original: &str, formatted: &str, opens_mid_lin
     let original_tail = tail_lines(original_tail);
     if let Some((final_line, original_blank_lines)) = original_tail.split_last() {
         // The blank lines the formatter kept, no more than the original had,
-        // then the original's final line break and indentation. Every one
-        // ends with the original's line break: the layout keeps one style,
-        // and a kept lone CR cannot merge with an LF after it into one CRLF.
-        let original_break =
-            &final_line[..final_line.len() - final_line.trim_start_matches(['\r', '\n']).len()];
+        // then the original's final line break and indentation.
         let formatted_tail = tail_lines(formatted_tail);
         let blank_lines = formatted_tail.len().saturating_sub(1);
         for line in &formatted_tail[..blank_lines.min(original_blank_lines.len())] {
-            restored.push_str(original_break);
-            restored.push_str(line.trim_start_matches(['\r', '\n']));
+            push_line(&mut restored, line);
         }
-        restored.push_str(final_line);
+        push_line(&mut restored, final_line);
     }
     restored
+}
+
+/// Append a whitespace-only `line` of the layout, its line breaks as they
+/// are. Pieces of two texts meet here: should a lone CR meet an LF, an LF
+/// goes between them, as one CRLF would read as a single line break.
+fn push_line(restored: &mut String, line: &str) {
+    if restored.ends_with('\r') && line.starts_with('\n') {
+        restored.push('\n');
+    }
+    restored.push_str(line);
 }
 
 /// The rest of the delimiter's line that `text` opens with: spaces or tabs
@@ -162,13 +164,10 @@ mod tests {
     #[case::no_trailing_blank_lines_added("x\n", "x\n\n", false, "x\n")]
     #[case::closing_indentation_read_as_a_line_not_doubled("x\n  ", "x\n  \n", true, "x\n  ")]
     #[case::crlf_edges("\r\n  x\r\n  ", "x\n", true, "\r\nx\r\n  ")]
-    #[case::kept_blank_lines_take_the_original_line_break(
-        "x\r\n\r\n  ",
-        "x\n\n",
-        true,
-        "x\r\n\r\n  "
-    )]
-    #[case::a_kept_lone_cr_does_not_merge_into_a_crlf("x\n\n", "x\r\r\n", false, "x\n\n")]
+    #[case::kept_blank_lines_keep_their_line_breaks("x\r\n\r\n  ", "x\n\n", true, "x\n\r\n  ")]
+    #[case::untouched_blank_line_breaks_stay("x\r\n  \n", "x\r\n\n", false, "x\r\n\n")]
+    #[case::a_kept_lone_cr_does_not_merge_into_a_crlf("x\n\n", "x\r\r\n", false, "x\r\n\n")]
+    #[case::a_lone_cr_layout_does_not_merge_into_a_crlf("\r\r  x", "\n\nx", true, "\r\n\nx")]
     #[case::trailing_spaces_on_the_last_line_are_content("x  \n  ", "x\n", true, "x\n  ")]
     #[case::mixed_trailing_breaks_left_alone("a\r\n\n", "a\r\n\n", false, "a\r\n\n")]
     #[case::mixed_leading_breaks_left_alone("\r\n\na", "\r\n\na", true, "\r\n\na")]
