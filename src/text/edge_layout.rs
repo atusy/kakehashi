@@ -27,7 +27,8 @@ pub(crate) fn restore_edge_layout(original: &str, formatted: &str, opens_mid_lin
 
 /// How [`restore_edge_layout`] changes a formatted text: its first
 /// `head_end` bytes become `head`, and its bytes from `tail_start` on become
-/// `tail`. An edge left as formatted replaces nothing with nothing.
+/// `tail`, each narrowed to what differs. An edge left as formatted replaces
+/// nothing with nothing.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct EdgeRestore {
     pub(crate) head_end: usize,
@@ -104,16 +105,26 @@ pub(crate) fn restore_edges(original: &str, formatted: &str, opens_mid_line: boo
         }
     }
 
-    // A rebuilt edge equal to the formatter's own replaces nothing.
-    if edges.head == formatted[..edges.head_end] {
-        edges.head_end = 0;
-        edges.head.clear();
-    }
-    if edges.tail == formatted[edges.tail_start..] {
-        edges.tail_start = formatted.len();
-        edges.tail.clear();
-    }
+    // Each edge replaces only what differs from the formatter's own: the
+    // rest stays formatted text, so the formatter's edits there are kept.
+    let same_suffix = common_len(
+        edges.head.chars().rev(),
+        formatted[..edges.head_end].chars().rev(),
+    );
+    edges.head_end -= same_suffix;
+    edges.head.truncate(edges.head.len() - same_suffix);
+    let same_prefix = common_len(edges.tail.chars(), formatted[edges.tail_start..].chars());
+    edges.tail_start += same_prefix;
+    edges.tail.drain(..same_prefix);
     edges
+}
+
+/// The byte length of the longest run `a` and `b` share from their start.
+fn common_len(a: impl Iterator<Item = char>, b: impl Iterator<Item = char>) -> usize {
+    a.zip(b)
+        .take_while(|(x, y)| x == y)
+        .map(|(x, _)| x.len_utf8())
+        .sum()
 }
 
 /// Append a whitespace-only `line` of the layout, its line breaks as they

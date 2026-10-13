@@ -1349,6 +1349,31 @@ mod tests {
     }
 
     #[test]
+    fn a_blockquoted_region_keeps_its_trimmed_blank_lines_apart() {
+        // Each blank line's spaces go in an edit of its own; only the last,
+        // the closing indentation, is the host's to keep.
+        let host = "> ```lua\n> a\n>   \n>   \n>   ";
+        let virtual_content = "a\n  \n  \n  ";
+        let result = json!([
+            { "range": { "start": { "line": 1, "character": 0 },
+                         "end": { "line": 1, "character": 2 } }, "newText": "" },
+            { "range": { "start": { "line": 2, "character": 0 },
+                         "end": { "line": 2, "character": 2 } }, "newText": "" },
+            { "range": { "start": { "line": 3, "character": 0 },
+                         "end": { "line": 3, "character": 2 } }, "newText": "" }
+        ]);
+
+        let formatted = format_host(
+            host,
+            RegionOffset::with_per_line_offsets(1, vec![2, 2, 2, 2]),
+            virtual_content,
+            result,
+        );
+
+        assert_eq!(formatted, "> ```lua\n> a\n> \n> \n>   ");
+    }
+
+    #[test]
     fn a_region_without_a_final_line_break_gains_none() {
         // This Nix string's value ends without a line break; adding one, as
         // shfmt does, would change the value and move the closing delimiter.
