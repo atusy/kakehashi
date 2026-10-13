@@ -1724,8 +1724,10 @@ fn pipeline_region_text(
 ///   1:1 mapping, exact even when prefixes differ per line (nested
 ///   blockquotes).
 /// - **Line count changed**: the pipeline computes no diff/alignment, so
-///   every continuation line takes the region's longest common prefix — exact
-///   for the usual uniform-prefix region, a documented limitation otherwise.
+///   every continuation line takes the longest common prefix of the region's
+///   continuation lines — exact for the usual uniform-prefix region, a
+///   documented limitation otherwise (a one-line region has no continuation
+///   line to take it from, so the output's take none).
 ///   The LCP excludes trailing empty-prefix entries: a region whose content
 ///   ends with `\n` carries a synthetic final line bucket whose host prefix
 ///   belongs to the line *after* the replacement range, and including its
@@ -1751,8 +1753,11 @@ fn reapply_host_line_prefixes(final_text: &str, host_line_prefixes: &[String]) -
         // newline; that host line's own prefix sits OUTSIDE the replacement
         // range (the range ends at its column 0). Including it would
         // collapse the LCP to "" for a uniformly prefixed blockquote, so the
-        // LCP is computed over the content lines' prefixes only.
-        let mut content_prefixes = host_line_prefixes;
+        // LCP is computed over the content lines' prefixes only. Line 0's
+        // prefix is left out too: it sits before the replacement range and
+        // is never re-applied, and for a region opening mid-line it is the
+        // opening delimiter's line (a Nix `''`), not a prefix lines repeat.
+        let mut content_prefixes = host_line_prefixes.get(1..).unwrap_or_default();
         while let [rest @ .., last] = content_prefixes {
             if !last.is_empty() {
                 break;
@@ -2659,6 +2664,28 @@ mod tests {
         let text = pipeline_region_text(original, "    {}\n  ", &RegionOffset::new(1, 19), &[]);
 
         assert_eq!(text, None);
+    }
+
+    #[test]
+    fn pipeline_prefixes_no_line_with_the_opening_delimiter_line() {
+        // The text before a Nix `''` string on its first line is no line
+        // prefix: once the line count changes, it must not repeat on every
+        // continuation line.
+        let original = "\n    {\"a\":1}\n  ";
+        let prefixes = [
+            "  a = /* json */ ''".to_string(),
+            String::new(),
+            String::new(),
+        ];
+
+        let text = pipeline_region_text(
+            original,
+            "{\n    \"a\": 1\n}\n  ",
+            &RegionOffset::new(1, 19),
+            &prefixes,
+        );
+
+        assert_eq!(text.as_deref(), Some("\n{\n    \"a\": 1\n}\n  "));
     }
 
     #[test]
