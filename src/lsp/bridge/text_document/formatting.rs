@@ -1090,6 +1090,9 @@ mod tests {
         assert_eq!(formatted, "{\n  c = /* bash */ ''\necho hi'';\n}\n");
     }
 
+    /// A range as ((start line, start character), (end line, end character)).
+    type Span = ((u32, u32), (u32, u32));
+
     #[rstest]
     // The common suffix starts at the first line break's LF; ending the edit
     // after its CR would name a position inside a line break.
@@ -1100,7 +1103,7 @@ mod tests {
     fn replacement_between_spans_only_what_differs(
         #[case] original: &str,
         #[case] replacement: &str,
-        #[case] range: ((u32, u32), (u32, u32)),
+        #[case] range: Span,
         #[case] new_text: &str,
     ) {
         let ((start_line, start_character), (end_line, end_character)) = range;
@@ -1123,7 +1126,7 @@ mod tests {
     #[case::reversed(&[((0, 2), (0, 1))], false)]
     #[case::overlapping(&[((0, 0), (0, 2)), ((0, 1), (0, 3))], false)]
     fn edits_apply_in_order_rejects_reversed_and_overlapping_ranges(
-        #[case] ranges: &[((u32, u32), (u32, u32))],
+        #[case] ranges: &[Span],
         #[case] expected: bool,
     ) {
         let edits: Vec<TextEdit> = ranges
