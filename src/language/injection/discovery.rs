@@ -17,7 +17,7 @@ use super::ranges::{
 use crate::language::LanguageCoordinator;
 use crate::language::node_tracker::NodeTracker;
 use crate::language::query_predicates::check_match_predicates;
-use crate::text::{clamped_slice, fnv1a_hash};
+use crate::text::{LoneCarriageReturns, clamped_slice, fnv1a_hash};
 
 // Keep bridge-region identities in a namespace disjoint from real parse-tree
 // injection depths (0..=MAX_INJECTION_DEPTH). The per-range slot then gives
@@ -119,10 +119,11 @@ pub(crate) struct CacheableInjectionRegion {
     pub language: String,
     /// Byte range of the injection content in the source
     pub byte_range: Range<usize>,
-    /// Line range (0-indexed, inclusive start, exclusive end)
+    /// Line range (0-indexed, inclusive start, exclusive end) in LSP lines,
+    /// which a lone CR ends too, unlike tree-sitter rows.
     pub line_range: Range<u32>,
-    /// Column offset of the injection content start within its start line,
-    /// stored as UTF-16 code units (matching LSP's position encoding).
+    /// Column offset of the injection content start within its start LSP
+    /// line, stored as UTF-16 code units (matching LSP's position encoding).
     /// Non-zero for inline injections (e.g., code within a markdown paragraph).
     /// Only affects the first line (line 0) of the virtual document during
     /// coordinate translation; subsequent lines start at column 0.
@@ -165,6 +166,11 @@ fn position_of_byte(
     let column = text[line_start..byte_pos].encode_utf16().count() as u32;
     (row as u32, column)
 }
+
+/// What a resolver needs to build regions itself rather than take prebuilt
+/// ones: the tracker identity (URI and incarnation) that mints region IDs, and
+/// the host text's lone CRs for LSP positions.
+type RegionIdentity<'a> = (&'a NodeTracker, &'a Url, u64, &'a LoneCarriageReturns);
 
 /// The (tree-sitter row, UTF-16 column) of `start_byte`, the start of
 /// `info`'s effective content range ([`effective_content_range`]).
@@ -304,10 +310,15 @@ impl CacheableInjectionRegion {
     /// # Panics (debug builds)
     /// Panics if the content node is zero-width (`start_byte >= end_byte`).
     /// Callers must filter zero-width nodes upstream (see `collect_all_injections`).
+    ///
+    /// `lone_crs` must be built from `text`: the line range and start column
+    /// are LSP positions, which the bridge translates against, and a lone CR
+    /// ends an LSP line but not a tree-sitter row.
     pub(crate) fn from_region_info(
         info: &InjectionRegionInfo<'_>,
         region_id: &str,
         text: &str,
+        lone_crs: &LoneCarriageReturns,
     ) -> Self {
         let node = &info.content_node;
         debug_assert!(
@@ -330,23 +341,24 @@ impl CacheableInjectionRegion {
         } = effective_content_range(info, text);
         let content = &text[start_byte..end_byte];
 
-        let (start_line, start_column) = tree_start_position(info, start_byte, text);
+        let (tree_start_row, tree_start_column) = tree_start_position(info, start_byte, text);
+        let (start_line, start_column) =
+            lone_crs.lsp_position(text, start_byte, tree_start_row, tree_start_column);
 
-        // end_position() points past the last byte. When that position is mid-line
-        // (column > 0), the node still occupies that row → exclusive end is row + 1.
-        // When column == 0 (node ended with newline), the row is already one past
-        // the last occupied line — use it directly.
-        let end_line = if end_byte == node.end_byte() {
-            let end_pos = node.end_position();
-            if end_pos.column > 0 {
-                end_pos.row as u32 + 1
-            } else {
-                end_pos.row as u32
-            }
+        // The end points past the last byte. When that position is mid-line
+        // (column > 0), the content still occupies that line → exclusive end
+        // is line + 1. When column == 0 (content ended with a line end), the
+        // line is already one past the last occupied line — use it directly.
+        let tree_end_row = if end_byte == node.end_byte() {
+            node.end_position().row
         } else {
-            let (end_row, end_column) =
-                position_of_byte(text, end_byte, node.end_byte(), node.end_position().row);
-            if end_column > 0 { end_row + 1 } else { end_row }
+            position_of_byte(text, end_byte, node.end_byte(), node.end_position().row).0 as usize
+        };
+        let end_line = lone_crs.lsp_line(end_byte, tree_end_row as u32);
+        let end_line = if lone_crs.starts_lsp_line(text, end_byte) {
+            end_line
+        } else {
+            end_line + 1
         };
 
         Self {
@@ -965,13 +977,18 @@ impl InjectionResolver {
         boundary: RegionBoundary,
     ) -> Option<ResolvedInjection> {
         let injections = collect_all_injections(&tree.root_node(), text, Some(injection_query))?;
+        let lone_crs = LoneCarriageReturns::new(text);
         let resolve = |region: &InjectionRegionInfo<'_>| {
             if region.combined {
                 // A member with no included bytes is not a positional entry
                 // into the surviving members of its combined group.
                 let id = Self::calculate_region_id(tracker, uri, region, incarnation)?;
-                let cacheable =
-                    CacheableInjectionRegion::from_region_info(region, &id.to_string(), text);
+                let cacheable = CacheableInjectionRegion::from_region_info(
+                    region,
+                    &id.to_string(),
+                    text,
+                    &lone_crs,
+                );
                 extract_virtual_content_and_offsets(region, &cacheable, text)?;
 
                 let group: Vec<_> = injections
@@ -984,13 +1001,21 @@ impl InjectionResolver {
                     .collect();
                 Self::build_combined_injection(
                     coordinator,
-                    Some((tracker, uri, incarnation)),
+                    Some((tracker, uri, incarnation, &lone_crs)),
                     &group,
                     None,
                     text,
                 )
             } else {
-                Self::build_resolved_injection(coordinator, tracker, uri, region, text, incarnation)
+                Self::build_resolved_injection(
+                    coordinator,
+                    tracker,
+                    uri,
+                    region,
+                    text,
+                    &lone_crs,
+                    incarnation,
+                )
             }
         };
 
@@ -1097,12 +1122,13 @@ impl InjectionResolver {
         uri: &Url,
         region: &InjectionRegionInfo,
         text: &str,
+        lone_crs: &LoneCarriageReturns,
         incarnation: u64,
     ) -> Option<ResolvedInjection> {
         let region_id = Self::calculate_region_id(tracker, uri, region, incarnation)?;
         let region_id_str = region_id.to_string();
         let cacheable_region =
-            CacheableInjectionRegion::from_region_info(region, &region_id_str, text);
+            CacheableInjectionRegion::from_region_info(region, &region_id_str, text, lone_crs);
         let (virtual_content, line_column_offsets) =
             extract_virtual_content_and_offsets(region, &cacheable_region, text)?;
         let resolved_language =
@@ -1124,7 +1150,7 @@ impl InjectionResolver {
     /// indentation from host prefixes.
     fn build_combined_injection(
         coordinator: &LanguageCoordinator,
-        identity: Option<(&NodeTracker, &Url, u64)>,
+        identity: Option<RegionIdentity<'_>>,
         regions: &[&InjectionRegionInfo<'_>],
         prebuilt: Option<&[&CacheableInjectionRegion]>,
         text: &str,
@@ -1134,7 +1160,7 @@ impl InjectionResolver {
         let cacheable: Vec<&CacheableInjectionRegion> = match prebuilt {
             Some(cacheable) => cacheable.to_vec(),
             None => {
-                let (tracker, uri, incarnation) =
+                let (tracker, uri, incarnation, lone_crs) =
                     identity.expect("non-prebuilt regions require identity");
                 owned_cacheable = regions
                     .iter()
@@ -1144,6 +1170,7 @@ impl InjectionResolver {
                             region,
                             &id.to_string(),
                             text,
+                            lone_crs,
                         ))
                     })
                     .collect::<Option<Vec<_>>>()?;
@@ -1322,7 +1349,9 @@ impl InjectionResolver {
         // An opaque ID for a capture whose child exclusions leave no bytes is
         // not a bridge layer, even when another member of the same combined
         // group remains active.
-        let selected = CacheableInjectionRegion::from_region_info(region, region_id, text);
+        let lone_crs = LoneCarriageReturns::new(text);
+        let selected =
+            CacheableInjectionRegion::from_region_info(region, region_id, text, &lone_crs);
         extract_virtual_content_and_offsets(region, &selected, text)?;
 
         if region.combined {
@@ -1340,7 +1369,7 @@ impl InjectionResolver {
             // document rather than rejecting non-first captures below.
             Self::build_combined_injection(
                 coordinator,
-                Some((tracker, uri, incarnation)),
+                Some((tracker, uri, incarnation, &lone_crs)),
                 &group,
                 None,
                 text,
@@ -1352,6 +1381,7 @@ impl InjectionResolver {
                 uri,
                 region,
                 text,
+                &lone_crs,
                 incarnation,
             )?;
             (resolved.region.region_id == region_id).then_some(resolved)
@@ -1369,9 +1399,10 @@ impl InjectionResolver {
         text: &str,
         incarnation: u64,
     ) -> Vec<ResolvedInjection> {
+        let lone_crs = LoneCarriageReturns::new(text);
         Self::resolve_grouped(
             coordinator,
-            Some((tracker, uri, incarnation)),
+            Some((tracker, uri, incarnation, &lone_crs)),
             regions,
             None,
             text,
@@ -1399,7 +1430,7 @@ impl InjectionResolver {
 
     fn resolve_grouped(
         coordinator: &LanguageCoordinator,
-        identity: Option<(&NodeTracker, &Url, u64)>,
+        identity: Option<RegionIdentity<'_>>,
         regions: &[InjectionRegionInfo<'_>],
         prebuilt: Option<&[CacheableInjectionRegion]>,
         text: &str,
@@ -1481,7 +1512,7 @@ impl InjectionResolver {
                     contiguous: true,
                 });
             } else {
-                let (tracker, uri, incarnation) =
+                let (tracker, uri, incarnation, lone_crs) =
                     identity.expect("non-prebuilt regions require identity");
                 if let Some(single) = Self::build_resolved_injection(
                     coordinator,
@@ -1489,6 +1520,7 @@ impl InjectionResolver {
                     uri,
                     region,
                     text,
+                    lone_crs,
                     incarnation,
                 ) {
                     resolved.push(single);
@@ -2362,7 +2394,12 @@ mod tests {
             collect_all_injections(&root, text, Some(&query)).expect("should find injections");
         assert!(!regions.is_empty(), "expected at least one injection");
 
-        CacheableInjectionRegion::from_region_info(&regions[0], "test-id", text)
+        CacheableInjectionRegion::from_region_info(
+            &regions[0],
+            "test-id",
+            text,
+            &LoneCarriageReturns::new(text),
+        )
     }
 
     #[test]
@@ -2715,7 +2752,7 @@ mod tests {
         let uri = test_uri("combined_empty_member");
         let resolved = InjectionResolver::build_combined_injection(
             &test_coordinator(),
-            Some((&tracker, &uri, 0)),
+            Some((&tracker, &uri, 0, &LoneCarriageReturns::new(text))),
             &[&empty, &active],
             None,
             text,
@@ -3160,8 +3197,12 @@ mod tests {
         let region_info = &regions[0];
 
         // Convert to CacheableInjectionRegion (owned, no lifetime)
-        let cacheable =
-            CacheableInjectionRegion::from_region_info(region_info, "test-result-id", text);
+        let cacheable = CacheableInjectionRegion::from_region_info(
+            region_info,
+            "test-result-id",
+            text,
+            &LoneCarriageReturns::new(text),
+        );
 
         // Verify all fields are captured correctly
         assert_eq!(cacheable.language, "markdown");
@@ -3205,7 +3246,12 @@ mod tests {
 
         let regions = collect_all_injections(&root, text, Some(&query)).expect("injections");
         assert_eq!(regions.len(), 1);
-        let cacheable = CacheableInjectionRegion::from_region_info(&regions[0], "test-id", text);
+        let cacheable = CacheableInjectionRegion::from_region_info(
+            &regions[0],
+            "test-id",
+            text,
+            &LoneCarriageReturns::new(text),
+        );
 
         assert_eq!(&text[cacheable.byte_range.clone()], "regex content");
         assert_eq!(cacheable.byte_range, 3..text.len());
@@ -3235,7 +3281,12 @@ mod tests {
 
         let regions = collect_all_injections(&root, text, Some(&query)).expect("injections");
         assert_eq!(regions.len(), 1);
-        let cacheable = CacheableInjectionRegion::from_region_info(&regions[0], "test-id", text);
+        let cacheable = CacheableInjectionRegion::from_region_info(
+            &regions[0],
+            "test-id",
+            text,
+            &LoneCarriageReturns::new(text),
+        );
 
         assert_eq!(&text[cacheable.byte_range.clone()], "title: x\n");
         assert_eq!(cacheable.line_range, 1..2);
@@ -4745,7 +4796,12 @@ local y = "duplicate"
             .iter()
             .enumerate()
             .map(|(i, region)| {
-                CacheableInjectionRegion::from_region_info(region, &format!("region-{i}"), &text)
+                CacheableInjectionRegion::from_region_info(
+                    region,
+                    &format!("region-{i}"),
+                    &text,
+                    &LoneCarriageReturns::new(&text),
+                )
             })
             .collect::<Vec<_>>();
         let cancel = crate::cancel::CancelToken::default();
@@ -4774,6 +4830,101 @@ local y = "duplicate"
         assert_eq!((row, col), (0, 0));
     }
 
+    /// The region's origin must be the LSP position `PositionMapper` gives
+    /// its effective content, which the bridge translates against.
+    fn assert_lsp_origin(text: &str, cacheable: &CacheableInjectionRegion) {
+        let mapper = crate::text::PositionMapper::new(text);
+        let start = mapper
+            .byte_to_position(cacheable.byte_range.start)
+            .expect("start in bounds");
+        let end = mapper
+            .byte_to_position(cacheable.byte_range.end)
+            .expect("end in bounds");
+        let end_line = if end.character > 0 {
+            end.line + 1
+        } else {
+            end.line
+        };
+        assert_eq!(
+            (cacheable.line_range.clone(), cacheable.start_column),
+            (start.line..end_line, start.character),
+            "{text:?}"
+        );
+    }
+
+    fn rust_string_regions(text: &str, query_str: &str) -> CacheableInjectionRegion {
+        let mut parser = create_rust_parser();
+        let tree = parse_rust_code(&mut parser, text);
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, query_str).expect("valid query");
+        let regions =
+            collect_all_injections(&tree.root_node(), text, Some(&query)).expect("injections");
+        assert_eq!(regions.len(), 1);
+        CacheableInjectionRegion::from_region_info(
+            &regions[0],
+            "id",
+            text,
+            &LoneCarriageReturns::new(text),
+        )
+    }
+
+    #[rstest]
+    #[case::lone_cr_on_an_earlier_row(
+        "fn a() {}\r\nfn b() {}\rfn c() {}\nfn main() { let s = \"x\"; }"
+    )]
+    #[case::lone_cr_earlier_on_the_same_row("fn a() {}\rfn main() { let s = \"x\"; }")]
+    #[case::lone_cr_inside_the_region("fn main() { let s = \"a\rb\"; }")]
+    fn from_region_info_origin_is_the_lsp_position(#[case] text: &str) {
+        let cacheable = rust_string_regions(
+            text,
+            r#"((string_literal) @injection.content (#set! injection.language "md"))"#,
+        );
+
+        assert_lsp_origin(text, &cacheable);
+    }
+
+    #[rstest]
+    #[case::lone_cr_earlier_on_the_same_row("fn a() {}\rfn main() { let s = \"x\"; }")]
+    #[case::lone_cr_inside_the_region("fn main() { let s = \"a\rb\"; }")]
+    fn from_region_info_origin_is_the_lsp_position_after_an_offset(#[case] text: &str) {
+        // `#offset!` moves the start off the node, through `position_of_byte`.
+        let cacheable = rust_string_regions(
+            text,
+            r#"((string_literal) @injection.content
+                (#set! injection.language "md")
+                (#offset! @injection.content 0 1 0 -1))"#,
+        );
+
+        assert_lsp_origin(text, &cacheable);
+    }
+
+    #[test]
+    fn from_region_info_origin_is_the_lsp_position_in_a_lone_cr_markdown_fence() {
+        let md_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&md_language).expect("set md language");
+        let text = "one\rtwo\n\n```lua\nlocal x = 1\rlocal y = 2\n```\n";
+        let tree = parser.parse(text, None).expect("parse markdown");
+        let query = Query::new(
+            &md_language,
+            r#"((fenced_code_block (code_fence_content) @injection.content)
+                (#set! injection.language "lua"))"#,
+        )
+        .expect("valid query");
+        let regions =
+            collect_all_injections(&tree.root_node(), text, Some(&query)).expect("injections");
+        assert_eq!(regions.len(), 1);
+
+        let cacheable = CacheableInjectionRegion::from_region_info(
+            &regions[0],
+            "id",
+            text,
+            &LoneCarriageReturns::new(text),
+        );
+
+        assert_lsp_origin(text, &cacheable);
+    }
+
     #[test]
     fn from_region_info_stale_node_does_not_panic() {
         // A node parsed from `text` but resolved against a much shorter text
@@ -4789,7 +4940,12 @@ local y = "duplicate"
         assert!(!regions.is_empty());
 
         let short_text = "x";
-        let cacheable = CacheableInjectionRegion::from_region_info(&regions[0], "id", short_text);
+        let cacheable = CacheableInjectionRegion::from_region_info(
+            &regions[0],
+            "id",
+            short_text,
+            &LoneCarriageReturns::new(short_text),
+        );
         // Completed without panicking; metadata is still populated.
         assert_eq!(cacheable.language, "md");
         assert_eq!(cacheable.region_id, "id");

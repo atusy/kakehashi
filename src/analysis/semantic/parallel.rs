@@ -3182,7 +3182,12 @@ local b = 2
                         crate::language::loader::static_node_kind(&info.content_node),
                     )
                     .to_string();
-                CacheableInjectionRegion::from_region_info(info, &id, text)
+                CacheableInjectionRegion::from_region_info(
+                    info,
+                    &id,
+                    text,
+                    &crate::text::LoneCarriageReturns::new(text),
+                )
             })
             .collect()
     }

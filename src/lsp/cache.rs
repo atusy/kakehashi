@@ -416,6 +416,7 @@ impl CacheCoordinator {
             if crate::cancel::is_cancelled(cancel) {
                 return None;
             }
+            let lone_crs = crate::text::LoneCarriageReturns::new(text);
             let mut cacheable_regions = Vec::with_capacity(regions.len());
             for (info, ulid) in regions.iter().zip(&region_ids) {
                 if crate::cancel::is_cancelled_periodically(cancel, &mut work_items) {
@@ -423,7 +424,7 @@ impl CacheCoordinator {
                 }
                 let region_id = ulid.to_string();
                 cacheable_regions.push(CacheableInjectionRegion::from_region_info(
-                    info, &region_id, text,
+                    info, &region_id, text, &lone_crs,
                 ));
             }
 
