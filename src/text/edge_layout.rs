@@ -88,7 +88,15 @@ pub(crate) fn restore_edges(original: &str, formatted: &str, opens_mid_line: boo
                     .skip(1)
                     .take(original_blank_lines.len())
                 {
-                    push_line(&mut edges.head, line);
+                    // The host's lone CR before it stays one: an LF opening
+                    // the formatter's blank line takes a CR instead.
+                    match line.strip_prefix('\n') {
+                        Some(rest) if edges.head.ends_with('\r') => {
+                            edges.head.push('\r');
+                            edges.head.push_str(rest);
+                        }
+                        _ => edges.head.push_str(line),
+                    }
                 }
             }
         }
@@ -149,9 +157,9 @@ fn common_len(a: impl Iterator<Item = char>, b: impl Iterator<Item = char>) -> u
         .sum()
 }
 
-/// Append a whitespace-only `line` of the layout, its line breaks as they
-/// are. Pieces of two texts meet here: should a lone CR meet an LF, an LF
-/// goes between them, as one CRLF would read as a single line break.
+/// Append a whitespace-only line of the trailing layout, its line breaks as
+/// they are. Pieces of two texts meet here: should a kept lone CR meet an LF,
+/// an LF goes between them, as one CRLF would read as a single line break.
 fn push_line(restored: &mut String, line: &str) {
     if restored.ends_with('\r') && line.starts_with('\n') {
         restored.push('\n');
@@ -246,7 +254,9 @@ mod tests {
     #[case::kept_blank_lines_keep_their_line_breaks("x\r\n\r\n  ", "x\n\n", true, "x\n\r\n  ")]
     #[case::untouched_blank_line_breaks_stay("x\r\n  \n", "x\r\n\n", false, "x\r\n\n")]
     #[case::a_kept_lone_cr_does_not_merge_into_a_crlf("x\n\n", "x\r\r\n", false, "x\r\n\n")]
-    #[case::a_lone_cr_layout_does_not_merge_into_a_crlf("\r\r  x", "\n\nx", true, "\r\n\nx")]
+    // The host's lone CR stays; the kept blank line takes a CR so the two
+    // do not merge into one CRLF.
+    #[case::a_lone_cr_layout_does_not_merge_into_a_crlf("\r\r  x", "\n\nx", true, "\r\rx")]
     #[case::trailing_spaces_on_the_last_line_are_content("x  \n  ", "x\n", true, "x\n  ")]
     #[case::mixed_trailing_breaks_left_alone("a\r\n\n", "a\r\n\n", false, "a\r\n\n")]
     #[case::mixed_leading_breaks_left_alone("\r\n\na", "\r\n\na", true, "\r\n\na")]
