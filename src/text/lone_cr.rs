@@ -5,8 +5,10 @@
 ///
 /// The LSP position model, like [`super::PositionMapper`], ends a line at a
 /// lone CR, while tree-sitter rows split only at LF. Built once per document,
-/// it turns a tree-sitter position into an LSP one with a binary search, and
-/// a document without lone CRs, the usual case, costs one scan for `\r`.
+/// it turns a tree-sitter line into an LSP one with a binary search; a column
+/// after a lone CR also takes a scan back to its LSP line start. A document
+/// without lone CRs, the usual case, costs one scan for `\r` and nothing per
+/// position.
 #[derive(Debug)]
 pub(crate) struct LoneCarriageReturns(Vec<usize>);
 
