@@ -10,7 +10,8 @@
 /// Return `formatted` with the edge layout of `original` restored.
 ///
 /// - Leading: when the region opens mid-line, after a delimiter, its leading
-///   line break (or the absence of one) is kept. A region opening at a line
+///   line break with any spaces or tabs before it (or the absence of one) is
+///   kept. A region opening at a line
 ///   start has none of the host's: a leading line break there is a blank line
 ///   of content, the formatter's to keep or remove.
 /// - Trailing: the final line break and the whitespace after it are kept, as
@@ -25,14 +26,14 @@ pub(crate) fn restore_edge_layout(original: &str, formatted: &str, opens_mid_lin
     }
     let (body, formatted_tail) = formatted.split_at(tail_start(formatted));
     let body = if opens_mid_line {
-        &body[leading_line_break(body).len()..]
+        &body[leading_layout(body).len()..]
     } else {
         body
     };
 
     let mut restored = String::with_capacity(formatted.len() + original.len());
     if opens_mid_line {
-        restored.push_str(leading_line_break(original));
+        restored.push_str(leading_layout(original));
     }
     restored.push_str(body);
     let original_tail = tail_lines(&original[tail_start(original)..]);
@@ -49,15 +50,20 @@ pub(crate) fn restore_edge_layout(original: &str, formatted: &str, opens_mid_lin
     restored
 }
 
-/// The line break `text` opens with, or `""`.
-fn leading_line_break(text: &str) -> &str {
-    if text.starts_with("\r\n") {
-        &text[..2]
-    } else if text.starts_with(['\n', '\r']) {
-        &text[..1]
+/// The rest of the delimiter's line that `text` opens with: spaces or tabs
+/// and the line break after them, or `""` when no line break follows them
+/// (they then indent content).
+fn leading_layout(text: &str) -> &str {
+    let rest = text.trim_start_matches([' ', '\t']);
+    let blank = text.len() - rest.len();
+    let line_break = if rest.starts_with("\r\n") {
+        2
+    } else if rest.starts_with(['\n', '\r']) {
+        1
     } else {
-        ""
-    }
+        return "";
+    };
+    &text[..blank + line_break]
 }
 
 /// Where the trailing layout of `text` starts: the first line break of its
@@ -101,6 +107,9 @@ mod tests {
     #[case::final_line_break_before_a_fence("{}\n", "{}", false, "{}\n")]
     #[case::no_final_line_break_added("\nx", "x\n", true, "\nx")]
     #[case::no_leading_line_break_added("x", "\nx", true, "x")]
+    #[case::spaces_before_the_leading_line_break("  \n  x\n  ", "x\n", true, "  \nx\n  ")]
+    #[case::spaces_before_the_leading_line_break_kept("  \n  x\n  ", "  \nx\n", true, "  \nx\n  ")]
+    #[case::leading_indentation_is_content("x", "  x", true, "  x")]
     #[case::leading_blank_line_at_a_line_start_is_content("\nx\n", "x\n", false, "x\n")]
     #[case::trimmed_trailing_blank_lines_stay_trimmed("x\n\n\n", "x\n", false, "x\n")]
     #[case::kept_trailing_blank_line("x\n\n  ", "x\n\n", true, "x\n\n  ")]
