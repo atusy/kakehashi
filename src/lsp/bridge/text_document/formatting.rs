@@ -192,12 +192,8 @@ fn keep_edge_layout(
     if !edits_apply_in_order(&edits) {
         return edits;
     }
-    // A region with one column offset past 0 opens mid-line, after a host
-    // delimiter. A prefixed (blockquote) region has a column per line, and one
-    // opening with a line break spans at least two lines.
-    let opens_mid_line = matches!(offset.columns(), [column] if *column > 0);
     let formatted = apply_text_edits(virtual_content, &edits);
-    let restored = restore_edge_layout(virtual_content, &formatted, opens_mid_line);
+    let restored = restore_edge_layout(virtual_content, &formatted, offset.opens_mid_line());
     if restored == formatted {
         return edits;
     }
