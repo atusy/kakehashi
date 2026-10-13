@@ -209,6 +209,11 @@ fn keep_edge_layout(
 }
 
 /// Whether every range is ordered and none overlaps another.
+///
+/// Positions compare as sent, after the past-EOF clamps: an edit ending at the
+/// (last line, u32::MAX) sentinel reads as overlapping one starting at that
+/// line's real end, although they only touch. Such an answer passes as
+/// received, as before the edge layout was kept.
 fn edits_apply_in_order(edits: &[TextEdit]) -> bool {
     let key = |position: Position| (position.line, position.character);
     let mut ranges: Vec<_> = edits.iter().map(|edit| edit.range).collect();
