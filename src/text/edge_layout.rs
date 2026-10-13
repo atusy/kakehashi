@@ -39,11 +39,16 @@ pub(crate) fn restore_edge_layout(original: &str, formatted: &str, opens_mid_lin
     let original_tail = tail_lines(&original[tail_start(original)..]);
     if let Some((final_line, original_blank_lines)) = original_tail.split_last() {
         // The blank lines the formatter kept, no more than the original had,
-        // then the original's final line break and indentation.
+        // then the original's final line break and indentation. Every one
+        // ends with the original's line break: the layout keeps one style,
+        // and a kept lone CR cannot merge with an LF after it into one CRLF.
+        let original_break =
+            &final_line[..final_line.len() - final_line.trim_start_matches(['\r', '\n']).len()];
         let formatted_tail = tail_lines(formatted_tail);
         let blank_lines = formatted_tail.len().saturating_sub(1);
         for line in &formatted_tail[..blank_lines.min(original_blank_lines.len())] {
-            restored.push_str(line);
+            restored.push_str(original_break);
+            restored.push_str(line.trim_start_matches(['\r', '\n']));
         }
         restored.push_str(final_line);
     }
@@ -116,6 +121,13 @@ mod tests {
     #[case::no_trailing_blank_lines_added("x\n", "x\n\n", false, "x\n")]
     #[case::closing_indentation_read_as_a_line_not_doubled("x\n  ", "x\n  \n", true, "x\n  ")]
     #[case::crlf_edges("\r\n  x\r\n  ", "x\n", true, "\r\nx\r\n  ")]
+    #[case::kept_blank_lines_take_the_original_line_break(
+        "x\r\n\r\n  ",
+        "x\n\n",
+        true,
+        "x\r\n\r\n  "
+    )]
+    #[case::a_kept_lone_cr_does_not_merge_into_a_crlf("x\n\n", "x\r\r\n", false, "x\n\n")]
     #[case::trailing_spaces_on_the_last_line_are_content("x  \n  ", "x\n", true, "x\n  ")]
     #[case::edges_already_match("\n  x\n  ", "\n  y;\n  ", true, "\n  y;\n  ")]
     #[case::whitespace_only_original("\n  ", "", true, "")]
