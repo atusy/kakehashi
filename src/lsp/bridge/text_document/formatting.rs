@@ -3,8 +3,9 @@
 //! the injection's [`RegionOffset`] (including per-line column for the first line).
 //!
 //! [`transform_formatting_response_to_host`] is `pub(super)` so
-//! [`super::range_formatting`] and [`super::on_type_formatting`], which share
-//! the same virtual→host hazards, can reuse it.
+//! [`super::range_formatting`], which shares the same virtual→host hazards,
+//! can reuse it; [`super::on_type_formatting`] uses
+//! [`transform_on_type_formatting_response_to_host`].
 //!
 //! # Known limitation: formatting in prefixed regions can drop WHOLE responses
 //!
@@ -541,11 +542,36 @@ fn build_formatting_request(
 /// past EOF); any edit whose start is still on a line `>= virtual_line_count`
 /// is then dropped before translation.
 /// `virtual_content` is the text the server formatted: the edits apply to it.
+///
+/// The region's edge layout is kept (see `keep_edge_layout`).
 pub(super) fn transform_formatting_response_to_host(
+    response: serde_json::Value,
+    offset: &RegionOffset,
+    virtual_content: &str,
+    region_end: Position,
+) -> io::Result<Vec<TextEdit>> {
+    transform_formatting_style_response(response, offset, virtual_content, region_end, true)
+}
+
+/// [`transform_formatting_response_to_host`] for on-type formatting, whose
+/// answer is about the line being typed, leaving the edges as answered: at
+/// the end of an unclosed region (a fence at EOF), that line is the region's
+/// last, and its indentation is content, not a closing delimiter's.
+pub(super) fn transform_on_type_formatting_response_to_host(
+    response: serde_json::Value,
+    offset: &RegionOffset,
+    virtual_content: &str,
+    region_end: Position,
+) -> io::Result<Vec<TextEdit>> {
+    transform_formatting_style_response(response, offset, virtual_content, region_end, false)
+}
+
+fn transform_formatting_style_response(
     mut response: serde_json::Value,
     offset: &RegionOffset,
     virtual_content: &str,
     region_end: Position,
+    keep_edges: bool,
 ) -> io::Result<Vec<TextEdit>> {
     let virtual_line_count = count_lines(virtual_content);
     if response_has_jsonrpc_error(&response, "formatting-style request") {
@@ -620,7 +646,9 @@ pub(super) fn transform_formatting_response_to_host(
         return Ok(Vec::new());
     }
 
-    let mut edits = keep_edge_layout(edits, virtual_content, offset);
+    if keep_edges {
+        edits = keep_edge_layout(edits, virtual_content, offset);
+    }
 
     for edit in &mut edits {
         translate_virtual_range_to_host(&mut edit.range, offset);
@@ -1444,6 +1472,29 @@ mod tests {
         let formatted = format_host(host, RegionOffset::new(0, 0), host, result);
 
         assert_eq!(formatted, "x\r  ");
+    }
+
+    #[test]
+    fn on_type_formatting_reindents_the_last_line_of_an_unclosed_fence() {
+        // An unclosed fence at EOF ends on the line being typed: its
+        // indentation is content, not a closing delimiter's.
+        let virtual_content = "if (true) {\n  ";
+        let offset = RegionOffset::new(1, 0);
+        let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [
+            { "range": { "start": { "line": 1, "character": 0 },
+                         "end": { "line": 1, "character": 2 } }, "newText": "    " }
+        ]});
+
+        let edits = transform_on_type_formatting_response_to_host(
+            response,
+            &offset,
+            virtual_content,
+            region_host_end(virtual_content, &offset),
+        )
+        .unwrap();
+
+        assert_eq!(edits.len(), 1, "{edits:?}");
+        assert_eq!(edits[0].new_text, "    ");
     }
 
     #[test]
