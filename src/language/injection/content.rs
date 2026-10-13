@@ -41,9 +41,8 @@ pub(crate) fn extract_clean_content(
 /// Compute per-virtual-line UTF-16 column offsets from included ranges.
 ///
 /// Each offset is the width of the blockquote prefix (or other excluded content)
-/// before the gap on that line, in at least two entries. When `included_ranges`
-/// is `None`, returns `vec![start_column]` — the non-blockquote fallback where
-/// only line 0 has an offset.
+/// before the gap on that line. When `included_ranges` is `None`, returns
+/// `vec![start_column]` — the non-blockquote fallback where only line 0 has an offset.
 pub(super) fn compute_line_column_offsets(
     host_text: &str,
     byte_range: std::ops::Range<usize>,
@@ -110,17 +109,10 @@ pub(super) fn compute_line_column_offsets(
                 }
             }
             if offsets.is_empty() {
-                offsets.push(start_column);
+                vec![start_column]
+            } else {
+                offsets
             }
-            // At least two entries, the row after a one-line region's
-            // content included (0, as missing entries read): one entry is the
-            // single-column shape of a region without excluded ranges, which
-            // `RegionOffset::opens_mid_line` reads as opening after a
-            // delimiter on its line.
-            if offsets.len() == 1 {
-                offsets.push(0);
-            }
-            offsets
         }
     }
 }
@@ -651,23 +643,13 @@ mod tests {
     }
 
     #[test]
-    fn a_one_line_prefixed_region_has_a_column_per_line_and_one_after() {
-        // `> x` at EOF without a closing fence or a line break: its one
-        // column must not read as the single-column shape of a region that
-        // opens mid-line after a delimiter (`[2]`).
-        let ranges = [range_at(2, 3, 0, 2)];
-        let offsets = compute_line_column_offsets("> x", 0..3, 2, Some(&ranges));
-        assert_eq!(offsets, vec![2, 0]);
-    }
-
-    #[test]
     fn compute_line_column_offsets_oversized_column_does_not_panic() {
         // A stale range whose Point claims a later row and an oversized
         // column must not underflow or slice past the end. Lines and line
         // starts come from the bytes, so the range sits on line 0.
         let ranges = [range_at(2, 3, 1, 100)];
         let offsets = compute_line_column_offsets("hello", 0..5, 0, Some(&ranges));
-        assert_eq!(offsets, vec![0, 0]);
+        assert_eq!(offsets, vec![0]);
     }
 
     #[test]
