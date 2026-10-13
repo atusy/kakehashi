@@ -99,8 +99,14 @@ impl PositionMapper<'_> {
                     .map(|line| line.strip_suffix('\r').unwrap_or(line))
                     .unwrap_or_else(|| line.strip_suffix('\r').unwrap_or(line));
                 let line_end = line_start + content.len();
+                // A line has no more UTF-16 units than bytes, so capping the
+                // character at the byte length keeps every column on the line
+                // while `line_start + character` can no longer overflow.
+                let character = position
+                    .character
+                    .min(u32::try_from(content.len()).unwrap_or(u32::MAX));
                 let byte = self
-                    .position_to_byte(position)
+                    .position_to_byte(Position::new(position.line, character))
                     .unwrap_or(line_end)
                     .min(line_end);
                 self.text.floor_char_boundary(byte)
@@ -477,6 +483,18 @@ mod tests {
         let text = "hello\nworld\n";
         let mapper = PositionMapper::new(text);
         assert_eq!(mapper.position_to_byte_clamped(Position::new(0, 999)), 5);
+    }
+
+    #[test]
+    fn clamped_snaps_the_largest_character_to_line_end() {
+        // The end-of-line sentinel (line, u32::MAX) is a valid LSP position;
+        // adding it to the line start must not overflow.
+        let text = "hello\nworld";
+        let mapper = PositionMapper::new(text);
+        assert_eq!(
+            mapper.position_to_byte_clamped(Position::new(1, u32::MAX)),
+            11
+        );
     }
 
     #[test]
