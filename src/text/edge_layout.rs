@@ -11,9 +11,10 @@
 ///
 /// - Leading: when the region opens mid-line, after a delimiter, its leading
 ///   line break with any spaces or tabs before it (or the absence of one) is
-///   kept. A region opening at a line
-///   start has none of the host's: a leading line break there is a blank line
-///   of content, the formatter's to keep or remove.
+///   kept. Blank lines after it stay the formatter's to trim, but no more of
+///   them than `original` had. A region opening at a line start has none of
+///   the host's: a leading line break there is a blank line of content, the
+///   formatter's to keep or remove.
 /// - Trailing: the final line break and the whitespace after it are kept, as
 ///   is the absence of a final line break. Blank lines before it stay the
 ///   formatter's to trim, but no more of them than `original` had.
@@ -24,16 +25,28 @@ pub(crate) fn restore_edge_layout(original: &str, formatted: &str, opens_mid_lin
     if original.trim().is_empty() || formatted.trim().is_empty() {
         return formatted.to_string();
     }
-    let (body, formatted_tail) = formatted.split_at(tail_start(formatted));
-    let body = if opens_mid_line {
-        &body[leading_layout(body).len()..]
-    } else {
-        body
-    };
+    let (mut body, formatted_tail) = formatted.split_at(tail_start(formatted));
 
     let mut restored = String::with_capacity(formatted.len() + original.len());
     if opens_mid_line {
-        restored.push_str(leading_layout(original));
+        let original_head = head_lines(original);
+        let formatted_head = head_lines(body);
+        body = &body[formatted_head.iter().map(|line| line.len()).sum::<usize>()..];
+        if let Some((layout, original_blank_lines)) = original_head.split_first() {
+            // The original's line break ending the delimiter's line, then the
+            // blank lines the formatter kept, no more than the original had,
+            // each ending with that line break (see the trailing layout).
+            restored.push_str(layout);
+            let line_break = layout.trim_start_matches([' ', '\t']);
+            for line in formatted_head
+                .iter()
+                .skip(1)
+                .take(original_blank_lines.len())
+            {
+                restored.push_str(line.trim_end_matches(['\r', '\n']));
+                restored.push_str(line_break);
+            }
+        }
     }
     restored.push_str(body);
     let original_tail = tail_lines(&original[tail_start(original)..]);
@@ -69,6 +82,20 @@ fn leading_layout(text: &str) -> &str {
         return "";
     };
     &text[..blank + line_break]
+}
+
+/// The whitespace-only lines `text` opens with, each ending with its line
+/// break: the rest of the delimiter's line, then blank lines.
+fn head_lines(mut text: &str) -> Vec<&str> {
+    let mut lines = Vec::new();
+    loop {
+        let line = leading_layout(text);
+        if line.is_empty() {
+            return lines;
+        }
+        lines.push(line);
+        text = &text[line.len()..];
+    }
 }
 
 /// Where the trailing layout of `text` starts: the first line break of its
@@ -115,6 +142,10 @@ mod tests {
     #[case::spaces_before_the_leading_line_break("  \n  x\n  ", "x\n", true, "  \nx\n  ")]
     #[case::spaces_before_the_leading_line_break_kept("  \n  x\n  ", "  \nx\n", true, "  \nx\n  ")]
     #[case::leading_indentation_is_content("x", "  x", true, "  x")]
+    #[case::no_leading_blank_lines_added("x", "\n\nx", true, "x")]
+    #[case::no_leading_blank_lines_added_after_the_line_break("\n  x", "\n\nx", true, "\nx")]
+    #[case::kept_leading_blank_line("\n\n  x", "\n\nx", true, "\n\nx")]
+    #[case::trimmed_leading_blank_line("\n\n  x", "x", true, "\nx")]
     #[case::leading_blank_line_at_a_line_start_is_content("\nx\n", "x\n", false, "x\n")]
     #[case::trimmed_trailing_blank_lines_stay_trimmed("x\n\n\n", "x\n", false, "x\n")]
     #[case::kept_trailing_blank_line("x\n\n  ", "x\n\n", true, "x\n\n  ")]
