@@ -195,6 +195,11 @@ fn keep_edge_layout(
     if edits.is_empty() || !edits_apply_in_order(&edits) {
         return edits;
     }
+    // Edits inside the content cannot reach the edges: skip applying them,
+    // which costs a scan per position on long lines.
+    if edits_stay_inside_content(virtual_content, &edits) {
+        return edits;
+    }
     let mapper = PositionMapper::new(virtual_content);
     let Some(applied) = AppliedEdits::new(virtual_content, &mapper, &edits) else {
         return edits;
@@ -218,6 +223,28 @@ fn keep_edge_layout(
     // boundary within `virtual_content`, so a position always exists today.
     // Should one not, the answer passes as received rather than being lost.
     replacement_between(virtual_content, &restored).map_or(edits, |edit| vec![edit])
+}
+
+/// Whether every edit starts after the first character of `text`'s content
+/// and ends before its last, so the whitespace around the content, its edge
+/// layout, stays as it is. False for a whitespace-only `text`.
+fn edits_stay_inside_content(text: &str, edits: &[TextEdit]) -> bool {
+    let is_layout = |c: char| matches!(c, ' ' | '\t' | '\r' | '\n');
+    let Some(first) = text.find(|c| !is_layout(c)) else {
+        return false;
+    };
+    let last_end = text.trim_end_matches(is_layout).len();
+    let mapper = PositionMapper::new(text);
+    let (Some(first), Some(last_end)) = (
+        mapper.byte_to_position(first),
+        mapper.byte_to_position(last_end),
+    ) else {
+        return false;
+    };
+    let key = |position: Position| (position.line, position.character);
+    edits
+        .iter()
+        .all(|edit| key(edit.range.start) > key(first) && key(edit.range.end) < key(last_end))
 }
 
 /// A formatting answer applied to the text it was made for, keeping where
@@ -1417,6 +1444,25 @@ mod tests {
             crate::text::edit::apply_text_edits(original, &[edit]),
             replacement
         );
+    }
+
+    #[rstest]
+    #[case::inside(&[((1, 2), (1, 3))], true)]
+    #[case::at_the_first_content_character(&[((1, 1), (1, 2))], false)]
+    #[case::at_the_last_content_character(&[((1, 2), (1, 5))], false)]
+    #[case::in_the_leading_layout(&[((0, 0), (0, 0))], false)]
+    #[case::at_the_eof_sentinel(&[((1, 2), (1, u32::MAX))], false)]
+    fn edits_inside_content_leave_the_edges_alone(#[case] ranges: &[Span], #[case] expected: bool) {
+        let text = "\n abcd\n  ";
+        let edits: Vec<TextEdit> = ranges
+            .iter()
+            .map(|&((sl, sc), (el, ec))| TextEdit {
+                range: Range::new(Position::new(sl, sc), Position::new(el, ec)),
+                new_text: "\n\n".to_string(),
+            })
+            .collect();
+
+        assert_eq!(edits_stay_inside_content(text, &edits), expected);
     }
 
     #[rstest]
