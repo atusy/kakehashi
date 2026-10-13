@@ -621,27 +621,22 @@ pub(super) fn unique_edit_regions(
 /// within-region pipeline, concatenated-formatting-pipeline Decision
 /// point 4). `None` when the chain round-tripped to the original text.
 ///
-/// Line counting treats `\n` as the only line break: a document using bare
-/// `\r` separators (which LSP also recognizes) would get an end position on
-/// the wrong line. Tree-sitter parsing upstream shares the `\n` assumption,
-/// so such documents do not reach this path in practice.
+/// The end is the original's LSP end position: LF, CRLF, and a lone CR each
+/// end a line.
 fn whole_document_replacement(original: &str, formatted: &str) -> Option<Vec<TextEdit>> {
     if original == formatted {
         return None;
     }
-    let end_line = original.matches('\n').count() as u32;
-    let last_line_start = original.rfind('\n').map(|i| i + 1).unwrap_or(0);
-    let end_character = original[last_line_start..].encode_utf16().count() as u32;
+    let end = crate::text::PositionMapper::new(original)
+        .byte_to_position(original.len())
+        .unwrap_or_default();
     Some(vec![TextEdit {
         range: Range {
             start: Position {
                 line: 0,
                 character: 0,
             },
-            end: Position {
-                line: end_line,
-                character: end_character,
-            },
+            end,
         },
         new_text: formatted.to_string(),
     }])
@@ -2100,6 +2095,13 @@ mod tests {
         // With a trailing newline the last line is empty: end = (lines, 0).
         let original = "a\nb\n";
         let edits = whole_document_replacement(original, "c\n").unwrap();
+        assert_eq!(edits[0].range.end, Position::new(2, 0));
+    }
+
+    #[test]
+    fn whole_document_replacement_ends_at_the_lsp_end_after_a_lone_cr() {
+        // A lone CR ends an LSP line: "a\rb\n" has lines "a", "b" and "".
+        let edits = whole_document_replacement("a\rb\n", "c\n").unwrap();
         assert_eq!(edits[0].range.end, Position::new(2, 0));
     }
 
