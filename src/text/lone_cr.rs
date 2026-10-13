@@ -7,7 +7,7 @@
 /// lone CR, while tree-sitter rows split only at LF. Built once per document,
 /// it turns a tree-sitter position into an LSP one with a binary search, and
 /// a document without lone CRs, the usual case, costs one scan for `\r`.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct LoneCarriageReturns(Vec<usize>);
 
 impl LoneCarriageReturns {
