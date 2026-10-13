@@ -1577,22 +1577,32 @@ fn build_combined_virtual_content(
     let mut offsets = Vec::new();
     let mut line_start = span.start;
     let mut range_index = 0;
+    // Lines are LSP lines, as the virtual document is read: LF, CRLF, and a
+    // lone CR each end one (the markdown grammar ends a blockquote line at a
+    // lone CR too).
     let mut host_line_start = text[..line_start]
-        .rfind('\n')
-        .map_or(0, |newline| newline + 1);
+        .rfind(['\n', '\r'])
+        .map_or(0, |line_break| line_break + 1);
 
     while line_start < span.end {
         let remaining = clamped_slice(text, line_start..span.end);
-        let line_end = remaining
-            .find('\n')
-            .map_or(span.end, |newline| line_start + newline + 1);
-        let mut content_end = line_end;
-        if text.as_bytes().get(content_end.saturating_sub(1)) == Some(&b'\n') {
-            content_end -= 1;
-            if text.as_bytes().get(content_end.saturating_sub(1)) == Some(&b'\r') {
-                content_end -= 1;
+        let (content_end, line_end) = match remaining.find(['\n', '\r']) {
+            None => (span.end, span.end),
+            Some(index) => {
+                let line_break = line_start + index;
+                let crlf = text.as_bytes()[line_break] == b'\r'
+                    && text.as_bytes().get(line_break + 1) == Some(&b'\n');
+                if !crlf {
+                    (line_break, line_break + 1)
+                } else if line_break + 2 <= span.end {
+                    (line_break, line_break + 2)
+                } else {
+                    // The span ends between CR and LF: the CR is the span's
+                    // last content byte.
+                    (span.end, span.end)
+                }
             }
-        }
+        };
 
         while included
             .get(range_index)
@@ -2882,6 +2892,33 @@ mod tests {
         );
 
         assert_eq!(content, "\n");
+        assert_eq!(offsets, vec![2, 0]);
+    }
+
+    #[test]
+    fn combined_content_splits_lines_at_a_lone_cr() {
+        // A lone CR ends an LSP line (and a blockquote line), so each line
+        // keeps its own "> " offset and the prefix after it is stripped.
+        let text = "> a\r> b\n";
+
+        let (content, offsets) =
+            build_combined_virtual_content(text, 0..text.len(), &[2..4, 6..text.len()]);
+
+        assert_eq!(content, "a\rb\n");
+        assert_eq!(offsets, vec![2, 2, 0]);
+    }
+
+    #[test]
+    fn combined_content_measures_the_first_line_from_a_lone_cr() {
+        let text = "ab\r  x\n";
+
+        let (content, offsets) = build_combined_virtual_content(
+            text,
+            3..text.len(),
+            std::slice::from_ref(&(5..text.len())),
+        );
+
+        assert_eq!(content, "x\n");
         assert_eq!(offsets, vec![2, 0]);
     }
 
