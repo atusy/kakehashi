@@ -734,9 +734,10 @@ fn discover_single_region(
     };
 
     // Resolve this single region's cache identity (#529). region_id is minted
-    // from the RAW content node — byte-identical to populate_injections
-    // (cache.rs), which keeps the bridge/tracker identities in sync (token
-    // eviction itself is content-addressed and needs no id). Eligibility
+    // (or, on a stale serve, looked up) from the RAW content node —
+    // byte-identical to populate_injections (cache.rs), which keeps the
+    // bridge/tracker identities in sync — and gates caching; the id itself is
+    // not kept (token eviction is content-addressed and needs none). Eligibility
     // is this request's translation predicate: column-0 start AND no per-row
     // prefixes (singles are never injection.combined).
     let token_cache = cache_for_singles.and_then(|(uri, tracker, incarnation, mint_regions)| {
@@ -1563,8 +1564,8 @@ fn visit_until_cancelled<T>(
 /// Translate an eligible region's host-absolute tokens into region-local
 /// coordinates for caching: subtract the region's first host line so a stored
 /// entry re-anchors with a single `line += line_start` on reuse. The column is
-/// already region-invariant for an eligible region (`start_column == 0`, no
-/// per-row prefixes), so only the line shifts. `saturating_sub` guards the
+/// already region-invariant for an eligible region (a tree-sitter column-0
+/// content start, no per-row prefixes), so only the line shifts. `saturating_sub` guards the
 /// (unexpected) case of a token above the region start rather than underflowing.
 fn to_region_local(tokens: &[RawToken], line_start: u32) -> Vec<RawToken> {
     let line_start = line_start as usize;
@@ -1587,7 +1588,8 @@ fn to_region_local(tokens: &[RawToken], line_start: u32) -> Vec<RawToken> {
 
 /// Re-anchor cached region-local tokens to the region's current host position:
 /// the inverse of [`to_region_local`]. Because the region is eligible
-/// (`start_column == 0`, no per-row prefixes), the column is already correct and
+/// (a tree-sitter column-0 content start, no per-row prefixes), the column is
+/// already correct and
 /// only the line shifts by the region's current first host line — so an edit
 /// *above* an unchanged region (which leaves its content hash, hence the cache
 /// entry, intact but moves it) is re-anchored exactly.
