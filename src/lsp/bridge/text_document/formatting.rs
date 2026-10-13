@@ -1084,6 +1084,53 @@ mod tests {
         assert_eq!(formatted, "{\n  c = /* bash */ ''\necho hi'';\n}\n");
     }
 
+    #[rstest]
+    // The common suffix starts at the first line break's LF; ending the edit
+    // after its CR would name a position inside a line break.
+    #[case::suffix_never_splits_a_crlf("x\r\ny\r\n", "x\ny\r\n", ((0, 1), (1, 0)), "\n")]
+    // The common prefix runs through a CR whose LF the replacement lacks.
+    #[case::prefix_never_splits_a_crlf("x\r\ny", "x\ry", ((0, 1), (1, 0)), "\r")]
+    #[case::utf16_columns("é\u{1F600}a", "é\u{1F600}b", ((0, 3), (0, 4)), "b")]
+    fn replacement_between_spans_only_what_differs(
+        #[case] original: &str,
+        #[case] replacement: &str,
+        #[case] range: ((u32, u32), (u32, u32)),
+        #[case] new_text: &str,
+    ) {
+        let ((start_line, start_character), (end_line, end_character)) = range;
+
+        let edit = replacement_between(original, replacement).unwrap();
+
+        assert_eq!(edit.range.start, Position::new(start_line, start_character));
+        assert_eq!(edit.range.end, Position::new(end_line, end_character));
+        assert_eq!(edit.new_text, new_text);
+        assert_eq!(
+            crate::text::edit::apply_text_edits(original, &[edit]),
+            replacement
+        );
+    }
+
+    #[rstest]
+    #[case::ordered(&[((0, 0), (0, 1)), ((0, 1), (0, 2))], true)]
+    #[case::listed_out_of_order(&[((1, 0), (1, 1)), ((0, 0), (0, 1))], true)]
+    #[case::inserts_at_one_position(&[((0, 1), (0, 1)), ((0, 1), (0, 1))], true)]
+    #[case::reversed(&[((0, 2), (0, 1))], false)]
+    #[case::overlapping(&[((0, 0), (0, 2)), ((0, 1), (0, 3))], false)]
+    fn edits_apply_in_order_rejects_reversed_and_overlapping_ranges(
+        #[case] ranges: &[((u32, u32), (u32, u32))],
+        #[case] expected: bool,
+    ) {
+        let edits: Vec<TextEdit> = ranges
+            .iter()
+            .map(|&((sl, sc), (el, ec))| TextEdit {
+                range: Range::new(Position::new(sl, sc), Position::new(el, ec)),
+                new_text: String::new(),
+            })
+            .collect();
+
+        assert_eq!(edits_apply_in_order(&edits), expected);
+    }
+
     #[test]
     fn edits_that_overlap_pass_through_unchanged() {
         // Overlapping edits apply in no defined order, so the formatted text,
