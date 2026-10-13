@@ -360,7 +360,7 @@ impl CacheableInjectionRegion {
     }
 
     /// Compute a simple hash of content bytes for stable matching.
-    fn hash_content(content: &str) -> u64 {
+    pub(crate) fn hash_content(content: &str) -> u64 {
         fnv1a_hash(content)
     }
 }

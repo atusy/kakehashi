@@ -740,23 +740,22 @@ fn discover_single_region(
     // is this request's translation predicate: column-0 start AND no per-row
     // prefixes (singles are never injection.combined).
     let token_cache = cache_for_singles.and_then(|(uri, tracker, incarnation, mint_regions)| {
-        let cacheable_owned;
-        let cacheable = match prebuilt_cacheable {
-            Some(prebuilt) => prebuilt,
+        let content_hash = match prebuilt_cacheable {
+            Some(prebuilt) => prebuilt.content_hash,
             None => {
                 // Mint only when the served snapshot was current (see
                 // InjectionCacheCtx::mint_regions): a stale serve's coordinates
                 // must not enter the live tracker. Read-only reuse keeps the
                 // cache warm for regions the edits did not shift; an unknown
                 // region simply goes uncached for this stale serve.
-                let region_id = if mint_regions {
+                if mint_regions {
                     tracker.get_or_create_for_incarnation(
                         uri,
                         injection.content_node.start_byte(),
                         injection.content_node.end_byte(),
                         crate::language::loader::static_node_kind(&injection.content_node),
                         incarnation,
-                    )?
+                    )?;
                 } else {
                     tracker.lookup_in_layer_for_incarnation(
                         uri,
@@ -765,12 +764,9 @@ fn discover_single_region(
                         crate::language::loader::static_node_kind(&injection.content_node),
                         0,
                         incarnation,
-                    )?
+                    )?;
                 }
-                .to_string();
-                cacheable_owned =
-                    CacheableInjectionRegion::from_region_info(injection, &region_id, text);
-                &cacheable_owned
+                CacheableInjectionRegion::hash_content(injection_content)
             }
         };
         // The tokens carry tree-sitter rows and columns, so the re-anchor
@@ -781,10 +777,8 @@ fn discover_single_region(
         // Content-addressed cache key: content hash folded with the resolved
         // language (one shared definition — populate's eviction sweep must
         // compute the same fold).
-        let validity_hash = crate::analysis::semantic_cache::region_validity_hash(
-            cacheable.content_hash,
-            &resolved_lang,
-        );
+        let validity_hash =
+            crate::analysis::semantic_cache::region_validity_hash(content_hash, &resolved_lang);
         Some(DiscoveredRegionCache {
             validity_hash,
             line_start: tree_start_row,
