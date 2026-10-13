@@ -912,8 +912,9 @@ pub(crate) enum RegionBoundary {
     /// end sits mid-line (a non-zero end column) or at the document's end.
     /// Both conditions are measured on the effective span, so a directive that
     /// trims the end moves the byte this fires at — and one that trims it back
-    /// across a `\n` makes it stop firing, the region having become the
-    /// column-0 shape below. A region ending at column 0
+    /// across a line end (LF, CRLF, or lone CR) makes it stop firing, the
+    /// region having become the column-0 shape below. A region ending at
+    /// column 0
     /// (fenced-block shape) keeps the caret on the closing fence outside:
     /// every caret position on its last content line is already inside
     /// half-open, so the fallback would only ever add the fence line itself.
