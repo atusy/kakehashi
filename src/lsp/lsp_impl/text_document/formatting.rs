@@ -1705,10 +1705,22 @@ fn pipeline_region_text(
     if final_text == original_virtual {
         return None;
     }
+    // A region opening mid-line has no line prefix: the host text before it
+    // on its first line is the opening delimiter's line (a Nix `''`), which
+    // continuation lines must not take once the line count changes.
+    let host_line_prefixes = if offset.opens_mid_line() {
+        let mut prefixes = host_line_prefixes.to_vec();
+        if let Some(first) = prefixes.first_mut() {
+            first.clear();
+        }
+        std::borrow::Cow::Owned(prefixes)
+    } else {
+        std::borrow::Cow::Borrowed(host_line_prefixes)
+    };
     // Decision point 4: the virtual output starts at column 0 of the embedded
     // language, so every continuation line must re-gain its host prefix before
     // the whole-region replacement is emitted.
-    Some(reapply_host_line_prefixes(&final_text, host_line_prefixes))
+    Some(reapply_host_line_prefixes(&final_text, &host_line_prefixes))
 }
 
 /// Re-apply the region's host per-line prefixes to the pipeline's final text
@@ -1724,10 +1736,8 @@ fn pipeline_region_text(
 ///   1:1 mapping, exact even when prefixes differ per line (nested
 ///   blockquotes).
 /// - **Line count changed**: the pipeline computes no diff/alignment, so
-///   every continuation line takes the longest common prefix of the region's
-///   continuation lines — exact for the usual uniform-prefix region, a
-///   documented limitation otherwise (a one-line region has no continuation
-///   line to take it from, so the output's take none).
+///   every continuation line takes the region's longest common prefix — exact
+///   for the usual uniform-prefix region, a documented limitation otherwise.
 ///   The LCP excludes trailing empty-prefix entries: a region whose content
 ///   ends with `\n` carries a synthetic final line bucket whose host prefix
 ///   belongs to the line *after* the replacement range, and including its
@@ -1753,11 +1763,8 @@ fn reapply_host_line_prefixes(final_text: &str, host_line_prefixes: &[String]) -
         // newline; that host line's own prefix sits OUTSIDE the replacement
         // range (the range ends at its column 0). Including it would
         // collapse the LCP to "" for a uniformly prefixed blockquote, so the
-        // LCP is computed over the content lines' prefixes only. Line 0's
-        // prefix is left out too: it sits before the replacement range and
-        // is never re-applied, and for a region opening mid-line it is the
-        // opening delimiter's line (a Nix `''`), not a prefix lines repeat.
-        let mut content_prefixes = host_line_prefixes.get(1..).unwrap_or_default();
+        // LCP is computed over the content lines' prefixes only.
+        let mut content_prefixes = host_line_prefixes;
         while let [rest @ .., last] = content_prefixes {
             if !last.is_empty() {
                 break;
@@ -2686,6 +2693,22 @@ mod tests {
         );
 
         assert_eq!(text.as_deref(), Some("\n{\n    \"a\": 1\n}\n  "));
+    }
+
+    #[test]
+    fn pipeline_prefixes_the_lines_a_one_line_blockquoted_fence_grows() {
+        // A blockquoted fence with one content line has no continuation line
+        // to take the `> ` prefix from: its first line's prefix is the one.
+        let prefixes = ["> ".to_string(), String::new()];
+
+        let text = pipeline_region_text(
+            "{\"a\":1}\n",
+            "{\n    \"a\": 1\n}\n",
+            &RegionOffset::with_per_line_offsets(3, vec![2, 0]),
+            &prefixes,
+        );
+
+        assert_eq!(text.as_deref(), Some("{\n>     \"a\": 1\n> }\n"));
     }
 
     #[test]
