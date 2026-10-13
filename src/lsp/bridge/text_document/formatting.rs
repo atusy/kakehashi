@@ -31,7 +31,7 @@ use log::warn;
 
 use crate::config::settings::BridgeServerConfig;
 use crate::text::PositionMapper;
-use crate::text::edge_layout::restore_edge_layout;
+use crate::text::edge_layout::{EdgeRestore, restore_edges};
 use crate::text::edit::apply_text_edits;
 use tower_lsp_server::ls_types::{
     DocumentFormattingParams, FormattingOptions, NumberOrString, Position, Range,
@@ -179,9 +179,10 @@ fn clamp_end_past_eof(
 }
 
 /// Keep the region's edge layout through a formatting answer (see
-/// [`restore_edge_layout`]): when the answer changes the edges, it is replaced
-/// by the edits from `virtual_content` to the formatted text with the edges
-/// restored (see [`edits_between`]), or by none when only the edges changed.
+/// [`restore_edges`]). When the answer changes the edges, the formatter's
+/// edits away from them pass as sent, and those reaching into an edge become
+/// one edit with that edge's restore (see [`AppliedEdits::with_edges`]); an
+/// answer that changed only the edges becomes none.
 ///
 /// Edits that do not apply in order (reversed or overlapping) leave the
 /// formatted text undefined, so they pass as received, edges and all.
@@ -194,16 +195,24 @@ fn keep_edge_layout(
     if edits.is_empty() || !edits_apply_in_order(&edits) {
         return edits;
     }
-    let formatted = apply_text_edits(virtual_content, &edits);
-    let restored = restore_edge_layout(virtual_content, &formatted, offset.opens_mid_line());
-    if restored == formatted {
+    let mapper = PositionMapper::new(virtual_content);
+    let Some(applied) = AppliedEdits::new(virtual_content, &mapper, &edits) else {
+        return edits;
+    };
+    let edges = restore_edges(virtual_content, &applied.formatted, offset.opens_mid_line());
+    let restored = edges.apply(&applied.formatted);
+    if restored == applied.formatted {
         return edits;
     }
     if restored == virtual_content {
         return Vec::new();
     }
-    if let Some(edits) = edits_between(virtual_content, &restored) {
-        return edits;
+    // The composed edits are checked against the restored text; should they
+    // miss it, one edit covering every change stands in.
+    if let Some(kept) = applied.with_edges(virtual_content, &mapper, &edits, &edges)
+        && apply_text_edits(virtual_content, &kept) == restored
+    {
+        return kept;
     }
     // Forward-looking: every offset `replacement_between` maps is a char
     // boundary within `virtual_content`, so a position always exists today.
@@ -211,75 +220,149 @@ fn keep_edge_layout(
     replacement_between(virtual_content, &restored).map_or(edits, |edit| vec![edit])
 }
 
-/// How long [`edits_between`] may search for the smallest diff before
-/// settling for a coarser one. A formatting request already waits on a
-/// server round trip; this bounds the extra time a whole-region rewrite of a
-/// large region can add.
-const EDGE_DIFF_DEADLINE: std::time::Duration = std::time::Duration::from_millis(20);
+/// A formatting answer applied to the text it was made for, keeping where
+/// each edit landed: its bytes in that text and in the formatted text.
+struct AppliedEdits {
+    formatted: String,
+    /// In text order.
+    spans: Vec<AppliedSpan>,
+}
 
-/// The edits turning `original` into `replacement`, one per run of changed
-/// characters. Changes apart stay apart, so an answer whose edits each kept
-/// to their own line (behind a blockquote's `> ` prefixes) still does after
-/// its edges are restored. `None` when the edits do not reproduce
-/// `replacement`, for [`replacement_between`] to cover.
-fn edits_between(original: &str, replacement: &str) -> Option<Vec<TextEdit>> {
-    use similar::{ChangeTag, TextDiff};
+struct AppliedSpan {
+    /// The edit's index in the answer.
+    index: usize,
+    start: usize,
+    end: usize,
+    formatted_start: usize,
+    formatted_end: usize,
+}
 
-    let diff = TextDiff::configure()
-        .deadline(std::time::Instant::now() + EDGE_DIFF_DEADLINE)
-        .diff_chars(original, replacement);
-    // (start, end) bytes in `original`, and the text replacing them.
-    let mut byte_edits: Vec<(usize, usize, String)> = Vec::new();
-    let mut pending: Option<(usize, usize, String)> = None;
-    let mut old_byte = 0;
-    for change in diff.iter_all_changes() {
-        let value = change.value();
-        match change.tag() {
-            ChangeTag::Equal => {
-                byte_edits.extend(pending.take());
-                old_byte += value.len();
-            }
-            ChangeTag::Delete => {
-                let edit = pending.get_or_insert_with(|| (old_byte, old_byte, String::new()));
-                old_byte += value.len();
-                edit.1 = old_byte;
-            }
-            ChangeTag::Insert => {
-                let edit = pending.get_or_insert_with(|| (old_byte, old_byte, String::new()));
-                edit.2.push_str(value);
-            }
-        }
-    }
-    byte_edits.extend(pending);
-
-    // Never split a CRLF: a position between its CR and LF names no column.
-    // The CR or LF taken in is unchanged, so the new text takes it in too.
-    for (start, end, new_text) in &mut byte_edits {
-        if original[..*start].ends_with('\r') && original[*start..].starts_with('\n') {
-            *start -= 1;
-            new_text.insert(0, '\r');
-        }
-        if original[..*end].ends_with('\r') && original[*end..].starts_with('\n') {
-            *end += 1;
-            new_text.push('\n');
-        }
-    }
-
-    let mapper = PositionMapper::new(original);
-    let edits = byte_edits
-        .into_iter()
-        .map(|(start, end, new_text)| {
-            Some(TextEdit {
-                range: Range {
-                    start: mapper.byte_to_position(start)?,
-                    end: mapper.byte_to_position(end)?,
-                },
-                new_text,
+impl AppliedEdits {
+    /// Apply `edits` as [`apply_text_edits`] does. `None` when two of them
+    /// overlap once their positions are clamped to the text.
+    fn new(text: &str, mapper: &PositionMapper, edits: &[TextEdit]) -> Option<Self> {
+        let byte = |position| text.floor_char_boundary(mapper.position_to_byte_clamped(position));
+        let mut spans: Vec<AppliedSpan> = edits
+            .iter()
+            .enumerate()
+            .map(|(index, edit)| AppliedSpan {
+                index,
+                start: byte(edit.range.start),
+                end: byte(edit.range.end),
+                formatted_start: 0,
+                formatted_end: 0,
             })
-        })
-        .collect::<Option<Vec<_>>>()?;
-    (edits_apply_in_order(&edits) && apply_text_edits(original, &edits) == replacement)
-        .then_some(edits)
+            .collect();
+        spans.sort_by_key(|span| (span.start, span.end));
+        let mut formatted = String::with_capacity(text.len());
+        let mut cursor = 0;
+        for span in &mut spans {
+            if span.start < cursor || span.end < span.start {
+                return None;
+            }
+            formatted.push_str(&text[cursor..span.start]);
+            span.formatted_start = formatted.len();
+            formatted.push_str(&edits[span.index].new_text);
+            span.formatted_end = formatted.len();
+            cursor = span.end;
+        }
+        formatted.push_str(&text[cursor..]);
+        Some(Self { formatted, spans })
+    }
+
+    /// The answer with `edges` restored: the edits away from the edges as
+    /// sent, and for each changed edge one edit from the text's start (or to
+    /// its end) through every edit reaching into that edge. `None` when one
+    /// edit reaches into both edges, which one edit then covers.
+    fn with_edges(
+        &self,
+        text: &str,
+        mapper: &PositionMapper,
+        edits: &[TextEdit],
+        edges: &EdgeRestore,
+    ) -> Option<Vec<TextEdit>> {
+        let formatted = self.formatted.as_str();
+        // How far the edits before `count` moved the text after them.
+        let shift = |count: usize| {
+            self.spans[..count]
+                .iter()
+                .map(|span| {
+                    (span.formatted_end - span.formatted_start) as isize
+                        - (span.end - span.start) as isize
+                })
+                .sum::<isize>()
+        };
+
+        let mut head = None;
+        let mut first_kept = 0;
+        if edges.head_end > 0 || !edges.head.is_empty() {
+            first_kept = self
+                .spans
+                .iter()
+                .take_while(|span| span.formatted_start < edges.head_end)
+                .count();
+            let (end, formatted_end) = match first_kept.checked_sub(1).map(|i| &self.spans[i]) {
+                Some(span) if span.formatted_end > edges.head_end => (span.end, span.formatted_end),
+                _ => (
+                    edges.head_end.checked_add_signed(-shift(first_kept))?,
+                    edges.head_end,
+                ),
+            };
+            let new_text = [
+                edges.head.as_str(),
+                &formatted[edges.head_end..formatted_end],
+            ]
+            .concat();
+            head = Some((0, end, new_text));
+        }
+
+        let mut tail = None;
+        let mut kept_end = self.spans.len();
+        if edges.tail_start < formatted.len() || !edges.tail.is_empty() {
+            kept_end = self
+                .spans
+                .iter()
+                .position(|span| {
+                    span.formatted_end > edges.tail_start
+                        || span.formatted_start >= edges.tail_start
+                })
+                .unwrap_or(self.spans.len());
+            let (start, formatted_start) = match self.spans.get(kept_end) {
+                Some(span) if span.formatted_start < edges.tail_start => {
+                    (span.start, span.formatted_start)
+                }
+                _ => (
+                    edges.tail_start.checked_add_signed(-shift(kept_end))?,
+                    edges.tail_start,
+                ),
+            };
+            let new_text = [
+                &formatted[formatted_start..edges.tail_start],
+                edges.tail.as_str(),
+            ]
+            .concat();
+            tail = Some((start, text.len(), new_text));
+        }
+
+        if first_kept > kept_end
+            || matches!((&head, &tail), (Some((_, head_end, _)), Some((tail_start, _, _))) if head_end > tail_start)
+        {
+            return None;
+        }
+        let mut kept = Vec::with_capacity(kept_end - first_kept + 2);
+        if let Some((start, end, new_text)) = head {
+            kept.extend(trimmed_edit(text, mapper, start, end, &new_text)?);
+        }
+        kept.extend(
+            self.spans[first_kept..kept_end]
+                .iter()
+                .map(|span| edits[span.index].clone()),
+        );
+        if let Some((start, end, new_text)) = tail {
+            kept.extend(trimmed_edit(text, mapper, start, end, &new_text)?);
+        }
+        Some(kept)
+    }
 }
 
 /// Whether every range is ordered and none overlaps another.
@@ -303,35 +386,56 @@ fn edits_apply_in_order(edits: &[TextEdit]) -> bool {
 /// One edit turning `original` into `replacement` (which differ), spanning
 /// only what differs. `None` when a position cannot be expressed.
 fn replacement_between(original: &str, replacement: &str) -> Option<TextEdit> {
+    let mapper = PositionMapper::new(original);
+    trimmed_edit(original, &mapper, 0, original.len(), replacement)?
+}
+
+/// The edit replacing `text[start..end]` with `new_text`, narrowed to what
+/// differs: `Some(None)` when nothing does, and `None` when a position cannot
+/// be expressed.
+fn trimmed_edit(
+    text: &str,
+    mapper: &PositionMapper,
+    mut start: usize,
+    mut end: usize,
+    new_text: &str,
+) -> Option<Option<TextEdit>> {
     let common_len = |a: &mut dyn Iterator<Item = (char, char)>| {
         a.take_while(|(x, y)| x == y)
             .map(|(x, _)| x.len_utf8())
             .sum::<usize>()
     };
-    let mut start = common_len(&mut original.chars().zip(replacement.chars()));
-    // Never split a CRLF: a position between its CR and LF names no column.
-    if original[..start].ends_with('\r') && original[start..].starts_with('\n') {
-        start -= 1;
-    }
-    let mut suffix = common_len(
-        &mut original[start..]
+    let prefix = common_len(&mut text[start..end].chars().zip(new_text.chars()));
+    let suffix = common_len(
+        &mut text[start + prefix..end]
             .chars()
             .rev()
-            .zip(replacement[start..].chars().rev()),
+            .zip(new_text[prefix..].chars().rev()),
     );
-    let end = original.len() - suffix;
-    if original[..end].ends_with('\r') && original[end..].starts_with('\n') {
-        suffix -= 1;
+    if prefix == end - start && prefix == new_text.len() {
+        return Some(None);
     }
-    let end = original.len() - suffix;
-    let mapper = PositionMapper::new(original);
-    Some(TextEdit {
+    let (mut new_start, mut new_end) = (prefix, new_text.len() - suffix);
+    start += prefix;
+    end -= suffix;
+    // Never split a CRLF: a position between its CR and LF names no column.
+    // The CR or LF taken back in is unchanged (it is in the common part), so
+    // the new text takes it too.
+    if new_start > 0 && text[..start].ends_with('\r') && text[start..].starts_with('\n') {
+        start -= 1;
+        new_start -= 1;
+    }
+    if new_end < new_text.len() && text[..end].ends_with('\r') && text[end..].starts_with('\n') {
+        end += 1;
+        new_end += 1;
+    }
+    Some(Some(TextEdit {
         range: Range {
             start: mapper.byte_to_position(start)?,
             end: mapper.byte_to_position(end)?,
         },
-        new_text: replacement[start..replacement.len() - suffix].to_string(),
-    })
+        new_text: new_text[new_start..new_end].to_string(),
+    }))
 }
 
 /// Build a JSON-RPC formatting request for a downstream language server.
@@ -1175,6 +1279,76 @@ mod tests {
     }
 
     #[test]
+    fn a_blockquoted_region_keeps_edits_that_swap_lines() {
+        // Two single-line edits swap the lines; a diff of the texts would
+        // align across them and span a `> ` prefix. The formatter's own
+        // edits away from the edges pass as sent.
+        let host = "> ```lua\n> a\n> b\n>   ";
+        let virtual_content = "a\nb\n  ";
+        let result = json!([
+            { "range": { "start": { "line": 0, "character": 0 },
+                         "end": { "line": 0, "character": 1 } }, "newText": "b" },
+            { "range": { "start": { "line": 1, "character": 0 },
+                         "end": { "line": 1, "character": 1 } }, "newText": "a" },
+            { "range": { "start": { "line": 2, "character": 0 },
+                         "end": { "line": 2, "character": 2 } }, "newText": "" }
+        ]);
+
+        let formatted = format_host(
+            host,
+            RegionOffset::with_per_line_offsets(1, vec![2, 2, 2]),
+            virtual_content,
+            result,
+        );
+
+        assert_eq!(formatted, "> ```lua\n> b\n> a\n>   ");
+    }
+
+    #[test]
+    fn a_nix_string_keeps_the_edits_jsonls_made_away_from_its_edges() {
+        // jsonls's answer, verbatim: its first and last edits take the
+        // string's edges, the three between reformat the JSON.
+        let virtual_content = "\n    {\n      \"name\":   \"x\"\n    }\n  ";
+        let host = "{\n  a = /* json */ ''\n    {\n      \"name\":   \"x\"\n    }\n  '';\n}\n";
+        let middle = json!([
+            { "range": { "start": { "line": 1, "character": 5 },
+                         "end": { "line": 2, "character": 6 } }, "newText": "\n    " },
+            { "range": { "start": { "line": 2, "character": 13 },
+                         "end": { "line": 2, "character": 16 } }, "newText": " " },
+            { "range": { "start": { "line": 2, "character": 19 },
+                         "end": { "line": 3, "character": 4 } }, "newText": "\n" }
+        ]);
+        let mut result = middle.as_array().unwrap().clone();
+        result.insert(
+            0,
+            json!({ "range": { "start": { "line": 0, "character": 0 },
+                                           "end": { "line": 1, "character": 4 } }, "newText": "" }),
+        );
+        result.push(json!({ "range": { "start": { "line": 3, "character": 5 },
+                                      "end": { "line": 4, "character": 2 } }, "newText": "" }));
+        let offset = RegionOffset::new(1, 19);
+        let response = json!({ "jsonrpc": "2.0", "id": 42, "result": result });
+
+        let edits = transform_formatting_response_to_host(
+            response,
+            &offset,
+            virtual_content,
+            region_host_end(virtual_content, &offset),
+        )
+        .unwrap();
+
+        assert_eq!(
+            crate::text::edit::apply_text_edits(host, &edits),
+            "{\n  a = /* json */ ''\n{\n    \"name\": \"x\"\n}\n  '';\n}\n"
+        );
+        let new_texts: Vec<&str> = edits.iter().map(|edit| edit.new_text.as_str()).collect();
+        assert!(
+            new_texts.windows(3).any(|w| w == ["\n    ", " ", "\n"]),
+            "the edits away from the edges pass as sent: {edits:?}"
+        );
+    }
+
+    #[test]
     fn a_region_without_a_final_line_break_gains_none() {
         // This Nix string's value ends without a line break; adding one, as
         // shfmt does, would change the value and move the closing delimiter.
@@ -1216,33 +1390,6 @@ mod tests {
         assert_eq!(edit.new_text, new_text);
         assert_eq!(
             crate::text::edit::apply_text_edits(original, &[edit]),
-            replacement
-        );
-    }
-
-    #[rstest]
-    #[case::changes_apart_stay_apart("a  \nb  \n", "a\nb\n", &[((0, 1), (0, 3)), ((1, 1), (1, 3))])]
-    // An LF turned into a CRLF: the edit takes in the unchanged LF, so no
-    // edit ends between a CR and its LF.
-    #[case::crlf_never_split("x\r\ny", "x\r\r\ny", &[((0, 1), (1, 0))])]
-    #[case::utf16_columns("é\u{1F600}a", "é\u{1F600}b", &[((0, 3), (0, 4))])]
-    fn edits_between_keeps_each_change_to_its_own_edit(
-        #[case] original: &str,
-        #[case] replacement: &str,
-        #[case] ranges: &[Span],
-    ) {
-        let edits = edits_between(original, replacement).unwrap();
-
-        let actual: Vec<Span> = edits
-            .iter()
-            .map(|edit| {
-                let Range { start, end } = edit.range;
-                ((start.line, start.character), (end.line, end.character))
-            })
-            .collect();
-        assert_eq!(actual, ranges);
-        assert_eq!(
-            crate::text::edit::apply_text_edits(original, &edits),
             replacement
         );
     }
