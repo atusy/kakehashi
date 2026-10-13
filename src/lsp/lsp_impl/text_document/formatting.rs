@@ -1375,11 +1375,12 @@ async fn dispatch_concatenated_formatting(
         return None;
     }
 
-    let final_text = final_text?;
-    // Decision point 4: the virtual output starts at column 0 of the embedded
-    // language, so every continuation line must re-gain its host prefix before
-    // the whole-region replacement is emitted.
-    let final_text = reapply_host_line_prefixes(&final_text, &host_line_prefixes);
+    let final_text = pipeline_region_text(
+        &region_ctx.resolved.virtual_content,
+        &final_text?,
+        &offset,
+        &host_line_prefixes,
+    );
     Some(vec![TextEdit {
         range: replacement_range,
         new_text: final_text,
@@ -1681,6 +1682,28 @@ fn extract_host_line_prefixes(
             }
         })
         .collect()
+}
+
+/// The host text replacing the region after the concatenated pipeline
+/// formatted `original_virtual` into `final_text`.
+fn pipeline_region_text(
+    original_virtual: &str,
+    final_text: &str,
+    offset: &RegionOffset,
+    host_line_prefixes: &[String],
+) -> String {
+    // Each step keeps the edge layout of its own text, but formats with a zero
+    // offset, which reads as a region opening at a line start: only the
+    // region's real offset tells whether its leading line break is layout.
+    let final_text = crate::text::edge_layout::restore_edge_layout(
+        original_virtual,
+        final_text,
+        offset.opens_mid_line(),
+    );
+    // Decision point 4: the virtual output starts at column 0 of the embedded
+    // language, so every continuation line must re-gain its host prefix before
+    // the whole-region replacement is emitted.
+    reapply_host_line_prefixes(&final_text, host_line_prefixes)
 }
 
 /// Re-apply the region's host per-line prefixes to the pipeline's final text
@@ -2610,6 +2633,24 @@ mod tests {
     // (concatenated-formatting-pipeline Decision point 4: multi-line output
     // must re-gain the host prefix per line)
     // ==========================================================================
+
+    #[test]
+    fn pipeline_keeps_the_leading_line_break_of_a_region_opening_mid_line() {
+        // Steps format with a zero offset, which reads as a line start, so a
+        // Nix `''` string's leading line break comes back stripped.
+        let original = "\n    {\n    }\n  ";
+
+        let text = pipeline_region_text(original, "{\n}\n  ", &RegionOffset::new(1, 19), &[]);
+
+        assert_eq!(text, "\n{\n}\n  ");
+    }
+
+    #[test]
+    fn pipeline_lets_a_fence_lose_its_leading_blank_line() {
+        let text = pipeline_region_text("\nx\n", "x\n", &RegionOffset::new(1, 0), &[]);
+
+        assert_eq!(text, "x\n");
+    }
 
     #[test]
     fn reapply_uses_per_line_prefixes_when_line_count_is_preserved() {
