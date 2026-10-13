@@ -197,11 +197,13 @@ fn keep_edge_layout(
     if restored == formatted {
         return edits;
     }
-    match replacement_between(virtual_content, &restored) {
-        Some(edit) => vec![edit],
-        None if virtual_content == restored => Vec::new(),
-        None => edits,
+    if restored == virtual_content {
+        return Vec::new();
     }
+    // Forward-looking: every offset `replacement_between` maps is a char
+    // boundary within `virtual_content`, so a position always exists today.
+    // Should one not, the answer passes as received rather than being lost.
+    replacement_between(virtual_content, &restored).map_or(edits, |edit| vec![edit])
 }
 
 /// Whether every range is ordered and none overlaps another.
@@ -217,12 +219,9 @@ fn edits_apply_in_order(edits: &[TextEdit]) -> bool {
             .all(|pair| key(pair[0].end) <= key(pair[1].start))
 }
 
-/// One edit turning `original` into `replacement`, spanning only what differs.
-/// `None` when they are equal, or when a position cannot be expressed.
+/// One edit turning `original` into `replacement` (which differ), spanning
+/// only what differs. `None` when a position cannot be expressed.
 fn replacement_between(original: &str, replacement: &str) -> Option<TextEdit> {
-    if original == replacement {
-        return None;
-    }
     let common_len = |a: &mut dyn Iterator<Item = (char, char)>| {
         a.take_while(|(x, y)| x == y)
             .map(|(x, _)| x.len_utf8())
