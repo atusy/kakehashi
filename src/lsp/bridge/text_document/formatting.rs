@@ -2,9 +2,9 @@
 //! `TextEdit` range from virtual coordinates back to the host document, applying
 //! the injection's [`RegionOffset`] (including per-line column for the first line).
 //!
-//! [`transform_formatting_response_to_host`] and [`count_lines`] are `pub(super)`
-//! so [`super::range_formatting`], which shares the same virtual→host hazards,
-//! can reuse them.
+//! [`transform_formatting_response_to_host`] is `pub(super)` so
+//! [`super::range_formatting`] and [`super::on_type_formatting`], which share
+//! the same virtual→host hazards, can reuse it.
 //!
 //! # Known limitation: formatting in prefixed regions can drop WHOLE responses
 //!
@@ -84,7 +84,6 @@ impl LanguageServerPool {
         if !handle.has_capability("textDocument/formatting") {
             return Ok(None);
         }
-        let virtual_line_count = count_lines(virtual_content);
         let region_end = region_host_end(virtual_content, &offset);
         self.execute_bridge_request_observed(
             handle,
@@ -105,7 +104,7 @@ impl LanguageServerPool {
                 transform_formatting_response_to_host(
                     response,
                     ctx.offset,
-                    virtual_line_count,
+                    virtual_content,
                     region_end,
                 )
                 .map(Some)
@@ -121,7 +120,7 @@ impl LanguageServerPool {
 /// `PositionMapper`, a lone CR ends a line too, and CRLF ends one.
 ///
 /// Returns 1 for the empty string (a single empty line, index 0).
-pub(super) fn count_lines(text: &str) -> u32 {
+fn count_lines(text: &str) -> u32 {
     // Every LF ends a line; a CR ends one unless an LF follows it.
     let bytes = text.as_bytes();
     let terminators = bytes
@@ -220,13 +219,14 @@ fn build_formatting_request(
 /// canonical insert-final-newline anchor (column 0 of the synthetic line just
 /// past EOF); any edit whose start is still on a line `>= virtual_line_count`
 /// is then dropped before translation.
-/// `virtual_line_count` is the LSP line count (1 for empty), from [`count_lines`].
+/// `virtual_content` is the text the server formatted: the edits apply to it.
 pub(super) fn transform_formatting_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,
-    virtual_line_count: u32,
+    virtual_content: &str,
     region_end: Position,
 ) -> io::Result<Vec<TextEdit>> {
+    let virtual_line_count = count_lines(virtual_content);
     if response_has_jsonrpc_error(&response, "formatting-style request") {
         return Err(io::Error::other(
             "downstream server answered the formatting request with an error response",
@@ -381,8 +381,13 @@ mod tests {
             ]
         });
 
-        let edits =
-            transform_formatting_response_to_host(response, &offset, 2, region_end).unwrap();
+        let edits = transform_formatting_response_to_host(
+            response,
+            &offset,
+            "aaaaaaaa\nbbbbbbbb",
+            region_end,
+        )
+        .unwrap();
 
         assert!(
             edits.is_empty(),
@@ -409,8 +414,13 @@ mod tests {
             ]
         });
 
-        let edits =
-            transform_formatting_response_to_host(response, &offset, 2, region_end).unwrap();
+        let edits = transform_formatting_response_to_host(
+            response,
+            &offset,
+            "aaaaaaaa\nbbbbbbbb",
+            region_end,
+        )
+        .unwrap();
 
         assert_eq!(edits.len(), 1, "all-safe response passes: {edits:?}");
         assert_eq!(edits[0].new_text, "safe");
@@ -505,9 +515,10 @@ mod tests {
     // Formatting response transformation tests
     // ==========================================================================
 
-    /// Permissive line count used by tests that don't care about boundary
-    /// behavior — chosen large enough that no test edit is filtered out.
-    const UNBOUNDED: u32 = u32::MAX;
+    /// Virtual text for tests that don't care about boundary behavior: long
+    /// enough that no test edit is filtered out, with no line break at
+    /// either end.
+    const PLAIN_TEXT: &str = "aaaaaaaa\nbbbbbbbb\ncccccccc\ndddddddd\neeeeeeee";
 
     #[test]
     fn formatting_response_transforms_text_edit_ranges_to_host_coordinates() {
@@ -535,7 +546,7 @@ mod tests {
         let edits = transform_formatting_response_to_host(
             response,
             &RegionOffset::new(10, 0),
-            UNBOUNDED,
+            PLAIN_TEXT,
             TEST_REGION_END,
         )
         .unwrap();
@@ -576,7 +587,7 @@ mod tests {
         let edits = transform_formatting_response_to_host(
             response,
             &RegionOffset::new(5, 4),
-            UNBOUNDED,
+            PLAIN_TEXT,
             TEST_REGION_END,
         )
         .unwrap();
@@ -605,7 +616,7 @@ mod tests {
         let transformed = transform_formatting_response_to_host(
             response,
             &RegionOffset::new(5, 0),
-            UNBOUNDED,
+            PLAIN_TEXT,
             TEST_REGION_END,
         );
         assert!(transformed.is_err());
@@ -625,7 +636,7 @@ mod tests {
         let transformed = transform_formatting_response_to_host(
             response,
             &RegionOffset::new(5, 0),
-            UNBOUNDED,
+            PLAIN_TEXT,
             TEST_REGION_END,
         )
         .expect("null result is a handled response, not a failure");
@@ -644,7 +655,7 @@ mod tests {
         let edits = transform_formatting_response_to_host(
             response,
             &RegionOffset::new(5, 0),
-            UNBOUNDED,
+            PLAIN_TEXT,
             TEST_REGION_END,
         )
         .unwrap();
@@ -671,7 +682,7 @@ mod tests {
         let edits = transform_formatting_response_to_host(
             response,
             &RegionOffset::new(u32::MAX - 1, 0),
-            2,
+            "aaaaaaaa\nbbbbbbbb",
             TEST_REGION_END,
         )
         .unwrap();
@@ -719,7 +730,7 @@ mod tests {
         let edits = transform_formatting_response_to_host(
             response,
             &RegionOffset::new(10, 0),
-            3,
+            "aaaaaaaa\nbbbbbbbb\ncccccc",
             TEST_REGION_END,
         )
         .unwrap();
@@ -755,7 +766,7 @@ mod tests {
         let edits = transform_formatting_response_to_host(
             response,
             &RegionOffset::new(10, 0),
-            3,
+            "aaaaaaaa\nbbbbbbbb\ncccccc",
             TEST_REGION_END,
         )
         .unwrap();
@@ -794,7 +805,7 @@ mod tests {
         let edits = transform_formatting_response_to_host(
             response,
             &RegionOffset::new(10, 0),
-            2,
+            "aaaaaaaa\nbbbbbbbb",
             TEST_REGION_END,
         )
         .unwrap();
@@ -827,7 +838,8 @@ mod tests {
         });
 
         let edits =
-            transform_formatting_response_to_host(response, &offset, 1, region_end).unwrap();
+            transform_formatting_response_to_host(response, &offset, "local x = 1", region_end)
+                .unwrap();
 
         assert_eq!(edits.len(), 1, "insertFinalNewline must survive: {edits:?}");
         assert_eq!(edits[0].range.start, region_end);
@@ -852,13 +864,9 @@ mod tests {
         });
         let region_end = region_host_end(virtual_content, &offset);
 
-        let edits = transform_formatting_response_to_host(
-            response,
-            &offset,
-            count_lines(virtual_content),
-            region_end,
-        )
-        .unwrap();
+        let edits =
+            transform_formatting_response_to_host(response, &offset, virtual_content, region_end)
+                .unwrap();
 
         assert_eq!(edits.len(), 1, "{edits:?}");
         assert_eq!(edits[0].range.start, Position::new(10, 0));
@@ -916,7 +924,7 @@ mod tests {
         let edits = transform_formatting_response_to_host(
             response,
             &RegionOffset::new(10, 0),
-            1,
+            "foo",
             TEST_REGION_END,
         )
         .unwrap();
@@ -958,7 +966,7 @@ mod tests {
         let edits = transform_formatting_response_to_host(
             response,
             &RegionOffset::new(0, 0),
-            2,
+            "aaa\nbbb",
             TEST_REGION_END,
         )
         .unwrap();
@@ -995,7 +1003,7 @@ mod tests {
         let edits = transform_formatting_response_to_host(
             response,
             &RegionOffset::new(0, 0),
-            2,
+            "aaaaaaaa\nbbbbbbbb",
             TEST_REGION_END,
         )
         .unwrap();
@@ -1030,7 +1038,7 @@ mod tests {
         let edits = transform_formatting_response_to_host(
             response,
             &RegionOffset::new(10, 0),
-            2,
+            "aaa\nbbb",
             region_end,
         )
         .unwrap();
@@ -1063,7 +1071,7 @@ mod tests {
         let edits = transform_formatting_response_to_host(
             response,
             &RegionOffset::new(10, 0),
-            2,
+            "aaa\nbbb",
             region_end,
         )
         .unwrap();
@@ -1097,7 +1105,7 @@ mod tests {
         let edits = transform_formatting_response_to_host(
             response,
             &RegionOffset::new(4, 7),
-            1,
+            "x  =1",
             region_end,
         )
         .unwrap();
@@ -1129,7 +1137,7 @@ mod tests {
         let edits = transform_formatting_response_to_host(
             response,
             &RegionOffset::new(10, 0),
-            4,
+            "if true;then\necho\nfi\n",
             region_end,
         )
         .unwrap();
@@ -1161,7 +1169,7 @@ mod tests {
         let edits = transform_formatting_response_to_host(
             response,
             &RegionOffset::new(0, 0),
-            2,
+            "aaaaaaaa\nbbbbbbbb",
             TEST_REGION_END,
         )
         .unwrap();
@@ -1191,7 +1199,7 @@ mod tests {
         let edits = transform_formatting_response_to_host(
             response,
             &RegionOffset::new(0, 0),
-            2,
+            "aaaaaaaa\nbbbbbbbb",
             TEST_REGION_END,
         )
         .unwrap();
