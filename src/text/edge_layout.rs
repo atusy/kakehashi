@@ -33,7 +33,10 @@ pub(crate) fn restore_edge_layout(original: &str, formatted: &str, opens_mid_lin
         let original_head = head_lines(original);
         let formatted_head = head_lines(body);
         body = &body[formatted_head.iter().map(|line| line.len()).sum::<usize>()..];
-        if let Some((layout, original_blank_lines)) = original_head.split_first() {
+        if formatted_head == original_head {
+            // Untouched: kept as is, whatever its line breaks.
+            restored.extend(formatted_head);
+        } else if let Some((layout, original_blank_lines)) = original_head.split_first() {
             // The original's line break ending the delimiter's line, then the
             // blank lines the formatter kept, no more than the original had,
             // each ending with that line break (see the trailing layout).
@@ -50,7 +53,13 @@ pub(crate) fn restore_edge_layout(original: &str, formatted: &str, opens_mid_lin
         }
     }
     restored.push_str(body);
-    let original_tail = tail_lines(&original[tail_start(original)..]);
+    let original_tail = &original[tail_start(original)..];
+    if formatted_tail == original_tail {
+        // Untouched: kept as is, whatever its line breaks.
+        restored.push_str(formatted_tail);
+        return restored;
+    }
+    let original_tail = tail_lines(original_tail);
     if let Some((final_line, original_blank_lines)) = original_tail.split_last() {
         // The blank lines the formatter kept, no more than the original had,
         // then the original's final line break and indentation. Every one
@@ -161,6 +170,9 @@ mod tests {
     )]
     #[case::a_kept_lone_cr_does_not_merge_into_a_crlf("x\n\n", "x\r\r\n", false, "x\n\n")]
     #[case::trailing_spaces_on_the_last_line_are_content("x  \n  ", "x\n", true, "x\n  ")]
+    #[case::mixed_trailing_breaks_left_alone("a\r\n\n", "a\r\n\n", false, "a\r\n\n")]
+    #[case::mixed_leading_breaks_left_alone("\r\n\na", "\r\n\na", true, "\r\n\na")]
+    #[case::lone_cr_tail_left_alone("a\n\r", "a\n\r", false, "a\n\r")]
     #[case::edges_already_match("\n  x\n  ", "\n  y;\n  ", true, "\n  y;\n  ")]
     #[case::whitespace_only_original("\n  ", "", true, "")]
     #[case::whitespace_only_formatted("\n  x\n  ", "\n", true, "\n")]
