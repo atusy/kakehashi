@@ -427,7 +427,9 @@ impl AppliedEdits {
 fn edits_apply_in_order(edits: &[TextEdit]) -> bool {
     let key = |position: Position| (position.line, position.character);
     let mut ranges: Vec<_> = edits.iter().map(|edit| edit.range).collect();
-    ranges.sort_by_key(|range| key(range.start));
+    // In the order `apply_text_edits` applies them: an insert before a
+    // replacement starting where it inserts.
+    ranges.sort_by_key(|range| (key(range.start), key(range.end)));
     ranges
         .iter()
         .all(|range| key(range.start) <= key(range.end))
@@ -1498,6 +1500,24 @@ mod tests {
     }
 
     #[test]
+    fn a_replacement_listed_before_an_insert_at_its_start_keeps_the_edges() {
+        // The pair applies in order (the insert, then the replacement), so
+        // the edges are kept: the line break after `''` survives.
+        let host = "{\n  b = /* bash */ ''\n    x\n  '';\n}\n";
+        let virtual_content = "\n    x\n  ";
+        let result = json!([
+            { "range": { "start": { "line": 0, "character": 0 },
+                         "end": { "line": 1, "character": 4 } }, "newText": "" },
+            { "range": { "start": { "line": 0, "character": 0 },
+                         "end": { "line": 0, "character": 0 } }, "newText": "y" }
+        ]);
+
+        let formatted = format_host(host, RegionOffset::new(1, 19), virtual_content, result);
+
+        assert_eq!(formatted, "{\n  b = /* bash */ ''\nyx\n  '';\n}\n");
+    }
+
+    #[test]
     fn a_region_without_a_final_line_break_gains_none() {
         // This Nix string's value ends without a line break; adding one, as
         // shfmt does, would change the value and move the closing delimiter.
@@ -1566,6 +1586,9 @@ mod tests {
     #[case::ordered(&[((0, 0), (0, 1)), ((0, 1), (0, 2))], true)]
     #[case::listed_out_of_order(&[((1, 0), (1, 1)), ((0, 0), (0, 1))], true)]
     #[case::inserts_at_one_position(&[((0, 1), (0, 1)), ((0, 1), (0, 1))], true)]
+    // Applied as `apply_text_edits` does: the insert first, then the
+    // replacement starting where it inserts.
+    #[case::replacement_listed_before_an_insert_at_its_start(&[((0, 0), (0, 2)), ((0, 0), (0, 0))], true)]
     #[case::reversed(&[((0, 2), (0, 1))], false)]
     #[case::overlapping(&[((0, 0), (0, 2)), ((0, 1), (0, 3))], false)]
     fn edits_apply_in_order_rejects_reversed_and_overlapping_ranges(
