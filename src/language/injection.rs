@@ -28,6 +28,7 @@ pub(crate) use discovery::{
     CacheableInjectionRegion, InjectionRegionInfo, InjectionResolver, REGION_IDENTITY_LAYER_BASE,
     RegionBoundary, ResolvedInjection, collect_all_injections,
     collect_all_injections_parallel_cancellable, detect_injection, effective_content_range,
+    tree_start_position,
 };
 #[cfg(test)]
 pub(crate) use offset::effective_offset_for_pattern;

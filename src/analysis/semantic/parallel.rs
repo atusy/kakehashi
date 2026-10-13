@@ -26,7 +26,7 @@ use crate::language::injection::{
     CacheableInjectionRegion, InjectionRegionInfo, MAX_INJECTION_DEPTH, byte_to_point,
     byte_to_point_anchored, compute_included_ranges, compute_included_ranges_clipped,
     effective_content_range, intersect_included_ranges, parse_with_ranges,
-    sub_select_included_ranges,
+    sub_select_included_ranges, tree_start_position,
 };
 use crate::text::position::byte_to_utf16_col;
 
@@ -734,29 +734,29 @@ fn discover_single_region(
     };
 
     // Resolve this single region's cache identity (#529). region_id is minted
-    // from the RAW content node — byte-identical to populate_injections
-    // (cache.rs), which keeps the bridge/tracker identities in sync (token
-    // eviction itself is content-addressed and needs no id). Eligibility
+    // (or, on a stale serve, looked up) from the RAW content node —
+    // byte-identical to populate_injections (cache.rs), which keeps the
+    // bridge/tracker identities in sync — and gates caching; the id itself is
+    // not kept (token eviction is content-addressed and needs none). Eligibility
     // is this request's translation predicate: column-0 start AND no per-row
     // prefixes (singles are never injection.combined).
     let token_cache = cache_for_singles.and_then(|(uri, tracker, incarnation, mint_regions)| {
-        let cacheable_owned;
-        let cacheable = match prebuilt_cacheable {
-            Some(prebuilt) => prebuilt,
+        let content_hash = match prebuilt_cacheable {
+            Some(prebuilt) => prebuilt.content_hash,
             None => {
                 // Mint only when the served snapshot was current (see
                 // InjectionCacheCtx::mint_regions): a stale serve's coordinates
                 // must not enter the live tracker. Read-only reuse keeps the
                 // cache warm for regions the edits did not shift; an unknown
                 // region simply goes uncached for this stale serve.
-                let region_id = if mint_regions {
+                if mint_regions {
                     tracker.get_or_create_for_incarnation(
                         uri,
                         injection.content_node.start_byte(),
                         injection.content_node.end_byte(),
                         crate::language::loader::static_node_kind(&injection.content_node),
                         incarnation,
-                    )?
+                    )?;
                 } else {
                     tracker.lookup_in_layer_for_incarnation(
                         uri,
@@ -765,25 +765,24 @@ fn discover_single_region(
                         crate::language::loader::static_node_kind(&injection.content_node),
                         0,
                         incarnation,
-                    )?
+                    )?;
                 }
-                .to_string();
-                cacheable_owned =
-                    CacheableInjectionRegion::from_region_info(injection, &region_id, text);
-                &cacheable_owned
+                CacheableInjectionRegion::hash_content(injection_content)
             }
         };
-        let eligible = cacheable.start_column == 0 && prefix_byte_widths.is_empty();
+        // The tokens carry tree-sitter rows and columns, so the re-anchor
+        // origin is the tree-sitter position of the content start.
+        let (tree_start_row, tree_start_column) =
+            tree_start_position(injection, inj_start_byte, text);
+        let eligible = tree_start_column == 0 && prefix_byte_widths.is_empty();
         // Content-addressed cache key: content hash folded with the resolved
         // language (one shared definition — populate's eviction sweep must
         // compute the same fold).
-        let validity_hash = crate::analysis::semantic_cache::region_validity_hash(
-            cacheable.content_hash,
-            &resolved_lang,
-        );
+        let validity_hash =
+            crate::analysis::semantic_cache::region_validity_hash(content_hash, &resolved_lang);
         Some(DiscoveredRegionCache {
             validity_hash,
-            line_start: cacheable.line_range.start,
+            line_start: tree_start_row,
             eligible,
         })
     });
@@ -1565,8 +1564,8 @@ fn visit_until_cancelled<T>(
 /// Translate an eligible region's host-absolute tokens into region-local
 /// coordinates for caching: subtract the region's first host line so a stored
 /// entry re-anchors with a single `line += line_start` on reuse. The column is
-/// already region-invariant for an eligible region (`start_column == 0`, no
-/// per-row prefixes), so only the line shifts. `saturating_sub` guards the
+/// already region-invariant for an eligible region (a tree-sitter column-0
+/// content start, no per-row prefixes), so only the line shifts. `saturating_sub` guards the
 /// (unexpected) case of a token above the region start rather than underflowing.
 fn to_region_local(tokens: &[RawToken], line_start: u32) -> Vec<RawToken> {
     let line_start = line_start as usize;
@@ -1589,7 +1588,8 @@ fn to_region_local(tokens: &[RawToken], line_start: u32) -> Vec<RawToken> {
 
 /// Re-anchor cached region-local tokens to the region's current host position:
 /// the inverse of [`to_region_local`]. Because the region is eligible
-/// (`start_column == 0`, no per-row prefixes), the column is already correct and
+/// (a tree-sitter column-0 content start, no per-row prefixes), the column is
+/// already correct and
 /// only the line shifts by the region's current first host line — so an edit
 /// *above* an unchanged region (which leaves its content hash, hence the cache
 /// entry, intact but moves it) is re-anchored exactly.
@@ -3184,7 +3184,12 @@ local b = 2
                         crate::language::loader::static_node_kind(&info.content_node),
                     )
                     .to_string();
-                CacheableInjectionRegion::from_region_info(info, &id, text)
+                CacheableInjectionRegion::from_region_info(
+                    info,
+                    &id,
+                    text,
+                    &crate::text::LoneCarriageReturns::new(text),
+                )
             })
             .collect()
     }
@@ -3987,12 +3992,18 @@ local b = 2
     /// new host line. With the tracker positions adjusted (as production does in
     /// did_change), the cached entry stays valid and is shifted by the inserted
     /// line — matching a fresh uncached compute of the edited document.
-    #[test]
-    fn injection_cache_reanchors_after_edit_above() {
+    ///
+    /// With a lone CR above the regions, their tree-sitter rows (which the
+    /// tokens carry) and LSP lines differ; the re-anchor origin must be the
+    /// tree-sitter row.
+    #[rstest::rstest]
+    #[case::lf_only("")]
+    #[case::lone_cr_above("intro\rmore\n\n")]
+    fn injection_cache_reanchors_after_edit_above(#[case] prefix: &str) {
         let Some(coordinator) = markdown_lua_coordinator() else {
             return;
         };
-        let old_text = eight_lua_block_doc();
+        let old_text = format!("{prefix}{}", eight_lua_block_doc());
         let old_tree = parse_markdown(&coordinator, &old_text);
         let old_lines: Vec<&str> = old_text.lines().collect();
         let old_line_starts = build_line_start_bytes(&old_text);

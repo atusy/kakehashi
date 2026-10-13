@@ -12,9 +12,10 @@ use tree_sitter::Query;
 /// Populated only for top-level singles when injection-token caching is active
 /// (a cache handle is threaded in and the region count clears the gate). Carries
 /// everything the reuse path needs without re-touching the tree-sitter node:
-/// the position-stable `region_id` (minted the same way as `populate_injections`),
-/// the content hash + the region's first host line for re-anchoring, and whether
-/// the region satisfies the language-agnostic translation predicate this request.
+/// the content-addressed key, the region's first host row for re-anchoring, and
+/// whether the region satisfies the language-agnostic translation predicate this
+/// request. The position-stable `region_id` is minted (the same way as
+/// `populate_injections`) to gate caching, but not kept.
 pub(super) struct RegionCacheInfo {
     /// Content-addressed cache key ([`region_validity_hash`]): the region's
     /// content hash folded with its resolved injection language. The content
@@ -22,11 +23,14 @@ pub(super) struct RegionCacheInfo {
     /// injecting *different* languages get different keys (barring a 64-bit
     /// collision), so one can't serve the other's tokens.
     pub validity_hash: u64,
-    /// `line_range.start`: the region's first host line, added back on reuse
-    /// (`host_line = line_start + token.line`).
+    /// The tree-sitter row of the region's effective content start, added back
+    /// on reuse (`host_line = line_start + token.line`). Tokens carry
+    /// tree-sitter rows, so this is not `CacheableInjectionRegion::line_range`,
+    /// which is in LSP lines.
     pub line_start: u32,
     /// Whether this region qualifies for the trivial re-anchor this request:
-    /// `start_column == 0` ∧ no per-row prefix widths ∧ not `injection.combined`.
+    /// a tree-sitter column-0 content start ∧ no per-row prefix widths ∧ not
+    /// `injection.combined`.
     /// Recomputed every request from the fresh context, so a region that stopped
     /// qualifying is recomputed rather than served a stale hit.
     pub eligible: bool,
