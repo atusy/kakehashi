@@ -404,8 +404,7 @@ impl Kakehashi {
                     // the host snapshot is at hand: the pipeline's whole-region
                     // replacement must re-apply them to its multi-line output
                     // (Decision point 4, `reapply_host_line_prefixes`).
-                    let virtual_line_count =
-                        region_ctx.resolved.virtual_content.matches('\n').count() + 1;
+                    let virtual_line_count = lsp_line_count(&region_ctx.resolved.virtual_content);
                     let mapper = host_mapper
                         .get_or_insert_with(|| crate::text::PositionMapper::new(snapshot.text()));
                     let host_line_prefixes = extract_host_line_prefixes(
@@ -1714,7 +1713,7 @@ fn extract_host_line_prefixes(
 ///   (`>` not `> `; a space-only prefix is left off entirely) so the pipeline
 ///   introduces no trailing-whitespace violations.
 fn reapply_host_line_prefixes(final_text: &str, host_line_prefixes: &[String]) -> String {
-    let lines: Vec<&str> = final_text.split('\n').collect();
+    let lines = split_lsp_lines(final_text);
     if lines.len() <= 1 {
         // Single-line output sits entirely after the first line's host prefix.
         return final_text.to_string();
@@ -1748,37 +1747,59 @@ fn reapply_host_line_prefixes(final_text: &str, host_line_prefixes: &[String]) -
         (lines.len() - 1) * lcp.len()
     };
     let mut out = String::with_capacity(final_text.len() + added_len);
-    for (i, line) in lines.iter().enumerate() {
-        if i == 0 {
-            out.push_str(line);
-            continue;
-        }
-        out.push('\n');
-        // `split('\n')` keeps a trailing '\r' on CRLF content; a line is
-        // "empty" for the prefix rules with or without it.
-        let line_is_empty = line.trim_end_matches('\r').is_empty();
-        let prefix = if line_count_preserved {
-            host_line_prefixes[i].as_str()
-        } else if line_is_empty && i == lines.len() - 1 {
-            // The trailing empty output line sits at the region end, where
-            // the host's own prefix (e.g. the closing fence's "> ") follows
-            // immediately outside the replacement range — prefixing it here
-            // would double the marker.
-            ""
-        } else {
-            lcp
-        };
-        // Empty output lines take the prefix with trailing whitespace
-        // trimmed so the pipeline introduces no trailing-whitespace
-        // violations.
-        if line_is_empty {
-            out.push_str(prefix.trim_end());
-        } else {
-            out.push_str(prefix);
+    for (i, &(line, line_end)) in lines.iter().enumerate() {
+        if i > 0 {
+            let line_is_empty = line.is_empty();
+            let prefix = if line_count_preserved {
+                host_line_prefixes[i].as_str()
+            } else if line_is_empty && i == lines.len() - 1 {
+                // The trailing empty output line sits at the region end, where
+                // the host's own prefix (e.g. the closing fence's "> ") follows
+                // immediately outside the replacement range — prefixing it here
+                // would double the marker.
+                ""
+            } else {
+                lcp
+            };
+            // Empty output lines take the prefix with trailing whitespace
+            // trimmed so the pipeline introduces no trailing-whitespace
+            // violations.
+            if line_is_empty {
+                out.push_str(prefix.trim_end());
+            } else {
+                out.push_str(prefix);
+            }
         }
         out.push_str(line);
+        out.push_str(line_end);
     }
     out
+}
+
+/// Split `text` into LSP lines, each paired with the line end that follows
+/// it: LF, CRLF, or a lone CR (empty for the last line). The host prefixes
+/// are indexed by LSP line, so the pipeline output is split the same way.
+fn split_lsp_lines(text: &str) -> Vec<(&str, &str)> {
+    let bytes = text.as_bytes();
+    let mut lines = Vec::new();
+    let mut line_start = 0;
+    while let Some(index) = text[line_start..].find(['\n', '\r']) {
+        let line_break = line_start + index;
+        let line_end = if bytes[line_break] == b'\r' && bytes.get(line_break + 1) == Some(&b'\n') {
+            line_break + 2
+        } else {
+            line_break + 1
+        };
+        lines.push((&text[line_start..line_break], &text[line_break..line_end]));
+        line_start = line_end;
+    }
+    lines.push((&text[line_start..], ""));
+    lines
+}
+
+/// The number of LSP lines in `text` (1 for empty text).
+fn lsp_line_count(text: &str) -> usize {
+    split_lsp_lines(text).len()
 }
 
 /// Longest common prefix of all strings, on char boundaries. Empty input or
@@ -2590,6 +2611,22 @@ mod tests {
             reapply_host_line_prefixes("a\nb\nc", &prefixes),
             "a\n> b\n> c"
         );
+    }
+
+    #[rstest::rstest]
+    #[case::lf("a\nb\n", "a\n> b\n")]
+    #[case::crlf("a\r\nb\r\n", "a\r\n> b\r\n")]
+    #[case::lone_cr("a\rb\n", "a\r> b\n")]
+    fn reapply_maps_prefixes_to_lsp_lines(#[case] final_text: &str, #[case] expected: &str) {
+        // The prefixes are indexed by LSP line, where a lone CR ends a line
+        // too, so the output must be split the same way to keep the mapping.
+        let prefixes = vec!["> ".to_string(), "> ".to_string(), String::new()];
+        assert_eq!(reapply_host_line_prefixes(final_text, &prefixes), expected);
+    }
+
+    #[test]
+    fn host_line_prefix_count_follows_lsp_lines() {
+        assert_eq!(lsp_line_count("a\rb\r\nc\n"), 4);
     }
 
     #[test]
