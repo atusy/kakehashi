@@ -22,52 +22,98 @@
 /// A whitespace-only `original` or `formatted` has no content between its
 /// edges, so it is returned as formatted.
 pub(crate) fn restore_edge_layout(original: &str, formatted: &str, opens_mid_line: bool) -> String {
-    if original.trim().is_empty() || formatted.trim().is_empty() {
-        return formatted.to_string();
-    }
-    let (mut body, formatted_tail) = formatted.split_at(tail_start(formatted));
+    restore_edges(original, formatted, opens_mid_line).apply(formatted)
+}
 
-    // The formatted text plus the edges it may have lost, usually a few bytes.
-    let mut restored = String::with_capacity(formatted.len() + 16);
+/// How [`restore_edge_layout`] changes a formatted text: its first
+/// `head_end` bytes become `head`, and its bytes from `tail_start` on become
+/// `tail`. An edge left as formatted replaces nothing with nothing.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct EdgeRestore {
+    pub(crate) head_end: usize,
+    pub(crate) head: String,
+    pub(crate) tail_start: usize,
+    pub(crate) tail: String,
+}
+
+impl EdgeRestore {
+    fn unchanged(formatted: &str) -> Self {
+        Self {
+            head_end: 0,
+            head: String::new(),
+            tail_start: formatted.len(),
+            tail: String::new(),
+        }
+    }
+
+    pub(crate) fn apply(&self, formatted: &str) -> String {
+        let body = &formatted[self.head_end..self.tail_start];
+        let mut restored = String::with_capacity(self.head.len() + body.len() + self.tail.len());
+        restored.push_str(&self.head);
+        restored.push_str(body);
+        restored.push_str(&self.tail);
+        restored
+    }
+}
+
+/// The [`EdgeRestore`] that [`restore_edge_layout`] applies.
+pub(crate) fn restore_edges(original: &str, formatted: &str, opens_mid_line: bool) -> EdgeRestore {
+    let mut edges = EdgeRestore::unchanged(formatted);
+    if original.trim().is_empty() || formatted.trim().is_empty() {
+        return edges;
+    }
+    let formatted_tail_start = tail_start(formatted);
+
     if opens_mid_line {
         let original_head = head_lines(original);
-        let formatted_head = head_lines(body);
-        body = &body[formatted_head.iter().map(|line| line.len()).sum::<usize>()..];
-        if formatted_head == original_head {
-            // Untouched: kept as is, whatever its line breaks.
-            restored.extend(formatted_head);
-        } else if let Some((layout, original_blank_lines)) = original_head.split_first() {
-            // The original's line break ending the delimiter's line, then the
-            // blank lines the formatter kept, no more than the original had.
-            restored.push_str(layout);
-            for line in formatted_head
-                .iter()
-                .skip(1)
-                .take(original_blank_lines.len())
-            {
-                push_line(&mut restored, line);
+        let formatted_head = head_lines(&formatted[..formatted_tail_start]);
+        // Untouched, the head is kept as is, whatever its line breaks.
+        if formatted_head != original_head {
+            edges.head_end = formatted_head.iter().map(|line| line.len()).sum();
+            if let Some((layout, original_blank_lines)) = original_head.split_first() {
+                // The original's line break ending the delimiter's line, then
+                // the blank lines the formatter kept, no more than the
+                // original had.
+                edges.head.push_str(layout);
+                for line in formatted_head
+                    .iter()
+                    .skip(1)
+                    .take(original_blank_lines.len())
+                {
+                    push_line(&mut edges.head, line);
+                }
             }
         }
     }
-    restored.push_str(body);
+
     let original_tail = &original[tail_start(original)..];
-    if formatted_tail == original_tail {
-        // Untouched: kept as is, whatever its line breaks.
-        restored.push_str(formatted_tail);
-        return restored;
-    }
-    let original_tail = tail_lines(original_tail);
-    if let Some((final_line, original_blank_lines)) = original_tail.split_last() {
-        // The blank lines the formatter kept, no more than the original had,
-        // then the original's final line break and indentation.
-        let formatted_tail = tail_lines(formatted_tail);
-        let blank_lines = formatted_tail.len().saturating_sub(1);
-        for line in &formatted_tail[..blank_lines.min(original_blank_lines.len())] {
-            push_line(&mut restored, line);
+    let formatted_tail = &formatted[formatted_tail_start..];
+    // Untouched, the tail is kept as is, whatever its line breaks.
+    if formatted_tail != original_tail {
+        edges.tail_start = formatted_tail_start;
+        let original_tail = tail_lines(original_tail);
+        if let Some((final_line, original_blank_lines)) = original_tail.split_last() {
+            // The blank lines the formatter kept, no more than the original
+            // had, then the original's final line break and indentation.
+            let formatted_tail = tail_lines(formatted_tail);
+            let blank_lines = formatted_tail.len().saturating_sub(1);
+            for line in &formatted_tail[..blank_lines.min(original_blank_lines.len())] {
+                push_line(&mut edges.tail, line);
+            }
+            push_line(&mut edges.tail, final_line);
         }
-        push_line(&mut restored, final_line);
     }
-    restored
+
+    // A rebuilt edge equal to the formatter's own replaces nothing.
+    if edges.head == formatted[..edges.head_end] {
+        edges.head_end = 0;
+        edges.head.clear();
+    }
+    if edges.tail == formatted[edges.tail_start..] {
+        edges.tail_start = formatted.len();
+        edges.tail.clear();
+    }
+    edges
 }
 
 /// Append a whitespace-only `line` of the layout, its line breaks as they
