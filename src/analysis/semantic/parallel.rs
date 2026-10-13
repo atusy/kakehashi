@@ -3990,12 +3990,18 @@ local b = 2
     /// new host line. With the tracker positions adjusted (as production does in
     /// did_change), the cached entry stays valid and is shifted by the inserted
     /// line — matching a fresh uncached compute of the edited document.
-    #[test]
-    fn injection_cache_reanchors_after_edit_above() {
+    ///
+    /// With a lone CR above the regions, their tree-sitter rows (which the
+    /// tokens carry) and LSP lines differ; the re-anchor origin must be the
+    /// tree-sitter row.
+    #[rstest::rstest]
+    #[case::lf_only("")]
+    #[case::lone_cr_above("intro\rmore\n\n")]
+    fn injection_cache_reanchors_after_edit_above(#[case] prefix: &str) {
         let Some(coordinator) = markdown_lua_coordinator() else {
             return;
         };
-        let old_text = eight_lua_block_doc();
+        let old_text = format!("{prefix}{}", eight_lua_block_doc());
         let old_tree = parse_markdown(&coordinator, &old_text);
         let old_lines: Vec<&str> = old_text.lines().collect();
         let old_line_starts = build_line_start_bytes(&old_text);
