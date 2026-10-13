@@ -1707,17 +1707,16 @@ fn pipeline_region_text(
     }
     // A region opening mid-line has no line prefix: the host text before it
     // on its first line is the opening delimiter's line (a Nix `''`), which
-    // continuation lines must not take once the line count changes. A region
-    // with one content line keeps it, as on main: its one column offset is
-    // also the shape of a blockquoted fence ending at EOF, whose `> ` it is.
-    // Only with a second content line do the unprefixed later lines of that
-    // shape tell the two apart; a final line break adds no content line.
-    let content = original_virtual
-        .strip_suffix("\r\n")
-        .or_else(|| original_virtual.strip_suffix(['\n', '\r']))
-        .unwrap_or(original_virtual);
-    let several_content_lines = content.contains(['\n', '\r']);
-    let host_line_prefixes = if offset.opens_mid_line() && several_content_lines {
+    // continuation lines must not take once the line count changes. One
+    // column offset is also the shape of a blockquoted or list-item fence
+    // ending at EOF, whose first-line text is its prefix; a line prefix is
+    // made of container markers and indentation only, a delimiter's line is
+    // not.
+    let opens_after_a_delimiter = offset.opens_mid_line()
+        && host_line_prefixes
+            .first()
+            .is_some_and(|text| text.chars().any(|c| !(c == '>' || c.is_whitespace())));
+    let host_line_prefixes = if opens_after_a_delimiter {
         let mut prefixes = host_line_prefixes.to_vec();
         if let Some(first) = prefixes.first_mut() {
             first.clear();
@@ -2743,6 +2742,52 @@ mod tests {
         );
 
         assert_eq!(text.as_deref(), Some("{\n>     \"a\": 1\n> }\n"));
+    }
+
+    #[test]
+    fn pipeline_keeps_the_indentation_of_a_list_fence_at_eof() {
+        // A list-item fence at EOF with trailing blank lines: one column
+        // offset, its first line's indentation its prefix.
+        let text = pipeline_region_text(
+            "{\"a\":1}\n\n",
+            "{\n    \"a\": 1\n}\n\n",
+            &RegionOffset::with_per_line_offsets(1, vec![2]),
+            &["  ".to_string(), String::new(), String::new()],
+        );
+
+        assert_eq!(text.as_deref(), Some("{\n      \"a\": 1\n  }\n\n"));
+    }
+
+    #[test]
+    fn pipeline_prefixes_no_line_of_a_one_line_script_it_grows() {
+        // A Nix string with one script line, which shfmt splits: the text
+        // before the string is the delimiter's line, not a prefix.
+        let text = pipeline_region_text(
+            "\n    if x; then y; fi\n  ",
+            "if x; then\n  y\nfi\n",
+            &RegionOffset::new(1, 19),
+            &[
+                "  b = /* bash */ ''".to_string(),
+                String::new(),
+                String::new(),
+            ],
+        );
+
+        assert_eq!(text.as_deref(), Some("\nif x; then\n  y\nfi\n  "));
+    }
+
+    #[test]
+    fn pipeline_prefixes_no_line_of_a_one_line_string_it_grows() {
+        // An inline Nix string grown to several lines: one column offset, as
+        // a fence at EOF has, but the text before it is a delimiter's line.
+        let text = pipeline_region_text(
+            "{\"a\":1}",
+            "{\n  \"a\": 1\n}",
+            &RegionOffset::new(0, 19),
+            &["  d = /* json */ ''".to_string()],
+        );
+
+        assert_eq!(text.as_deref(), Some("{\n  \"a\": 1\n}"));
     }
 
     #[test]
