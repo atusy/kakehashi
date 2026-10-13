@@ -1707,10 +1707,17 @@ fn pipeline_region_text(
     }
     // A region opening mid-line has no line prefix: the host text before it
     // on its first line is the opening delimiter's line (a Nix `''`), which
-    // continuation lines must not take once the line count changes. A
-    // one-line region keeps it, as on main: its one column offset is also
-    // the shape of a blockquoted fence ending at EOF, whose `> ` it is.
-    let host_line_prefixes = if offset.opens_mid_line() && host_line_prefixes.len() > 1 {
+    // continuation lines must not take once the line count changes. A region
+    // with one content line keeps it, as on main: its one column offset is
+    // also the shape of a blockquoted fence ending at EOF, whose `> ` it is.
+    // Only with a second content line do the unprefixed later lines of that
+    // shape tell the two apart; a final line break adds no content line.
+    let content = original_virtual
+        .strip_suffix("\r\n")
+        .or_else(|| original_virtual.strip_suffix(['\n', '\r']))
+        .unwrap_or(original_virtual);
+    let several_content_lines = content.contains(['\n', '\r']);
+    let host_line_prefixes = if offset.opens_mid_line() && several_content_lines {
         let mut prefixes = host_line_prefixes.to_vec();
         if let Some(first) = prefixes.first_mut() {
             first.clear();
@@ -2726,6 +2733,16 @@ mod tests {
         );
 
         assert_eq!(text.as_deref(), Some("{\n>     \"a\": 1\n> }"));
+
+        // Ending with a line break adds only the synthetic line after it.
+        let text = pipeline_region_text(
+            "{\"a\":1}\n",
+            "{\n    \"a\": 1\n}\n",
+            &RegionOffset::with_per_line_offsets(3, vec![2]),
+            &["> ".to_string(), String::new()],
+        );
+
+        assert_eq!(text.as_deref(), Some("{\n>     \"a\": 1\n> }\n"));
     }
 
     #[test]
