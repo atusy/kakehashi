@@ -183,7 +183,7 @@ fn clamp_end_past_eof(
 /// restored, or by none when only the edges changed.
 ///
 /// Edits that do not apply in order (reversed or overlapping) leave the
-/// formatted text undefined; they pass as received, to the checks after this.
+/// formatted text undefined, so they pass as received, edges and all.
 fn keep_edge_layout(
     edits: Vec<TextEdit>,
     virtual_content: &str,
@@ -1083,7 +1083,7 @@ mod tests {
     }
 
     #[test]
-    fn edits_that_overlap_are_left_to_the_other_checks() {
+    fn edits_that_overlap_pass_through_unchanged() {
         // Overlapping edits apply in no defined order, so the formatted text,
         // and the edges with it, are unknown: the edits pass as received.
         let virtual_content = "\n    x\n  ";
