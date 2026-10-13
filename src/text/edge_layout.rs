@@ -27,7 +27,8 @@ pub(crate) fn restore_edge_layout(original: &str, formatted: &str, opens_mid_lin
     }
     let (mut body, formatted_tail) = formatted.split_at(tail_start(formatted));
 
-    let mut restored = String::with_capacity(formatted.len() + original.len());
+    // The formatted text plus the edges it may have lost, usually a few bytes.
+    let mut restored = String::with_capacity(formatted.len() + 16);
     if opens_mid_line {
         let original_head = head_lines(original);
         let formatted_head = head_lines(body);

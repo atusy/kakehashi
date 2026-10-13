@@ -190,7 +190,8 @@ fn keep_edge_layout(
     virtual_content: &str,
     offset: &RegionOffset,
 ) -> Vec<TextEdit> {
-    if !edits_apply_in_order(&edits) {
+    // An empty answer, the usual one from on-type formatting, changes nothing.
+    if edits.is_empty() || !edits_apply_in_order(&edits) {
         return edits;
     }
     let formatted = apply_text_edits(virtual_content, &edits);
