@@ -8415,6 +8415,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_unchanged_text_sent_with_another_map_is_held_under_it() {
+        use super::super::protocol::{SegmentKind, VirtualLayout, apply_prepare_result};
+        // `x = ${a}`: only the gap's host text changes, so the prepared text
+        // does not, and no didChange is sent — but it maps back differently.
+        let prepared = |gap: &str| {
+            let layout = VirtualLayout::from_pieces(
+                "x =     ",
+                [
+                    (SegmentKind::Content, 0..4, String::new()),
+                    (SegmentKind::Gap, 4..8, gap.to_string()),
+                ],
+            );
+            let result = serde_json::from_value(serde_json::json!({"segments": [
+                {"type": "content"}, {"type": "gap", "content": "0"}
+            ]}))
+            .unwrap();
+            apply_prepare_result("x =     ", &layout, Some(result)).unwrap()
+        };
+        let (first, second) = (prepared("${a}"), prepared("${b}"));
+        assert_eq!(first.text, second.text);
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///project/doc.nix").unwrap();
+        let key = ConnectionKey::for_server("lua");
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        pool.register_opened_document(&host_uri, &virtual_uri, &key)
+            .await;
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        pool.connections
+            .lock()
+            .await
+            .insert(key.clone(), Arc::clone(&handle));
+        pool.open_host_incarnation(&host_uri, 1).await;
+        let injection = |document: &super::super::protocol::PreparedDocument| {
+            super::super::coordinator::BridgeInjection {
+                held: false,
+                prepared: document.map.clone(),
+                language: "lua".to_string(),
+                region_id: TEST_ULID_LUA_0.to_string(),
+                content: document.text.clone(),
+            }
+        };
+        pool.forward_didchange_to_opened_docs(&host_uri, 1, &[injection(&first)])
+            .await;
+        let uri = virtual_uri.to_uri_string();
+        let before = pool.held_text(&uri, &key).unwrap();
+        assert_eq!(before.map, first.map);
+
+        pool.forward_didchange_to_opened_docs(&host_uri, 1, &[injection(&second)])
+            .await;
+
+        let after = pool.held_text(&uri, &key).unwrap();
+        assert_eq!(after.generation, before.generation, "no new text was sent");
+        assert!(Arc::ptr_eq(
+            after.map.as_ref().unwrap(),
+            second.map.as_ref().unwrap()
+        ));
+    }
+
+    #[tokio::test]
     async fn a_prepared_open_ignores_a_cached_text_sent_as_is() {
         use super::super::protocol::{VirtualLayout, apply_prepare_result};
         let pool = LanguageServerPool::new();
