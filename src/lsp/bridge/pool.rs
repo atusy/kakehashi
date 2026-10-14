@@ -691,9 +691,10 @@ impl LanguageServerPool {
 
     /// Record whether `server_name` advertises
     /// `kakehashi/virtualDocument/prepare`: its last handshake, a
-    /// `MethodNotFound` answer since, or a failure to start it.
-    pub(crate) fn record_prepare_advertisement(&self, server_name: &str, advertised: bool) {
-        self.prepare_advertisements.record(server_name, advertised);
+    /// `MethodNotFound` answer since, or a failure to start it. `true` when
+    /// this changed the record (see [`Self::prepare_advertised_epoch`]).
+    pub(crate) fn record_prepare_advertisement(&self, server_name: &str, advertised: bool) -> bool {
+        self.prepare_advertisements.record(server_name, advertised)
     }
 
     /// Whether `server_name` advertises `kakehashi/virtualDocument/prepare`,
@@ -703,8 +704,8 @@ impl LanguageServerPool {
         self.prepare_advertisements.get(server_name)
     }
 
-    /// How many times a server recorded as not advertising
-    /// `kakehashi/virtualDocument/prepare` started advertising it.
+    /// How many times a server's recorded advertisement of
+    /// `kakehashi/virtualDocument/prepare` changed, either way.
     pub(crate) fn prepare_advertised_epoch(&self) -> u64 {
         self.prepare_advertisements
             .advertised_epoch
@@ -5323,32 +5324,32 @@ pub(crate) struct PrepareAdvertisements {
     /// and either way their documents should be synced again without
     /// waiting for an edit.
     on_advertised: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
-    /// Bumped whenever a server starts advertising after being recorded as
-    /// not advertising, before the hook runs: an attempt that found no
-    /// candidate meanwhile knows its answer is outdated.
+    /// Bumped whenever a server's recorded advertisement changes, before the
+    /// hook runs: an attempt that answered meanwhile knows a candidate ahead
+    /// of the one answering (or behind one withdrawing) may answer now.
     advertised_epoch: std::sync::atomic::AtomicU64,
 }
 
 impl PrepareAdvertisements {
     /// Record `server_name`'s advertisement, cloning its name only when
-    /// first seen.
-    fn record(&self, server_name: &str, advertised: bool) {
+    /// first seen; `true` when it changed a recorded one. (A first record
+    /// changes no candidate's selection: an unrecorded candidate is asked.)
+    fn record(&self, server_name: &str, advertised: bool) -> bool {
         let previous = match self.by_server.get_mut(server_name) {
             Some(mut entry) => std::mem::replace(&mut *entry, advertised),
             None => {
                 self.by_server.insert(server_name.to_string(), advertised);
-                return;
+                return false;
             }
         };
         if advertised == previous {
-            return;
+            return false;
         }
-        if advertised {
-            self.advertised_epoch.fetch_add(1, Ordering::AcqRel);
-        }
+        self.advertised_epoch.fetch_add(1, Ordering::AcqRel);
         if let Some(hook) = self.on_advertised.get() {
             hook();
         }
+        true
     }
 
     fn get(&self, server_name: &str) -> Option<bool> {
@@ -5422,7 +5423,7 @@ mod tests {
         // Withdrawn (a `MethodNotFound`): its documents hold prepared text.
         pool.record_prepare_advertisement("late", false);
         assert_eq!(runs(), 2);
-        assert_eq!(pool.prepare_advertised_epoch(), before + 1);
+        assert_eq!(pool.prepare_advertised_epoch(), before + 2);
     }
     use crate::lsp::bridge::actor::{OutboundMessage, RouteResult, spawn_reader_task};
     use crate::lsp::bridge::protocol::RegionOffset;

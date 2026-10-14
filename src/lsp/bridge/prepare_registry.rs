@@ -232,7 +232,7 @@ pub(crate) struct PrepareRegistry {
     /// Source of `textDocument.version`: shared by all documents, so a
     /// document forgotten and prepared again (a settings change, a reopen)
     /// never repeats a version the peer saw.
-    next_revision: AtomicI32,
+    next_revision: Arc<AtomicI32>,
     resync_tx: UnboundedSender<Resync>,
     resync_rx: std::sync::Mutex<Option<UnboundedReceiver<Resync>>>,
 }
@@ -251,7 +251,7 @@ impl Default for PrepareRegistry {
         Self {
             regions: Arc::default(),
             used: AtomicBool::new(false),
-            next_revision: AtomicI32::new(1),
+            next_revision: Arc::new(AtomicI32::new(1)),
             resync_tx,
             resync_rx: std::sync::Mutex::new(Some(resync_rx)),
         }
@@ -640,17 +640,12 @@ impl PrepareRegistry {
             input.region_id,
         );
         let key = slot.key;
-        // Every attempt takes the next version when it starts: a retry after
+        // Every request takes the next version as it goes out: a retry after
         // another input was asked (an undo while the first was backing off)
         // must not reuse an older one. (Attempts for different inputs run on
         // their own tasks, so two started together may still reach the peer
         // in either order.)
-        let revision = self.revision();
-        #[cfg(test)]
-        cell.versions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(revision);
+        let revisions = Arc::clone(&self.next_revision);
         let pool = Arc::clone(pool);
         let target = target.clone();
         let job = PrepareJob::from(input);
@@ -666,15 +661,42 @@ impl PrepareRegistry {
                     .get(&region)
                     .is_some_and(|region| region.has(&cell) && region.holds(key))
             };
-            match run(&pool, &target, &job, revision, &admitted).await {
-                Ok(outcome) => {
+            let next_version = || {
+                let version = next_revision(&revisions);
+                #[cfg(test)]
+                cell.versions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(version);
+                version
+            };
+            match run(&pool, &target, &job, &next_version, &admitted).await {
+                Ok((advertised_epoch, outcome)) => {
                     let ready = outcome.is_some();
                     let _ = cell.outcome.set(outcome);
+                    let held = holds(&regions);
+                    // An advertisement change after the attempt's last look
+                    // may have had its hook forget settled answers before
+                    // this one was set: forget it here then, and sync the
+                    // host again if it holds the document on it (the hook's
+                    // own pass may have found it still in flight).
+                    if pool.prepare_advertised_epoch() != advertised_epoch {
+                        if let Some(mut region) = regions.get_mut(&region) {
+                            region.slots.retain(|slot| !Arc::ptr_eq(&slot.cell, &cell));
+                        }
+                        if held {
+                            let _ = resync_tx.send(Resync {
+                                host_uri: job.host_uri.clone(),
+                                ready: false,
+                                failed: false,
+                            });
+                        }
+                    }
                     // The answer the lifecycle pass holds the document on
                     // re-syncs the host, whoever asked. An unusable one
                     // does too, unready: nothing more is coming for this
                     // input, which a pull owed a refresh must learn.
-                    if holds(&regions) {
+                    else if held {
                         // The receiver is gone only at shutdown.
                         let _ = resync_tx.send(Resync {
                             host_uri: job.host_uri.clone(),
@@ -715,12 +737,12 @@ impl PrepareRegistry {
         });
         true
     }
+}
 
-    fn revision(&self) -> i32 {
-        // Wraps after 2^31 prepares; the peer only compares a document's
-        // versions over its lifetime.
-        self.next_revision.fetch_add(1, Ordering::Relaxed)
-    }
+fn next_revision(counter: &AtomicI32) -> i32 {
+    // Wraps after 2^31 prepares; the peer only compares a document's
+    // versions over its lifetime.
+    counter.fetch_add(1, Ordering::Relaxed)
 }
 
 /// How many times one attempt goes through the candidates while some of
@@ -794,9 +816,9 @@ async fn run(
     pool: &LanguageServerPool,
     target: &PrepareTarget,
     job: &PrepareJob,
-    revision: i32,
+    next_version: &(dyn Fn() -> i32 + Sync),
     admitted: &(dyn Fn() -> bool + Sync),
-) -> Result<Outcome, ()> {
+) -> Result<(u64, Outcome), ()> {
     // The error carries the peer's own text (its error object, the variant
     // names of a malformed answer): escaped, as is the language name.
     let log_failure = |error: &dyn std::fmt::Display| {
@@ -808,11 +830,11 @@ async fn run(
             escape_terminal_controls(&error.to_string())
         );
     };
-    match try_run(pool, target, job, revision, admitted).await {
-        Ok(Ok(prepared)) => Ok(Some(Arc::new(prepared))),
-        Ok(Err(refused)) => {
+    match try_run(pool, target, job, next_version, admitted).await {
+        Ok((epoch, Ok(prepared))) => Ok((epoch, Some(Arc::new(prepared)))),
+        Ok((epoch, Err(refused))) => {
             log_failure(&refused);
-            Ok(None)
+            Ok((epoch, None))
         }
         Err(unanswered) => {
             // A revoked attempt (its host closed, a settings change dropped
@@ -842,37 +864,51 @@ async fn run(
 /// is passed over. Only the first that advertises it is asked, and its
 /// answer stands — a failure does not fall through to the next, which would
 /// let a flaky peer switch which preparation servers see.
+///
+/// An answer comes with the advertisement epoch it was checked against (see
+/// [`LanguageServerPool::prepare_advertised_epoch`]).
 async fn try_run(
     pool: &LanguageServerPool,
     target: &PrepareTarget,
     job: &PrepareJob,
-    revision: i32,
+    next_version: &(dyn Fn() -> i32 + Sync),
     admitted: &(dyn Fn() -> bool + Sync),
-) -> std::io::Result<std::io::Result<PreparedDocument>> {
+) -> std::io::Result<(u64, std::io::Result<PreparedDocument>)> {
+    let mut advertised_epoch = pool.prepare_advertised_epoch();
     let host_uri = match crate::lsp::lsp_impl::url_to_uri(&job.host_uri) {
         Ok(host_uri) => host_uri,
-        Err(error) => return Ok(Err(std::io::Error::other(error.to_string()))),
+        Err(error) => {
+            return Ok((
+                advertised_epoch,
+                Err(std::io::Error::other(error.to_string())),
+            ));
+        }
     };
     let virtual_uri =
         VirtualDocumentUri::new(&host_uri, &job.injection_language, &job.region_id).to_uri_string();
     let layout = VirtualLayout::from_gaps(&job.virtual_text, &job.gaps);
-    let params = PrepareParams::new(
-        PrepareTextDocument {
-            uri: &virtual_uri,
-            language_id: &job.injection_language,
-            version: revision,
-        },
-        PrepareHostTextDocument {
-            uri: job.host_uri.as_str(),
-            language_id: &job.host_language,
-        },
-        &layout,
-    );
+    // Every request takes the next version as it goes out: one asked again
+    // in a later pass must not repeat the version it was asked with.
+    let params = |version| {
+        PrepareParams::new(
+            PrepareTextDocument {
+                uri: &virtual_uri,
+                language_id: &job.injection_language,
+                version,
+            },
+            PrepareHostTextDocument {
+                uri: job.host_uri.as_str(),
+                language_id: &job.host_language,
+            },
+            &layout,
+        )
+    };
     // A candidate passed over below may start advertising before the loop
     // ends, which makes the answer outdated — as is, or a later candidate's,
     // while one ahead of it would answer now: ask again then, a bounded
-    // number of times (the last pass's answer stands).
-    let mut advertised_epoch = pool.prepare_advertised_epoch();
+    // number of times (the last pass's answer stands). A change this
+    // attempt records itself (a candidate it could not start, or that
+    // answered `MethodNotFound`) is accounted for as it is made.
     let mut pass = 1;
     loop {
         let answer = 'candidates: {
@@ -909,19 +945,26 @@ async fn try_run(
                             job.host_uri,
                             escape_terminal_controls(&error.to_string()),
                         );
-                        pool.record_prepare_advertisement(name, false);
+                        if pool.record_prepare_advertisement(name, false) {
+                            advertised_epoch += 1;
+                        }
                         continue;
                     }
                 };
                 if !handle.supports_virtual_document_prepare() {
                     continue;
                 }
-                let result = match handle.request_virtual_document_prepare(&params).await {
+                let result = match handle
+                    .request_virtual_document_prepare(&params(next_version()))
+                    .await
+                {
                     Ok(result) => result,
                     // It does not answer the request after all (`MethodNotFound`
                     // withdraws the advertisement): as if it had not advertised it.
                     Err(_) if !handle.supports_virtual_document_prepare() => {
-                        pool.record_prepare_advertisement(name, false);
+                        if pool.record_prepare_advertisement(name, false) {
+                            advertised_epoch += 1;
+                        }
                         continue;
                     }
                     // Final for this input: an unusable answer (an error response or
@@ -955,7 +998,7 @@ async fn try_run(
         };
         let epoch = pool.prepare_advertised_epoch();
         if epoch == advertised_epoch || pass == MAX_CANDIDATE_PASSES {
-            return Ok(answer);
+            return Ok((advertised_epoch, answer));
         }
         advertised_epoch = epoch;
         pass += 1;
@@ -1245,6 +1288,50 @@ mod tests {
                 ready: false,
                 failed: true
             })
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_answer_given_while_its_peer_withdraws_is_asked_of_the_next_candidate() {
+        let registry = PrepareRegistry::default();
+        let pool = Arc::new(LanguageServerPool::new());
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        let sent = |path: &std::path::Path| std::fs::read_to_string(path).unwrap_or_default();
+        // `first` answers a while after the request arrived, having
+        // withdrawn its advertisement meanwhile.
+        refusing_candidate(&pool, "first", &first, 0.5).await;
+        pool.record_prepare_advertisement("first", true);
+        recording_candidate(&pool, "second", true, &second).await;
+        let host = Url::parse("file:///host.md").unwrap();
+        let target = target_of(&[("first", &["first"]), ("second", &["second"])]);
+        registry.slot(&target, input(&host, "a"), Holder::LifecyclePass);
+        let method = crate::lsp::bridge::protocol::PREPARE_METHOD;
+        let withdraw = async {
+            while !sent(&first).contains(method) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            pool.record_prepare_advertisement("first", false);
+        };
+        let (miss, ()) = tokio::join!(
+            registry.prepare(&pool, &target, input(&host, "a")),
+            withdraw
+        );
+        // `first`'s answer is not the answer: `second` is asked now (and,
+        // never answering, leaves the input unanswered).
+        assert!(sent(&second).contains(method));
+        assert_eq!(miss.err(), Some(PrepareMiss::Unanswered));
+        // Each request went out with a version of its own.
+        let versions = cell(&registry, &target, input(&host, "a"), Holder::Request)
+            .versions
+            .lock()
+            .unwrap()
+            .clone();
+        assert!(
+            versions.len() == 2 && versions[0] < versions[1],
+            "{versions:?}"
         );
     }
 
