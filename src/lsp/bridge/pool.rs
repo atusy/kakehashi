@@ -3309,60 +3309,55 @@ impl LanguageServerPool {
         // now sees the shared connection as Ready+incapable, so it re-resolves
         // to the per-root key; acquire that connection instead, within the
         // caller's remaining budget.
-        if handle.key().is_shared() && !handle.supports_workspace_folder_changes() {
-            // Divert only a root the connection is not already serving, per
-            // the tiered proof in `incapable_shared_serves`. A marker-less
-            // acquisition brings no marker root of its own, so it rides the
-            // shared connection regardless of the capability — the same
-            // exemption `resolve_acquire`'s pre-Ready probe applies. On an
-            // INCAPABLE connection its client-workspace announcement is also
-            // suppressed, so its didOpen may fall outside the server's
-            // folders: accepted — out-of-workspace documents are LSP-legal
-            // (single-file mode), and diverting to the fallback instead
-            // would re-split the session-wide state this routing exists to
-            // unify.
-            let needs_divert = marker
-                .as_ref()
-                .is_some_and(|(root, _folder)| !incapable_shared_serves(&handle, root));
-            if needs_divert {
-                handle.log_incapable_fallback_once(server_name);
-                let remaining = timeout.saturating_sub(start.elapsed());
-                // Reuse the already-resolved `marker` to build the per-root key
-                // directly — re-running `resolve_acquire` here would redo the
-                // filesystem marker walk and re-lock `connections` for the same
-                // result (the shared connection is now Ready+incapable).
-                let per_root_key = ConnectionKey::new(
-                    server_name,
-                    marker
-                        .as_ref()
-                        .map(|(root, _folder)| root.as_str().to_owned()),
-                );
-                if let Some(origin) = reopen_from {
-                    self.arm_reopen_if_key_changed(origin, &per_root_key);
-                }
-                let diverted = self
-                    .acquire_resolved_wait_ready(
-                        server_name,
-                        server_config,
-                        per_root_key,
-                        marker.clone(),
-                        remaining,
-                        false,
-                        admit,
-                    )
-                    .await;
-                // A dynamically registering server makes this divert race its
-                // own registration: the per-root spawn above is usually still
-                // handshaking when the shared instance registers, and the
-                // consolidation that follows retires it mid-wait. Its failure
-                // then means "no longer needed", not "unavailable" — take the
-                // shared instance that just became able to serve this root.
-                if diverted.is_err() && handle.supports_workspace_folder_changes() {
-                    self.announce_shared_root(&handle, &marker).await?;
-                    return Ok(handle);
-                }
-                return diverted;
+        // Divert only a root the connection is not already serving (see
+        // `incapable_shared_refuses`). A marker-less acquisition brings no
+        // marker root of its own, so it rides the shared connection
+        // regardless of the capability — the same exemption
+        // `resolve_acquire`'s pre-Ready probe applies. On an INCAPABLE
+        // connection its client-workspace announcement is also
+        // suppressed, so its didOpen may fall outside the server's
+        // folders: accepted — out-of-workspace documents are LSP-legal
+        // (single-file mode), and diverting to the fallback instead
+        // would re-split the session-wide state this routing exists to
+        // unify.
+        if incapable_shared_refuses(&handle, &marker) {
+            handle.log_incapable_fallback_once(server_name);
+            let remaining = timeout.saturating_sub(start.elapsed());
+            // Reuse the already-resolved `marker` to build the per-root key
+            // directly — re-running `resolve_acquire` here would redo the
+            // filesystem marker walk and re-lock `connections` for the same
+            // result (the shared connection is now Ready+incapable).
+            let per_root_key = ConnectionKey::new(
+                server_name,
+                marker
+                    .as_ref()
+                    .map(|(root, _folder)| root.as_str().to_owned()),
+            );
+            if let Some(origin) = reopen_from {
+                self.arm_reopen_if_key_changed(origin, &per_root_key);
             }
+            let diverted = self
+                .acquire_resolved_wait_ready(
+                    server_name,
+                    server_config,
+                    per_root_key,
+                    marker.clone(),
+                    remaining,
+                    false,
+                    admit,
+                )
+                .await;
+            // A dynamically registering server makes this divert race its
+            // own registration: the per-root spawn above is usually still
+            // handshaking when the shared instance registers, and the
+            // consolidation that follows retires it mid-wait. Its failure
+            // then means "no longer needed", not "unavailable" — take the
+            // shared instance that just became able to serve this root.
+            if diverted.is_err() && handle.supports_workspace_folder_changes() {
+                self.announce_shared_root(&handle, &marker).await?;
+                return Ok(handle);
+            }
+            return diverted;
         }
 
         // Announce the (possibly newly-joined) root before the caller opens any
@@ -5162,6 +5157,21 @@ impl LanguageServerPool {
             .recover_poison("LanguageServerPool::unregister_all_for_upstream_id")
             .remove(upstream_id);
     }
+}
+
+/// Whether an acquisition carrying `marker` must not take `handle`: a shared
+/// connection without folder-change support that does not already serve the
+/// marker root (per [`incapable_shared_serves`]). A marker-less acquisition
+/// brings no root, so it is never refused.
+fn incapable_shared_refuses(
+    handle: &ConnectionHandle,
+    marker: &Option<(Url, tower_lsp_server::ls_types::WorkspaceFolder)>,
+) -> bool {
+    handle.key().is_shared()
+        && !handle.supports_workspace_folder_changes()
+        && marker
+            .as_ref()
+            .is_some_and(|(root, _folder)| !incapable_shared_serves(handle, root))
 }
 
 /// Served-root proof for the incapable-shared divert: whether `handle` — a
