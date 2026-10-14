@@ -176,8 +176,7 @@ pub(super) fn resolve_region_offset(
 /// (an inbound edit, a showDocument selection): the offset translates
 /// through the map of the text that connection holds, and `None` when that
 /// text describes no current host position (see
-/// [`BridgeCoordinator::held_presentation`]). Also returns the virtual text
-/// it was built for.
+/// [`BridgeCoordinator::held_presentation`]).
 pub(super) fn resolve_region_offset_for_connection(
     documents: &DocumentStore,
     language: &Arc<LanguageCoordinator>,
@@ -185,7 +184,7 @@ pub(super) fn resolve_region_offset_for_connection(
     host_url: &Url,
     region_id: &str,
     connection: &crate::lsp::bridge::ConnectionKey,
-) -> Option<((RegionOffset, Position, bool, String), String)> {
+) -> Option<(RegionOffset, Position, bool, String)> {
     let resolved = resolve_region(documents, language, bridge, host_url, region_id)?;
     let presentation = bridge.held_presentation(
         host_url,
@@ -194,16 +193,12 @@ pub(super) fn resolve_region_offset_for_connection(
         &resolved.virtual_content,
         connection,
     );
-    let virtual_text = resolved.virtual_content.clone();
     let (offset, region_end, contiguous, injection_language) = resolved_region_geometry(resolved);
     Some((
-        (
-            presentation.offset(offset)?,
-            region_end,
-            contiguous,
-            injection_language,
-        ),
-        virtual_text,
+        presentation.offset(offset)?,
+        region_end,
+        contiguous,
+        injection_language,
     ))
 }
 

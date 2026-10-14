@@ -132,15 +132,14 @@ impl ShowDocumentTranslator {
         region_id: &str,
         connection: &crate::lsp::bridge::ConnectionKey,
     ) -> Option<RegionOffset> {
-        let ((offset, _region_end, _contiguous, _language), _) =
-            resolve_region_offset_for_connection(
-                &self.documents,
-                &self.language,
-                &self.bridge,
-                host_url,
-                region_id,
-                connection,
-            )?;
+        let (offset, _region_end, _contiguous, _language) = resolve_region_offset_for_connection(
+            &self.documents,
+            &self.language,
+            &self.bridge,
+            host_url,
+            region_id,
+            connection,
+        )?;
         Some(offset)
     }
 }

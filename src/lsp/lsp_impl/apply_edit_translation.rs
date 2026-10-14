@@ -174,7 +174,7 @@ impl ApplyEditTranslator {
         // Through the map of the text the sending connection holds: an
         // unversioned edit skips the version check, and a versioned one can
         // pass it just before a send replaces that text.
-        let Some(((offset, region_end, contiguous, _), _)) = resolve_region_offset_for_connection(
+        let Some((offset, region_end, contiguous, _)) = resolve_region_offset_for_connection(
             &self.documents,
             &self.language,
             &self.bridge,
