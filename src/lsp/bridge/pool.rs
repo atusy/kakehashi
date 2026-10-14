@@ -2884,6 +2884,20 @@ impl LanguageServerPool {
             .filter(|cached| provided.map.is_none() || cached.map.is_some())
             .map_or(provided, LatestText::as_sent);
         let did_open = build_didopen_notification(virtual_uri, virtual_content.text);
+        // What the connection holds is recorded before the didOpen can reach
+        // it: a server pushing diagnostics the moment it opens the document
+        // must find its text on record when the reader stamps the push. (The
+        // fingerprint also keeps the first position-only host edit, which
+        // leaves this region's content unchanged, from re-sending a
+        // didChange — and flickering a server that clears on didChange,
+        // #422.) A didOpen that never goes out takes the record with its
+        // claim: the rollback below, or the claim guard's on cancellation.
+        self.document_tracker.record_sent(
+            virtual_uri,
+            connection_key,
+            virtual_content,
+            Some(crate::lsp::bridge::protocol::DIDOPEN_VERSION),
+        );
         if let Err(e) = sender.send_notification(did_open).await {
             self.document_tracker
                 .rollback_open_claim_if(host_uri, virtual_uri, connection_key, &claim)
@@ -2906,13 +2920,6 @@ impl LanguageServerPool {
         let promotion_connection_key = connection_key.clone();
         let promotion_claim = Arc::clone(&claim);
         let transition_locks = Arc::clone(&self.open_transition_locks);
-        // What the connection now holds is recorded by the promotion too, under
-        // the transition lock like every other send: the caller may be
-        // cancelled once didOpen is queued (a losing fan-out arm, an editor
-        // cancel), and a document open with nothing on record would read as
-        // holding no prepared text.
-        let held_text = virtual_content.text.to_owned();
-        let held_map = virtual_content.map.cloned();
         let promotion = tokio::spawn(async move {
             let promoted = queued
                 && tracker
@@ -2923,25 +2930,7 @@ impl LanguageServerPool {
                         &promotion_claim,
                     )
                     .await;
-            if promoted {
-                // The didOpen was confirmed enqueued (the `MessageSender` maps
-                // `Queued` → `Ok`), so seed the content fingerprint with the
-                // opened content. Without this, the FIRST position-only host
-                // edit — which leaves this region's content unchanged — would
-                // still re-send a didChange (and, for a server that clears on
-                // didChange, flicker the diagnostics) because no fingerprint
-                // existed to compare against (#422).
-                tracker
-                    .record_sent_content_fingerprint(
-                        &promotion_virtual_uri,
-                        &promotion_connection_key,
-                        SentText {
-                            text: &held_text,
-                            map: held_map.as_ref(),
-                        },
-                    )
-                    .await;
-            } else {
+            if !promoted {
                 tracker
                     .rollback_open_claim_if(
                         &promotion_host_uri,
@@ -3190,8 +3179,7 @@ impl LanguageServerPool {
             .await
     }
 
-    /// [`Self::record_sent_content_fingerprint`] for a send that knows its
-    /// version: synchronous, so it cannot be cancelled away from its send.
+    /// See [`DocumentTracker::record_sent`].
     pub(super) fn record_sent_content(
         &self,
         virtual_uri: &VirtualDocumentUri,
@@ -9405,6 +9393,81 @@ mod tests {
         )
         .await
         .expect("no re-open outstanding, so no wait");
+    }
+
+    #[tokio::test]
+    async fn a_didopen_finds_its_text_on_record_as_it_goes_out_and_takes_it_back_if_it_does_not() {
+        /// Notes whether the connection's text is on record as the didOpen
+        /// is handed over, then blocks (as a full queue would).
+        struct ObservingSender {
+            tracker: Arc<DocumentTracker>,
+            virtual_uri: String,
+            connection_key: ConnectionKey,
+            on_record: Arc<std::sync::Mutex<Option<bool>>>,
+            entered: Arc<tokio::sync::Notify>,
+        }
+
+        impl message_sender::MessageSender for ObservingSender {
+            async fn send_notification<P: serde::Serialize + Send>(
+                &mut self,
+                _notification: JsonRpcNotification<P>,
+            ) -> io::Result<()> {
+                let held = self
+                    .tracker
+                    .held_text(&self.virtual_uri, &self.connection_key)
+                    .is_some();
+                *self.on_record.lock().unwrap() = Some(held);
+                self.entered.notify_one();
+                std::future::pending().await
+            }
+        }
+
+        let pool = Arc::new(LanguageServerPool::new());
+        let host_uri = Url::parse("file:///test/record.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let connection_key = ConnectionKey::for_server("lua");
+        let on_record = Arc::new(std::sync::Mutex::new(None));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let task = {
+            let pool = Arc::clone(&pool);
+            let mut sender = ObservingSender {
+                tracker: Arc::clone(&pool.document_tracker),
+                virtual_uri: virtual_uri.to_uri_string(),
+                connection_key: connection_key.clone(),
+                on_record: Arc::clone(&on_record),
+                entered: Arc::clone(&entered),
+            };
+            let host_uri = host_uri.clone();
+            let virtual_uri = virtual_uri.clone();
+            let connection_key = connection_key.clone();
+            tokio::spawn(async move {
+                pool.ensure_document_opened(
+                    &mut sender,
+                    &host_uri,
+                    &virtual_uri,
+                    "print('x')",
+                    &connection_key,
+                )
+                .await
+            })
+        };
+        entered.notified().await;
+        // A push the server sends as it opens the document finds it.
+        assert_eq!(*on_record.lock().unwrap(), Some(true));
+        // Never sent: the record goes with the claim.
+        task.abort();
+        let _ = task.await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool
+                .document_tracker
+                .held_text(&virtual_uri.to_uri_string(), &connection_key)
+                .is_some()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the aborted didOpen's record is rolled back");
     }
 
     #[tokio::test]

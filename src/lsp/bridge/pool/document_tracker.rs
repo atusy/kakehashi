@@ -702,13 +702,9 @@ impl DocumentTracker {
         Some(*version)
     }
 
-    /// Record the content just **successfully enqueued** (`didOpen` or
-    /// `didChange`) to this connection: its fingerprint, so a later edit
-    /// leaving the region's content identical is skipped (#422), and the
-    /// prepared map it was sent with (see [`HeldText`]). Call this only after
-    /// the send returns `Queued` — recording before the send (or on a dropped
-    /// send) would mark content the server never received, defeating the
-    /// self-heal on the next edit.
+    /// [`Self::record_sent`] under the version this connection's counter
+    /// holds for the document now, as a test simulating a send needs.
+    #[cfg(test)]
     pub(super) async fn record_sent_content_fingerprint(
         &self,
         virtual_uri: &VirtualDocumentUri,
@@ -728,9 +724,15 @@ impl DocumentTracker {
         self.record_sent(virtual_uri, connection_key, content, version);
     }
 
-    /// [`Self::record_sent_content_fingerprint`] for a send that knows the
-    /// version it went out under: synchronous, so a caller cancelled once
-    /// its didChange is enqueued cannot leave the record behind.
+    /// Record the content a `didOpen` or `didChange` hands this connection,
+    /// under the version it goes out with: its fingerprint, so a later edit
+    /// leaving the region's content identical is skipped (#422), and the
+    /// prepared map it was sent with (see [`HeldText`]). Synchronous, so a
+    /// caller cancelled around its send cannot leave the record behind. A
+    /// record must not outlive a send that never went out — it would mark
+    /// content the server never received, defeating the self-heal on the
+    /// next edit: a didChange records once enqueued, a didOpen before it is
+    /// queued and takes the record back with its claim if it is not.
     pub(super) fn record_sent(
         &self,
         virtual_uri: &VirtualDocumentUri,
