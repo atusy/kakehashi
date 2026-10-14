@@ -1399,6 +1399,13 @@ impl LineMap {
 
     /// Byte offset of `position`, or `None` unless it names a real location.
     fn offset_strict(&self, position: Position) -> Option<usize> {
+        // A line has no more UTF-16 units than bytes: a column past its byte
+        // length names nothing, and is refused before the index adds it to
+        // the line's start (which a column near `u32::MAX` would overflow).
+        let line = self.index.0.line(position.line)?;
+        if position.character > u32::from(line.len()) {
+            return None;
+        }
         let line_col = self.index.0.to_utf8(
             WideEncoding::Utf16,
             WideLineCol {
@@ -1717,6 +1724,15 @@ fn diff_hunks(old: &str, new: &str) -> Vec<Hunk> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_column_past_any_line_names_no_location() {
+        let lines = LineMap::new("\n ".to_string());
+        assert_eq!(lines.offset_strict(Position::new(1, u32::MAX)), None);
+        assert_eq!(lines.offset_strict(Position::new(1, 2)), None);
+        assert_eq!(lines.offset_strict(Position::new(1, 1)), Some(2));
+        assert_eq!(lines.offset_clamped(Position::new(1, u32::MAX)), 2);
+    }
 
     #[test]
     fn a_clamped_offset_is_where_a_scan_of_its_line_stops() {
