@@ -2489,10 +2489,16 @@ mod tests {
         let map = prepared.map.unwrap();
         let insert = edit((0, 0), (0, 0), "a");
         let replace = edit((0, 0), (0, 2), "if");
-        let forward = map.map_edits(&[insert.clone(), replace.clone()], EditMode::Extent);
-        let backward = map.map_edits(&[replace, insert], EditMode::Extent);
-        assert!(forward.is_some());
-        assert!(backward.is_some());
+        let forward = map
+            .map_edits(&[insert.clone(), replace.clone()], EditMode::Extent)
+            .unwrap();
+        let backward = map.map_edits(&[replace, insert], EditMode::Extent).unwrap();
+        let (virtual_text, _) = dedented();
+        assert_eq!(
+            apply_to(&virtual_text, &forward),
+            apply_to(&virtual_text, &backward)
+        );
+        assert_eq!(apply_to(&virtual_text, &forward), "  aif x:\n    y\n");
     }
 
     #[test]
