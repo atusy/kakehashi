@@ -2176,7 +2176,7 @@ impl LanguageServerPool {
         version: Option<i32>,
     ) -> Option<crate::lsp::diagnostic_cache::HeldStamp> {
         self.document_tracker
-            .held_stamp(virtual_uri, connection_key, version)
+            .held_stamp(virtual_uri, connection_key, version, u64::MAX)
     }
 
     /// Whether any connection was ever sent a prepared text: until then,

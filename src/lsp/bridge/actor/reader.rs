@@ -990,7 +990,7 @@ async fn handle_message(
                 // (push-propagation-diagnostic-forwarding) instead of dropping (#380).
                 // `message` is owned and discarded after this arm, so move it in and
                 // deserialize the diagnostics by value (no string clones).
-                text_document::publish_diagnostics::forward_push(message, deps);
+                text_document::publish_diagnostics::forward_push(message, deps, held_through);
             } else if message["method"].as_str() == Some("$/progress") {
                 window::progress::forward(&message, server_prefix, deps);
             } else if message["method"].as_str() == Some("$/cancelRequest") {
@@ -3593,7 +3593,9 @@ mod tests {
             );
         };
         send("a");
-        let when_read = tracker.held_stamp(&uri, &connection, None).unwrap();
+        let when_read = tracker
+            .held_stamp(&uri, &connection, None, u64::MAX)
+            .unwrap();
         let message = json!({
             "jsonrpc": "2.0",
             "method": "textDocument/publishDiagnostics",
@@ -3602,11 +3604,30 @@ mod tests {
         handle_message(message, &router, "", &deps, u64::MAX).await;
         // The next text goes out while the push waits upstream.
         send("b");
-        let now = tracker.held_stamp(&uri, &connection, None).unwrap();
+        let now = tracker
+            .held_stamp(&uri, &connection, None, u64::MAX)
+            .unwrap();
         assert_ne!(when_read.generation, now.generation);
         match upstream_rx.try_recv().expect("the push is routed upstream") {
             UpstreamNotification::PublishDiagnostics { held, .. } => {
                 assert_eq!(held, Some(when_read));
+            }
+            _ => panic!("expected PublishDiagnostics"),
+        }
+        // Arrived before the next text was recorded, but read after: it
+        // was not computed for that text, and places nowhere.
+        let arrived = tracker.held_through();
+        send("c");
+        let message = json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": {"uri": uri, "diagnostics": []}
+        });
+        handle_message(message, &router, "", &deps, arrived).await;
+        match upstream_rx.try_recv().expect("the push is routed upstream") {
+            UpstreamNotification::PublishDiagnostics { held, .. } => {
+                let held = held.unwrap();
+                assert!(held.prepared && held.generation.is_none(), "{held:?}");
             }
             _ => panic!("expected PublishDiagnostics"),
         }

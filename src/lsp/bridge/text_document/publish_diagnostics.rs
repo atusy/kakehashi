@@ -39,6 +39,7 @@ pub(in crate::lsp::bridge) fn is_scratch_publish_diagnostics(message: &serde_jso
 pub(in crate::lsp::bridge) fn forward_push(
     mut message: serde_json::Value,
     deps: &crate::lsp::bridge::actor::ServerRequestDeps,
+    received: u64,
 ) {
     // The server name keys the cache slot; production always sets it (readers are
     // spawned with `Some(server_name)`). Check it by reference up front so a push
@@ -96,7 +97,7 @@ pub(in crate::lsp::bridge) fn forward_push(
     let held = crate::lsp::bridge::protocol::VirtualDocumentUri::is_virtual_uri(&uri)
         .then(|| {
             deps.document_tracker
-                .held_stamp(&uri, &deps.connection_key, version)
+                .held_stamp(&uri, &deps.connection_key, version, received)
         })
         .flatten();
     let _ = deps.upstream_tx.send(

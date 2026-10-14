@@ -942,22 +942,25 @@ impl DocumentTracker {
     /// computed for an earlier text (prepared or not, whatever the
     /// connection holds now), and is stamped to place nowhere — as is one
     /// naming a version with nothing on record: every send is recorded
-    /// before it goes out, so its document was closed since.
+    /// before it goes out, so its document was closed since. So is one read
+    /// before its connection was sent the text it holds now (a generation
+    /// newer than `received`, the watermark taken as the push arrived).
     pub(in crate::lsp::bridge) fn held_stamp(
         &self,
         virtual_uri: &str,
         connection: &ConnectionKey,
         version: Option<i32>,
+        received: u64,
     ) -> Option<crate::lsp::diagnostic_cache::HeldStamp> {
         if !self.ever_held_prepared() {
             return None;
         }
         let held = self.held_text(virtual_uri, connection);
-        if let Some(version) = version
-            && held
-                .as_ref()
+        let stale_version = version.is_some_and(|version| {
+            held.as_ref()
                 .is_none_or(|held| held.version != Some(version))
-        {
+        });
+        if stale_version || held.as_ref().is_some_and(|held| held.generation > received) {
             return Some(crate::lsp::diagnostic_cache::HeldStamp {
                 connection: connection.clone(),
                 generation: None,
