@@ -244,7 +244,7 @@ The sequential formatter pipeline described above
 }
 ```
 
-Restore the markers yourself:
+Restore the comment markers yourself:
 
 ```rust
 // {
