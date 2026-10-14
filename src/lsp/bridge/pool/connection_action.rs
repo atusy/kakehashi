@@ -50,7 +50,8 @@ pub(crate) enum BridgeError {
     /// Carried as `io::ErrorKind::Interrupted`: the acquisition was overtaken
     /// by the server, not failed by it. Unlike the other interrupted
     /// acquisitions (shutdown, supersession), re-resolving now diverts the
-    /// root, so acquisition entry points retry exactly this one.
+    /// root, so acquisition entry points retry it (see
+    /// [`BridgeError::reroutes`]).
     FolderSupportWithdrawn,
     /// Routing chose a shared instance that has since come up without
     /// folder-change support and does not serve the acquisition's marker
