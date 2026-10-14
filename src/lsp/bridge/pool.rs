@@ -5587,10 +5587,27 @@ impl PrepareAdvertisements {
             .recover_poison("PrepareAdvertisements::start_failures")
     }
 
-    /// Take `handle` as the connection serving its key from now on.
+    /// Take `handle` as the connection serving its key from now on. What the
+    /// connection it replaces advertised goes with it: until `handle`'s own
+    /// handshake records, the key advertises nothing — and should that
+    /// handshake fail, the server is not left counting a connection gone.
     fn adopt(&self, handle: &Arc<ConnectionHandle>) {
-        self.current
-            .insert(handle.key().clone(), Arc::downgrade(handle));
+        // Held across the removal, as in `record_from`.
+        let mut current = self.current.entry(handle.key().clone()).or_default();
+        *current = Arc::downgrade(handle);
+        let removed = self.forget(handle.key());
+        drop(current);
+        if removed {
+            self.invalidate();
+        }
+    }
+
+    /// Drop `connection`'s record; `true` when there was one.
+    fn forget(&self, connection: &ConnectionKey) -> bool {
+        // An emptied entry aggregates as none recorded, like a missing one.
+        self.by_server
+            .get_mut(connection.server())
+            .is_some_and(|mut connections| connections.remove(connection).is_some())
     }
 
     /// Forget `handle`'s advertisement as it leaves the pool with no
@@ -5605,11 +5622,7 @@ impl PrepareAdvertisements {
             return;
         }
         *current = std::sync::Weak::new();
-        // An emptied entry aggregates as none recorded, like a missing one.
-        let removed = self
-            .by_server
-            .get_mut(handle.key().server())
-            .is_some_and(|mut connections| connections.remove(handle.key()).is_some());
+        let removed = self.forget(handle.key());
         drop(current);
         if removed {
             self.invalidate();
@@ -5818,6 +5831,30 @@ mod tests {
         // The retired connection's handshake, finishing late, changes nothing.
         assert!(!pool.record_prepare_advertisement_from(&retired, false));
         assert_eq!(pool.prepare_advertisement("peer"), Some(true));
+    }
+
+    #[tokio::test]
+    async fn a_replacement_starts_with_nothing_advertised_for_its_key() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("peer");
+        let failed =
+            test_helpers::create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        pool.prepare_advertisements.adopt(&failed);
+        pool.record_prepare_advertisement_from(&failed, true);
+        assert_eq!(pool.prepare_advertisement("peer"), Some(true));
+        let epoch = pool.prepare_advertised_epoch();
+
+        // Replaced (say after a crash): the replacement's handshake, which
+        // may fail, has recorded nothing yet.
+        let replacement =
+            test_helpers::create_handle_with_key(ConnectionState::Initializing, key.clone()).await;
+        pool.prepare_advertisements.adopt(&replacement);
+        assert_eq!(
+            pool.prepare_advertisement("peer"),
+            None,
+            "the replaced connection's advertisement went with it"
+        );
+        assert!(pool.prepare_advertised_epoch() > epoch);
     }
 
     #[tokio::test]
