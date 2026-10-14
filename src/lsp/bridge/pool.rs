@@ -389,8 +389,10 @@ pub(crate) struct HostVirtualContents {
 pub(crate) struct LatestText {
     text: String,
     map: Option<Arc<super::protocol::PreparedMap>>,
-    /// When it was recorded (see [`super::protocol::next_presentation`]).
-    recorded: u64,
+    /// When it was last recorded (see [`super::protocol::next_presentation`]),
+    /// the same text recorded again included: the pass recording it decided
+    /// on it then.
+    recorded: std::sync::atomic::AtomicU64,
 }
 
 impl LatestText {
@@ -2918,9 +2920,9 @@ impl LanguageServerPool {
             .as_deref()
             .filter(|cached| {
                 cached.map.is_some()
-                    || provided
-                        .map
-                        .is_none_or(|request| cached.recorded > request.built())
+                    || provided.map.is_none_or(|request| {
+                        cached.recorded.load(std::sync::atomic::Ordering::Relaxed) > request.built()
+                    })
             })
             .map_or(provided, LatestText::as_sent);
         let did_open = build_didopen_notification(virtual_uri, virtual_content.text);
@@ -3019,13 +3021,17 @@ impl LanguageServerPool {
             Arc::new(LatestText {
                 text: content.text.to_string(),
                 map: content.map.cloned(),
-                recorded: super::protocol::next_presentation(),
+                recorded: std::sync::atomic::AtomicU64::new(super::protocol::next_presentation()),
             })
         };
         if let Some(regions) = host.contents.get(language) {
-            if regions.get(region_id).is_some_and(|cached| {
+            if let Some(cached) = regions.get(region_id).filter(|cached| {
                 cached.text == content.text && cached.map.as_deref() == content.map.map(Arc::as_ref)
             }) {
+                cached.recorded.store(
+                    super::protocol::next_presentation(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 return;
             }
             regions.insert(region_id.to_string(), latest());
@@ -8652,8 +8658,10 @@ mod tests {
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
         let key = ConnectionKey::for_server("lua");
         pool.open_host_incarnation(&host_uri, 1).await;
-        // The request's answer, then the lifecycle pass sending the text as
+        // The text forwarded as is before the pair gained its peer, the
+        // request's answer, then the lifecycle pass sending the same text as
         // is once the pair lost its peer.
+        pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  a");
         let result = serde_json::from_value(serde_json::json!({"segments": [{"type": "content", "changes": [
             {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
         ]}]}))
