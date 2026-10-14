@@ -357,10 +357,9 @@ impl Kakehashi {
         // Forward root_uri and workspace_folders to bridge pool for downstream server initialization
         let workspace_folders_for_bridge =
             bridge_workspace_folders(&params, root_uri_for_bridge.as_deref());
-        self.bridge.pool().set_root_uri(root_uri_for_bridge);
         self.bridge
             .pool()
-            .set_workspace_folders(workspace_folders_for_bridge);
+            .seed_client_workspace(root_uri_for_bridge, workspace_folders_for_bridge);
         // Clients without codeActionLiteralSupport only understand
         // `Command[]` responses. The bridge surfaces CodeAction literals and
         // cannot guarantee a Command-only response (bare downstream Commands
