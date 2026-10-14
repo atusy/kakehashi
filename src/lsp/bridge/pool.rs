@@ -2857,9 +2857,10 @@ impl LanguageServerPool {
         // A cached text sent as is, while the request is prepared, was sent
         // before the pair gained its peer: a prepared pair must not be opened
         // with it. The reverse — a prepared cache for a request built as is —
-        // is the lifecycle pass's newer text (the pair gained its peer since),
-        // which the server should hold even though this request then fails
-        // its own check.
+        // is most likely the lifecycle pass's newer text (the pair gained its
+        // peer since), which the server should hold even though this request
+        // then fails its own check; right after a pair lost its peer, it is
+        // the older one, which the lifecycle pass replaces on its next send.
         let virtual_content = current_content
             .as_deref()
             .filter(|cached| provided.map.is_none() || cached.map.is_some())
