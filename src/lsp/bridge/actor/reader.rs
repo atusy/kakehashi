@@ -84,6 +84,9 @@ pub(crate) enum UpstreamNotification {
         /// cached slot so a later reader exit can evict only this connection's slots,
         /// never a restarted connection's (which gets a fresh id) (#469).
         connection_id: crate::lsp::bridge::ProgressConnectionId,
+        /// The originating connection's key: what it holds for the published
+        /// document decides how a region push's coordinates translate.
+        connection: ConnectionKey,
         /// The pushed diagnostics, in the published document's own coordinates
         /// (virtual for a region push, host for a `_self` push).
         diagnostics: Vec<tower_lsp_server::ls_types::Diagnostic>,
@@ -3531,9 +3534,11 @@ mod tests {
                 uri,
                 server,
                 connection_id,
+                connection,
                 diagnostics,
             } => {
                 assert_eq!(connection_id, deps.progress_connection_id);
+                assert_eq!(connection, deps.connection_key);
                 assert!(uri.contains("kakehashi-virtual-uri-REGION"));
                 assert_eq!(server, "luals");
                 assert_eq!(diagnostics.len(), 1);

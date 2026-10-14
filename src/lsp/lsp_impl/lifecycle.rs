@@ -1217,11 +1217,13 @@ async fn deliver_upstream_batch(
                 uri,
                 server,
                 connection_id,
+                connection,
                 diagnostics,
             } => pushes.push(DiagnosticPush {
                 uri,
                 server,
                 connection_id,
+                connection,
                 diagnostics,
             }),
             barrier => {
@@ -1320,6 +1322,7 @@ fn coalesce_upstream_batch(
                 uri,
                 server,
                 connection_id,
+                connection,
                 diagnostics,
             } => {
                 let idx = output.len();
@@ -1336,6 +1339,7 @@ fn coalesce_upstream_batch(
                     uri,
                     server,
                     connection_id,
+                    connection,
                     diagnostics,
                 }));
             }
@@ -2270,6 +2274,7 @@ async fn deliver_upstream_notification(
             uri,
             server,
             connection_id,
+            connection,
             diagnostics,
         } => {
             // Cache the downstream push and republish the merged host set
@@ -2282,7 +2287,7 @@ async fn deliver_upstream_notification(
                 delivery_context.map(|context| context.diagnostic_publisher.as_ref())
             {
                 publisher
-                    .publish_push(uri, server, connection_id, diagnostics)
+                    .publish_push(uri, server, connection_id, connection, diagnostics)
                     .await;
             }
         }
@@ -3443,6 +3448,7 @@ mod tests {
                 uri: uri.to_string(),
                 server: "srv".to_string(),
                 connection_id: ProgressConnectionId::for_test(conn),
+                connection: crate::lsp::bridge::ConnectionKey::for_server("srv"),
                 diagnostics: vec![Diagnostic {
                     message: msg.to_string(),
                     ..Default::default()
@@ -3456,6 +3462,7 @@ mod tests {
                 uri: uri.to_string(),
                 server: "srv".to_string(),
                 connection_id: ProgressConnectionId::for_test(conn),
+                connection: crate::lsp::bridge::ConnectionKey::for_server("srv"),
                 diagnostics: vec![],
             }
         }

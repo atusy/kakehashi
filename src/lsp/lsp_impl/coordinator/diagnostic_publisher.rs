@@ -25,7 +25,7 @@ use crate::lsp::bridge::{
     BridgeCoordinator, ProgressConnectionId, RegionOffset, VirtualDocumentUri,
 };
 use crate::lsp::diagnostic_cache::{
-    DiagnosticAggregator, DiagnosticSource, merge_cached_diagnostics,
+    DiagnosticAggregator, DiagnosticSource, HeldStamp, merge_cached_diagnostics,
 };
 use crate::lsp::lsp_impl::Kakehashi;
 use crate::lsp::lsp_impl::coordinator::diagnostic::DiagnosticSnapshotPreparer;
@@ -43,6 +43,8 @@ pub(crate) struct DiagnosticPush {
     pub(crate) uri: String,
     pub(crate) server: String,
     pub(crate) connection_id: ProgressConnectionId,
+    /// The originating connection's key (see `held_stamp`).
+    pub(crate) connection: crate::lsp::bridge::ConnectionKey,
     pub(crate) diagnostics: Vec<Diagnostic>,
 }
 
@@ -649,12 +651,14 @@ impl DiagnosticPublisher {
         uri: String,
         server: String,
         connection_id: ProgressConnectionId,
+        connection: crate::lsp::bridge::ConnectionKey,
         diagnostics: Vec<Diagnostic>,
     ) {
         self.publish_push_batch(vec![DiagnosticPush {
             uri,
             server,
             connection_id,
+            connection,
             diagnostics,
         }])
         .await;
@@ -667,12 +671,27 @@ impl DiagnosticPublisher {
     pub(crate) async fn publish_push_batch(&self, pushes: Vec<DiagnosticPush>) -> usize {
         let mut index_of: HashMap<Url, usize> = HashMap::new();
         let mut hosts: Vec<RecordedHost> = Vec::new();
-        for push in pushes {
+        // Stamped before any await below: a region push is in the coordinates
+        // of the text its connection holds when it arrives, which a send
+        // queued while this batch resolves its hosts must not replace. (A
+        // push still queued for this task when such a send happens is no
+        // different from one late on the wire: it carries no text to compare.)
+        let stamped: Vec<(DiagnosticPush, Option<HeldStamp>)> = pushes
+            .into_iter()
+            .map(|push| {
+                let held = VirtualDocumentUri::is_virtual_uri(&push.uri)
+                    .then(|| self.bridge.held_stamp(&push.uri, &push.connection))
+                    .flatten();
+                (push, held)
+            })
+            .collect();
+        for (push, held) in stamped {
             let recorded = if VirtualDocumentUri::is_virtual_uri(&push.uri) {
                 self.record_region_push(
                     &push.uri,
                     push.server,
                     push.connection_id,
+                    held,
                     push.diagnostics,
                 )
                 .await
@@ -958,8 +977,12 @@ impl DiagnosticPublisher {
         connection_id: ProgressConnectionId,
         diagnostics: Vec<Diagnostic>,
     ) {
+        let held = self.bridge.held_stamp(
+            virtual_uri,
+            &crate::lsp::bridge::ConnectionKey::for_server(&server),
+        );
         if let Some(RecordedPush { host, changed }) = self
-            .record_region_push(virtual_uri, server, connection_id, diagnostics)
+            .record_region_push(virtual_uri, server, connection_id, held, diagnostics)
             .await
         {
             self.publish_recorded_hosts(vec![(host, changed.into_iter().collect())])
@@ -972,6 +995,7 @@ impl DiagnosticPublisher {
         virtual_uri: &str,
         server: String,
         connection_id: ProgressConnectionId,
+        held: Option<HeldStamp>,
         diagnostics: Vec<Diagnostic>,
     ) -> Option<RecordedPush> {
         let Some((host, region_id)) = self.bridge.resolve_virtual_uri(virtual_uri).await else {
@@ -999,14 +1023,10 @@ impl DiagnosticPublisher {
             );
             return None;
         }
-        // Stamped with what the connection holds now: a prepared text's push
-        // places through that text's map only while the connection still
-        // holds it (see `BridgeCoordinator::place_push`), so a send replacing
-        // it while this push is recorded cannot leave it misplaced. A server
-        // pushing late for the text before one it was just sent is not caught
-        // here, any more than for an unprepared document: the push carries no
-        // text to compare.
-        let held = self.bridge.held_stamp(virtual_uri, connection_id).await;
+        // The stamp (what the connection held when the push arrived) places a
+        // prepared text's push through that text's map only while the
+        // connection still holds it (see `BridgeCoordinator::place_push`), so
+        // a send replacing it meanwhile cannot leave it misplaced.
         let slot = (DiagnosticSource::Region(region_id.clone()), server.clone());
         let changed = self.aggregator.record_held(
             &host,
@@ -3420,12 +3440,14 @@ mod tests {
                     uri: uri.to_string(),
                     server: "rust_ls".to_string(),
                     connection_id: ProgressConnectionId::for_test(1),
+                    connection: crate::lsp::bridge::ConnectionKey::for_server("rust_ls"),
                     diagnostics: vec![diag("superseded")],
                 },
                 DiagnosticPush {
                     uri: uri.to_string(),
                     server: "rust_ls".to_string(),
                     connection_id: ProgressConnectionId::for_test(1),
+                    connection: crate::lsp::bridge::ConnectionKey::for_server("rust_ls"),
                     diagnostics: vec![diag("latest")],
                 },
             ])

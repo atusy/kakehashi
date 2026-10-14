@@ -2059,18 +2059,6 @@ impl LanguageServerPool {
         self.document_tracker.ever_held_prepared()
     }
 
-    /// The key of the live connection `connection_id`, if any.
-    pub(crate) async fn connection_key_for_id(
-        &self,
-        connection_id: super::ProgressConnectionId,
-    ) -> Option<ConnectionKey> {
-        let connections = self.connections.lock().await;
-        connections
-            .values()
-            .find(|handle| handle.connection_id() == Some(connection_id))
-            .map(|handle| handle.key().clone())
-    }
-
     /// Find ALL connections (`(server, root)` keys) that have opened a given
     /// virtual document URI.
     ///

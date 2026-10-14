@@ -90,6 +90,7 @@ pub(in crate::lsp::bridge) fn forward_push(
             uri,
             server: server_name.to_owned(),
             connection_id: deps.progress_connection_id,
+            connection: deps.connection_key.clone(),
             diagnostics,
         },
     );

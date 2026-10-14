@@ -719,23 +719,21 @@ impl BridgeCoordinator {
         held_presentation(held, virtual_text)
     }
 
-    /// What the connection `connection_id` holds for `virtual_uri` now, to
-    /// stamp a push it sent with (see
-    /// [`crate::lsp::diagnostic_cache::HeldStamp`]); `None` when the
-    /// connection is gone, or when no connection was ever sent a prepared
-    /// text — every one then holds its text as is, which needs no stamp.
-    pub(crate) async fn held_stamp(
+    /// What `connection` holds for `virtual_uri` now, to stamp a push it
+    /// sent with (see [`crate::lsp::diagnostic_cache::HeldStamp`]); `None`
+    /// when no connection was ever sent a prepared text — every one then
+    /// holds its text as is, which needs no stamp.
+    pub(crate) fn held_stamp(
         &self,
         virtual_uri: &str,
-        connection_id: crate::lsp::bridge::ProgressConnectionId,
+        connection: &crate::lsp::bridge::pool::ConnectionKey,
     ) -> Option<crate::lsp::diagnostic_cache::HeldStamp> {
         if !self.pool.ever_held_prepared() {
             return None;
         }
-        let connection = self.pool.connection_key_for_id(connection_id).await?;
-        let held = self.pool.held_text(virtual_uri, &connection);
+        let held = self.pool.held_text(virtual_uri, connection);
         Some(crate::lsp::diagnostic_cache::HeldStamp {
-            connection,
+            connection: connection.clone(),
             generation: held.as_ref().map(|held| held.generation),
             prepared: held.is_some_and(|held| held.map.is_some()),
         })
@@ -3040,6 +3038,53 @@ mod tests {
             generation: Some(held.generation),
             prepared: held.map.is_some(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_push_is_stamped_with_what_its_connection_holds() {
+        use crate::lsp::bridge::protocol::{
+            VirtualDocumentUri, VirtualLayout, apply_prepare_result,
+        };
+        let coordinator = BridgeCoordinator::new();
+        let host = Url::parse("file:///doc.nix").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host).unwrap(),
+            "json",
+            "01J0000000000000000000000A",
+        );
+        let uri = virtual_uri.to_uri_string();
+        let connection = ConnectionKey::for_server("jsonls");
+        let other = ConnectionKey::for_server("other");
+        coordinator
+            .record_sent_content_for_test(&virtual_uri, &connection, "x")
+            .await;
+        // Nothing was ever sent prepared: no stamp needed.
+        assert_eq!(coordinator.held_stamp(&uri, &connection), None);
+        let prepared = apply_prepare_result("x", &VirtualLayout::single("x"), None).unwrap();
+        coordinator
+            .record_sent_content_for_test(
+                &virtual_uri,
+                &connection,
+                crate::lsp::bridge::SentText {
+                    text: &prepared.text,
+                    map: prepared.map.as_ref(),
+                },
+            )
+            .await;
+        let stamp = coordinator.held_stamp(&uri, &connection).unwrap();
+        assert_eq!(stamp.connection, connection);
+        assert!(stamp.prepared);
+        assert_eq!(
+            stamp.generation,
+            coordinator
+                .pool
+                .held_text(&uri, &connection)
+                .map(|held| held.generation)
+        );
+        // Another connection with nothing on record.
+        let unrecorded = coordinator.held_stamp(&uri, &other).unwrap();
+        assert_eq!(unrecorded.generation, None);
+        assert!(!unrecorded.prepared);
     }
 
     #[tokio::test]
