@@ -2846,8 +2846,13 @@ impl LanguageServerPool {
             ),
             VirtualOpenContent::Snapshot(provided) => (provided, None),
         };
+        // A cached text of the other kind (sent as is while the request is
+        // prepared, or the reverse, across a pair gaining or losing its peer)
+        // is not the newer one of the same document: it is one the request's
+        // coordinates cannot read, which a prepared pair must not open with.
         let virtual_content = current_content
             .as_deref()
+            .filter(|cached| cached.map.is_some() == provided.map.is_some())
             .map_or(provided, LatestText::as_sent);
         let did_open = build_didopen_notification(virtual_uri, virtual_content.text);
         if let Err(e) = sender.send_notification(did_open).await {
@@ -8406,6 +8411,45 @@ mod tests {
             message["params"]["textDocument"]["text"],
             "print('current')"
         );
+    }
+
+    #[tokio::test]
+    async fn a_prepared_open_ignores_a_cached_text_sent_as_is() {
+        use super::super::protocol::{VirtualLayout, apply_prepare_result};
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///test/prepared-open.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        // Forwarded before the pair gained its peer.
+        pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  a");
+        let result = serde_json::from_value(serde_json::json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared =
+            apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(result)).unwrap();
+
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(1);
+        pool.ensure_document_opened(
+            &mut sender,
+            &host_uri,
+            &virtual_uri,
+            SentText {
+                text: &prepared.text,
+                map: prepared.map.as_ref(),
+            },
+            &key,
+        )
+        .await
+        .unwrap();
+
+        let OutboundMessage::Untracked(message) = rx.try_recv().unwrap() else {
+            panic!("didOpen must be an untracked notification");
+        };
+        assert_eq!(message["params"]["textDocument"]["text"], "a");
+        let held = pool.held_text(&virtual_uri.to_uri_string(), &key).unwrap();
+        assert_eq!(held.map, prepared.map);
     }
 
     #[tokio::test]
