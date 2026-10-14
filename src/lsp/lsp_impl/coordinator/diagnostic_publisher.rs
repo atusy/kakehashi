@@ -471,6 +471,10 @@ impl DiagnosticPublisher {
         let mut tasks = tokio::task::JoinSet::new();
         let mut summary = ForwardedPrefetchSummary::default();
         for uri in self.documents.open_uris() {
+            // Read before the snapshot: an advertisement change after it may
+            // re-send what the prepared regions hold (see
+            // `commit_refresh_prefetch`).
+            let prepare_epoch = self.bridge.pool().prepare_advertised_epoch();
             let Some(snapshot) = self.snapshot_preparer.prepare_diagnostic_snapshot(&uri) else {
                 // No snapshot conflates two very different states. A document
                 // that is gone or has no detectable language is covered: the
@@ -529,7 +533,7 @@ impl DiagnosticPublisher {
                 }
                 summary.absorb(
                     publisher
-                        .commit_refresh_prefetch(&uri, lineage, outcome)
+                        .commit_refresh_prefetch(&uri, lineage, prepare_epoch, outcome)
                         .await,
                 );
                 summary
@@ -572,6 +576,7 @@ impl DiagnosticPublisher {
         &self,
         uri: &Url,
         lineage: DiagnosticSnapshotLineage,
+        prepare_epoch: u64,
         outcome: PullLayerOutcome,
     ) -> ForwardedPrefetchSummary {
         let edit_lock = self.documents.edit_lock(uri);
@@ -598,6 +603,21 @@ impl DiagnosticPublisher {
             log::debug!(
                 target: LOG_TARGET,
                 "Discarding refresh prefetch resolved under stale settings for {uri}"
+            );
+            drop(edit_guard);
+            return ForwardedPrefetchSummary {
+                coverage_incomplete: true,
+                ..Default::default()
+            };
+        }
+        // A prepare peer's advertisement changing mid-prefetch re-sends what
+        // the prepared regions hold, and the collection that follows it
+        // (`recollect`) may already have committed: this result was pulled
+        // against the text before, and must not overwrite it.
+        if prepare_epoch != self.bridge.pool().prepare_advertised_epoch() {
+            log::debug!(
+                target: LOG_TARGET,
+                "Discarding refresh prefetch resolved under replaced prepare advertisements for {uri}"
             );
             drop(edit_guard);
             return ForwardedPrefetchSummary {
@@ -2618,6 +2638,7 @@ mod tests {
             .commit_refresh_prefetch(
                 &uri,
                 lineage,
+                server.bridge.pool().prepare_advertised_epoch(),
                 PullLayerOutcome::Publish(vec![diag("old-surface")]),
             )
             .await;
@@ -2634,6 +2655,56 @@ mod tests {
             server.diagnostics.snapshot(&uri).is_empty(),
             "the old-surface result must not reach the cache"
         );
+    }
+
+    /// A prepare peer's advertisement changing mid-prefetch re-sends what the
+    /// prepared regions hold: the result pulled before must not be committed.
+    #[tokio::test]
+    async fn prefetch_under_replaced_prepare_advertisements_is_not_committed() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        register_rust(server);
+        server.settings_manager.apply_settings(rust_settings(true));
+
+        let uri = Url::parse("file:///test/replaced_advertisement_prefetch.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let (incarnation, content_version) = {
+            let doc = server.documents.get(&uri).expect("doc just inserted");
+            (doc.incarnation(), doc.content_version())
+        };
+        let lineage =
+            crate::lsp::lsp_impl::text_document::publish_diagnostic::DiagnosticSnapshotLineage {
+                incarnation,
+                content_version,
+                settings_generation: server.settings_manager.settings_generation(),
+            };
+        let pool = server.bridge.pool();
+        let peer = crate::lsp::bridge::ConnectionKey::for_server("peer");
+        pool.record_prepare_advertisement(&peer, true);
+        let prepare_epoch = pool.prepare_advertised_epoch();
+        // The peer withdraws the request mid-prefetch.
+        assert!(pool.record_prepare_advertisement(&peer, false));
+
+        let publisher = DiagnosticPublisher::new(server);
+        let summary = publisher
+            .commit_refresh_prefetch(
+                &uri,
+                lineage,
+                prepare_epoch,
+                PullLayerOutcome::Publish(vec![diag("pulled before")]),
+            )
+            .await;
+
+        assert!(
+            server.diagnostics.snapshot(&uri).is_empty(),
+            "a result pulled under replaced advertisements must not reach the cache"
+        );
+        assert!(summary.coverage_incomplete);
     }
 
     /// A prefetch that finds a region still waiting for its prepare answer
