@@ -267,8 +267,9 @@ formatting, an answer that adds line breaks to this region is dropped whole,
 like one that breaks a `> ` prefix, and the line is left as it was: the region
 ends on the line it starts on, so a line break would split that host line.
 This guard does not cover a region that also takes its line break, such as one
-from a query capturing the text of a Rust `///` doc comment. There every
-strategy applies the answer, and the new lines lack the `///` too.
+from a query capturing the text of a Rust `///` doc comment. There a formatter
+can add lines without the `///` under either server strategy, and in range and
+on-type formatting, as long as the answer passes the other checks above.
 
 This differs from a fenced code block inside a Markdown blockquote. There the
 text before each line holds only `>` markers and indentation, so the sequential
