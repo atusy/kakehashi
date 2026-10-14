@@ -63,15 +63,21 @@ priorities = ["tsudoi"]
 - When no candidate advertises the request, the document is sent as is.
   Each server's advertisement is remembered from its last handshake (a
   server that answered `MethodNotFound` counts as not advertising until its
-  next one; one that could not start is passed over for that host's
-  documents only, until then, a settings change or the host closing — its
-  connection for another workspace root may be healthy), so a pair none of
-  whose candidates advertises it is not held back per edit to find that
-  out again. Any
-  change of a server's advertisement forgets the answers settled before it
-  and re-syncs open documents without waiting for an edit: a server that
-  starts advertising later has its pairs' documents prepared, and one that
-  withdraws it has them asked of the next candidate (or sent as is).
+  next one), so a pair none of whose candidates advertises it is not held
+  back per edit to find that out again. One that could not start is
+  recorded as failing for that host's documents only — its connection for
+  another workspace root may be healthy — not as not advertising, until a
+  handshake of it advertises the request, a settings change, or the host
+  closing; a failure an attempt saw before such a clearing is not
+  recorded.
+- Any change of a server's advertisement — or a clearing of start
+  failures (but a host's closing), or runtime settings pushed to servers —
+  forgets every answer settled before it and re-syncs open hosts without
+  waiting for an edit: a server that starts advertising later has its
+  pairs' documents prepared, and one that withdraws it has them asked of
+  the next candidate (or sent as is). An attempt that finds the
+  advertisements moved while it asked asks its candidates again, a bounded
+  number of times, and an answer found outdated once set is forgotten.
 
 The feature is dormant unless `KAKEHASHI_EXPERIMENTAL=true`. Only pairs
 that are bridged and have a server for the injection language are
@@ -147,9 +153,17 @@ diffed, so a whole-document replacement maps as precisely as small edits. A
 workspace edit's plain edits to one document (rename, code action) are
 replayed together too — mapped one by one, adjacent edits could both claim a
 dedented line's removed indentation — after each is checked, as sent,
-against the gaps. Any other set (a completion's main edit with its
-additional edits, an inlay hint's edits, a color presentation's) is mapped
-edit by edit, keeping each extent. In every case a line an edit creates
+against the gaps. Edits a server makes to the host document directly in the
+same workspace edit are merged with the mapped ones and checked together in
+V, once per representation (`changes`, `documentChanges`: a client applies
+one of them); one only meeting the region at its edge is outside it. Any
+other set (a completion's main edit with its additional edits, an inlay
+hint's edits, a color presentation's) is mapped edit by edit, keeping each
+extent. A completion's snippet is checked as the client expands it — every
+tabstop at its default — and kept only when every client expands it alike
+(literal text, tabstops, at most one `$`-free default per tabstop); its
+additional edits are checked with each range the client may apply the main
+edit through (insert and replace). In every case a line an edit creates
 inside dedented content regains the content's removed indentation, and an
 edit replacing a whole dedented line covers (and restores) that line's own
 indentation. Deleted edge blank lines stay in V: P's start maps after the
@@ -169,7 +183,9 @@ into a corruption only together. A set is **refused** when:
   would no longer start one, by the same rule as at the region's own end;
 - a line break P hides (a deleted edge line's, or a replaced gap's) would
   fuse with one beside it into a single CRLF;
-- mapped edits would overlap;
+- edits to the document would overlap within one representation;
+- an edit made to the host directly reaches into text P hides (a gap, a
+  deleted edge line), or into the region from outside it;
 - an edit creates lines in content whose removed indentation is not one
   uniform string.
 
@@ -198,13 +214,16 @@ that prefers a fallback answers `null` (or catches its own errors and does
 so); kakehashi does not choose one on its behalf.
 
 An unusable answer (an error response, a malformed or refused result) is
-final for that input. A missing answer from the chosen peer (crashing,
+final for that input — until settled answers are forgotten (see
+Configuration and Discovery) or a settings change re-runs the injection
+pass. It re-syncs its host as it arrives, and the host's diagnostics are
+collected again without those placed from the document's earlier text. A missing answer from the chosen peer (crashing,
 timing out, or answering with one of LSP's retryable cancellation codes) is
 retried with backoff — one second, doubling to a minute — without waiting
 for an edit, and requests do not pile further attempts onto a backing-off
-one. A candidate that cannot start is never chosen: it is passed over (see
-Configuration and Discovery), and its pairs are prepared once its handshake
-advertises the request.
+one. A candidate that cannot start is never chosen: it is passed over for that
+host's documents (see Configuration and Discovery), and its pairs are
+prepared once its handshake advertises the request.
 
 ### Lifecycle
 
@@ -222,7 +241,10 @@ prepares the pair, its open documents stay as they are. A save a held document m
 prepared text is sent, if the host is still at the saved version, to the
 servers that have the document open or opening by then. A server that
 opens it later opens the saved text and gets no `didSave`, as with any
-server that starts after a save.
+server that starts after a save. A request opening a document lazily opens
+the newer of its own text and the latest the lifecycle pass recorded,
+answers and records taking their place in one process-wide order as they
+are made.
 
 ## Invariants
 
@@ -235,7 +257,10 @@ server that starts after a save.
   them hands a server text whose coordinates no map describes.
 - **What a connection holds decides how its coordinates translate.** The
   record of the text each connection was last sent, kept by the paths that
-  send it and by nothing else, carries the map that text was sent with.
+  send it and by nothing else, carries the map that text was sent with. It
+  is made before the send is queued, so a push answering it already finds
+  it, and taken back if the send is not queued — under the lock a push's
+  stamp reads, for a sender that queues at once.
   Coordinates a connection computed — a response, a push, an inbound edit or
   selection — translate through that map, never one chosen by URI or by
   region: right after a send, connections of one region can hold different
@@ -245,7 +270,9 @@ server that starts after a save.
   region's current one describes no current host position, and a region the
   lifecycle pass prepares is bridged only through a prepared text: one held
   as is (sent before its pair gained a peer), or none on record yet,
-  translates nothing.
+  translates nothing. An inbound edit or selection translates only while its
+  connection still holds what it held when the request arrived: a text sent
+  after that is not the one it was computed for.
 - **A request reads only the text its coordinates describe.** Right after an
   edit, a request is prepared for the new text while an open document still
   holds the previous one until the lifecycle pass sends it; reading the old
@@ -255,7 +282,8 @@ server that starts after a save.
   text, right after its pair lost its peer. The request must not send the
   text itself — it could overtake a newer text the lifecycle pass already
   sent.
-- **A push follows the text its connection held when it pushed.** A push
+- **A push follows the text its connection held when kakehashi read it.**
+  The push is stamped as it is read, before it waits to be published. A push
   for a prepared text, or one read while its connection holds one, is placed
   only while the connection still holds that very text: the server may never
   publish again, and its next text may map differently. The same text held
@@ -266,10 +294,12 @@ server that starts after a save.
   version, computed for the previous text but arriving after the new one
   was sent, cannot be told apart.
 - **Cached answers follow the configuration.** An answer is the peer's for
-  one launch configuration: a settings change that drops or retargets a
-  pair's peer drops the pair's answers, and a request still carrying
-  settings from before the change neither reads the new launch's answers nor
-  starts the old one's peer.
+  one launch configuration and its runtime settings: a settings change that
+  drops or retargets a pair's peer drops the pair's answers, and a lookup —
+  a request's or the lifecycle pass's — resolved from settings the change
+  replaced neither reads answers nor starts the old one's peer (the
+  lifecycle pass then syncs its host again under the current settings).
+  Runtime settings pushed to servers invalidate every answer.
 - **The answer that unblocks a held document always re-syncs its host**,
   whoever started the attempt that got it; requests may read older answers
   but never move what the lifecycle pass holds the document on.

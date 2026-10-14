@@ -951,8 +951,9 @@ and the original document. Edits that would touch a gap are refused, which
 also makes formatting and other edit-producing methods available for
 combined documents — except the concatenated formatting pipeline on a
 blockquoted (line-prefixed) region, whose result is refused when prepared,
-and linkedEditingRange and prepareRename, which stay unavailable on
-combined documents. A document the server fails to prepare is not sent
+and linkedEditingRange, prepareRename and a server's own
+`workspace/applyEdit`, which stay unavailable on non-contiguous combined
+documents. A document the server fails to prepare is not sent
 downstream at all; answer `null` to keep a document unchanged.
 
 ### Configuration Files
