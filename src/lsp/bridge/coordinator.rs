@@ -232,8 +232,9 @@ pub(crate) struct BridgeCoordinator {
     pool: Arc<LanguageServerPool>,
     /// Prepared forms of virtual documents (`kakehashi/virtualDocument/prepare`).
     prepare: super::prepare_registry::PrepareRegistry,
-    /// (host, injection) pairs already warned about for a `prepare`
-    /// strategy other than `preferred`, until the next settings change: the
+    /// (host, injection) pairs already warned about for a
+    /// `kakehashi/virtualDocument/prepare` aggregation strategy other than
+    /// `preferred`, until the next settings change: the
     /// warning would otherwise repeat per region per edit.
     warned_prepare_strategy: dashmap::DashSet<(String, String)>,
     /// Hosts owed a `workspace/diagnostic/refresh` once their documents
