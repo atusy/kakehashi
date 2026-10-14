@@ -402,7 +402,14 @@ impl InjectionCoordinator {
             &injection.language,
             self.experimental,
         ) else {
-            // Sent as is.
+            // Sent as is: whatever was prepared for it no longer describes it
+            // (every candidate stopped advertising, say, which no settings
+            // change prunes).
+            self.bridge.forget_prepared_region(
+                uri,
+                Some(&injection.language),
+                &injection.region_id,
+            );
             return injection;
         };
         let input = crate::lsp::bridge::PrepareInput {
