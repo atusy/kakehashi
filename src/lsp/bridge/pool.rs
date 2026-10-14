@@ -2846,13 +2846,15 @@ impl LanguageServerPool {
             ),
             VirtualOpenContent::Snapshot(provided) => (provided, None),
         };
-        // A cached text of the other kind (sent as is while the request is
-        // prepared, or the reverse, across a pair gaining or losing its peer)
-        // is not the newer one of the same document: it is one the request's
-        // coordinates cannot read, which a prepared pair must not open with.
+        // A cached text sent as is, while the request is prepared, was sent
+        // before the pair gained its peer: a prepared pair must not be opened
+        // with it. The reverse — a prepared cache for a request built as is —
+        // is the lifecycle pass's newer text (the pair gained its peer since),
+        // which the server should hold even though this request then fails
+        // its own check.
         let virtual_content = current_content
             .as_deref()
-            .filter(|cached| cached.map.is_some() == provided.map.is_some())
+            .filter(|cached| provided.map.is_none() || cached.map.is_some())
             .map_or(provided, LatestText::as_sent);
         let did_open = build_didopen_notification(virtual_uri, virtual_content.text);
         if let Err(e) = sender.send_notification(did_open).await {
