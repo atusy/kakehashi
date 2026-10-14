@@ -81,6 +81,8 @@ pub(crate) struct DiagnosticSnapshotPreparer {
     bridge: std::sync::Arc<BridgeCoordinator>,
     settings_manager: std::sync::Arc<SettingsManager>,
     cache: std::sync::Arc<crate::lsp::cache::CacheCoordinator>,
+    /// Experimental features (virtual-document preparation) are on.
+    experimental: bool,
 }
 
 impl DiagnosticSnapshotPreparer {
@@ -91,6 +93,7 @@ impl DiagnosticSnapshotPreparer {
             bridge: std::sync::Arc::clone(&server.bridge),
             settings_manager: std::sync::Arc::clone(&server.settings_manager),
             cache: std::sync::Arc::clone(&server.cache),
+            experimental: server.experimental_enabled(),
         }
     }
 }
@@ -236,7 +239,36 @@ impl DiagnosticScheduler {
     /// `textDocument/publishDiagnostics`.
     pub(crate) fn spawn_synthetic_diagnostic_task(&self, uri: Url) {
         let snapshot_data = self.prepare_diagnostic_snapshot(&uri);
-        self.spawn_prepared_synthetic_diagnostic_task(uri, snapshot_data);
+        self.spawn_prepared_synthetic_diagnostic_task(
+            uri,
+            snapshot_data,
+            SyntheticDiagnosticTrigger::Open,
+        );
+    }
+
+    /// Refresh pull-mode clients owed one for a pull answered while some of
+    /// `uri`'s documents waited for their prepare answers — once a held
+    /// document was sent (`ready`), or nothing is waiting any more (the
+    /// last answer came back unusable, which sends nothing).
+    pub(crate) fn settle_pull_debt_after_prepare(&self, uri: &Url, ready: bool) {
+        if (ready || !self.bridge.prepare_host_has_pending(uri))
+            && self.bridge.take_pull_debt_after_prepare(uri)
+        {
+            self.publisher.request_pull_diagnostic_refresh(true);
+        }
+    }
+
+    /// Collect diagnostics again once held regions reached their servers.
+    /// The collections that ran while they were held (on open, change or
+    /// save) left them out, so this one supersedes any of them for the same
+    /// version.
+    pub(crate) fn spawn_diagnostic_task_after_prepare(&self, uri: Url) {
+        let snapshot_data = self.prepare_diagnostic_snapshot(&uri);
+        self.spawn_prepared_synthetic_diagnostic_task(
+            uri,
+            snapshot_data,
+            SyntheticDiagnosticTrigger::Prepared,
+        );
     }
 
     pub(crate) fn spawn_synthetic_diagnostic_task_for_parse(
@@ -251,13 +283,18 @@ impl DiagnosticScheduler {
                 parsed.incarnation,
                 parsed.content_version,
             );
-        self.spawn_prepared_synthetic_diagnostic_task(uri, snapshot_data);
+        self.spawn_prepared_synthetic_diagnostic_task(
+            uri,
+            snapshot_data,
+            SyntheticDiagnosticTrigger::Open,
+        );
     }
 
     fn spawn_prepared_synthetic_diagnostic_task(
         &self,
         uri: Url,
         snapshot_data: Option<DiagnosticSnapshot>,
+        trigger: SyntheticDiagnosticTrigger,
     ) {
         let Some(lineage) = snapshot_data.as_ref().map(|snapshot| snapshot.lineage) else {
             return;
@@ -286,7 +323,7 @@ impl DiagnosticScheduler {
             lineage.incarnation,
             lineage.content_version,
             lineage.settings_generation,
-            SyntheticDiagnosticTrigger::Open,
+            trigger,
             future,
         );
     }
@@ -558,7 +595,8 @@ impl DiagnosticSnapshotPreparer {
                             continue;
                         };
 
-                        contexts.push(DocumentRequestContext {
+                        let ctx = DocumentRequestContext {
+                            prepared: None,
                             uri: uri.clone(),
                             resolved: resolved.clone(),
                             region_end: None,
@@ -568,7 +606,21 @@ impl DiagnosticSnapshotPreparer {
                             strategy: agg.strategy,
                             max_fan_out: agg.max_fan_out,
                             client_progress_token: None,
-                        });
+                        };
+                        // The snapshot is built synchronously: a document still
+                        // waiting for its prepare peer skips this cycle (its host
+                        // is synced again when the answer arrives).
+                        if let Some(ctx) =
+                            crate::lsp::lsp_impl::bridge_context::prepare_request_context_now(
+                                &self.bridge,
+                                &settings,
+                                self.experimental,
+                                &language_name,
+                                ctx,
+                            )
+                        {
+                            contexts.push(ctx);
+                        }
                     }
                     contexts
                 })

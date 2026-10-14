@@ -85,7 +85,7 @@ use crate::lsp::bridge::{
     workspace_edit_preserves_line_prefixes, workspace_edit_within_region,
 };
 
-use super::region_offset::resolve_region_offset;
+use super::region_offset::resolve_region_offset_for_connection;
 
 /// Translates `workspace/applyEdit` params whose edit targets a virtual
 /// document back to the host document + host coordinates. Holds shared
@@ -171,16 +171,21 @@ impl ApplyEditTranslator {
                 "kakehashi: the virtual document's host URI is unmappable: {host_url}"
             ));
         };
-        let Some((offset, region_end, contiguous, _)) = resolve_region_offset(
+        // Through the map of the text the sending connection holds: an
+        // unversioned edit skips the version check, and a versioned one can
+        // pass it just before a send replaces that text.
+        let Some(((offset, region_end, contiguous, _), _)) = resolve_region_offset_for_connection(
             &self.documents,
             &self.language,
             &self.bridge,
             &host_url,
             &region_id,
+            connection,
         ) else {
             // The region moved or was removed since the downstream produced
-            // the edit; translating against a stale offset would edit the
-            // wrong host text.
+            // the edit, or the connection holds a text that no longer
+            // describes it; translating against a stale offset would edit
+            // the wrong host text.
             return Err(
                 "kakehashi: the injected region changed before the edit could be applied"
                     .to_string(),
@@ -656,6 +661,63 @@ mod tests {
             .register_opened_document_for_test(&host_url, &typed_uri, connection)
             .await;
         (bridge, typed_uri)
+    }
+
+    #[tokio::test]
+    async fn an_inbound_edit_translates_through_the_text_its_connection_holds() {
+        use crate::lsp::bridge::{HeldPresentation, VirtualLayout, apply_prepare_result};
+        let region_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let connection = test_connection();
+        let (bridge, typed_uri) = bridge_with_open_document(region_id, &connection).await;
+        let host_url = url::Url::parse("file:///project/doc.md").unwrap();
+        let dedented = |virtual_text: &str| {
+            let result = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+            ]}]}))
+            .unwrap();
+            apply_prepare_result(
+                virtual_text,
+                &VirtualLayout::single(virtual_text),
+                Some(result),
+            )
+            .unwrap()
+        };
+        let presentation =
+            || bridge.held_presentation(&host_url, "lua", region_id, "  a\n", &connection);
+        // Held as is (or never recorded): as on any unprepared path.
+        assert!(matches!(presentation(), HeldPresentation::AsIs));
+        bridge
+            .record_sent_content_for_test(&typed_uri, &connection, "  a\n")
+            .await;
+        assert!(matches!(presentation(), HeldPresentation::AsIs));
+        // Held prepared from the current virtual text: through its map.
+        let current = dedented("  a\n");
+        bridge
+            .record_sent_content_for_test(
+                &typed_uri,
+                &connection,
+                crate::lsp::bridge::SentText {
+                    text: &current.text,
+                    map: current.map.as_ref(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(presentation(), HeldPresentation::Prepared(map) if Some(&map) == current.map.as_ref())
+        );
+        // Held prepared from an earlier virtual text: no current position.
+        let earlier = dedented("  ab\n");
+        bridge
+            .record_sent_content_for_test(
+                &typed_uri,
+                &connection,
+                crate::lsp::bridge::SentText {
+                    text: &earlier.text,
+                    map: earlier.map.as_ref(),
+                },
+            )
+            .await;
+        assert!(matches!(presentation(), HeldPresentation::Unavailable));
     }
 
     #[tokio::test]

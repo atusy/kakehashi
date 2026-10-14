@@ -36,11 +36,12 @@ pub(crate) use jsonrpc::{
     JsonRpcNotification, JsonRpcRequest, jsonrpc_error_summary, response_has_jsonrpc_error,
 };
 pub(crate) use lifecycle::*;
+#[cfg(test)]
+pub(crate) use prepare::SegmentKind;
 pub(crate) use prepare::{
-    Bias, EditMode, PREPARE_METHOD, PREPARE_TIMEOUT, PrepareError, PrepareHostTextDocument,
-    PrepareParams, PrepareResult, PrepareTextDocument, PreparedDocument, PreparedMap, SegmentKind,
-    VirtualLayout, apply_prepare_result, apply_text_edits_clamped, parse_prepare_response,
-    restore_joined_layout,
+    Bias, EditMode, PREPARE_METHOD, PREPARE_TIMEOUT, PrepareHostTextDocument, PrepareParams,
+    PrepareResult, PrepareTextDocument, PreparedDocument, PreparedMap, VirtualLayout,
+    apply_prepare_result, apply_text_edits_clamped, parse_prepare_response, restore_joined_layout,
 };
 pub(crate) use request::*;
 pub(crate) use request_id::RequestId;

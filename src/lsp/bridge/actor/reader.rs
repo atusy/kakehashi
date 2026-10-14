@@ -176,6 +176,9 @@ pub(crate) enum UpstreamRequest {
     /// virtual-document URIs); the editor's success flag is relayed back.
     ShowDocument {
         params: tower_lsp_server::ls_types::ShowDocumentParams,
+        /// The connection the request arrived on: a selection in a virtual
+        /// document is in the coordinates of the text it was sent.
+        connection: ConnectionKey,
         reply: oneshot::Sender<bool>,
         cancel: ForwardedRequestCancel,
     },

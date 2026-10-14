@@ -365,6 +365,54 @@ impl PrepareRegistry {
             .unwrap_or(false)
     }
 
+    /// Whether the lifecycle pass holds a region's document on a prepared
+    /// answer, or on one it still waits for (or that failed): either way,
+    /// not on the virtual text as is.
+    pub(crate) fn held_is_prepared(
+        &self,
+        host_uri: &Url,
+        injection_language: &str,
+        region_id: &str,
+    ) -> bool {
+        let host_uri = host_uri.as_str();
+        self.regions
+            .get(&region_hash(host_uri, injection_language, region_id))
+            .filter(|region| region.is(host_uri, injection_language, region_id))
+            .and_then(|region| {
+                region.held_slot().map(|slot| {
+                    !matches!(slot.cell.outcome.get(), Some(Some(prepared)) if prepared.map.is_none())
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    /// Hold a region's document on an input whose answer is not in, as the
+    /// lifecycle pass does, without asking anyone.
+    #[cfg(test)]
+    pub(crate) fn hold_pending_for_test(&self, input: PrepareInput<'_>) {
+        let target = PrepareTarget {
+            candidates: Arc::new([]),
+        };
+        self.slot(&target, input, Holder::LifecyclePass);
+    }
+
+    /// Hold a region's document on an input the peer answered with
+    /// `outcome` (`None`: unusably), as the lifecycle pass does.
+    #[cfg(test)]
+    pub(crate) fn hold_answered_for_test(
+        &self,
+        input: PrepareInput<'_>,
+        outcome: Option<Arc<PreparedDocument>>,
+    ) {
+        let target = PrepareTarget {
+            candidates: Arc::new([]),
+        };
+        let slot = self
+            .slot(&target, input, Holder::LifecyclePass)
+            .expect("the lifecycle pass always gets a slot");
+        let _ = slot.cell.outcome.set(outcome);
+    }
+
     /// Keep only the regions `keep(host language, injection language,
     /// candidates)` accepts — after a settings change, those whose pair still
     /// lists the same servers with the same launch configs. With

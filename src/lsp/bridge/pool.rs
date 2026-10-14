@@ -49,7 +49,7 @@ pub(crate) struct CrashedConnection {
 }
 pub(crate) use crash_recovery::{RecoveryDecision, Reservation};
 pub(in crate::lsp::bridge) use document_tracker::DocumentTracker;
-pub(crate) use document_tracker::{OpenedVirtualDoc, SentText, VirtualUriObserver};
+pub(crate) use document_tracker::{HeldText, OpenedVirtualDoc, SentText, VirtualUriObserver};
 pub(crate) use dynamic_capability_registry::DynamicCapabilityRegistry;
 pub(crate) use message_sender::{ConnectionHandleSender, MessageSender};
 use pending_reopen::PendingReopenRegistry;
@@ -2043,6 +2043,34 @@ impl LanguageServerPool {
             .await
     }
 
+    /// What `connection_key` was last sent for `virtual_uri` (see
+    /// [`HeldText`]).
+    pub(crate) fn held_text(
+        &self,
+        virtual_uri: &str,
+        connection_key: &ConnectionKey,
+    ) -> Option<HeldText> {
+        self.document_tracker.held_text(virtual_uri, connection_key)
+    }
+
+    /// Whether any connection was ever sent a prepared text: until then,
+    /// every connection holds virtual text as is (or nothing).
+    pub(crate) fn ever_held_prepared(&self) -> bool {
+        self.document_tracker.ever_held_prepared()
+    }
+
+    /// The key of the live connection `connection_id`, if any.
+    pub(crate) async fn connection_key_for_id(
+        &self,
+        connection_id: super::ProgressConnectionId,
+    ) -> Option<ConnectionKey> {
+        let connections = self.connections.lock().await;
+        connections
+            .values()
+            .find(|handle| handle.connection_id() == Some(connection_id))
+            .map(|handle| handle.key().clone())
+    }
+
     /// Find ALL connections (`(server, root)` keys) that have opened a given
     /// virtual document URI.
     ///
@@ -2691,6 +2719,9 @@ impl LanguageServerPool {
                 .await?;
             self.record_sent_content_fingerprint(virtual_uri, connection_key, content)
                 .await;
+        } else {
+            // Unchanged text is held again under its current map too.
+            self.rehold_unchanged_content(virtual_uri, connection_key, content);
         }
         Ok(())
     }
@@ -3104,6 +3135,19 @@ impl LanguageServerPool {
         self.document_tracker
             .record_sent_content_fingerprint(virtual_uri, connection_key, content.into())
             .await
+    }
+
+    /// Re-hold the text `connection_key` already holds for `virtual_uri`
+    /// under `content`'s map, when `content` is that same text (see
+    /// [`DocumentTracker::rehold_unchanged`]).
+    pub(super) fn rehold_unchanged_content(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+        content: SentText<'_>,
+    ) {
+        self.document_tracker
+            .rehold_unchanged(virtual_uri, connection_key, content);
     }
 
     /// Get or create a connection for the specified server, spawning the server
@@ -8178,6 +8222,8 @@ mod tests {
         // ls-bridge-message-ordering: No need to hold a writer lock - sends are channel-based and non-blocking
         use crate::lsp::bridge::coordinator::BridgeInjection;
         let injections = vec![BridgeInjection {
+            held: false,
+            prepared: None,
             language: "lua".to_string(),
             region_id: TEST_ULID_LUA_0.to_string(),
             content: "local x = 42".to_string(),
@@ -8271,6 +8317,8 @@ mod tests {
             &host_uri,
             1,
             &[super::super::coordinator::BridgeInjection {
+                held: false,
+                prepared: None,
                 language: "lua".to_string(),
                 region_id: TEST_ULID_LUA_0.to_string(),
                 content: "print('current')".to_string(),
@@ -8309,6 +8357,8 @@ mod tests {
             &host_uri,
             1,
             &[super::super::coordinator::BridgeInjection {
+                held: false,
+                prepared: None,
                 language: "lua".into(),
                 region_id: TEST_ULID_LUA_0.into(),
                 content: "print('previous')".into(),
@@ -8459,6 +8509,8 @@ mod tests {
                     revision: None,
                 },
                 vec![super::super::coordinator::BridgeInjection {
+                    held: false,
+                    prepared: None,
                     language: "lua".to_string(),
                     region_id: TEST_ULID_LUA_0.to_string(),
                     content: "print('old lifetime')".to_string(),
@@ -8506,6 +8558,8 @@ mod tests {
                     revision: None,
                 },
                 vec![super::super::coordinator::BridgeInjection {
+                    held: false,
+                    prepared: None,
                     language: "lua".to_string(),
                     region_id: TEST_ULID_LUA_0.to_string(),
                     content: "print('old lifetime')".to_string(),
@@ -8529,6 +8583,8 @@ mod tests {
             &host_uri,
             1,
             &[super::super::coordinator::BridgeInjection {
+                held: false,
+                prepared: None,
                 language: "lua".to_string(),
                 region_id: TEST_ULID_LUA_0.to_string(),
                 content: "print('cached')".to_string(),
@@ -11260,6 +11316,8 @@ mod tests {
                     &host_uri,
                     1,
                     &[crate::lsp::bridge::coordinator::BridgeInjection {
+                        held: false,
+                        prepared: None,
                         language: "lua".to_string(),
                         region_id: TEST_ULID_LUA_0.to_string(),
                         content: "print('new')".to_string(),
@@ -11333,6 +11391,8 @@ mod tests {
 
         // Forward didChange
         let injections = vec![crate::lsp::bridge::coordinator::BridgeInjection {
+            held: false,
+            prepared: None,
             language: "lua".to_string(),
             region_id: TEST_ULID_LUA_0.to_string(),
             content: "print('hello')".to_string(),
@@ -11405,6 +11465,8 @@ mod tests {
 
         // Forward didChange
         let injections = vec![crate::lsp::bridge::coordinator::BridgeInjection {
+            held: false,
+            prepared: None,
             language: "lua".to_string(),
             region_id: TEST_ULID_LUA_0.to_string(),
             content: "print('hello')".to_string(),

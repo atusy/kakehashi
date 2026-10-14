@@ -999,13 +999,27 @@ impl DiagnosticPublisher {
             );
             return None;
         }
-        Some(self.record_push(
-            host,
+        // Stamped with what the connection holds now: a prepared text's push
+        // places through that text's map only while the connection still
+        // holds it (see `BridgeCoordinator::place_push`), so a send replacing
+        // it while this push is recorded cannot leave it misplaced. A server
+        // pushing late for the text before one it was just sent is not caught
+        // here, any more than for an unprepared document: the push carries no
+        // text to compare.
+        let held = self.bridge.held_stamp(virtual_uri, connection_id).await;
+        let slot = (DiagnosticSource::Region(region_id.clone()), server.clone());
+        let changed = self.aggregator.record_held(
+            &host,
             DiagnosticSource::Region(region_id),
             server,
-            connection_id,
+            Some(connection_id),
+            held,
             diagnostics,
-        ))
+        );
+        Some(RecordedPush {
+            host,
+            changed: changed.then_some(slot),
+        })
     }
 
     /// Feed a proactive pull's combined result into the cache and republish.
@@ -1256,7 +1270,7 @@ impl DiagnosticPublisher {
                     // Only now is each region's injection language known: gate
                     // the region pushes on the allowlist before the merge.
                     self.filter_excluded_region_slots(&settings, &mut snapshot, &geometry, pushed);
-                    geometry.offsets
+                    (geometry.offsets, geometry.regions)
                 }
                 // The document is open but has no parse snapshot: `did_change`
                 // cleared the tree and the off-ingress reparse hasn't landed yet,
@@ -1313,9 +1327,29 @@ impl DiagnosticPublisher {
             }) {
                 pushed.pull_only_change = true;
             }
-            HashMap::new()
+            (HashMap::new(), None)
         };
-        let diagnostics = merge_cached_diagnostics(host, snapshot, &region_offsets);
+        let (region_offsets, regions) = region_offsets;
+        let regions: HashMap<&str, &crate::language::injection::ResolvedInjection> = regions
+            .iter()
+            .flat_map(|regions| regions.iter())
+            .map(|region| (region.region.region_id.as_str(), region))
+            .collect();
+        // A slot's coordinates follow the text its connection held when it
+        // pushed (see `BridgeCoordinator::place_push`).
+        let diagnostics =
+            merge_cached_diagnostics(host, snapshot, &region_offsets, |region_id, slot| {
+                match regions.get(region_id) {
+                    Some(region) => self.bridge.place_push(
+                        host,
+                        &region.injection_language,
+                        region_id,
+                        &region.virtual_content,
+                        slot.held.as_ref(),
+                    ),
+                    None => crate::lsp::diagnostic_cache::Placement::Skip,
+                }
+            });
 
         let lsp_uri = match crate::lsp::lsp_impl::url_to_uri(host) {
             Ok(uri) => uri,

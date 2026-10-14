@@ -152,7 +152,7 @@ pub(crate) struct HeldText {
     pub(crate) generation: u64,
 }
 
-fn content_fingerprint(content: &str) -> u64 {
+pub(super) fn content_fingerprint(content: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     content.hash(&mut hasher);
@@ -216,6 +216,10 @@ pub(crate) struct DocumentTracker {
     document_fingerprints: std::sync::Mutex<HashMap<ConnectionKey, HashMap<String, HeldText>>>,
     /// Source of [`HeldText::generation`].
     held_generations: std::sync::atomic::AtomicU64,
+    /// Some connection was ever sent a prepared text: until then every held
+    /// text is a virtual text as is, which lets paths skip looking up what a
+    /// connection holds.
+    ever_held_prepared: std::sync::atomic::AtomicBool,
     /// Tracks which virtual documents were opened for each host document.
     ///
     /// Each OpenedVirtualDoc stores its connection key for reverse lookup during didClose.
@@ -255,6 +259,7 @@ impl DocumentTracker {
             document_versions: Mutex::new(HashMap::new()),
             document_fingerprints: std::sync::Mutex::new(HashMap::new()),
             held_generations: std::sync::atomic::AtomicU64::new(0),
+            ever_held_prepared: std::sync::atomic::AtomicBool::new(false),
             host_to_virtual: Mutex::new(HashMap::new()),
             opened_documents: DashMap::new(),
             virtual_to_servers: DashMap::new(),
@@ -710,6 +715,9 @@ impl DocumentTracker {
         let uri_string = virtual_uri.to_uri_string();
         let fingerprint = content_fingerprint(content.text);
         let map = content.map.cloned();
+        if map.is_some() {
+            self.ever_held_prepared.store(true, Ordering::Release);
+        }
         let mut fingerprints = self
             .document_fingerprints
             .lock()
@@ -736,6 +744,38 @@ impl DocumentTracker {
                 );
             }
         }
+    }
+
+    /// Record that this connection holds `content` under `content`'s map
+    /// when it already holds that exact text — a send skipped because the
+    /// text is unchanged, whose map may not be. A no-op otherwise: only a
+    /// send records a new text.
+    pub(super) fn rehold_unchanged(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+        content: SentText<'_>,
+    ) {
+        let fingerprint = content_fingerprint(content.text);
+        if content.map.is_some() {
+            self.ever_held_prepared.store(true, Ordering::Release);
+        }
+        let mut fingerprints = self
+            .document_fingerprints
+            .lock()
+            .recover_poison("DocumentTracker::document_fingerprints");
+        if let Some(held) = fingerprints
+            .get_mut(connection_key)
+            .and_then(|docs| docs.get_mut(&virtual_uri.to_uri_string()))
+            .filter(|held| held.fingerprint == fingerprint)
+        {
+            held.map = content.map.cloned();
+        }
+    }
+
+    /// Whether any connection was ever sent a prepared text.
+    pub(super) fn ever_held_prepared(&self) -> bool {
+        self.ever_held_prepared.load(Ordering::Acquire)
     }
 
     /// What this connection was last sent for the document, if anything.

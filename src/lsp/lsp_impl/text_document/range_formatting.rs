@@ -182,7 +182,9 @@ impl Kakehashi {
                 // Non-contiguous combined injections contain masked host-only
                 // gaps. Even a covering range may fall back to full formatting,
                 // whose single replacement would overwrite those real gaps.
-                if !resolved.contiguous {
+                if !resolved.contiguous
+                    && !self.prepares(&language_name, &resolved.injection_language)
+                {
                     continue;
                 }
                 // A covering request (its byte span encloses the whole region)
@@ -271,6 +273,7 @@ impl Kakehashi {
                     continue;
                 }
                 let region_ctx = DocumentRequestContext {
+                    prepared: None,
                     uri: uri.clone(),
                     resolved: resolved.clone(),
                     region_end: None,
@@ -281,6 +284,21 @@ impl Kakehashi {
                     max_fan_out: agg.max_fan_out,
                     client_progress_token: None,
                 };
+                let Some(region_ctx) =
+                    crate::lsp::lsp_impl::bridge_context::prepare_request_context(
+                        &self.bridge,
+                        &self.settings_manager.load_settings(),
+                        self.experimental_enabled(),
+                        &language_name,
+                        region_ctx,
+                    )
+                    .await
+                else {
+                    continue;
+                };
+                if !region_ctx.resolved.contiguous && region_ctx.prepared.is_none() {
+                    continue;
+                }
                 // Mint this region's tracked-source token into the shared
                 // aggregator (the per-region map dispatch hands to its winning
                 // downstream).

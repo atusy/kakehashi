@@ -241,8 +241,9 @@ impl Kakehashi {
     }
 
     /// Format every safe bridge virtual document (the **virt** layer): resolve
-    /// from the parsed snapshot, skip non-contiguous groups, format each
-    /// remaining document, and concatenate its disjoint edits.
+    /// from the parsed snapshot, skip non-contiguous groups (unless prepared,
+    /// whose map keeps edits off their gaps), format each remaining document,
+    /// and concatenate its disjoint edits.
     #[allow(clippy::too_many_arguments)]
     async fn virt_format_edits(
         &self,
@@ -308,8 +309,10 @@ impl Kakehashi {
         for resolved in all_regions.iter() {
             // Non-contiguous combined injections contain masked host-only gaps.
             // A formatter returns a contiguous whole-document replacement, which
-            // would replace those real host gaps as well and corrupt the document.
-            if !resolved.contiguous {
+            // would replace those real host gaps as well and corrupt the document
+            // — unless a prepare peer's map re-diffs the result and refuses any
+            // change to a gap (checked again once the context is prepared).
+            if !resolved.contiguous && !self.prepares(language_name, &resolved.injection_language) {
                 continue;
             }
             let configs = self
@@ -361,6 +364,7 @@ impl Kakehashi {
                 continue;
             }
             let region_ctx = DocumentRequestContext {
+                prepared: None,
                 uri: uri.clone(),
                 resolved: resolved.clone(),
                 region_end: None,
@@ -371,6 +375,23 @@ impl Kakehashi {
                 max_fan_out: agg.max_fan_out,
                 client_progress_token: None,
             };
+            let Some(region_ctx) = crate::lsp::lsp_impl::bridge_context::prepare_request_context(
+                &self.bridge,
+                &self.settings_manager.load_settings(),
+                self.experimental_enabled(),
+                language_name,
+                region_ctx,
+            )
+            .await
+            else {
+                // The peer could not prepare the region: it is left
+                // unformatted, which the CLI must not report as success.
+                count_request_errors(&cancel_state.request_error_sink, 1);
+                continue;
+            };
+            if !region_ctx.resolved.contiguous && region_ctx.prepared.is_none() {
+                continue;
+            }
             // Decide how this region formats — concatenated pipeline, preferred
             // fan-out, or skip — from its resolved aggregation config. See
             // [`plan_region_format`] for the allowlist rule
@@ -403,8 +424,18 @@ impl Kakehashi {
                     // Capture the region's per-line host prefixes now, while
                     // the host snapshot is at hand: the pipeline's whole-region
                     // replacement must re-apply them to its multi-line output
-                    // (Decision point 4, `reapply_host_line_prefixes`).
-                    let virtual_line_count = lsp_line_count(&region_ctx.resolved.virtual_content);
+                    // (Decision point 4, `reapply_host_line_prefixes`). The
+                    // prefixes are per host line, so count the virtual
+                    // document's lines: a prepared one may have fewer, its
+                    // edge blank lines deleted.
+                    let virtual_line_count = lsp_line_count(
+                        region_ctx
+                            .prepared
+                            .as_deref()
+                            .map_or(&region_ctx.resolved.virtual_content, |map| {
+                                map.virtual_text()
+                            }),
+                    );
                     let mapper = host_mapper
                         .get_or_insert_with(|| crate::text::PositionMapper::new(snapshot.text()));
                     let host_line_prefixes = extract_host_line_prefixes(
@@ -959,8 +990,18 @@ async fn dispatch_concatenated_formatting(
     let offset = RegionOffset::with_per_line_offsets(
         region_ctx.resolved.region.line_range.start,
         region_ctx.resolved.line_column_offsets.clone(),
-    );
+    )
+    .with_prepared(region_ctx.prepared.clone());
     let original_virtual = region_ctx.resolved.virtual_content.clone();
+    // A prepared document's whole-region result goes back through the
+    // prepared map below; precompute its extent (in prepared coordinates)
+    // before `original_virtual` moves into the pipeline.
+    let prepared_failure_sink = request_error_sink.clone();
+    let prepared_end = region_ctx.prepared.as_ref().map(|_| {
+        crate::text::PositionMapper::new(&original_virtual)
+            .byte_to_position(original_virtual.len())
+            .unwrap_or_default()
+    });
     // Precompute the host replacement range now, while we still hold
     // `original_virtual`, so it can be moved into the pipeline below without a
     // second clone. An unresolvable end position means we emit no edit (bounded
@@ -1375,9 +1416,22 @@ async fn dispatch_concatenated_formatting(
         return None;
     }
 
+    let final_text = final_text?;
+    if prepared_end.is_some()
+        && let Some(map) = &region_ctx.prepared
+    {
+        return prepared_pipeline_edits(
+            map,
+            &final_text,
+            &offset,
+            &host_line_prefixes,
+            &region_ctx.uri,
+            &prepared_failure_sink,
+        );
+    }
     let final_text = pipeline_region_text(
         &region_ctx.resolved.virtual_content,
-        &final_text?,
+        &final_text,
         &offset,
         &host_line_prefixes,
     )?;
@@ -1687,6 +1741,77 @@ fn extract_host_line_prefixes(
 /// The host text replacing the region after the concatenated pipeline
 /// formatted `original_virtual` into `final_text`, or `None` when the region
 /// is left as it was.
+/// The edits a concatenated pipeline's result over a prepared document
+/// makes to the host: the result keeps the edge layout of each string the
+/// prepared text joins (see [`crate::lsp::bridge::restore_joined_layout`]),
+/// then goes back through the prepared map as one formatting answer, which
+/// restores dedented indentation and refuses a result rewriting host-owned
+/// text (a gap). Host line prefixes are not re-applied on this path, so a
+/// prefixed region fails closed, as does a refused result; both count as
+/// request errors. `None` also when the result changes nothing.
+fn prepared_pipeline_edits(
+    map: &crate::lsp::bridge::PreparedMap,
+    final_text: &str,
+    offset: &RegionOffset,
+    host_line_prefixes: &[String],
+    uri: &url::Url,
+    failure_sink: &RequestErrorSink,
+) -> Option<Vec<TextEdit>> {
+    let prepared = map.prepared_text();
+    let opens_after_a_delimiter = opens_after_a_delimiter(offset, host_line_prefixes);
+    let restored = crate::lsp::bridge::restore_joined_layout(
+        prepared,
+        final_text,
+        map.emptied_gap_offsets(),
+        opens_after_a_delimiter,
+    );
+    if restored == prepared {
+        return None;
+    }
+    let prefixed = host_line_prefixes
+        .iter()
+        .skip(usize::from(opens_after_a_delimiter))
+        .any(|prefix| !prefix.is_empty());
+    let edits = (!prefixed)
+        .then(|| {
+            let mapper = crate::text::PositionMapper::new(prepared);
+            crate::lsp::bridge::translate_virtual_text_edits_to_host(
+                vec![TextEdit {
+                    range: tower_lsp_server::ls_types::Range::new(
+                        tower_lsp_server::ls_types::Position::new(0, 0),
+                        mapper.byte_to_position(prepared.len()).unwrap_or_default(),
+                    ),
+                    new_text: restored,
+                }],
+                offset,
+                crate::lsp::bridge::EditMode::Formatting,
+            )
+        })
+        .flatten();
+    if edits.is_none() {
+        log::warn!(
+            target: "kakehashi::formatting",
+            "concatenated formatting result for {} edits host-owned text of a prepared virtual document; dropping it",
+            uri
+        );
+        count_request_errors(failure_sink, 1);
+    }
+    edits
+}
+
+/// Whether a region opens mid-line, after a delimiter on its first line (a
+/// Nix `''`): its leading line break is then layout, and its first line has
+/// no line prefix. One column offset is also the shape of a blockquoted or
+/// list-item fence ending at EOF, which opens at a line start behind its
+/// prefix; a line prefix is made of container markers and indentation only,
+/// a delimiter's line is not.
+fn opens_after_a_delimiter(offset: &RegionOffset, host_line_prefixes: &[String]) -> bool {
+    offset.opens_mid_line()
+        && host_line_prefixes
+            .first()
+            .is_some_and(|text| text.chars().any(|c| !(c == '>' || c.is_whitespace())))
+}
+
 fn pipeline_region_text(
     original_virtual: &str,
     final_text: &str,
@@ -1695,14 +1820,8 @@ fn pipeline_region_text(
 ) -> Option<String> {
     // A region opening mid-line, after a delimiter on its first line (a Nix
     // `''`), has its leading line break as layout and no line prefix: the
-    // host text before it is the delimiter's line. One column offset is also
-    // the shape of a blockquoted or list-item fence ending at EOF, which
-    // opens at a line start behind its prefix; a line prefix is made of
-    // container markers and indentation only, a delimiter's line is not.
-    let opens_after_a_delimiter = offset.opens_mid_line()
-        && host_line_prefixes
-            .first()
-            .is_some_and(|text| text.chars().any(|c| !(c == '>' || c.is_whitespace())));
+    // host text before it is the delimiter's line.
+    let opens_after_a_delimiter = opens_after_a_delimiter(offset, host_line_prefixes);
     // Each step keeps the edge layout of its own text, but formats with a zero
     // offset, which reads as a region opening at a line start: only the
     // region tells whether its leading line break is layout.

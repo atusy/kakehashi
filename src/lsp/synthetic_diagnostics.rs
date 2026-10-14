@@ -37,6 +37,23 @@ pub(crate) enum SyntheticDiagnosticTrigger {
     Open,
     Change,
     Save,
+    /// Regions held for their prepare answers reached their servers: any
+    /// earlier collection of this version left them out, so this one
+    /// supersedes all of them — and, ranking with a save, a later save
+    /// supersedes it in turn.
+    Prepared,
+}
+
+impl SyntheticDiagnosticTrigger {
+    /// Precedence among one version's collections; equal ranks supersede
+    /// each other in arrival order.
+    fn rank(self) -> u8 {
+        match self {
+            Self::Open => 0,
+            Self::Change => 1,
+            Self::Save | Self::Prepared => 2,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -44,7 +61,8 @@ struct SyntheticDiagnosticTaskKey {
     incarnation: u64,
     content_version: u64,
     settings_generation: u64,
-    trigger: SyntheticDiagnosticTrigger,
+    /// [`SyntheticDiagnosticTrigger::rank`].
+    trigger_rank: u8,
 }
 
 impl ActiveTask {
@@ -107,7 +125,7 @@ impl SyntheticDiagnosticsManager {
             incarnation,
             content_version,
             settings_generation,
-            trigger,
+            trigger_rank: trigger.rank(),
         };
         match self.active_tasks.entry(uri) {
             Entry::Vacant(entry) => {
@@ -266,7 +284,7 @@ mod tests {
                 incarnation: 0,
                 content_version: 0,
                 settings_generation: 0,
-                trigger: SyntheticDiagnosticTrigger::Open,
+                trigger_rank: SyntheticDiagnosticTrigger::Open.rank(),
             },
             abort_handle: Some(abort_handle),
         }
@@ -375,6 +393,33 @@ mod tests {
         assert!(late_open_handle.is_finished());
         assert!(!saved_handle.is_finished());
         saved_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn prepared_and_save_collections_supersede_each_other() {
+        let manager = SyntheticDiagnosticsManager::new();
+        let uri = Url::parse("file:///prepared-same-version.md").unwrap();
+        let register = |trigger| {
+            let task = tokio::spawn(std::future::pending::<()>());
+            let handle = task.abort_handle();
+            let accepted =
+                manager.register_task_for_lineage(uri.clone(), 1, 2, 0, trigger, handle.clone());
+            (accepted, handle)
+        };
+        let (_, save) = register(SyntheticDiagnosticTrigger::Save);
+        let (accepted, prepared) = register(SyntheticDiagnosticTrigger::Prepared);
+        assert!(
+            accepted,
+            "a collection after held regions are sent supersedes the save's"
+        );
+        tokio::task::yield_now().await;
+        assert!(save.is_finished());
+        let (accepted, _) = register(SyntheticDiagnosticTrigger::Save);
+        assert!(accepted, "a later save still supersedes it");
+        tokio::task::yield_now().await;
+        assert!(prepared.is_finished());
+        let (accepted, _) = register(SyntheticDiagnosticTrigger::Change);
+        assert!(!accepted, "a change-level collection still yields");
     }
 
     #[tokio::test]

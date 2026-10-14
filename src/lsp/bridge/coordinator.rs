@@ -34,8 +34,77 @@ pub(crate) struct BridgeInjection {
     pub(crate) language: String,
     /// Stable ULID-based region ID (lazy-node-identity-tracking)
     pub(crate) region_id: String,
-    /// The text content of the bridge virtual document
+    /// The text content of the bridge virtual document: what downstream
+    /// servers are sent, the prepared text for a prepared one.
     pub(crate) content: String,
+    /// Not to be sent: its prepared form is not available
+    /// (`kakehashi/virtualDocument/prepare` pending or failed). A held
+    /// injection still exists — its open document stays open — but neither
+    /// opens nor changes downstream.
+    pub(crate) held: bool,
+    /// The map from `content` back to the virtual document, for a prepared
+    /// one: sent along with it, so each connection's record of what it holds
+    /// says how its coordinates translate.
+    pub(crate) prepared: Option<Arc<super::protocol::PreparedMap>>,
+}
+
+impl BridgeInjection {
+    /// The text to send, with its map.
+    pub(crate) fn sent(&self) -> super::pool::SentText<'_> {
+        super::pool::SentText {
+            text: &self.content,
+            map: self.prepared.as_ref(),
+        }
+    }
+}
+
+/// A save that reached a host while some of its virtual documents were held
+/// back for their prepare answers.
+#[derive(Debug, Default)]
+pub(crate) struct HeldSave {
+    pub(crate) incarnation: u64,
+    pub(crate) content_version: u64,
+    pub(crate) region_ids: std::collections::HashSet<String>,
+}
+
+/// How coordinates a connection computed for a region translate to the host
+/// (see [`BridgeCoordinator::held_presentation`]).
+#[derive(Debug, Clone)]
+pub(crate) enum HeldPresentation {
+    /// Through the region's offset alone: the connection holds the virtual
+    /// text as is (or nothing on record, as for any unprepared document).
+    AsIs,
+    /// Through this map first: the connection holds the text a peer
+    /// prepared from the region's current virtual text.
+    Prepared(Arc<super::protocol::PreparedMap>),
+    /// Not at all: the connection holds a text prepared from another virtual
+    /// text, or the region is not bridged.
+    Unavailable,
+}
+
+impl HeldPresentation {
+    /// `offset` as the coordinates follow it, `None` when unavailable.
+    pub(crate) fn offset(
+        self,
+        offset: super::protocol::RegionOffset,
+    ) -> Option<super::protocol::RegionOffset> {
+        match self {
+            Self::AsIs => Some(offset),
+            Self::Prepared(map) => Some(offset.with_prepared(Some(map))),
+            Self::Unavailable => None,
+        }
+    }
+}
+
+/// [`HeldPresentation`] of a held text while the region's virtual text is
+/// `virtual_text`. A text held as is translates as on any unprepared path,
+/// without comparing it: an edit's didChange may still be on its way.
+fn held_presentation(held: Option<super::pool::HeldText>, virtual_text: &str) -> HeldPresentation {
+    match held.and_then(|held| held.map) {
+        None => HeldPresentation::AsIs,
+        Some(map) if map.virtual_text() == virtual_text => HeldPresentation::Prepared(map),
+        Some(_) => HeldPresentation::Unavailable,
+    }
 }
 
 /// One server's share of an eager-open batch: its spawn config plus the
@@ -160,6 +229,19 @@ pub(crate) struct ForceStartTestControl {
 /// genuinely benefits from a semantic name (e.g., document lifecycle, shutdown).
 pub(crate) struct BridgeCoordinator {
     pool: Arc<LanguageServerPool>,
+    /// Prepared forms of virtual documents (`kakehashi/virtualDocument/prepare`).
+    prepare: super::prepare_registry::PrepareRegistry,
+    /// (host, injection) pairs already warned about for a `prepare`
+    /// strategy other than `preferred`, until the next settings change: the
+    /// warning would otherwise repeat per region per edit.
+    warned_prepare_strategy: dashmap::DashSet<(String, String)>,
+    /// Hosts owed a `workspace/diagnostic/refresh` once their documents
+    /// waiting for prepare answers are sent (see
+    /// [`Self::owe_pull_after_prepare`]).
+    prepare_pull_debts: dashmap::DashSet<Url>,
+    /// Saves a held virtual document missed: forwarded once its prepared
+    /// text is sent (if the host is still at the saved version).
+    held_saves: DashMap<Url, HeldSave>,
     node_tracker: Arc<NodeTracker>,
     /// Cancel forwarder for upstream cancel notification and downstream forwarding.
     ///
@@ -254,6 +336,11 @@ struct ConfigMemo {
     virt: DashMap<String, Vec<VirtMemoEntry>>,
     /// `host_language` → `_self` host-bridge configs.
     host: DashMap<String, Arc<Vec<ResolvedServerConfig>>>,
+    /// `host_language` → `(injection_language, prepare target)` pairs, like
+    /// `virt`: resolving a target expands the method's priorities over the
+    /// language's servers, which the lifecycle pass and every request would
+    /// otherwise redo per region.
+    prepare: DashMap<String, Vec<(String, Option<super::PrepareTarget>)>>,
 }
 
 impl ConfigMemo {
@@ -262,6 +349,7 @@ impl ConfigMemo {
             settings,
             virt: DashMap::new(),
             host: DashMap::new(),
+            prepare: DashMap::new(),
         }
     }
 }
@@ -297,6 +385,10 @@ impl BridgeCoordinator {
         let cancel_forwarder = CancelForwarder::new(Arc::clone(&pool));
         Self {
             pool,
+            prepare: super::prepare_registry::PrepareRegistry::default(),
+            warned_prepare_strategy: dashmap::DashSet::new(),
+            prepare_pull_debts: dashmap::DashSet::new(),
+            held_saves: DashMap::new(),
             node_tracker: Arc::new(NodeTracker::new()),
             cancel_forwarder,
             eager_open_generation: std::sync::atomic::AtomicU64::new(0),
@@ -323,6 +415,10 @@ impl BridgeCoordinator {
     ) -> Self {
         Self {
             pool,
+            prepare: super::prepare_registry::PrepareRegistry::default(),
+            warned_prepare_strategy: dashmap::DashSet::new(),
+            prepare_pull_debts: dashmap::DashSet::new(),
+            held_saves: DashMap::new(),
             node_tracker: Arc::new(NodeTracker::new()),
             cancel_forwarder,
             eager_open_generation: std::sync::atomic::AtomicU64::new(0),
@@ -383,6 +479,396 @@ impl BridgeCoordinator {
     /// Used by handlers for `send_*_request()` methods.
     pub(crate) fn pool(&self) -> &LanguageServerPool {
         &self.pool
+    }
+
+    /// The servers that may prepare `injection_language` virtual documents
+    /// in `host_language` hosts, when experimental features are on: those
+    /// the pair's `kakehashi/virtualDocument/prepare` aggregation
+    /// `priorities` admit among the servers bridged for the language, in
+    /// that order (`"*"` by name). `None` when there are none, or when every
+    /// one is known not to advertise the request — the pair is then not
+    /// prepared at all, rather than each revision being held back to find
+    /// that out again.
+    pub(crate) fn prepare_target(
+        &self,
+        settings: &Arc<WorkspaceSettings>,
+        host_language: &str,
+        injection_language: &str,
+        experimental: bool,
+    ) -> Option<super::PrepareTarget> {
+        if !experimental {
+            return None;
+        }
+        // Memoized per settings snapshot: this runs per bridged region in
+        // every lifecycle pass and request. The memoized `Arc` also lets the
+        // registry compare candidates by identity.
+        let memo = self.config_memo_for(settings);
+        let target = match memo.prepare.get(host_language).and_then(|hit| {
+            hit.iter()
+                .find(|(lang, _)| lang == injection_language)
+                .map(|(_, target)| target.clone())
+        }) {
+            Some(target) => target,
+            None => {
+                let target =
+                    self.resolve_prepare_target(settings, host_language, injection_language);
+                let mut pairs = memo.prepare.entry(host_language.to_string()).or_default();
+                if !pairs.iter().any(|(lang, _)| lang == injection_language) {
+                    pairs.push((injection_language.to_string(), target.clone()));
+                }
+                target
+            }
+        }?;
+        let pool = self.pool();
+        target
+            .candidates
+            .iter()
+            .any(|candidate| pool.prepare_advertisement(&candidate.server_name) != Some(false))
+            .then_some(target)
+    }
+
+    fn resolve_prepare_target(
+        &self,
+        settings: &Arc<WorkspaceSettings>,
+        host_language: &str,
+        injection_language: &str,
+    ) -> Option<super::PrepareTarget> {
+        use crate::lsp::aggregation::server::priority::{entry_names, expand_priorities};
+        let configs =
+            self.cached_configs_for_injection_language(settings, host_language, injection_language);
+        if configs.is_empty() {
+            return None;
+        }
+        let aggregation =
+            crate::lsp::lsp_impl::bridge_context::resolve_aggregation_config_from_settings(
+                settings,
+                host_language,
+                injection_language,
+                super::protocol::PREPARE_METHOD,
+            );
+        if aggregation.strategy != crate::config::settings::AggregationStrategy::Preferred
+            && self
+                .warned_prepare_strategy
+                .insert((host_language.to_string(), injection_language.to_string()))
+        {
+            log::warn!(
+                target: "kakehashi::bridge::prepare",
+                "{} in {} hosts: {} is always aggregated as preferred; the configured strategy is ignored",
+                escape_terminal_controls(injection_language),
+                escape_terminal_controls(host_language),
+                super::protocol::PREPARE_METHOD,
+            );
+        }
+        let candidates: Arc<[ResolvedServerConfig]> =
+            entry_names(&expand_priorities(&aggregation.priorities, &configs))
+                .into_iter()
+                .filter_map(|name| configs.iter().find(|config| config.server_name == name))
+                .cloned()
+                .collect();
+        (!candidates.is_empty()).then_some(super::PrepareTarget { candidates })
+    }
+
+    /// After a settings change, drop prepared documents whose (host,
+    /// injection) pair no longer lists the candidates that prepared them,
+    /// so no path keeps translating through a map for text no longer sent.
+    /// `reparsing`: the change re-runs every host's injection pass, so
+    /// answers cached as unusable can go too and be asked again.
+    pub(crate) fn prune_prepared(
+        &self,
+        settings: &Arc<WorkspaceSettings>,
+        experimental: bool,
+        reparsing: bool,
+    ) {
+        self.warned_prepare_strategy.clear();
+        self.prepare.retain(
+            |host_language, injection_language, candidates| {
+                experimental
+                    // The same names may now launch differently (or not at
+                    // all): their old answers no longer describe what they
+                    // say.
+                    && self
+                        .resolve_prepare_target(settings, host_language, injection_language)
+                        .is_some_and(|target| {
+                            super::prepare_registry::same_candidates(&target.candidates, candidates)
+                        })
+            },
+            reparsing,
+        );
+    }
+
+    /// The prepared form of a virtual document, without waiting: on a miss
+    /// an attempt starts in the background, and the host is queued for a
+    /// re-sync once it lands (see [`Self::take_prepare_resync_rx`]).
+    pub(crate) fn prepared_document_now(
+        &self,
+        target: &super::PrepareTarget,
+        input: super::PrepareInput<'_>,
+    ) -> super::PrepareLookup {
+        self.prepare.lookup_or_start(&self.pool, target, input)
+    }
+
+    /// [`Self::prepared_document_now`] for a request that cannot wait (see
+    /// `PrepareRegistry::lookup_or_start_for_request`).
+    pub(crate) fn prepared_document_now_for_request(
+        &self,
+        target: &super::PrepareTarget,
+        input: super::PrepareInput<'_>,
+    ) -> super::PrepareLookup {
+        self.prepare
+            .lookup_or_start_for_request(&self.pool, target, input)
+    }
+
+    /// The document to send for a virtual document, waiting for the peer.
+    /// A miss sends nothing.
+    pub(crate) async fn prepared_document(
+        &self,
+        target: &super::PrepareTarget,
+        input: super::PrepareInput<'_>,
+    ) -> Result<Arc<super::protocol::PreparedDocument>, super::PrepareMiss> {
+        self.prepare.prepare(&self.pool, target, input).await
+    }
+
+    /// Note that a pull for `host` was answered without documents still
+    /// waiting for their prepare answers; it is owed a
+    /// `workspace/diagnostic/refresh` once a resync pass sends them. When
+    /// none is pending any more — the answer came while the pull ran, and
+    /// its resync may already have looked for the debt — the host is synced
+    /// again, so a pass that reaches every server settles it.
+    pub(crate) fn owe_pull_after_prepare(&self, host: &Url) {
+        self.prepare_pull_debts.insert(host.clone());
+        if !self.prepare.host_has_pending(host) {
+            self.prepare.requeue_resync(
+                super::prepare_registry::Resync {
+                    host_uri: host.clone(),
+                    ready: false,
+                },
+                std::time::Duration::ZERO,
+            );
+        }
+    }
+
+    /// Whether any of `host`'s documents still waits for its prepare answer.
+    pub(crate) fn prepare_host_has_pending(&self, host: &Url) -> bool {
+        self.prepare.host_has_pending(host)
+    }
+
+    /// Take `host`'s debt of a pull answered without documents then waiting
+    /// for their prepare answers (see [`Self::owe_pull_after_prepare`]).
+    pub(crate) fn take_pull_debt_after_prepare(&self, host: &Url) -> bool {
+        self.prepare_pull_debts.remove(host).is_some()
+    }
+
+    /// Sync `resync`'s host again after `delay` (see
+    /// `PrepareRegistry::requeue_resync`).
+    pub(crate) fn requeue_prepare_resync(
+        &self,
+        resync: super::prepare_registry::Resync,
+        delay: std::time::Duration,
+    ) {
+        self.prepare.requeue_resync(resync, delay);
+    }
+
+    /// Hosts whose held-back virtual documents finished preparing; the
+    /// receiver re-runs their injection pass. Taken once.
+    pub(crate) fn take_prepare_resync_rx(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<super::prepare_registry::Resync>> {
+        self.prepare.take_resync_rx()
+    }
+
+    /// How coordinates `connection` computed for a region translate to the
+    /// host while the region's virtual text is `virtual_text`: through the
+    /// map of the text the connection holds, whatever the region's current
+    /// preparation says. A region whose current input the peer answered
+    /// unusably is not bridged, and a prepared text built from another
+    /// virtual text describes no current host position: both
+    /// [`HeldPresentation::Unavailable`].
+    pub(crate) fn held_presentation(
+        &self,
+        host_uri: &Url,
+        injection_language: &str,
+        region_id: &str,
+        virtual_text: &str,
+        connection: &crate::lsp::bridge::pool::ConnectionKey,
+    ) -> HeldPresentation {
+        if self
+            .prepare
+            .held_failed(host_uri, injection_language, region_id)
+        {
+            return HeldPresentation::Unavailable;
+        }
+        let Ok(host) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
+            return HeldPresentation::Unavailable;
+        };
+        let virtual_uri =
+            super::protocol::VirtualDocumentUri::new(&host, injection_language, region_id);
+        let held = self
+            .pool
+            .held_text(&virtual_uri.to_uri_string(), connection);
+        // A region the lifecycle pass prepares is bridged only through a
+        // prepared text: one held as is was sent before its pair gained its
+        // peer, and nothing on record (a didOpen still being recorded) is
+        // likely a prepared text whose map is not known.
+        if held.as_ref().is_none_or(|held| held.map.is_none())
+            && self
+                .prepare
+                .held_is_prepared(host_uri, injection_language, region_id)
+        {
+            return HeldPresentation::Unavailable;
+        }
+        held_presentation(held, virtual_text)
+    }
+
+    /// What the connection `connection_id` holds for `virtual_uri` now, to
+    /// stamp a push it sent with (see
+    /// [`crate::lsp::diagnostic_cache::HeldStamp`]); `None` when the
+    /// connection is gone, or when no connection was ever sent a prepared
+    /// text — every one then holds its text as is, which needs no stamp.
+    pub(crate) async fn held_stamp(
+        &self,
+        virtual_uri: &str,
+        connection_id: crate::lsp::bridge::ProgressConnectionId,
+    ) -> Option<crate::lsp::diagnostic_cache::HeldStamp> {
+        if !self.pool.ever_held_prepared() {
+            return None;
+        }
+        let connection = self.pool.connection_key_for_id(connection_id).await?;
+        let held = self.pool.held_text(virtual_uri, &connection);
+        Some(crate::lsp::diagnostic_cache::HeldStamp {
+            connection,
+            generation: held.as_ref().map(|held| held.generation),
+            prepared: held.is_some_and(|held| held.map.is_some()),
+        })
+    }
+
+    /// How a region's cached push places while the region's virtual text is
+    /// `virtual_text`. A push for a prepared text, or one read while its
+    /// connection holds a prepared text, is in the coordinates of the text
+    /// it was pushed for only: once its connection was sent another, it
+    /// describes nothing current (a server publishing on open only keeps it
+    /// otherwise, placed through a map it was not computed against). Pushes
+    /// for text held as is place as on any unprepared path.
+    pub(crate) fn place_push(
+        &self,
+        host_uri: &Url,
+        injection_language: &str,
+        region_id: &str,
+        virtual_text: &str,
+        held: Option<&crate::lsp::diagnostic_cache::HeldStamp>,
+    ) -> crate::lsp::diagnostic_cache::Placement {
+        use crate::lsp::diagnostic_cache::Placement;
+        // A region the lifecycle pass prepares is bridged only through a
+        // prepared text (see `held_presentation`).
+        let region_prepared =
+            self.prepare
+                .held_is_prepared(host_uri, injection_language, region_id);
+        // Pushed with nothing on record for its connection (a didOpen still
+        // being recorded), from a connection gone by then, or before any
+        // prepared text was ever sent: no prepared text to place it through.
+        let Some(stamp) = held.filter(|stamp| stamp.generation.is_some()) else {
+            return if region_prepared {
+                Placement::Skip
+            } else {
+                Placement::Offset
+            };
+        };
+        let Ok(host) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
+            return Placement::Skip;
+        };
+        let virtual_uri =
+            super::protocol::VirtualDocumentUri::new(&host, injection_language, region_id);
+        let current = self
+            .pool
+            .held_text(&virtual_uri.to_uri_string(), &stamp.connection);
+        let current_prepared = current.as_ref().is_some_and(|held| held.map.is_some());
+        if (stamp.prepared || current_prepared)
+            && current.as_ref().map(|held| held.generation) != stamp.generation
+        {
+            return Placement::Skip;
+        }
+        if (region_prepared && !current_prepared)
+            || self
+                .prepare
+                .held_failed(host_uri, injection_language, region_id)
+        {
+            return Placement::Skip;
+        }
+        match held_presentation(current, virtual_text) {
+            HeldPresentation::AsIs => Placement::Offset,
+            HeldPresentation::Prepared(map) => Placement::Prepared(map),
+            HeldPresentation::Unavailable => Placement::Skip,
+        }
+    }
+
+    /// Whether the lifecycle pass prepares (or holds back for its peer) a
+    /// region's current document: coordinates kept from an earlier text of
+    /// it, unprepared or prepared differently (a resolve envelope's), no
+    /// longer describe it.
+    pub(crate) fn region_is_prepared(
+        &self,
+        host_uri: &Url,
+        injection_language: &str,
+        region_id: &str,
+    ) -> bool {
+        self.prepare
+            .held_is_prepared(host_uri, injection_language, region_id)
+    }
+
+    /// Drop one region's prepared document (see
+    /// `PrepareRegistry::forget_region`).
+    pub(crate) fn forget_prepared_region(
+        &self,
+        host_uri: &Url,
+        injection_language: Option<&str>,
+        region_id: &str,
+    ) {
+        self.prepare
+            .forget_region(host_uri, injection_language, region_id);
+    }
+
+    /// Drop a replaced region's prepared documents except under the language
+    /// it resolves to now (see `PrepareRegistry::forget_region_except`).
+    pub(crate) fn forget_replaced_prepared_region(
+        &self,
+        host_uri: &Url,
+        region_id: &str,
+        current_language: Option<&str>,
+    ) {
+        self.prepare
+            .forget_region_except(host_uri, region_id, current_language);
+    }
+
+    /// Remember that a save reached the host while these regions were held,
+    /// so it can be forwarded once they are sent.
+    pub(crate) fn hold_save(
+        &self,
+        host_uri: &Url,
+        incarnation: u64,
+        content_version: u64,
+        region_ids: impl IntoIterator<Item = String>,
+    ) {
+        let mut held = self.held_saves.entry(host_uri.clone()).or_default();
+        if (held.incarnation, held.content_version) != (incarnation, content_version) {
+            // A newer save supersedes what an older one missed.
+            *held = HeldSave {
+                incarnation,
+                content_version,
+                region_ids: Default::default(),
+            };
+        }
+        held.region_ids.extend(region_ids);
+    }
+
+    /// Take the save a host's held regions missed, if any.
+    pub(crate) fn take_held_save(&self, host_uri: &Url) -> Option<HeldSave> {
+        self.held_saves.remove(host_uri).map(|(_, held)| held)
+    }
+
+    /// Drop a closed host's prepared documents.
+    pub(crate) fn forget_prepared_host(&self, host_uri: &Url) {
+        self.prepare_pull_debts.remove(host_uri);
+        self.held_saves.remove(host_uri);
+        self.prepare.forget_host(host_uri);
     }
 
     /// Get a cloneable reference to the pool for use in spawned tasks.
@@ -685,6 +1171,20 @@ impl BridgeCoordinator {
     ) -> Option<i32> {
         self.pool
             .increment_document_version(virtual_uri, connection_key)
+            .await
+    }
+
+    /// Record `content` as the text sent for a virtual document, as a
+    /// didOpen or didChange forward would.
+    #[cfg(test)]
+    pub(crate) async fn record_sent_content_for_test<'a>(
+        &self,
+        virtual_uri: &crate::lsp::bridge::protocol::VirtualDocumentUri,
+        connection_key: &crate::lsp::bridge::pool::ConnectionKey,
+        content: impl Into<crate::lsp::bridge::pool::SentText<'a>>,
+    ) {
+        self.pool
+            .record_sent_content_fingerprint(virtual_uri, connection_key, content)
             .await
     }
 
@@ -1019,19 +1519,11 @@ impl BridgeCoordinator {
         (for_server, config)
     }
 
-    /// Memo-resolving front for [`Self::get_all_configs_for_language`] /
-    /// [`Self::get_host_configs_for_language`]: returns the memoized result
-    /// for the current settings snapshot, computing (and caching) it on
-    /// first use. Callers on request paths — especially per-region loops —
-    /// must use this instead of the raw resolvers (see `config_memo`).
-    fn cached_configs(
-        &self,
-        settings: &Arc<WorkspaceSettings>,
-        host_language: &str,
-        injection_language: Option<&str>,
-    ) -> Vec<ResolvedServerConfig> {
+    /// The config memo for this settings snapshot: the current one, or a
+    /// fresh generation anchored to `settings` (see `cached_configs`).
+    fn config_memo_for(&self, settings: &Arc<WorkspaceSettings>) -> Arc<ConfigMemo> {
         let memo = self.config_memo.load();
-        let memo = if memo
+        if memo
             .settings
             .as_ref()
             .is_some_and(|s| Arc::ptr_eq(s, settings))
@@ -1050,7 +1542,21 @@ impl BridgeCoordinator {
             let fresh = Arc::new(ConfigMemo::empty(Some(Arc::clone(settings))));
             self.config_memo.store(Arc::clone(&fresh));
             fresh
-        };
+        }
+    }
+
+    /// Memo-resolving front for [`Self::get_all_configs_for_language`] /
+    /// [`Self::get_host_configs_for_language`]: returns the memoized result
+    /// for the current settings snapshot, computing (and caching) it on
+    /// first use. Callers on request paths — especially per-region loops —
+    /// must use this instead of the raw resolvers (see `config_memo`).
+    fn cached_configs(
+        &self,
+        settings: &Arc<WorkspaceSettings>,
+        host_language: &str,
+        injection_language: Option<&str>,
+    ) -> Vec<ResolvedServerConfig> {
+        let memo = self.config_memo_for(settings);
         match injection_language {
             Some(injection_language) => {
                 if let Some(hit) = memo.virt.get(host_language)
@@ -1341,6 +1847,34 @@ impl BridgeCoordinator {
         injections: &[BridgeInjection],
     ) -> std::collections::HashSet<String> {
         self.pool.close_replaced_docs(uri, injections).await
+    }
+
+    /// Close the documents of `held` regions (`(injection language, region
+    /// id)`) on the connections that hold them unprepared — sent before their
+    /// pair gained a prepare peer, or never recorded: until the peer answers
+    /// (or if it fails) that text would stay bridged, which a prepared pair
+    /// never is. Returns the regions closed.
+    pub(crate) async fn close_unprepared_held_docs(
+        &self,
+        uri: &Url,
+        held: &[(&str, &str)],
+    ) -> Vec<String> {
+        let held: std::collections::HashSet<(&str, &str)> = held.iter().copied().collect();
+        if held.is_empty() {
+            return Vec::new();
+        }
+        self.pool
+            .close_deselected_docs(uri, |doc| {
+                !held.contains(&(doc.virtual_uri.language(), doc.virtual_uri.region_id()))
+                    || self
+                        .pool
+                        .held_text(&doc.virtual_uri.to_uri_string(), &doc.connection_key)
+                        .is_some_and(|held| held.map.is_some())
+            })
+            .await
+            .into_iter()
+            .map(|doc| doc.virtual_uri.region_id().to_string())
+            .collect()
     }
 
     /// Close the host's virtual documents whose server current settings no
@@ -2494,6 +3028,108 @@ mod tests {
     use crate::lsp::bridge::ConnectionKey;
     use crate::lsp::bridge::pool::ConnectionState;
 
+    /// A held text's stamp, as a push from `connection` would carry now.
+    fn stamp_now(
+        coordinator: &BridgeCoordinator,
+        virtual_uri: &str,
+        connection: &ConnectionKey,
+    ) -> crate::lsp::diagnostic_cache::HeldStamp {
+        let held = coordinator.pool.held_text(virtual_uri, connection).unwrap();
+        crate::lsp::diagnostic_cache::HeldStamp {
+            connection: connection.clone(),
+            generation: Some(held.generation),
+            prepared: held.map.is_some(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_push_places_through_the_text_its_connection_holds() {
+        use crate::lsp::bridge::protocol::{
+            SegmentKind, VirtualDocumentUri, VirtualLayout, apply_prepare_result,
+        };
+        use crate::lsp::diagnostic_cache::Placement;
+        let coordinator = BridgeCoordinator::new();
+        let host = Url::parse("file:///doc.nix").unwrap();
+        let region = "01J0000000000000000000000A";
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host).unwrap(),
+            "json",
+            region,
+        );
+        let uri = virtual_uri.to_uri_string();
+        let connection = ConnectionKey::for_server("jsonls");
+        coordinator
+            .register_opened_document_for_test(&host, &virtual_uri, &connection)
+            .await;
+        // `x = ${a}` with the interpolation a gap whose host text varies
+        // while the virtual (and prepared) text does not.
+        let virtual_text = "x =     \n";
+        let prepared = |gap: &str| {
+            let layout = VirtualLayout::from_pieces(
+                virtual_text,
+                [
+                    (SegmentKind::Content, 0..4, String::new()),
+                    (SegmentKind::Gap, 4..8, gap.to_string()),
+                    (SegmentKind::Content, 8..9, String::new()),
+                ],
+            );
+            let result = serde_json::from_value(serde_json::json!({"segments": [
+                {"type": "content"}, {"type": "gap", "content": "0"}, {"type": "content"}
+            ]}))
+            .unwrap();
+            apply_prepare_result(virtual_text, &layout, Some(result)).unwrap()
+        };
+        let place = |held: &crate::lsp::diagnostic_cache::HeldStamp| {
+            coordinator.place_push(&host, "json", region, virtual_text, Some(held))
+        };
+
+        let first = prepared("${a}");
+        coordinator
+            .record_sent_content_for_test(
+                &virtual_uri,
+                &connection,
+                crate::lsp::bridge::SentText {
+                    text: &first.text,
+                    map: first.map.as_ref(),
+                },
+            )
+            .await;
+        let pushed = stamp_now(&coordinator, &uri, &connection);
+        assert!(
+            matches!(place(&pushed), Placement::Prepared(map) if Some(&map) == first.map.as_ref())
+        );
+
+        // Only the gap's host text changed: the server holds the same text,
+        // so its push stays, placed through the map it holds now.
+        let second = prepared("${b}");
+        assert_eq!(first.text, second.text);
+        coordinator.pool.rehold_unchanged_content(
+            &virtual_uri,
+            &connection,
+            crate::lsp::bridge::SentText {
+                text: &second.text,
+                map: second.map.as_ref(),
+            },
+        );
+        assert!(
+            matches!(place(&pushed), Placement::Prepared(map) if Some(&map) == second.map.as_ref())
+        );
+
+        // Sent another text: the push was computed for one it no longer
+        // holds.
+        coordinator
+            .record_sent_content_for_test(&virtual_uri, &connection, "y =     \n")
+            .await;
+        assert!(matches!(place(&pushed), Placement::Skip));
+        // A push for text held as is places as on any unprepared path.
+        let as_is = stamp_now(&coordinator, &uri, &connection);
+        assert!(matches!(place(&as_is), Placement::Offset));
+        assert!(matches!(
+            coordinator.place_push(&host, "json", region, virtual_text, None),
+            Placement::Offset
+        ));
+    }
+
     #[test]
     fn reload_resolution_does_not_resurrect_deleted_server_from_wildcard() {
         let mut settings = WorkspaceSettings::default();
@@ -2806,6 +3442,8 @@ mod tests {
         let host_uri = Url::parse("file:///doc.md").unwrap();
         let injections = || {
             vec![BridgeInjection {
+                held: false,
+                prepared: None,
                 language: "lua".to_string(),
                 region_id: "region-0".to_string(),
                 content: "print(1)\n".to_string(),
@@ -2870,6 +3508,8 @@ mod tests {
         let host_uri = Url::parse("file:///doc.md").unwrap();
         let injections = || {
             vec![BridgeInjection {
+                held: false,
+                prepared: None,
                 language: "lua".to_string(),
                 region_id: "region-0".to_string(),
                 content: "print(1)\n".to_string(),
@@ -3428,6 +4068,8 @@ mod tests {
         });
 
         let injections = vec![BridgeInjection {
+            held: false,
+            prepared: None,
             language: "python".to_string(),
             region_id: "region-0".to_string(),
             content: "import os\n".to_string(),
@@ -3492,6 +4134,8 @@ mod tests {
 
         let host_uri = Url::parse("file:///doc.md").unwrap();
         let injections = vec![BridgeInjection {
+            held: false,
+            prepared: None,
             language: "python".to_string(),
             region_id: "region-0".to_string(),
             content: "import os\n".to_string(),
@@ -3530,6 +4174,8 @@ mod tests {
         let host_uri = Url::parse("file:///doc.md").unwrap();
         let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap();
         let injection = BridgeInjection {
+            held: false,
+            prepared: None,
             language: "lua".to_string(),
             region_id: "region-0".to_string(),
             content: "print('hello')".to_string(),
@@ -3913,6 +4559,8 @@ mod tests {
 
     fn injection(language: &str, region_id: &str) -> BridgeInjection {
         BridgeInjection {
+            held: false,
+            prepared: None,
             language: language.to_string(),
             region_id: region_id.to_string(),
             content: String::new(),
@@ -4079,6 +4727,103 @@ mod tests {
             Some(2),
             "both the rust server and the wildcard server must get a task"
         );
+    }
+
+    #[test]
+    fn prepare_target_lists_the_language_servers_by_their_priorities() {
+        use crate::config::settings::{AggregationConfig, BridgeLanguageConfig, LanguageSettings};
+        use crate::lsp::bridge::protocol::PREPARE_METHOD;
+        let coordinator = BridgeCoordinator::new();
+        let mut settings = WorkspaceSettings {
+            languages: crate::config::defaults::default_settings().languages,
+            ..Default::default()
+        };
+        let server = |languages: &[&str]| BridgeServerConfig {
+            cmd: Some(vec!["server".to_string()]),
+            languages: Some(languages.iter().map(|l| l.to_string()).collect()),
+            ..Default::default()
+        };
+        settings.language_servers = HashMap::from([
+            ("tsudoi".to_string(), server(&["lua", "r", "ruby", "go"])),
+            ("lua-ls".to_string(), server(&["lua", "r"])),
+            ("ruby-ls".to_string(), server(&["ruby"])),
+            ("gopls".to_string(), server(&["go"])),
+            ("pyright".to_string(), server(&["python"])),
+        ]);
+        let bridge = |method: &str, priorities: Option<&[&str]>, enabled: Option<bool>| {
+            BridgeLanguageConfig {
+                enabled,
+                aggregation: priorities.map(|priorities| {
+                    HashMap::from([(
+                        method.to_string(),
+                        AggregationConfig {
+                            priorities: Some(priorities.iter().map(|p| p.to_string()).collect()),
+                            ..Default::default()
+                        },
+                    )])
+                }),
+            }
+        };
+        settings.languages.insert(
+            "markdown".to_string(),
+            LanguageSettings {
+                bridge: Some(HashMap::from([
+                    ("_".to_string(), bridge("_", None, None)),
+                    ("r".to_string(), bridge(PREPARE_METHOD, Some(&[]), None)),
+                    ("ruby".to_string(), bridge("_", Some(&["ruby-ls"]), None)),
+                    (
+                        "go".to_string(),
+                        bridge(PREPARE_METHOD, Some(&["ghost"]), None),
+                    ),
+                    ("python".to_string(), bridge("_", None, Some(false))),
+                ])),
+                ..Default::default()
+            },
+        );
+        let settings = Arc::new(settings);
+        let target = |injection: &str, experimental| {
+            coordinator.prepare_target(&settings, "markdown", injection, experimental)
+        };
+        let names = |target: &super::super::PrepareTarget| {
+            target
+                .candidates
+                .iter()
+                .map(|candidate| candidate.server_name.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let lua = target("lua", true).expect("`*` lists every lua server");
+        assert_eq!(names(&lua), ["lua-ls", "tsudoi"], "by name within `*`");
+        let again = target("lua", true).expect("memoized");
+        assert!(
+            Arc::ptr_eq(&lua.candidates, &again.candidates),
+            "one settings snapshot resolves the candidates once"
+        );
+        assert!(target("lua", false).is_none(), "experimental gate");
+        assert!(target("r", true).is_none(), "`[]` opts a language out");
+        let ruby = target("ruby", true).expect("the `_` method entry applies");
+        assert_eq!(names(&ruby), ["ruby-ls"]);
+        assert!(
+            target("go", true).is_none(),
+            "an unlisted name is no candidate"
+        );
+        assert!(target("python", true).is_none(), "not bridged");
+        assert!(target("toml", true).is_none(), "no server for the language");
+
+        // Once every candidate is known not to advertise the request, the
+        // pair is not prepared at all rather than held for each revision.
+        coordinator
+            .pool()
+            .record_prepare_advertisement("lua-ls", false);
+        assert!(target("lua", true).is_some(), "tsudoi is not known yet");
+        coordinator
+            .pool()
+            .record_prepare_advertisement("tsudoi", false);
+        assert!(target("lua", true).is_none());
+        coordinator
+            .pool()
+            .record_prepare_advertisement("tsudoi", true);
+        assert!(target("lua", true).is_some(), "a restart may advertise it");
     }
 
     #[test]
@@ -4266,6 +5011,132 @@ mod tests {
             vec!["harper-ls".to_string(), "rust-analyzer".to_string()],
             "both answer for rust, in the documented name-sorted order"
         );
+    }
+
+    #[tokio::test]
+    async fn a_region_its_peer_answered_unusably_places_nothing() {
+        use crate::lsp::bridge::protocol::{
+            VirtualDocumentUri, VirtualLayout, apply_prepare_result,
+        };
+        use crate::lsp::diagnostic_cache::Placement;
+        let coordinator = BridgeCoordinator::new();
+        let host = Url::parse("file:///doc.nix").unwrap();
+        let region = "01J0000000000000000000000A";
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host).unwrap(),
+            "json",
+            region,
+        );
+        let connection = ConnectionKey::for_server("jsonls");
+        coordinator
+            .register_opened_document_for_test(&host, &virtual_uri, &connection)
+            .await;
+        // The server holds the text prepared for the region's current virtual
+        // text, from an earlier input differing only in a gap…
+        let prepared = apply_prepare_result("x\n", &VirtualLayout::single("x\n"), None).unwrap();
+        coordinator
+            .record_sent_content_for_test(
+                &virtual_uri,
+                &connection,
+                crate::lsp::bridge::SentText {
+                    text: &prepared.text,
+                    map: prepared.map.as_ref(),
+                },
+            )
+            .await;
+        let pushed = stamp_now(&coordinator, &virtual_uri.to_uri_string(), &connection);
+        let input = super::super::PrepareInput {
+            host_uri: &host,
+            host_language: "nix",
+            injection_language: "json",
+            region_id: region,
+            virtual_text: "x\n",
+            gaps: &[],
+        };
+        coordinator
+            .prepare
+            .hold_answered_for_test(input, Some(Arc::new(prepared.clone())));
+        assert!(matches!(
+            coordinator.place_push(&host, "json", region, "x\n", Some(&pushed)),
+            Placement::Prepared(_)
+        ));
+        // …but the peer answered the current input unusably: the document is
+        // not bridged, so nothing its server computed is either.
+        let failed = super::super::PrepareInput {
+            gaps: &[crate::language::injection::VirtualGap {
+                virtual_range: 0..0,
+                host_text: "${broken}".to_string(),
+            }],
+            ..input
+        };
+        coordinator.prepare.hold_answered_for_test(failed, None);
+        assert!(matches!(
+            coordinator.place_push(&host, "json", region, "x\n", Some(&pushed)),
+            Placement::Skip
+        ));
+        assert!(matches!(
+            coordinator.held_presentation(&host, "json", region, "x\n", &connection),
+            HeldPresentation::Unavailable
+        ));
+        assert!(coordinator.region_is_prepared(&host, "json", region));
+    }
+
+    #[tokio::test]
+    async fn coordinates_from_a_connection_with_nothing_on_record_place_only_unprepared() {
+        use crate::lsp::diagnostic_cache::{HeldStamp, Placement};
+        let coordinator = BridgeCoordinator::new();
+        let host = Url::parse("file:///doc.nix").unwrap();
+        let region = "01J0000000000000000000000A";
+        let connection = ConnectionKey::for_server("jsonls");
+        let unrecorded = HeldStamp {
+            connection: connection.clone(),
+            generation: None,
+            prepared: false,
+        };
+        let place =
+            |stamp: Option<&HeldStamp>| coordinator.place_push(&host, "json", region, "x\n", stamp);
+        // Not prepared: as on any unprepared path.
+        assert!(matches!(place(Some(&unrecorded)), Placement::Offset));
+        assert!(matches!(place(None), Placement::Offset));
+        assert!(matches!(
+            coordinator.held_presentation(&host, "json", region, "x\n", &connection),
+            HeldPresentation::AsIs
+        ));
+        // Prepared (its answer pending here): the text the connection was
+        // being sent is likely prepared, whose map is not on record.
+        coordinator
+            .prepare
+            .hold_pending_for_test(super::super::PrepareInput {
+                host_uri: &host,
+                host_language: "nix",
+                injection_language: "json",
+                region_id: region,
+                virtual_text: "x\n",
+                gaps: &[],
+            });
+        assert!(matches!(place(Some(&unrecorded)), Placement::Skip));
+        assert!(matches!(place(None), Placement::Skip));
+        assert!(matches!(
+            coordinator.held_presentation(&host, "json", region, "x\n", &connection),
+            HeldPresentation::Unavailable
+        ));
+        // Nor through the text sent before the pair gained its peer: a
+        // prepared pair is never bridged unprepared.
+        let host_lsp = crate::lsp::lsp_impl::url_to_uri(&host).unwrap();
+        let virtual_uri =
+            super::super::protocol::VirtualDocumentUri::new(&host_lsp, "json", region);
+        coordinator
+            .register_opened_document_for_test(&host, &virtual_uri, &connection)
+            .await;
+        coordinator
+            .record_sent_content_for_test(&virtual_uri, &connection, "x\n")
+            .await;
+        let as_is = stamp_now(&coordinator, &virtual_uri.to_uri_string(), &connection);
+        assert!(matches!(place(Some(&as_is)), Placement::Skip));
+        assert!(matches!(
+            coordinator.held_presentation(&host, "json", region, "x\n", &connection),
+            HeldPresentation::Unavailable
+        ));
     }
 
     /// The retraction closes exactly the `(injection language, server)` pairs

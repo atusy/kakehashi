@@ -118,7 +118,7 @@ impl VirtualLayout {
     /// own: between content it never reaches downstream servers, so there is
     /// nothing to replace, and the content around it merges into one segment.
     /// Next to a visible gap it is part of that gap's host text.
-    fn from_pieces(
+    pub(crate) fn from_pieces(
         virtual_text: &str,
         pieces: impl IntoIterator<Item = (SegmentKind, Range<usize>, String)>,
     ) -> Self {

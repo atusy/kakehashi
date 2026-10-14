@@ -66,7 +66,7 @@ impl LanguageServerPool {
                 incarnation,
                 &injection.language,
                 &injection.region_id,
-                &injection.content,
+                injection.sent(),
             );
             let virtual_uri =
                 VirtualDocumentUri::new(&host_uri_lsp, &injection.language, &injection.region_id);
@@ -118,6 +118,11 @@ impl LanguageServerPool {
                     )
                     .await
                 else {
+                    // The same text may map back differently now (its gaps
+                    // changed, which the prepared text hides): the server
+                    // holds it under the new map.
+                    self.rehold_unchanged_content(&virtual_uri, &connection_key, injection.sent());
+                    drop(transition_guard);
                     continue;
                 };
 
@@ -136,7 +141,7 @@ impl LanguageServerPool {
                     self.record_sent_content_fingerprint(
                         &virtual_uri,
                         &connection_key,
-                        &injection.content,
+                        injection.sent(),
                     )
                     .await;
                 } else {
