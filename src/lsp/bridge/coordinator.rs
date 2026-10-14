@@ -429,6 +429,7 @@ impl BridgeCoordinator {
                 let _ = resync.send(super::Resync {
                     host_uri,
                     ready: false,
+                    failed: false,
                 });
             }
         }));
@@ -694,6 +695,7 @@ impl BridgeCoordinator {
                 super::prepare_registry::Resync {
                     host_uri: host.clone(),
                     ready: false,
+                    failed: false,
                 },
                 std::time::Duration::ZERO,
             );

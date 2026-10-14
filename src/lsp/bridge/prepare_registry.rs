@@ -101,6 +101,10 @@ pub(crate) struct Resync {
     /// coming due, or an answer coming back unusable), so the host's
     /// diagnostics are collected again too.
     pub(crate) ready: bool,
+    /// A document held back got an unusable answer: it is no longer
+    /// bridged, so the host's diagnostics are collected again too, dropping
+    /// those placed from its earlier text.
+    pub(crate) failed: bool,
 }
 
 /// The answer for one input, and the attempts to get it.
@@ -675,6 +679,7 @@ impl PrepareRegistry {
                         let _ = resync_tx.send(Resync {
                             host_uri: job.host_uri.clone(),
                             ready,
+                            failed: !ready,
                         });
                     }
                 }
@@ -700,6 +705,7 @@ impl PrepareRegistry {
                             let _ = resync_tx.send(Resync {
                                 host_uri,
                                 ready: false,
+                                failed: false,
                             });
                         }
                     });
@@ -1042,7 +1048,8 @@ mod tests {
             resync.try_recv().ok(),
             Some(Resync {
                 host_uri: host,
-                ready: true
+                ready: true,
+                failed: false
             })
         );
     }
@@ -1066,7 +1073,8 @@ mod tests {
             resync.try_recv().ok(),
             Some(Resync {
                 host_uri: host.clone(),
-                ready: true
+                ready: true,
+                failed: false
             })
         );
         // An answer for text the lifecycle pass no longer holds on re-syncs
@@ -1165,7 +1173,77 @@ mod tests {
             resynced,
             Some(Resync {
                 host_uri: host.clone(),
-                ready: false
+                ready: false,
+                failed: false
+            })
+        );
+    }
+
+    /// A candidate advertising the request that refuses it (its first
+    /// request, id 2) `delay` seconds after it arrived, recording what it
+    /// was sent at `path`.
+    #[cfg(unix)]
+    async fn refusing_candidate(
+        pool: &LanguageServerPool,
+        name: &str,
+        path: &std::path::Path,
+        delay: f64,
+    ) {
+        use crate::lsp::bridge::pool::test_helpers::{
+            advertise_prepare_for_test, create_handle_with_command,
+        };
+        use crate::lsp::bridge::pool::{ConnectionKey, ConnectionState};
+        let refusal = r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32603,"message":"no"}}"#;
+        let script = format!(
+            // An asynchronous list reads /dev/null unless given stdin.
+            "exec 3<&0; (cat <&3 > \"$1\") & \
+             while ! grep -q virtualDocument \"$1\" 2>/dev/null; do sleep 0.05; done; \
+             sleep {delay}; printf 'Content-Length: {}\\r\\n\\r\\n%s' '{refusal}'; wait",
+            refusal.len()
+        );
+        let (handle, _) = create_handle_with_command(
+            ConnectionState::Ready,
+            ConnectionKey::for_server(name),
+            vec![
+                "sh".into(),
+                "-c".into(),
+                script,
+                "refuse".into(),
+                path.to_str().unwrap().into(),
+            ],
+            None,
+        )
+        .await;
+        advertise_prepare_for_test(&handle, true);
+        pool.insert_connection(handle).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unusable_answer_resyncs_its_host_as_failed() {
+        let registry = PrepareRegistry::default();
+        let mut resync = registry.take_resync_rx().unwrap();
+        let pool = Arc::new(LanguageServerPool::new());
+        let dir = tempfile::tempdir().unwrap();
+        refusing_candidate(&pool, "peer", &dir.path().join("peer"), 0.0).await;
+        let host = Url::parse("file:///host.md").unwrap();
+        let target = target_of(&[("peer", &["peer"])]);
+        registry.slot(&target, input(&host, "a"), Holder::LifecyclePass);
+        assert_eq!(
+            registry
+                .prepare(&pool, &target, input(&host, "a"))
+                .await
+                .err(),
+            Some(PrepareMiss::Failed)
+        );
+        // Diagnostics placed from the region's earlier text are collected
+        // away; the pull debt still waits for the host's other answers.
+        assert_eq!(
+            resync.try_recv().ok(),
+            Some(Resync {
+                host_uri: host,
+                ready: false,
+                failed: true
             })
         );
     }
@@ -1173,10 +1251,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn an_answer_given_while_a_passed_over_candidate_starts_advertising_is_asked_again() {
-        use crate::lsp::bridge::pool::test_helpers::{
-            advertise_prepare_for_test, create_handle_with_command,
-        };
-        use crate::lsp::bridge::pool::{ConnectionKey, ConnectionState};
         let registry = PrepareRegistry::default();
         let pool = Arc::new(LanguageServerPool::new());
         let dir = tempfile::tempdir().unwrap();
@@ -1186,31 +1260,9 @@ mod tests {
         // `first` has not advertised the request so far: passed over.
         recording_candidate(&pool, "first", true, &first).await;
         pool.record_prepare_advertisement("first", false);
-        // `second` refuses the request (its first one, id 2), but only a
-        // while after it arrived: `first` starts advertising meanwhile.
-        let refusal = r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32603,"message":"no"}}"#;
-        let script = format!(
-            // An asynchronous list reads /dev/null unless given stdin.
-            "exec 3<&0; (cat <&3 > \"$1\") & \
-             while ! grep -q virtualDocument \"$1\" 2>/dev/null; do sleep 0.05; done; \
-             sleep 0.5; printf 'Content-Length: {}\\r\\n\\r\\n%s' '{refusal}'; wait",
-            refusal.len()
-        );
-        let (handle, _) = create_handle_with_command(
-            ConnectionState::Ready,
-            ConnectionKey::for_server("second"),
-            vec![
-                "sh".into(),
-                "-c".into(),
-                script,
-                "refuse".into(),
-                second.to_str().unwrap().into(),
-            ],
-            None,
-        )
-        .await;
-        advertise_prepare_for_test(&handle, true);
-        pool.insert_connection(handle).await;
+        // `second` refuses the request, but only a while after it arrived:
+        // `first` starts advertising meanwhile.
+        refusing_candidate(&pool, "second", &second, 0.5).await;
         let host = Url::parse("file:///host.md").unwrap();
         let target = target_of(&[("first", &["first"]), ("second", &["second"])]);
         registry.slot(&target, input(&host, "a"), Holder::LifecyclePass);

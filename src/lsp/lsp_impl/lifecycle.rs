@@ -804,12 +804,16 @@ impl Kakehashi {
                     // Several documents of one host usually finish together;
                     // a host is re-diagnosed when any of its documents became
                     // ready (a retry coming due sends nothing new yet).
-                    let mut hosts =
-                        std::collections::HashMap::from([(first.host_uri, first.ready)]);
+                    let mut hosts = std::collections::HashMap::from([(
+                        first.host_uri,
+                        (first.ready, first.failed),
+                    )]);
                     while let Ok(resync) = resync_rx.try_recv() {
-                        *hosts.entry(resync.host_uri).or_default() |= resync.ready;
+                        let (ready, unusable) = hosts.entry(resync.host_uri).or_default();
+                        *ready |= resync.ready;
+                        *unusable |= resync.failed;
                     }
-                    for (uri, ready) in hosts {
+                    for (uri, (ready, unusable)) in hosts {
                         // A send the pass could not queue leaves its server
                         // on the text before, and the answer is cached, so
                         // no resync would come again: retry with backoff,
@@ -835,6 +839,7 @@ impl Kakehashi {
                                     crate::lsp::bridge::Resync {
                                         host_uri: uri.clone(),
                                         ready,
+                                        failed: unusable,
                                     },
                                     crate::lsp::bridge::prepare_retry_delay(*failed),
                                 );
@@ -865,8 +870,11 @@ impl Kakehashi {
                         // now that they reached their servers — or once the
                         // retry carrying this readiness gets through. Not
                         // after retries ran out: servers may still hold the
-                        // text before, and the next edit collects anyway.
-                        if ready && synchronized && looked && !retrying {
+                        // text before, and the next edit collects anyway. A
+                        // region whose answer came back unusable is no longer
+                        // bridged: collecting again drops what its earlier
+                        // (prepared) text published.
+                        if (ready || unusable) && synchronized && looked && !retrying {
                             diagnostics.spawn_diagnostic_task_after_prepare(uri);
                         }
                     }
