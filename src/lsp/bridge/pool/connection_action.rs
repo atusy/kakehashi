@@ -53,10 +53,11 @@ pub(crate) enum BridgeError {
     /// root, so acquisition entry points retry it (see
     /// [`BridgeError::reroutes`]).
     FolderSupportWithdrawn,
-    /// Routing chose a shared instance that has since come up without
-    /// folder-change support and does not serve the acquisition's marker
-    /// root (#992): routing probed it still `Initializing`, and the handshake
-    /// completed before the acquire took the pool.
+    /// Routing chose a shared instance that, by the time the acquire found it
+    /// `Ready`, lacks folder-change support and does not serve the
+    /// acquisition's marker root: typically routing probed it still
+    /// `Initializing` and its handshake completed before the acquire (#992),
+    /// or an unregistration landed after a probe that saw it capable (#968).
     ///
     /// Carried as `io::ErrorKind::Interrupted` for the same reason as
     /// [`BridgeError::FolderSupportWithdrawn`]: re-resolving now diverts the
@@ -156,8 +157,8 @@ impl std::fmt::Display for BridgeError {
             ),
             BridgeError::SharedRootUnserved => write!(
                 f,
-                "bridge: shared instance came up without folder-change support \
-                 and does not serve this root"
+                "bridge: shared instance lacks folder-change support and does \
+                 not serve this root"
             ),
         }
     }
