@@ -675,8 +675,9 @@ impl Kakehashi {
         let mut push_fallback_by_lang: HashMap<String, bool> = HashMap::new();
         for (region_id, injection_language, offset, virtual_text) in region_meta {
             // `get` on the common (cache-hit) path is a single lookup; only the
-            // resolving miss touches the map again, moving the owned language key
-            // in (no clone).
+            // resolving miss touches the map again, cloning the language key
+            // (once per distinct language: the owned one goes on to place the
+            // region's pushes).
             let push_fallback = match push_fallback_by_lang.get(&injection_language) {
                 Some(&fallback) => fallback,
                 None => {
