@@ -716,10 +716,22 @@ impl LanguageServerPool {
         }
     }
 
-    /// Record whether `connection` advertises
-    /// `kakehashi/virtualDocument/prepare`: its last handshake, or a
-    /// `MethodNotFound` answer since. `true` when this changed what its
-    /// server is recorded to advertise (see [`Self::prepare_advertised_epoch`]).
+    /// Record whether `handle`'s connection advertises
+    /// `kakehashi/virtualDocument/prepare` (its handshake, or a
+    /// `MethodNotFound` answer since), unless
+    /// another connection has replaced it since: `true` when this changed
+    /// what is recorded (see [`Self::prepare_advertised_epoch`]).
+    pub(crate) fn record_prepare_advertisement_from(
+        &self,
+        handle: &ConnectionHandle,
+        advertised: bool,
+    ) -> bool {
+        self.prepare_advertisements.record_from(handle, advertised)
+    }
+
+    /// [`Self::record_prepare_advertisement_from`] by the connection's key,
+    /// whichever handle serves it: tests stand for a connection by its key.
+    #[cfg(test)]
     pub(crate) fn record_prepare_advertisement(
         &self,
         connection: &ConnectionKey,
@@ -4728,6 +4740,7 @@ impl LanguageServerPool {
 
         // Insert into pool immediately so concurrent requests see Initializing state
         connections.insert(connection_key.clone(), Arc::clone(&handle));
+        self.prepare_advertisements.adopt(&handle);
         self.peer_directory.register(&handle);
 
         // Release lock before spawning handshake task
@@ -4848,10 +4861,8 @@ impl LanguageServerPool {
                     // advertisement of `kakehashi/virtualDocument/prepare`: one
                     // retired during its handshake (a settings reload replacing
                     // it) must not overwrite what its replacement recorded.
-                    prepare_advertisements.record(
-                        handle_for_handshake.key(),
-                        extensions.virtual_document_prepare,
-                    );
+                    prepare_advertisements
+                        .record_from(&handle_for_handshake, extensions.virtual_document_prepare);
                     // Record advertised palette command names AFTER Ready, so a
                     // command fired without an action context (raw name) routes
                     // back to a Ready connection (#628). Dedup is by name across
@@ -5537,6 +5548,9 @@ impl LanguageServerPool {
 #[derive(Default)]
 pub(crate) struct PrepareAdvertisements {
     by_server: DashMap<String, std::collections::HashMap<ConnectionKey, bool>>,
+    /// The connection now serving each key: one it replaced (retired while
+    /// its handshake or a request still ran) records no advertisement.
+    current: DashMap<ConnectionKey, std::sync::Weak<ConnectionHandle>>,
     /// Run when a server's recorded advertisement changes: one that starts
     /// advertising had its pairs sent as is meanwhile, one that withdraws
     /// it (a `MethodNotFound`) leaves documents holding its prepared text,
@@ -5569,6 +5583,22 @@ impl PrepareAdvertisements {
         self.start_failures
             .lock()
             .recover_poison("PrepareAdvertisements::start_failures")
+    }
+
+    /// Take `handle` as the connection serving its key from now on.
+    fn adopt(&self, handle: &Arc<ConnectionHandle>) {
+        self.current
+            .insert(handle.key().clone(), Arc::downgrade(handle));
+    }
+
+    /// [`Self::record`] for `handle`'s advertisement, unless another
+    /// connection has taken its key since.
+    fn record_from(&self, handle: &ConnectionHandle, advertised: bool) -> bool {
+        let replaced = self
+            .current
+            .get(handle.key())
+            .is_some_and(|current| !std::ptr::eq(current.as_ptr(), std::ptr::from_ref(handle)));
+        !replaced && self.record(handle.key(), advertised)
     }
 
     /// Whether a server's connections advertise the request: while any
@@ -5741,6 +5771,23 @@ mod tests {
         pool.forget_prepare_start_failures(None);
         assert!(!pool.prepare_start_failed("peer", &b));
         assert_eq!(runs.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn a_replaced_connection_records_no_prepare_advertisement() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("peer");
+        let retired =
+            test_helpers::create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        pool.prepare_advertisements.adopt(&retired);
+        let replacement =
+            test_helpers::create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        pool.prepare_advertisements.adopt(&replacement);
+        assert!(!pool.record_prepare_advertisement_from(&replacement, true));
+        assert_eq!(pool.prepare_advertisement("peer"), Some(true));
+        // The retired connection's handshake, finishing late, changes nothing.
+        assert!(!pool.record_prepare_advertisement_from(&retired, false));
+        assert_eq!(pool.prepare_advertisement("peer"), Some(true));
     }
 
     #[test]

@@ -1076,7 +1076,7 @@ async fn try_run(
                     // It does not answer the request after all (`MethodNotFound`
                     // withdraws the advertisement): as if it had not advertised it.
                     Err(_) if !handle.supports_virtual_document_prepare() => {
-                        if pool.record_prepare_advertisement(handle.key(), false) {
+                        if pool.record_prepare_advertisement_from(&handle, false) {
                             advertised_epoch += 1;
                         }
                         continue;
