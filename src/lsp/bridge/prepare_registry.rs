@@ -784,7 +784,18 @@ async fn run(
             Ok(None)
         }
         Err(unanswered) => {
-            log_failure(&unanswered);
+            // A revoked attempt (its host closed, or a settings change
+            // dropped its pair) is no failure worth a warning.
+            if admitted() {
+                log_failure(&unanswered);
+            } else {
+                log::debug!(
+                    target: "kakehashi::bridge::prepare",
+                    "Dropped a revoked prepare attempt for {}: {}",
+                    job.host_uri,
+                    escape_terminal_controls(&unanswered.to_string())
+                );
+            }
             Err(())
         }
     }
