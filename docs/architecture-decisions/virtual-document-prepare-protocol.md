@@ -61,10 +61,11 @@ priorities = ["tsudoi"]
   passed over. Only that candidate is asked, and its answer stands (see
   Failure). A configured `concatenated` is ignored with a warning.
 - When no candidate advertises the request, the document is sent as is.
-  Each server's advertisement is remembered from its last handshake (a
-  server that answered `MethodNotFound` counts as not advertising until its
-  next one), so a pair none of whose candidates advertises it is not held
-  back per edit to find that out again. One that could not start is
+  Each connection's advertisement is remembered from its last handshake (one
+  that answered `MethodNotFound` counts as not advertising until its next
+  one), and a server advertises the request while any of its connections
+  (one per workspace root) does, so a pair none of whose candidates
+  advertises it is not held back per edit to find that out again. One that could not start is
   recorded as failing for that host's documents only — its connection for
   another workspace root may be healthy — not as not advertising, until a
   handshake of it advertises the request, a settings change, or the host

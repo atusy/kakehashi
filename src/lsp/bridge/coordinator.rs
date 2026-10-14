@@ -4981,17 +4981,20 @@ mod tests {
 
         // Once every candidate is known not to advertise the request, the
         // pair is not prepared at all rather than held for each revision.
-        coordinator
-            .pool()
-            .record_prepare_advertisement("lua-ls", false);
+        coordinator.pool().record_prepare_advertisement(
+            &crate::lsp::bridge::pool::ConnectionKey::for_server("lua-ls"),
+            false,
+        );
         assert!(target("lua", true).is_some(), "tsudoi is not known yet");
-        coordinator
-            .pool()
-            .record_prepare_advertisement("tsudoi", false);
+        coordinator.pool().record_prepare_advertisement(
+            &crate::lsp::bridge::pool::ConnectionKey::for_server("tsudoi"),
+            false,
+        );
         assert!(target("lua", true).is_none());
-        coordinator
-            .pool()
-            .record_prepare_advertisement("tsudoi", true);
+        coordinator.pool().record_prepare_advertisement(
+            &crate::lsp::bridge::pool::ConnectionKey::for_server("tsudoi"),
+            true,
+        );
         assert!(target("lua", true).is_some(), "a restart may advertise it");
     }
 

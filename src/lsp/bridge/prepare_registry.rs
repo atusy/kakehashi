@@ -1032,7 +1032,7 @@ async fn try_run(
                     // It does not answer the request after all (`MethodNotFound`
                     // withdraws the advertisement): as if it had not advertised it.
                     Err(_) if !handle.supports_virtual_document_prepare() => {
-                        if pool.record_prepare_advertisement(name, false) {
+                        if pool.record_prepare_advertisement(handle.key(), false) {
                             advertised_epoch += 1;
                         }
                         continue;
@@ -1412,7 +1412,10 @@ mod tests {
         // `first` answers a while after the request arrived, having
         // withdrawn its advertisement meanwhile.
         refusing_candidate(&pool, "first", &first, 0.5).await;
-        pool.record_prepare_advertisement("first", true);
+        pool.record_prepare_advertisement(
+            &crate::lsp::bridge::pool::ConnectionKey::for_server("first"),
+            true,
+        );
         recording_candidate(&pool, "second", true, &second).await;
         let host = Url::parse("file:///host.md").unwrap();
         let target = target_of(&[("first", &["first"]), ("second", &["second"])]);
@@ -1422,7 +1425,10 @@ mod tests {
             while !sent(&first).contains(method) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            pool.record_prepare_advertisement("first", false);
+            pool.record_prepare_advertisement(
+                &crate::lsp::bridge::pool::ConnectionKey::for_server("first"),
+                false,
+            );
         };
         let (miss, ()) = tokio::join!(
             registry.prepare(&pool, &target, input(&host, "a")),
@@ -1455,7 +1461,10 @@ mod tests {
         let sent = |path: &std::path::Path| std::fs::read_to_string(path).unwrap_or_default();
         // `first` has not advertised the request so far: passed over.
         recording_candidate(&pool, "first", true, &first).await;
-        pool.record_prepare_advertisement("first", false);
+        pool.record_prepare_advertisement(
+            &crate::lsp::bridge::pool::ConnectionKey::for_server("first"),
+            false,
+        );
         // `second` refuses the request, but only a while after it arrived:
         // `first` starts advertising meanwhile.
         refusing_candidate(&pool, "second", &second, 0.5).await;
@@ -1467,7 +1476,10 @@ mod tests {
             while !sent(&second).contains(method) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            pool.record_prepare_advertisement("first", true);
+            pool.record_prepare_advertisement(
+                &crate::lsp::bridge::pool::ConnectionKey::for_server("first"),
+                true,
+            );
         };
         let (miss, ()) = tokio::join!(
             registry.prepare(&pool, &target, input(&host, "a")),

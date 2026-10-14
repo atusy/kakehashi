@@ -712,12 +712,16 @@ impl LanguageServerPool {
         }
     }
 
-    /// Record whether `server_name` advertises
-    /// `kakehashi/virtualDocument/prepare`: its last handshake, a
-    /// `MethodNotFound` answer since, or a failure to start it. `true` when
-    /// this changed the record (see [`Self::prepare_advertised_epoch`]).
-    pub(crate) fn record_prepare_advertisement(&self, server_name: &str, advertised: bool) -> bool {
-        self.prepare_advertisements.record(server_name, advertised)
+    /// Record whether `connection` advertises
+    /// `kakehashi/virtualDocument/prepare`: its last handshake, or a
+    /// `MethodNotFound` answer since. `true` when this changed what its
+    /// server is recorded to advertise (see [`Self::prepare_advertised_epoch`]).
+    pub(crate) fn record_prepare_advertisement(
+        &self,
+        connection: &ConnectionKey,
+        advertised: bool,
+    ) -> bool {
+        self.prepare_advertisements.record(connection, advertised)
     }
 
     /// Whether `server_name` advertises `kakehashi/virtualDocument/prepare`,
@@ -4787,8 +4791,10 @@ impl LanguageServerPool {
                     // advertisement of `kakehashi/virtualDocument/prepare`: one
                     // retired during its handshake (a settings reload replacing
                     // it) must not overwrite what its replacement recorded.
-                    prepare_advertisements
-                        .record(&server_name_for_log, extensions.virtual_document_prepare);
+                    prepare_advertisements.record(
+                        handle_for_handshake.key(),
+                        extensions.virtual_document_prepare,
+                    );
                     // Record advertised palette command names AFTER Ready, so a
                     // command fired without an action context (raw name) routes
                     // back to a Ready connection (#628). Dedup is by name across
@@ -5466,12 +5472,14 @@ impl LanguageServerPool {
     }
 }
 
-/// Whether each server (by name) advertised
+/// Whether each connection advertised
 /// `experimental.kakehashi.virtualDocumentPrepare` in its last handshake
-/// (`false` too for one that could not start, or answered `MethodNotFound`).
+/// (`false` too once it answered `MethodNotFound`), kept per server: a
+/// server advertises it while any of its connections (one per workspace
+/// root) does, so one root's withdrawal does not pass over another's.
 #[derive(Default)]
 pub(crate) struct PrepareAdvertisements {
-    by_server: DashMap<String, bool>,
+    by_server: DashMap<String, std::collections::HashMap<ConnectionKey, bool>>,
     /// Run when a server's recorded advertisement changes: one that starts
     /// advertising had its pairs sent as is meanwhile, one that withdraws
     /// it (a `MethodNotFound`) leaves documents holding its prepared text,
@@ -5506,25 +5514,34 @@ impl PrepareAdvertisements {
             .recover_poison("PrepareAdvertisements::start_failures")
     }
 
-    /// Record `server_name`'s advertisement, cloning its name only when
-    /// first seen; `true` when it changed a recorded one. (A first record
-    /// changes no candidate's selection: an unrecorded candidate is asked.)
-    fn record(&self, server_name: &str, advertised: bool) -> bool {
+    /// Whether a server's connections advertise the request: while any
+    /// does; `None` with none recorded.
+    fn aggregate(connections: &std::collections::HashMap<ConnectionKey, bool>) -> Option<bool> {
+        (!connections.is_empty()).then(|| connections.values().any(|advertised| *advertised))
+    }
+
+    /// Record `connection`'s advertisement; `true` when it changed what its
+    /// server was recorded to advertise. (A server's first record changes no
+    /// candidate's selection: an unrecorded candidate is asked.)
+    fn record(&self, connection: &ConnectionKey, advertised: bool) -> bool {
+        let server_name = connection.server();
         // A handshake advertising the request: the server started somewhere,
         // and is tried again where it could not be — the answers given
         // without it (as is, or a later candidate's) are asked again.
         let retried = advertised && self.forget_start_failures(|server, _| server == server_name);
-        let previous = match self.by_server.get_mut(server_name) {
-            Some(mut entry) => std::mem::replace(&mut *entry, advertised),
-            None => {
-                self.by_server.insert(server_name.to_string(), advertised);
-                if retried {
-                    self.invalidate();
-                }
-                return false;
-            }
+        let (previous, now) = {
+            let mut connections = self.by_server.entry(server_name.to_string()).or_default();
+            let previous = Self::aggregate(&connections);
+            connections.insert(connection.clone(), advertised);
+            (previous, Self::aggregate(&connections))
         };
-        if advertised == previous {
+        let Some(previous) = previous else {
+            if retried {
+                self.invalidate();
+            }
+            return false;
+        };
+        if now == Some(previous) {
             if retried {
                 self.invalidate();
             }
@@ -5563,7 +5580,7 @@ impl PrepareAdvertisements {
     fn get(&self, server_name: &str) -> Option<bool> {
         self.by_server
             .get(server_name)
-            .map(|advertised| *advertised)
+            .and_then(|connections| Self::aggregate(&connections))
     }
 }
 
@@ -5616,7 +5633,10 @@ mod tests {
         }));
         let a = Url::parse("file:///a/doc.md").unwrap();
         let b = Url::parse("file:///b/doc.md").unwrap();
-        pool.record_prepare_advertisement("peer", true);
+        pool.record_prepare_advertisement(
+            &crate::lsp::bridge::pool::ConnectionKey::for_server("peer"),
+            true,
+        );
         let epoch = pool.prepare_advertised_epoch();
         assert!(pool.record_prepare_start_failure(
             "peer",
@@ -5631,7 +5651,10 @@ mod tests {
         assert_eq!(runs.load(std::sync::atomic::Ordering::Relaxed), 0);
         // A handshake advertising the request tries it again, asking again
         // what was answered without it.
-        pool.record_prepare_advertisement("peer", true);
+        pool.record_prepare_advertisement(
+            &crate::lsp::bridge::pool::ConnectionKey::for_server("peer"),
+            true,
+        );
         assert!(!pool.prepare_start_failed("peer", &b));
         assert_eq!(pool.prepare_advertised_epoch(), epoch + 1);
         assert_eq!(runs.load(std::sync::atomic::Ordering::Relaxed), 1);
@@ -5664,6 +5687,27 @@ mod tests {
     }
 
     #[test]
+    fn a_server_advertises_prepare_while_any_of_its_connections_does() {
+        let pool = LanguageServerPool::new();
+        let a = ConnectionKey::new("peer", Some("file:///a".to_string()));
+        let b = ConnectionKey::new("peer", Some("file:///b".to_string()));
+        pool.record_prepare_advertisement(&a, true);
+        let epoch = pool.prepare_advertised_epoch();
+        // One root's connection withdrawing it (a `MethodNotFound`) leaves
+        // the other's preparing.
+        pool.record_prepare_advertisement(&b, false);
+        assert_eq!(pool.prepare_advertisement("peer"), Some(true));
+        assert_eq!(
+            pool.prepare_advertised_epoch(),
+            epoch,
+            "nothing changed for the server"
+        );
+        // Withdrawn by every connection: the server is passed over.
+        assert!(pool.record_prepare_advertisement(&a, false));
+        assert_eq!(pool.prepare_advertisement("peer"), Some(false));
+    }
+
+    #[test]
     fn a_change_of_prepare_advertisement_runs_the_hook() {
         let pool = LanguageServerPool::new();
         let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -5673,20 +5717,35 @@ mod tests {
         }));
         let runs = || runs.load(std::sync::atomic::Ordering::Relaxed);
         // A first handshake that advertises: nothing was sent as is for it.
-        pool.record_prepare_advertisement("tsudoi", true);
+        pool.record_prepare_advertisement(
+            &crate::lsp::bridge::pool::ConnectionKey::for_server("tsudoi"),
+            true,
+        );
         assert_eq!(runs(), 0);
-        pool.record_prepare_advertisement("tsudoi", true);
+        pool.record_prepare_advertisement(
+            &crate::lsp::bridge::pool::ConnectionKey::for_server("tsudoi"),
+            true,
+        );
         assert_eq!(runs(), 0);
         // It did not start in time, then advertised once up.
-        pool.record_prepare_advertisement("late", false);
+        pool.record_prepare_advertisement(
+            &crate::lsp::bridge::pool::ConnectionKey::for_server("late"),
+            false,
+        );
         assert_eq!(pool.prepare_advertisement("late"), Some(false));
         let before = pool.prepare_advertised_epoch();
-        pool.record_prepare_advertisement("late", true);
+        pool.record_prepare_advertisement(
+            &crate::lsp::bridge::pool::ConnectionKey::for_server("late"),
+            true,
+        );
         assert_eq!(runs(), 1);
         assert_eq!(pool.prepare_advertised_epoch(), before + 1);
         assert_eq!(pool.prepare_advertisement("late"), Some(true));
         // Withdrawn (a `MethodNotFound`): its documents hold prepared text.
-        pool.record_prepare_advertisement("late", false);
+        pool.record_prepare_advertisement(
+            &crate::lsp::bridge::pool::ConnectionKey::for_server("late"),
+            false,
+        );
         assert_eq!(runs(), 2);
         assert_eq!(pool.prepare_advertised_epoch(), before + 2);
         // Runtime settings propagated: as if an advertisement had changed.
