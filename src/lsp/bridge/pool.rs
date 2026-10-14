@@ -385,10 +385,12 @@ pub(crate) struct HostVirtualContents {
 /// The latest text forwarded for a virtual document, which a deferred
 /// didOpen substitutes: what downstream servers are sent, with the prepared
 /// map when a peer prepared it.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct LatestText {
     text: String,
     map: Option<Arc<super::protocol::PreparedMap>>,
+    /// When it was recorded (see [`super::protocol::next_presentation`]).
+    recorded: u64,
 }
 
 impl LatestText {
@@ -2901,16 +2903,25 @@ impl LanguageServerPool {
             ),
             VirtualOpenContent::Snapshot(provided) => (provided, None),
         };
-        // A cached text sent as is, while the request is prepared, was sent
-        // before the pair gained its peer: a prepared pair must not be opened
-        // with it. The reverse — a prepared cache for a request built as is —
-        // is most likely the lifecycle pass's newer text (the pair gained its
-        // peer since), which the server should hold even though this request
-        // then fails its own check; right after a pair lost its peer, it is
-        // the older one, which the lifecycle pass replaces on its next send.
+        // A cached text sent as is, for a prepared request, is the older of
+        // the two when it was recorded before the request's answer was
+        // applied (before the pair gained its peer): a prepared pair must not
+        // be opened with it. Recorded after, it is the lifecycle pass's newer
+        // text (the pair lost its peer since), which the stale request must
+        // not replace. The reverse — a prepared cache for a request built as
+        // is — is most likely the lifecycle pass's newer text (the pair
+        // gained its peer since), which the server should hold even though
+        // this request then fails its own check; right after a pair lost its
+        // peer, it is the older one, which the lifecycle pass replaces on its
+        // next send.
         let virtual_content = current_content
             .as_deref()
-            .filter(|cached| provided.map.is_none() || cached.map.is_some())
+            .filter(|cached| {
+                cached.map.is_some()
+                    || provided
+                        .map
+                        .is_none_or(|request| cached.recorded > request.built())
+            })
             .map_or(provided, LatestText::as_sent);
         let did_open = build_didopen_notification(virtual_uri, virtual_content.text);
         // What the connection holds is recorded before the didOpen can reach
@@ -3008,6 +3019,7 @@ impl LanguageServerPool {
             Arc::new(LatestText {
                 text: content.text.to_string(),
                 map: content.map.cloned(),
+                recorded: super::protocol::next_presentation(),
             })
         };
         if let Some(regions) = host.contents.get(language) {
@@ -8630,6 +8642,46 @@ mod tests {
         assert_eq!(message["params"]["textDocument"]["text"], "a");
         let held = pool.held_text(&virtual_uri.to_uri_string(), &key).unwrap();
         assert_eq!(held.map, prepared.map);
+    }
+
+    #[tokio::test]
+    async fn a_prepared_open_built_before_its_pair_lost_its_peer_takes_the_newer_text_as_is() {
+        use super::super::protocol::{VirtualLayout, apply_prepare_result};
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///test/lost-peer-open.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        // The request's answer, then the lifecycle pass sending the text as
+        // is once the pair lost its peer.
+        let result = serde_json::from_value(serde_json::json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared =
+            apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(result)).unwrap();
+        pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  a");
+
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(1);
+        pool.ensure_document_opened(
+            &mut sender,
+            &host_uri,
+            &virtual_uri,
+            SentText {
+                text: &prepared.text,
+                map: prepared.map.as_ref(),
+            },
+            &key,
+        )
+        .await
+        .unwrap();
+
+        let OutboundMessage::Untracked(message) = rx.try_recv().unwrap() else {
+            panic!("didOpen must be an untracked notification");
+        };
+        assert_eq!(message["params"]["textDocument"]["text"], "  a");
+        let held = pool.held_text(&virtual_uri.to_uri_string(), &key).unwrap();
+        assert_eq!(held.map, None, "the stale request's map is not held");
     }
 
     #[tokio::test]

@@ -443,6 +443,7 @@ pub(crate) fn apply_prepare_result(
         runs,
         indents,
         fingerprint,
+        built: next_presentation(),
     };
     Ok(PreparedDocument {
         text,
@@ -709,6 +710,17 @@ pub(crate) struct PreparedMap {
     runs: Vec<Run>,
     indents: Vec<SegmentIndent>,
     fingerprint: u64,
+    /// When the answer it came from was applied (see
+    /// [`next_presentation`]); not part of its equality.
+    built: u64,
+}
+
+/// A process-wide order of the decisions about what a virtual document's
+/// servers are sent: a prepared answer applied, a text recorded as the
+/// latest to send. Tells which of two such decisions is the newer.
+pub(crate) fn next_presentation() -> u64 {
+    static PRESENTATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    PRESENTATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
 impl PartialEq for PreparedMap {
@@ -720,6 +732,12 @@ impl PartialEq for PreparedMap {
 impl Eq for PreparedMap {}
 
 impl PreparedMap {
+    /// When the answer this map came from was applied (see
+    /// [`next_presentation`]).
+    pub(crate) fn built(&self) -> u64 {
+        self.built
+    }
+
     /// Translate a position in P to V.
     pub(crate) fn to_virtual(&self, position: Position, bias: Bias) -> Position {
         let offset = self.prepared_lines.offset_clamped(position);
