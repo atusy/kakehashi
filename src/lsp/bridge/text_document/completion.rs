@@ -301,6 +301,22 @@ pub(super) fn transform_completion_item(
             Vec::new()
         };
 
+    // An item without a `textEdit` is inserted at the cursor as is, never
+    // through the prepared map: a line it breaks would not regain the
+    // indentation the peer removed, nor keep off a hidden line break.
+    // Single-line text needs neither.
+    if offset.prepared().is_some() && item.text_edit.is_none() {
+        let text = item.insert_text.as_deref().unwrap_or(&item.label);
+        let inserted = if snippet {
+            snippet_expansion(text)
+        } else {
+            Some(text.to_string())
+        };
+        if inserted.is_none_or(|text| text.contains(['\n', '\r'])) {
+            return false;
+        }
+    }
+
     // A snippet's tabstops vanish when the client expands it, so the text
     // a prepared map checks must be the expansion too: `$0\n` reads as
     // ending with a line break the map may need, but expands to one that
@@ -1085,6 +1101,38 @@ mod tests {
         assert_eq!(expanded("${1:${2:${3:x}}}"), None);
         let deep = format!("{}x{}", "${1:".repeat(10_000), "}".repeat(10_000));
         assert_eq!(expanded(&deep), None);
+    }
+
+    #[rstest]
+    #[case::multi_line_insert_text(Some("a\nb"), false)]
+    #[case::single_line_insert_text(Some("ab"), true)]
+    #[case::label_only(None, true)]
+    fn a_prepared_item_without_a_text_edit_is_kept_only_on_one_line(
+        #[case] insert_text: Option<&str>,
+        #[case] kept: bool,
+    ) {
+        use super::super::super::protocol::{VirtualLayout, apply_prepare_result};
+        let result = serde_json::from_value(serde_json::json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared =
+            apply_prepare_result("  a\n", &VirtualLayout::single("  a\n"), Some(result)).unwrap();
+        let offset = RegionOffset::new(0, 0).with_prepared(prepared.map);
+        let mut item = tower_lsp_server::ls_types::CompletionItem {
+            label: "x".to_string(),
+            insert_text: insert_text.map(str::to_string),
+            ..Default::default()
+        };
+        assert_eq!(
+            transform_completion_item(
+                &mut item,
+                &offset,
+                Position::new(1, 0),
+                Some(Position::new(0, 3)),
+            ),
+            kept
+        );
     }
 
     #[rstest]
