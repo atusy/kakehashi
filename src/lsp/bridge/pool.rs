@@ -607,6 +607,12 @@ pub struct LanguageServerPool {
     inbound_request_registry: super::InboundRequestRegistry,
     /// Palette command name → origin server (#628 palette-fired executeCommand).
     command_origins: Arc<CommandOriginRegistry>,
+    /// Whether each server (by name) advertised
+    /// `experimental.kakehashi.virtualDocumentPrepare` in its last handshake
+    /// (`false` too for one that could not start), so a (host, injection)
+    /// pair none of whose candidates prepares is not held back on each
+    /// revision to find that out again.
+    prepare_advertisements: Arc<DashMap<String, bool>>,
 }
 
 impl Default for LanguageServerPool {
@@ -679,7 +685,23 @@ impl LanguageServerPool {
             client_progress_registry: Arc::new(super::ClientProgressRegistry::new()),
             inbound_request_registry: super::InboundRequestRegistry::default(),
             command_origins: Arc::new(CommandOriginRegistry::default()),
+            prepare_advertisements: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Record whether `server_name` advertises
+    /// `kakehashi/virtualDocument/prepare`: its last handshake, a
+    /// `MethodNotFound` answer since, or a failure to start it.
+    pub(crate) fn record_prepare_advertisement(&self, server_name: &str, advertised: bool) {
+        record_prepare_advertisement(&self.prepare_advertisements, server_name, advertised);
+    }
+
+    /// Whether `server_name` advertised `kakehashi/virtualDocument/prepare`
+    /// in its last handshake; `None` before it has had one.
+    pub(crate) fn prepare_advertisement(&self, server_name: &str) -> Option<bool> {
+        self.prepare_advertisements
+            .get(server_name)
+            .map(|advertised| *advertised)
     }
 
     /// What is known about the raw palette command names downstream servers have
@@ -4425,6 +4447,7 @@ impl LanguageServerPool {
         let handle_for_handshake = Arc::clone(&handle);
         let server_name_for_log = server_name.to_string();
         let command_origins = Arc::clone(&self.command_origins);
+        let prepare_advertisements = Arc::clone(&self.prepare_advertisements);
         let command_registration_key = connection_key.clone();
         let upstream_request_tx = self.upstream_request_tx.clone();
         let pending_reopen = Arc::clone(&self.pending_reopen);
@@ -4450,7 +4473,7 @@ impl LanguageServerPool {
 
             // Handle initialization result - transition state
             match init_result {
-                Ok(Ok((capabilities, bridge_routing, type_hierarchy_provider))) => {
+                Ok(Ok((capabilities, extensions, type_hierarchy_provider))) => {
                     // Init succeeded - store capabilities and transition to Ready
                     log::info!(
                         target: "kakehashi::bridge::init",
@@ -4465,7 +4488,14 @@ impl LanguageServerPool {
                         .as_ref()
                         .map(|options| options.commands.clone());
                     handle_for_handshake.set_server_capabilities(capabilities);
-                    handle_for_handshake.set_bridge_routing(bridge_routing);
+                    handle_for_handshake.set_bridge_routing(extensions.bridge_routing);
+                    handle_for_handshake
+                        .set_virtual_document_prepare(extensions.virtual_document_prepare);
+                    record_prepare_advertisement(
+                        &prepare_advertisements,
+                        &server_name_for_log,
+                        extensions.virtual_document_prepare,
+                    );
                     handle_for_handshake.set_type_hierarchy_provider(type_hierarchy_provider);
                     // Path a: push this server's settings now that `initialized`
                     // has been sent, so push-model servers are configured even
@@ -5204,6 +5234,20 @@ impl LanguageServerPool {
 /// Told-at-initialize folders prove nothing for a server that declared no
 /// folder support at all. All comparisons go through
 /// [`same_root_uri`](super::root_markers::same_root_uri).
+/// Update a server's advertisement, cloning its name only when first seen.
+fn record_prepare_advertisement(
+    advertisements: &DashMap<String, bool>,
+    server_name: &str,
+    advertised: bool,
+) {
+    match advertisements.get_mut(server_name) {
+        Some(mut entry) => *entry = advertised,
+        None => {
+            advertisements.insert(server_name.to_string(), advertised);
+        }
+    }
+}
+
 fn incapable_shared_serves(handle: &ConnectionHandle, root: &Url) -> bool {
     if handle
         .spawn_root()
