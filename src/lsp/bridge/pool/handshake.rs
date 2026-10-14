@@ -4,7 +4,9 @@
 //! with a downstream language server. The handshake follows the LSP specification:
 //! 1. Send `initialize` request
 //! 2. Wait for `initialize` response
-//! 3. Send `initialized` notification
+//! 3. Validate the response; record a static `changeNotifications` id as a
+//!    registration (#1117)
+//! 4. Send `initialized` notification
 //!
 //! # Single-Writer Loop (ls-bridge-message-ordering)
 //!
@@ -17,16 +19,17 @@ use std::io;
 use tower_lsp_server::ls_types::{ClientCapabilities, ServerCapabilities, WorkspaceFolder};
 
 use super::ConnectionHandle;
-use super::connection_handle::NotificationSendResult;
+use super::connection_handle::{NotificationSendResult, static_folder_change_registration};
 use crate::lsp::bridge::protocol::{
     RequestId, build_initialize_request, build_initialized_notification,
     parse_initialize_response_capabilities,
 };
 
-/// Send `initialize`, await the response, send `initialized`, return the typed
-/// `ServerCapabilities`. Invoked by `get_or_create_connection_with_timeout`
-/// once the connection has spawned and the reader task is up; goes through
-/// the single-writer channel (ls-bridge-message-ordering) for FIFO ordering.
+/// Send `initialize`, await the response, record a `changeNotifications` id as
+/// a registration, send `initialized`, return the typed `ServerCapabilities`.
+/// Invoked by `get_or_create_connection_with_timeout` once the connection has
+/// spawned and the reader task is up; goes through the single-writer channel
+/// (ls-bridge-message-ordering) for FIFO ordering.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn perform_lsp_handshake(
     handle: &ConnectionHandle,
@@ -70,6 +73,14 @@ pub(super) async fn perform_lsp_handshake(
     let bridge_routing = parsed.bridge_routing;
     let type_hierarchy_provider = parsed.type_hierarchy_provider;
     let capabilities = parsed.capabilities;
+    // A `changeNotifications` id is a registration the server may withdraw
+    // (#1117). Record it before `initialized` is queued, so a server that
+    // unregisters on hearing `initialized` finds it recorded. One sent
+    // earlier (allowed once the response is out) may reach the reader first;
+    // the registry remembers it and the record honors it.
+    handle
+        .dynamic_capabilities()
+        .record_static_registration(static_folder_change_registration(&capabilities));
 
     // 4. Send initialized notification via the single-writer loop
     let initialized = build_initialized_notification();
@@ -106,6 +117,8 @@ mod tests {
     use super::*;
     use crate::lsp::bridge::actor::{ResponseRouter, spawn_reader_task};
     use crate::lsp::bridge::connection::AsyncBridgeConnection;
+    use crate::lsp::bridge::pool::ConnectionState;
+    use crate::lsp::bridge::pool::test_helpers::create_handle_with_state;
 
     #[tokio::test]
     async fn recovered_capabilities_complete_the_handshake() {
@@ -164,6 +177,128 @@ mod tests {
         assert!(
             messages.contains("\"method\":\"initialized\""),
             "initialized notification was not written: {messages:?}"
+        );
+    }
+
+    /// A string `changeNotifications` is the id the notification is registered
+    /// under and can be unregistered by (LSP 3.18). The handshake must record
+    /// it as a registration before `initialized` reaches the server, or a
+    /// `client/unregisterCapability` of that id withdraws nothing (#1117).
+    #[tokio::test]
+    async fn static_change_notifications_id_can_be_unregistered() {
+        use tower_lsp_server::ls_types::Unregistration;
+
+        let handle = create_handle_with_state(ConnectionState::Initializing).await;
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        response_tx
+            .send(serde_json::json!({
+                "result": {
+                    "capabilities": {
+                        "workspace": {
+                            "workspaceFolders": {
+                                "supported": true,
+                                "changeNotifications": "wf-id"
+                            }
+                        }
+                    }
+                }
+            }))
+            .unwrap();
+
+        // Capabilities are deliberately not stored: the pool stores them only
+        // after `initialized` is queued, too late for the id to be recorded.
+        perform_lsp_handshake(
+            &handle,
+            RequestId::new(1),
+            response_rx,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect("handshake");
+        assert!(
+            handle.supports_workspace_folder_changes(),
+            "a static registration id declares folder-change support"
+        );
+        assert!(
+            handle
+                .dynamic_capabilities()
+                .ever_registered("workspace/didChangeWorkspaceFolders"),
+            "the id is a registration like a dynamic one, for the served-root proof"
+        );
+
+        handle
+            .dynamic_capabilities()
+            .unregister(vec![Unregistration {
+                id: "wf-id".to_string(),
+                method: "workspace/didChangeWorkspaceFolders".to_string(),
+            }]);
+        assert!(
+            !handle.supports_workspace_folder_changes(),
+            "unregistering the static id must withdraw folder-change support"
+        );
+    }
+
+    /// The id is recorded BEFORE `initialized` is queued: a server may
+    /// unregister it as soon as it hears `initialized`, and a later seed would
+    /// resurrect the withdrawn id (#1117). A full outbound queue stops the
+    /// handshake exactly at that send, so only an earlier seed is observed.
+    #[tokio::test]
+    async fn static_change_notifications_id_is_recorded_before_initialized() {
+        let handle = create_handle_with_state(ConnectionState::Initializing).await;
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let respond = async {
+            // Waits for `initialize` to drain, then holds every queue slot so
+            // the `initialized` send finds the queue full.
+            let permits = handle.reserve_outbound_capacity_for_test().await;
+            response_tx
+                .send(serde_json::json!({
+                    "result": {
+                        "capabilities": {
+                            "workspace": {
+                                "workspaceFolders": {
+                                    "supported": true,
+                                    "changeNotifications": "wf-id"
+                                }
+                            }
+                        }
+                    }
+                }))
+                .unwrap();
+            permits
+        };
+        let handshake = perform_lsp_handshake(
+            &handle,
+            RequestId::new(1),
+            response_rx,
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+
+        // `biased` polls the handshake first, so `initialize` is queued before
+        // `respond` starts reserving; the timeout turns a handshake that would
+        // wait for a slot (instead of failing on a full queue) into a failure.
+        let (result, _permits) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(biased; handshake, respond)
+        })
+        .await
+        .expect("the handshake must fail fast on a full queue, not wait");
+
+        assert_eq!(
+            result.expect_err("initialized must not fit").kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(
+            handle
+                .dynamic_capabilities()
+                .has_registration("workspace/didChangeWorkspaceFolders"),
+            "the id must be recorded before initialized is queued"
         );
     }
 }

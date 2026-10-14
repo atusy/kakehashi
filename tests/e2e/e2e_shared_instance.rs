@@ -239,7 +239,7 @@ fn e2e_opt_in_falls_back_to_per_root_when_server_incapable() {
     );
 }
 
-/// The process id a `workspace-folders-dynamic` hover reports.
+/// The process id a `workspace-folders*` hover reports.
 fn hover_pid(folders: &str) -> &str {
     folders
         .split_once(";pid:")
@@ -282,13 +282,12 @@ fn e2e_opt_in_shares_one_process_with_a_dynamically_registering_server() {
     );
 }
 
-/// A client-root fallback whose server registered folder-change support
-/// dynamically takes an upstream `workspace/didChangeWorkspaceFolders` as a
-/// notification (#968). Recycling it instead would ALSO leave the new folder
-/// known — the replacement initializes with the current snapshot — so only the
-/// unchanged process id tells forwarding apart from a restart.
-#[test]
-fn e2e_client_folder_change_is_forwarded_to_a_dynamically_registering_server() {
+/// Hovers a client-root fallback of a `mock_mode` server before and after the
+/// client adds a second workspace folder. Returns `(before, after)`; `after`
+/// already knows the added folder, whether the fallback took the change as a
+/// notification or was recycled with the current snapshot, so only the
+/// process ids tell those apart.
+fn hover_around_client_folder_change(mock_mode: &str) -> (String, String) {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     // Marker search is switched off below, so the document resolves to the
     // client-root fallback even when the temp dir sits inside a checkout.
@@ -303,7 +302,7 @@ fn e2e_client_folder_change_is_forwarded_to_a_dynamically_registering_server() {
 
     let (mut client, _cfg) = init_client_with_folders(
         false,
-        "workspace-folders-dynamic",
+        mock_mode,
         json!([{ "uri": root_a, "name": "a" }]),
         None,
         Some(json!([])),
@@ -324,10 +323,47 @@ fn e2e_client_folder_change_is_forwarded_to_a_dynamically_registering_server() {
         after.contains(&root_b),
         "the added folder must reach the server; got {after:?}"
     );
+    (before, after)
+}
+
+/// A client-root fallback whose server registered folder-change support
+/// dynamically takes an upstream `workspace/didChangeWorkspaceFolders` as a
+/// notification (#968), rather than being recycled.
+#[test]
+fn e2e_client_folder_change_is_forwarded_to_a_dynamically_registering_server() {
+    let (before, after) = hover_around_client_folder_change("workspace-folders-dynamic");
     assert_eq!(
         hover_pid(&after),
         hover_pid(&before),
         "the folder change must be forwarded, not answered with a restart"
+    );
+}
+
+/// A `changeNotifications` registration id declares folder-change support as
+/// `true` does: the fallback takes the client's folder change as a
+/// notification (#1117). The control for the unregistration case below — it
+/// fails if the id is not counted at all.
+#[test]
+fn e2e_client_folder_change_is_forwarded_under_a_static_registration_id() {
+    let (before, after) = hover_around_client_folder_change("workspace-folders-static-id");
+    assert_eq!(
+        hover_pid(&after),
+        hover_pid(&before),
+        "the folder change must be forwarded, not answered with a restart"
+    );
+}
+
+/// Unregistering the `changeNotifications` id withdraws folder-change support
+/// (LSP 3.18, #1117): the fallback no longer takes the client's folder change
+/// as a notification and is recycled onto the new workspace instead.
+#[test]
+fn e2e_unregistered_static_registration_id_recycles_on_client_folder_change() {
+    let (before, after) =
+        hover_around_client_folder_change("workspace-folders-static-id-unregister");
+    assert_ne!(
+        hover_pid(&after),
+        hover_pid(&before),
+        "a server that unregistered folder changes must be recycled, not notified"
     );
 }
 
