@@ -66,7 +66,9 @@ jobs:
       # than the bridge's startup deadline would fail every test. Keep the
       # specifier in sync with `TSUDOI` in the test module.
       - run: deno cache npm:@atusy/tsudoi-language-server@0.1.0-alpha.2/cli
-      - run: "cargo test --features e2e --test e2e e2e_virtual_document_prepare::"
+      # Two at a time like the e2e job above: each test drives a Deno peer and
+      # a downstream mock, and some assert on response latency.
+      - run: "cargo test --features e2e --test e2e e2e_virtual_document_prepare:: -- --test-threads=2"
         env:
           # Fail instead of skipping when Deno is missing.
           KAKEHASHI_E2E_REQUIRE_DENO: "1"
