@@ -320,10 +320,26 @@ pub(crate) struct PreparedDocument {
 ///
 /// `result` of `None` is the wire `null`: every gap keeps its
 /// coordinate-preserving whitespace and no content changes.
+/// [`apply_prepare_result_at`] taking its place in the presentation order
+/// now, as a test applying an answer directly does.
+#[cfg(test)]
 pub(crate) fn apply_prepare_result(
     virtual_text: &str,
     layout: &VirtualLayout,
     result: Option<PrepareResult>,
+) -> Result<PreparedDocument, PrepareError> {
+    apply_prepare_result_at(virtual_text, layout, result, next_presentation())
+}
+
+/// [`apply_prepare_result`] for an answer to an input taken at `taken` in
+/// the presentation order (see [`next_presentation`]): what orders it
+/// against other texts is when its virtual text was read, not when the
+/// answer came — two attempts in flight can answer in either order.
+pub(crate) fn apply_prepare_result_at(
+    virtual_text: &str,
+    layout: &VirtualLayout,
+    result: Option<PrepareResult>,
+    taken: u64,
 ) -> Result<PreparedDocument, PrepareError> {
     // `null` keeps every segment, and still yields a map (see below).
     let result = result.unwrap_or_else(|| PrepareResult {
@@ -443,7 +459,7 @@ pub(crate) fn apply_prepare_result(
         runs,
         indents,
         fingerprint,
-        built: next_presentation(),
+        built: taken,
     };
     Ok(PreparedDocument {
         text,
@@ -710,8 +726,8 @@ pub(crate) struct PreparedMap {
     runs: Vec<Run>,
     indents: Vec<SegmentIndent>,
     fingerprint: u64,
-    /// When the answer it came from was applied (see
-    /// [`next_presentation`]); not part of its equality.
+    /// Where the input its answer came from was taken in the presentation
+    /// order (see [`apply_prepare_result_at`]); not part of its equality.
     built: u64,
 }
 
@@ -732,8 +748,8 @@ impl PartialEq for PreparedMap {
 impl Eq for PreparedMap {}
 
 impl PreparedMap {
-    /// When the answer this map came from was applied (see
-    /// [`next_presentation`]).
+    /// Where the input this map's answer came from was taken in the
+    /// presentation order (see [`apply_prepare_result_at`]).
     pub(crate) fn built(&self) -> u64 {
         self.built
     }

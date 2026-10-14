@@ -38,7 +38,7 @@ use super::ResolvedServerConfig;
 use super::pool::LanguageServerPool;
 use super::protocol::{
     PrepareHostTextDocument, PrepareParams, PrepareTextDocument, PreparedDocument,
-    VirtualDocumentUri, VirtualLayout, apply_prepare_result,
+    VirtualDocumentUri, VirtualLayout, apply_prepare_result_at,
 };
 use crate::language::injection::VirtualGap;
 use crate::text::terminal::escape_terminal_controls;
@@ -114,6 +114,10 @@ pub(crate) struct Resync {
 /// The answer for one input, and the attempts to get it.
 #[derive(Default)]
 struct Cell {
+    /// Where the input was first looked up in the presentation order (see
+    /// `protocol::next_presentation`): an answer to it is as new as its
+    /// virtual text, not as the moment it came.
+    taken: u64,
     /// Set once an attempt got an answer.
     outcome: std::sync::OnceLock<Outcome>,
     /// An attempt is running.
@@ -630,7 +634,10 @@ impl PrepareRegistry {
             Some(index) => region.slots.remove(index),
             None => Slot {
                 key,
-                cell: Arc::default(),
+                cell: Arc::new(Cell {
+                    taken: super::protocol::next_presentation(),
+                    ..Cell::default()
+                }),
             },
         };
         region.slots.insert(0, slot.clone());
@@ -691,7 +698,7 @@ impl PrepareRegistry {
         let revisions = Arc::clone(&self.next_revision);
         let pool = Arc::clone(pool);
         let target = target.clone();
-        let job = PrepareJob::from(input);
+        let job = PrepareJob::new(input, cell.taken);
         let resync_tx = self.resync_tx.clone();
         tokio::spawn(async move {
             let cell = Arc::clone(&end.0);
@@ -829,6 +836,8 @@ pub(crate) fn same_candidates(a: &[ResolvedServerConfig], b: &[ResolvedServerCon
 
 /// An owned [`PrepareInput`], for the background request.
 struct PrepareJob {
+    /// See `Cell::taken`.
+    taken: u64,
     host_uri: Url,
     host_language: String,
     injection_language: String,
@@ -837,9 +846,10 @@ struct PrepareJob {
     gaps: Vec<VirtualGap>,
 }
 
-impl From<PrepareInput<'_>> for PrepareJob {
-    fn from(input: PrepareInput<'_>) -> Self {
+impl PrepareJob {
+    fn new(input: PrepareInput<'_>, taken: u64) -> Self {
         Self {
+            taken,
             host_uri: input.host_uri.clone(),
             host_language: input.host_language.to_string(),
             injection_language: input.injection_language.to_string(),
@@ -1043,13 +1053,18 @@ async fn try_run(
                         ));
                     }
                 };
-                break 'candidates apply_prepare_result(&job.virtual_text, &layout, result)
-                    .map_err(|error| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("{name} answered unusably: {error}"),
-                        )
-                    });
+                break 'candidates apply_prepare_result_at(
+                    &job.virtual_text,
+                    &layout,
+                    result,
+                    job.taken,
+                )
+                .map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("{name} answered unusably: {error}"),
+                    )
+                });
             }
             Ok(PreparedDocument {
                 text: job.virtual_text.clone(),

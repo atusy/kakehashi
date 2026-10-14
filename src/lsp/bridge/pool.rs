@@ -8857,6 +8857,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_late_answer_for_an_older_text_does_not_open_over_the_newer_cache() {
+        use super::super::protocol::{VirtualLayout, apply_prepare_result_at, next_presentation};
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///test/late-answer.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        let dedent = |text: &str, taken: u64| {
+            let result = serde_json::from_value(serde_json::json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+            ]}]}))
+            .unwrap();
+            apply_prepare_result_at(text, &VirtualLayout::single(text), Some(result), taken)
+                .unwrap()
+        };
+        // Revision N is looked up, then N+1; N+1 answers first and is
+        // recorded, N's answer comes after.
+        let n_taken = next_presentation();
+        let newer = dedent("  b", next_presentation());
+        pool.record_latest_virtual_content(
+            &host_uri,
+            1,
+            "lua",
+            TEST_ULID_LUA_0,
+            SentText {
+                text: &newer.text,
+                map: newer.map.as_ref(),
+            },
+        );
+        let older = dedent("  a", n_taken);
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(1);
+        pool.ensure_document_opened(
+            &mut sender,
+            &host_uri,
+            &virtual_uri,
+            SentText {
+                text: &older.text,
+                map: older.map.as_ref(),
+            },
+            &key,
+        )
+        .await
+        .unwrap();
+        let OutboundMessage::Untracked(message) = rx.try_recv().unwrap() else {
+            panic!("didOpen must be an untracked notification");
+        };
+        assert_eq!(message["params"]["textDocument"]["text"], "b");
+    }
+
+    #[tokio::test]
     async fn a_prepared_open_ignores_a_cached_text_sent_as_is() {
         use super::super::protocol::{VirtualLayout, apply_prepare_result};
         let pool = LanguageServerPool::new();

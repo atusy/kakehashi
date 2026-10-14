@@ -38,10 +38,12 @@ pub(crate) use jsonrpc::{
 pub(crate) use lifecycle::*;
 #[cfg(test)]
 pub(crate) use prepare::SegmentKind;
+#[cfg(test)]
+pub(crate) use prepare::apply_prepare_result;
 pub(crate) use prepare::{
     Bias, EditMode, PREPARE_METHOD, PREPARE_TIMEOUT, PrepareHostTextDocument, PrepareParams,
     PrepareResult, PrepareTextDocument, PreparedDocument, PreparedMap, VirtualLayout,
-    apply_prepare_result, apply_text_edits_clamped, next_presentation, parse_prepare_response,
+    apply_prepare_result_at, apply_text_edits_clamped, next_presentation, parse_prepare_response,
     restore_joined_layout,
 };
 pub(crate) use request::*;
