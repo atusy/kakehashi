@@ -667,6 +667,10 @@ impl Kakehashi {
         }
 
         let mut region_offsets = HashMap::new();
+        // The language and virtual text place a slot through the text its
+        // connection held (see `BridgeCoordinator::place_push`), needed only
+        // once anything was prepared.
+        let places_as_is = self.bridge.places_pushes_as_is();
         let mut region_texts: HashMap<String, (String, &str)> = HashMap::new();
         let mut push_fallback_by_lang: HashMap<String, bool> = HashMap::new();
         for (region_id, injection_language, offset, virtual_text) in region_meta {
@@ -688,7 +692,9 @@ impl Kakehashi {
                 }
             };
             if push_fallback {
-                region_texts.insert(region_id.clone(), (injection_language, virtual_text));
+                if !places_as_is {
+                    region_texts.insert(region_id.clone(), (injection_language, virtual_text));
+                }
                 region_offsets.insert(region_id, offset);
             }
         }
@@ -731,10 +737,11 @@ impl Kakehashi {
                 DiagnosticSource::PullLayer => false,
             }
         };
-        let place =
-            |region_id: &str, slot: &crate::lsp::diagnostic_cache::SlotEntry| match region_texts
-                .get(region_id)
-            {
+        let place = |region_id: &str, slot: &crate::lsp::diagnostic_cache::SlotEntry| {
+            if places_as_is {
+                return crate::lsp::diagnostic_cache::Placement::Offset;
+            }
+            match region_texts.get(region_id) {
                 Some((language, virtual_text)) => self.bridge.place_push(
                     host,
                     language,
@@ -743,7 +750,8 @@ impl Kakehashi {
                     slot.held.as_ref(),
                 ),
                 None => crate::lsp::diagnostic_cache::Placement::Skip,
-            };
+            }
+        };
         let (region_push, host_push) =
             cached_push_diagnostics(host, snapshot, &region_offsets, place, include);
         virt_items.extend(region_push);

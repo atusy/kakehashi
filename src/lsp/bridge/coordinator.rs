@@ -765,6 +765,14 @@ impl BridgeCoordinator {
         })
     }
 
+    /// Whether every cached push places through its region's offset alone
+    /// (see [`Self::place_push`]): no region was ever prepared, and no
+    /// connection ever held a prepared text. Lets publishing skip the
+    /// per-slot placement.
+    pub(crate) fn places_pushes_as_is(&self) -> bool {
+        self.prepare.unused() && !self.pool.ever_held_prepared()
+    }
+
     /// How a region's cached push places while the region's virtual text is
     /// `virtual_text`. A push for a prepared text, or one read while its
     /// connection holds a prepared text, is in the coordinates of the text

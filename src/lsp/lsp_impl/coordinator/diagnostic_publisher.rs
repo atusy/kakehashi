@@ -1350,14 +1350,19 @@ impl DiagnosticPublisher {
             (HashMap::new(), None)
         };
         let (region_offsets, regions) = region_offsets;
-        let regions: HashMap<&str, &crate::language::injection::ResolvedInjection> = regions
-            .iter()
-            .flat_map(|regions| regions.iter())
-            .map(|region| (region.region.region_id.as_str(), region))
-            .collect();
         // A slot's coordinates follow the text its connection held when it
-        // pushed (see `BridgeCoordinator::place_push`).
-        let diagnostics =
+        // pushed (see `BridgeCoordinator::place_push`) — through the region's
+        // offset alone while nothing was ever prepared.
+        let diagnostics = if self.bridge.places_pushes_as_is() {
+            merge_cached_diagnostics(host, snapshot, &region_offsets, |_, _| {
+                crate::lsp::diagnostic_cache::Placement::Offset
+            })
+        } else {
+            let regions: HashMap<&str, &crate::language::injection::ResolvedInjection> = regions
+                .iter()
+                .flat_map(|regions| regions.iter())
+                .map(|region| (region.region.region_id.as_str(), region))
+                .collect();
             merge_cached_diagnostics(host, snapshot, &region_offsets, |region_id, slot| {
                 match regions.get(region_id) {
                     Some(region) => self.bridge.place_push(
@@ -1369,7 +1374,8 @@ impl DiagnosticPublisher {
                     ),
                     None => crate::lsp::diagnostic_cache::Placement::Skip,
                 }
-            });
+            })
+        };
 
         let lsp_uri = match crate::lsp::lsp_impl::url_to_uri(host) {
             Ok(uri) => uri,

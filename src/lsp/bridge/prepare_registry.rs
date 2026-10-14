@@ -254,7 +254,7 @@ impl Default for PrepareRegistry {
 
 impl PrepareRegistry {
     /// Whether no region was ever looked up (see `used`).
-    fn unused(&self) -> bool {
+    pub(crate) fn unused(&self) -> bool {
         !self.used.load(Ordering::Acquire)
     }
 
