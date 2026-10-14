@@ -299,35 +299,37 @@ impl Kakehashi {
                     // and its pushes are dropped — not a clean result.
                     // Only a caller counting failures (CLI diagnose) waits
                     // for the answer to find out; an editor's pull does not,
-                    // but while the answer is pending the region's pushes are
-                    // left out of this result: owe a refresh once it is sent.
-                    if external_error_sink.is_none()
-                        && self.bridge.prepare_region_pending(
-                            &uri,
-                            &resolved.injection_language,
-                            &resolved.region.region_id,
-                        )
-                    {
-                        prepare_skipped.store(true, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    if external_error_sink.is_some()
-                        && let Some(target) = self.bridge.prepare_target(
-                            &settings,
-                            language_name,
-                            &resolved.injection_language,
-                            self.experimental_enabled(),
-                        )
-                    {
-                        let (uri, request_error_sink) = (&uri, &request_error_sink);
+                    // but while the answer for the current text is pending
+                    // (whether or not the lifecycle pass holds the document
+                    // on it yet) the region's pushes are left out of this
+                    // result: owe a refresh once it is sent.
+                    let Some(target) = self.bridge.prepare_target(
+                        &settings,
+                        language_name,
+                        &resolved.injection_language,
+                        self.experimental_enabled(),
+                    ) else {
+                        continue;
+                    };
+                    let input = crate::lsp::bridge::PrepareInput {
+                        host_uri: &uri,
+                        host_language: language_name,
+                        injection_language: &resolved.injection_language,
+                        region_id: &resolved.region.region_id,
+                        virtual_text: &resolved.virtual_content,
+                        gaps: &resolved.gaps,
+                    };
+                    if external_error_sink.is_none() {
+                        if matches!(
+                            self.bridge
+                                .prepared_document_now_for_request(&target, input),
+                            crate::lsp::bridge::PrepareLookup::Pending
+                        ) {
+                            prepare_skipped.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    } else {
+                        let request_error_sink = &request_error_sink;
                         prepares.push(Box::pin(async move {
-                            let input = crate::lsp::bridge::PrepareInput {
-                                host_uri: uri,
-                                host_language: language_name,
-                                injection_language: &resolved.injection_language,
-                                region_id: &resolved.region.region_id,
-                                virtual_text: &resolved.virtual_content,
-                                gaps: &resolved.gaps,
-                            };
                             if self.bridge.prepared_document(&target, input).await.is_err() {
                                 count_request_errors(request_error_sink, 1);
                             }
@@ -1371,10 +1373,11 @@ mod tests {
         assert_ne!(id, diagnostic_result_id(&shrunk));
     }
 
-    /// An editor's pull skips a push-only region whose document waits for
-    /// its prepare answer: that region's pushes are not in the result, so
-    /// the pull owes a refresh once the prepared text is sent instead of
-    /// counting as covered.
+    /// An editor's pull skips a push-only region whose prepare answer is not
+    /// in — here before the lifecycle pass even held its document on it:
+    /// that region's pushes are not in the result, so the pull owes a
+    /// refresh once the prepared text is sent instead of counting as
+    /// covered.
     #[tokio::test]
     async fn pull_owes_a_refresh_for_a_push_only_region_awaiting_preparation() {
         let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
@@ -1434,26 +1437,6 @@ mod tests {
             .parse_coordinator()
             .parse_document(uri.clone(), Some("markdown"), None, None)
             .await;
-        let snapshot = server
-            .documents
-            .latest_snapshot(&uri)
-            .and_then(|view| view.slot.snapshot)
-            .expect("parsed");
-        let regions = server
-            .whole_document_regions(&uri, &snapshot)
-            .expect("regions resolved");
-        let region = regions.first().expect("one lua region");
-        server
-            .bridge
-            .hold_prepare_pending_for_test(crate::lsp::bridge::PrepareInput {
-                host_uri: &uri,
-                host_language: "markdown",
-                injection_language: &region.injection_language,
-                region_id: &region.region.region_id,
-                virtual_text: &region.virtual_content,
-                gaps: &region.gaps,
-            });
-
         server
             .diagnostic_impl(DocumentDiagnosticParams {
                 text_document: tower_lsp_server::ls_types::TextDocumentIdentifier {

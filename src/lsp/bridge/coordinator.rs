@@ -736,18 +736,6 @@ impl BridgeCoordinator {
         }
     }
 
-    /// Whether a region's document waits for its prepare answer, held back
-    /// from its servers.
-    pub(crate) fn prepare_region_pending(
-        &self,
-        host_uri: &Url,
-        injection_language: &str,
-        region_id: &str,
-    ) -> bool {
-        self.prepare
-            .held_pending(host_uri, injection_language, region_id)
-    }
-
     /// Whether any of `host`'s documents still waits for its prepare answer.
     pub(crate) fn prepare_host_has_pending(&self, host: &Url) -> bool {
         self.prepare.host_has_pending(host)
@@ -1246,13 +1234,6 @@ impl BridgeCoordinator {
     ///
     /// Used by higher-level LSP tests that need eager-open behavior without
     /// depending on a real downstream language server.
-    /// Hold a region's document on an input whose answer is not in, as the
-    /// lifecycle pass does.
-    #[cfg(test)]
-    pub(crate) fn hold_prepare_pending_for_test(&self, input: super::PrepareInput<'_>) {
-        self.prepare.hold_pending_for_test(input);
-    }
-
     #[cfg(test)]
     pub(crate) async fn insert_ready_test_connection(&self, server_name: &str) {
         use crate::lsp::bridge::pool::ConnectionKey;

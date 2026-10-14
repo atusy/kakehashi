@@ -415,29 +415,6 @@ impl PrepareRegistry {
         })
     }
 
-    /// Whether the lifecycle pass holds a region's document on an input
-    /// whose answer is not in: the document has not reached its servers.
-    pub(crate) fn held_pending(
-        &self,
-        host_uri: &Url,
-        injection_language: &str,
-        region_id: &str,
-    ) -> bool {
-        if self.unused() {
-            return false;
-        }
-        let host_uri = host_uri.as_str();
-        self.regions
-            .get(&region_hash(host_uri, injection_language, region_id))
-            .filter(|region| region.is(host_uri, injection_language, region_id))
-            .and_then(|region| {
-                region
-                    .held_slot()
-                    .map(|slot| slot.cell.outcome.get().is_none())
-            })
-            .unwrap_or(false)
-    }
-
     /// Whether the peer answered the input the lifecycle pass holds a
     /// region's document on unusably: that document is not bridged, so
     /// nothing a server computed for an earlier text of it is either.
