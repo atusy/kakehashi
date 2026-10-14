@@ -577,25 +577,28 @@ fn insertion_point_prefixed(offset: &RegionOffset, region_end: Position, host_li
 /// The text `snippet` expands to with every tabstop, placeholder and choice
 /// left at its default: what the client inserts unless the user types over
 /// it. Every occurrence of a tabstop mirrors the default of its placeholder
-/// (or choice), wherever that stands — `$1x${1:y}` expands to `yxy`. `None`
-/// for text the client decides at insert time (a variable), that this
-/// expansion does not compute (a transform), or that clients disagree on (a
-/// tabstop with several placeholders: which default wins varies).
+/// (or choice), wherever that stands — `$1x${1:y}` expands to `yxy`.
+///
+/// Only snippets whose expansion every client agrees on are expanded:
+/// literal text, tabstops, and at most one placeholder (or choice) per
+/// tabstop whose default holds no `$` — no nesting, no mirror inside a
+/// default. `None` for anything else: text the client decides at insert time
+/// (a variable), that this expansion does not compute (a transform), or
+/// that clients resolve differently (several defaults for one tabstop,
+/// defaults holding defaults); and for an expansion far longer than the
+/// snippet (one default mirrored many times).
 fn snippet_expansion(snippet: &str) -> Option<String> {
     use std::collections::HashMap;
 
-    /// Placeholders nested deeper give no expansion.
-    const MAX_SNIPPET_NESTING: usize = 32;
-    /// Mirrors of mirrors are resolved this many links deep; deeper chains,
-    /// and cycles, give no expansion.
-    const MAX_MIRROR_PASSES: usize = 8;
-
-    type Chars<'a> = std::iter::Peekable<std::str::Chars<'a>>;
+    enum Piece {
+        Text(String),
+        Tabstop(String),
+    }
 
     /// Read a tabstop number (digits only: `$0name` is tabstop 0, then
     /// text), without leading zeros (`$01` is tabstop 1); `None`, consuming
     /// nothing, before anything else.
-    fn tabstop(chars: &mut Chars<'_>) -> Option<String> {
+    fn tabstop(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<String> {
         let mut number = String::new();
         let mut read = false;
         while let Some(digit) = chars.next_if(char::is_ascii_digit) {
@@ -613,181 +616,109 @@ fn snippet_expansion(snippet: &str) -> Option<String> {
         })
     }
 
-    /// One expansion with each tabstop mirroring `mirrors`, recording into
-    /// `defaults` the default each tabstop's placeholder gives.
-    struct Pass<'m> {
-        mirrors: &'m HashMap<String, String>,
-        defaults: HashMap<String, String>,
-        /// The longest expansion computed: mirrors repeat text, so a short
-        /// snippet can expand exponentially (`${1:$2$2}${2:$3$3}…`).
-        limit: usize,
-        /// The placeholders whose default is being expanded, innermost last.
-        enclosing: Vec<String>,
-        /// Which tabstop's default holds which (`(outer, inner)`).
-        holds: Vec<(String, String)>,
-    }
-
-    impl Pass<'_> {
-        fn occurrence(&mut self, number: String, default: Option<String>) -> Option<String> {
-            if let Some(outer) = self.enclosing.last() {
-                self.holds.push((outer.clone(), number.clone()));
-            }
-            Some(if let Some(default) = default {
-                match self.defaults.entry(number.clone()) {
-                    std::collections::hash_map::Entry::Occupied(_) => return None,
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        entry.insert(default.clone());
-                    }
+    let mut chars = snippet.chars().peekable();
+    let mut pieces = Vec::new();
+    let mut defaults: HashMap<String, String> = HashMap::new();
+    let mut text = String::new();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some(escaped @ ('$' | '}' | '\\')) => text.push(escaped),
+                Some(other) => {
+                    text.push('\\');
+                    text.push(other);
                 }
-                self.mirrors.get(&number).cloned().unwrap_or(default)
-            } else {
-                self.mirrors.get(&number).cloned().unwrap_or_default()
-            })
-        }
-
-        /// `depth`: how many placeholders enclose `chars` (0 at the top).
-        fn expand(&mut self, chars: &mut Chars<'_>, depth: usize) -> Option<String> {
-            // Placeholders nested past any real snippet's depth: refused
-            // rather than recursed into (the snippet is the server's input).
-            if depth > MAX_SNIPPET_NESTING {
-                return None;
-            }
-            let nested = depth > 0;
-            let mut out = String::new();
-            while let Some(c) = chars.next() {
-                match c {
-                    '\\' => match chars.next() {
-                        Some(escaped @ ('$' | '}' | '\\')) => out.push(escaped),
-                        Some(other) => {
-                            out.push('\\');
-                            out.push(other);
-                        }
-                        None => out.push('\\'),
-                    },
-                    '}' if nested => return Some(out),
-                    '$' => {
-                        if chars.next_if_eq(&'{').is_some() {
-                            // A variable (or anything but a tabstop).
-                            let number = tabstop(chars)?;
-                            let default = match chars.next() {
-                                Some(':') => {
-                                    self.enclosing.push(number.clone());
-                                    let default = self.expand(chars, depth + 1)?;
-                                    self.enclosing.pop();
-                                    Some(default)
+                None => text.push('\\'),
+            },
+            '$' => {
+                let number = if chars.next_if_eq(&'{').is_some() {
+                    // A variable (or anything but a tabstop).
+                    let number = tabstop(&mut chars)?;
+                    let default = match chars.next()? {
+                        '}' => None,
+                        ':' => {
+                            let mut default = String::new();
+                            loop {
+                                match chars.next()? {
+                                    '\\' => match chars.next()? {
+                                        escaped @ ('$' | '}' | '\\') => default.push(escaped),
+                                        other => {
+                                            default.push('\\');
+                                            default.push(other);
+                                        }
+                                    },
+                                    '}' => break,
+                                    // A nested placeholder, a mirror or a
+                                    // variable in a default.
+                                    '$' => return None,
+                                    c => default.push(c),
                                 }
-                                Some('|') => Some(choice(chars)),
-                                Some('}') => None,
-                                // A transform, or unterminated.
-                                _ => return None,
-                            };
-                            out.push_str(&self.occurrence(number, default)?);
-                        } else if let Some(number) = tabstop(chars) {
-                            out.push_str(&self.occurrence(number, None)?);
-                        } else if chars
-                            .peek()
-                            .is_some_and(|c| c.is_ascii_alphabetic() || *c == '_')
-                        {
-                            // A variable.
-                            return None;
-                        } else {
-                            out.push('$');
+                            }
+                            Some(default)
                         }
-                        // Only a mirror grows the text past the snippet's.
-                        if out.len() > self.limit {
-                            return None;
+                        '|' => {
+                            // The first choice.
+                            let mut choice = String::new();
+                            let mut first = true;
+                            loop {
+                                match chars.next()? {
+                                    '\\' => {
+                                        let escaped = chars.next()?;
+                                        if first {
+                                            choice.push(escaped);
+                                        }
+                                    }
+                                    ',' => first = false,
+                                    '|' => break,
+                                    c if first => choice.push(c),
+                                    _ => {}
+                                }
+                            }
+                            chars.next_if_eq(&'}')?;
+                            Some(choice)
                         }
-                    }
-                    _ => out.push(c),
-                }
-            }
-            // An unterminated placeholder.
-            (!nested).then_some(out)
-        }
-    }
-
-    /// The first choice of a `${1|a,b|}`, read past its closing `|}`.
-    fn choice(chars: &mut Chars<'_>) -> String {
-        let mut choice = String::new();
-        let mut first = true;
-        while let Some(c) = chars.next() {
-            match c {
-                '\\' => {
-                    if let Some(escaped) = chars.next()
-                        && first
+                        // A transform.
+                        _ => return None,
+                    };
+                    if let Some(default) = default
+                        && defaults.insert(number.clone(), default).is_some()
                     {
-                        choice.push(escaped);
+                        // Several defaults for one tabstop.
+                        return None;
                     }
-                }
-                ',' => first = false,
-                '|' => {
-                    chars.next_if_eq(&'}');
-                    break;
-                }
-                _ if first => choice.push(c),
-                _ => {}
+                    number
+                } else if let Some(number) = tabstop(&mut chars) {
+                    number
+                } else if chars
+                    .peek()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || *c == '_')
+                {
+                    // A variable.
+                    return None;
+                } else {
+                    text.push('$');
+                    continue;
+                };
+                pieces.push(Piece::Text(std::mem::take(&mut text)));
+                pieces.push(Piece::Tabstop(number));
             }
+            c => text.push(c),
         }
-        choice
     }
-
-    /// Whether some tabstop's default holds itself, through mirrors or
-    /// nested placeholders: what clients make of that is anyone's guess.
-    fn cyclic(holds: &[(String, String)]) -> bool {
-        // Peel off tabstops nothing left holds (Kahn's algorithm, without
-        // recursion: a server's snippet can chain any number of them);
-        // what remains holds itself.
-        let mut inner: HashMap<&str, Vec<&str>> = HashMap::new();
-        let mut holders: HashMap<&str, usize> = HashMap::new();
-        for (outer, held) in holds {
-            inner.entry(outer).or_default().push(held);
-            *holders.entry(held).or_default() += 1;
-            holders.entry(outer).or_default();
-        }
-        let mut free: Vec<&str> = holders
-            .iter()
-            .filter(|(_, count)| **count == 0)
-            .map(|(tabstop, _)| *tabstop)
-            .collect();
-        let mut peeled = 0;
-        while let Some(tabstop) = free.pop() {
-            peeled += 1;
-            for held in inner.get(tabstop).into_iter().flatten() {
-                let count = holders
-                    .get_mut(held)
-                    .expect("every held tabstop is counted");
-                *count -= 1;
-                if *count == 0 {
-                    free.push(held);
-                }
-            }
-        }
-        peeled < holders.len()
-    }
-
-    // Each pass mirrors the defaults the previous one found, until they
-    // settle: a default holding a mirror of another tabstop takes one pass
-    // per link.
+    pieces.push(Piece::Text(text));
+    // Mirrors repeat their default: bounded by the snippet's own size.
     let limit = snippet.len().saturating_mul(4).max(4096);
-    let mut mirrors = HashMap::new();
-    for pass_number in 0..=MAX_MIRROR_PASSES {
-        let mut pass = Pass {
-            mirrors: &mirrors,
-            defaults: HashMap::new(),
-            limit,
-            enclosing: Vec::new(),
-            holds: Vec::new(),
-        };
-        let out = pass.expand(&mut snippet.chars().peekable(), 0)?;
-        if pass_number == 0 && cyclic(&pass.holds) {
+    let mut out = String::new();
+    for piece in &pieces {
+        out.push_str(match piece {
+            Piece::Text(text) => text,
+            Piece::Tabstop(number) => defaults.get(number).map_or("", String::as_str),
+        });
+        if out.len() > limit {
             return None;
         }
-        if pass.defaults == mirrors {
-            return Some(out);
-        }
-        mirrors = pass.defaults;
     }
-    None
+    Some(out)
 }
 
 /// Whether snippet-syntax text references a snippet VARIABLE — `$name` or
@@ -1095,34 +1026,31 @@ mod tests {
         let expanded = |snippet| snippet_expansion(snippet);
         assert_eq!(expanded("$0\n").as_deref(), Some("\n"));
         assert_eq!(expanded("f(${1})$0").as_deref(), Some("f()"));
-        assert_eq!(expanded("f(${1:x, ${2:y}})").as_deref(), Some("f(x, y)"));
+        assert_eq!(expanded("f(${1:x}, ${2:y})").as_deref(), Some("f(x, y)"));
         assert_eq!(expanded("${1|a,b|}c").as_deref(), Some("ac"));
         assert_eq!(expanded("\\$1 \\} \\x").as_deref(), Some("$1 } \\x"));
         assert_eq!(expanded("cost: $").as_deref(), Some("cost: $"));
         assert_eq!(expanded("$0name\n").as_deref(), Some("name\n"));
         assert_eq!(expanded("${1}x$12y").as_deref(), Some("xy"));
-        // Every occurrence mirrors its tabstop's first default, ahead of it
-        // or nested in another.
+        // Every occurrence mirrors its tabstop's default, ahead of it too.
         assert_eq!(expanded("$1x${1:\n}").as_deref(), Some("\nx\n"));
         assert_eq!(expanded("$01x${1:\n}").as_deref(), Some("\nx\n"));
         assert_eq!(expanded("$00").as_deref(), Some(""));
         // Clients disagree on which of several placeholders' defaults wins.
         assert_eq!(expanded("${1:a} ${1:b}"), None);
         assert_eq!(expanded("$1x${1:}${1:\n}"), None);
-        assert_eq!(expanded("$2 ${1:<$2>} ${2:x}").as_deref(), Some("x <x> x"));
-        // A long flat chain of defaults is no cycle, and is checked
-        // without recursing per link (its mirrors then resolve too deep).
+        // Defaults holding placeholders or mirrors, which clients resolve
+        // differently (and could chain or cycle without end): none.
+        assert_eq!(expanded("f(${1:x, ${2:y}})"), None);
+        assert_eq!(expanded("$2 ${1:<$2>} ${2:x}"), None);
         let chain: String = (1..100_000)
             .map(|n| format!("${{{n}:${}}}", n + 1))
             .chain(["${100000:x}".to_string()])
             .collect();
         assert_eq!(expanded(&chain), None);
-        // Defaults holding themselves: no expansion.
         assert_eq!(expanded("${1:$2}${2:$1}"), None);
         assert_eq!(expanded("${1:a$1}"), None);
         assert_eq!(expanded("${1:${2:$1}}"), None);
-        // Mirrors chained past a few links, doubling the text at each
-        // (`${1:$2$2}${2:$3$3}…`): no expansion.
         let doubling: String = (1..32)
             .map(|n| format!("${{{n}:${}${}}}", n + 1, n + 1))
             .chain(["${32:x}".to_string()])
@@ -1138,12 +1066,7 @@ mod tests {
         assert_eq!(expanded("${NAME:d}"), None);
         assert_eq!(expanded("${1/a/b/}"), None);
         assert_eq!(expanded("${1:x"), None);
-        // Nesting is bounded, not recursed into without limit.
-        assert_eq!(
-            expanded("${1:${2:${3:x}}}").as_deref(),
-            Some("x"),
-            "real snippets nest a few levels"
-        );
+        assert_eq!(expanded("${1:${2:${3:x}}}"), None);
         let deep = format!("{}x{}", "${1:".repeat(10_000), "}".repeat(10_000));
         assert_eq!(expanded(&deep), None);
     }
