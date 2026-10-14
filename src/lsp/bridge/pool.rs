@@ -1120,6 +1120,7 @@ impl LanguageServerPool {
         for key in invalidated {
             if let Some(handle) = connections.get(&key) {
                 handle.begin_shutdown();
+                self.prepare_advertisements.retire(handle);
             }
             self.host_documents.lock().await.retain(|_, connections| {
                 connections.remove(&key);
@@ -2293,6 +2294,7 @@ impl LanguageServerPool {
         // Failed/SpawnNew path and repeats the idempotent purge instead of
         // leaving a Closing entry that fails fast forever.
         failed_handle.set_state(ConnectionState::Failed);
+        self.prepare_advertisements.retire(failed_handle);
         // Own teardown independently of this cleanup future. The purge below
         // can await several locks and be cancelled; the detached, bounded
         // shutdown must still retire the live process before a replacement is
@@ -5591,6 +5593,29 @@ impl PrepareAdvertisements {
             .insert(handle.key().clone(), Arc::downgrade(handle));
     }
 
+    /// Forget `handle`'s advertisement as it leaves the pool with no
+    /// replacement: a connection that is gone prepares nothing, and its
+    /// handshake, should it still finish, records nothing.
+    fn retire(&self, handle: &ConnectionHandle) {
+        // Held across the removal, as in `record_from`.
+        let mut current = self.current.entry(handle.key().clone()).or_default();
+        if current.strong_count() != 0
+            && !std::ptr::eq(current.as_ptr(), std::ptr::from_ref(handle))
+        {
+            return;
+        }
+        *current = std::sync::Weak::new();
+        // An emptied entry aggregates as none recorded, like a missing one.
+        let removed = self
+            .by_server
+            .get_mut(handle.key().server())
+            .is_some_and(|mut connections| connections.remove(handle.key()).is_some());
+        drop(current);
+        if removed {
+            self.invalidate();
+        }
+    }
+
     /// [`Self::record`] for `handle`'s advertisement, unless another
     /// connection has taken its key since.
     fn record_from(&self, handle: &ConnectionHandle, advertised: bool) -> bool {
@@ -5793,6 +5818,42 @@ mod tests {
         // The retired connection's handshake, finishing late, changes nothing.
         assert!(!pool.record_prepare_advertisement_from(&retired, false));
         assert_eq!(pool.prepare_advertisement("peer"), Some(true));
+    }
+
+    #[tokio::test]
+    async fn a_retired_connection_stops_advertising_prepare() {
+        let pool = LanguageServerPool::new();
+        let a = ConnectionKey::new("peer", Some("file:///a".to_string()));
+        let b = ConnectionKey::new("peer", Some("file:///b".to_string()));
+        let handle_a =
+            test_helpers::create_handle_with_key(ConnectionState::Ready, a.clone()).await;
+        let handle_b =
+            test_helpers::create_handle_with_key(ConnectionState::Ready, b.clone()).await;
+        pool.prepare_advertisements.adopt(&handle_a);
+        pool.prepare_advertisements.adopt(&handle_b);
+        pool.insert_connection(Arc::clone(&handle_a)).await;
+        pool.insert_connection(Arc::clone(&handle_b)).await;
+        pool.record_prepare_advertisement_from(&handle_a, true);
+        pool.record_prepare_advertisement_from(&handle_b, false);
+        assert_eq!(pool.prepare_advertisement("peer"), Some(true));
+        let epoch = pool.prepare_advertised_epoch();
+
+        // Root `a` leaves the workspace: its connection goes, unreplaced.
+        let retired = {
+            let mut connections = pool.connections.lock().await;
+            pool.retire_invalidated_connections(&mut connections, vec![a.clone()])
+                .await
+        };
+        assert_eq!(retired.len(), 1);
+        assert_eq!(
+            pool.prepare_advertisement("peer"),
+            Some(false),
+            "only the remaining connection's advertisement counts"
+        );
+        assert!(pool.prepare_advertised_epoch() > epoch);
+        // Its handshake, finishing late, records nothing.
+        assert!(!pool.record_prepare_advertisement_from(&handle_a, true));
+        assert_eq!(pool.prepare_advertisement("peer"), Some(false));
     }
 
     #[test]
