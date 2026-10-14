@@ -700,14 +700,20 @@ impl PrepareRegistry {
         };
         region.slots.insert(0, slot.clone());
         // Evict the least recently used beyond the bound, never the one the
-        // lifecycle pass holds on, nor one whose attempt is in flight (a
-        // lookup for its input would start a second request for it), nor the
-        // one being looked up, at the front. (The bound is exceeded only by
-        // the attempts running.)
+        // lifecycle pass holds on, nor one in use: returned to a lookup that
+        // has yet to start or wait on it, or with its attempt in flight (an
+        // evicted one's attempt is refused admission, and a lookup for its
+        // input would start a second request for it), nor the one being
+        // looked up, at the front. Only the region's own reference is unused:
+        // a reference is only taken under this region's guard, so a count
+        // read here can only overstate use. (The bound is exceeded only by
+        // the slots in use.)
         while region.slots.len() > SLOTS_PER_REGION + 1 {
             let held = region.held;
             let Some(index) = region.slots[1..].iter().rposition(|slot| {
-                Some(slot.key) != held && !slot.cell.in_flight.load(Ordering::Acquire)
+                Some(slot.key) != held
+                    && !slot.cell.in_flight.load(Ordering::Acquire)
+                    && Arc::strong_count(&slot.cell) == 1
             }) else {
                 break;
             };
@@ -1206,6 +1212,32 @@ mod tests {
         Arc::clone(&region.held_slot().unwrap().cell)
     }
 
+    #[test]
+    fn a_slot_returned_to_a_lookup_is_not_evicted_before_it_starts() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        // Looked up, its attempt not yet started.
+        let first = registry
+            .slot(&target, input(&host, "a"), Holder::Request)
+            .unwrap();
+        // Lookups for newer texts push it past the bound.
+        for text in ["b", "c", "d", "e", "f"] {
+            registry.slot(&target, input(&host, text), Holder::Request);
+        }
+        let region = registry.regions.iter().next().unwrap();
+        assert!(
+            region.has(&first.cell),
+            "a slot still in a lookup's hands keeps its place"
+        );
+        drop(region);
+        drop(first);
+        // Once released, it is the least recently used, and goes.
+        registry.slot(&target, input(&host, "g"), Holder::Request);
+        let region = registry.regions.iter().next().unwrap();
+        assert_eq!(region.slots.len(), SLOTS_PER_REGION + 1);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn an_answer_passing_over_a_failure_cleared_meanwhile_is_not_kept() {
@@ -1565,15 +1597,20 @@ mod tests {
         let host = Url::parse("file:///host.md").unwrap();
         let running = cell(&registry, &target, input(&host, "a"), Holder::Request);
         running.in_flight.store(true, Ordering::Release);
-        let idle = cell(&registry, &target, input(&host, "b"), Holder::Request);
+        // Looked up and released: idle.
+        cell(&registry, &target, input(&host, "b"), Holder::Request);
         // A burst of other inputs past the bound.
         for text in ["c", "d", "e", "f", "g"] {
             cell(&registry, &target, input(&host, text), Holder::Request);
         }
         let again = cell(&registry, &target, input(&host, "a"), Holder::Request);
         assert!(Arc::ptr_eq(&running, &again), "no second attempt for it");
-        let fresh = cell(&registry, &target, input(&host, "b"), Holder::Request);
-        assert!(!Arc::ptr_eq(&idle, &fresh), "an idle one is still evicted");
+        let region = registry.regions.iter().next().unwrap();
+        let idle = input_key(&target, input(&host, "b"));
+        assert!(
+            region.slots.iter().all(|slot| slot.key != idle),
+            "an idle one is still evicted"
+        );
     }
 
     #[test]
@@ -1622,13 +1659,15 @@ mod tests {
         );
         assert!(Arc::ptr_eq(&v1, &undone));
         assert!(Arc::ptr_eq(&held_cell(&registry), &v1));
+        drop((v1, v2, again, undone));
         // Requests on many older texts evict the least recently used, never
         // the held one.
         for text in ["r1", "r2", "r3", "r4", "r5"] {
             cell(&registry, &target, input(&host, text), Holder::Request);
         }
-        assert!(Arc::ptr_eq(&held_cell(&registry), &v1));
+        let held = input_key(&target, input(&host, "v1"));
         let region = registry.regions.iter().next().unwrap();
+        assert_eq!(region.held, Some(held));
         let kept: Vec<u64> = region.slots.iter().map(|slot| slot.key).collect();
         let key = |text| input_key(&target, input(&host, text));
         assert_eq!(kept, vec![key("r5"), key("r4"), key("r3"), key("v1")]);
