@@ -87,6 +87,8 @@ pub(crate) enum UpstreamNotification {
         /// The originating connection's key: what it holds for the published
         /// document decides how a region push's coordinates translate.
         connection: ConnectionKey,
+        /// The document version the server published for, when it said.
+        version: Option<i32>,
         /// The pushed diagnostics, in the published document's own coordinates
         /// (virtual for a region push, host for a `_self` push).
         diagnostics: Vec<tower_lsp_server::ls_types::Diagnostic>,
@@ -3536,6 +3538,7 @@ mod tests {
                 connection_id,
                 connection,
                 diagnostics,
+                ..
             } => {
                 assert_eq!(connection_id, deps.progress_connection_id);
                 assert_eq!(connection, deps.connection_key);

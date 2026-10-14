@@ -820,6 +820,11 @@ impl BridgeCoordinator {
         // Pushed with nothing on record for its connection (a didOpen still
         // being recorded), from a connection gone by then, or before any
         // prepared text was ever sent: no prepared text to place it through.
+        // A push for a prepared text whose generation is unknown (computed
+        // for an earlier version) places nowhere.
+        if held.is_some_and(|stamp| stamp.prepared && stamp.generation.is_none()) {
+            return Placement::Skip;
+        }
         let Some(stamp) = held.filter(|stamp| stamp.generation.is_some()) else {
             return if region_prepared {
                 Placement::Skip
@@ -5199,6 +5204,12 @@ mod tests {
             |stamp: Option<&HeldStamp>| coordinator.place_push(&host, "json", region, "x\n", stamp);
         // Not prepared: as on any unprepared path.
         assert!(matches!(place(Some(&unrecorded)), Placement::Offset));
+        // Pushed for an earlier version of a prepared text: nowhere.
+        let stale = HeldStamp {
+            prepared: true,
+            ..unrecorded.clone()
+        };
+        assert!(matches!(place(Some(&stale)), Placement::Skip));
         assert!(matches!(place(None), Placement::Offset));
         assert!(matches!(
             coordinator.held_presentation(&host, "json", region, "x\n", &connection),

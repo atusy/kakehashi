@@ -111,9 +111,10 @@ pub(crate) struct SlotEntry {
 
 /// The text a connection held when it pushed a region slot: the generation
 /// of its record (see the bridge's `HeldText`; `None` with nothing on record
-/// yet), and whether that text was prepared. A slot pushed for a prepared
-/// text, or read while its connection holds one, is in the coordinates of
-/// that generation only.
+/// yet, or for a prepared text when the push named an earlier document
+/// version), and whether that text was prepared. A slot pushed for a
+/// prepared text, or read while its connection holds one, is in the
+/// coordinates of that generation only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HeldStamp {
     pub(crate) connection: crate::lsp::bridge::ConnectionKey,

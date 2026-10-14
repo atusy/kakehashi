@@ -45,6 +45,8 @@ pub(crate) struct DiagnosticPush {
     pub(crate) connection_id: ProgressConnectionId,
     /// The originating connection's key (see `held_stamp`).
     pub(crate) connection: crate::lsp::bridge::ConnectionKey,
+    /// The document version the server published for, when it said.
+    pub(crate) version: Option<i32>,
     pub(crate) diagnostics: Vec<Diagnostic>,
 }
 
@@ -652,6 +654,7 @@ impl DiagnosticPublisher {
         server: String,
         connection_id: ProgressConnectionId,
         connection: crate::lsp::bridge::ConnectionKey,
+        version: Option<i32>,
         diagnostics: Vec<Diagnostic>,
     ) {
         self.publish_push_batch(vec![DiagnosticPush {
@@ -659,6 +662,7 @@ impl DiagnosticPublisher {
             server,
             connection_id,
             connection,
+            version,
             diagnostics,
         }])
         .await;
@@ -685,7 +689,20 @@ impl DiagnosticPublisher {
                 (push, held)
             })
             .collect();
-        for (push, held) in stamped {
+        for (push, mut held) in stamped {
+            // A push for a prepared text that names another version than the
+            // one its connection was sent last was computed for an earlier
+            // text, however late it arrived: it places nowhere.
+            if let (Some(stamp), Some(version)) = (held.as_mut(), push.version)
+                && stamp.prepared
+                && self
+                    .bridge
+                    .virtual_document_version(&push.uri, &stamp.connection)
+                    .await
+                    != Some(version)
+            {
+                stamp.generation = None;
+            }
             let recorded = if VirtualDocumentUri::is_virtual_uri(&push.uri) {
                 self.record_region_push(
                     &push.uri,
@@ -3425,6 +3442,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_push_for_an_earlier_version_of_a_prepared_text_is_stamped_stale() {
+        use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let host_uri = Url::parse("file:///test/region_prepared.nix").unwrap();
+        server.documents.insert(
+            host_uri.clone(),
+            "x".to_string(),
+            Some("nix".to_string()),
+            None,
+        );
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap(),
+            "json",
+            "region-1",
+        );
+        let connection = crate::lsp::bridge::ConnectionKey::for_server("jsonls");
+        server
+            .bridge
+            .register_opened_document_for_test(&host_uri, &virtual_uri, &connection)
+            .await;
+        let prepared = apply_prepare_result("{}", &VirtualLayout::single("{}"), None).unwrap();
+        server
+            .bridge
+            .record_sent_content_for_test(
+                &virtual_uri,
+                &connection,
+                crate::lsp::bridge::SentText {
+                    text: &prepared.text,
+                    map: prepared.map.as_ref(),
+                },
+            )
+            .await;
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "jsonls".to_string(),
+            BridgeServerConfig {
+                cmd: Some(vec!["jsonls".to_string()]),
+                ..Default::default()
+            },
+        );
+        server.settings_manager.apply_settings(settings);
+        let held = server
+            .bridge
+            .virtual_document_version(&virtual_uri.to_uri_string(), &connection)
+            .await;
+        let push = |version: Option<i32>| DiagnosticPush {
+            uri: virtual_uri.to_uri_string(),
+            server: "jsonls".to_string(),
+            connection_id: ProgressConnectionId::for_test(1),
+            connection: connection.clone(),
+            version,
+            diagnostics: vec![diag("x")],
+        };
+        let stamp = || {
+            server.diagnostics.snapshot(&host_uri)
+                [&DiagnosticSource::Region("region-1".to_string())]["jsonls"]
+                .held
+                .clone()
+                .unwrap()
+        };
+        let publisher = DiagnosticPublisher::new(server);
+
+        publisher.publish_push_batch(vec![push(held)]).await;
+        assert!(stamp().generation.is_some(), "the version the server holds");
+        publisher.publish_push_batch(vec![push(None)]).await;
+        assert!(stamp().generation.is_some(), "no version to tell by");
+        publisher
+            .publish_push_batch(vec![push(held.map(|version| version - 1))])
+            .await;
+        let stale = stamp();
+        assert!(stale.prepared && stale.generation.is_none());
+    }
+
+    #[tokio::test]
     async fn push_batch_publishes_only_the_latest_host_state_once() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
@@ -3447,6 +3539,7 @@ mod tests {
                     server: "rust_ls".to_string(),
                     connection_id: ProgressConnectionId::for_test(1),
                     connection: crate::lsp::bridge::ConnectionKey::for_server("rust_ls"),
+                    version: None,
                     diagnostics: vec![diag("superseded")],
                 },
                 DiagnosticPush {
@@ -3454,6 +3547,7 @@ mod tests {
                     server: "rust_ls".to_string(),
                     connection_id: ProgressConnectionId::for_test(1),
                     connection: crate::lsp::bridge::ConnectionKey::for_server("rust_ls"),
+                    version: None,
                     diagnostics: vec![diag("latest")],
                 },
             ])
