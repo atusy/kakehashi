@@ -718,34 +718,39 @@ fn a_save_while_preparing_reaches_the_server_with_the_prepared_text() {
         "textDocument/didSave",
         json!({ "textDocument": { "uri": uri } }),
     );
+    // The save reaching the server and the diagnostics published once its
+    // prepared text was sent are forwarded independently: watch for both
+    // together, in either order. (The save's diagnostic pass ran while the
+    // region was held; the one after its prepared text was sent must still
+    // publish it.)
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    loop {
+    let (mut saved, mut published) = (false, false);
+    while !(saved && published) {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        let params = client
-            .wait_for_notification("window/logMessage", remaining)
-            .expect("the server never received the save");
-        // Relayed with the server's name as a prefix.
-        if let Some((_, saved)) = params["message"]
-            .as_str()
-            .and_then(|message| message.split_once("echo-document saved: "))
-        {
-            assert_eq!(saved, "local x = 2\n");
-            break;
-        }
-    }
-    // The save's diagnostic pass ran while the region was held; the one after
-    // its prepared text was sent must still publish it.
-    loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        let params = client
-            .wait_for_notification("textDocument/publishDiagnostics", remaining)
-            .expect("no diagnostics for the saved prepared text");
-        if params["diagnostics"].as_array().is_some_and(|items| {
+        let (method, params) = client
+            .wait_for_notification_where(
+                &["window/logMessage", "textDocument/publishDiagnostics"],
+                remaining,
+                |_| true,
+            )
+            .unwrap_or_else(|| {
+                panic!("timed out: save received = {saved}, diagnostics published = {published}")
+            });
+        if method == "window/logMessage" {
+            // Relayed with the server's name as a prefix.
+            if let Some((_, text)) = params["message"]
+                .as_str()
+                .and_then(|message| message.split_once("echo-document saved: "))
+            {
+                assert_eq!(text, "local x = 2\n");
+                saved = true;
+            }
+        } else if params["diagnostics"].as_array().is_some_and(|items| {
             items
                 .iter()
                 .any(|d| d["source"] == "echo-document" && d["message"] == "local x = 2\n")
         }) {
-            return;
+            published = true;
         }
     }
 }
