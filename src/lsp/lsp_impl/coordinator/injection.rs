@@ -636,10 +636,24 @@ impl InjectionCoordinator {
         // them: downstream servers never see a document unprepared.
         // A held region whose servers still hold the text sent before its
         // pair gained a peer is closed: held documents otherwise keep the
-        // text sent last, which for them is unprepared.
+        // text sent last, which for them is unprepared. Only once a peer is
+        // known to prepare the pair, though: a pair held only until its
+        // candidates' handshakes tell whether any prepares it (a server
+        // just added by a settings change) is most likely sent as is again
+        // once they do, and closing its documents meanwhile would only drop
+        // their diagnostics.
+        let settings = self.settings_manager.load_settings();
         let held: Vec<(&str, &str)> = injections
             .iter()
-            .filter(|injection| injection.held)
+            .filter(|injection| {
+                injection.held
+                    && self.bridge.prepare_peer_known(
+                        &settings,
+                        &host_language,
+                        &injection.language,
+                        self.experimental,
+                    )
+            })
             .map(|injection| (injection.language.as_str(), injection.region_id.as_str()))
             .collect();
         if !held.is_empty() {

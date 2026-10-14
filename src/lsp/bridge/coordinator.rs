@@ -553,6 +553,23 @@ impl BridgeCoordinator {
             .then_some(target)
     }
 
+    /// Whether some candidate of the pair is known to prepare its documents:
+    /// it advertised the request in its last handshake.
+    pub(crate) fn prepare_peer_known(
+        &self,
+        settings: &Arc<WorkspaceSettings>,
+        host_language: &str,
+        injection_language: &str,
+        experimental: bool,
+    ) -> bool {
+        self.prepare_target(settings, host_language, injection_language, experimental)
+            .is_some_and(|target| {
+                target.candidates.iter().any(|candidate| {
+                    self.pool.prepare_advertisement(&candidate.server_name) == Some(true)
+                })
+            })
+    }
+
     fn resolve_prepare_target(
         &self,
         settings: &Arc<WorkspaceSettings>,
