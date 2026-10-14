@@ -2871,6 +2871,13 @@ impl LanguageServerPool {
         let promotion_connection_key = connection_key.clone();
         let promotion_claim = Arc::clone(&claim);
         let transition_locks = Arc::clone(&self.open_transition_locks);
+        // What the connection now holds is recorded by the promotion too, under
+        // the transition lock like every other send: the caller may be
+        // cancelled once didOpen is queued (a losing fan-out arm, an editor
+        // cancel), and a document open with nothing on record would read as
+        // holding no prepared text.
+        let held_text = virtual_content.text.to_owned();
+        let held_map = virtual_content.map.cloned();
         let promotion = tokio::spawn(async move {
             let promoted = queued
                 && tracker
@@ -2881,7 +2888,25 @@ impl LanguageServerPool {
                         &promotion_claim,
                     )
                     .await;
-            if !promoted {
+            if promoted {
+                // The didOpen was confirmed enqueued (the `MessageSender` maps
+                // `Queued` → `Ok`), so seed the content fingerprint with the
+                // opened content. Without this, the FIRST position-only host
+                // edit — which leaves this region's content unchanged — would
+                // still re-send a didChange (and, for a server that clears on
+                // didChange, flicker the diagnostics) because no fingerprint
+                // existed to compare against (#422).
+                tracker
+                    .record_sent_content_fingerprint(
+                        &promotion_virtual_uri,
+                        &promotion_connection_key,
+                        SentText {
+                            text: &held_text,
+                            map: held_map.as_ref(),
+                        },
+                    )
+                    .await;
+            } else {
                 tracker
                     .rollback_open_claim_if(
                         &promotion_host_uri,
@@ -2908,15 +2933,6 @@ impl LanguageServerPool {
                 "bridge: didOpen claim invalidated during enqueue",
             ));
         }
-        // The didOpen was confirmed enqueued (the `MessageSender` maps `Queued` →
-        // `Ok`), so seed the content fingerprint with the opened content. Without
-        // this, the FIRST position-only host edit — which leaves this region's
-        // content unchanged — would still re-send a didChange (and, for a server that
-        // clears on didChange, flicker the diagnostics) because no fingerprint existed
-        // to compare against (#422).
-        self.document_tracker
-            .record_sent_content_fingerprint(virtual_uri, connection_key, virtual_content)
-            .await;
         Ok(())
     }
 
@@ -9322,6 +9338,16 @@ mod tests {
         })
         .await
         .expect("detached promotion should finish after caller cancellation");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool
+                .held_text(&virtual_uri.to_uri_string(), &connection_key)
+                .is_none()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the opened text must be on record after caller cancellation");
         tokio::time::timeout(Duration::from_secs(1), async {
             while pool
                 .open_transition_locks
