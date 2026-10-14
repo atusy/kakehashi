@@ -162,7 +162,8 @@ other set (a completion's main edit with its additional edits, an inlay
 hint's edits, a color presentation's) is mapped edit by edit, keeping each
 extent. A completion's snippet is checked as the client expands it — every
 tabstop at its default — and kept only when every client expands it alike
-(literal text, tabstops, at most one `$`-free default per tabstop); its
+(literal text, tabstops, at most one `$`-free default per tabstop, a
+choice escaping nothing but `,`, `|` or `\`); its
 additional edits are checked with each range the client may apply the main
 edit through (insert and replace). In every case a line an edit creates
 inside dedented content regains the content's removed indentation, and an
