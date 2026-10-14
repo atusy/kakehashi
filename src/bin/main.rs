@@ -632,7 +632,8 @@ fn installed_query_language_name_checked(path: &Path) -> std::io::Result<Option<
     Ok(Some(name))
 }
 
-/// Say what discovery deliberately left on disk, and why.
+/// Say what this run deliberately left on disk, and why — entries `--all`
+/// discovery walked past, or a directory a named uninstall's parser probe met.
 ///
 /// Called on EVERY exit that makes a claim about the directory — including the
 /// failing ones and the "nothing installed" one — because the claim is exactly
@@ -686,8 +687,10 @@ fn run_language_uninstall(
         eprintln!("Warning: failed to recover interrupted query installs: {e}");
     }
 
-    // Entries discovery deliberately walked past, with why. Kept so the summary
-    // cannot claim it removed everything while one of them is still on disk.
+    // Entries this run deliberately leaves on disk, with why: filled by `--all`
+    // discovery, and by a named uninstall that meets a directory-shaped parser.
+    // Kept so the summary cannot claim it removed everything while one of them
+    // is still on disk.
     let mut unmanaged: Vec<(PathBuf, &'static str)> = Vec::new();
 
     // Entries discovery could not classify at all. Distinct from `unmanaged`,
@@ -738,7 +741,7 @@ fn run_language_uninstall(
                     }
                 }
                 Ok(Some(ParserEntry::WrongShape)) => {
-                    unmanaged.push((path.clone(), "it is not a shape this CLI can remove"));
+                    unmanaged.push((path.clone(), WRONG_SHAPE_PARSER_NOTE));
                 }
                 Err(error) => {
                     // Debug-format: the name comes from the filesystem, so it
@@ -884,10 +887,15 @@ fn run_language_uninstall(
             // settled that such an entry does not count as an installed parser,
             // and that answer stands when there is nothing else to lose. What
             // it never considered is queries sitting beside one: taking those
-            // would leave the half-removed language and, on the named path
-            // (which has no leftovers summary), report it as a clean uninstall.
-            // So the refusal is scoped to exactly that case.
+            // would leave the half-removed language and report it as a clean
+            // uninstall. So the refusal is scoped to exactly that case.
             Ok(Some((path, ParserEntry::WrongShape))) => {
+                // Whichever way this goes, the directory stays, and only the
+                // user can clear it: name it with the advice. `--all` discovery
+                // already did, so it is not repeated there.
+                if !all {
+                    unmanaged.push((path.clone(), WRONG_SHAPE_PARSER_NOTE));
+                }
                 // Only a confirmed absence permits going on. Reading any other
                 // error as "no queries here" would hand back the half-removal
                 // this branch exists to prevent, decided on a guess.
@@ -896,7 +904,7 @@ fn run_language_uninstall(
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
                     Err(e) => {
                         eprintln!(
-                            "✗ Leaving '{}' untouched: {:?} is not a shape this CLI can remove, and whether it has queries could not be determined: {}",
+                            "✗ Leaving '{}' untouched: {:?} is a directory, which this CLI never removes, and whether it has queries could not be determined: {}",
                             lang, path, e
                         );
                         any_failed = true;
@@ -905,7 +913,7 @@ fn run_language_uninstall(
                 };
                 if queries_present {
                     eprintln!(
-                        "✗ Leaving '{}' untouched: {:?} is not a shape this CLI can remove, and taking its queries alone would half-remove it.",
+                        "✗ Leaving '{}' untouched: {:?} is a directory, which this CLI never removes, and taking its queries alone would half-remove it.",
                         lang, path
                     );
                     any_failed = true;
@@ -957,10 +965,14 @@ fn run_language_uninstall(
                 // parser would *create* that state, so leave both and let the
                 // retry be a plain retry.
                 if !failure.removal.queries_absent {
-                    eprintln!(
-                        "  Leaving the parser for '{}' in place; run the command again.",
-                        lang
-                    );
+                    // Only when there is a parser to leave: naming one that
+                    // does not exist sends the user looking for it.
+                    if parser_entry.is_some() {
+                        eprintln!(
+                            "  Leaving the parser for '{}' in place; run the command again.",
+                            lang
+                        );
+                    }
                     if removed_something {
                         any_removed = true;
                     }
@@ -1078,15 +1090,21 @@ fn find_parser_entry(
     Ok(parser_entry_kind(&path)?.map(|entry| (path, entry)))
 }
 
+/// Why a [`ParserEntry::WrongShape`] entry was left, and what to do about it.
+/// The only such shape is a directory, which no install writes, so it is the
+/// user's to judge.
+const WRONG_SHAPE_PARSER_NOTE: &str =
+    "it is a directory, which this CLI never removes; delete it by hand if you no longer need it";
+
 /// What a path in `parser/` is, as far as uninstall is concerned.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ParserEntry {
-    /// An entry removal can take: a regular file, or a symlink.
+    /// An entry removal can take: anything that is not a directory.
     Removable { is_symlink: bool },
     /// An entry that is plainly there but is not a shape removal can take —
-    /// a directory (#828), or a special file. Discovery must remember these
-    /// rather than skip them silently, because the summary goes on to claim
-    /// it removed everything and one of these on disk makes that false.
+    /// a directory (#828). Discovery must remember these rather than skip
+    /// them silently, because the summary goes on to claim it removed
+    /// everything and one of these on disk makes that false.
     WrongShape,
 }
 
@@ -1097,23 +1115,27 @@ enum ParserEntry {
 /// which can be served from `readdir`'s cached `d_type` and so would report
 /// success on some filesystems and fail on others for an unreadable directory.
 ///
-/// A regular file or a symlink is removable — install produces the first, and a
-/// hand-pointed local build the second. Everything else is [`WrongShape`]:
-/// `remove_file` cannot take a directory (#828), and a FIFO or socket named
-/// `lua.dylib` is not an install this CLI created, so removing it would be
-/// discovery inventing one.
+/// Anything but a directory is removable. The name `parser/<lang>.<ext>` is
+/// kakehashi's — install publishes there — so uninstall clears whatever shape
+/// occupies it, as long as it can do so without opening or following the
+/// entry: a regular file, a hand-pointed symlink, a FIFO or a socket alike.
+/// `remove_parser_entry` takes each with `unlink` (or, for a Windows directory
+/// link, `RemoveDirectoryW`), neither of which opens the entry, so a FIFO
+/// cannot block it. The queries slot answers the same way (#1006). A directory
+/// is [`WrongShape`]: `remove_file` cannot take one, and #828 settled that it
+/// is not an installed parser.
 ///
 /// [`WrongShape`]: ParserEntry::WrongShape
 fn parser_entry_kind(path: &Path) -> std::io::Result<Option<ParserEntry>> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
             let file_type = metadata.file_type();
-            Ok(Some(if file_type.is_file() || file_type.is_symlink() {
+            Ok(Some(if file_type.is_dir() {
+                ParserEntry::WrongShape
+            } else {
                 ParserEntry::Removable {
                     is_symlink: file_type.is_symlink(),
                 }
-            } else {
-                ParserEntry::WrongShape
             }))
         }
         // Absent is the ordinary "not installed" answer; every other failure
@@ -1174,15 +1196,16 @@ fn remove_parser_entry(path: &Path) -> std::io::Result<bool> {
 /// `queries/lua` is unusable but perfectly removable, so calling it an I/O
 /// error — as the shared helper does, correctly, for `status` — would leave
 /// `uninstall --all` failing on it forever while `uninstall lua` cleared it.
+///
+/// Every shape counts, because removal takes every shape: a regular file, FIFO
+/// or socket in the slot is unlinked like a symlink is. Skipping those here
+/// made `--all` blind to them while it reported the directory empty (#1006).
 fn query_entry_language_name(path: &Path) -> std::io::Result<Option<String>> {
     let Some(name) = safe_query_entry_name(path) else {
         return Ok(None);
     };
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            let file_type = metadata.file_type();
-            Ok((file_type.is_dir() || file_type.is_symlink()).then(|| name.to_string()))
-        }
+        Ok(_) => Ok(Some(name)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }

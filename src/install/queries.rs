@@ -914,7 +914,7 @@ impl PublishedQueryInstall {
         })
     }
 
-    /// Un-publish the requested language, restoring the directory it displaced.
+    /// Un-publish the requested language, restoring the entry it displaced.
     ///
     /// Only the requested language is un-published. Query files for the base
     /// languages it inherits are shared: another install running concurrently
@@ -1027,7 +1027,7 @@ pub(crate) enum RollbackOutcome {
     NewQueriesRemain,
     /// The new queries are gone but the ones they displaced could not be put
     /// back, so the language has no queries and the previous ones are in a
-    /// backup directory. The warnings name it.
+    /// backup. The warnings name it.
     PreviousQueriesStranded,
 }
 
@@ -1078,28 +1078,31 @@ fn discard_backup_locked(published: &PublishedQueryDir) {
     discard_backup(published);
 }
 
-/// Drop a displaced query directory and the sidecar that marks it as ours.
+/// Drop a displaced query entry and the sidecar that marks it as ours.
 ///
-/// The sidecar is removed even when the directory is already gone: gating it on
+/// The sidecar is removed even when the backup is already gone: gating it on
 /// a successful removal is how orphaned `.kakehashi-backup` files accumulate
-/// when a concurrent uninstall collects the directory first.
+/// when a concurrent uninstall collects the backup first.
 fn discard_backup(published: &PublishedQueryDir) {
     let Some(backup) = &published.backup else {
         return;
     };
-    discard_backup_dir(backup);
+    discard_backup_entry(backup);
 }
 
-/// Remove a backup directory and, once it is confirmed gone, the sidecar that
-/// marks it as ours.
+/// Remove a backup (a directory, or whatever shape sat in the slot) and, once
+/// it is confirmed gone, the sidecar that marks it as ours.
 ///
 /// The sidecar outlives a removal that *failed*: every collector — uninstall,
 /// the recovery sweep, `newest_complete_backup_dir` — gates on it, so dropping
-/// it while the directory survives would make that directory unreachable by all
-/// of them. It is dropped when the directory is confirmed absent, which is how
+/// it while the backup survives would make that backup unreachable by all of
+/// them. It is dropped when the backup is confirmed absent, which is how
 /// a concurrent uninstall's collection stops leaving sidecars behind.
-fn discard_backup_dir(backup: &Path) {
-    match remove_dir_all_tolerating_vanished(backup) {
+fn discard_backup_entry(backup: &Path) {
+    // Whatever shape it has: a backup is what sat in the slot before, and a
+    // regular file there makes a regular-file backup that `remove_dir_all`
+    // cannot take (#1006).
+    match remove_entry_tolerating_vanished(backup) {
         Ok(_) => {
             let _ = fs::remove_file(backup_ownership_sidecar(backup));
         }
@@ -1471,7 +1474,8 @@ fn unique_backup_query_dir(queries_dir: &Path, language: &str) -> PathBuf {
     }
 }
 
-/// Recover query directories stranded by a process exit during replacement.
+/// Recover query directories stranded by a process exit during replacement,
+/// and collect the backups a completed replacement left behind.
 pub fn recover_interrupted_query_installs(queries_parent: &Path) -> Result<(), QueryInstallError> {
     let entries = match fs::read_dir(queries_parent) {
         Ok(entries) => entries,
@@ -1481,20 +1485,25 @@ pub fn recover_interrupted_query_installs(queries_parent: &Path) -> Result<(), Q
 
     // Recover at most once per language: a single recovery pass already
     // considers every backup for that language (newest_complete_backup_dir
-    // rescans the parent), so running it per backup directory would redo the
-    // same scan and lock acquisition for each stranded backup.
+    // rescans the parent), so running it per backup would redo the same scan
+    // and lock acquisition for each stranded backup.
     let mut recovered_languages = std::collections::HashSet::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
+        // A backup is recognised by its generated name, whatever its shape:
+        // a publish moves an existing slot entry aside, so a regular file
+        // there makes a regular-file backup. Restoring still takes only a complete
+        // directory (newest_complete_backup_dir), so this widens collection,
+        // not recovery.
         if let Some(language) = backup_language_name(&path) {
             if recovered_languages.insert(language.clone()) {
                 recover_interrupted_query_install(queries_parent, &language)?;
                 collect_superseded_backups(queries_parent, &language)?;
             }
-        } else if let Some((language, _)) = temp_language_name_and_pid(&path) {
+        } else if path.is_dir()
+            && let Some((language, _)) = temp_language_name_and_pid(&path)
+        {
+            // Staging entries are always directories this process created.
             remove_interrupted_temp_query_install(queries_parent, &language, &path)?;
         }
     }
@@ -1506,7 +1515,7 @@ pub fn recover_interrupted_query_installs(queries_parent: &Path) -> Result<(), Q
 pub struct QueryRemoval {
     pub removed_queries: bool,
     pub removed_backups: bool,
-    /// Whether the language's query directory is gone — removed by this call or
+    /// Whether the language's query entry is gone — removed by this call or
     /// already absent when it started. Distinct from `removed_queries`, which
     /// only says whether *this* call did the removing: a caller deciding
     /// whether it may now remove the parser needs the state, not the action.
@@ -1567,12 +1576,11 @@ fn remove_query_install_and_backups_inner(
     write_uninstall_tombstone(queries_parent, language)?;
     let queries_dir = queries_parent.join(language);
 
-    // No exists() pre-check: Path::exists() reads false on metadata errors
-    // (e.g. PermissionDenied), which would skip removal and report "not
-    // installed" over a still-present unreadable dir. The tolerant removal
-    // reports whether anything was actually removed.
-    removal.removed_queries = remove_dir_all_tolerating_vanished(&queries_dir)?;
-    // Either branch of that call leaves the directory gone; anything else
+    // Classified under the replace lock, rather than trusting whatever
+    // discovery saw: a shape decided earlier is a statement about what the
+    // path WAS.
+    removal.removed_queries = remove_entry_tolerating_vanished(&queries_dir)?;
+    // Every branch of that call leaves the entry gone; anything else
     // returned an error above.
     removal.queries_absent = true;
 
@@ -1584,19 +1592,18 @@ fn remove_query_install_and_backups_inner(
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        // file_type() over path.is_dir(): is_dir() swallows metadata errors
-        // as "not a directory", which could leave an unreadable backup behind
-        // while uninstall reports success.
-        if entry.file_type()?.is_dir()
-            && generated_backup_matches_language(name, language)
-            && backup_is_owned(&path)
-        {
+        // Any shape: a publish moves an existing slot entry aside, so a backup
+        // is a regular file when a regular file was there. The generated name
+        // and the ownership sidecar are what make it ours; the removal
+        // classifies it and propagates a failure to remove it, rather than
+        // reading it as "not a backup" and reporting success over it.
+        if generated_backup_matches_language(name, language) && backup_is_owned(&path) {
             let ownership = backup_ownership_sidecar(&path);
-            // Same NotFound tolerance as the canonical dir above: a backup
+            // Same NotFound tolerance as the canonical entry above: a backup
             // deleted externally after enumeration is already the end state.
-            let removed_dir = remove_dir_all_tolerating_vanished(&path)?;
+            let removed_backup = remove_entry_tolerating_vanished(&path)?;
             // The sidecar is a kakehashi-owned artifact too: deleting it
-            // counts as removal even when the dir itself vanished first —
+            // counts as removal even when the backup itself vanished first —
             // and, like every other I/O in this loop, only NotFound is
             // tolerated (an unremovable marker must fail the uninstall, not
             // linger behind a success report).
@@ -1605,7 +1612,7 @@ fn remove_query_install_and_backups_inner(
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
                 Err(e) => return Err(QueryInstallError::IoError(e)),
             };
-            if removed_dir || removed_sidecar {
+            if removed_backup || removed_sidecar {
                 removal.removed_backups = true;
             }
         }
@@ -1634,6 +1641,68 @@ fn remove_dir_all_tolerating_vanished(dir: &Path) -> Result<bool, QueryInstallEr
         {
             Ok(false)
         }
+        Err(e) => Err(QueryInstallError::IoError(e)),
+    }
+}
+
+/// Remove whatever occupies a path kakehashi owns, whatever its shape, treating
+/// an entry already gone as the desired end state. Returns whether this call
+/// removed anything.
+///
+/// Classified by `symlink_metadata`, not `exists()`, which reads false on
+/// metadata errors (e.g. PermissionDenied) and would skip removal and report
+/// "not installed" over a still-present unreadable entry.
+fn remove_entry_tolerating_vanished(path: &Path) -> Result<bool, QueryInstallError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            remove_symlink_tolerating_vanished(path)
+        }
+        Ok(metadata) if metadata.is_dir() => remove_dir_all_tolerating_vanished(path),
+        // Anything else — a regular file, FIFO or socket — still occupies a
+        // name kakehashi owns, and a publish moves such an entry aside too.
+        // `remove_dir_all` cannot take it, and `unlink` never opens it, so a
+        // FIFO cannot block the removal (#1006).
+        Ok(_) => remove_file_tolerating_vanished(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(QueryInstallError::IoError(e)),
+    }
+}
+
+/// Remove a symlink itself, never its target, whatever it points at.
+///
+/// `remove_file` is `unlink` on unix, which takes any link. Windows splits
+/// links by kind: a file symlink needs `DeleteFileW` (which `remove_dir_all`
+/// refuses, since the link is not a directory), while a directory symlink or
+/// junction needs `RemoveDirectoryW`. So try the first, and fall back to the
+/// second only while the entry is still a symlink — the same shape as the
+/// parser side's removal in `src/bin/main.rs`.
+fn remove_symlink_tolerating_vanished(path: &Path) -> Result<bool, QueryInstallError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => {
+            let still_a_symlink =
+                fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink());
+            if !still_a_symlink {
+                return Err(QueryInstallError::IoError(e));
+            }
+            match fs::remove_dir(path) {
+                Ok(()) => Ok(true),
+                Err(second) if second.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(_) => Err(QueryInstallError::IoError(e)),
+            }
+        }
+    }
+}
+
+/// `fs::remove_file` that treats an entry already gone as the desired end
+/// state. Returns whether this call removed anything. Unlike a directory
+/// removal, `unlink` is a single step, so its `NotFound` cannot mean a
+/// partially removed entry and needs no confirmation.
+fn remove_file_tolerating_vanished(path: &Path) -> Result<bool, QueryInstallError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(QueryInstallError::IoError(e)),
     }
 }
@@ -1794,7 +1863,7 @@ fn recover_interrupted_query_install(
 /// directory but before committing.
 ///
 /// [`recover_interrupted_query_install`] restores a backup only when the live
-/// directory is missing. Once the publish landed, the directory it displaced is
+/// directory is missing. Once the publish landed, the entry it displaced is
 /// superseded — and invisible to that recovery for exactly that reason — so
 /// without this it would sit under `queries/` until the user uninstalled the
 /// language by name. An install publishes one such backup per language in the
@@ -1837,12 +1906,9 @@ fn collect_superseded_backups(
         // could not even read is how residue it never saw becomes permanent.
         let entry = entry.map_err(QueryInstallError::IoError)?;
         let path = entry.path();
-        if !entry
-            .file_type()
-            .map_err(QueryInstallError::IoError)?
-            .is_dir()
-            || !backup_is_owned(&path)
-        {
+        // Any shape, as in uninstall's sweep: a displaced regular file is a
+        // backup too, and `discard_backup_entry` takes one.
+        if !backup_is_owned(&path) {
             continue;
         }
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
@@ -1854,7 +1920,7 @@ fn collect_superseded_backups(
         if backup_language != language || process_is_running(pid) {
             continue;
         }
-        discard_backup_dir(&path);
+        discard_backup_entry(&path);
     }
     Ok(())
 }
@@ -3009,6 +3075,51 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// A publish moves an existing query-slot entry aside, so a regular file
+    /// there becomes a regular-file backup. Discarding it after a successful
+    /// publish must take it and its sidecar; `remove_dir_all` alone cannot,
+    /// which stranded both with a warning on every such install (#1006).
+    #[test]
+    fn discarding_a_regular_file_backup_takes_it_and_its_sidecar() {
+        let temp = TempDir::new().unwrap();
+        let backup = temp.path().join(".lua.1.2.backup");
+        fs::write(&backup, "a file that sat in the query slot").unwrap();
+        write_backup_ownership_marker(&backup).unwrap();
+
+        discard_backup_entry(&backup);
+
+        assert!(
+            fs::symlink_metadata(&backup).is_err(),
+            "the displaced file must be removed"
+        );
+        assert!(
+            fs::symlink_metadata(backup_ownership_sidecar(&backup)).is_err(),
+            "its ownership sidecar must go with it"
+        );
+    }
+
+    /// The same backup stranded by an interrupted install is uninstall's to
+    /// collect: it is owned (sidecar present) and named for the language.
+    #[test]
+    fn uninstall_collects_an_owned_regular_file_backup() {
+        let temp = TempDir::new().unwrap();
+        let data_dir = temp.path().join("data");
+        let queries_parent = data_dir.join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        let backup = queries_parent.join(".lua.1.2.backup");
+        fs::write(&backup, "a file that sat in the query slot").unwrap();
+        write_backup_ownership_marker(&backup).unwrap();
+        let LanguageLockProbe::Idle(lock) = try_lock_language(&data_dir, "lua") else {
+            panic!("test language should be unlocked");
+        };
+
+        let removal = remove_query_install_and_backups(&lock).unwrap();
+
+        assert!(removal.removed_backups, "the backup was there to remove");
+        assert!(fs::symlink_metadata(&backup).is_err());
+        assert!(fs::symlink_metadata(backup_ownership_sidecar(&backup)).is_err());
+    }
+
     #[test]
     #[cfg(unix)]
     fn uninstall_refuses_a_tombstone_symlink_without_removing_queries() {
@@ -3332,6 +3443,38 @@ mod tests {
             fs::read_to_string(live.join("highlights.scm")).unwrap(),
             "published",
             "collecting a backup must not disturb the live queries"
+        );
+    }
+
+    /// A backup of a regular file that sat in the slot is a regular file. When
+    /// it is the only thing an interrupted install stranded, recovery must still
+    /// find it and collect it once complete queries have taken its place.
+    #[test]
+    #[cfg(unix)]
+    fn recover_interrupted_query_installs_collects_a_lone_regular_file_backup() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        let live = queries_parent.join("lua");
+        fs::create_dir_all(&live).unwrap();
+        fs::write(live.join("highlights.scm"), "published").unwrap();
+        write_install_marker(&live).unwrap();
+        let backup = queries_parent.join(format!(".lua.{}.0.backup", dead_test_pid()));
+        fs::write(&backup, "a file that sat in the query slot").unwrap();
+        write_backup_ownership_marker(&backup).unwrap();
+
+        recover_interrupted_query_installs(&queries_parent).unwrap();
+
+        assert!(
+            fs::symlink_metadata(&backup).is_err(),
+            "a superseded file backup must be collected"
+        );
+        assert!(
+            fs::symlink_metadata(backup_ownership_sidecar(&backup)).is_err(),
+            "its ownership sidecar must go with it"
+        );
+        assert_eq!(
+            fs::read_to_string(live.join("highlights.scm")).unwrap(),
+            "published"
         );
     }
 
