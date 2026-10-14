@@ -144,31 +144,33 @@ struct Cell {
 }
 
 impl Cell {
-    /// Whether the answer, if any, still stands at `epoch`.
-    fn current(&self, epoch: u64) -> bool {
-        !self.revoked.load(Ordering::Acquire)
-            && (self.outcome.get().is_none()
-                || self.answered_epoch.load(Ordering::Acquire) == epoch)
+    /// The answer, if any, while it still stands at `epoch`; `Err` when it
+    /// is outdated. The answer is read once, before its epoch is: read after
+    /// a check that found none, an answer an old attempt published meanwhile
+    /// would be served unchecked. (Its epoch is stored before it, so read
+    /// after it, the epoch is its own.)
+    fn standing(&self, epoch: u64) -> Result<Option<&Outcome>, ()> {
+        let outcome = self.outcome.get();
+        if self.revoked.load(Ordering::Acquire)
+            || outcome.is_some() && self.answered_epoch.load(Ordering::Acquire) != epoch
+        {
+            return Err(());
+        }
+        Ok(outcome)
     }
 
     fn lookup(&self, epoch: u64) -> Option<PrepareLookup> {
-        if !self.current(epoch) {
-            return None;
-        }
-        self.outcome.get().map(|outcome| match outcome {
+        self.standing(epoch).ok()?.map(|outcome| match outcome {
             Some(prepared) => PrepareLookup::Ready(Arc::clone(prepared)),
             None => PrepareLookup::Failed,
         })
     }
 
     fn settled(&self, epoch: u64) -> Result<Arc<PreparedDocument>, PrepareMiss> {
-        if !self.current(epoch) {
-            return Err(PrepareMiss::Unanswered);
-        }
-        match self.outcome.get() {
-            Some(Some(prepared)) => Ok(Arc::clone(prepared)),
-            Some(None) => Err(PrepareMiss::Failed),
-            None => Err(PrepareMiss::Unanswered),
+        match self.standing(epoch) {
+            Ok(Some(Some(prepared))) => Ok(Arc::clone(prepared)),
+            Ok(Some(None)) => Err(PrepareMiss::Failed),
+            Ok(None) | Err(()) => Err(PrepareMiss::Unanswered),
         }
     }
 
