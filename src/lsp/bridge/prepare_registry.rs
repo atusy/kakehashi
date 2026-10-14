@@ -1107,11 +1107,12 @@ mod tests {
             registry.lookup_or_start(&pool, &target, input(&host, "a")),
             PrepareLookup::Pending
         ));
-        assert!(
+        assert_eq!(
             registry
                 .prepare(&pool, &target, input(&host, "a"))
                 .await
-                .is_err()
+                .err(),
+            Some(PrepareMiss::Unanswered)
         );
         assert_eq!(*cell.attempts.borrow(), 1);
         // The host is synced again once the backoff ends.
@@ -1165,7 +1166,9 @@ mod tests {
         }
         assert!(Arc::ptr_eq(&held_cell(&registry), &v1));
         let region = registry.regions.iter().next().unwrap();
-        assert_eq!(region.slots.len(), SLOTS_PER_REGION + 1);
+        let kept: Vec<u64> = region.slots.iter().map(|slot| slot.key).collect();
+        let key = |text| input_key(&target, input(&host, text));
+        assert_eq!(kept, vec![key("r5"), key("r4"), key("r3"), key("v1")]);
     }
 
     #[test]
