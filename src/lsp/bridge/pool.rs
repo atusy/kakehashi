@@ -824,16 +824,10 @@ impl LanguageServerPool {
         self.client_workspace.seed(root_uri, folders);
     }
 
-    /// Get the workspace root URI.
-    fn root_uri(&self) -> Option<String> {
-        self.client_workspace.snapshot().root
-    }
-
-    /// Get the workspace folders.
-    pub(crate) fn workspace_folders(
-        &self,
-    ) -> Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>> {
-        self.client_workspace.snapshot().folders
+    /// The client workspace folders and the root derived from them, read
+    /// together: callers needing both must take them from one snapshot.
+    pub(crate) fn client_workspace(&self) -> super::ClientWorkspaceSnapshot {
+        self.client_workspace.snapshot()
     }
 
     /// Update the upstream client workspace snapshot used by future
@@ -3838,11 +3832,14 @@ impl LanguageServerPool {
         let folders: Vec<tower_lsp_server::ls_types::WorkspaceFolder> = match marker {
             Some((_root, folder)) => vec![folder.clone()],
             None => {
-                let snapshot = self.workspace_folders().unwrap_or_default();
+                // One snapshot for both rungs: the root must be the one
+                // derived from the folders just found empty.
+                let client = self.client_workspace();
+                let snapshot = client.folders.unwrap_or_default();
                 if !snapshot.is_empty() {
                     snapshot
-                } else if let Some((_root, folder)) = self
-                    .root_uri()
+                } else if let Some((_root, folder)) = client
+                    .root
                     .and_then(|root| Url::parse(&root).ok())
                     .and_then(super::root_markers::workspace_at_root)
                 {
@@ -4319,7 +4316,10 @@ impl LanguageServerPool {
             (None, Some(Vec::new()))
         } else {
             super::root_markers::workspace_from_marker(marker, || {
-                (self.root_uri(), self.workspace_folders())
+                // Root and folders from one snapshot, so the handshake never
+                // pairs a root with a folder list it was not derived from.
+                let client = self.client_workspace();
+                (client.root, client.folders)
             })
         };
         log::debug!(
@@ -5416,8 +5416,9 @@ mod tests {
         pool.apply_workspace_folder_change(vec![replacement.clone()], &[original])
             .await;
 
-        assert_eq!(pool.root_uri().as_deref(), Some("file:///replacement"));
-        assert_eq!(pool.workspace_folders(), Some(vec![replacement]));
+        let client = pool.client_workspace();
+        assert_eq!(client.root.as_deref(), Some("file:///replacement"));
+        assert_eq!(client.folders, Some(vec![replacement]));
     }
 
     /// Concurrent folder changes must leave the forwarded root naming the
@@ -5464,12 +5465,12 @@ mod tests {
                 task.await.unwrap();
             }
 
-            let first = pool
-                .workspace_folders()
+            let client = pool.client_workspace();
+            let first = client
+                .folders
                 .and_then(|set| set.first().map(|folder| folder.uri.to_string()));
             assert_eq!(
-                pool.root_uri(),
-                first,
+                client.root, first,
                 "round {round}: the root must name the first folder of the converged set"
             );
         }
@@ -5659,11 +5660,13 @@ mod tests {
             "and must not arm it for a re-open it never earned"
         );
         assert_eq!(
-            pool.root_uri(),
-            Some("file:///original".to_string()),
+            pool.client_workspace(),
+            super::super::ClientWorkspaceSnapshot {
+                root: Some("file:///original".to_string()),
+                folders: Some(vec![original]),
+            },
             "and must not touch the client workspace snapshot"
         );
-        assert_eq!(pool.workspace_folders(), Some(vec![original]));
     }
 
     #[tokio::test]

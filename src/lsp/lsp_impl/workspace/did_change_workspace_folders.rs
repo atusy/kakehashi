@@ -68,7 +68,8 @@ impl Kakehashi {
         let first_folder = self
             .bridge
             .pool()
-            .workspace_folders()
+            .client_workspace()
+            .folders
             .and_then(|folders| folders.first().cloned());
         let root_path = config_root_after_folder_change(
             first_folder.as_ref().map(|folder| &folder.uri),
