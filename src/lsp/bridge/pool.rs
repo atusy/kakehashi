@@ -2979,24 +2979,23 @@ impl LanguageServerPool {
             ),
             VirtualOpenContent::Snapshot(provided) => (provided, None),
         };
-        // A cached text sent as is, for a prepared request, is the older of
-        // the two when it was recorded before the request's answer was
-        // applied (before the pair gained its peer): a prepared pair must not
-        // be opened with it. Recorded after, it is the lifecycle pass's newer
-        // text (the pair lost its peer since), which the stale request must
-        // not replace. The reverse — a prepared cache for a request built as
-        // is — is most likely the lifecycle pass's newer text (the pair
-        // gained its peer since), which the server should hold even though
-        // this request then fails its own check; right after a pair lost its
-        // peer, it is the older one, which the lifecycle pass replaces on its
-        // next send.
+        // A prepared request opens with the newer of its own text and the
+        // cached one, by when its answer was applied and the cache recorded:
+        // a cache from before (sent as is before the pair gained its peer, or
+        // prepared from an earlier text) would hold back a request whose
+        // answer is already in, and a newer one (the lifecycle pass's, as is
+        // since the pair lost its peer, say) must not be replaced by the
+        // stale request. A request built as is opens with the cache — most
+        // likely the lifecycle pass's newer text (the pair gained its peer
+        // since), which the server should hold even though this request then
+        // fails its own check; right after a pair lost its peer, it is the
+        // older one, which the lifecycle pass replaces on its next send.
         let virtual_content = current_content
             .as_deref()
             .filter(|cached| {
-                cached.map.is_some()
-                    || provided.map.is_none_or(|request| {
-                        cached.recorded.load(std::sync::atomic::Ordering::Relaxed) > request.built()
-                    })
+                provided.map.is_none_or(|request| {
+                    cached.recorded.load(std::sync::atomic::Ordering::Relaxed) > request.built()
+                })
             })
             .map_or(provided, LatestText::as_sent);
         let did_open = build_didopen_notification(virtual_uri, virtual_content.text);
@@ -8807,6 +8806,54 @@ mod tests {
             after.map.as_ref().unwrap(),
             second.map.as_ref().unwrap()
         ));
+    }
+
+    #[tokio::test]
+    async fn a_prepared_open_takes_its_newer_answer_over_an_older_prepared_cache() {
+        use super::super::protocol::{VirtualLayout, apply_prepare_result};
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///test/newer-answer.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        let dedent = |text: &str| {
+            let result = serde_json::from_value(serde_json::json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+            ]}]}))
+            .unwrap();
+            apply_prepare_result(text, &VirtualLayout::single(text), Some(result)).unwrap()
+        };
+        // The lifecycle pass recorded revision N's prepared text…
+        let older = dedent("  a");
+        pool.record_latest_virtual_content(
+            &host_uri,
+            1,
+            "lua",
+            TEST_ULID_LUA_0,
+            SentText {
+                text: &older.text,
+                map: older.map.as_ref(),
+            },
+        );
+        // …before a request got revision N+1's answer.
+        let newer = dedent("  b");
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(1);
+        pool.ensure_document_opened(
+            &mut sender,
+            &host_uri,
+            &virtual_uri,
+            SentText {
+                text: &newer.text,
+                map: newer.map.as_ref(),
+            },
+            &key,
+        )
+        .await
+        .unwrap();
+        let OutboundMessage::Untracked(message) = rx.try_recv().unwrap() else {
+            panic!("didOpen must be an untracked notification");
+        };
+        assert_eq!(message["params"]["textDocument"]["text"], "b");
     }
 
     #[tokio::test]
