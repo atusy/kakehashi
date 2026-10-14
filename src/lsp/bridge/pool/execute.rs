@@ -59,9 +59,9 @@ impl Drop for RequestHostLifecycle<'_> {
     }
 }
 
-/// How long a request on a prepared document waits for the lifecycle pass
-/// to sync the prepared text it was built for (see
-/// `LanguageServerPool::wait_for_prepared_sync`). The answer is already in
+/// How long a request waits for the lifecycle pass to sync the text it was
+/// built for — a prepared one, or text as is in place of a prepared one (see
+/// `LanguageServerPool::wait_for_held_text`). The answer is already in
 /// by then and the sync follows it within a lifecycle pass; a request whose
 /// text a newer edit superseded never sees its text sent and fails here
 /// (the pool cannot tell supersession from a slow pass, and the editor
@@ -108,7 +108,7 @@ impl<'a> HeldCheck<'a> {
 fn prepared_text_not_synced(connection_key: &super::ConnectionKey) -> io::Error {
     io::Error::new(
         io::ErrorKind::WouldBlock,
-        format!("{connection_key} does not hold the prepared text this request was built for"),
+        format!("{connection_key} does not hold the text this request was built for"),
     )
 }
 
