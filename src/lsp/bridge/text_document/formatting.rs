@@ -691,7 +691,10 @@ fn transform_formatting_style_response(
         // through the prepared map, which restores dedented indentation and
         // refuses an answer rewriting host-owned text (a gap). The deleted
         // edge lines stay in the host; the edges kept are the prepared
-        // text's, per string it joins.
+        // text's, per string it joins. A refused answer fails the request
+        // (the CLI reports it), unlike the malformed answers dropped below:
+        // the server did its job, and the region is left unformatted only
+        // because its result would rewrite the host.
         Some(map) => {
             if keep_edges {
                 edits = keep_prepared_edge_layout(edits, virtual_content, map, offset);
