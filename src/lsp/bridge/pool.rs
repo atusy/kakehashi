@@ -4733,8 +4733,6 @@ impl LanguageServerPool {
                     handle_for_handshake.set_bridge_routing(extensions.bridge_routing);
                     handle_for_handshake
                         .set_virtual_document_prepare(extensions.virtual_document_prepare);
-                    prepare_advertisements
-                        .record(&server_name_for_log, extensions.virtual_document_prepare);
                     handle_for_handshake.set_type_hierarchy_provider(type_hierarchy_provider);
                     // Path a: push this server's settings now that `initialized`
                     // has been sent, so push-model servers are configured even
@@ -4783,6 +4781,12 @@ impl LanguageServerPool {
                             "bridge: connection was invalidated during initialization",
                         ));
                     }
+                    // Only a connection that became Ready records its
+                    // advertisement of `kakehashi/virtualDocument/prepare`: one
+                    // retired during its handshake (a settings reload replacing
+                    // it) must not overwrite what its replacement recorded.
+                    prepare_advertisements
+                        .record(&server_name_for_log, extensions.virtual_document_prepare);
                     // Record advertised palette command names AFTER Ready, so a
                     // command fired without an action context (raw name) routes
                     // back to a Ready connection (#628). Dedup is by name across
