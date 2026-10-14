@@ -218,6 +218,10 @@ pub(crate) struct PrepareRegistry {
     /// Keyed by a hash of (host URI, injection language, region id), so a
     /// lookup allocates nothing; the entry holds the identity it checks.
     regions: Arc<Regions>,
+    /// Some region was ever looked up: until then every query answers "no
+    /// region" without touching the map, which the paths every bridged
+    /// region takes per edit rely on when nothing is prepared.
+    used: AtomicBool,
     /// Source of `textDocument.version`: shared by all documents, so a
     /// document forgotten and prepared again (a settings change, a reopen)
     /// never repeats a version the peer saw.
@@ -239,6 +243,7 @@ impl Default for PrepareRegistry {
         let (resync_tx, resync_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             regions: Arc::default(),
+            used: AtomicBool::new(false),
             next_revision: AtomicI32::new(1),
             resync_tx,
             resync_rx: std::sync::Mutex::new(Some(resync_rx)),
@@ -247,6 +252,11 @@ impl Default for PrepareRegistry {
 }
 
 impl PrepareRegistry {
+    /// Whether no region was ever looked up (see `used`).
+    fn unused(&self) -> bool {
+        !self.used.load(Ordering::Acquire)
+    }
+
     /// Queue `resync` again after `delay` — for a pass whose sends failed,
     /// which nothing else would repeat. A shutdown drops it.
     pub(crate) fn requeue_resync(&self, resync: Resync, delay: Duration) {
@@ -336,6 +346,9 @@ impl PrepareRegistry {
     /// Whether any of `host_uri`'s documents the lifecycle pass holds back
     /// still waits for its answer (one is running, or a retry is due).
     pub(crate) fn host_has_pending(&self, host_uri: &Url) -> bool {
+        if self.unused() {
+            return false;
+        }
         self.regions.iter().any(|region| {
             region.host_uri == host_uri.as_str()
                 && region
@@ -353,6 +366,9 @@ impl PrepareRegistry {
         injection_language: &str,
         region_id: &str,
     ) -> bool {
+        if self.unused() {
+            return false;
+        }
         let host_uri = host_uri.as_str();
         self.regions
             .get(&region_hash(host_uri, injection_language, region_id))
@@ -374,6 +390,9 @@ impl PrepareRegistry {
         injection_language: &str,
         region_id: &str,
     ) -> bool {
+        if self.unused() {
+            return false;
+        }
         let host_uri = host_uri.as_str();
         self.regions
             .get(&region_hash(host_uri, injection_language, region_id))
@@ -450,6 +469,9 @@ impl PrepareRegistry {
         injection_language: Option<&str>,
         region_id: &str,
     ) {
+        if self.unused() {
+            return;
+        }
         let host_uri = host_uri.as_str();
         match injection_language {
             Some(language) => {
@@ -469,6 +491,9 @@ impl PrepareRegistry {
     /// keeps its id, and its document under the new language may be being
     /// prepared already.
     pub(crate) fn forget_region_except(&self, host_uri: &Url, region_id: &str, keep: Option<&str>) {
+        if self.unused() {
+            return;
+        }
         let host_uri = host_uri.as_str();
         self.regions.retain(|_, region| {
             !(region.host_uri == host_uri
@@ -479,6 +504,9 @@ impl PrepareRegistry {
 
     /// Forget a closed host's documents.
     pub(crate) fn forget_host(&self, host_uri: &Url) {
+        if self.unused() {
+            return;
+        }
         self.regions
             .retain(|_, region| region.host_uri != host_uri.as_str());
     }
@@ -494,6 +522,7 @@ impl PrepareRegistry {
         input: PrepareInput<'_>,
         holder: Holder,
     ) -> Option<Slot> {
+        self.used.store(true, Ordering::Release);
         let key = input_key(target, input);
         let host_uri = input.host_uri.as_str();
         let hash = region_hash(host_uri, input.injection_language, input.region_id);
