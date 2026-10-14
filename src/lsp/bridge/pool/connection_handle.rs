@@ -566,9 +566,10 @@ impl ConnectionHandle {
     ///
     /// `Ok(None)` is the peer's `null` (present unchanged). Every failure —
     /// no advertisement, an error response, a malformed result, a timeout —
-    /// is an `Err`: the caller must not send the document unprepared. A
-    /// `MethodNotFound` response also clears the advertisement until the
-    /// next handshake.
+    /// is an `Err`. A missing advertisement (or a `MethodNotFound` response,
+    /// which also clears it until the next handshake) means the server is no
+    /// peer, and the caller moves on to the next candidate; any other `Err`
+    /// must not let the document through unprepared.
     pub(crate) async fn request_virtual_document_prepare(
         &self,
         params: &PrepareParams<'_>,
