@@ -222,6 +222,49 @@ into the closing fence) is dropped **whole** — a formatter answer is one
 atomic diff, so applying only its safe edits could duplicate or lose content.
 The same rule covers range and on-type formatting.
 
+#### Host text on lines a formatter adds
+
+A custom injection query can leave part of a host line out of the region. For
+example, a query using `#offset!` can extract the JSON from a Rust line
+comment, leaving `// ` in the host:
+
+```rust
+// {"a":1,"b":2}
+```
+
+The sequential pipeline (`strategy = "concatenated"`) can format this
+one-line region into several lines. The `// ` stays outside the replaced text,
+in front of the first line only. It is not copied to the new lines:
+
+```rust
+// {
+  "a": 1,
+  "b": 2
+}
+```
+
+Restore the markers yourself:
+
+```rust
+// {
+//   "a": 1,
+//   "b": 2
+// }
+```
+
+Until you do, the new lines are outside the comment. The Rust file may no
+longer compile, or may mean something else. A query that removes host text
+from a region decides what the server sees. It does not tell formatting to
+repeat that text on lines the formatter adds. Under the default `preferred`
+strategy, and for range and on-type formatting, the same answer adds line
+breaks to a one-line region that opens after host text, so it is dropped whole
+as described above, and the line is left as it was.
+
+This differs from a fenced code block inside a Markdown blockquote. There the
+`> ` on each line is recorded as a line prefix when the block is extracted, and
+the sequential pipeline puts the prefix back on every line, including the lines
+a formatter adds.
+
 ### Range formatting
 
 [`textDocument/rangeFormatting`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_rangeFormatting)
