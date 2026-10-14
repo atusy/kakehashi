@@ -732,7 +732,8 @@ fn insertion_point_prefixed(offset: &RegionOffset, region_end: Position, host_li
 /// default. `None` for anything else: text the client decides at insert time
 /// (a variable), that this expansion does not compute (a transform), or
 /// that clients resolve differently (several defaults for one tabstop,
-/// defaults holding defaults); and for an expansion far longer than the
+/// defaults holding defaults, a choice escaping anything but `,`, `|` or
+/// `\`); and for an expansion far longer than the
 /// snippet (one default mirrored many times).
 fn snippet_expansion(snippet: &str) -> Option<String> {
     use std::collections::HashMap;
@@ -809,12 +810,18 @@ fn snippet_expansion(snippet: &str) -> Option<String> {
                             let mut first = true;
                             loop {
                                 match chars.next()? {
-                                    '\\' => {
-                                        let escaped = chars.next()?;
-                                        if first {
-                                            choice.push(escaped);
+                                    // Clients agree only on these escapes
+                                    // in a choice: VS Code keeps the
+                                    // backslash of `\$` and `\}`, which
+                                    // the grammar drops.
+                                    '\\' => match chars.next()? {
+                                        escaped @ (',' | '|' | '\\') => {
+                                            if first {
+                                                choice.push(escaped);
+                                            }
                                         }
-                                    }
+                                        _ => return None,
+                                    },
                                     ',' => first = false,
                                     '|' => break,
                                     c if first => choice.push(c),
@@ -1175,6 +1182,14 @@ mod tests {
         assert_eq!(expanded("f(${1})$0").as_deref(), Some("f()"));
         assert_eq!(expanded("f(${1:x}, ${2:y})").as_deref(), Some("f(x, y)"));
         assert_eq!(expanded("${1|a,b|}c").as_deref(), Some("ac"));
+        assert_eq!(
+            expanded("${1|a\\,b\\|\\\\c,d|}").as_deref(),
+            Some("a,b|\\c")
+        );
+        // Escapes clients read differently in a choice: none.
+        assert_eq!(expanded("${1|a\\$b|}"), None);
+        assert_eq!(expanded("${1|a\\}b|}"), None);
+        assert_eq!(expanded("${1|a\\qb|}"), None);
         assert_eq!(expanded("\\$1 \\} \\x").as_deref(), Some("$1 } \\x"));
         assert_eq!(expanded("cost: $").as_deref(), Some("cost: $"));
         assert_eq!(expanded("$0name\n").as_deref(), Some("name\n"));
