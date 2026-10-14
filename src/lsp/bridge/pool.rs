@@ -2075,6 +2075,18 @@ impl LanguageServerPool {
         self.document_tracker.held_text(virtual_uri, connection_key)
     }
 
+    /// See `DocumentTracker::held_stamp`.
+    #[cfg(test)]
+    pub(crate) fn held_stamp(
+        &self,
+        virtual_uri: &str,
+        connection_key: &ConnectionKey,
+        version: Option<i32>,
+    ) -> Option<crate::lsp::diagnostic_cache::HeldStamp> {
+        self.document_tracker
+            .held_stamp(virtual_uri, connection_key, version)
+    }
+
     /// Whether any connection was ever sent a prepared text: until then,
     /// every connection holds virtual text as is (or nothing).
     pub(crate) fn ever_held_prepared(&self) -> bool {
@@ -4486,6 +4498,7 @@ impl LanguageServerPool {
                 client_progress_registry: Arc::clone(&self.client_progress_registry),
                 progress_connection_id,
                 settings: Arc::clone(&settings_cell),
+                document_tracker: Arc::clone(&self.document_tracker),
             },
         );
 

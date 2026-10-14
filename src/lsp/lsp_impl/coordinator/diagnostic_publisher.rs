@@ -43,10 +43,9 @@ pub(crate) struct DiagnosticPush {
     pub(crate) uri: String,
     pub(crate) server: String,
     pub(crate) connection_id: ProgressConnectionId,
-    /// The originating connection's key (see `held_stamp`).
-    pub(crate) connection: crate::lsp::bridge::ConnectionKey,
-    /// The document version the server published for, when it said.
-    pub(crate) version: Option<i32>,
+    /// What the originating connection held for a region push's document
+    /// as the reader read it (see [`HeldStamp`]).
+    pub(crate) held: Option<HeldStamp>,
     pub(crate) diagnostics: Vec<Diagnostic>,
 }
 
@@ -653,16 +652,14 @@ impl DiagnosticPublisher {
         uri: String,
         server: String,
         connection_id: ProgressConnectionId,
-        connection: crate::lsp::bridge::ConnectionKey,
-        version: Option<i32>,
+        held: Option<HeldStamp>,
         diagnostics: Vec<Diagnostic>,
     ) {
         self.publish_push_batch(vec![DiagnosticPush {
             uri,
             server,
             connection_id,
-            connection,
-            version,
+            held,
             diagnostics,
         }])
         .await;
@@ -675,24 +672,10 @@ impl DiagnosticPublisher {
     pub(crate) async fn publish_push_batch(&self, pushes: Vec<DiagnosticPush>) -> usize {
         let mut index_of: HashMap<Url, usize> = HashMap::new();
         let mut hosts: Vec<RecordedHost> = Vec::new();
-        // Stamped before any await below: a region push is in the coordinates
-        // of the text its connection holds when it arrives, which a send
-        // queued while this batch resolves its hosts must not replace. (A
-        // push still queued for this task when such a send happens is no
-        // different from one late on the wire: it carries no text to compare.)
-        let stamped: Vec<(DiagnosticPush, Option<HeldStamp>)> = pushes
-            .into_iter()
-            .map(|push| {
-                let held = VirtualDocumentUri::is_virtual_uri(&push.uri)
-                    .then(|| {
-                        self.bridge
-                            .held_stamp(&push.uri, &push.connection, push.version)
-                    })
-                    .flatten();
-                (push, held)
-            })
-            .collect();
-        for (push, held) in stamped {
+        // Each region push carries the stamp the reader gave it as it read
+        // it: what its connection held then, not now.
+        for push in pushes {
+            let held = push.held;
             let recorded = if VirtualDocumentUri::is_virtual_uri(&push.uri) {
                 self.record_region_push(
                     &push.uri,
@@ -3479,12 +3462,14 @@ mod tests {
             .bridge
             .virtual_document_version(&virtual_uri.to_uri_string(), &connection)
             .await;
+        // Stamped as the reader stamps a push it reads.
         let push = |version: Option<i32>| DiagnosticPush {
             uri: virtual_uri.to_uri_string(),
             server: "jsonls".to_string(),
             connection_id: ProgressConnectionId::for_test(1),
-            connection: connection.clone(),
-            version,
+            held: server
+                .bridge
+                .held_stamp(&virtual_uri.to_uri_string(), &connection, version),
             diagnostics: vec![diag("x")],
         };
         let stamp = || {
@@ -3548,16 +3533,14 @@ mod tests {
                     uri: uri.to_string(),
                     server: "rust_ls".to_string(),
                     connection_id: ProgressConnectionId::for_test(1),
-                    connection: crate::lsp::bridge::ConnectionKey::for_server("rust_ls"),
-                    version: None,
+                    held: None,
                     diagnostics: vec![diag("superseded")],
                 },
                 DiagnosticPush {
                     uri: uri.to_string(),
                     server: "rust_ls".to_string(),
                     connection_id: ProgressConnectionId::for_test(1),
-                    connection: crate::lsp::bridge::ConnectionKey::for_server("rust_ls"),
-                    version: None,
+                    held: None,
                     diagnostics: vec![diag("latest")],
                 },
             ])

@@ -814,6 +814,52 @@ impl DocumentTracker {
         self.ever_held_prepared.load(Ordering::Acquire)
     }
 
+    /// Record `content` as sent, as a forward would (see `record_sent`).
+    #[cfg(test)]
+    pub(in crate::lsp::bridge) fn record_sent_for_test(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+        content: SentText<'_>,
+    ) {
+        self.record_sent(virtual_uri, connection_key, content, None);
+    }
+
+    /// What `connection` holds for `virtual_uri` now, to stamp a push it
+    /// sent with (see [`crate::lsp::diagnostic_cache::HeldStamp`]); `None`
+    /// when no connection was ever sent a prepared text — every one then
+    /// holds its text as is, which needs no stamp. A push naming a document
+    /// `version` other than the one the connection was last sent was
+    /// computed for an earlier text (prepared or not, whatever the
+    /// connection holds now), and is stamped to place nowhere.
+    pub(in crate::lsp::bridge) fn held_stamp(
+        &self,
+        virtual_uri: &str,
+        connection: &ConnectionKey,
+        version: Option<i32>,
+    ) -> Option<crate::lsp::diagnostic_cache::HeldStamp> {
+        if !self.ever_held_prepared() {
+            return None;
+        }
+        let held = self.held_text(virtual_uri, connection);
+        if let Some(version) = version
+            && held
+                .as_ref()
+                .is_some_and(|held| held.version != Some(version))
+        {
+            return Some(crate::lsp::diagnostic_cache::HeldStamp {
+                connection: connection.clone(),
+                generation: None,
+                prepared: true,
+            });
+        }
+        Some(crate::lsp::diagnostic_cache::HeldStamp {
+            connection: connection.clone(),
+            generation: held.as_ref().map(|held| held.generation),
+            prepared: held.is_some_and(|held| held.map.is_some()),
+        })
+    }
+
     /// What this connection was last sent for the document, if anything.
     pub(super) fn held_text(
         &self,

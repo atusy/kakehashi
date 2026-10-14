@@ -91,13 +91,20 @@ pub(in crate::lsp::bridge) fn forward_push(
         }
     };
 
+    // Stamped as read, before the push waits in the upstream channel: a send
+    // queued meanwhile must not make it read as computed for newer text.
+    let held = crate::lsp::bridge::protocol::VirtualDocumentUri::is_virtual_uri(&uri)
+        .then(|| {
+            deps.document_tracker
+                .held_stamp(&uri, &deps.connection_key, version)
+        })
+        .flatten();
     let _ = deps.upstream_tx.send(
         crate::lsp::bridge::actor::UpstreamNotification::PublishDiagnostics {
             uri,
             server: server_name.to_owned(),
             connection_id: deps.progress_connection_id,
-            connection: deps.connection_key.clone(),
-            version,
+            held,
             diagnostics,
         },
     );
