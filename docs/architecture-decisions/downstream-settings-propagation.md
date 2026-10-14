@@ -217,30 +217,57 @@ keeps propagation proportional to actual change.
 The following are **deferred** and intentionally out of scope:
 
 - ~~**Upstream pull**~~ (kakehashi → editor `workspace/configuration`):
-  **implemented** (#952 stage 1). Gated on the editor's
+  **implemented** (#952). Gated on the editor's
   `capabilities.workspace.configuration`, as this decision required. kakehashi
   asks once the handshake completes, again whenever a
   `didChangeConfiguration` carries no usable payload — which is the shape
   pull-model editors send — and again after a `didChangeWorkspaceFolders`
   that moves the selected configuration root. The last is a decision, not a
-  protocol requirement. Even unscoped, the answer may depend on the open
-  workspace — VS Code folds workspace settings into it, while Neovim answers
-  from one per-client table — so an answer read in the old workspace may not
-  describe the new one, and its relative paths anchor to whichever root is in
-  effect when it is applied. It asks only once the reload has put the new
-  root in effect, so the answer anchors to it. A folder change that keeps the
-  root does not ask, and neither does a reload rejected as invalid: that
-  keeps the old root, so an answer would anchor to a workspace the editor
-  has left. For the same reason an answer to a request asked at an earlier
-  root is dropped when it arrives: the root change that moved the session has
-  already queued a pull for the new one. Asking has a price: a non-empty
-  answer is applied like any pull, so the reload's reparse of open documents
-  and semantic-token refresh happen a second time, and one more layer is
-  retained for later replays. Accepted, because a root change is rare next to
-  an edit. The answer is
-  applied as a configuration layer, identically to a push of the same section
-  (see the accumulate contract in configuration-merging-strategy), so nothing
-  about the merge is special-cased for having been pulled.
+  protocol requirement: the answer is asked for that root (below), so one read
+  for the old root does not describe the new one. It asks only once the reload
+  has put the new root in effect, so the answer anchors to it. A folder change
+  that keeps the root does not ask, and neither does a reload rejected as
+  invalid: that keeps the old root, so an answer would anchor to a workspace
+  the editor has left. Asking has a price: an answer that changes the
+  settings in effect is published again, so the reload's reparse of open
+  documents and semantic-token refresh happen a second time (an answer that
+  rebuilds to the same settings is not republished). Accepted, because a
+  root change is rare next to an edit.
+
+  Until that answer arrives, the previous answer stays in effect — it was
+  read for the old root, and the reload replays it anchored to the new one.
+  It is kept as the last known answer rather than withdrawn at the reload:
+  withdrawing would run one reload without the client's configuration,
+  tearing down and respawning every bridge server configured only through
+  the editor on each folder switch, to cover a re-pull failing. If the re-pull
+  answers `null`, errors, or times out, the old root's answer therefore keeps
+  applying. That differs from an answer that *arrives* for a root the session
+  has left, which is discarded (see `scopeUri` below).
+
+  The answer is ingested as a push of the same section is (unknown keys
+  aside, see configuration-merging-strategy), but retained differently. A push
+  accumulates (#734); an answer is the client's whole configuration for the
+  scope asked, so it **replaces the previous answer** and lands at its own
+  arrival, above older pushes — the newest answer is the newest statement of
+  the client's configuration. An answer holding nothing for kakehashi
+  withdraws the previous one; `null`, an error, or a timeout is no answer and
+  changes nothing — which also means an editor that answers `null` once
+  nothing is configured has no way to withdraw an earlier answer; LSP defines
+  `null` as "cannot provide", so it is not read as "nothing configured".
+
+  Because the fold is not associative, taking the previous answer out cannot
+  be done on the merged snapshot. Each applied answer rebuilds the settings
+  instead, folding the retained client layers over the defaults-and-files
+  prefix kept from the load that last read the configuration files
+  (initialize, or a root change) — a prefix checkpoint, which #948 records as
+  safe. The files are not read again for a pull, so a file saved half-edited
+  since cannot drop out of effect because the editor's settings changed; an
+  edited file takes effect at the next root change, as before. The rebuild
+  inherits one gap #948 tracks for root changes, now reachable on every pull:
+  a parser directory appended to the settings in effect after an install is
+  in no layer, so a rebuild drops it (#948 describes when that is reachable —
+  auto-install only runs when `searchPaths` already includes the default data
+  directory).
 
   One consequence worth stating for anyone writing an editor integration: a
   field the client answers with an empty container **clears** the layer below,
@@ -250,13 +277,40 @@ The following are **deferred** and intentionally out of scope:
   a setting would clear it for users who configured nothing. Special-casing it
   is not an option — it would make an intentional clear unspellable through a
   pull-model editor — so register defaults as absent rather than empty.
-- **`scopeUri` / multi-root resolution**: on the downstream side
-  `ConfigurationItem.scopeUri` is ignored — a single per-server `settings`
-  value answers all scopes. Upstream, kakehashi asks without a scope on
-  purpose: it resolves one effective settings snapshot for the whole process,
-  so naming a scope and applying the answer process-wide would promote one
-  folder's configuration to global. Scoped pull is #952 stage 2 and changes
-  that invariant.
+- **`scopeUri`**: upstream, **implemented for the selected root** (#952).
+  The pull's `scopeUri` names the process-wide configuration root the client
+  selected — the first workspace folder, else `rootUri`, else the deprecated
+  `rootPath` converted to a file URI — sent as the client spelled it. It is
+  `null` whenever the root is not a `file:` location the client named: when
+  kakehashi fell back to its launch directory (including when the first rung
+  the client sent is not a `file:` URI — the ladder does not skip past it),
+  and when a folder change leaves the session with no root at all. This keeps the invariant that one server process resolves one
+  effective settings snapshot: the scope is the root that snapshot is resolved
+  for, so no folder's configuration is promoted beyond the scope it already
+  had. An answer to a request made for a root the session has since left —
+  by path or by scope — is discarded; the root change pulls again for the new
+  scope.
+
+  On the downstream side `ConfigurationItem.scopeUri` is still ignored — a
+  single per-server `settings` value answers all scopes.
+- **Per-folder and per-document resolution** stays deferred behind #948's
+  retained-layer model, because it breaks the one-snapshot invariant: the layer
+  list becomes `(scope, layer)`, and every consumer of the settings has to say
+  which scope it asks about. Each has an open question that settings alone do
+  not answer:
+  - *Which scope a request resolves to* — the containing workspace folder, or
+    the document's own URI.
+  - *Parser selection* — parsers and queries are held once per language name
+    for the whole process; two folders naming different parser paths or query
+    sets for one language cannot both be honoured without per-scope registries.
+  - *Bridge server spawning and reuse* — pooled connections are keyed without a
+    configuration scope; per-folder `languageServers` would decide when a
+    connection may be shared and when it must be a separate process.
+  - *The auto-install gate* — it reads the process-wide `searchPaths`; with
+    per-folder paths, whose settings admit an install, and where it goes.
+  - *Semantic tokens* — capture mappings and layer aggregation would resolve
+    per document, so anything cached across documents would need the scope
+    too.
 
 ## Validation
 
