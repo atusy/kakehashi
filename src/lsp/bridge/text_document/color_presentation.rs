@@ -211,11 +211,16 @@ fn transform_color_presentation_response_to_host(
                 .cloned()
                 .chain(additional_edits.iter().cloned())
                 .collect();
+            // Kept only when the main edit maps in the set as it went out
+            // alone: what follows an edit in the set can change how it
+            // regains a removed indent, and the edits sent must be the set
+            // checked.
             let translated = match translate_virtual_text_edits_to_host(set, offset, EditMode::Extent)
             {
-                Some(mapped) => {
-                    *additional_edits = mapped.into_iter().skip(usize::from(main_edit.is_some())).collect();
-                    true
+                Some(mut mapped) => {
+                    let joint_main = main_edit.is_some().then(|| mapped.remove(0));
+                    *additional_edits = mapped;
+                    joint_main.as_ref() == presentation.text_edit.as_ref()
                 }
                 None => false,
             };
@@ -817,6 +822,45 @@ mod tests {
             Range::new(Position::new(0, 0), Position::new(0, 5)),
         );
         assert_eq!(kept.len(), 2, "{kept:?}");
+    }
+
+    #[test]
+    fn additional_edits_are_kept_only_with_the_main_edit_they_were_checked_with() {
+        use super::super::super::protocol::{VirtualLayout, apply_prepare_result};
+        // `  a\n  b\n`, dedented by two.
+        let result = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            "  a\n  b\n",
+            &VirtualLayout::single("  a\n  b\n"),
+            Some(result),
+        )
+        .unwrap();
+        let offset = RegionOffset::new(0, 0).with_prepared(prepared.map);
+        // The main edit's line break is followed by the additional edit's
+        // `y` in the set, but by the end of its line alone.
+        let response = json!({"jsonrpc": "2.0", "id": 1, "result": [{
+            "label": "x",
+            "textEdit": {
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+                "newText": "x\n"
+            },
+            "additionalTextEdits": [{
+                "range": {"start": {"line": 0, "character": 1}, "end": {"line": 1, "character": 0}},
+                "newText": "y"
+            }]
+        }]});
+        let kept = transform_color_presentation_response_to_host(
+            response,
+            &offset,
+            Position::new(2, 0),
+            Range::new(Position::new(0, 2), Position::new(0, 3)),
+        );
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[0].additional_text_edits, None);
     }
 
     #[test]

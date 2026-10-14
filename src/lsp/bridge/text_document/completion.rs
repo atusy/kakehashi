@@ -445,32 +445,76 @@ pub(super) fn transform_completion_item(
             }
             true
         } else {
-            // With each primary the client may apply; the additional edits
-            // map the same in every set (each edit maps on its own).
-            let sets: Vec<Option<Vec<_>>> = if primaries.is_empty() {
-                vec![translate_virtual_text_edits_to_host(
+            // With each primary the client may apply. What follows an edit in
+            // a set can change how it regains a removed indent, so the edits
+            // sent must be the set checked: each set's primary must map as
+            // the primary that went out (for a snippet: on its range, to its
+            // expansion), and the additional edits alike in every set.
+            if primaries.is_empty() {
+                match translate_virtual_text_edits_to_host(
                     additional_edits.clone(),
                     offset,
                     EditMode::Extent,
-                )]
-            } else {
-                primaries
-                    .iter()
-                    .map(|primary| {
-                        let set = std::iter::once(primary.clone())
-                            .chain(additional_edits.iter().cloned())
-                            .collect();
-                        translate_virtual_text_edits_to_host(set, offset, EditMode::Extent)
-                            .map(|mapped| mapped.into_iter().skip(1).collect())
-                    })
-                    .collect()
-            };
-            match sets.into_iter().collect::<Option<Vec<_>>>() {
-                Some(mut mapped) => {
-                    *additional_edits = mapped.swap_remove(0);
-                    true
+                ) {
+                    Some(mapped) => {
+                        *additional_edits = mapped;
+                        true
+                    }
+                    None => false,
                 }
-                None => false,
+            } else {
+                let sent: Vec<tower_lsp_server::ls_types::TextEdit> = match &item.text_edit {
+                    Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(edit)) => {
+                        vec![edit.clone()]
+                    }
+                    Some(tower_lsp_server::ls_types::CompletionTextEdit::InsertAndReplace(
+                        edit,
+                    )) => vec![
+                        tower_lsp_server::ls_types::TextEdit {
+                            range: edit.insert,
+                            new_text: edit.new_text.clone(),
+                        },
+                        tower_lsp_server::ls_types::TextEdit {
+                            range: edit.replace,
+                            new_text: edit.new_text.clone(),
+                        },
+                    ],
+                    None => Vec::new(),
+                };
+                let mut agreed: Option<Vec<tower_lsp_server::ls_types::TextEdit>> = None;
+                let mut consistent = sent.len() == primaries.len();
+                for (primary, sent) in primaries.iter().zip(&sent) {
+                    let set = std::iter::once(primary.clone())
+                        .chain(additional_edits.iter().cloned())
+                        .collect();
+                    let Some(mut mapped) =
+                        translate_virtual_text_edits_to_host(set, offset, EditMode::Extent)
+                    else {
+                        consistent = false;
+                        break;
+                    };
+                    let joint = mapped.remove(0);
+                    let sent_text = if snippet {
+                        snippet_expansion(&sent.new_text)
+                    } else {
+                        Some(sent.new_text.clone())
+                    };
+                    if joint.range != sent.range
+                        || sent_text.as_ref() != Some(&joint.new_text)
+                        || agreed.as_ref().is_some_and(|agreed| *agreed != mapped)
+                    {
+                        consistent = false;
+                        break;
+                    }
+                    agreed = Some(mapped);
+                }
+                match agreed.filter(|_| consistent) {
+                    Some(mapped) => {
+                        *additional_edits = mapped;
+                        true
+                    }
+                    None => false,
+                }
             }
         };
         if !translated
@@ -1173,6 +1217,48 @@ mod tests {
             ),
             kept
         );
+    }
+
+    #[test]
+    fn additional_edits_are_kept_only_with_the_primary_they_were_checked_with() {
+        use super::super::super::protocol::{VirtualLayout, apply_prepare_result};
+        // `  a\n  b\n`, dedented by two.
+        let result = serde_json::from_value(serde_json::json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            "  a\n  b\n",
+            &VirtualLayout::single("  a\n  b\n"),
+            Some(result),
+        )
+        .unwrap();
+        let offset = RegionOffset::new(0, 0).with_prepared(prepared.map);
+        // The primary's line break is followed by the additional edit's `y`
+        // in the set, but by the end of its line alone: they regain the
+        // removed indent differently.
+        let mut item: tower_lsp_server::ls_types::CompletionItem = serde_json::from_value(
+            serde_json::json!({
+                "label": "x",
+                "textEdit": {
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+                    "newText": "x\n"
+                },
+                "additionalTextEdits": [{
+                    "range": {"start": {"line": 0, "character": 1}, "end": {"line": 1, "character": 0}},
+                    "newText": "y"
+                }]
+            }),
+        )
+        .unwrap();
+        assert!(transform_completion_item(
+            &mut item,
+            &offset,
+            Position::new(2, 0),
+            Some(Position::new(0, 2)),
+        ));
+        assert_eq!(item.additional_text_edits, None);
     }
 
     #[test]
