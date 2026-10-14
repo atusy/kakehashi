@@ -703,6 +703,14 @@ impl LanguageServerPool {
         self.prepare_advertisements.get(server_name)
     }
 
+    /// How many times a server recorded as not advertising
+    /// `kakehashi/virtualDocument/prepare` started advertising it.
+    pub(crate) fn prepare_advertised_epoch(&self) -> u64 {
+        self.prepare_advertisements
+            .advertised_epoch
+            .load(Ordering::Acquire)
+    }
+
     /// Run `hook` whenever a server recorded as not advertising
     /// `kakehashi/virtualDocument/prepare` starts advertising it (set once).
     pub(crate) fn set_prepare_advertised_hook(&self, hook: Box<dyn Fn() + Send + Sync>) {
@@ -5299,6 +5307,10 @@ pub(crate) struct PrepareAdvertisements {
     /// pairs were sent as is meanwhile, and their documents should be
     /// prepared without waiting for an edit.
     on_advertised: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// Bumped whenever a server starts advertising after being recorded as
+    /// not advertising, before the hook runs: an attempt that found no
+    /// candidate meanwhile knows its answer is outdated.
+    advertised_epoch: std::sync::atomic::AtomicU64,
 }
 
 impl PrepareAdvertisements {
@@ -5312,11 +5324,11 @@ impl PrepareAdvertisements {
                 return;
             }
         };
-        if advertised
-            && !previous
-            && let Some(hook) = self.on_advertised.get()
-        {
-            hook();
+        if advertised && !previous {
+            self.advertised_epoch.fetch_add(1, Ordering::AcqRel);
+            if let Some(hook) = self.on_advertised.get() {
+                hook();
+            }
         }
     }
 
@@ -5383,8 +5395,10 @@ mod tests {
         // It did not start in time, then advertised once up.
         pool.record_prepare_advertisement("late", false);
         assert_eq!(pool.prepare_advertisement("late"), Some(false));
+        let before = pool.prepare_advertised_epoch();
         pool.record_prepare_advertisement("late", true);
         assert_eq!(runs(), 1);
+        assert_eq!(pool.prepare_advertised_epoch(), before + 1);
         assert_eq!(pool.prepare_advertisement("late"), Some(true));
         pool.record_prepare_advertisement("late", false);
         assert_eq!(runs(), 1);

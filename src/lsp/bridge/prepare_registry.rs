@@ -834,6 +834,9 @@ async fn try_run(
     revision: i32,
     admitted: &(dyn Fn() -> bool + Sync),
 ) -> std::io::Result<std::io::Result<PreparedDocument>> {
+    // Read first: a candidate passed over below may start advertising before
+    // this attempt ends, whose answer as is would then be outdated.
+    let advertised_epoch = pool.prepare_advertised_epoch();
     let host_uri = match crate::lsp::lsp_impl::url_to_uri(&job.host_uri) {
         Ok(host_uri) => host_uri,
         Err(error) => return Ok(Err(std::io::Error::other(error.to_string()))),
@@ -925,6 +928,13 @@ async fn try_run(
                 )
             }),
         );
+    }
+    if pool.prepare_advertised_epoch() != advertised_epoch {
+        // No answer, retried: the hook that ran forgot answers as is before
+        // this one was in.
+        return Err(std::io::Error::other(
+            "a candidate started advertising the request while none was asked",
+        ));
     }
     Ok(Ok(PreparedDocument {
         text: job.virtual_text.clone(),
