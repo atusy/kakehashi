@@ -77,7 +77,8 @@ prepared.
 ```ts
 interface VirtualDocumentPrepareParams {
   // The virtual document as kakehashi built it; `version` increases with
-  // every request kakehashi sends, so a later request carries a later one.
+  // every request kakehashi makes (requests for different documents may
+  // still arrive in either order).
   textDocument: { uri: DocumentUri; languageId: string; version: integer };
   hostTextDocument: { uri: DocumentUri; languageId: string };
   segments: { type: "content" | "gap"; content: string }[];
