@@ -6180,13 +6180,22 @@ mod tests {
             create_handle_with_key(ConnectionState::Initializing, ConnectionKey::shared("lua"))
                 .await;
         pool.insert_connection(Arc::clone(&shared)).await;
-        // ...and it comes up Ready but incapable while wait_ready waits.
-        let shared_clone = Arc::clone(&shared);
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            shared_clone
-                .set_server_capabilities(tower_lsp_server::ls_types::ServerCapabilities::default());
-            shared_clone.set_state(ConnectionState::Ready);
+        // ...and it comes up Ready but incapable while wait_ready waits. The
+        // flip is spawned once routing has probed, so on this current-thread
+        // runtime it runs at the acquisition's first yield — the wait, after
+        // the acquire has already seen the connection Initializing. A flip
+        // landing before the acquire would be refused there instead, and
+        // this test would stop pinning the post-wait divert.
+        pool.set_after_resolve({
+            let shared = Arc::clone(&shared);
+            move || {
+                tokio::spawn(async move {
+                    shared.set_server_capabilities(
+                        tower_lsp_server::ls_types::ServerCapabilities::default(),
+                    );
+                    shared.set_state(ConnectionState::Ready);
+                });
+            }
         });
 
         let result = pool
