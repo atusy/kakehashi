@@ -584,6 +584,9 @@ fn insertion_point_prefixed(offset: &RegionOffset, region_end: Position, host_li
 fn snippet_expansion(snippet: &str) -> Option<String> {
     use std::collections::HashMap;
 
+    /// Placeholders nested deeper give no expansion.
+    const MAX_SNIPPET_NESTING: usize = 32;
+
     type Chars<'a> = std::iter::Peekable<std::str::Chars<'a>>;
 
     /// Read a tabstop number (digits only: `$0name` is tabstop 0, then
@@ -629,7 +632,14 @@ fn snippet_expansion(snippet: &str) -> Option<String> {
             })
         }
 
-        fn expand(&mut self, chars: &mut Chars<'_>, nested: bool) -> Option<String> {
+        /// `depth`: how many placeholders enclose `chars` (0 at the top).
+        fn expand(&mut self, chars: &mut Chars<'_>, depth: usize) -> Option<String> {
+            // Placeholders nested past any real snippet's depth: refused
+            // rather than recursed into (the snippet is the server's input).
+            if depth > MAX_SNIPPET_NESTING {
+                return None;
+            }
+            let nested = depth > 0;
             let mut out = String::new();
             while let Some(c) = chars.next() {
                 match c {
@@ -647,7 +657,7 @@ fn snippet_expansion(snippet: &str) -> Option<String> {
                             // A variable (or anything but a tabstop).
                             let number = tabstop(chars)?;
                             let default = match chars.next() {
-                                Some(':') => Some(self.expand(chars, true)?),
+                                Some(':') => Some(self.expand(chars, depth + 1)?),
                                 Some('|') => Some(choice(chars)),
                                 Some('}') => None,
                                 // A transform, or unterminated.
@@ -710,7 +720,7 @@ fn snippet_expansion(snippet: &str) -> Option<String> {
             mirrors: &mirrors,
             defaults: HashMap::new(),
         };
-        let out = pass.expand(&mut snippet.chars().peekable(), false)?;
+        let out = pass.expand(&mut snippet.chars().peekable(), 0)?;
         passes += 1;
         if pass.defaults == mirrors || passes > pass.defaults.len() {
             return Some(out);
@@ -1046,6 +1056,14 @@ mod tests {
         assert_eq!(expanded("${NAME:d}"), None);
         assert_eq!(expanded("${1/a/b/}"), None);
         assert_eq!(expanded("${1:x"), None);
+        // Nesting is bounded, not recursed into without limit.
+        assert_eq!(
+            expanded("${1:${2:${3:x}}}").as_deref(),
+            Some("x"),
+            "real snippets nest a few levels"
+        );
+        let deep = format!("{}x{}", "${1:".repeat(10_000), "}".repeat(10_000));
+        assert_eq!(expanded(&deep), None);
     }
 
     #[test]
