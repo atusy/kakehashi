@@ -2446,6 +2446,37 @@ mod tests {
     }
 
     #[test]
+    fn an_emptied_gaps_leading_lf_stays_hidden_beside_content_showing_one() {
+        // `a${\nx}\nb`, the gap emptied: P shows the content's LF after
+        // `a`, never the gap's, which a CR inserted before the gap would fuse
+        // with.
+        let virtual_text = "a\n \nb";
+        let layout = VirtualLayout::from_pieces(
+            virtual_text,
+            [
+                (SegmentKind::Content, 0..1, String::new()),
+                (SegmentKind::Gap, 1..3, "\nx".to_string()),
+                (SegmentKind::Content, 3..5, String::new()),
+            ],
+        );
+        let map = apply_prepare_result(
+            virtual_text,
+            &layout,
+            result(json!({"segments": [
+                {"type": "content"}, {"type": "gap", "content": ""}, {"type": "content"}
+            ]})),
+        )
+        .unwrap()
+        .map
+        .unwrap();
+        assert_eq!(map.prepared_text(), "a\nb");
+        assert_eq!(
+            map.map_edits(&[edit((0, 1), (0, 1), "\r")], EditMode::Extent),
+            None
+        );
+    }
+
+    #[test]
     fn edits_fusing_a_cr_and_lf_only_together_are_refused_together() {
         // A completion's main edit and an additional one: each alone leaves
         // a character between the hidden CR and the LF, together they leave
