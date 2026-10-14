@@ -260,24 +260,45 @@ pub(super) fn transform_completion_item(
         snippet && prefixed_at_insertion(host_line) && snippet_contains_variable(text)
     };
 
-    // The primary edit as the server sent it (the replace range of an
-    // insert/replace one): the additional edits are checked together with it
-    // below.
-    // Only a prepared document checks them together, and only when there are
-    // additional edits: the clone is per item, on the hottest response.
-    let primary = if offset.prepared().is_some() && item.additional_text_edits.is_some() {
-        item.text_edit.as_ref().map(|text_edit| match text_edit {
-            tower_lsp_server::ls_types::CompletionTextEdit::Edit(edit) => edit.clone(),
-            tower_lsp_server::ls_types::CompletionTextEdit::InsertAndReplace(edit) => {
-                tower_lsp_server::ls_types::TextEdit {
-                    range: edit.replace,
-                    new_text: edit.new_text.clone(),
+    // The primary edit as the client applies it — through either range of an
+    // insert/replace one, a snippet expanded — which the additional edits are
+    // checked together with below. Only a prepared document checks them
+    // together, and only when there are additional edits: the clones are per
+    // item, on the hottest response.
+    let primaries: Vec<tower_lsp_server::ls_types::TextEdit> =
+        if offset.prepared().is_some() && item.additional_text_edits.is_some() {
+            let applied = |new_text: &str| {
+                if snippet {
+                    snippet_expansion(new_text)
+                } else {
+                    new_text.to_string()
                 }
+            };
+            match &item.text_edit {
+                Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(edit)) => {
+                    vec![tower_lsp_server::ls_types::TextEdit {
+                        range: edit.range,
+                        new_text: applied(&edit.new_text),
+                    }]
+                }
+                Some(tower_lsp_server::ls_types::CompletionTextEdit::InsertAndReplace(edit)) => {
+                    let new_text = applied(&edit.new_text);
+                    vec![
+                        tower_lsp_server::ls_types::TextEdit {
+                            range: edit.insert,
+                            new_text: new_text.clone(),
+                        },
+                        tower_lsp_server::ls_types::TextEdit {
+                            range: edit.replace,
+                            new_text,
+                        },
+                    ]
+                }
+                None => Vec::new(),
             }
-        })
-    } else {
-        None
-    };
+        } else {
+            Vec::new()
+        };
 
     // A snippet's tabstops vanish when the client expands it, so the text
     // a prepared map checks must be the expansion too: `$0\n` reads as
@@ -390,17 +411,29 @@ pub(super) fn transform_completion_item(
             }
             true
         } else {
-            let set: Vec<_> = primary
-                .iter()
-                .cloned()
-                .chain(additional_edits.iter().cloned())
-                .collect();
-            match translate_virtual_text_edits_to_host(set, offset, EditMode::Extent) {
-                Some(mapped) => {
-                    *additional_edits = mapped
-                        .into_iter()
-                        .skip(usize::from(primary.is_some()))
-                        .collect();
+            // With each primary the client may apply; the additional edits
+            // map the same in every set (each edit maps on its own).
+            let sets: Vec<Option<Vec<_>>> = if primaries.is_empty() {
+                vec![translate_virtual_text_edits_to_host(
+                    additional_edits.clone(),
+                    offset,
+                    EditMode::Extent,
+                )]
+            } else {
+                primaries
+                    .iter()
+                    .map(|primary| {
+                        let set = std::iter::once(primary.clone())
+                            .chain(additional_edits.iter().cloned())
+                            .collect();
+                        translate_virtual_text_edits_to_host(set, offset, EditMode::Extent)
+                            .map(|mapped| mapped.into_iter().skip(1).collect())
+                    })
+                    .collect()
+            };
+            match sets.into_iter().collect::<Option<Vec<_>>>() {
+                Some(mut mapped) => {
+                    *additional_edits = mapped.swap_remove(0);
                     true
                 }
                 None => false,
@@ -934,6 +967,43 @@ mod tests {
         assert_eq!(snippet_expansion("cost: $"), "cost: $");
         assert_eq!(snippet_expansion("$0name\n"), "name\n");
         assert_eq!(snippet_expansion("${1}x$12y"), "xy");
+    }
+
+    #[test]
+    fn a_prepared_snippet_and_its_additional_edits_are_checked_as_expanded() {
+        use super::super::super::protocol::{VirtualLayout, apply_prepare_result};
+        // `\rab\n`, its lone-CR leading line deleted: replacing `a` with
+        // `$0` and deleting `b` leaves `$0\n` after the hidden CR, which
+        // expands to an LF fusing with it.
+        let result = serde_json::from_value(serde_json::json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared =
+            apply_prepare_result("\rab\n", &VirtualLayout::single("\rab\n"), Some(result)).unwrap();
+        let offset = RegionOffset::new(0, 0).with_prepared(prepared.map);
+        let mut item: tower_lsp_server::ls_types::CompletionItem = serde_json::from_value(
+            serde_json::json!({
+                "label": "x",
+                "insertTextFormat": 2,
+                "textEdit": {
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+                    "newText": "$0"
+                },
+                "additionalTextEdits": [{
+                    "range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 2}},
+                    "newText": ""
+                }]
+            }),
+        )
+        .unwrap();
+        assert!(transform_completion_item(
+            &mut item,
+            &offset,
+            Position::new(2, 0),
+            Some(Position::new(1, 1)),
+        ));
+        assert_eq!(item.additional_text_edits, None);
     }
 
     #[test]
