@@ -348,7 +348,9 @@ impl LanguageServerPool {
 
             // The open above may have sent newer cached text instead, or
             // the text may have changed since the wait.
-            if checks_held
+            // Read again: a prepared text may have been sent for the first
+            // time since the wait (a peer that started advertising).
+            if (checks_held || self.document_tracker.ever_held_prepared())
                 && !held_check.holds(
                     self.document_tracker
                         .held_text(&uri_string, connection_key)
