@@ -624,7 +624,13 @@ impl Kakehashi {
                     return;
                 }
                 let warnings = Self::misconfigured_settings_warnings(&settings);
-                self.apply_raw_settings_locked(&reload, raw, settings).await;
+                self.apply_raw_settings_locked(
+                    &reload,
+                    ReloadTrigger::Configuration,
+                    raw,
+                    settings,
+                )
+                .await;
                 drop(reload);
                 self.warn_on_misconfigured_settings(&warnings).await;
                 self.notifier().log_info(ingress.applied_message()).await;
