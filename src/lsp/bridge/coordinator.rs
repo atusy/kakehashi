@@ -881,17 +881,41 @@ impl BridgeCoordinator {
     }
 
     /// Whether the lifecycle pass prepares (or holds back for its peer) a
-    /// region's current document: coordinates kept from an earlier text of
-    /// it, unprepared or prepared differently (a resolve envelope's), no
-    /// longer describe it.
+    /// region's current document, or a server still holds a prepared text of
+    /// it: coordinates kept from an earlier text of it, unprepared or
+    /// prepared differently (a resolve envelope's), no longer describe what
+    /// its servers hold.
     pub(crate) fn region_is_prepared(
         &self,
         host_uri: &Url,
         injection_language: &str,
         region_id: &str,
     ) -> bool {
-        self.prepare
+        if self
+            .prepare
             .held_is_prepared(host_uri, injection_language, region_id)
+        {
+            return true;
+        }
+        // Right after its pair lost its peer, the registry has forgotten it
+        // while servers still hold its prepared text until the next send.
+        if !self.pool.ever_held_prepared() {
+            return false;
+        }
+        let Ok(host) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
+            return false;
+        };
+        let virtual_uri =
+            super::protocol::VirtualDocumentUri::new(&host, injection_language, region_id);
+        let uri = virtual_uri.to_uri_string();
+        self.pool
+            .get_all_connections_for_virtual_uri(&virtual_uri)
+            .iter()
+            .any(|connection| {
+                self.pool
+                    .held_text(&uri, connection)
+                    .is_some_and(|held| held.map.is_some())
+            })
     }
 
     /// Drop one region's prepared document (see
@@ -5138,6 +5162,43 @@ mod tests {
             vec!["harper-ls".to_string(), "rust-analyzer".to_string()],
             "both answer for rust, in the documented name-sorted order"
         );
+    }
+
+    #[tokio::test]
+    async fn a_region_reads_prepared_while_a_server_holds_its_prepared_text() {
+        use crate::lsp::bridge::protocol::{
+            VirtualDocumentUri, VirtualLayout, apply_prepare_result,
+        };
+        let coordinator = BridgeCoordinator::new();
+        let host = Url::parse("file:///doc.nix").unwrap();
+        let region = "01J0000000000000000000000A";
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host).unwrap(),
+            "json",
+            region,
+        );
+        let connection = ConnectionKey::for_server("jsonls");
+        coordinator
+            .register_opened_document_for_test(&host, &virtual_uri, &connection)
+            .await;
+        // The pair lost its peer: the registry knows nothing of the region,
+        // but the server still holds its prepared text until the next send.
+        let prepared = apply_prepare_result("x", &VirtualLayout::single("x"), None).unwrap();
+        coordinator
+            .record_sent_content_for_test(
+                &virtual_uri,
+                &connection,
+                crate::lsp::bridge::SentText {
+                    text: &prepared.text,
+                    map: prepared.map.as_ref(),
+                },
+            )
+            .await;
+        assert!(coordinator.region_is_prepared(&host, "json", region));
+        coordinator
+            .record_sent_content_for_test(&virtual_uri, &connection, "x")
+            .await;
+        assert!(!coordinator.region_is_prepared(&host, "json", region));
     }
 
     #[tokio::test]

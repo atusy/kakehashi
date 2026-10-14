@@ -2085,7 +2085,7 @@ impl LanguageServerPool {
     ///
     /// Used by did_change to forward notifications to every connection that has
     /// the document open, not just the first one found.
-    pub(super) fn get_all_connections_for_virtual_uri(
+    pub(in crate::lsp::bridge) fn get_all_connections_for_virtual_uri(
         &self,
         virtual_uri: &VirtualDocumentUri,
     ) -> Vec<ConnectionKey> {
