@@ -6314,7 +6314,10 @@ mod tests {
     /// connection for a root it does not already serve (#992) — the
     /// fast-fail path has no post-wait re-check of its own to catch it. The
     /// exemptions hold through the same window: the spawn root's own
-    /// document and a marker-less document stay aboard.
+    /// document and a marker-less document stay aboard. Only the fast-fail
+    /// cases discriminate the acquire-time refusal; the wait_ready cases are
+    /// parity pins (its post-wait re-check diverted here before), though
+    /// they alone exercise that path's retry of the refusal.
     #[rstest::rstest]
     #[case::fast_fail_unserved_root_diverts(false, Some(false), false)]
     #[case::wait_ready_unserved_root_diverts(true, Some(false), false)]
