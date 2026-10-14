@@ -73,8 +73,8 @@ prepared.
 
 ```ts
 interface VirtualDocumentPrepareParams {
-  // The virtual document as kakehashi built it; `version` increases
-  // whenever its text, segments or peer change, and is never reused.
+  // The virtual document as kakehashi built it; `version` increases with
+  // every request kakehashi sends, so a later request carries a later one.
   textDocument: { uri: DocumentUri; languageId: string; version: integer };
   hostTextDocument: { uri: DocumentUri; languageId: string };
   segments: { type: "content" | "gap"; content: string }[];
@@ -196,8 +196,9 @@ edit, and requests do not pile further attempts onto a backing-off one.
 
 ### Lifecycle
 
-The prepare request is made once per document version and its answer is
-shared by every downstream server and every translation path. `didChange`
+The prepare request is made for each input (the virtual text and its
+segments, under the pair's candidates) until it is answered, and its answer
+is shared by every downstream server and every translation path. `didChange`
 to downstream servers stays a full-text sync of the prepared document, so
 open and change need no separate hooks. While a version's answer is
 pending, the document is held: not opened or changed downstream, nor

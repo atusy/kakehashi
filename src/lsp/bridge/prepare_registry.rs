@@ -114,6 +114,9 @@ struct Cell {
     retry_at: std::sync::Mutex<Option<Instant>>,
     /// Bumped after every attempt, answered or not.
     attempts: tokio::sync::watch::Sender<u32>,
+    /// The `textDocument.version` of each attempt, in order.
+    #[cfg(test)]
+    versions: std::sync::Mutex<Vec<i32>>,
 }
 
 impl Cell {
@@ -153,12 +156,10 @@ impl Drop for AttemptEnd {
     }
 }
 
-/// One input's cell, under the `textDocument.version` the peer is asked it
-/// with.
+/// One input's cell.
 #[derive(Clone)]
 struct Slot {
     key: u64,
-    revision: i32,
     cell: Arc<Cell>,
 }
 
@@ -566,7 +567,6 @@ impl PrepareRegistry {
             Some(index) => region.slots.remove(index),
             None => Slot {
                 key,
-                revision: self.revision(),
                 cell: Arc::default(),
             },
         };
@@ -615,7 +615,15 @@ impl PrepareRegistry {
             input.region_id,
         );
         let key = slot.key;
-        let revision = slot.revision;
+        // Every request gets its own version, in the order they are sent: a
+        // retry after another input was asked (an undo while the first was
+        // backing off) must not go out with an older one.
+        let revision = self.revision();
+        #[cfg(test)]
+        cell.versions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(revision);
         let pool = Arc::clone(pool);
         let target = target.clone();
         let job = PrepareJob::from(input);
@@ -1300,28 +1308,24 @@ mod tests {
         assert_eq!(retry_delay(100), Duration::from_secs(60));
     }
 
-    #[test]
-    fn versions_are_never_reused() {
+    #[tokio::test]
+    async fn every_request_goes_out_with_a_newer_version() {
         let registry = PrepareRegistry::default();
+        let pool = Arc::new(LanguageServerPool::new());
         let target = unstartable_target();
         let host = Url::parse("file:///host.md").unwrap();
-        let slot = |text| {
-            registry
-                .slot(&target, input(&host, text), Holder::Request)
-                .unwrap()
-        };
-        let first = slot("a");
-        let same = slot("a");
-        assert!(Arc::ptr_eq(&first.cell, &same.cell));
-        assert_eq!(first.revision, same.revision);
-        let changed = slot("b");
-        assert!(changed.revision > first.revision);
-        registry.forget_region(&host, None, REGION);
-        assert!(registry.regions.is_empty());
-        assert!(
-            slot("b").revision > changed.revision,
-            "a forgotten document never repeats a version"
-        );
+        let mut asked = Vec::new();
+        for text in ["a", "b", "a"] {
+            let slot = registry
+                .slot(&target, input(&host, text), Holder::LifecyclePass)
+                .unwrap();
+            let _ = registry.prepare(&pool, &target, input(&host, text)).await;
+            asked.extend(slot.cell.versions.lock().unwrap().drain(..));
+            // Asked again from scratch, as after a settings change.
+            registry.forget_region(&host, None, REGION);
+        }
+        assert_eq!(asked.len(), 3);
+        assert!(asked.windows(2).all(|pair| pair[0] < pair[1]), "{asked:?}");
     }
 
     #[test]
