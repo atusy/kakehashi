@@ -631,9 +631,11 @@ impl PrepareRegistry {
             input.region_id,
         );
         let key = slot.key;
-        // Every request gets its own version, in the order they are sent: a
-        // retry after another input was asked (an undo while the first was
-        // backing off) must not go out with an older one.
+        // Every attempt takes the next version when it starts: a retry after
+        // another input was asked (an undo while the first was backing off)
+        // must not reuse an older one. (Attempts for different inputs run on
+        // their own tasks, so two started together may still reach the peer
+        // in either order.)
         let revision = self.revision();
         #[cfg(test)]
         cell.versions
@@ -798,8 +800,9 @@ async fn run(
             Ok(None)
         }
         Err(unanswered) => {
-            // A revoked attempt (its host closed, or a settings change
-            // dropped its pair) is no failure worth a warning.
+            // A revoked attempt (its host closed, a settings change dropped
+            // its pair, the pair lost its peer, or its input was evicted or
+            // replaced meanwhile) is no failure worth a warning.
             if admitted() {
                 log_failure(&unanswered);
             } else {
@@ -872,12 +875,13 @@ async fn try_run(
             // Advertising nothing until a handshake says otherwise, so later
             // inputs are not held back to start it again.
             Err(error) => {
-                // Its pairs go out unprepared from now on, until its handshake
-                // advertises the request: worth seeing at the default level.
-                // Recorded below, it is not started again per input.
+                // Passed over from now on, until its handshake advertises the
+                // request (its pairs go out as is unless a later candidate
+                // prepares them): worth seeing at the default level. Recorded
+                // below, it is not started again per input.
                 log::warn!(
                     target: "kakehashi::bridge::prepare",
-                    "Prepare candidate {} for {} did not start; sending its documents as is: {}",
+                    "Prepare candidate {} for {} did not start; passing it over: {}",
                     escape_terminal_controls(name),
                     job.host_uri,
                     escape_terminal_controls(&error.to_string()),
