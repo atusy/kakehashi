@@ -3222,13 +3222,16 @@ impl LanguageServerPool {
             )
             .await
         {
-            // Routing chose the shared instance and it withdrew folder-change
-            // support before this root was announced (#968), or came up
-            // without it after routing probed it (#992). Re-resolving now
-            // diverts the root; do it here rather than fail an acquisition a
-            // one-shot caller (eager didOpen) would not repeat. Once: the
-            // retry routes to the per-root key, which is never refused, and a
-            // second withdrawal needs a second registration in between.
+            // Routing chose the shared instance, and by the time it was
+            // acquired or announced the instance lacked folder-change support
+            // for this root: it came up without it after routing probed it
+            // (#992), or withdrew it before the root was announced (#968).
+            // Re-resolving now diverts the root; do it here rather than fail
+            // an acquisition a one-shot caller (eager didOpen) would not
+            // repeat. Once: the retry normally routes to the per-root key,
+            // which is never refused; one that routes back to the shared key
+            // and is refused again needs a registration (then a withdrawal)
+            // or a respawn in between.
             Err(error) if BridgeError::reroutes(&error) => {
                 self.get_or_create_connection_wait_ready_once(
                     server_name,
