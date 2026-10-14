@@ -114,6 +114,10 @@ pub(crate) struct Resync {
 /// The answer for one input, and the attempts to get it.
 #[derive(Default)]
 struct Cell {
+    /// Its answer was found outdated (an advertisement or runtime settings
+    /// changed): a request still holding it, waiting or not, takes it as
+    /// no answer.
+    revoked: AtomicBool,
     /// Where the input was first looked up in the presentation order (see
     /// `protocol::next_presentation`): an answer to it is as new as its
     /// virtual text, not as the moment it came.
@@ -135,6 +139,9 @@ struct Cell {
 
 impl Cell {
     fn lookup(&self) -> Option<PrepareLookup> {
+        if self.revoked.load(Ordering::Acquire) {
+            return None;
+        }
         self.outcome.get().map(|outcome| match outcome {
             Some(prepared) => PrepareLookup::Ready(Arc::clone(prepared)),
             None => PrepareLookup::Failed,
@@ -142,6 +149,9 @@ impl Cell {
     }
 
     fn settled(&self) -> Result<Arc<PreparedDocument>, PrepareMiss> {
+        if self.revoked.load(Ordering::Acquire) {
+            return Err(PrepareMiss::Unanswered);
+        }
         match self.outcome.get() {
             Some(Some(prepared)) => Ok(Arc::clone(prepared)),
             Some(None) => Err(PrepareMiss::Failed),
@@ -481,9 +491,13 @@ impl PrepareRegistry {
         let regions = Arc::clone(&self.regions);
         move || {
             for mut region in regions.iter_mut() {
-                region
-                    .slots
-                    .retain(|slot| slot.cell.outcome.get().is_none());
+                region.slots.retain(|slot| {
+                    let settled = slot.cell.outcome.get().is_some();
+                    if settled {
+                        slot.cell.revoked.store(true, Ordering::Release);
+                    }
+                    !settled
+                });
             }
         }
     }
@@ -731,6 +745,8 @@ impl PrepareRegistry {
                     // host again if it holds the document on it (the hook's
                     // own pass may have found it still in flight).
                     if pool.prepare_advertised_epoch() != advertised_epoch {
+                        // Before the attempt's end wakes those waiting on it.
+                        cell.revoked.store(true, Ordering::Release);
                         if let Some(mut region) = regions.get_mut(&region) {
                             region.slots.retain(|slot| !Arc::ptr_eq(&slot.cell, &cell));
                         }
@@ -1784,6 +1800,9 @@ mod tests {
         assert!(!Arc::ptr_eq(&failed, &fresh), "a final failure goes");
         let kept = cell(&registry, &target, input(&host, "c"), Holder::Request);
         assert!(Arc::ptr_eq(&pending, &kept), "an attempt in flight stays");
+        // A request still holding a forgotten answer takes it as none.
+        assert_eq!(as_is.settled().err(), Some(PrepareMiss::Unanswered));
+        assert!(as_is.lookup().is_none());
     }
 
     #[test]
