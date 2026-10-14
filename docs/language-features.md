@@ -232,9 +232,10 @@ comment, leaving `// ` in the host:
 // {"a":1,"b":2}
 ```
 
-The sequential pipeline (`strategy = "concatenated"`) can format this
-one-line region into several lines. The `// ` stays outside the replaced text,
-in front of the first line only. It is not copied to the new lines:
+The sequential formatter pipeline described above
+(`strategy = "concatenated"` in `bridge.<lang>.aggregation`, not in
+`layers.aggregation`) can format this one-line region into several lines. The
+`// ` stays outside the replaced text, in front of the first line only. It is not copied to the new lines:
 
 ```rust
 // {
@@ -259,12 +260,13 @@ repeat that text on lines the formatter adds. The pipeline repeats left-out
 text only when it holds nothing but `>` markers and indentation, as a
 blockquote's line prefix does.
 
-Under the default `preferred` strategy, and for range and on-type formatting,
-an answer that adds line breaks to this region is dropped whole, like one that
-breaks a `> ` prefix, and the line is left as it was: the region ends on the
-line it starts on, so a line break would split that host line. This guard does not cover a region that
-also takes its line break, such as the text of a Rust `///` doc comment. There
-every strategy applies the answer, and the new lines lack the `///` too.
+Under the default `preferred` server strategy, and for range and on-type
+formatting, an answer that adds line breaks to this region is dropped whole,
+like one that breaks a `> ` prefix, and the line is left as it was: the region
+ends on the line it starts on, so a line break would split that host line.
+This guard does not cover a region that also takes its line break, such as the
+text of a Rust `///` doc comment. There every strategy applies the answer, and
+the new lines lack the `///` too.
 
 This differs from a fenced code block inside a Markdown blockquote. There the
 text before each line holds only `>` markers and indentation, so the sequential
