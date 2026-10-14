@@ -1706,13 +1706,13 @@ mod tests {
     /// The edit-mapping entry points the tests below read best through.
     impl PreparedMap {
         /// One edit keeping its extent.
-        fn edit_to_virtual(&self, edit: &TextEdit) -> Option<TextEdit> {
+        fn map_one_with_extent(&self, edit: &TextEdit) -> Option<TextEdit> {
             self.map_edits(std::slice::from_ref(edit), EditMode::Extent)
                 .map(|mut edits| edits.remove(0))
         }
 
         /// A formatter's answer.
-        fn edits_to_virtual(&self, edits: &[TextEdit]) -> Option<Vec<TextEdit>> {
+        fn map_formatting(&self, edits: &[TextEdit]) -> Option<Vec<TextEdit>> {
             self.map_edits(edits, EditMode::Formatting)
         }
     }
@@ -1815,16 +1815,19 @@ mod tests {
             .unwrap();
             let map = prepared.map.unwrap();
             // Joining `foo()` onto the closing fence.
-            assert_eq!(map.edit_to_virtual(&edit((0, 5), (1, 0), "")), None);
-            assert_eq!(map.edits_to_virtual(&[edit((0, 5), (1, 0), "")]), None);
-            assert_eq!(map.edit_to_virtual(&edit((0, 5), (1, 0), ";")), None);
+            assert_eq!(map.map_one_with_extent(&edit((0, 5), (1, 0), "")), None);
+            assert_eq!(map.map_formatting(&[edit((0, 5), (1, 0), "")]), None);
+            assert_eq!(map.map_one_with_extent(&edit((0, 5), (1, 0), ";")), None);
             // Whole lines, or text ending with a line break, keep it.
-            assert!(map.edit_to_virtual(&edit((0, 0), (1, 0), "")).is_some());
+            assert!(map.map_one_with_extent(&edit((0, 0), (1, 0), "")).is_some());
             assert!(
-                map.edit_to_virtual(&edit((0, 0), (1, 0), "baz()\n"))
+                map.map_one_with_extent(&edit((0, 0), (1, 0), "baz()\n"))
                     .is_some()
             );
-            assert!(map.edit_to_virtual(&edit((0, 5), (0, 5), ";")).is_some());
+            assert!(
+                map.map_one_with_extent(&edit((0, 5), (0, 5), ";"))
+                    .is_some()
+            );
         }
     }
 
@@ -1948,7 +1951,7 @@ mod tests {
         let prepared = apply_prepare_result(&virtual_text, &layout, None).unwrap();
         assert_eq!(prepared.text, virtual_text);
         let map = prepared.map.expect("gaps stay protected");
-        assert_eq!(map.edits_to_virtual(&[edit((0, 5), (0, 6), "1")]), None);
+        assert_eq!(map.map_formatting(&[edit((0, 5), (0, 6), "1")]), None);
     }
 
     #[test]
@@ -2123,17 +2126,21 @@ mod tests {
         let (virtual_text, prepared) = trailing_blank_dedented();
         let map = prepared.map.unwrap();
         let formatted = map
-            .edits_to_virtual(&[edit((0, 0), (1, 0), "if a:\n  b\n")])
+            .map_formatting(&[edit((0, 0), (1, 0), "if a:\n  b\n")])
             .unwrap();
         assert_eq!(
             apply_to(&virtual_text, &formatted),
             "  if a:\n    b\n  \n\n"
         );
         // A change reaching P's end stops before the deleted lines.
-        let changed = map.edit_to_virtual(&edit((0, 0), (1, 0), "b\n")).unwrap();
+        let changed = map
+            .map_one_with_extent(&edit((0, 0), (1, 0), "b\n"))
+            .unwrap();
         assert_eq!(apply_to(&virtual_text, &[changed]), "  b\n  \n\n");
         // An append at P's end goes before them, indented.
-        let appended = map.edit_to_virtual(&edit((1, 0), (1, 0), "c\n")).unwrap();
+        let appended = map
+            .map_one_with_extent(&edit((1, 0), (1, 0), "c\n"))
+            .unwrap();
         assert_eq!(apply_to(&virtual_text, &[appended]), "  a\n  c\n  \n\n");
     }
 
@@ -2155,7 +2162,9 @@ mod tests {
         .unwrap();
         assert_eq!(prepared.text, "a\n");
         let map = prepared.map.unwrap();
-        let changed = map.edit_to_virtual(&edit((0, 0), (1, 0), "b\n")).unwrap();
+        let changed = map
+            .map_one_with_extent(&edit((0, 0), (1, 0), "b\n"))
+            .unwrap();
         assert_eq!(apply_to(&virtual_text, &[changed]), "  b\n\n  ");
     }
 
@@ -2192,11 +2201,11 @@ mod tests {
         .unwrap();
         assert_eq!(prepared.text, "a\n");
         let map = prepared.map.unwrap();
-        let appended = map.edit_to_virtual(&edit((1, 0), (1, 0), "b\n")).unwrap();
-        assert_eq!(apply_to(&virtual_text, &[appended]), "  a\n  b\n   \n  ");
         let appended = map
-            .edits_to_virtual(&[edit((1, 0), (1, 0), "b\n")])
+            .map_one_with_extent(&edit((1, 0), (1, 0), "b\n"))
             .unwrap();
+        assert_eq!(apply_to(&virtual_text, &[appended]), "  a\n  b\n   \n  ");
+        let appended = map.map_formatting(&[edit((1, 0), (1, 0), "b\n")]).unwrap();
         assert_eq!(apply_to(&virtual_text, &appended), "  a\n  b\n   \n  ");
     }
 
@@ -2220,7 +2229,7 @@ mod tests {
         assert_eq!(prepared.text, "a\n");
         let map = prepared.map.unwrap();
         let formatted = map
-            .edits_to_virtual(&[edit((0, 0), (1, 0), "a\nb\n")])
+            .map_formatting(&[edit((0, 0), (1, 0), "a\nb\n")])
             .unwrap();
         assert_eq!(apply_to(&virtual_text, &formatted), "\n    a\n    b\n\n  ");
         // Without a dedent, a new line gains none either.
@@ -2235,7 +2244,9 @@ mod tests {
         )
         .unwrap();
         let map = prepared.map.unwrap();
-        let appended = map.edit_to_virtual(&edit((1, 0), (1, 0), "b\n")).unwrap();
+        let appended = map
+            .map_one_with_extent(&edit((1, 0), (1, 0), "b\n"))
+            .unwrap();
         assert_eq!(apply_to(&virtual_text, &[appended]), "  a\nb\n\n\t\t");
     }
 
@@ -2254,7 +2265,7 @@ mod tests {
         .unwrap();
         let map = prepared.map.unwrap();
         let formatted = map
-            .edits_to_virtual(&[edit((0, 0), (0, 0), "if True:\n  pass\nprint(1)")])
+            .map_formatting(&[edit((0, 0), (0, 0), "if True:\n  pass\nprint(1)")])
             .unwrap();
         assert_eq!(
             apply_to(&virtual_text, &formatted),
@@ -2283,16 +2294,18 @@ mod tests {
             edit((1, 0), (1, 0), "hello\nEOF"),
             edit((0, 0), (1, 0), "x"),
         ] {
-            assert_eq!(map.edit_to_virtual(&refused), None, "{refused:?}");
-            assert_eq!(map.edits_to_virtual(&[refused]), None);
+            assert_eq!(map.map_one_with_extent(&refused), None, "{refused:?}");
+            assert_eq!(map.map_formatting(&[refused]), None);
         }
         // Ending its line, or deleting whole lines, is fine.
-        let appended = map.edit_to_virtual(&edit((1, 0), (1, 0), "EOF\n")).unwrap();
+        let appended = map
+            .map_one_with_extent(&edit((1, 0), (1, 0), "EOF\n"))
+            .unwrap();
         assert_eq!(
             apply_to(&virtual_text, &[appended]),
             "  cat <<'EOF'\n  EOF\n  \n\n"
         );
-        let deleted = map.edit_to_virtual(&edit((0, 0), (1, 0), "")).unwrap();
+        let deleted = map.map_one_with_extent(&edit((0, 0), (1, 0), "")).unwrap();
         assert_eq!(apply_to(&virtual_text, &[deleted]), "  \n\n");
     }
 
@@ -2324,7 +2337,9 @@ mod tests {
         .unwrap();
         assert_eq!(prepared.text, "ax\n");
         let map = prepared.map.unwrap();
-        let appended = map.edit_to_virtual(&edit((1, 0), (1, 0), "b\n")).unwrap();
+        let appended = map
+            .map_one_with_extent(&edit((1, 0), (1, 0), "b\n"))
+            .unwrap();
         assert_eq!(apply_to(&virtual_text, &[appended]), "a    \nb\n\n  ");
     }
 
@@ -2347,24 +2362,26 @@ mod tests {
             "a\n\n",
             json!([{"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""}]),
         );
-        assert_eq!(map.edit_to_virtual(&edit((1, 0), (1, 0), "b\r")), None);
-        assert_eq!(map.edits_to_virtual(&[edit((1, 0), (1, 0), "b\r")]), None);
+        assert_eq!(map.map_one_with_extent(&edit((1, 0), (1, 0), "b\r")), None);
+        assert_eq!(map.map_formatting(&[edit((1, 0), (1, 0), "b\r")]), None);
         let map = prepare(
             "\ra",
             json!([{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""}]),
         );
-        assert_eq!(map.edit_to_virtual(&edit((0, 0), (0, 0), "\nb")), None);
-        assert_eq!(map.edits_to_virtual(&[edit((0, 0), (0, 0), "\nb")]), None);
+        assert_eq!(map.map_one_with_extent(&edit((0, 0), (0, 0), "\nb")), None);
+        assert_eq!(map.map_formatting(&[edit((0, 0), (0, 0), "\nb")]), None);
         // Deleting what keeps a hidden CR from a visible LF fuses them too.
         let map = prepare(
             "\ra\n",
             json!([{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""}]),
         );
-        assert_eq!(map.edit_to_virtual(&edit((0, 0), (0, 1), "")), None);
-        assert_eq!(map.edits_to_virtual(&[edit((0, 0), (0, 1), "")]), None);
+        assert_eq!(map.map_one_with_extent(&edit((0, 0), (0, 1), "")), None);
+        assert_eq!(map.map_formatting(&[edit((0, 0), (0, 1), "")]), None);
         // A CRLF the edit makes from line breaks P has is the edit's own.
         let map = prepare("a\n", json!([]));
-        let crlf = map.edit_to_virtual(&edit((0, 1), (0, 1), "\r")).unwrap();
+        let crlf = map
+            .map_one_with_extent(&edit((0, 1), (0, 1), "\r"))
+            .unwrap();
         assert_eq!(apply_to("a\n", &[crlf]), "a\r\n");
     }
 
@@ -2510,7 +2527,7 @@ mod tests {
         .unwrap();
         let map = prepared.map.unwrap();
         let edits = map
-            .edits_to_virtual(&[edit((3, 0), (3, 0), "if True:\n  pass\nprint(1)")])
+            .map_formatting(&[edit((3, 0), (3, 0), "if True:\n  pass\nprint(1)")])
             .unwrap();
         assert_eq!(
             apply_to(&virtual_text, &edits),
@@ -2540,7 +2557,7 @@ mod tests {
         .unwrap();
         let map = prepared.map.unwrap();
         let edits = map
-            .edits_to_virtual(&[edit((4, 0), (4, 0), "if True:\n  pass\nprint(1)")])
+            .map_formatting(&[edit((4, 0), (4, 0), "if True:\n  pass\nprint(1)")])
             .unwrap();
         assert_eq!(
             apply_to(&virtual_text, &edits),
@@ -2656,16 +2673,16 @@ mod tests {
         // A formatter's whole-document answer re-indents under the host's
         // line break.
         let formatted = map
-            .edits_to_virtual(&[edit((0, 0), (2, 0), "if a:\n  b\n")])
+            .map_formatting(&[edit((0, 0), (2, 0), "if a:\n  b\n")])
             .unwrap();
         assert_eq!(apply_to(&virtual_text, &formatted), "\n  if a:\n    b\n");
         // Replacing P's whole first line restores that line's indent only.
-        let replaced = map
-            .edits_to_virtual(&[edit((0, 0), (1, 0), "c\n")])
-            .unwrap();
+        let replaced = map.map_formatting(&[edit((0, 0), (1, 0), "c\n")]).unwrap();
         assert_eq!(apply_to(&virtual_text, &replaced), "\n  c\n  b\n");
         // A line inserted before P's first goes after the deleted line.
-        let inserted = map.edit_to_virtual(&edit((0, 0), (0, 0), "z\n")).unwrap();
+        let inserted = map
+            .map_one_with_extent(&edit((0, 0), (0, 0), "z\n"))
+            .unwrap();
         assert_eq!(apply_to(&virtual_text, &[inserted]), "\n  z\n  a\n  b\n");
     }
 
@@ -2758,7 +2775,7 @@ mod tests {
             // A line added at P's end lands before the deleted line,
             // indented: both need the line break recognized as one.
             let formatted = map
-                .edits_to_virtual(&[edit((0, 0), (2, 0), &format!("a{eol}b{eol}c{eol}"))])
+                .map_formatting(&[edit((0, 0), (2, 0), &format!("a{eol}b{eol}c{eol}"))])
                 .unwrap();
             assert_eq!(
                 apply_to(&virtual_text, &formatted),
@@ -2825,7 +2842,9 @@ mod tests {
         assert_eq!(prepared.text, "");
         let map = prepared.map.unwrap();
         assert_eq!(map.to_virtual(pos(0, 0), Bias::Start), pos(1, 0));
-        let inserted = map.edit_to_virtual(&edit((0, 0), (0, 0), "x\n")).unwrap();
+        let inserted = map
+            .map_one_with_extent(&edit((0, 0), (0, 0), "x\n"))
+            .unwrap();
         assert_eq!(apply_to(&virtual_text, &[inserted]), "\nx\n");
     }
 
@@ -3069,7 +3088,7 @@ mod tests {
         let map = prepared.map.unwrap();
         // A formatter rewrites P wholesale, adding a statement.
         let edits = [edit((0, 0), (2, 0), "if x:\n  y\n  z\n")];
-        let virtual_edits = map.edits_to_virtual(&edits).unwrap();
+        let virtual_edits = map.map_formatting(&edits).unwrap();
         assert_eq!(
             apply_to(&virtual_text, &virtual_edits),
             "  if x:\n    y\n    z\n"
@@ -3081,7 +3100,7 @@ mod tests {
         let (virtual_text, prepared) = dedented();
         let map = prepared.map.unwrap();
         let edits = [edit((0, 5), (1, 0), " ")];
-        let virtual_edits = map.edits_to_virtual(&edits).unwrap();
+        let virtual_edits = map.map_formatting(&edits).unwrap();
         assert_eq!(apply_to(&virtual_text, &virtual_edits), "  if x:   y\n");
     }
 
@@ -3089,7 +3108,7 @@ mod tests {
     fn edit_indenting_a_line_keeps_the_host_indent() {
         let (virtual_text, prepared) = dedented();
         let map = prepared.map.unwrap();
-        let virtual_edits = map.edits_to_virtual(&[edit((1, 0), (1, 0), "  ")]).unwrap();
+        let virtual_edits = map.map_formatting(&[edit((1, 0), (1, 0), "  ")]).unwrap();
         assert_eq!(
             apply_to(&virtual_text, &virtual_edits),
             "  if x:\n      y\n"
@@ -3108,16 +3127,16 @@ mod tests {
         let map = prepared.map.unwrap();
         // `x = None` → `x=None`: the change is in content before the gap.
         let virtual_edits = map
-            .edits_to_virtual(&[edit((0, 0), (2, 0), "x=None\nprint(x)\n")])
+            .map_formatting(&[edit((0, 0), (2, 0), "x=None\nprint(x)\n")])
             .unwrap();
         assert_eq!(
             apply_to(&virtual_text, &virtual_edits),
             "x=    \nprint(x)\n"
         );
         // Touching the placeholder would edit host-owned text.
-        assert_eq!(map.edits_to_virtual(&[edit((0, 4), (0, 8), "1")]), None);
+        assert_eq!(map.map_formatting(&[edit((0, 4), (0, 8), "1")]), None);
         assert_eq!(
-            map.edits_to_virtual(&[edit((0, 0), (2, 0), "x = 1\nprint(x)\n")]),
+            map.map_formatting(&[edit((0, 0), (2, 0), "x = 1\nprint(x)\n")]),
             None
         );
     }
@@ -3127,10 +3146,14 @@ mod tests {
         let (virtual_text, prepared) = dedented();
         let map = prepared.map.unwrap();
         // A completion replacing `y` (P line 1, columns 2..3) keeps its range.
-        let completed = map.edit_to_virtual(&edit((1, 2), (1, 3), "yes")).unwrap();
+        let completed = map
+            .map_one_with_extent(&edit((1, 2), (1, 3), "yes"))
+            .unwrap();
         assert_eq!(completed.range, LspRange::new(pos(1, 4), pos(1, 5)));
         // An inserted block gains the host indent on each new line.
-        let inserted = map.edit_to_virtual(&edit((1, 3), (1, 3), "\n  z")).unwrap();
+        let inserted = map
+            .map_one_with_extent(&edit((1, 3), (1, 3), "\n  z"))
+            .unwrap();
         assert_eq!(
             apply_to(&virtual_text, &[inserted]),
             "  if x:\n    y\n    z\n"
@@ -3165,20 +3188,18 @@ mod tests {
     fn a_change_before_an_emptied_gap_keeps_the_gap() {
         let (virtual_text, map) = emptied_gap();
         // Deleting `b` must not reach over the gap's host text.
-        let deleted = map.edit_to_virtual(&edit((0, 1), (0, 2), "")).unwrap();
+        let deleted = map.map_one_with_extent(&edit((0, 1), (0, 2), "")).unwrap();
         assert_eq!(apply_to(&virtual_text, &[deleted]), "a    cd");
-        let formatted = map
-            .edits_to_virtual(&[edit((0, 0), (0, 4), "aBcd")])
-            .unwrap();
+        let formatted = map.map_formatting(&[edit((0, 0), (0, 4), "aBcd")]).unwrap();
         assert_eq!(apply_to(&virtual_text, &formatted), "aB    cd");
         // A range ending there stops before the gap too…
         assert_eq!(map.to_virtual(pos(0, 2), Bias::End), pos(0, 2));
         // …while an insertion there stays an insertion, before the gap too.
-        let inserted = map.edit_to_virtual(&edit((0, 2), (0, 2), "!")).unwrap();
+        let inserted = map.map_one_with_extent(&edit((0, 2), (0, 2), "!")).unwrap();
         assert_eq!(inserted.range.start, inserted.range.end);
         assert_eq!(apply_to(&virtual_text, &[inserted]), "ab!    cd");
         let formatted = map
-            .edits_to_virtual(&[edit((0, 0), (0, 4), "ab;cd")])
+            .map_formatting(&[edit((0, 0), (0, 4), "ab;cd")])
             .unwrap();
         assert_eq!(apply_to(&virtual_text, &formatted), "ab;    cd");
     }
@@ -3216,10 +3237,10 @@ mod tests {
         )
         .unwrap();
         let map = prepared.map.unwrap();
-        let replaced = map.edit_to_virtual(&edit((1, 0), (1, 1), "B")).unwrap();
+        let replaced = map.map_one_with_extent(&edit((1, 0), (1, 1), "B")).unwrap();
         assert_eq!(apply_to(virtual_text, &[replaced]), "  a\nB\n");
         let formatted = map
-            .edits_to_virtual(&[edit((0, 0), (2, 0), "a\nB\n")])
+            .map_formatting(&[edit((0, 0), (2, 0), "a\nB\n")])
             .unwrap();
         assert_eq!(apply_to(virtual_text, &formatted), "  a\nB\n");
     }
@@ -3229,8 +3250,12 @@ mod tests {
         let (virtual_text, prepared) = dedented();
         let map = prepared.map.unwrap();
         // A completion's replace range over `if` (insert range empty there).
-        let replaced = map.edit_to_virtual(&edit((0, 0), (0, 2), "while")).unwrap();
-        let inserted = map.edit_to_virtual(&edit((0, 0), (0, 0), "while")).unwrap();
+        let replaced = map
+            .map_one_with_extent(&edit((0, 0), (0, 2), "while"))
+            .unwrap();
+        let inserted = map
+            .map_one_with_extent(&edit((0, 0), (0, 0), "while"))
+            .unwrap();
         assert_eq!(replaced.new_text, inserted.new_text);
         assert_eq!(replaced.range.start, inserted.range.start);
         assert_eq!(apply_to(&virtual_text, &[replaced]), "  while x:\n    y\n");
@@ -3251,11 +3276,9 @@ mod tests {
         .unwrap();
         assert_eq!(prepared.text, "a\n");
         let map = prepared.map.unwrap();
-        let inserted = map.edit_to_virtual(&edit((1, 0), (1, 0), "b")).unwrap();
+        let inserted = map.map_one_with_extent(&edit((1, 0), (1, 0), "b")).unwrap();
         assert_eq!(apply_to(virtual_text, &[inserted]), "  a\n  b");
-        let formatted = map
-            .edits_to_virtual(&[edit((0, 0), (1, 0), "a\nb")])
-            .unwrap();
+        let formatted = map.map_formatting(&[edit((0, 0), (1, 0), "a\nb")]).unwrap();
         assert_eq!(apply_to(virtual_text, &formatted), "  a\n  b");
     }
 
@@ -3264,7 +3287,7 @@ mod tests {
         let virtual_text = "  a\r\n  b\r\n";
         let map = dedent_all(virtual_text, "  ");
         let formatted = map
-            .edits_to_virtual(&[edit((0, 0), (2, 0), "a\nb\n")])
+            .map_formatting(&[edit((0, 0), (2, 0), "a\nb\n")])
             .unwrap();
         assert_eq!(apply_to(virtual_text, &formatted), "  a\n  b\n");
     }
@@ -3284,7 +3307,7 @@ mod tests {
         )
         .unwrap();
         let map = prepared.map.unwrap();
-        let removed = map.edit_to_virtual(&edit((0, 0), (1, 0), "")).unwrap();
+        let removed = map.map_one_with_extent(&edit((0, 0), (1, 0), "")).unwrap();
         assert_eq!(apply_to(virtual_text, &[removed]), "    b\n");
     }
 
@@ -3293,10 +3316,12 @@ mod tests {
         let imports = "  import os\n  x = 1\n";
         let map = dedent_by_two(imports);
         let formatted = map
-            .edits_to_virtual(&[edit((0, 0), (2, 0), "import os\n\n\nx = 1\n")])
+            .map_formatting(&[edit((0, 0), (2, 0), "import os\n\n\nx = 1\n")])
             .unwrap();
         assert_eq!(apply_to(imports, &formatted), "  import os\n\n\n  x = 1\n");
-        let inserted = map.edit_to_virtual(&edit((1, 0), (1, 0), "\n")).unwrap();
+        let inserted = map
+            .map_one_with_extent(&edit((1, 0), (1, 0), "\n"))
+            .unwrap();
         assert_eq!(apply_to(imports, &[inserted]), "  import os\n\n  x = 1\n");
     }
 
@@ -3314,10 +3339,12 @@ mod tests {
         )
         .unwrap();
         let map = prepared.map.unwrap();
-        let inserted = map.edit_to_virtual(&edit((1, 0), (1, 0), "x\n")).unwrap();
+        let inserted = map
+            .map_one_with_extent(&edit((1, 0), (1, 0), "x\n"))
+            .unwrap();
         assert_eq!(apply_to(virtual_text, &[inserted]), "  a\n  x\nb\n");
         let formatted = map
-            .edits_to_virtual(&[edit((0, 0), (2, 0), "a\n\nb\n")])
+            .map_formatting(&[edit((0, 0), (2, 0), "a\n\nb\n")])
             .unwrap();
         assert_eq!(apply_to(virtual_text, &formatted), "  a\n\nb\n");
     }
@@ -3444,7 +3471,7 @@ mod tests {
                 new_text: formatted.clone(),
             };
             let edits = map
-                .edits_to_virtual(&[whole])
+                .map_formatting(&[whole])
                 .unwrap_or_else(|| panic!("refused: {virtual_text:?} → {formatted:?}"));
             assert_eq!(
                 apply_to(&virtual_text, &edits),
@@ -3458,17 +3485,19 @@ mod tests {
     fn removing_a_line_keeps_the_next_lines_indent_once() {
         let virtual_text = "  a\n  b\n";
         let map = dedent_by_two(virtual_text);
-        let removed = map.edit_to_virtual(&edit((0, 0), (1, 0), "")).unwrap();
+        let removed = map.map_one_with_extent(&edit((0, 0), (1, 0), "")).unwrap();
         assert_eq!(apply_to(virtual_text, &[removed]), "  b\n");
-        let replaced = map.edit_to_virtual(&edit((0, 0), (1, 0), "x\n")).unwrap();
+        let replaced = map
+            .map_one_with_extent(&edit((0, 0), (1, 0), "x\n"))
+            .unwrap();
         assert_eq!(apply_to(virtual_text, &[replaced]), "  x\n  b\n");
 
         let imports = "  import os\n  import sys\n\n\n\n  x = 1\n";
         let map = dedent_by_two(imports);
-        let fixed = map.edit_to_virtual(&edit((0, 0), (1, 0), "")).unwrap();
+        let fixed = map.map_one_with_extent(&edit((0, 0), (1, 0), "")).unwrap();
         assert_eq!(apply_to(imports, &[fixed]), "  import sys\n\n\n\n  x = 1\n");
         let formatted = map
-            .edits_to_virtual(&[edit((0, 0), (6, 0), "import os\nimport sys\n\nx = 1\n")])
+            .map_formatting(&[edit((0, 0), (6, 0), "import os\nimport sys\n\nx = 1\n")])
             .unwrap();
         assert_eq!(
             apply_to(imports, &formatted),
@@ -3477,7 +3506,7 @@ mod tests {
 
         let blank = "  a\n\n  b\n";
         let map = dedent_by_two(blank);
-        let removed = map.edit_to_virtual(&edit((1, 0), (2, 0), "")).unwrap();
+        let removed = map.map_one_with_extent(&edit((1, 0), (2, 0), "")).unwrap();
         assert_eq!(apply_to(blank, &[removed]), "  a\n  b\n");
     }
 
@@ -3506,11 +3535,9 @@ mod tests {
         .unwrap();
         assert_eq!(prepared.text, "a\nb\n");
         let map = prepared.map.unwrap();
-        let removed = map.edit_to_virtual(&edit((0, 0), (1, 0), "")).unwrap();
+        let removed = map.map_one_with_extent(&edit((0, 0), (1, 0), "")).unwrap();
         assert_eq!(apply_to(&virtual_text, &[removed]), "\n\n  b\n");
-        let formatted = map
-            .edits_to_virtual(&[edit((0, 0), (2, 0), "b\n")])
-            .unwrap();
+        let formatted = map.map_formatting(&[edit((0, 0), (2, 0), "b\n")]).unwrap();
         assert_eq!(apply_to(&virtual_text, &formatted), "\n\n  b\n");
 
         // Indent then gap: `\n  foo\n  ${x}b\n` with `${x}` emptied.
@@ -3538,7 +3565,7 @@ mod tests {
         .unwrap();
         assert_eq!(prepared.text, "\nfoo\nb\n");
         let map = prepared.map.unwrap();
-        let replaced = map.edit_to_virtual(&edit((2, 0), (2, 1), "z")).unwrap();
+        let replaced = map.map_one_with_extent(&edit((2, 0), (2, 1), "z")).unwrap();
         assert_eq!(apply_to(&virtual_text, &[replaced]), "\n  foo\n      z\n");
     }
 
@@ -3568,14 +3595,14 @@ mod tests {
     fn deleting_a_dedented_line_takes_its_indent() {
         let (virtual_text, prepared) = dedented();
         let map = prepared.map.unwrap();
-        let deleted = map.edit_to_virtual(&edit((1, 0), (2, 0), "")).unwrap();
+        let deleted = map.map_one_with_extent(&edit((1, 0), (2, 0), "")).unwrap();
         assert_eq!(apply_to(&virtual_text, &[deleted]), "  if x:\n");
-        let cleared = map.edit_to_virtual(&edit((1, 0), (1, 3), "")).unwrap();
+        let cleared = map.map_one_with_extent(&edit((1, 0), (1, 3), "")).unwrap();
         assert_eq!(apply_to(&virtual_text, &[cleared]), "  if x:\n\n");
-        let replaced = map.edit_to_virtual(&edit((1, 0), (1, 3), "z")).unwrap();
+        let replaced = map.map_one_with_extent(&edit((1, 0), (1, 3), "z")).unwrap();
         assert_eq!(apply_to(&virtual_text, &[replaced]), "  if x:\n  z\n");
         let formatted = map
-            .edits_to_virtual(&[edit((0, 0), (2, 0), "if x:\n")])
+            .map_formatting(&[edit((0, 0), (2, 0), "if x:\n")])
             .unwrap();
         assert_eq!(apply_to(&virtual_text, &formatted), "  if x:\n");
     }
@@ -3596,7 +3623,9 @@ mod tests {
         assert_eq!(prepared.text, "a\r\nb\r\n");
         let map = prepared.map.unwrap();
         assert_eq!(map.to_virtual(pos(1, 1), Bias::Start), pos(1, 3));
-        let inserted = map.edit_to_virtual(&edit((1, 1), (1, 1), "\r\nc")).unwrap();
+        let inserted = map
+            .map_one_with_extent(&edit((1, 1), (1, 1), "\r\nc"))
+            .unwrap();
         assert_eq!(
             apply_to(&virtual_text, &[inserted]),
             "  a\r\n  b\r\n  c\r\n"
@@ -3663,8 +3692,8 @@ mod tests {
         .unwrap();
         let map = prepared.map.unwrap();
         // Same-line edits still map…
-        assert!(map.edits_to_virtual(&[edit((0, 0), (0, 1), "A")]).is_some());
+        assert!(map.map_formatting(&[edit((0, 0), (0, 1), "A")]).is_some());
         // …but a new line has no single right indentation.
-        assert_eq!(map.edits_to_virtual(&[edit((0, 1), (0, 1), "\nc")]), None);
+        assert_eq!(map.map_formatting(&[edit((0, 1), (0, 1), "\nc")]), None);
     }
 }
