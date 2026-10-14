@@ -576,10 +576,11 @@ fn insertion_point_prefixed(offset: &RegionOffset, region_end: Position, host_li
 
 /// The text `snippet` expands to with every tabstop, placeholder and choice
 /// left at its default: what the client inserts unless the user types over
-/// it. Every occurrence of a tabstop mirrors the default of its first
-/// placeholder (or choice), wherever that stands — `$1x${1:y}` expands to
-/// `yxy`. `None` for text the client decides at insert time (a variable)
-/// or that this expansion does not compute (a transform).
+/// it. Every occurrence of a tabstop mirrors the default of its placeholder
+/// (or choice), wherever that stands — `$1x${1:y}` expands to `yxy`. `None`
+/// for text the client decides at insert time (a variable), that this
+/// expansion does not compute (a transform), or that clients disagree on (a
+/// tabstop with several placeholders: which default wins varies).
 fn snippet_expansion(snippet: &str) -> Option<String> {
     use std::collections::HashMap;
 
@@ -607,22 +608,25 @@ fn snippet_expansion(snippet: &str) -> Option<String> {
     }
 
     /// One expansion with each tabstop mirroring `mirrors`, recording into
-    /// `defaults` the default each tabstop's first placeholder gives.
+    /// `defaults` the default each tabstop's placeholder gives.
     struct Pass<'m> {
         mirrors: &'m HashMap<String, String>,
         defaults: HashMap<String, String>,
     }
 
     impl Pass<'_> {
-        fn occurrence(&mut self, number: String, default: Option<String>) -> String {
-            if let Some(default) = default {
-                self.defaults
-                    .entry(number.clone())
-                    .or_insert(default.clone());
+        fn occurrence(&mut self, number: String, default: Option<String>) -> Option<String> {
+            Some(if let Some(default) = default {
+                match self.defaults.entry(number.clone()) {
+                    std::collections::hash_map::Entry::Occupied(_) => return None,
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(default.clone());
+                    }
+                }
                 self.mirrors.get(&number).cloned().unwrap_or(default)
             } else {
                 self.mirrors.get(&number).cloned().unwrap_or_default()
-            }
+            })
         }
 
         fn expand(&mut self, chars: &mut Chars<'_>, nested: bool) -> Option<String> {
@@ -649,9 +653,9 @@ fn snippet_expansion(snippet: &str) -> Option<String> {
                                 // A transform, or unterminated.
                                 _ => return None,
                             };
-                            out.push_str(&self.occurrence(number, default));
+                            out.push_str(&self.occurrence(number, default)?);
                         } else if let Some(number) = tabstop(chars) {
-                            out.push_str(&self.occurrence(number, None));
+                            out.push_str(&self.occurrence(number, None)?);
                         } else if chars
                             .peek()
                             .is_some_and(|c| c.is_ascii_alphabetic() || *c == '_')
@@ -1031,7 +1035,9 @@ mod tests {
         assert_eq!(expanded("$1x${1:\n}").as_deref(), Some("\nx\n"));
         assert_eq!(expanded("$01x${1:\n}").as_deref(), Some("\nx\n"));
         assert_eq!(expanded("$00").as_deref(), Some(""));
-        assert_eq!(expanded("${1:a} ${1:b}").as_deref(), Some("a a"));
+        // Clients disagree on which of several placeholders' defaults wins.
+        assert_eq!(expanded("${1:a} ${1:b}"), None);
+        assert_eq!(expanded("$1x${1:}${1:\n}"), None);
         assert_eq!(expanded("$2 ${1:<$2>} ${2:x}").as_deref(), Some("x <x> x"));
         // Cyclic defaults end.
         assert!(expanded("${1:$2}${2:$1}").is_some());
@@ -1086,6 +1092,7 @@ mod tests {
     // Reads as starting with text, but `$1` mirrors the later default.
     #[case::tabstop_mirroring_a_later_default("$1x${1:\n}")]
     #[case::tabstop_numbered_with_a_leading_zero("$01x${1:\n}")]
+    #[case::tabstop_with_an_empty_and_a_later_default("$1x${1:}${1:\n}")]
     fn a_prepared_snippet_whose_expansion_fuses_a_hidden_line_break_is_dropped(
         #[case] snippet: &str,
     ) {
