@@ -1368,24 +1368,34 @@ mod tests {
         assert_eq!(retry_delay(100), Duration::from_secs(60));
     }
 
-    #[tokio::test]
-    async fn every_request_goes_out_with_a_newer_version() {
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_goes_out_with_a_newer_version_than_requests_made_meanwhile() {
         let registry = PrepareRegistry::default();
         let pool = Arc::new(LanguageServerPool::new());
-        let target = unstartable_target();
+        let dir = tempfile::tempdir().unwrap();
+        recording_candidate(&pool, "peer", true, &dir.path().join("peer")).await;
+        let target = target_of(&[("peer", &["peer"])]);
         let host = Url::parse("file:///host.md").unwrap();
-        let mut asked = Vec::new();
-        for text in ["a", "b", "a"] {
-            let slot = registry
-                .slot(&target, input(&host, text), Holder::LifecyclePass)
-                .unwrap();
-            let _ = registry.prepare(&pool, &target, input(&host, text)).await;
-            asked.extend(slot.cell.versions.lock().unwrap().drain(..));
-            // Asked again from scratch, as after a settings change.
-            registry.forget_region(&host, None, REGION);
-        }
-        assert_eq!(asked.len(), 3);
-        assert!(asked.windows(2).all(|pair| pair[0] < pair[1]), "{asked:?}");
+        let versions = |text| {
+            cell(&registry, &target, input(&host, text), Holder::Request)
+                .versions
+                .lock()
+                .unwrap()
+                .clone()
+        };
+        // `a` gets no answer and backs off; `b` is asked meanwhile.
+        registry.slot(&target, input(&host, "a"), Holder::LifecyclePass);
+        let _ = registry.prepare(&pool, &target, input(&host, "a")).await;
+        let _ = registry.prepare(&pool, &target, input(&host, "b")).await;
+        // Its backoff over, `a` is asked again.
+        tokio::time::sleep(retry_delay(1) * 2).await;
+        let _ = registry.prepare(&pool, &target, input(&host, "a")).await;
+
+        let (a, b) = (versions("a"), versions("b"));
+        assert_eq!(a.len(), 2, "{a:?}");
+        assert_eq!(b.len(), 1, "{b:?}");
+        assert!(a[0] < b[0] && b[0] < a[1], "a: {a:?}, b: {b:?}");
     }
 
     #[test]
