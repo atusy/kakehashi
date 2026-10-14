@@ -145,11 +145,19 @@ fn host_edits_touch_gaps(edit: &WorkspaceEdit, host_uri: &Uri, offset: &RegionOf
     host_edit_ranges(edit, host_uri).any(touches)
 }
 
-/// Whether the edits a `WorkspaceEdit` makes to `host_uri` overlap.
+/// Whether the edits a `WorkspaceEdit` makes to `host_uri` overlap, in
+/// `changes` or in `documentChanges`: they are alternatives (a client
+/// applies `documentChanges` when it supports them, `changes` otherwise),
+/// so an edit in one never meets an edit in the other.
 fn host_edits_overlap(edit: &WorkspaceEdit, host_uri: &Uri) -> bool {
-    let mut ranges: Vec<&Range> = host_edit_ranges(edit, host_uri).collect();
-    ranges.sort_by_key(|range| (range.start, range.end));
-    ranges.windows(2).any(|pair| pair[0].end > pair[1].start)
+    let overlap = |ranges: Vec<&Range>| {
+        let mut ranges = ranges;
+        ranges.sort_by_key(|range| (range.start, range.end));
+        ranges.windows(2).any(|pair| pair[0].end > pair[1].start)
+    };
+    let (changes, document_changes) = host_text_edits_by_kind(edit, host_uri);
+    overlap(changes.map(|(range, _)| range).collect())
+        || overlap(document_changes.map(|(range, _)| range).collect())
 }
 
 /// The range and new text of every edit a `WorkspaceEdit` makes to
@@ -158,6 +166,19 @@ fn host_text_edits<'a>(
     edit: &'a WorkspaceEdit,
     host_uri: &'a Uri,
 ) -> impl Iterator<Item = (&'a Range, &'a str)> {
+    let (changes, document_changes) = host_text_edits_by_kind(edit, host_uri);
+    changes.chain(document_changes)
+}
+
+/// [`host_text_edits`], those in `changes` apart from those in
+/// `documentChanges`.
+fn host_text_edits_by_kind<'a>(
+    edit: &'a WorkspaceEdit,
+    host_uri: &'a Uri,
+) -> (
+    impl Iterator<Item = (&'a Range, &'a str)>,
+    impl Iterator<Item = (&'a Range, &'a str)>,
+) {
     let changes = edit
         .changes
         .as_ref()
@@ -188,7 +209,7 @@ fn host_text_edits<'a>(
                 ),
             })
         });
-    changes.chain(document_changes)
+    (changes, document_changes)
 }
 
 /// The ranges of every edit a `WorkspaceEdit` makes to `host_uri`.
@@ -910,6 +931,42 @@ mod tests {
             }
         }));
         assert!(!transform_workspace_edit_to_host(
+            &mut edit,
+            &virtual_uri,
+            &host_uri,
+            &offset,
+        ));
+    }
+
+    #[test]
+    fn the_same_prepared_edit_in_both_representations_is_no_overlap() {
+        use super::super::prepare::{VirtualLayout, apply_prepare_result};
+        let virtual_text = "  a\n";
+        let result = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(result),
+        )
+        .unwrap();
+        let offset = RegionOffset::new(0, 0).with_prepared(prepared.map);
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        // A rename sending its edit both ways: a client applies one of them.
+        let rename = json!([
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "newText": "b"}
+        ]);
+        let mut edit = parse_workspace_edit(json!({
+            "changes": { virtual_uri.clone(): rename },
+            "documentChanges": [{
+                "textDocument": {"uri": virtual_uri.clone(), "version": null},
+                "edits": rename
+            }]
+        }));
+        assert!(transform_workspace_edit_to_host(
             &mut edit,
             &virtual_uri,
             &host_uri,
