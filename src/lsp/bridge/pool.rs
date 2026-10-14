@@ -423,6 +423,11 @@ pub struct LanguageServerPool {
     /// an event between an acquisition's routing and its announce.
     #[cfg(test)]
     before_announce: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Test-only hook run once when the next acquisition has resolved its
+    /// route, to place an event between that route's capability probe and
+    /// the acquire that acts on it.
+    #[cfg(test)]
+    after_resolve: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Weak directory exposed to downstream `kakehashi/bridge/peer*` requests.
     peer_directory: Arc<super::peer::PeerDirectory>,
     /// Gate that rejects **new** connection spawns once shutdown has begun.
@@ -614,6 +619,8 @@ impl LanguageServerPool {
             connections: Mutex::new(HashMap::new()),
             #[cfg(test)]
             before_announce: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            after_resolve: std::sync::Mutex::new(None),
             peer_directory: Arc::new(super::peer::PeerDirectory::new(
                 Arc::clone(&document_tracker),
                 Arc::clone(&host_documents),
@@ -1191,6 +1198,15 @@ impl LanguageServerPool {
             .before_announce
             .lock()
             .recover_poison("LanguageServerPool::set_before_announce") = Some(Box::new(hook));
+    }
+
+    /// Run `hook` once when the next acquisition has resolved its route.
+    #[cfg(test)]
+    pub(crate) fn set_after_resolve(&self, hook: impl FnOnce() + Send + 'static) {
+        *self
+            .after_resolve
+            .lock()
+            .recover_poison("LanguageServerPool::set_after_resolve") = Some(Box::new(hook));
     }
 
     /// How many connections the pool holds, for tests outside this module
@@ -3207,11 +3223,13 @@ impl LanguageServerPool {
             .await
         {
             // Routing chose the shared instance and it withdrew folder-change
-            // support before this root was announced. Re-resolving now diverts
-            // the root; do it here rather than fail an acquisition a one-shot
-            // caller (eager didOpen) would not repeat (#968). Once: a second
-            // withdrawal needs a second registration in between.
-            Err(error) if BridgeError::is_folder_support_withdrawn(&error) => {
+            // support before this root was announced (#968), or came up
+            // without it after routing probed it (#992). Re-resolving now
+            // diverts the root; do it here rather than fail an acquisition a
+            // one-shot caller (eager didOpen) would not repeat. Once: the
+            // retry routes to the per-root key, which is never refused, and a
+            // second withdrawal needs a second registration in between.
+            Err(error) if BridgeError::reroutes(&error) => {
                 self.get_or_create_connection_wait_ready_once(
                     server_name,
                     server_config,
@@ -3301,14 +3319,14 @@ impl LanguageServerPool {
             Err(e) => return Err(e),
         };
 
-        // The shared connection's capability is only known now that it is Ready.
-        // If it came up incapable and does not already serve this root, the
-        // shared-instance opt-in must degrade to a per-root instance (#391):
-        // opening this document on a server that ignores
-        // didChangeWorkspaceFolders would wedge the 2nd+ root. `resolve_acquire`
-        // now sees the shared connection as Ready+incapable, so it re-resolves
-        // to the per-root key; acquire that connection instead, within the
-        // caller's remaining budget.
+        // A shared connection that was Initializing at acquire time has its
+        // capability known only now that it is Ready (one already Ready was
+        // vetted by the acquire itself, #992). If it came up incapable and does
+        // not already serve this root, the shared-instance opt-in must degrade
+        // to a per-root instance (#391): opening this document on a server
+        // that ignores didChangeWorkspaceFolders would wedge the 2nd+ root.
+        // Acquire the per-root connection instead, within the caller's
+        // remaining budget.
         // Divert only a root the connection is not already serving (see
         // `incapable_shared_refuses`). A marker-less acquisition brings no
         // marker root of its own, so it rides the shared connection
@@ -3598,15 +3616,16 @@ impl LanguageServerPool {
     /// isolation rather than splitting one root across two processes.
     ///
     /// A still-initializing shared connection is treated optimistically as
-    /// shared, because its capability is not known yet. The two acquire paths
-    /// then resolve the race once it is `Ready`: the fast-fail path returns the
-    /// `Initializing` error before any `didOpen` and re-resolves on retry, and
-    /// the wait path
-    /// ([`get_or_create_connection_wait_ready`](Self::get_or_create_connection_wait_ready))
-    /// re-checks the capability after waiting and diverts a new root to a
-    /// per-root connection if the shared one came up incapable — so no document
-    /// is ever opened on an incapable shared connection for a root it does not
-    /// already serve.
+    /// shared, because its capability is not known yet. The acquire resolves
+    /// the race once it is `Ready`: an acquire that finds the shared
+    /// connection Ready+incapable refuses a root it does not serve and the
+    /// entry point re-resolves, diverting it (both paths, even when the
+    /// handshake completes between this probe and the acquire, #992); one
+    /// that finds it still `Initializing` either fails fast (the caller
+    /// retries) or, on the wait path
+    /// ([`get_or_create_connection_wait_ready`](Self::get_or_create_connection_wait_ready)),
+    /// re-checks after waiting and diverts — so no document is ever opened on
+    /// an incapable shared connection for a root it does not already serve.
     ///
     /// A server that registers the capability dynamically is incapable between
     /// Ready and its registration, so roots acquired in that window divert;
@@ -3628,6 +3647,15 @@ impl LanguageServerPool {
         let (marker, key, heal_straggler, _) = self
             .resolve_connection_route(server_name, server_config, document_uri)
             .await;
+        #[cfg(test)]
+        if let Some(hook) = self
+            .after_resolve
+            .lock()
+            .recover_poison("LanguageServerPool::resolve_acquire")
+            .take()
+        {
+            hook();
+        }
         // Handed to the upstream loop rather than awaited here: this runs in
         // request futures a `$/cancelRequest` can drop, and retirement marks
         // connections Closing before its cleanup awaits — a cancelled inline
@@ -3988,8 +4016,9 @@ impl LanguageServerPool {
             )
             .await
         {
-            // Same re-resolve as `get_or_create_connection_wait_ready` (#968).
-            Err(error) if BridgeError::is_folder_support_withdrawn(&error) => {
+            // Same re-resolve as `get_or_create_connection_wait_ready` (#968,
+            // #992).
+            Err(error) if BridgeError::reroutes(&error) => {
                 self.get_or_create_connection_with_timeout_once(
                     server_name,
                     server_config,
@@ -4168,6 +4197,18 @@ impl LanguageServerPool {
                 // reentrant).
                 drop(connections);
                 if !rootless {
+                    // Routing probes the shared instance's capability before
+                    // this lock, so it may have routed here optimistically
+                    // while the instance was still Initializing — and it is
+                    // Ready now. Hold the invariant for every acquisition
+                    // path, not only the one that waits (#992): an incapable
+                    // shared connection takes no marker root it does not
+                    // already serve. Refused, the entry point re-resolves,
+                    // and routing now sees it Ready+incapable and diverts.
+                    if incapable_shared_refuses(&handle, &marker) {
+                        handle.log_incapable_fallback_once(server_name);
+                        return Err(BridgeError::shared_root_unserved());
+                    }
                     self.announce_shared_root(&handle, &marker).await?;
                 }
                 return Ok(handle);
@@ -6107,7 +6148,7 @@ mod tests {
     }
 
     /// The divert-TAKEN direction of the same post-Ready check, pinned at the
-    /// wait_ready level because only wait_ready can construct it: a
+    /// wait_ready level because only wait_ready waits through the handshake: a
     /// marker-rooted document optimistically routed to a still-Initializing
     /// shared connection (resolve_acquire's catch-all arm) must be re-keyed to
     /// its per-root connection once the shared handle comes up Ready WITHOUT
@@ -6257,6 +6298,87 @@ mod tests {
         .expect("the retired divert's handshake must end promptly")
         .expect("falls back to the shared instance");
         assert!(Arc::ptr_eq(&handle, &shared));
+    }
+
+    /// Routing probes the shared connection's capability before the acquire
+    /// takes the pool lock, so the shared connection can come up Ready and
+    /// incapable in between: the probe saw it Initializing and routed
+    /// optimistically to the shared key. Both acquisition paths must still
+    /// hold the invariant that no document is opened on an incapable shared
+    /// connection for a root it does not already serve (#992) — the
+    /// fast-fail path has no post-wait re-check of its own to catch it. The
+    /// exemptions hold through the same window: the spawn root's own
+    /// document and a marker-less document stay aboard.
+    #[rstest::rstest]
+    #[case::fast_fail_unserved_root_diverts(false, Some(false), false)]
+    #[case::wait_ready_unserved_root_diverts(true, Some(false), false)]
+    #[case::fast_fail_spawn_root_stays(false, Some(true), true)]
+    #[case::wait_ready_spawn_root_stays(true, Some(true), true)]
+    #[case::fast_fail_marker_less_stays(false, None, true)]
+    #[case::wait_ready_marker_less_stays(true, None, true)]
+    #[tokio::test]
+    async fn shared_coming_up_incapable_between_routing_and_acquire(
+        #[case] wait_ready: bool,
+        #[case] spawn_root_is_doc_root: Option<bool>,
+        #[case] stays_on_shared: bool,
+    ) {
+        let (_tmp, rooted_doc) = marker_rooted_doc();
+        let pool = Arc::new(LanguageServerPool::new());
+        let config = shared_config();
+        let doc = match spawn_root_is_doc_root {
+            Some(_) => rooted_doc,
+            None => Url::parse("untitled://cmdline").unwrap(),
+        };
+
+        // Where a divert lands, Ready already, so no spawn is needed.
+        let per_root_key = pool.connection_key("lua", &config, Some(&doc));
+        let per_root = create_handle_with_key(ConnectionState::Ready, per_root_key).await;
+        pool.insert_connection(Arc::clone(&per_root)).await;
+
+        let shared =
+            create_handle_with_key(ConnectionState::Initializing, ConnectionKey::shared("lua"))
+                .await;
+        if spawn_root_is_doc_root == Some(true) {
+            let (marker, _) = pool.resolve_marker_and_key("lua", &config, Some(&doc));
+            shared.record_spawn_root(Some(String::from(marker.expect("marker-rooted").0)));
+        }
+        pool.insert_connection(Arc::clone(&shared)).await;
+        // Routing has probed (Initializing → shared key); the handshake then
+        // completes without folder-change support before the acquire.
+        pool.set_after_resolve({
+            let shared = Arc::clone(&shared);
+            move || {
+                shared.set_server_capabilities(
+                    tower_lsp_server::ls_types::ServerCapabilities::default(),
+                );
+                shared.set_state(ConnectionState::Ready);
+            }
+        });
+
+        let budget = Duration::from_secs(2);
+        let result = if wait_ready {
+            pool.get_or_create_connection_wait_ready("lua", &config, Some(&doc), budget)
+                .await
+        } else {
+            pool.get_or_create_connection_with_timeout("lua", &config, Some(&doc), budget, None)
+                .await
+        }
+        .expect("both candidate connections are Ready; nothing needs spawning");
+
+        if stays_on_shared {
+            assert!(
+                Arc::ptr_eq(&result, &shared),
+                "a document the incapable shared connection serves (or a marker-less one) \
+                 must stay aboard"
+            );
+        } else {
+            assert!(
+                Arc::ptr_eq(&result, &per_root),
+                "a root the incapable shared connection does not serve must divert to its \
+                 per-root connection, got {}",
+                result.key()
+            );
+        }
     }
 
     /// The incapable-shared divert proves served-ness against the SPAWN root,
