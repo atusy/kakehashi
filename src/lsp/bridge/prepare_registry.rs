@@ -1002,6 +1002,13 @@ async fn try_run(
                 if !handle.supports_virtual_document_prepare() {
                     continue;
                 }
+                // Revoked while the candidate started (its region pruned by a
+                // settings change, say): no request with the text it was for.
+                if !admitted() {
+                    return Err(std::io::Error::other(
+                        "revoked before its prepare request went out",
+                    ));
+                }
                 let result = match handle
                     .request_virtual_document_prepare(&params(next_version()))
                     .await
