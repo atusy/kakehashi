@@ -450,18 +450,12 @@ pub(super) fn transform_completion_item(
             // sent must be the set checked: each set's primary must map as
             // the primary that went out (for a snippet: on its range, to its
             // expansion), and the additional edits alike in every set.
-            if primaries.is_empty() {
-                match translate_virtual_text_edits_to_host(
-                    additional_edits.clone(),
-                    offset,
-                    EditMode::Extent,
-                ) {
-                    Some(mapped) => {
-                        *additional_edits = mapped;
-                        true
-                    }
-                    None => false,
-                }
+            if item.text_edit.is_none() {
+                // Inserted at the cursor over a range the client picks: the
+                // set the additional edits would go out with cannot be
+                // checked, and mapped alone they may miss what the insertion
+                // puts beside them (a removed indent left out).
+                false
             } else {
                 let sent: Vec<tower_lsp_server::ls_types::TextEdit> = match &item.text_edit {
                     Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(edit)) => {
@@ -1217,6 +1211,46 @@ mod tests {
             ),
             kept
         );
+    }
+
+    #[test]
+    fn a_prepared_item_without_a_text_edit_drops_its_additional_edits() {
+        use super::super::super::protocol::{VirtualLayout, apply_prepare_result};
+        // `  a\n  \n  b\n`, dedented by two.
+        let virtual_text = "  a\n  \n  b\n";
+        let result = serde_json::from_value(serde_json::json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(result),
+        )
+        .unwrap();
+        let offset = RegionOffset::new(0, 0).with_prepared(prepared.map);
+        // Inserted at the cursor on the emptied line, beside a deletion of
+        // the line before it: checked apart from the insertion, the deletion
+        // takes the line's indent with it.
+        let mut item: tower_lsp_server::ls_types::CompletionItem = serde_json::from_value(
+            serde_json::json!({
+                "label": "x",
+                "additionalTextEdits": [{
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}},
+                    "newText": ""
+                }]
+            }),
+        )
+        .unwrap();
+        assert!(transform_completion_item(
+            &mut item,
+            &offset,
+            Position::new(3, 0),
+            Some(Position::new(1, 2)),
+        ));
+        assert_eq!(item.additional_text_edits, None);
     }
 
     #[test]
