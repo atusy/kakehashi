@@ -1193,6 +1193,47 @@ mod tests {
         ));
     }
 
+    #[rstest::rstest]
+    // The closing line's indent, deleted with the closing blank line: edge
+    // text, refused.
+    #[case::closing_indent((2, 0), (2, 2), false)]
+    #[case::insertion_inside_the_closing_indent((2, 1), (2, 1), false)]
+    // A content line's dedent: editable.
+    #[case::content_dedent((0, 0), (0, 2), true)]
+    fn a_direct_host_edit_over_the_deleted_closing_indent_is_refused(
+        #[case] start: (u32, u32),
+        #[case] end: (u32, u32),
+        #[case] kept: bool,
+    ) {
+        use super::super::prepare::{VirtualLayout, apply_prepare_result};
+        let virtual_text = "  a\n\n  ";
+        let result = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""},
+            {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(result),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "a\n");
+        let offset = RegionOffset::new(0, 0).with_prepared(prepared.map);
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let mut edit = parse_workspace_edit(json!({
+            "changes": { host_uri.as_str(): [
+                {"range": {"start": {"line": start.0, "character": start.1}, "end": {"line": end.0, "character": end.1}}, "newText": "X"}
+            ]}
+        }));
+        assert_eq!(
+            transform_workspace_edit_to_host(&mut edit, &virtual_uri, &host_uri, &offset),
+            kept
+        );
+    }
+
     #[test]
     fn document_changes_entries_of_a_prepared_edit_apply_in_order() {
         use super::super::prepare::{VirtualLayout, apply_prepare_result};
