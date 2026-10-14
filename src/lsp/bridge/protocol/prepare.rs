@@ -919,6 +919,31 @@ impl PreparedMap {
     /// Checked on the edited V as a whole: a completion's main edit and its
     /// additional edits, say, each fine alone, can fuse a CR and an LF only
     /// together.
+    /// Whether `position` names a location in V.
+    pub(crate) fn names_virtual_position(&self, position: Position) -> bool {
+        self.virtual_lines.offset_strict(position).is_some()
+    }
+
+    /// [`Self::mapped_edits_keep_host_text`] for edits already in V (a
+    /// merged set: the mapped edits with edits made to the host directly):
+    /// `false` too when one names no location in V.
+    pub(crate) fn virtual_edits_keep_host_text(&self, edits: &[TextEdit]) -> bool {
+        let mut mapped = Vec::with_capacity(edits.len());
+        for edit in edits {
+            let (Some(start), Some(end)) = (
+                self.virtual_lines.offset_strict(edit.range.start),
+                self.virtual_lines.offset_strict(edit.range.end),
+            ) else {
+                return false;
+            };
+            if start > end {
+                return false;
+            }
+            mapped.push((start..end, edit.new_text.clone()));
+        }
+        self.mapped_edits_keep_host_text(&mapped)
+    }
+
     fn mapped_edits_keep_host_text(&self, mapped: &[(Range<usize>, String)]) -> bool {
         let virtual_text = self.virtual_lines.text();
         let mut sorted: Vec<&(Range<usize>, String)> = mapped.iter().collect();

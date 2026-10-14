@@ -81,7 +81,52 @@ pub(crate) fn transform_workspace_edit_to_host(
     !(prepared
         && (host_edits_overlap(edit, host_uri)
             || host_edits_touch_gaps(edit, host_uri, original)
-            || host_edits_join_gap_lines(edit, host_uri, original)))
+            || host_edits_join_gap_lines(edit, host_uri, original)
+            || !host_edits_keep_hidden_text(edit, host_uri, original)))
+}
+
+/// Whether the edits to `host_uri` that reach into the region, mapped ones
+/// and ones made to the host directly together, keep the text the prepared
+/// document hides (see `PreparedMap::virtual_edits_keep_host_text`): each
+/// set passed alone, but a hidden CR may still fuse with an LF only the
+/// two together bring next to it. Each representation (`changes`,
+/// `documentChanges`) is one set. An edit reaching into the region from
+/// outside it is refused.
+fn host_edits_keep_hidden_text(
+    edit: &WorkspaceEdit,
+    host_uri: &Uri,
+    offset: &RegionOffset,
+) -> bool {
+    let Some(prepared) = offset.prepared() else {
+        return true;
+    };
+    let unprepared = offset.unprepared();
+    // The region position `position` names, if it names one: translated
+    // back, it must come out the same (host text before the region, after
+    // it, or in a line's host prefix does not).
+    let to_virtual = |position: &Position| {
+        let mut translated = *position;
+        super::translation::translate_host_position_to_virtual(&mut translated, &unprepared);
+        let mut back = translated;
+        super::translation::translate_virtual_position_to_host(&mut back, &unprepared);
+        (back == *position && prepared.names_virtual_position(translated)).then_some(translated)
+    };
+    let set_keeps = |edits: Vec<(&Range, &str)>| {
+        let mut in_region = Vec::new();
+        for (range, new_text) in edits {
+            match (to_virtual(&range.start), to_virtual(&range.end)) {
+                (Some(start), Some(end)) => in_region.push(TextEdit {
+                    range: Range { start, end },
+                    new_text: new_text.to_string(),
+                }),
+                (None, None) => {}
+                _ => return false,
+            }
+        }
+        in_region.is_empty() || prepared.virtual_edits_keep_host_text(&in_region)
+    };
+    let (changes, document_changes) = host_text_edits_by_kind(edit, host_uri);
+    set_keeps(changes.collect()) && set_keeps(document_changes.collect())
 }
 
 /// Whether any edit to `host_uri` ending right where a gap starts a line
@@ -932,6 +977,53 @@ mod tests {
         }));
         assert!(!transform_workspace_edit_to_host(
             &mut edit,
+            &virtual_uri,
+            &host_uri,
+            &offset,
+        ));
+    }
+
+    #[test]
+    fn mapped_and_direct_host_edits_together_keep_a_hidden_line_break_apart() {
+        use super::super::prepare::{VirtualLayout, apply_prepare_result};
+        // `\rab\n`, its lone-CR leading line deleted: `ab\n`.
+        let virtual_text = "\rab\n";
+        let result = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(result),
+        )
+        .unwrap();
+        let offset = RegionOffset::new(0, 0).with_prepared(prepared.map);
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let edit = |host_text: &str| {
+            parse_workspace_edit(json!({
+                "changes": {
+                    // `a`, through the prepared document…
+                    virtual_uri.clone(): [
+                        {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "newText": ""}
+                    ],
+                    // …and `b`, on the host directly.
+                    host_uri.as_str(): [
+                        {"range": {"start": {"line": 1, "character": 1}, "end": {"line": 1, "character": 2}}, "newText": host_text}
+                    ]
+                }
+            }))
+        };
+        // Both deleted: the hidden CR meets the LF.
+        assert!(!transform_workspace_edit_to_host(
+            &mut edit(""),
+            &virtual_uri,
+            &host_uri,
+            &offset,
+        ));
+        assert!(transform_workspace_edit_to_host(
+            &mut edit("y"),
             &virtual_uri,
             &host_uri,
             &offset,
