@@ -727,19 +727,21 @@ impl DocumentTracker {
     /// Record the content a `didOpen` or `didChange` hands this connection,
     /// under the version it goes out with: its fingerprint, so a later edit
     /// leaving the region's content identical is skipped (#422), and the
-    /// prepared map it was sent with (see [`HeldText`]). Synchronous, so a
-    /// caller cancelled around its send cannot leave the record behind. A
-    /// record must not outlive a send that never went out — it would mark
-    /// content the server never received, defeating the self-heal on the
-    /// next edit: a didChange records once enqueued, a didOpen before it is
-    /// queued and takes the record back with its claim if it is not.
+    /// prepared map it was sent with (see [`HeldText`]). Recorded before
+    /// the send is queued, so a push answering it already finds it when the
+    /// reader stamps the push; synchronous, so no cancellation separates it
+    /// from the send. A record must not outlive a send that never went out —
+    /// it would mark content the server never received, defeating the
+    /// self-heal on the next edit: the record it replaced is returned, for
+    /// [`Self::restore_held`] (a didOpen takes it back with its claim
+    /// instead).
     pub(super) fn record_sent(
         &self,
         virtual_uri: &VirtualDocumentUri,
         connection_key: &ConnectionKey,
         content: SentText<'_>,
         version: Option<i32>,
-    ) {
+    ) -> Option<HeldText> {
         let uri_string = virtual_uri.to_uri_string();
         let fingerprint = content_fingerprint(content.text);
         let map = content.map.cloned();
@@ -760,8 +762,10 @@ impl DocumentTracker {
             // The same text: what the server computed stays in the same
             // coordinates, even when it maps back differently now.
             Some(held) if held.fingerprint == fingerprint => {
+                let previous = held.clone();
                 held.map = map;
                 held.version = version;
+                Some(previous)
             }
             _ => {
                 let generation = self.held_generations.fetch_add(1, Ordering::Relaxed) + 1;
@@ -773,7 +777,33 @@ impl DocumentTracker {
                         generation,
                         version,
                     },
-                );
+                )
+            }
+        }
+    }
+
+    /// Put back the record [`Self::record_sent`] replaced (`None`: there was
+    /// none), for a send that was not queued after all.
+    pub(super) fn restore_held(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+        previous: Option<HeldText>,
+    ) {
+        let uri_string = virtual_uri.to_uri_string();
+        let mut fingerprints = self
+            .document_fingerprints
+            .lock()
+            .recover_poison("DocumentTracker::document_fingerprints");
+        let Some(docs) = fingerprints.get_mut(connection_key) else {
+            return;
+        };
+        match previous {
+            Some(previous) => {
+                docs.insert(uri_string, previous);
+            }
+            None => {
+                docs.remove(&uri_string);
             }
         }
     }

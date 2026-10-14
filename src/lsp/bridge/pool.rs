@@ -332,6 +332,25 @@ enum VirtualOpenContent<'a> {
 /// Eager-open tasks are deliberately aborted when a newer parse supersedes
 /// them; dropping the handler between claim and FIFO enqueue must not leave a
 /// phantom "opened" document that suppresses every later didOpen.
+/// Puts back what a connection held for a document (see
+/// [`DocumentTracker::restore_held`]) when dropped before its didChange was
+/// sent, which clears `previous`.
+struct RestoreHeldUnlessSent<'a> {
+    tracker: &'a DocumentTracker,
+    virtual_uri: &'a VirtualDocumentUri,
+    connection_key: &'a ConnectionKey,
+    previous: Option<Option<HeldText>>,
+}
+
+impl Drop for RestoreHeldUnlessSent<'_> {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            self.tracker
+                .restore_held(self.virtual_uri, self.connection_key, previous);
+        }
+    }
+}
+
 struct OpenClaimGuard {
     tracker: Arc<DocumentTracker>,
     claim: Arc<tokio::sync::Notify>,
@@ -2742,10 +2761,20 @@ impl LanguageServerPool {
                     text: content.text.to_owned(),
                 }],
             };
+            // Recorded before it is queued (see `send_didchange_recorded`),
+            // and taken back unless it is — on an error, or a caller
+            // cancelled before the send completed.
+            let previous = self.record_sent_held(virtual_uri, connection_key, content, version);
+            let mut unsent = RestoreHeldUnlessSent {
+                tracker: &self.document_tracker,
+                virtual_uri,
+                connection_key,
+                previous: Some(previous),
+            };
             sender
                 .send_notification(JsonRpcNotification::new("textDocument/didChange", params))
                 .await?;
-            self.record_sent_content(virtual_uri, connection_key, content, Some(version));
+            unsent.previous = None;
         } else {
             // Unchanged text is held again under its current map too.
             self.rehold_unchanged_content(virtual_uri, connection_key, content);
@@ -3179,16 +3208,28 @@ impl LanguageServerPool {
             .await
     }
 
-    /// See [`DocumentTracker::record_sent`].
-    pub(super) fn record_sent_content(
+    /// See [`DocumentTracker::record_sent`]: what a didChange about to be
+    /// queued sends, returning the record it replaced.
+    pub(super) fn record_sent_held(
         &self,
         virtual_uri: &VirtualDocumentUri,
         connection_key: &ConnectionKey,
         content: SentText<'_>,
-        version: Option<i32>,
+        version: i32,
+    ) -> Option<HeldText> {
+        self.document_tracker
+            .record_sent(virtual_uri, connection_key, content, Some(version))
+    }
+
+    /// See [`DocumentTracker::restore_held`].
+    pub(super) fn restore_held_content(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+        previous: Option<HeldText>,
     ) {
         self.document_tracker
-            .record_sent(virtual_uri, connection_key, content, version);
+            .restore_held(virtual_uri, connection_key, previous);
     }
 
     /// Re-hold the text `connection_key` already holds for `virtual_uri`
@@ -9393,6 +9434,75 @@ mod tests {
         )
         .await
         .expect("no re-open outstanding, so no wait");
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_didchange_finds_its_text_on_record_and_takes_it_back_if_not_queued() {
+        /// Notes the connection's held generation as the didChange is handed
+        /// over, then fails to queue it.
+        struct RefusingSender {
+            tracker: Arc<DocumentTracker>,
+            virtual_uri: String,
+            connection_key: ConnectionKey,
+            seen: Option<u64>,
+        }
+
+        impl message_sender::MessageSender for RefusingSender {
+            async fn send_notification<P: serde::Serialize + Send>(
+                &mut self,
+                _notification: JsonRpcNotification<P>,
+            ) -> io::Result<()> {
+                self.seen = self
+                    .tracker
+                    .held_text(&self.virtual_uri, &self.connection_key)
+                    .map(|held| held.generation);
+                Err(io::Error::other("queue full"))
+            }
+        }
+
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///test/snapshot.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let connection_key = ConnectionKey::for_server("lua");
+        let uri = virtual_uri.to_uri_string();
+        let (mut queue, _rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
+        pool.ensure_document_opened(&mut queue, &host_uri, &virtual_uri, "a", &connection_key)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let opened = pool
+            .document_tracker
+            .held_text(&uri, &connection_key)
+            .expect("the didOpen's text is on record")
+            .generation;
+        let mut refusing = RefusingSender {
+            tracker: Arc::clone(&pool.document_tracker),
+            virtual_uri: uri.clone(),
+            connection_key: connection_key.clone(),
+            seen: None,
+        };
+        assert!(
+            pool.ensure_document_opened_from_snapshot(
+                &mut refusing,
+                &host_uri,
+                &virtual_uri,
+                "b",
+                &connection_key,
+            )
+            .await
+            .is_err()
+        );
+        let seen = refusing
+            .seen
+            .expect("the new text is on record as it goes out");
+        assert_ne!(seen, opened);
+        assert_eq!(
+            pool.document_tracker
+                .held_text(&uri, &connection_key)
+                .map(|held| held.generation),
+            Some(opened),
+            "never queued: the text before is held again"
+        );
     }
 
     #[tokio::test]

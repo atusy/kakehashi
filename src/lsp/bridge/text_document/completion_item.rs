@@ -470,24 +470,18 @@ impl LanguageServerPool {
                         &document.text,
                     )
                     .await
-                {
-                    if !matches!(
-                        Self::send_didchange_for_virtual_doc(
+                    && !matches!(
+                        self.send_didchange_recorded(
                             handle,
-                            &virtual_uri.to_uri_string(),
-                            &document.text,
+                            &virtual_uri,
+                            connection_key,
+                            (&*document.text).into(),
                             version,
                         ),
                         NotificationSendResult::Queued
-                    ) {
-                        return Err(io::Error::other("completion text sync was not queued"));
-                    }
-                    self.record_sent_content(
-                        &virtual_uri,
-                        connection_key,
-                        (&*document.text).into(),
-                        Some(version),
-                    );
+                    )
+                {
+                    return Err(io::Error::other("completion text sync was not queued"));
                 }
                 handle
                     .send_request(request, request_id)

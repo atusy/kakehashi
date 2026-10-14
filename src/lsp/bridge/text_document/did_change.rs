@@ -127,30 +127,51 @@ impl LanguageServerPool {
                 };
 
                 // Send didChange notification via single-writer loop (ls-bridge-message-ordering).
-                // This is non-blocking and maintains FIFO ordering.
-                let send_result = Self::send_didchange_for_virtual_doc(
+                // This is non-blocking and maintains FIFO ordering. A dropped
+                // send (full/closed queue) leaves the old fingerprint so the
+                // next edit re-sends (#422).
+                let send_result = self.send_didchange_recorded(
                     &handle,
-                    &virtual_uri.to_uri_string(),
-                    &injection.content,
+                    &virtual_uri,
+                    &connection_key,
+                    injection.sent(),
                     version,
                 );
-                // Record the fingerprint ONLY on a confirmed enqueue (#422): a dropped
-                // send (full/closed queue) must leave the old fingerprint so the next
-                // edit re-sends, rather than marking content the server never received.
-                if matches!(send_result, NotificationSendResult::Queued) {
-                    self.record_sent_content(
-                        &virtual_uri,
-                        &connection_key,
-                        injection.sent(),
-                        Some(version),
-                    );
-                } else {
+                if !matches!(send_result, NotificationSendResult::Queued) {
                     synchronized = false;
                 }
                 drop(transition_guard);
             }
         }
         synchronized
+    }
+
+    /// Send a didChange of `content` and record it as what the connection
+    /// holds (see [`DocumentTracker::record_sent`]): recorded first, so a
+    /// push the server answers it with already finds it, and taken back
+    /// unless the send was queued.
+    ///
+    /// [`DocumentTracker::record_sent`]: super::super::pool::DocumentTracker::record_sent
+    pub(super) fn send_didchange_recorded(
+        &self,
+        handle: &Arc<ConnectionHandle>,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &crate::lsp::bridge::ConnectionKey,
+        content: crate::lsp::bridge::pool::SentText<'_>,
+        version: i32,
+    ) -> NotificationSendResult {
+        let text = content.text;
+        let previous = self.record_sent_held(virtual_uri, connection_key, content, version);
+        let result = Self::send_didchange_for_virtual_doc(
+            handle,
+            &virtual_uri.to_uri_string(),
+            text,
+            version,
+        );
+        if !matches!(result, NotificationSendResult::Queued) {
+            self.restore_held_content(virtual_uri, connection_key, previous);
+        }
+        result
     }
 
     /// Send a didChange notification for a virtual document, returning the

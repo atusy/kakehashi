@@ -116,21 +116,13 @@ impl LanguageServerPool {
                     )
                     .await
                 {
-                    let outcome = Self::send_didchange_for_virtual_doc(
+                    Some(self.send_didchange_recorded(
                         &handle,
-                        &virtual_uri.to_uri_string(),
-                        &injection.content,
+                        &virtual_uri,
+                        &connection_key,
+                        injection.sent(),
                         version,
-                    );
-                    if matches!(outcome, NotificationSendResult::Queued) {
-                        self.record_sent_content(
-                            &virtual_uri,
-                            &connection_key,
-                            injection.sent(),
-                            Some(version),
-                        );
-                    }
-                    Some(outcome)
+                    ))
                 } else {
                     self.rehold_unchanged_content(&virtual_uri, &connection_key, injection.sent());
                     None
