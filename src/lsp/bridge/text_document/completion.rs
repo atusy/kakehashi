@@ -279,6 +279,36 @@ pub(super) fn transform_completion_item(
         None
     };
 
+    // A snippet's tabstops vanish when the client expands it, so the text
+    // a prepared map checks must be the expansion too: `$0\n` reads as
+    // ending with a line break the map may need, but expands to one that
+    // can fuse with a CR the prepared document hides.
+    if snippet
+        && offset.prepared().is_some()
+        && let Some(text_edit) = &item.text_edit
+    {
+        let ranges = match text_edit {
+            tower_lsp_server::ls_types::CompletionTextEdit::Edit(edit) => {
+                vec![(edit.range, &edit.new_text)]
+            }
+            tower_lsp_server::ls_types::CompletionTextEdit::InsertAndReplace(edit) => {
+                vec![
+                    (edit.insert, &edit.new_text),
+                    (edit.replace, &edit.new_text),
+                ]
+            }
+        };
+        for (range, new_text) in ranges {
+            let expanded = tower_lsp_server::ls_types::TextEdit {
+                range,
+                new_text: snippet_expansion(new_text),
+            };
+            if translate_one_edit_to_host(expanded, offset).is_none() {
+                return false;
+            }
+        }
+    }
+
     // Transform text_edit if present
     if let Some(ref mut text_edit) = item.text_edit {
         match text_edit {
@@ -507,6 +537,87 @@ fn insertion_point_prefixed(offset: &RegionOffset, region_end: Position, host_li
             None => per_line_prefixed,
         },
     }
+}
+
+/// The text `snippet` expands to with every tabstop, placeholder and choice
+/// left at its default (and variables empty): what the client inserts unless
+/// the user types over it.
+fn snippet_expansion(snippet: &str) -> String {
+    fn expand(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, nested: bool) -> String {
+        let mut out = String::new();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => match chars.next() {
+                    Some(escaped @ ('$' | '}' | '\\')) => out.push(escaped),
+                    Some(other) => {
+                        out.push('\\');
+                        out.push(other);
+                    }
+                    None => out.push('\\'),
+                },
+                '}' if nested => return out,
+                '$' => match chars.peek().copied() {
+                    Some('{') => {
+                        chars.next();
+                        // A tabstop number or a variable name.
+                        while chars
+                            .peek()
+                            .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        {
+                            chars.next();
+                        }
+                        match chars.next() {
+                            Some(':') => out.push_str(&expand(chars, true)),
+                            Some('|') => {
+                                // The first choice.
+                                let mut choice = String::new();
+                                let mut first = true;
+                                while let Some(c) = chars.next() {
+                                    match c {
+                                        '\\' => {
+                                            if let Some(escaped) = chars.next() {
+                                                if first {
+                                                    choice.push(escaped);
+                                                }
+                                            }
+                                        }
+                                        ',' => first = false,
+                                        '|' => {
+                                            if chars.peek() == Some(&'}') {
+                                                chars.next();
+                                            }
+                                            break;
+                                        }
+                                        _ if first => choice.push(c),
+                                        _ => {}
+                                    }
+                                }
+                                out.push_str(&choice);
+                            }
+                            // `${1}`: nothing.
+                            Some('}') | None => {}
+                            // A transform, which this expansion ignores.
+                            Some(_) => {
+                                let _ = expand(chars, true);
+                            }
+                        }
+                    }
+                    Some(c) if c.is_ascii_alphanumeric() || c == '_' => {
+                        while chars
+                            .peek()
+                            .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        {
+                            chars.next();
+                        }
+                    }
+                    _ => out.push('$'),
+                },
+                _ => out.push(c),
+            }
+        }
+        out
+    }
+    expand(&mut snippet.chars().peekable(), false)
 }
 
 /// Whether snippet-syntax text references a snippet VARIABLE — `$name` or
@@ -808,6 +919,48 @@ pub(crate) fn strip_envelope(item: &mut CompletionItem) -> Option<KakehashiEnvel
 mod tests {
     use super::super::test_helpers::*;
     use super::*;
+
+    #[test]
+    fn a_snippet_expands_to_its_defaults() {
+        assert_eq!(snippet_expansion("$0\n"), "\n");
+        assert_eq!(snippet_expansion("f(${1})$0"), "f()");
+        assert_eq!(snippet_expansion("f(${1:x, ${2:y}})"), "f(x, y)");
+        assert_eq!(snippet_expansion("${1|a,b|}c"), "ac");
+        assert_eq!(snippet_expansion("\\$1 \\} $TM_X ${NAME:d}"), "$1 }  d");
+        assert_eq!(snippet_expansion("cost: $"), "cost: $");
+    }
+
+    #[test]
+    fn a_prepared_snippet_whose_expansion_fuses_a_hidden_line_break_is_dropped() {
+        use super::super::super::protocol::{VirtualLayout, apply_prepare_result};
+        // `\ra`, its leading blank line (ended by a lone CR) deleted: `$0\n`
+        // at the prepared start reads as text ending with a line break, but
+        // expands to an LF right after the hidden CR.
+        let result = serde_json::from_value(serde_json::json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared =
+            apply_prepare_result("\ra", &VirtualLayout::single("\ra"), Some(result)).unwrap();
+        let offset = RegionOffset::new(0, 0).with_prepared(prepared.map);
+        let mut item: tower_lsp_server::ls_types::CompletionItem = serde_json::from_value(
+            serde_json::json!({
+                "label": "x",
+                "insertTextFormat": 2,
+                "textEdit": {
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+                    "newText": "$0\n"
+                }
+            }),
+        )
+        .unwrap();
+        assert!(!transform_completion_item(
+            &mut item,
+            &offset,
+            Position::new(1, 1),
+            Some(Position::new(1, 0)),
+        ));
+    }
     use rstest::rstest;
     use serde_json::json;
 
