@@ -464,6 +464,10 @@ impl InjectionCoordinator {
             .filter(|injection| held.region_ids.contains(&injection.region_id))
             .partition(|injection| !injection.held);
         if !ready.is_empty() {
+            // Fire-and-forget like any didSave forward: a notification the
+            // downstream queue refuses is dropped, as a save sent directly
+            // under the same backpressure is, and is not retried — the debt
+            // is the save the held regions missed, not its delivery.
             self.bridge
                 .pool()
                 .sync_and_forward_did_save_to_virtual_docs(uri, held.incarnation, &ready)
