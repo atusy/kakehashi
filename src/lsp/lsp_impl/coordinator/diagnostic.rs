@@ -466,6 +466,7 @@ impl DiagnosticSnapshotPreparer {
             );
         let mut narrower_than_editor_pull = layer_cfg.priorities != editor_layer_cfg.priorities
             || layer_cfg.strategy != editor_layer_cfg.strategy;
+        let mut prepare_pending = false;
 
         // Virt layer: `None` = the document can never have virt diagnostics
         // (no injection query), distinct from `Some(vec![])` = gated off or
@@ -610,16 +611,18 @@ impl DiagnosticSnapshotPreparer {
                         // The snapshot is built synchronously: a document still
                         // waiting for its prepare peer skips this cycle (its host
                         // is synced again when the answer arrives).
-                        if let Some(ctx) =
-                            crate::lsp::lsp_impl::bridge_context::prepare_request_context_now(
-                                &self.bridge,
-                                &settings,
-                                self.experimental,
-                                &language_name,
-                                ctx,
-                            )
-                        {
-                            contexts.push(ctx);
+                        match crate::lsp::lsp_impl::bridge_context::prepare_request_context_now(
+                            &self.bridge,
+                            &settings,
+                            self.experimental,
+                            &language_name,
+                            ctx,
+                        ) {
+                            Ok(ctx) => contexts.push(ctx),
+                            Err(crate::lsp::lsp_impl::bridge_context::PrepareSkip::Failed) => {}
+                            Err(crate::lsp::lsp_impl::bridge_context::PrepareSkip::Pending) => {
+                                prepare_pending = true;
+                            }
                         }
                     }
                     contexts
@@ -711,6 +714,7 @@ impl DiagnosticSnapshotPreparer {
             virt_contexts,
             host_pull_enabled,
             narrower_than_editor_pull,
+            prepare_pending,
             host,
             layer_cfg,
         })

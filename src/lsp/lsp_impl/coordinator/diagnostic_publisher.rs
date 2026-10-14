@@ -489,6 +489,14 @@ impl DiagnosticPublisher {
                 }
                 continue;
             };
+            if snapshot.prepare_pending {
+                // A region waits for its prepare answer. The collection that
+                // runs when it arrives covers the region; this pull leaves it
+                // out and, committed after that collection, would drop its
+                // diagnostics. Skip the document and let the editor re-pull.
+                summary.coverage_incomplete = true;
+                continue;
+            }
             let lineage = snapshot.lineage;
             let narrower_than_editor_pull = snapshot.narrower_than_editor_pull;
             let pool = self.bridge.pool_arc();
@@ -2625,6 +2633,89 @@ mod tests {
         assert!(
             server.diagnostics.snapshot(&uri).is_empty(),
             "the old-surface result must not reach the cache"
+        );
+    }
+
+    /// A prefetch that finds a region still waiting for its prepare answer
+    /// leaves the document's pull layer alone: the collection run when the
+    /// answer arrives covers the region, and this narrower result, committed
+    /// after it, would drop the region's diagnostics.
+    #[tokio::test]
+    async fn prefetch_skips_a_document_with_a_region_awaiting_preparation() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server.set_experimental(true);
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("markdown".to_string(), tree_sitter_md::LANGUAGE.into());
+        let markdown: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let injection_query = tree_sitter::Query::new(
+            &markdown,
+            r#"
+            (fenced_code_block
+              (info_string
+                (language) @injection.language)
+              (code_fence_content) @injection.content)
+            "#,
+        )
+        .expect("valid markdown injection query");
+        server
+            .language
+            .query_store()
+            .insert_injection_query("markdown".to_string(), std::sync::Arc::new(injection_query));
+        server.settings_manager.apply_settings(WorkspaceSettings {
+            auto_install: false,
+            language_servers: HashMap::from([(
+                "lua-bridge".to_string(),
+                BridgeServerConfig {
+                    cmd: Some(vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        "cat > /dev/null".to_string(),
+                    ]),
+                    languages: Some(vec!["lua".to_string()]),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        });
+        server
+            .bridge
+            .insert_ready_test_connection("lua-bridge")
+            .await;
+
+        let uri = Url::parse("file:///test/prefetch_awaiting_preparation.md").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "```lua\nprint(1)\n```\n".to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("markdown"), None, None)
+            .await;
+        let publisher = DiagnosticPublisher::new(server);
+        publisher
+            .publish_pull_layer(&uri, vec![diag("prepared region")])
+            .await;
+
+        let summary = publisher
+            .prefetch_open_pull_fallback_diagnostics()
+            .await
+            .expect("no shutdown");
+
+        assert!(
+            server
+                .diagnostics
+                .snapshot(&uri)
+                .contains_key(&DiagnosticSource::PullLayer),
+            "the prefetch must not clear the pull layer while a region awaits its answer"
+        );
+        assert!(
+            summary.coverage_incomplete,
+            "a document left out of the prefetch cannot vouch for the editor's re-pull"
         );
     }
 

@@ -294,21 +294,30 @@ pub(crate) fn prepare_request_context_now(
     experimental: bool,
     host_language: &str,
     ctx: DocumentRequestContext,
-) -> Option<DocumentRequestContext> {
+) -> Result<DocumentRequestContext, PrepareSkip> {
     let Some(target) = bridge.prepare_target(
         settings,
         host_language,
         &ctx.resolved.injection_language,
         experimental,
     ) else {
-        return Some(ctx);
+        return Ok(ctx);
     };
     match bridge.prepared_document_now_for_request(&target, prepare_input(&ctx, host_language)) {
-        crate::lsp::bridge::PrepareLookup::Ready(prepared) => Some(with_prepared(ctx, &prepared)),
-        crate::lsp::bridge::PrepareLookup::Failed | crate::lsp::bridge::PrepareLookup::Pending => {
-            None
-        }
+        crate::lsp::bridge::PrepareLookup::Ready(prepared) => Ok(with_prepared(ctx, &prepared)),
+        crate::lsp::bridge::PrepareLookup::Failed => Err(PrepareSkip::Failed),
+        crate::lsp::bridge::PrepareLookup::Pending => Err(PrepareSkip::Pending),
     }
+}
+
+/// Why [`prepare_request_context_now`] gave no context to send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrepareSkip {
+    /// The peer could not prepare the region.
+    Failed,
+    /// No answer yet. A collection runs again once it arrives, and covers
+    /// the region.
+    Pending,
 }
 
 fn prepare_input<'a>(
