@@ -1426,14 +1426,30 @@ impl LineMap {
             .strip_suffix('\n')
             .map(|line| line.strip_suffix('\r').unwrap_or(line))
             .unwrap_or_else(|| line.strip_suffix('\r').unwrap_or(line));
-        let mut units = 0u32;
-        for (byte, character) in content.char_indices() {
-            if units >= position.character {
-                return line_start + byte;
-            }
-            units += character.len_utf16() as u32;
-        }
-        line_start + content.len()
+        let content_end = line_start + content.len();
+        // Through the index's per-line table of non-ASCII characters rather
+        // than a scan of the line. A line has no more UTF-16 units than
+        // bytes, so capping the column at the byte length keeps every column
+        // on the line while the byte it maps to cannot overflow; a column
+        // past the content clamps to its end, one inside a surrogate pair to
+        // the end of its character.
+        let character = position
+            .character
+            .min(u32::try_from(content.len()).unwrap_or(u32::MAX));
+        let byte = self
+            .index
+            .0
+            .to_utf8(
+                WideEncoding::Utf16,
+                WideLineCol {
+                    line: position.line,
+                    col: character,
+                },
+            )
+            .and_then(|line_col| self.index.0.offset(line_col))
+            .map_or(content_end, usize::from)
+            .min(content_end);
+        self.text.ceil_char_boundary(byte)
     }
 
     fn position(&self, offset: usize) -> Position {
@@ -1701,6 +1717,53 @@ fn diff_hunks(old: &str, new: &str) -> Vec<Hunk> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_clamped_offset_is_where_a_scan_of_its_line_stops() {
+        // The column-by-column scan the indexed conversion replaces.
+        fn scanned(text: &str, position: Position) -> usize {
+            let mut lines = Vec::new();
+            let mut start = 0;
+            let bytes = text.as_bytes();
+            for (index, byte) in bytes.iter().enumerate() {
+                let ends =
+                    *byte == b'\n' || (*byte == b'\r' && bytes.get(index + 1) != Some(&b'\n'));
+                if ends {
+                    lines.push(start..index + 1);
+                    start = index + 1;
+                }
+            }
+            lines.push(start..text.len());
+            let Some(range) = lines.get(position.line as usize) else {
+                return text.len();
+            };
+            let line = &text[range.clone()];
+            let content = line
+                .strip_suffix('\n')
+                .map(|line| line.strip_suffix('\r').unwrap_or(line))
+                .unwrap_or_else(|| line.strip_suffix('\r').unwrap_or(line));
+            let mut units = 0u32;
+            for (byte, character) in content.char_indices() {
+                if units >= position.character {
+                    return range.start + byte;
+                }
+                units += character.len_utf16() as u32;
+            }
+            range.start + content.len()
+        }
+        let text = "a\u{1F600}b\u{e9}\r\n\u{3042}\rx\n\n\u{1F600}";
+        let lines = LineMap::new(text.to_string());
+        for line in 0..7 {
+            for character in (0..12).chain([u32::MAX]) {
+                let position = Position::new(line, character);
+                assert_eq!(
+                    lines.offset_clamped(position),
+                    scanned(text, position),
+                    "{position:?}"
+                );
+            }
+        }
+    }
     use serde_json::json;
 
     /// The edit-mapping entry points the tests below read best through.
