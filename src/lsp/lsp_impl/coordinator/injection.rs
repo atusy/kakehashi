@@ -657,6 +657,14 @@ impl InjectionCoordinator {
             .map(|injection| (injection.language.as_str(), injection.region_id.as_str()))
             .collect();
         if !held.is_empty() {
+            for (language, region_id) in &held {
+                self.bridge.pool().hold_latest_virtual_content(
+                    uri,
+                    incarnation,
+                    language,
+                    region_id,
+                );
+            }
             for region_id in self.bridge.close_unprepared_held_docs(uri, &held).await {
                 self.diagnostics
                     .evict_source(uri, &DiagnosticSource::Region(region_id));

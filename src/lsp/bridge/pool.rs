@@ -380,6 +380,10 @@ pub(crate) struct HostVirtualContents {
     /// Explicit aliases keep their existing canonical request behavior.
     promoted_language: Option<HostLanguageAdmission>,
     contents: DashMap<String, DashMap<String, Arc<LatestText>>>,
+    /// (language, region id) of the regions the lifecycle pass holds for a
+    /// known prepare peer (see [`LanguageServerPool::hold_latest_virtual_content`]):
+    /// no request opens one with text as is.
+    held: dashmap::DashSet<(String, String)>,
 }
 
 /// The latest text forwarded for a virtual document, which a deferred
@@ -2877,6 +2881,30 @@ impl LanguageServerPool {
         let connection_generation = self.document_tracker.connection_generation(connection_key);
         let transition = self.open_transition_lock(virtual_uri, connection_key);
         let transition_guard = Arc::clone(&transition).lock_owned().await;
+        // Under the transition the lifecycle pass closes held documents
+        // under too: a region it holds for its prepare peer is not opened
+        // with text as is (a request resolved before its pair gained the
+        // peer), whether its own or the last forwarded.
+        if let VirtualOpenContent::LatestKnown(provided) = &content
+            && provided.map.is_none()
+            && self
+                .latest_virtual_contents
+                .get(host_uri)
+                .is_some_and(|host| {
+                    !host.held.is_empty()
+                        && host.held.contains(&(
+                            virtual_uri.language().to_string(),
+                            virtual_uri.region_id().to_string(),
+                        ))
+                })
+        {
+            drop(transition_guard);
+            self.remove_open_transition_lock_if_unshared(virtual_uri, connection_key, &transition);
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "bridge: the region is held for its prepare peer",
+            ));
+        }
         if !self
             .document_tracker
             .is_document_opened_on_connection(virtual_uri, connection_key)
@@ -3096,6 +3124,10 @@ impl LanguageServerPool {
         if host.incarnation != incarnation {
             return;
         }
+        if !host.held.is_empty() {
+            host.held
+                .remove(&(language.to_string(), region_id.to_string()));
+        }
         let latest = || {
             Arc::new(LatestText {
                 text: content.text.to_string(),
@@ -3201,8 +3233,29 @@ impl LanguageServerPool {
                 incarnation,
                 promoted_language: None,
                 contents: DashMap::new(),
+                held: dashmap::DashSet::new(),
             },
         );
+    }
+
+    /// Note that the lifecycle pass holds `region_id` (under `language`)
+    /// for a prepare peer known to prepare it: what was last forwarded for
+    /// it was sent as is, and a request opening it lazily must not send
+    /// that (or its own text as is) while it waits — or after its peer
+    /// failed. Cleared once text is recorded for it again.
+    pub(crate) fn hold_latest_virtual_content(
+        &self,
+        host_uri: &Url,
+        incarnation: u64,
+        language: &str,
+        region_id: &str,
+    ) {
+        if let Some(host) = self.latest_virtual_contents.get(host_uri)
+            && host.incarnation == incarnation
+        {
+            host.held
+                .insert((language.to_string(), region_id.to_string()));
+        }
     }
 
     pub(crate) async fn close_host_incarnation(&self, host_uri: &Url, incarnation: u64) {
@@ -8974,6 +9027,57 @@ mod tests {
             panic!("didOpen must be an untracked notification");
         };
         assert_eq!(message["params"]["textDocument"]["text"], "b");
+    }
+
+    #[tokio::test]
+    async fn a_region_held_for_its_peer_is_not_opened_as_is() {
+        use super::super::protocol::{VirtualLayout, apply_prepare_result};
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///test/held-open.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  a");
+        // The lifecycle pass holds it: its pair gained a peer.
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(1);
+        assert!(
+            pool.ensure_document_opened(&mut sender, &host_uri, &virtual_uri, "  a", &key)
+                .await
+                .is_err(),
+            "a request built as is opens nothing"
+        );
+        assert!(rx.try_recv().is_err());
+        // Its prepared text opens it.
+        let result = serde_json::from_value(serde_json::json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared =
+            apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(result)).unwrap();
+        pool.ensure_document_opened(
+            &mut sender,
+            &host_uri,
+            &virtual_uri,
+            SentText {
+                text: &prepared.text,
+                map: prepared.map.as_ref(),
+            },
+            &key,
+        )
+        .await
+        .unwrap();
+        assert!(rx.try_recv().is_ok());
+        // Text recorded for it again (the pass sends it) clears the hold.
+        pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  a");
+        assert!(
+            !pool
+                .latest_virtual_contents
+                .get(&host_uri)
+                .unwrap()
+                .held
+                .contains(&("lua".to_string(), TEST_ULID_LUA_0.to_string()))
+        );
     }
 
     #[tokio::test]
