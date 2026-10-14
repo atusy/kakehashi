@@ -836,8 +836,11 @@ impl DocumentTracker {
                 Some(previous)
             }
             _ => {
-                let generation = self.held_generations.fetch_add(1, Ordering::Relaxed) + 1;
-                docs.insert(
+                // Published once the record is in (generations are given out
+                // only under this lock): a watermark read without the lock
+                // never covers a record made after it.
+                let generation = self.held_generations.load(Ordering::Relaxed) + 1;
+                let previous = docs.insert(
                     uri_string,
                     HeldText {
                         fingerprint,
@@ -845,7 +848,9 @@ impl DocumentTracker {
                         generation,
                         version,
                     },
-                )
+                );
+                self.held_generations.store(generation, Ordering::Release);
+                previous
             }
         }
     }
@@ -921,16 +926,12 @@ impl DocumentTracker {
         self.record_sent(virtual_uri, connection_key, content, None);
     }
 
-    /// The newest [`HeldText::generation`] given out so far: a text held
-    /// with a newer one was sent after this was read. Read under the lock
-    /// generations are given out under, so no text taking one before this
-    /// read is recorded after it.
+    /// The newest [`HeldText::generation`] published so far: a text held
+    /// with a newer one was recorded after this was read (a generation is
+    /// published only once its record is in). Lock-free, for the reader to
+    /// take as each message arrives.
     pub(in crate::lsp::bridge) fn held_through(&self) -> u64 {
-        let _docs = self
-            .document_fingerprints
-            .lock()
-            .recover_poison("DocumentTracker::document_fingerprints");
-        self.held_generations.load(Ordering::Relaxed)
+        self.held_generations.load(Ordering::Acquire)
     }
 
     /// What `connection` holds for `virtual_uri` now, to stamp a push it

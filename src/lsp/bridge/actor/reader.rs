@@ -870,7 +870,17 @@ async fn reader_loop_with_liveness<R: tokio::io::AsyncRead + Unpin>(
                         // Reset liveness timer on any message activity (ls-bridge-async-connection)
                         liveness.reset(&server_prefix);
 
-                        handle_message(message, &router, &server_prefix, &server_request_deps).await;
+                        // What connections hold as the message arrived: an inbound
+                        // edit or selection was computed for no newer text.
+                        let held_through = server_request_deps.document_tracker.held_through();
+                        handle_message(
+                            message,
+                            &router,
+                            &server_prefix,
+                            &server_request_deps,
+                            held_through,
+                        )
+                        .await;
 
                         // Check if pending count returned to 0 - stop timer
                         if liveness.is_active() && router.awaiting_downstream_count() == 0 {
@@ -921,11 +931,14 @@ fn classify_message(message: &serde_json::Value) -> MessageKind {
 }
 
 /// Handle a single message from the downstream server.
+/// `held_through`: the held-text watermark taken as the message arrived
+/// (see `DocumentTracker::held_through`).
 async fn handle_message(
     message: serde_json::Value,
     router: &ResponseRouter,
     server_prefix: &str,
     deps: &ServerRequestDeps,
+    held_through: u64,
 ) {
     match classify_message(&message) {
         MessageKind::Response => {
@@ -957,7 +970,7 @@ async fn handle_message(
             }
         }
         MessageKind::ServerRequest => {
-            handle_server_request(message, server_prefix, deps).await;
+            handle_server_request(message, server_prefix, deps, held_through).await;
         }
         MessageKind::Notification => {
             // `publishDiagnostics` targeting a pipeline *scratch* document is
@@ -1052,6 +1065,7 @@ async fn handle_server_request(
     message: serde_json::Value,
     server_prefix: &str,
     deps: &ServerRequestDeps,
+    held_through: u64,
 ) {
     let id: jsonrpc::Id = message
         .get("id")
@@ -1072,11 +1086,11 @@ async fn handle_server_request(
             return;
         }
         "window/showDocument" => {
-            window::show_document::handle(&message, id, server_prefix, deps);
+            window::show_document::handle(&message, id, server_prefix, deps, held_through);
             return;
         }
         "workspace/applyEdit" => {
-            workspace::apply_edit::handle(&message, id, server_prefix, deps);
+            workspace::apply_edit::handle(&message, id, server_prefix, deps, held_through);
             return;
         }
         "kakehashi/bridge/peer/request" if deps.experimental_enabled => {
@@ -1258,7 +1272,7 @@ mod tests {
             "result": null
         });
 
-        handle_message(response, &router, "", &deps).await;
+        handle_message(response, &router, "", &deps, u64::MAX).await;
 
         // Receiver should have the response
         // We can't block on rx.await here in a sync test, but we can check
@@ -1280,7 +1294,7 @@ mod tests {
             "params": {}
         });
 
-        handle_message(notification, &router, "", &deps).await;
+        handle_message(notification, &router, "", &deps, u64::MAX).await;
 
         // Pending count should still be 1 (notification was ignored)
         assert_eq!(router.pending_count(), 1);
@@ -1307,6 +1321,7 @@ mod tests {
             &router,
             "",
             &deps,
+            u64::MAX,
         )
         .await;
         assert!(
@@ -1321,6 +1336,7 @@ mod tests {
             &router,
             "",
             &deps,
+            u64::MAX,
         )
         .await;
         assert!(!other.is_cancelled(), "unknown id must not cancel anything");
@@ -1390,6 +1406,7 @@ mod tests {
             &router,
             "",
             &deps,
+            u64::MAX,
         )
         .await;
         handle_message(
@@ -1401,6 +1418,7 @@ mod tests {
             &router,
             "",
             &deps,
+            u64::MAX,
         )
         .await;
 
@@ -1422,7 +1440,7 @@ mod tests {
             "params": { "type": 3, "message": "downstream says hi" }
         });
 
-        handle_message(notification, &router, "", &deps).await;
+        handle_message(notification, &router, "", &deps, u64::MAX).await;
 
         let forwarded = window_rx
             .try_recv()
@@ -1447,7 +1465,7 @@ mod tests {
             "params": { "message": 42 }
         });
 
-        handle_message(notification, &router, "", &deps).await;
+        handle_message(notification, &router, "", &deps, u64::MAX).await;
 
         assert!(
             window_rx.try_recv().is_err(),
@@ -1466,7 +1484,7 @@ mod tests {
             "params": { "type": 1, "message": "important popup" }
         });
 
-        handle_message(notification, &router, "", &deps).await;
+        handle_message(notification, &router, "", &deps, u64::MAX).await;
 
         let forwarded = window_rx
             .try_recv()
@@ -1522,8 +1540,8 @@ mod tests {
         // Capacity 1: the first message fills the queue, the second must be
         // dropped without blocking (this await completing IS the assertion
         // that the reader path stays non-blocking on a full queue).
-        handle_message(notification("first"), &router, "", &deps).await;
-        handle_message(notification("second"), &router, "", &deps).await;
+        handle_message(notification("first"), &router, "", &deps, u64::MAX).await;
+        handle_message(notification("second"), &router, "", &deps, u64::MAX).await;
 
         let forwarded = window_rx.try_recv().expect("first message is delivered");
         assert_eq!(
@@ -2009,7 +2027,7 @@ mod tests {
             "params": {}
         });
 
-        handle_message(server_request, &router, "", &deps).await;
+        handle_message(server_request, &router, "", &deps, u64::MAX).await;
 
         // The server request should NOT be routed as a response.
         // Pending count must remain 1 (the registered request is still waiting).
@@ -2065,7 +2083,7 @@ mod tests {
             }
         });
 
-        handle_message(message, &router, "", &deps).await;
+        handle_message(message, &router, "", &deps, u64::MAX).await;
 
         // Registry should have the registration
         assert!(dynamic_capabilities.has_registration("textDocument/diagnostic"));
@@ -2125,6 +2143,7 @@ mod tests {
                 &router,
                 "",
                 &deps,
+                u64::MAX,
             )
             .await;
 
@@ -2162,6 +2181,7 @@ mod tests {
             &router,
             "[tsudoi] ",
             &deps,
+            u64::MAX,
         )
         .await;
 
@@ -2199,6 +2219,7 @@ mod tests {
             &router,
             "[tsudoi] ",
             &deps,
+            u64::MAX,
         )
         .await;
 
@@ -2258,6 +2279,7 @@ mod tests {
             router,
             "[tsudoi] ",
             deps,
+            u64::MAX,
         )
         .await;
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -2300,6 +2322,7 @@ mod tests {
             &router,
             "[tsudoi] ",
             &deps,
+            u64::MAX,
         )
         .await;
 
@@ -2414,6 +2437,7 @@ mod tests {
             &router,
             "[tsudoi] ",
             &deps,
+            u64::MAX,
         )
         .await;
 
@@ -2468,6 +2492,7 @@ mod tests {
             &router,
             "[tsudoi] ",
             &deps,
+            u64::MAX,
         )
         .await;
 
@@ -2530,6 +2555,7 @@ mod tests {
             &router,
             "[tsudoi] ",
             &deps,
+            u64::MAX,
         )
         .await;
 
@@ -2571,6 +2597,7 @@ mod tests {
             &router,
             "[tsudoi] ",
             &deps,
+            u64::MAX,
         ));
         tokio::select! {
             biased;
@@ -2643,7 +2670,7 @@ mod tests {
             }
         });
 
-        handle_message(message, &router, "", &deps).await;
+        handle_message(message, &router, "", &deps, u64::MAX).await;
 
         // Registry should no longer have the registration
         assert!(!dynamic_capabilities.has_registration("textDocument/diagnostic"));
@@ -2701,7 +2728,7 @@ mod tests {
             "params": { "token": "some-token" }
         });
 
-        handle_message(message, &router, "", &deps).await;
+        handle_message(message, &router, "", &deps, u64::MAX).await;
 
         // Downstream gets an immediate success ack.
         let response = response_rx.try_recv().expect("should have response");
@@ -2736,7 +2763,7 @@ mod tests {
                 "value": { "kind": "begin", "title": "Indexing" }
             }
         });
-        handle_message(begin, &router, "", &deps).await;
+        handle_message(begin, &router, "", &deps, u64::MAX).await;
         let UpstreamNotification::CreateWorkDoneProgress { token } = upstream_rx
             .try_recv()
             .expect("renderable begin should announce the token")
@@ -2793,19 +2820,19 @@ mod tests {
             "method": "window/workDoneProgress/create",
             "params": { "token": "storm" }
         });
-        handle_message(create, &router, "", &deps).await;
+        handle_message(create, &router, "", &deps, u64::MAX).await;
         let begin = json!({
             "jsonrpc": "2.0",
             "method": "$/progress",
             "params": { "token": "storm", "value": { "kind": "begin", "title": "" } }
         });
-        handle_message(begin, &router, "", &deps).await;
+        handle_message(begin, &router, "", &deps, u64::MAX).await;
         let end = json!({
             "jsonrpc": "2.0",
             "method": "$/progress",
             "params": { "token": "storm", "value": { "kind": "end" } }
         });
-        handle_message(end, &router, "", &deps).await;
+        handle_message(end, &router, "", &deps, u64::MAX).await;
 
         assert!(
             upstream_rx.try_recv().is_err(),
@@ -2857,7 +2884,7 @@ mod tests {
             "method": "window/workDoneProgress/create",
             "params": { "token": "msg-only" }
         });
-        handle_message(create, &router, "", &deps).await;
+        handle_message(create, &router, "", &deps, u64::MAX).await;
         let begin = json!({
             "jsonrpc": "2.0",
             "method": "$/progress",
@@ -2866,7 +2893,7 @@ mod tests {
                 "value": { "kind": "begin", "title": "", "message": "Indexing 42%" }
             }
         });
-        handle_message(begin, &router, "", &deps).await;
+        handle_message(begin, &router, "", &deps, u64::MAX).await;
 
         let UpstreamNotification::CreateWorkDoneProgress { .. } = upstream_rx
             .try_recv()
@@ -2919,7 +2946,7 @@ mod tests {
             "method": "window/workDoneProgress/create",
             "params": { "token": "cancellable-only" }
         });
-        handle_message(create, &router, "", &deps).await;
+        handle_message(create, &router, "", &deps, u64::MAX).await;
         let begin = json!({
             "jsonrpc": "2.0",
             "method": "$/progress",
@@ -2928,7 +2955,7 @@ mod tests {
                 "value": { "kind": "begin", "title": "", "cancellable": true }
             }
         });
-        handle_message(begin, &router, "", &deps).await;
+        handle_message(begin, &router, "", &deps, u64::MAX).await;
 
         assert!(
             matches!(
@@ -2982,13 +3009,13 @@ mod tests {
             "method": "window/workDoneProgress/create",
             "params": { "token": "reused" }
         });
-        handle_message(create, &router, "", &deps).await;
+        handle_message(create, &router, "", &deps, u64::MAX).await;
         let blank = json!({
             "jsonrpc": "2.0",
             "method": "$/progress",
             "params": { "token": "reused", "value": { "kind": "begin", "title": "" } }
         });
-        handle_message(blank, &router, "", &deps).await;
+        handle_message(blank, &router, "", &deps, u64::MAX).await;
         assert!(
             upstream_rx.try_recv().is_err(),
             "blank begin is swallowed first"
@@ -2999,7 +3026,7 @@ mod tests {
             "method": "$/progress",
             "params": { "token": "reused", "value": { "kind": "begin", "title": "Indexing" } }
         });
-        handle_message(renderable, &router, "", &deps).await;
+        handle_message(renderable, &router, "", &deps, u64::MAX).await;
         assert!(
             matches!(
                 upstream_rx.try_recv(),
@@ -3057,11 +3084,11 @@ mod tests {
             })
         };
 
-        handle_message(make(), &router, "", &deps).await;
+        handle_message(make(), &router, "", &deps, u64::MAX).await;
 
         // Re-create before any begin: the first token was never announced, so
         // nothing is forgotten (and nothing was created).
-        handle_message(make(), &router, "", &deps).await;
+        handle_message(make(), &router, "", &deps, u64::MAX).await;
         assert!(
             upstream_rx.try_recv().is_err(),
             "unannounced stale token needs no Forget"
@@ -3073,7 +3100,7 @@ mod tests {
             "method": "$/progress",
             "params": { "token": "dup", "value": { "kind": "begin", "title": "Indexing" } }
         });
-        handle_message(begin, &router, "", &deps).await;
+        handle_message(begin, &router, "", &deps, u64::MAX).await;
         let UpstreamNotification::CreateWorkDoneProgress { token: announced } =
             upstream_rx.try_recv().expect("announce create")
         else {
@@ -3085,7 +3112,7 @@ mod tests {
         };
 
         // ...then a third create for the SAME downstream token forgets it.
-        handle_message(make(), &router, "", &deps).await;
+        handle_message(make(), &router, "", &deps, u64::MAX).await;
         let UpstreamNotification::ForgetWorkDoneProgress(forgotten) =
             upstream_rx.try_recv().expect("forget stale")
         else {
@@ -3099,7 +3126,7 @@ mod tests {
             "method": "$/progress",
             "params": { "token": "dup", "value": { "kind": "begin", "title": "Indexing" } }
         });
-        handle_message(begin2, &router, "", &deps).await;
+        handle_message(begin2, &router, "", &deps, u64::MAX).await;
         let UpstreamNotification::CreateWorkDoneProgress { token: reannounced } =
             upstream_rx.try_recv().expect("re-announce create")
         else {
@@ -3145,7 +3172,7 @@ mod tests {
             "params": {}
         });
 
-        handle_message(message, &router, "", &deps).await;
+        handle_message(message, &router, "", &deps, u64::MAX).await;
 
         // An error response is returned and nothing is bridged upstream.
         let response = response_rx.try_recv().expect("should have response");
@@ -3209,7 +3236,7 @@ mod tests {
                 "value": { "kind": "begin", "title": "Indexing" }
             }
         });
-        handle_message(begin, &router, "", &deps).await;
+        handle_message(begin, &router, "", &deps, u64::MAX).await;
         let UpstreamNotification::CreateWorkDoneProgress { token } =
             upstream_rx.try_recv().expect("begin should announce")
         else {
@@ -3230,7 +3257,7 @@ mod tests {
             "method": "$/progress",
             "params": { "token": 1, "value": { "kind": "report", "message": "50%" } }
         });
-        handle_message(report, &router, "", &deps).await;
+        handle_message(report, &router, "", &deps, u64::MAX).await;
         let UpstreamNotification::Progress { params } =
             upstream_rx.try_recv().expect("report should forward")
         else {
@@ -3249,7 +3276,7 @@ mod tests {
             "method": "$/progress",
             "params": { "token": 1, "value": { "kind": "end" } }
         });
-        handle_message(end, &router, "", &deps).await;
+        handle_message(end, &router, "", &deps, u64::MAX).await;
         assert!(upstream_rx.try_recv().is_ok(), "end should forward");
         assert_eq!(
             progress_registry.translate(progress_connection_id, &downstream_token),
@@ -3293,7 +3320,7 @@ mod tests {
             "method": "$/progress",
             "params": { "token": "never-registered", "value": { "kind": "begin", "title": "x" } }
         });
-        handle_message(progress, &router, "", &deps).await;
+        handle_message(progress, &router, "", &deps, u64::MAX).await;
 
         assert!(
             upstream_rx.try_recv().is_err(),
@@ -3339,7 +3366,7 @@ mod tests {
             "params": null
         });
 
-        handle_message(message, &router, "", &deps).await;
+        handle_message(message, &router, "", &deps, u64::MAX).await;
 
         // The response is queued before prefetch can be triggered upstream.
         let response = response_rx.try_recv().expect("should have response");
@@ -3399,7 +3426,7 @@ mod tests {
             "params": null
         });
 
-        handle_message(message, &router, "", &deps).await;
+        handle_message(message, &router, "", &deps, u64::MAX).await;
 
         let response = response_rx.try_recv().expect("should have response");
         match response {
@@ -3448,7 +3475,7 @@ mod tests {
             "params": null
         });
 
-        handle_message(message, &router, "", &deps).await;
+        handle_message(message, &router, "", &deps, u64::MAX).await;
 
         let response = response_rx.try_recv().expect("should have response");
         match response {
@@ -3505,7 +3532,7 @@ mod tests {
             }
         });
 
-        handle_message(message, &router, "", &deps).await;
+        handle_message(message, &router, "", &deps, u64::MAX).await;
 
         assert!(
             upstream_rx.try_recv().is_err(),
@@ -3572,7 +3599,7 @@ mod tests {
             "method": "textDocument/publishDiagnostics",
             "params": {"uri": uri, "diagnostics": []}
         });
-        handle_message(message, &router, "", &deps).await;
+        handle_message(message, &router, "", &deps, u64::MAX).await;
         // The next text goes out while the push waits upstream.
         send("b");
         let now = tracker.held_stamp(&uri, &connection, None).unwrap();
@@ -3622,7 +3649,7 @@ mod tests {
             }
         });
 
-        handle_message(message, &router, "", &deps).await;
+        handle_message(message, &router, "", &deps, u64::MAX).await;
 
         match upstream_rx
             .try_recv()
@@ -3688,7 +3715,7 @@ mod tests {
             }
         });
 
-        handle_message(message, &router, "", &deps).await;
+        handle_message(message, &router, "", &deps, u64::MAX).await;
 
         match upstream_rx
             .try_recv()
@@ -3744,7 +3771,7 @@ mod tests {
             "method": "textDocument/publishDiagnostics",
             "params": {"uri": uri, "diagnostics": [{"range": "not-a-range"}]}
         });
-        handle_message(malformed, &ResponseRouter::new(), "", &deps).await;
+        handle_message(malformed, &ResponseRouter::new(), "", &deps, u64::MAX).await;
         assert!(
             upstream_rx.try_recv().is_err(),
             "malformed diagnostics must be dropped, not routed"
@@ -3757,7 +3784,7 @@ mod tests {
             "method": "textDocument/publishDiagnostics",
             "params": {"uri": uri, "diagnostics": []}
         });
-        handle_message(empty, &ResponseRouter::new(), "", &deps).await;
+        handle_message(empty, &ResponseRouter::new(), "", &deps, u64::MAX).await;
         match upstream_rx
             .try_recv()
             .expect("empty array should be routed")
@@ -3775,7 +3802,7 @@ mod tests {
             "method": "textDocument/publishDiagnostics",
             "params": "not-an-object"
         });
-        handle_message(bad_params, &ResponseRouter::new(), "", &deps).await;
+        handle_message(bad_params, &ResponseRouter::new(), "", &deps, u64::MAX).await;
         assert!(
             upstream_rx.try_recv().is_err(),
             "a non-object params must be dropped without panicking"
@@ -3788,7 +3815,7 @@ mod tests {
             "method": "textDocument/publishDiagnostics",
             "params": {"diagnostics": []}
         });
-        handle_message(no_uri, &ResponseRouter::new(), "", &deps).await;
+        handle_message(no_uri, &ResponseRouter::new(), "", &deps, u64::MAX).await;
         assert!(upstream_rx.try_recv().is_err(), "missing uri is dropped");
     }
 
@@ -3825,7 +3852,7 @@ mod tests {
             "params": {}
         });
 
-        handle_message(message, &router, "", &deps).await;
+        handle_message(message, &router, "", &deps, u64::MAX).await;
 
         let response = response_rx.try_recv().expect("should have response");
         match response {
@@ -3870,7 +3897,7 @@ mod tests {
             "method": "client/registerCapability"
         });
 
-        handle_message(message, &router, "", &deps).await;
+        handle_message(message, &router, "", &deps, u64::MAX).await;
 
         // Should respond with InvalidParams error (-32602)
         let response = response_rx.try_recv().expect("should have response");
@@ -3930,7 +3957,7 @@ mod tests {
             "method": "client/unregisterCapability"
         });
 
-        handle_message(message, &router, "", &deps).await;
+        handle_message(message, &router, "", &deps, u64::MAX).await;
 
         // Should respond with InvalidParams error (-32602)
         let response = response_rx.try_recv().expect("should have response");
@@ -4000,7 +4027,7 @@ mod tests {
                 "method": "window/workDoneProgress/create",
                 "params": { "token": "test" }
             });
-            handle_server_request(message, "", &deps).await;
+            handle_server_request(message, "", &deps, u64::MAX).await;
         });
 
         // Give handle_server_request a moment to start waiting
@@ -4068,7 +4095,7 @@ mod tests {
         });
 
         // Should not panic
-        handle_server_request(message, "", &deps).await;
+        handle_server_request(message, "", &deps, u64::MAX).await;
     }
 
     // ============================================================
@@ -4539,7 +4566,7 @@ mod tests {
             "method": "telemetry/event",
             "params": { "kind": "metric", "value": 42 }
         });
-        handle_message(notification, &router, "", &deps).await;
+        handle_message(notification, &router, "", &deps, u64::MAX).await;
 
         match window_rx
             .try_recv()
@@ -4611,7 +4638,7 @@ mod tests {
                 "actions": [{ "title": "Retry" }, { "title": "Cancel" }]
             }
         });
-        handle_message(request, &router, "", &deps).await;
+        handle_message(request, &router, "", &deps, u64::MAX).await;
 
         // The bridge forwards an UpstreamRequest carrying the reply channel.
         let UpstreamRequest::ShowMessageRequest {
@@ -4653,7 +4680,7 @@ mod tests {
             "method": "window/showMessageRequest",
             "params": { "type": 1, "message": "oops" }
         });
-        handle_message(request, &router, "", &deps).await;
+        handle_message(request, &router, "", &deps, u64::MAX).await;
 
         // Dropping the request (and its reply sender) simulates the editor failing
         // to answer; the downstream must still get a `null` (no selection).
@@ -4677,7 +4704,7 @@ mod tests {
             "method": "window/showMessageRequest",
             "params": { "message": "no type" }
         });
-        handle_message(request, &router, "", &deps).await;
+        handle_message(request, &router, "", &deps, u64::MAX).await;
 
         let response = recv_untracked(&mut response_rx).await;
         assert_eq!(response["id"], 9);
@@ -4702,7 +4729,7 @@ mod tests {
             "method": "window/showDocument",
             "params": { "uri": virtual_uri }
         });
-        handle_message(request, &router, "", &deps).await;
+        handle_message(request, &router, "", &deps, u64::MAX).await;
 
         let UpstreamRequest::ShowDocument { params, reply, .. } = request_rx
             .recv()
@@ -4731,7 +4758,7 @@ mod tests {
             "method": "window/showDocument",
             "params": { "uri": "file:///nope.rs" }
         });
-        handle_message(request, &router, "", &deps).await;
+        handle_message(request, &router, "", &deps, u64::MAX).await;
 
         let UpstreamRequest::ShowDocument { reply, .. } =
             request_rx.recv().await.expect("forwarded")
@@ -4758,7 +4785,7 @@ mod tests {
             "method": "window/showDocument",
             "params": { "external": true }
         });
-        handle_message(request, &router, "", &deps).await;
+        handle_message(request, &router, "", &deps, u64::MAX).await;
 
         let response = recv_untracked(&mut response_rx).await;
         assert_eq!(response["id"], 13);
@@ -4783,7 +4810,7 @@ mod tests {
             "method": "window/showDocument",
             "params": { "uri": "file:///x.rs" }
         });
-        handle_message(request, &router, "", &deps).await;
+        handle_message(request, &router, "", &deps, u64::MAX).await;
 
         let response = recv_untracked(&mut response_rx).await;
         assert_eq!(response["id"], 12);
@@ -4804,7 +4831,7 @@ mod tests {
                 "edit": { "changes": { "file:///p/main.rs": [] } }
             }
         });
-        handle_message(request, &router, "", &deps).await;
+        handle_message(request, &router, "", &deps, u64::MAX).await;
 
         let UpstreamRequest::ApplyEdit { params, reply, .. } = request_rx
             .recv()
@@ -4846,7 +4873,7 @@ mod tests {
             "method": "workspace/applyEdit",
             "params": { "edit": {} }
         });
-        handle_message(request, &router, "", &deps).await;
+        handle_message(request, &router, "", &deps, u64::MAX).await;
 
         // Dropping the request (and its reply sender) simulates the editor
         // failing to answer; the downstream must still get `applied: false`.
@@ -4874,7 +4901,7 @@ mod tests {
             "method": "workspace/applyEdit",
             "params": { "label": "no edit" }
         });
-        handle_message(request, &router, "", &deps).await;
+        handle_message(request, &router, "", &deps, u64::MAX).await;
 
         let response = recv_untracked(&mut response_rx).await;
         assert_eq!(response["id"], 22);
@@ -4902,6 +4929,7 @@ mod tests {
             jsonrpc::Id::Number(9),
             "[test] ",
             &deps,
+            u64::MAX,
         );
 
         let sent = tokio::time::timeout(std::time::Duration::from_secs(5), response_rx.recv())
@@ -4936,6 +4964,7 @@ mod tests {
             jsonrpc::Id::Number(10),
             "[test] ",
             &deps,
+            u64::MAX,
         );
 
         let forwarded = tokio::time::timeout(std::time::Duration::from_secs(5), request_rx.recv())
@@ -4983,6 +5012,7 @@ mod tests {
             jsonrpc::Id::Number(11),
             "[test] ",
             &deps,
+            u64::MAX,
         );
 
         let sent = tokio::time::timeout(std::time::Duration::from_secs(5), response_rx.recv())
