@@ -926,7 +926,9 @@ impl PreparedMap {
 
     /// [`Self::mapped_edits_keep_host_text`] for edits already in V (a
     /// merged set: the mapped edits with edits made to the host directly):
-    /// `false` too when one names no location in V.
+    /// `false` too when one names no location in V, or reaches into text
+    /// the prepared document hides (a gap, a deleted edge line), where no
+    /// mapped edit reaches.
     pub(crate) fn virtual_edits_keep_host_text(&self, edits: &[TextEdit]) -> bool {
         let mut mapped = Vec::with_capacity(edits.len());
         for edit in edits {
@@ -937,6 +939,19 @@ impl PreparedMap {
                 return false;
             };
             if start > end {
+                return false;
+            }
+            let reaches_hidden = self.runs.iter().any(|run| {
+                matches!(
+                    run.kind,
+                    RunKind::Gap | RunKind::LeadingLines | RunKind::TrailingLines
+                ) && if start == end {
+                    run.virtual_.start < start && start < run.virtual_.end
+                } else {
+                    run.virtual_.start < end && start < run.virtual_.end
+                }
+            });
+            if reaches_hidden {
                 return false;
             }
             mapped.push((start..end, edit.new_text.clone()));

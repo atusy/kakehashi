@@ -1030,6 +1030,41 @@ mod tests {
         ));
     }
 
+    #[rstest::rstest]
+    #[case::hidden_lone_cr_line("\rab\n", 2)]
+    #[case::hidden_lf_line("\nabc", 1)]
+    fn a_direct_host_edit_over_a_hidden_edge_line_is_refused(
+        #[case] virtual_text: &str,
+        #[case] end_line: u32,
+    ) {
+        use super::super::prepare::{VirtualLayout, apply_prepare_result};
+        // The leading line deleted by the peer.
+        let result = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(result),
+        )
+        .unwrap();
+        let offset = RegionOffset::new(0, 0).with_prepared(prepared.map);
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let mut edit = parse_workspace_edit(json!({
+            "changes": { host_uri.as_str(): [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": end_line, "character": 0}}, "newText": ""}
+            ]}
+        }));
+        assert!(!transform_workspace_edit_to_host(
+            &mut edit,
+            &virtual_uri,
+            &host_uri,
+            &offset,
+        ));
+    }
+
     #[test]
     fn the_same_prepared_edit_in_both_representations_is_no_overlap() {
         use super::super::prepare::{VirtualLayout, apply_prepare_result};
