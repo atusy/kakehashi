@@ -1165,7 +1165,8 @@ fence is the region's last line.
 
 Host text that a custom query leaves out of a one-line region, such as the
 `// ` before JSON extracted from a Rust comment, is not repeated on lines a
-formatter adds in the sequential `concatenated` pipeline. Restore it by hand;
+formatter adds in the sequential `concatenated` pipeline, unless it is only
+`>` markers and indentation. Restore it by hand;
 see
 [Host text on lines a formatter adds](language-features.md#host-text-on-lines-a-formatter-adds).
 

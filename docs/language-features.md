@@ -255,15 +255,17 @@ Restore the markers yourself:
 Until you do, the new lines are outside the comment. The Rust file may no
 longer compile, or may mean something else. A query that removes host text
 from a region decides what the server sees. It does not tell formatting to
-repeat that text on lines the formatter adds. Under the default `preferred`
+repeat that text on lines the formatter adds. The pipeline repeats left-out
+text only when it holds nothing but `>` markers and indentation, as a
+blockquote's line prefix does. Under the default `preferred`
 strategy, and for range and on-type formatting, the same answer adds line
 breaks to a one-line region that opens after host text, so it is dropped whole
 as described above, and the line is left as it was.
 
 This differs from a fenced code block inside a Markdown blockquote. There the
-`> ` on each line is recorded as a line prefix when the block is extracted, and
-the sequential pipeline puts the prefix back on every line, including the lines
-a formatter adds.
+text before each line holds only `>` markers and indentation, so the sequential
+pipeline reads it as a line prefix and puts it back on the lines a formatter
+adds.
 
 ### Range formatting
 
