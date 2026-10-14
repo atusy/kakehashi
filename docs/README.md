@@ -873,7 +873,7 @@ The `bridge` map in language configuration controls which injection languages ar
 | `{}` | Disable bridging entirely for this host language |
 | `null` or omitted | Bridge all configured languages (default) |
 
-**Preparing Virtual Documents (`prepare`, experimental):**
+**Preparing Virtual Documents (experimental):**
 
 Embedded code is not always valid as written: a Nix indented string's
 content is indented by the host, and its `${…}` interpolations leave holes.
@@ -1243,9 +1243,9 @@ opening delimiter's line break. A region holding only whitespace, such as an
 empty Nix `''` string, is left as it is. This applies to full and range formatting,
 in the editor as well as here. On-type formatting is left as the server
 answers: it reformats the line being typed, which at the end of an unclosed
-fence is the region's last line. In a document a `prepare` server joins from
+fence is the region's last line. In a document a prepare peer joins from
 several strings (the Nix between them emptied), each string keeps its own
-edges. Blank lines a `prepare` server deleted never reach the formatter, so
+edges. Blank lines a prepare peer deleted never reach the formatter, so
 they stay as they are.
 
 ```bash
