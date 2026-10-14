@@ -147,11 +147,9 @@ impl LanguageServerPool {
     }
 
     /// Send a didChange of `content` and record it as what the connection
-    /// holds (see [`DocumentTracker::record_sent`]): recorded first, so a
+    /// holds (see `DocumentTracker::record_around`): recorded first, so a
     /// push the server answers it with already finds it, and taken back
-    /// unless the send was queued.
-    ///
-    /// [`DocumentTracker::record_sent`]: super::super::pool::DocumentTracker::record_sent
+    /// unless the send was queued — all before any push is stamped.
     pub(super) fn send_didchange_recorded(
         &self,
         handle: &Arc<ConnectionHandle>,
@@ -161,17 +159,21 @@ impl LanguageServerPool {
         version: i32,
     ) -> NotificationSendResult {
         let text = content.text;
-        let previous = self.record_sent_held(virtual_uri, connection_key, content, version);
-        let result = Self::send_didchange_for_virtual_doc(
-            handle,
-            &virtual_uri.to_uri_string(),
-            text,
+        self.record_around(
+            virtual_uri,
+            connection_key,
+            content,
             version,
-        );
-        if !matches!(result, NotificationSendResult::Queued) {
-            self.restore_held_content(virtual_uri, connection_key, previous);
-        }
-        result
+            || {
+                Self::send_didchange_for_virtual_doc(
+                    handle,
+                    &virtual_uri.to_uri_string(),
+                    text,
+                    version,
+                )
+            },
+            |result| matches!(result, NotificationSendResult::Queued),
+        )
     }
 
     /// Send a didChange notification for a virtual document, returning the

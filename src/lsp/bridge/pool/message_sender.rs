@@ -38,6 +38,23 @@ pub(crate) trait MessageSender: Send {
         &mut self,
         notification: JsonRpcNotification<P>,
     ) -> impl std::future::Future<Output = io::Result<()>> + Send;
+
+    /// Whether [`Self::send_now`] queues a notification at once.
+    fn queues_at_once(&self) -> bool {
+        false
+    }
+
+    /// [`Self::send_notification`] without waiting, for a sender that
+    /// [`Self::queues_at_once`]; one that cannot refuses it.
+    fn send_now<P: serde::Serialize + Send>(
+        &mut self,
+        _notification: JsonRpcNotification<P>,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "bridge: this sender cannot queue at once",
+        ))
+    }
 }
 
 // Implementation for channel-based sends
@@ -46,19 +63,38 @@ impl MessageSender for mpsc::Sender<OutboundMessage> {
         &mut self,
         notification: JsonRpcNotification<P>,
     ) -> io::Result<()> {
-        let payload = serde_json::to_value(notification)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        // Use try_send for non-blocking backpressure per ls-bridge-message-ordering
-        self.try_send(OutboundMessage::Untracked(payload))
-            .map_err(|e| match e {
-                mpsc::error::TrySendError::Full(_) => {
-                    io::Error::new(io::ErrorKind::WouldBlock, "bridge: notification queue full")
-                }
-                mpsc::error::TrySendError::Closed(_) => {
-                    io::Error::new(io::ErrorKind::BrokenPipe, "bridge: writer channel closed")
-                }
-            })
+        send_to_channel(self, notification)
     }
+
+    fn queues_at_once(&self) -> bool {
+        true
+    }
+
+    fn send_now<P: serde::Serialize + Send>(
+        &mut self,
+        notification: JsonRpcNotification<P>,
+    ) -> io::Result<()> {
+        send_to_channel(self, notification)
+    }
+}
+
+fn send_to_channel<P: serde::Serialize + Send>(
+    sender: &mpsc::Sender<OutboundMessage>,
+    notification: JsonRpcNotification<P>,
+) -> io::Result<()> {
+    let payload = serde_json::to_value(notification)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    // Use try_send for non-blocking backpressure per ls-bridge-message-ordering
+    sender
+        .try_send(OutboundMessage::Untracked(payload))
+        .map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => {
+                io::Error::new(io::ErrorKind::WouldBlock, "bridge: notification queue full")
+            }
+            mpsc::error::TrySendError::Closed(_) => {
+                io::Error::new(io::ErrorKind::BrokenPipe, "bridge: writer channel closed")
+            }
+        })
 }
 
 /// Wrapper around Arc<ConnectionHandle> for use with MessageSender trait.
@@ -79,21 +115,39 @@ impl MessageSender for ConnectionHandleSender<'_> {
         &mut self,
         notification: JsonRpcNotification<P>,
     ) -> io::Result<()> {
-        match self.0.send_notification(notification) {
-            NotificationSendResult::Queued => Ok(()),
-            NotificationSendResult::QueueFull => Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "bridge: notification queue full",
-            )),
-            NotificationSendResult::ChannelClosed => Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "bridge: notification channel closed",
-            )),
-            NotificationSendResult::SerializationFailed => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "bridge: failed to serialize notification payload",
-            )),
-        }
+        send_to_handle(self.0, notification)
+    }
+
+    fn queues_at_once(&self) -> bool {
+        true
+    }
+
+    fn send_now<P: serde::Serialize + Send>(
+        &mut self,
+        notification: JsonRpcNotification<P>,
+    ) -> io::Result<()> {
+        send_to_handle(self.0, notification)
+    }
+}
+
+fn send_to_handle<P: serde::Serialize + Send>(
+    handle: &ConnectionHandle,
+    notification: JsonRpcNotification<P>,
+) -> io::Result<()> {
+    match handle.send_notification(notification) {
+        NotificationSendResult::Queued => Ok(()),
+        NotificationSendResult::QueueFull => Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "bridge: notification queue full",
+        )),
+        NotificationSendResult::ChannelClosed => Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "bridge: notification channel closed",
+        )),
+        NotificationSendResult::SerializationFailed => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bridge: failed to serialize notification payload",
+        )),
     }
 }
 

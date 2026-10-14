@@ -2765,9 +2765,22 @@ impl LanguageServerPool {
                     text: content.text.to_owned(),
                 }],
             };
+            let notification = JsonRpcNotification::new("textDocument/didChange", params);
             // Recorded before it is queued (see `send_didchange_recorded`),
-            // and taken back unless it is — on an error, or a caller
-            // cancelled before the send completed.
+            // and taken back unless it is: at once, under the lock a push's
+            // stamp reads, by a sender that queues at once.
+            if sender.queues_at_once() {
+                return self.document_tracker.record_around(
+                    virtual_uri,
+                    connection_key,
+                    content,
+                    Some(version),
+                    || sender.send_now(notification),
+                    io::Result::is_ok,
+                );
+            }
+            // By one that cannot: taken back on an error, or when the caller
+            // is cancelled before the send completes.
             let previous = self.record_sent_held(virtual_uri, connection_key, content, version);
             let mut unsent = RestoreHeldUnlessSent {
                 tracker: &self.document_tracker,
@@ -2775,9 +2788,7 @@ impl LanguageServerPool {
                 connection_key,
                 previous: Some(previous),
             };
-            sender
-                .send_notification(JsonRpcNotification::new("textDocument/didChange", params))
-                .await?;
+            sender.send_notification(notification).await?;
             unsent.previous = None;
         } else {
             // Unchanged text is held again under its current map too.
@@ -3239,15 +3250,24 @@ impl LanguageServerPool {
             .record_sent(virtual_uri, connection_key, content, Some(version))
     }
 
-    /// See [`DocumentTracker::restore_held`].
-    pub(super) fn restore_held_content(
+    /// See [`DocumentTracker::record_around`].
+    pub(super) fn record_around<R>(
         &self,
         virtual_uri: &VirtualDocumentUri,
         connection_key: &ConnectionKey,
-        previous: Option<HeldText>,
-    ) {
-        self.document_tracker
-            .restore_held(virtual_uri, connection_key, previous);
+        content: SentText<'_>,
+        version: i32,
+        send: impl FnOnce() -> R,
+        queued: impl FnOnce(&R) -> bool,
+    ) -> R {
+        self.document_tracker.record_around(
+            virtual_uri,
+            connection_key,
+            content,
+            Some(version),
+            send,
+            queued,
+        )
     }
 
     /// Re-hold the text `connection_key` already holds for `virtual_uri`
@@ -9494,6 +9514,64 @@ mod tests {
         )
         .await
         .expect("no re-open outstanding, so no wait");
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_didchange_queued_at_once_is_recorded_and_sent_before_any_stamp_reads() {
+        /// Queues at once, noting whether stamp reads were held off then.
+        struct ImmediateSender {
+            tracker: Arc<DocumentTracker>,
+            stamps_held_off: Option<bool>,
+            queue: tokio::sync::mpsc::Sender<OutboundMessage>,
+        }
+
+        impl message_sender::MessageSender for ImmediateSender {
+            async fn send_notification<P: serde::Serialize + Send>(
+                &mut self,
+                _notification: JsonRpcNotification<P>,
+            ) -> io::Result<()> {
+                panic!("a sender that queues at once is not awaited")
+            }
+
+            fn queues_at_once(&self) -> bool {
+                true
+            }
+
+            fn send_now<P: serde::Serialize + Send>(
+                &mut self,
+                notification: JsonRpcNotification<P>,
+            ) -> io::Result<()> {
+                self.stamps_held_off = Some(self.tracker.held_text_locked_for_test());
+                self.queue.send_now(notification)
+            }
+        }
+
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///test/snapshot-now.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let connection_key = ConnectionKey::for_server("lua");
+        let (mut queue, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
+        pool.ensure_document_opened(&mut queue, &host_uri, &virtual_uri, "a", &connection_key)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let _ = rx.try_recv();
+        let mut sender = ImmediateSender {
+            tracker: Arc::clone(&pool.document_tracker),
+            stamps_held_off: None,
+            queue,
+        };
+        pool.ensure_document_opened_from_snapshot(
+            &mut sender,
+            &host_uri,
+            &virtual_uri,
+            "b",
+            &connection_key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sender.stamps_held_off, Some(true));
+        assert!(rx.try_recv().is_ok(), "the didChange was queued");
     }
 
     #[tokio::test]

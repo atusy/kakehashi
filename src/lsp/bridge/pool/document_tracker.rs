@@ -252,6 +252,26 @@ pub(crate) struct DocumentTracker {
     connection_generations: DashMap<ConnectionKey, u64>,
 }
 
+fn restore_locked(
+    fingerprints: &mut HashMap<ConnectionKey, HashMap<String, HeldText>>,
+    virtual_uri: &VirtualDocumentUri,
+    connection_key: &ConnectionKey,
+    previous: Option<HeldText>,
+) {
+    let Some(docs) = fingerprints.get_mut(connection_key) else {
+        return;
+    };
+    let uri_string = virtual_uri.to_uri_string();
+    match previous {
+        Some(previous) => {
+            docs.insert(uri_string, previous);
+        }
+        None => {
+            docs.remove(&uri_string);
+        }
+    }
+}
+
 impl DocumentTracker {
     /// Create a new DocumentTracker with empty state.
     ///
@@ -742,16 +762,64 @@ impl DocumentTracker {
         content: SentText<'_>,
         version: Option<i32>,
     ) -> Option<HeldText> {
+        let mut fingerprints = self
+            .document_fingerprints
+            .lock()
+            .recover_poison("DocumentTracker::document_fingerprints");
+        self.record_locked(
+            &mut fingerprints,
+            virtual_uri,
+            connection_key,
+            content,
+            version,
+        )
+    }
+
+    /// [`Self::record_sent`] around a `send` that queues the text at once:
+    /// the record, the send and (unless `queued` says it was) putting back
+    /// the record it replaced all happen under the lock a push's stamp
+    /// reads, so no push is stamped with a text whose send then fails.
+    pub(super) fn record_around<R>(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+        content: SentText<'_>,
+        version: Option<i32>,
+        send: impl FnOnce() -> R,
+        queued: impl FnOnce(&R) -> bool,
+    ) -> R {
+        let mut fingerprints = self
+            .document_fingerprints
+            .lock()
+            .recover_poison("DocumentTracker::document_fingerprints");
+        let previous = self.record_locked(
+            &mut fingerprints,
+            virtual_uri,
+            connection_key,
+            content,
+            version,
+        );
+        let result = send();
+        if !queued(&result) {
+            restore_locked(&mut fingerprints, virtual_uri, connection_key, previous);
+        }
+        result
+    }
+
+    fn record_locked(
+        &self,
+        fingerprints: &mut HashMap<ConnectionKey, HashMap<String, HeldText>>,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+        content: SentText<'_>,
+        version: Option<i32>,
+    ) -> Option<HeldText> {
         let uri_string = virtual_uri.to_uri_string();
         let fingerprint = content_fingerprint(content.text);
         let map = content.map.cloned();
         if map.is_some() {
             self.ever_held_prepared.store(true, Ordering::Release);
         }
-        let mut fingerprints = self
-            .document_fingerprints
-            .lock()
-            .recover_poison("DocumentTracker::document_fingerprints");
         // Clone the connection key only when first inserting it (common path: the
         // connection is already present, so look up by borrow).
         let docs = match fingerprints.get_mut(connection_key) {
@@ -782,6 +850,13 @@ impl DocumentTracker {
         }
     }
 
+    /// Whether what connections hold is being changed right now (a push's
+    /// stamp would wait).
+    #[cfg(test)]
+    pub(super) fn held_text_locked_for_test(&self) -> bool {
+        self.document_fingerprints.try_lock().is_err()
+    }
+
     /// Put back the record [`Self::record_sent`] replaced (`None`: there was
     /// none), for a send that was not queued after all.
     pub(super) fn restore_held(
@@ -790,22 +865,11 @@ impl DocumentTracker {
         connection_key: &ConnectionKey,
         previous: Option<HeldText>,
     ) {
-        let uri_string = virtual_uri.to_uri_string();
         let mut fingerprints = self
             .document_fingerprints
             .lock()
             .recover_poison("DocumentTracker::document_fingerprints");
-        let Some(docs) = fingerprints.get_mut(connection_key) else {
-            return;
-        };
-        match previous {
-            Some(previous) => {
-                docs.insert(uri_string, previous);
-            }
-            None => {
-                docs.remove(&uri_string);
-            }
-        }
+        restore_locked(&mut fingerprints, virtual_uri, connection_key, previous);
     }
 
     /// Record that this connection holds `content` under `content`'s map
