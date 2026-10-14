@@ -919,6 +919,11 @@ impl PreparedMap {
     /// Checked on the edited V as a whole: a completion's main edit and its
     /// additional edits, say, each fine alone, can fuse a CR and an LF only
     /// together.
+    /// Where V ends.
+    pub(crate) fn virtual_end(&self) -> Position {
+        self.virtual_lines.position(self.virtual_lines.text().len())
+    }
+
     /// Whether `position` names a location in V.
     pub(crate) fn names_virtual_position(&self, position: Position) -> bool {
         self.virtual_lines.offset_strict(position).is_some()

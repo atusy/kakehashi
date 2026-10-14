@@ -91,7 +91,8 @@ pub(crate) fn transform_workspace_edit_to_host(
 /// set passed alone, but a hidden CR may still fuse with an LF only the
 /// two together bring next to it. Each representation (`changes`,
 /// `documentChanges`) is one set. An edit reaching into the region from
-/// outside it is refused.
+/// outside it is refused; one only meeting it (a fence line replaced up to
+/// where the region starts) is not in it.
 fn host_edits_keep_hidden_text(
     edit: &WorkspaceEdit,
     host_uri: &Uri,
@@ -111,6 +112,14 @@ fn host_edits_keep_hidden_text(
         super::translation::translate_virtual_position_to_host(&mut back, &unprepared);
         (back == *position && prepared.names_virtual_position(translated)).then_some(translated)
     };
+    let to_host = |mut position: Position| {
+        super::translation::translate_virtual_position_to_host(&mut position, &unprepared);
+        position
+    };
+    let (region_start, region_end) = (
+        to_host(Position::new(0, 0)),
+        to_host(prepared.virtual_end()),
+    );
     let set_keeps = |edits: Vec<(&Range, &str)>| {
         let mut in_region = Vec::new();
         for (range, new_text) in edits {
@@ -120,6 +129,9 @@ fn host_edits_keep_hidden_text(
                     new_text: new_text.to_string(),
                 }),
                 (None, None) => {}
+                // Meeting the region at its edge only.
+                (None, Some(_)) if range.end == region_start => {}
+                (Some(_), None) if range.start == region_end => {}
                 _ => return false,
             }
         }
@@ -1024,6 +1036,37 @@ mod tests {
         ));
         assert!(transform_workspace_edit_to_host(
             &mut edit("y"),
+            &virtual_uri,
+            &host_uri,
+            &offset,
+        ));
+    }
+
+    #[test]
+    fn a_direct_host_edit_meeting_a_prepared_region_at_its_edge_is_not_in_it() {
+        use super::super::prepare::{VirtualLayout, apply_prepare_result};
+        let virtual_text = "  a\n";
+        let result = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(result),
+        )
+        .unwrap();
+        // The region starts on line 1, after its opening fence.
+        let offset = RegionOffset::new(1, 0).with_prepared(prepared.map);
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let mut edit = parse_workspace_edit(json!({
+            "changes": { host_uri.as_str(): [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": "~~~lua\n"}
+            ]}
+        }));
+        assert!(transform_workspace_edit_to_host(
+            &mut edit,
             &virtual_uri,
             &host_uri,
             &offset,
