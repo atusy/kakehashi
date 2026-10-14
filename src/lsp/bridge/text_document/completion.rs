@@ -77,6 +77,7 @@ impl LanguageServerPool {
         // does: a dynamic `resolveProvider` registration can land between
         // send and reply, and the envelope decision should see it.
         let origin = std::sync::Arc::clone(&handle);
+        let insert_mode = ClientInsertMode::from_capabilities(self.client_capabilities().as_ref());
         self.execute_position_bridge_request_with_handle(
             handle,
             host_uri,
@@ -108,6 +109,7 @@ impl LanguageServerPool {
                         region_end: Some(region_end),
                         host_layer: false,
                     },
+                    insert_mode,
                 )
             },
         )
@@ -146,6 +148,7 @@ fn transform_completion_response_to_host(
     request_host_position: Option<Position>,
     server_resolves: bool,
     envelope_ctx: &EnvelopeContext<'_>,
+    insert_mode: ClientInsertMode,
 ) -> Option<CompletionList> {
     if response_has_jsonrpc_error(&response, "textDocument/completion") {
         return None;
@@ -178,7 +181,8 @@ fn transform_completion_response_to_host(
     // under the same policy as the host layer.
     let before = list.items.len();
     list.items.retain_mut(|item| {
-        if !transform_completion_item(item, offset, region_end, request_host_position) {
+        if !transform_completion_item(item, offset, region_end, request_host_position, insert_mode)
+        {
             return false;
         }
         if should_envelope(item.data.as_ref(), server_resolves) {
@@ -195,6 +199,46 @@ fn transform_completion_response_to_host(
     }
 
     Some(list)
+}
+
+/// How the client inserts a completion's multi-line text (LSP
+/// `insertTextMode`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ClientInsertMode {
+    /// As is, by default, with no way to tell it otherwise declared.
+    #[default]
+    AsIs,
+    /// It honors an item's `insertTextMode: asIs`.
+    AsIsSettable,
+    /// It adjusts the indentation by default, and an item cannot tell it not
+    /// to.
+    AdjustsIndentation,
+}
+
+impl ClientInsertMode {
+    /// From the client's completion capabilities.
+    pub(crate) fn from_capabilities(
+        caps: Option<&tower_lsp_server::ls_types::ClientCapabilities>,
+    ) -> Self {
+        use tower_lsp_server::ls_types::InsertTextMode;
+        let completion = caps
+            .and_then(|caps| caps.text_document.as_ref())
+            .and_then(|text_document| text_document.completion.as_ref());
+        let settable = completion
+            .and_then(|completion| completion.completion_item.as_ref())
+            .and_then(|item| item.insert_text_mode_support.as_ref())
+            .is_some_and(|support| support.value_set.contains(&InsertTextMode::AS_IS));
+        if settable {
+            Self::AsIsSettable
+        } else if completion
+            .and_then(|completion| completion.insert_text_mode)
+            .is_some_and(|mode| mode == InsertTextMode::ADJUST_INDENTATION)
+        {
+            Self::AdjustsIndentation
+        } else {
+            Self::AsIs
+        }
+    }
 }
 
 /// Transform textEdit range in a single completion item to host coordinates.
@@ -215,6 +259,7 @@ pub(super) fn transform_completion_item(
     offset: &RegionOffset,
     region_end: Position,
     request_host_position: Option<Position>,
+    insert_mode: ClientInsertMode,
 ) -> bool {
     let request_host_line = request_host_position.map(|position| position.line);
     // LSP requires an item's edit ranges to contain the requested position.
@@ -405,6 +450,29 @@ pub(super) fn transform_completion_item(
                 {
                     return false;
                 }
+            }
+        }
+    }
+
+    // A prepared document's multi-line edit already regained the indentation
+    // the peer removed: a client adjusting it to the line's indentation as
+    // well would indent it twice, inserting other text than was checked.
+    if offset.prepared().is_some()
+        && let Some(text_edit) = &item.text_edit
+    {
+        let new_text = match text_edit {
+            tower_lsp_server::ls_types::CompletionTextEdit::Edit(edit) => &edit.new_text,
+            tower_lsp_server::ls_types::CompletionTextEdit::InsertAndReplace(edit) => {
+                &edit.new_text
+            }
+        };
+        if new_text.contains(['\n', '\r']) {
+            match insert_mode {
+                ClientInsertMode::AsIsSettable => {
+                    item.insert_text_mode = Some(tower_lsp_server::ls_types::InsertTextMode::AS_IS);
+                }
+                ClientInsertMode::AdjustsIndentation => return false,
+                ClientInsertMode::AsIs => {}
             }
         }
     }
@@ -1168,6 +1236,7 @@ mod tests {
                 &offset,
                 Position::new(1, 0),
                 Some(Position::new(0, 3)),
+                ClientInsertMode::default(),
             ),
             kept
         );
@@ -1208,6 +1277,7 @@ mod tests {
                 &offset,
                 Position::new(1, 0),
                 Some(Position::new(0, 2)),
+                ClientInsertMode::default(),
             ),
             kept
         );
@@ -1249,8 +1319,92 @@ mod tests {
             &offset,
             Position::new(3, 0),
             Some(Position::new(1, 2)),
+            ClientInsertMode::default(),
         ));
         assert_eq!(item.additional_text_edits, None);
+    }
+
+    #[rstest]
+    #[case::as_is_settable(
+        ClientInsertMode::AsIsSettable,
+        true,
+        Some(tower_lsp_server::ls_types::InsertTextMode::AS_IS)
+    )]
+    #[case::adjusting(ClientInsertMode::AdjustsIndentation, false, None)]
+    #[case::as_is(ClientInsertMode::AsIs, true, None)]
+    fn a_prepared_multi_line_edit_is_inserted_as_is(
+        #[case] insert_mode: ClientInsertMode,
+        #[case] kept: bool,
+        #[case] mode: Option<tower_lsp_server::ls_types::InsertTextMode>,
+    ) {
+        use super::super::super::protocol::{VirtualLayout, apply_prepare_result};
+        // `  foo\n  baz\n`, dedented by two.
+        let virtual_text = "  foo\n  baz\n";
+        let result = serde_json::from_value(serde_json::json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(result),
+        )
+        .unwrap();
+        let offset = RegionOffset::new(0, 0).with_prepared(prepared.map);
+        // Mapped, its second line regained the removed indent: a client
+        // adjusting it to the line's indent again would double it.
+        let mut item: tower_lsp_server::ls_types::CompletionItem = serde_json::from_value(
+            serde_json::json!({
+                "label": "if",
+                "insertTextMode": 2,
+                "textEdit": {
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}},
+                    "newText": "if x:\n  pass"
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            transform_completion_item(
+                &mut item,
+                &offset,
+                Position::new(2, 0),
+                Some(Position::new(0, 5)),
+                insert_mode,
+            ),
+            kept
+        );
+        if kept && mode.is_some() {
+            assert_eq!(item.insert_text_mode, mode);
+        }
+    }
+
+    #[test]
+    fn the_client_insert_mode_follows_its_capabilities() {
+        let caps = |value: serde_json::Value| -> tower_lsp_server::ls_types::ClientCapabilities {
+            serde_json::from_value(value).unwrap()
+        };
+        assert_eq!(
+            ClientInsertMode::from_capabilities(None),
+            ClientInsertMode::AsIs
+        );
+        assert_eq!(
+            ClientInsertMode::from_capabilities(Some(&caps(
+                serde_json::json!({"textDocument": {"completion": {
+                    "completionItem": {"insertTextModeSupport": {"valueSet": [1, 2]}}
+                }}})
+            ))),
+            ClientInsertMode::AsIsSettable
+        );
+        assert_eq!(
+            ClientInsertMode::from_capabilities(Some(&caps(
+                serde_json::json!({"textDocument": {"completion": {
+                    "insertTextMode": 2
+                }}})
+            ))),
+            ClientInsertMode::AdjustsIndentation
+        );
     }
 
     #[test]
@@ -1291,6 +1445,7 @@ mod tests {
             &offset,
             Position::new(2, 0),
             Some(Position::new(0, 2)),
+            ClientInsertMode::default(),
         ));
         assert_eq!(item.additional_text_edits, None);
     }
@@ -1328,6 +1483,7 @@ mod tests {
             &offset,
             Position::new(2, 0),
             Some(Position::new(1, 1)),
+            ClientInsertMode::default(),
         ));
         assert_eq!(item.additional_text_edits, None);
     }
@@ -1368,6 +1524,7 @@ mod tests {
             &offset,
             Position::new(1, 1),
             Some(Position::new(1, 0)),
+            ClientInsertMode::default(),
         ));
     }
     use rstest::rstest;
@@ -1424,7 +1581,8 @@ mod tests {
                 &mut item(),
                 &offset,
                 region_end,
-                Some(Position::new(10, 7))
+                Some(Position::new(10, 7)),
+                ClientInsertMode::default()
             ),
             "the edit lands before the gap, short of the caret after it"
         );
@@ -1432,7 +1590,8 @@ mod tests {
             &mut item(),
             &offset,
             region_end,
-            Some(Position::new(10, 3))
+            Some(Position::new(10, 3)),
+            ClientInsertMode::default()
         ));
     }
 
@@ -1539,6 +1698,7 @@ mod tests {
                 region_end: Some(region_end),
                 host_layer: false,
             },
+            ClientInsertMode::default(),
         )
     }
 

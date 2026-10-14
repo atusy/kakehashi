@@ -319,7 +319,15 @@ impl LanguageServerPool {
             .await
         {
             Some(mut resolved) => {
-                if transform_completion_item(&mut resolved, &offset, region_end, None) {
+                if transform_completion_item(
+                    &mut resolved,
+                    &offset,
+                    region_end,
+                    None,
+                    super::completion::ClientInsertMode::from_capabilities(
+                        self.client_capabilities().as_ref(),
+                    ),
+                ) {
                     // A client may resolve this result again. Its ranges now
                     // use the live geometry, so their next inverse mapping
                     // must use that same geometry rather than the producer's.
