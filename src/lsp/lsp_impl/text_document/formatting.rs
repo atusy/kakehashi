@@ -1738,9 +1738,6 @@ fn extract_host_line_prefixes(
         .collect()
 }
 
-/// The host text replacing the region after the concatenated pipeline
-/// formatted `original_virtual` into `final_text`, or `None` when the region
-/// is left as it was.
 /// The edits a concatenated pipeline's result over a prepared document
 /// makes to the host: the result keeps the edge layout of each string the
 /// prepared text joins (see [`crate::lsp::bridge::restore_joined_layout`]),
@@ -1817,6 +1814,9 @@ fn opens_after_a_delimiter(offset: &RegionOffset, host_line_prefixes: &[String])
             .is_some_and(|text| text.chars().any(|c| !(c == '>' || c.is_whitespace())))
 }
 
+/// The host text replacing the region after the concatenated pipeline
+/// formatted `original_virtual` into `final_text`, or `None` when the region
+/// is left as it was.
 fn pipeline_region_text(
     original_virtual: &str,
     final_text: &str,
