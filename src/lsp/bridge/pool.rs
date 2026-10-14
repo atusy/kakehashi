@@ -3330,17 +3330,16 @@ impl LanguageServerPool {
         // that ignores didChangeWorkspaceFolders would wedge the 2nd+ root.
         // Acquire the per-root connection instead, within the caller's
         // remaining budget.
+        //
         // Divert only a root the connection is not already serving (see
         // `incapable_shared_refuses`). A marker-less acquisition brings no
-        // marker root of its own, so it rides the shared connection
-        // regardless of the capability — the same exemption
-        // `resolve_acquire`'s pre-Ready probe applies. On an INCAPABLE
-        // connection its client-workspace announcement is also
-        // suppressed, so its didOpen may fall outside the server's
-        // folders: accepted — out-of-workspace documents are LSP-legal
-        // (single-file mode), and diverting to the fallback instead
-        // would re-split the session-wide state this routing exists to
-        // unify.
+        // marker root of its own, so it rides the shared connection regardless
+        // of the capability — the same exemption `resolve_acquire`'s pre-Ready
+        // probe applies. On an INCAPABLE connection its client-workspace
+        // announcement is also suppressed, so its didOpen may fall outside the
+        // server's folders: accepted — out-of-workspace documents are
+        // LSP-legal (single-file mode), and diverting to the fallback instead
+        // would re-split the session-wide state this routing exists to unify.
         if incapable_shared_refuses(&handle, &marker) {
             handle.log_incapable_fallback_once(server_name);
             let remaining = timeout.saturating_sub(start.elapsed());
