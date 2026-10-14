@@ -5145,6 +5145,68 @@ mod tests {
     /// including other servers on the same region and the same server on
     /// another language, open.
     #[tokio::test]
+    async fn a_held_region_closes_only_where_its_text_is_held_unprepared() {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let coordinator = BridgeCoordinator::new();
+        let host = Url::parse("file:///project/doc.md").unwrap();
+        let host_lsp = crate::lsp::lsp_impl::url_to_uri(&host).unwrap();
+        let held = super::super::protocol::VirtualDocumentUri::new(&host_lsp, "python", "PY");
+        let other = super::super::protocol::VirtualDocumentUri::new(&host_lsp, "lua", "LUA");
+        let prepared = apply_prepare_result("a", &VirtualLayout::single("a"), None).unwrap();
+        let unrecorded = ConnectionKey::for_server("unrecorded");
+        let as_is = ConnectionKey::for_server("as-is");
+        let with_map = ConnectionKey::for_server("prepared");
+        for key in [&unrecorded, &as_is, &with_map] {
+            coordinator
+                .register_opened_document_for_test(&host, &held, key)
+                .await;
+        }
+        coordinator
+            .register_opened_document_for_test(&host, &other, &as_is)
+            .await;
+        coordinator
+            .record_sent_content_for_test(&held, &as_is, "a")
+            .await;
+        coordinator
+            .record_sent_content_for_test(&other, &as_is, "b")
+            .await;
+        coordinator
+            .record_sent_content_for_test(
+                &held,
+                &with_map,
+                crate::lsp::bridge::SentText {
+                    text: &prepared.text,
+                    map: prepared.map.as_ref(),
+                },
+            )
+            .await;
+
+        let closed = coordinator
+            .close_unprepared_held_docs(&host, &[("python", "PY")])
+            .await;
+
+        // The text sent before the pair gained its peer, or never recorded,
+        // would stay bridged unprepared; a prepared one stays open, held.
+        assert_eq!(closed, vec!["PY".to_string(), "PY".to_string()]);
+        let mut open: Vec<_> = coordinator
+            .pool
+            .get_all_connections_for_virtual_uri(&held)
+            .into_iter()
+            .map(|key| key.server().to_string())
+            .collect();
+        open.sort();
+        assert_eq!(open, vec!["prepared".to_string()]);
+        assert_eq!(
+            coordinator
+                .pool
+                .get_all_connections_for_virtual_uri(&other)
+                .len(),
+            1,
+            "a region not held stays open"
+        );
+    }
+
+    #[tokio::test]
     async fn close_deselected_docs_closes_only_unselected_server_language_pairs() {
         let coordinator = BridgeCoordinator::new();
         let server = |languages: &[&str], enabled: Option<bool>| BridgeServerConfig {
