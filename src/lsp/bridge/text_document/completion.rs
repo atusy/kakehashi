@@ -586,6 +586,9 @@ fn snippet_expansion(snippet: &str) -> Option<String> {
 
     /// Placeholders nested deeper give no expansion.
     const MAX_SNIPPET_NESTING: usize = 32;
+    /// Mirrors of mirrors are resolved this many links deep; deeper chains,
+    /// and cycles, give no expansion.
+    const MAX_MIRROR_PASSES: usize = 8;
 
     type Chars<'a> = std::iter::Peekable<std::str::Chars<'a>>;
 
@@ -615,10 +618,20 @@ fn snippet_expansion(snippet: &str) -> Option<String> {
     struct Pass<'m> {
         mirrors: &'m HashMap<String, String>,
         defaults: HashMap<String, String>,
+        /// The longest expansion computed: mirrors repeat text, so a short
+        /// snippet can expand exponentially (`${1:$2$2}${2:$3$3}…`).
+        limit: usize,
+        /// The placeholders whose default is being expanded, innermost last.
+        enclosing: Vec<String>,
+        /// Which tabstop's default holds which (`(outer, inner)`).
+        holds: Vec<(String, String)>,
     }
 
     impl Pass<'_> {
         fn occurrence(&mut self, number: String, default: Option<String>) -> Option<String> {
+            if let Some(outer) = self.enclosing.last() {
+                self.holds.push((outer.clone(), number.clone()));
+            }
             Some(if let Some(default) = default {
                 match self.defaults.entry(number.clone()) {
                     std::collections::hash_map::Entry::Occupied(_) => return None,
@@ -657,7 +670,12 @@ fn snippet_expansion(snippet: &str) -> Option<String> {
                             // A variable (or anything but a tabstop).
                             let number = tabstop(chars)?;
                             let default = match chars.next() {
-                                Some(':') => Some(self.expand(chars, depth + 1)?),
+                                Some(':') => {
+                                    self.enclosing.push(number.clone());
+                                    let default = self.expand(chars, depth + 1)?;
+                                    self.enclosing.pop();
+                                    Some(default)
+                                }
                                 Some('|') => Some(choice(chars)),
                                 Some('}') => None,
                                 // A transform, or unterminated.
@@ -674,6 +692,10 @@ fn snippet_expansion(snippet: &str) -> Option<String> {
                             return None;
                         } else {
                             out.push('$');
+                        }
+                        // Only a mirror grows the text past the snippet's.
+                        if out.len() > self.limit {
+                            return None;
                         }
                     }
                     _ => out.push(c),
@@ -709,24 +731,62 @@ fn snippet_expansion(snippet: &str) -> Option<String> {
         choice
     }
 
+    /// Whether some tabstop's default holds itself, through mirrors or
+    /// nested placeholders: what clients make of that is anyone's guess.
+    fn cyclic(holds: &[(String, String)]) -> bool {
+        let mut inner: HashMap<&str, Vec<&str>> = HashMap::new();
+        for (outer, held) in holds {
+            inner.entry(outer).or_default().push(held);
+        }
+        // Depth-first, coloring each tabstop: on the path, or done.
+        fn visit<'a>(
+            at: &'a str,
+            inner: &HashMap<&'a str, Vec<&'a str>>,
+            on_path: &mut Vec<&'a str>,
+            done: &mut std::collections::HashSet<&'a str>,
+        ) -> bool {
+            if on_path.contains(&at) {
+                return true;
+            }
+            if !done.insert(at) {
+                return false;
+            }
+            on_path.push(at);
+            let found = inner
+                .get(at)
+                .is_some_and(|held| held.iter().any(|next| visit(next, inner, on_path, done)));
+            on_path.pop();
+            found
+        }
+        let mut done = std::collections::HashSet::new();
+        inner
+            .keys()
+            .any(|outer| visit(outer, &inner, &mut Vec::new(), &mut done))
+    }
+
     // Each pass mirrors the defaults the previous one found, until they
     // settle: a default holding a mirror of another tabstop takes one pass
-    // per link. Defaults that mirror each other in a cycle never settle;
-    // the bound (one pass per tabstop, and one to see them settle) ends it.
+    // per link.
+    let limit = snippet.len().saturating_mul(4).max(4096);
     let mut mirrors = HashMap::new();
-    let mut passes = 0;
-    loop {
+    for pass_number in 0..=MAX_MIRROR_PASSES {
         let mut pass = Pass {
             mirrors: &mirrors,
             defaults: HashMap::new(),
+            limit,
+            enclosing: Vec::new(),
+            holds: Vec::new(),
         };
         let out = pass.expand(&mut snippet.chars().peekable(), 0)?;
-        passes += 1;
-        if pass.defaults == mirrors || passes > pass.defaults.len() {
+        if pass_number == 0 && cyclic(&pass.holds) {
+            return None;
+        }
+        if pass.defaults == mirrors {
             return Some(out);
         }
         mirrors = pass.defaults;
     }
+    None
 }
 
 /// Whether snippet-syntax text references a snippet VARIABLE — `$name` or
@@ -1049,8 +1109,22 @@ mod tests {
         assert_eq!(expanded("${1:a} ${1:b}"), None);
         assert_eq!(expanded("$1x${1:}${1:\n}"), None);
         assert_eq!(expanded("$2 ${1:<$2>} ${2:x}").as_deref(), Some("x <x> x"));
-        // Cyclic defaults end.
-        assert!(expanded("${1:$2}${2:$1}").is_some());
+        // Defaults holding themselves: no expansion.
+        assert_eq!(expanded("${1:$2}${2:$1}"), None);
+        assert_eq!(expanded("${1:a$1}"), None);
+        assert_eq!(expanded("${1:${2:$1}}"), None);
+        // Mirrors chained past a few links, doubling the text at each
+        // (`${1:$2$2}${2:$3$3}…`): no expansion.
+        let doubling: String = (1..32)
+            .map(|n| format!("${{{n}:${}${}}}", n + 1, n + 1))
+            .chain(["${32:x}".to_string()])
+            .collect();
+        assert_eq!(expanded(&doubling), None);
+        // A default mirrored many times is bounded too.
+        let repeated = format!("${{1:{}}}{}", "x".repeat(1000), "$1".repeat(100));
+        assert_eq!(expanded(&repeated), None);
+        let few = format!("${{1:{}}}{}", "x".repeat(1000), "$1".repeat(3));
+        assert_eq!(expanded(&few).map(|text| text.len()), Some(4000));
         // The client decides these.
         assert_eq!(expanded("$TM_X"), None);
         assert_eq!(expanded("${NAME:d}"), None);
