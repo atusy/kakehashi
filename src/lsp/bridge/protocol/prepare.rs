@@ -895,21 +895,27 @@ impl PreparedMap {
                 return false;
             }
         }
-        let hidden = self.runs.iter().filter(|run| {
+        let prepared = self.prepared_lines.text();
+        let host_owned = self.runs.iter().filter(|run| {
             matches!(
                 run.kind,
                 RunKind::Gap | RunKind::LeadingLines | RunKind::TrailingLines
-            ) && virtual_text[run.virtual_.clone()]
-                != self.prepared_lines.text()[run.prepared.clone()]
+            )
         });
-        for run in hidden {
+        for run in host_owned {
             let text = &virtual_text[run.virtual_.clone()];
             let start = shifted(run.virtual_.start);
             let end = start + text.len();
-            let fused_after = text.ends_with('\r')
+            // A line break at the run's edge is hidden when P does not show
+            // it there: one the peer's text shows too (a gap replaced by text
+            // ending with the same CR) was the server's to join.
+            let cr_hidden = text.ends_with('\r') && !prepared[..run.prepared.end].ends_with('\r');
+            let lf_hidden =
+                text.starts_with('\n') && !prepared[run.prepared.start..].starts_with('\n');
+            let fused_after = cr_hidden
                 && edited[end..].starts_with('\n')
                 && !virtual_text[run.virtual_.end..].starts_with('\n');
-            let fused_before = text.starts_with('\n')
+            let fused_before = lf_hidden
                 && edited[..start].ends_with('\r')
                 && !virtual_text[..run.virtual_.start].ends_with('\r');
             if fused_after || fused_before {
@@ -2306,6 +2312,36 @@ mod tests {
         let map = prepare("a\n", json!([]));
         let crlf = map.edit_to_virtual(&edit((0, 1), (0, 1), "\r")).unwrap();
         assert_eq!(apply_to("a\n", &[crlf]), "a\r\n");
+    }
+
+    #[test]
+    fn a_line_break_the_prepared_text_shows_is_the_servers_to_join() {
+        // `a${x}b`, the interpolation's host text ending with a CR, replaced
+        // by text ending with a CR too: the server sees that CR.
+        let virtual_text = "a \rb";
+        let layout = VirtualLayout::from_pieces(
+            virtual_text,
+            [
+                (SegmentKind::Content, 0..1, String::new()),
+                (SegmentKind::Gap, 1..3, "x\r".to_string()),
+                (SegmentKind::Content, 3..4, String::new()),
+            ],
+        );
+        let map = apply_prepare_result(
+            virtual_text,
+            &layout,
+            result(json!({"segments": [
+                {"type": "content"}, {"type": "gap", "content": "y\r"}, {"type": "content"}
+            ]})),
+        )
+        .unwrap()
+        .map
+        .unwrap();
+        assert_eq!(map.prepared_text(), "ay\rb");
+        let mapped = map
+            .map_edits(&[edit((1, 0), (1, 0), "\n")], EditMode::Extent)
+            .unwrap();
+        assert_eq!(apply_to(virtual_text, &mapped), "a \r\nb");
     }
 
     #[test]
