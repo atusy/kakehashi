@@ -278,6 +278,11 @@ impl Kakehashi {
         let prepare_skipped = std::sync::atomic::AtomicBool::new(false);
         let virt_fut = async {
             let mut outer_join_set: JoinSet<Vec<Diagnostic>> = JoinSet::new();
+            let settings = self.settings_manager.load_settings();
+            // Each region's wait for its prepare answer, run together below:
+            // awaited one by one, slow peers' timeouts would add up.
+            let mut prepares: Vec<futures::future::BoxFuture<'_, Option<DocumentRequestContext>>> =
+                Vec::new();
             for resolved in virt_regions.iter() {
                 let mut configs = self.bridge_configs_for_injection_language(
                     language_name,
@@ -292,7 +297,6 @@ impl Kakehashi {
                     // Only push-driven servers: nothing to pull, but a region
                     // the peer could not prepare never reached them either,
                     // and its pushes are dropped — not a clean result.
-                    let settings = self.settings_manager.load_settings();
                     // Only a caller counting failures (CLI diagnose) waits
                     // for the answer to find out; an editor's pull does not.
                     if external_error_sink.is_some()
@@ -303,17 +307,21 @@ impl Kakehashi {
                             self.experimental_enabled(),
                         )
                     {
-                        let input = crate::lsp::bridge::PrepareInput {
-                            host_uri: &uri,
-                            host_language: language_name,
-                            injection_language: &resolved.injection_language,
-                            region_id: &resolved.region.region_id,
-                            virtual_text: &resolved.virtual_content,
-                            gaps: &resolved.gaps,
-                        };
-                        if self.bridge.prepared_document(&target, input).await.is_err() {
-                            count_request_errors(&request_error_sink, 1);
-                        }
+                        let (uri, request_error_sink) = (&uri, &request_error_sink);
+                        prepares.push(Box::pin(async move {
+                            let input = crate::lsp::bridge::PrepareInput {
+                                host_uri: uri,
+                                host_language: language_name,
+                                injection_language: &resolved.injection_language,
+                                region_id: &resolved.region.region_id,
+                                virtual_text: &resolved.virtual_content,
+                                gaps: &resolved.gaps,
+                            };
+                            if self.bridge.prepared_document(&target, input).await.is_err() {
+                                count_request_errors(request_error_sink, 1);
+                            }
+                            None
+                        }));
                     }
                     continue;
                 }
@@ -338,28 +346,37 @@ impl Kakehashi {
                     max_fan_out: agg.max_fan_out,
                     client_progress_token: None,
                 };
-                let region_ctx =
+                let (settings, request_error_sink, prepare_skipped) =
+                    (&settings, &request_error_sink, &prepare_skipped);
+                prepares.push(Box::pin(async move {
                     match crate::lsp::lsp_impl::bridge_context::prepare_request_context_or_miss(
                         &self.bridge,
-                        &self.settings_manager.load_settings(),
+                        settings,
                         self.experimental_enabled(),
                         language_name,
                         region_ctx,
                     )
                     .await
                     {
-                        Ok(region_ctx) => region_ctx,
+                        Ok(region_ctx) => Some(region_ctx),
                         Err(miss) => {
                             // The peer could not prepare the region: it goes
                             // undiagnosed, which the CLI must not report as
                             // success.
-                            count_request_errors(&request_error_sink, 1);
+                            count_request_errors(request_error_sink, 1);
                             if miss == crate::lsp::bridge::PrepareMiss::Unanswered {
                                 prepare_skipped.store(true, std::sync::atomic::Ordering::Relaxed);
                             }
-                            continue;
+                            None
                         }
-                    };
+                    }
+                }));
+            }
+            for region_ctx in futures::future::join_all(prepares)
+                .await
+                .into_iter()
+                .flatten()
+            {
                 let pool = Arc::clone(&pool);
                 let task_sink = request_error_sink.clone();
 
