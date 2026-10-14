@@ -586,13 +586,24 @@ fn snippet_expansion(snippet: &str) -> Option<String> {
     type Chars<'a> = std::iter::Peekable<std::str::Chars<'a>>;
 
     /// Read a tabstop number (digits only: `$0name` is tabstop 0, then
-    /// text); `None`, consuming nothing, before anything else.
+    /// text), without leading zeros (`$01` is tabstop 1); `None`, consuming
+    /// nothing, before anything else.
     fn tabstop(chars: &mut Chars<'_>) -> Option<String> {
         let mut number = String::new();
+        let mut read = false;
         while let Some(digit) = chars.next_if(char::is_ascii_digit) {
-            number.push(digit);
+            read = true;
+            if !(number.is_empty() && digit == '0') {
+                number.push(digit);
+            }
         }
-        (!number.is_empty()).then_some(number)
+        read.then(|| {
+            if number.is_empty() {
+                "0".to_string()
+            } else {
+                number
+            }
+        })
     }
 
     /// One expansion with each tabstop mirroring `mirrors`, recording into
@@ -1018,6 +1029,8 @@ mod tests {
         // Every occurrence mirrors its tabstop's first default, ahead of it
         // or nested in another.
         assert_eq!(expanded("$1x${1:\n}").as_deref(), Some("\nx\n"));
+        assert_eq!(expanded("$01x${1:\n}").as_deref(), Some("\nx\n"));
+        assert_eq!(expanded("$00").as_deref(), Some(""));
         assert_eq!(expanded("${1:a} ${1:b}").as_deref(), Some("a a"));
         assert_eq!(expanded("$2 ${1:<$2>} ${2:x}").as_deref(), Some("x <x> x"));
         // Cyclic defaults end.
@@ -1072,6 +1085,7 @@ mod tests {
     #[case::tabstop_vanishing("$0\n")]
     // Reads as starting with text, but `$1` mirrors the later default.
     #[case::tabstop_mirroring_a_later_default("$1x${1:\n}")]
+    #[case::tabstop_numbered_with_a_leading_zero("$01x${1:\n}")]
     fn a_prepared_snippet_whose_expansion_fuses_a_hidden_line_break_is_dropped(
         #[case] snippet: &str,
     ) {
