@@ -22,7 +22,7 @@ use tower_lsp_server::ls_types::{
 use url::Url;
 
 use super::super::{Kakehashi, uri_to_url};
-use crate::config::settings::{AggregationStrategy, LayerSource, ResolvedLayerConfig};
+use crate::config::settings::{AggregationStrategy, LayerSource};
 use crate::lsp::aggregation::server::{
     FanInResult, FanOutTask, HostFanOutTask, dispatch_concatenated, dispatch_host_concatenated,
     dispatch_host_preferred, dispatch_preferred, priorities_admit,
@@ -669,36 +669,7 @@ impl Kakehashi {
     }
 }
 
-/// Combine per-layer diagnostic results by the cross-layer strategy
-/// (cross-layer-aggregation): `concatenated` merges every participating
-/// layer's items in `priorities` order; `preferred` returns the first
-/// layer with a non-empty result. Native has no diagnostics contributor.
-pub(crate) fn combine_layer_diagnostics(
-    layer_cfg: &ResolvedLayerConfig,
-    virt: Vec<Diagnostic>,
-    host: Vec<Diagnostic>,
-) -> Vec<Diagnostic> {
-    let mut virt = Some(virt);
-    let mut host = Some(host);
-    let mut merged = Vec::new();
-    for layer in &layer_cfg.priorities {
-        let items = match layer {
-            LayerSource::Virt => virt.take(),
-            LayerSource::Host => host.take(),
-            LayerSource::Native => None,
-        };
-        let Some(items) = items else { continue };
-        match layer_cfg.strategy {
-            AggregationStrategy::Concatenated => merged.extend(items),
-            AggregationStrategy::Preferred => {
-                if !items.is_empty() {
-                    return items;
-                }
-            }
-        }
-    }
-    merged
-}
+pub(crate) use crate::lsp::aggregation::diagnostic::combine_layer_diagnostics;
 
 /// Collect diagnostics from the host layer's servers: a
 /// `textDocument/diagnostic` pull with the real URI, combined across host
@@ -994,6 +965,7 @@ fn empty_diagnostic_report() -> DocumentDiagnosticReportResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::settings::ResolvedLayerConfig;
     use tower_lsp_server::ls_types::{Position, Range};
 
     fn diag(message: &str) -> Diagnostic {

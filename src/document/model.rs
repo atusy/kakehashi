@@ -317,8 +317,16 @@ impl Document {
         self.snapshot_tx.borrow().clone()
     }
 
-    /// Subscribe for slot changes — used only by the bounded first-parse wait
-    /// (and Stage 2's explicit-action wait); per-keystroke readers never wait.
+    /// Wake readiness waiters after a parse attempt without replacing the
+    /// retained snapshot. Language registration may have changed host inputs
+    /// even when the attempt produced no new tree.
+    pub(super) fn notify_parse_attempt_finished(&self) {
+        self.snapshot_tx.send_modify(|_| {});
+    }
+
+    /// Subscribe for snapshot and readiness notifications. A wake does not
+    /// imply a new tree: callers re-check the slot and their required inputs.
+    /// Per-keystroke readers never wait.
     pub(crate) fn subscribe_snapshots(&self) -> watch::Receiver<SnapshotSlot> {
         self.snapshot_tx.subscribe()
     }
