@@ -15,7 +15,7 @@
 //! `initialize`'s: a client may send `rootUri` with an empty (or absent)
 //! folder list, and that root must still reach downstream servers. It is kept
 //! as `seed_root`, consulted only while the folder list is empty, and dropped
-//! by the first applied change — after a change the root is the first folder
+//! by the first change that names a folder — after a change the root is the first folder
 //! or nothing, never a root the client named before it changed its folders.
 
 use std::sync::Mutex;
@@ -37,7 +37,7 @@ pub(crate) struct ClientWorkspaceSnapshot {
 struct State {
     folders: Option<Vec<WorkspaceFolder>>,
     /// `initialize`'s root, used only while `folders` is empty and cleared by
-    /// the first applied change.
+    /// the first change that names a folder.
     seed_root: Option<String>,
 }
 
@@ -71,8 +71,12 @@ impl ClientWorkspace {
     /// Apply an upstream `workspace/didChangeWorkspaceFolders` event with
     /// [`WorkspaceFolderSet::apply_to`]'s semantics. The root follows the
     /// changed list from here on, so the `initialize` seed is dropped in the
-    /// same critical section.
+    /// same critical section. An event naming no folder describes no change
+    /// and leaves everything, the seed included, as it was.
     pub(crate) fn apply_change(&self, added: Vec<WorkspaceFolder>, removed: &[WorkspaceFolder]) {
+        if added.is_empty() && removed.is_empty() {
+            return;
+        }
         let mut state = self
             .inner
             .lock()
@@ -191,6 +195,23 @@ mod tests {
             ClientWorkspaceSnapshot {
                 root: None,
                 folders: None,
+            }
+        );
+    }
+
+    /// An event naming no folder changed nothing, so it must not retire the
+    /// `initialize` root a client sent beside an empty folder list.
+    #[test]
+    fn an_empty_event_keeps_the_seeded_root() {
+        let workspace = seeded(Some("file:///root"), Some(Vec::new()));
+
+        workspace.apply_change(Vec::new(), &[]);
+
+        assert_eq!(
+            workspace.snapshot(),
+            ClientWorkspaceSnapshot {
+                root: Some("file:///root".to_string()),
+                folders: Some(Vec::new()),
             }
         );
     }
