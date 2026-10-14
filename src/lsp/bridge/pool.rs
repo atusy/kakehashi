@@ -3124,10 +3124,6 @@ impl LanguageServerPool {
         if host.incarnation != incarnation {
             return;
         }
-        if !host.held.is_empty() {
-            host.held
-                .remove(&(language.to_string(), region_id.to_string()));
-        }
         let latest = || {
             Arc::new(LatestText {
                 text: content.text.to_string(),
@@ -3135,23 +3131,31 @@ impl LanguageServerPool {
                 recorded: std::sync::atomic::AtomicU64::new(super::protocol::next_presentation()),
             })
         };
-        if let Some(regions) = host.contents.get(language) {
-            if let Some(cached) = regions.get(region_id).filter(|cached| {
+        match host.contents.get(language) {
+            Some(regions) => match regions.get(region_id).filter(|cached| {
                 cached.text == content.text && cached.map.as_deref() == content.map.map(Arc::as_ref)
             }) {
-                cached.recorded.store(
+                Some(cached) => cached.recorded.store(
                     super::protocol::next_presentation(),
                     std::sync::atomic::Ordering::Relaxed,
-                );
-                return;
+                ),
+                None => {
+                    regions.insert(region_id.to_string(), latest());
+                }
+            },
+            None => {
+                host.contents
+                    .entry(language.to_string())
+                    .or_default()
+                    .insert(region_id.to_string(), latest());
             }
-            regions.insert(region_id.to_string(), latest());
-            return;
         }
-        host.contents
-            .entry(language.to_string())
-            .or_default()
-            .insert(region_id.to_string(), latest());
+        // Only once the text to open with is in: a request checking the hold
+        // in between would open the text it replaces.
+        if !host.held.is_empty() {
+            host.held
+                .remove(&(language.to_string(), region_id.to_string()));
+        }
     }
 
     /// The document's lifecycle lock, created on first use. Transitions lock it
