@@ -189,10 +189,13 @@ that prefers a fallback answers `null` (or catches its own errors and does
 so); kakehashi does not choose one on its behalf.
 
 An unusable answer (an error response, a malformed or refused result) is
-final for that document version. A missing answer (the peer not starting in time, crashing, timing
-out, or answering with one of LSP's retryable cancellation codes) is retried
-with backoff — one second, doubling to a minute — without waiting for an
-edit, and requests do not pile further attempts onto a backing-off one.
+final for that input. A missing answer from the chosen peer (crashing,
+timing out, or answering with one of LSP's retryable cancellation codes) is
+retried with backoff — one second, doubling to a minute — without waiting
+for an edit, and requests do not pile further attempts onto a backing-off
+one. A candidate that cannot start is never chosen: it is passed over (see
+Configuration and Discovery), and its pairs are prepared once its handshake
+advertises the request.
 
 ### Lifecycle
 

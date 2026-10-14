@@ -18,10 +18,11 @@
 //!
 //! Every attempt runs on its own task, so a cancelled request cannot strand
 //! one half-done, and all waiters share it. An attempt that gets no answer
-//! from the peer it chose (it does not start in time, crashes, times out, or
-//! cancels) is retried with backoff by syncing the host again; one that gets
-//! an unusable answer is final for that input, as is one that finds no
-//! candidate to ask (the document is then sent as is).
+//! from the peer it chose (it crashes, times out, or cancels) is retried
+//! with backoff by syncing the host again; one that gets an unusable answer
+//! is final for that input, as is one that finds no candidate to ask (the
+//! document is then sent as is). A candidate that cannot start is passed
+//! over, as one that does not advertise the request.
 
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
