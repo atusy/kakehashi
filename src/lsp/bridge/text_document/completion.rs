@@ -584,10 +584,10 @@ fn snippet_expansion(snippet: &str) -> String {
                                 while let Some(c) = chars.next() {
                                     match c {
                                         '\\' => {
-                                            if let Some(escaped) = chars.next() {
-                                                if first {
-                                                    choice.push(escaped);
-                                                }
+                                            if let Some(escaped) = chars.next()
+                                                && first
+                                            {
+                                                choice.push(escaped);
                                             }
                                         }
                                         ',' => first = false,
