@@ -734,34 +734,35 @@ fn snippet_expansion(snippet: &str) -> Option<String> {
     /// Whether some tabstop's default holds itself, through mirrors or
     /// nested placeholders: what clients make of that is anyone's guess.
     fn cyclic(holds: &[(String, String)]) -> bool {
+        // Peel off tabstops nothing left holds (Kahn's algorithm, without
+        // recursion: a server's snippet can chain any number of them);
+        // what remains holds itself.
         let mut inner: HashMap<&str, Vec<&str>> = HashMap::new();
+        let mut holders: HashMap<&str, usize> = HashMap::new();
         for (outer, held) in holds {
             inner.entry(outer).or_default().push(held);
+            *holders.entry(held).or_default() += 1;
+            holders.entry(outer).or_default();
         }
-        // Depth-first, coloring each tabstop: on the path, or done.
-        fn visit<'a>(
-            at: &'a str,
-            inner: &HashMap<&'a str, Vec<&'a str>>,
-            on_path: &mut Vec<&'a str>,
-            done: &mut std::collections::HashSet<&'a str>,
-        ) -> bool {
-            if on_path.contains(&at) {
-                return true;
+        let mut free: Vec<&str> = holders
+            .iter()
+            .filter(|(_, count)| **count == 0)
+            .map(|(tabstop, _)| *tabstop)
+            .collect();
+        let mut peeled = 0;
+        while let Some(tabstop) = free.pop() {
+            peeled += 1;
+            for held in inner.get(tabstop).into_iter().flatten() {
+                let count = holders
+                    .get_mut(held)
+                    .expect("every held tabstop is counted");
+                *count -= 1;
+                if *count == 0 {
+                    free.push(held);
+                }
             }
-            if !done.insert(at) {
-                return false;
-            }
-            on_path.push(at);
-            let found = inner
-                .get(at)
-                .is_some_and(|held| held.iter().any(|next| visit(next, inner, on_path, done)));
-            on_path.pop();
-            found
         }
-        let mut done = std::collections::HashSet::new();
-        inner
-            .keys()
-            .any(|outer| visit(outer, &inner, &mut Vec::new(), &mut done))
+        peeled < holders.len()
     }
 
     // Each pass mirrors the defaults the previous one found, until they
@@ -1109,6 +1110,13 @@ mod tests {
         assert_eq!(expanded("${1:a} ${1:b}"), None);
         assert_eq!(expanded("$1x${1:}${1:\n}"), None);
         assert_eq!(expanded("$2 ${1:<$2>} ${2:x}").as_deref(), Some("x <x> x"));
+        // A long flat chain of defaults is no cycle, and is checked
+        // without recursing per link (its mirrors then resolve too deep).
+        let chain: String = (1..100_000)
+            .map(|n| format!("${{{n}:${}}}", n + 1))
+            .chain(["${100000:x}".to_string()])
+            .collect();
+        assert_eq!(expanded(&chain), None);
         // Defaults holding themselves: no expansion.
         assert_eq!(expanded("${1:$2}${2:$1}"), None);
         assert_eq!(expanded("${1:a$1}"), None);
