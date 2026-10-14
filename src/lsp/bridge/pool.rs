@@ -5521,27 +5521,27 @@ impl PrepareAdvertisements {
     }
 
     /// Record `connection`'s advertisement; `true` when it changed what its
-    /// server was recorded to advertise. (A server's first record changes no
-    /// candidate's selection: an unrecorded candidate is asked.)
+    /// server was recorded to advertise, or what that connection was: an
+    /// attempt asks a candidate through the host's own connection, so one
+    /// root's change can alter its answers while the server still
+    /// advertises it through another. (A first record changes no candidate's
+    /// selection: an unrecorded candidate is asked.)
     fn record(&self, connection: &ConnectionKey, advertised: bool) -> bool {
         let server_name = connection.server();
         // A handshake advertising the request: the server started somewhere,
         // and is tried again where it could not be — the answers given
         // without it (as is, or a later candidate's) are asked again.
         let retried = advertised && self.forget_start_failures(|server, _| server == server_name);
-        let (previous, now) = {
+        let (server_changed, connection_changed) = {
             let mut connections = self.by_server.entry(server_name.to_string()).or_default();
             let previous = Self::aggregate(&connections);
-            connections.insert(connection.clone(), advertised);
-            (previous, Self::aggregate(&connections))
+            let was = connections.insert(connection.clone(), advertised);
+            (
+                previous.is_some_and(|previous| Self::aggregate(&connections) != Some(previous)),
+                was.is_some_and(|was| was != advertised),
+            )
         };
-        let Some(previous) = previous else {
-            if retried {
-                self.invalidate();
-            }
-            return false;
-        };
-        if now == Some(previous) {
+        if !server_changed && !connection_changed {
             if retried {
                 self.invalidate();
             }
@@ -5700,8 +5700,13 @@ mod tests {
         assert_eq!(
             pool.prepare_advertised_epoch(),
             epoch,
-            "nothing changed for the server"
+            "a connection's first record changes nothing"
         );
+        // That connection regaining it changes its own answers, though the
+        // server advertised it all along.
+        assert!(pool.record_prepare_advertisement(&b, true));
+        assert_eq!(pool.prepare_advertised_epoch(), epoch + 1);
+        pool.record_prepare_advertisement(&b, false);
         // Withdrawn by every connection: the server is passed over.
         assert!(pool.record_prepare_advertisement(&a, false));
         assert_eq!(pool.prepare_advertisement("peer"), Some(false));
