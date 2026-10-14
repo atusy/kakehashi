@@ -769,10 +769,15 @@ impl PreparedMap {
                 })
                 .collect(),
             EditMode::Formatting | EditMode::Replay => {
-                if mode == EditMode::Replay && self.edits_touch_gap(edits) {
-                    return None;
-                }
-                diff_hunks(prepared, &edited)
+                let hunks = if mode == EditMode::Replay {
+                    if self.edits_touch_gap(edits) {
+                        return None;
+                    }
+                    self.replayed_hunks(edits, &edited)
+                } else {
+                    diff_hunks(prepared, &edited)
+                };
+                hunks
                     .into_iter()
                     .map(|hunk| {
                         let following = edited[hunk.new.end..].chars().next();
@@ -817,6 +822,55 @@ impl PreparedMap {
     /// The prepared text this map was built for.
     pub(crate) fn prepared_text(&self) -> &str {
         self.prepared_lines.text()
+    }
+
+    /// The diff hunks of a replayed set: the edited P against P, diffed
+    /// piece by piece between the gaps the peer emptied. A whole diff could
+    /// slide an insertion across such a gap where the text on both sides
+    /// matches (inserting `c` at the end of `ab` in `ab${x}cd`, prepared
+    /// as `abcd`), moving it from one host string into the next; the edits
+    /// as sent say on which side of each gap their text lands — an
+    /// insertion right at one, before it.
+    fn replayed_hunks(&self, edits: &[TextEdit], edited: &str) -> Vec<Hunk> {
+        let prepared = self.prepared_lines.text();
+        let mut joints = self.emptied_gap_offsets().peekable();
+        if joints.peek().is_none() {
+            return diff_hunks(prepared, edited);
+        }
+        let mut spans: Vec<(usize, usize, usize)> = edits
+            .iter()
+            .map(|edit| {
+                let start = self.prepared_lines.offset_clamped(edit.range.start);
+                let end = self.prepared_lines.offset_clamped(edit.range.end);
+                (start, end, edit.new_text.len())
+            })
+            .collect();
+        spans.sort_by_key(|&(start, end, _)| (start, end));
+        // Where P offset `joint` lands in the edited P: after every edit
+        // ending at or before it.
+        let edited_at = |joint: usize| {
+            spans
+                .iter()
+                .take_while(|&&(_, end, _)| end <= joint)
+                .fold(joint, |at, &(start, end, len)| at + len - (end - start))
+        };
+        let mut hunks = Vec::new();
+        let (mut piece, mut edited_piece) = (0, 0);
+        for (joint, edited_joint) in joints
+            .map(|joint| (joint, edited_at(joint)))
+            .chain([(prepared.len(), edited.len())])
+        {
+            hunks.extend(
+                diff_hunks(&prepared[piece..joint], &edited[edited_piece..edited_joint])
+                    .into_iter()
+                    .map(|hunk| Hunk {
+                        old: hunk.old.start + piece..hunk.old.end + piece,
+                        new: hunk.new.start + edited_piece..hunk.new.end + edited_piece,
+                    }),
+            );
+            (piece, edited_piece) = (joint, edited_joint);
+        }
+        hunks
     }
 
     /// Whether any of these P edits, as sent, reaches into a gap. Mapping a
@@ -2369,6 +2423,17 @@ mod tests {
             assert_eq!(apply_to(virtual_text, &mapped).len(), 3);
         }
         assert_eq!(map.map_edits(&[first, second], EditMode::Extent), None);
+    }
+
+    #[test]
+    fn a_replayed_insertion_stays_on_its_side_of_an_emptied_gap() {
+        // `c` appended to `ab`: the diff of `abcd` against `abccd` would put
+        // it after the gap, into the next host string.
+        let (virtual_text, map) = emptied_gap();
+        let mapped = map
+            .map_edits(&[edit((0, 2), (0, 2), "c")], EditMode::Replay)
+            .unwrap();
+        assert_eq!(apply_to(&virtual_text, &mapped), "abc    cd");
     }
 
     #[test]
