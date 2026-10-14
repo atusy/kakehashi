@@ -889,7 +889,9 @@ impl PreparedMap {
     }
 
     /// The diff hunks of a replayed set: the edited P against P, diffed
-    /// piece by piece between the gaps. A whole diff could slide a change
+    /// piece by piece between the gaps and around each group of touching
+    /// edits (which keeps a change on the line it names where lines read
+    /// alike in P). A whole diff could slide a change
     /// across a gap where the text on both sides matches — an emptied one
     /// (inserting `c` at the end of `ab` in `ab${x}cd`, prepared as `abcd`)
     /// or one whose replacement repeats its neighbor (inserting `a` at the
@@ -899,19 +901,6 @@ impl PreparedMap {
     /// it, one right at its end after it.
     fn replayed_hunks(&self, edits: &[TextEdit], edited: &str) -> Vec<Hunk> {
         let prepared = self.prepared_lines.text();
-        // Each joint, and whether an insertion right at it goes before it.
-        let joints: Vec<(usize, bool)> = self
-            .runs
-            .iter()
-            .filter(|run| run.kind == RunKind::Gap)
-            .flat_map(|gap| {
-                std::iter::once((gap.prepared.start, true))
-                    .chain((!gap.prepared.is_empty()).then_some((gap.prepared.end, false)))
-            })
-            .collect();
-        if joints.is_empty() {
-            return diff_hunks(prepared, edited);
-        }
         let mut spans: Vec<(usize, usize, usize)> = edits
             .iter()
             .map(|edit| {
@@ -921,6 +910,44 @@ impl PreparedMap {
             })
             .collect();
         spans.sort_by_key(|&(start, end, _)| (start, end));
+        // Each joint, and whether an insertion right at it goes before it.
+        // Edits touching one another are diffed together (mapped one by one,
+        // they could both claim a dedented line's removed indentation), each
+        // such group on its own: a diff across the unchanged text between
+        // them could slide a change onto a line with the same prepared text
+        // but other removed indentation. At a group's start an insertion is
+        // the group's; at a gap's start it goes before the gap, at its end
+        // after it (a gap's joint wins where both fall).
+        let mut joints = std::collections::BTreeMap::new();
+        let mut group: Option<(usize, usize)> = None;
+        for &(start, end, _) in &spans {
+            match &mut group {
+                Some((_, group_end)) if start <= *group_end => {
+                    *group_end = (*group_end).max(end);
+                }
+                _ => {
+                    if let Some((group_start, group_end)) = group.replace((start, end)) {
+                        joints.insert(group_start, false);
+                        joints.insert(group_end, true);
+                    }
+                }
+            }
+        }
+        if let Some((group_start, group_end)) = group {
+            joints.insert(group_start, false);
+            joints.insert(group_end, true);
+        }
+        for gap in self.runs.iter().filter(|run| run.kind == RunKind::Gap) {
+            joints.insert(gap.prepared.start, true);
+            if !gap.prepared.is_empty() {
+                joints.insert(gap.prepared.end, false);
+            }
+        }
+        joints.remove(&0);
+        joints.remove(&prepared.len());
+        if joints.is_empty() {
+            return diff_hunks(prepared, edited);
+        }
         // Where P offset `joint` lands in the edited P: after every edit
         // ending before it, or at it unless an insertion that goes after.
         let edited_at = |joint: usize, insertions_before: bool| {
@@ -1878,6 +1905,41 @@ mod tests {
             apply_edits(&virtual_lines, &mapped).unwrap(),
             "  a\n  b\n  c\n"
         );
+    }
+
+    #[test]
+    fn a_replayed_edit_keeps_to_the_line_it_names() {
+        // `  a\n    a\n`, both lines dedented to `a`: alike in P, not in V.
+        let virtual_text = "  a\n    a\n";
+        let result = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 4}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(result),
+        )
+        .unwrap()
+        .map
+        .unwrap();
+        assert_eq!(prepared.prepared_text(), "a\na\n");
+        // Deleting the first line deletes the first line, not the second.
+        let mapped = prepared
+            .map_edits(
+                &[TextEdit {
+                    range: tower_lsp_server::ls_types::Range::new(
+                        Position::new(0, 0),
+                        Position::new(1, 0),
+                    ),
+                    new_text: String::new(),
+                }],
+                EditMode::Replay,
+            )
+            .unwrap();
+        let virtual_lines = LineMap::new(virtual_text.to_string());
+        assert_eq!(apply_edits(&virtual_lines, &mapped).unwrap(), "    a\n");
     }
 
     #[test]
