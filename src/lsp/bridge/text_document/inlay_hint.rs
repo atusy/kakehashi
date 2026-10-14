@@ -833,16 +833,22 @@ fn transform_inlay_hint_to_host(
     translate_virtual_position_to_host(&mut hint.position, offset);
 
     if let Some(text_edits) = &mut hint.text_edits {
-        let translated = match translate_virtual_text_edits_to_host(
-            text_edits.clone(),
-            offset,
-            EditMode::Extent,
-        ) {
-            Some(mapped) => {
-                *text_edits = mapped;
-                true
+        // An unprepared document's edits only have their ranges translated,
+        // in place: this runs per hint of every response.
+        let translated = if offset.prepared().is_none() {
+            for edit in text_edits.iter_mut() {
+                translate_virtual_range_to_host(&mut edit.range, offset);
             }
-            None => false,
+            true
+        } else {
+            match translate_virtual_text_edits_to_host(text_edits.clone(), offset, EditMode::Extent)
+            {
+                Some(mapped) => {
+                    *text_edits = mapped;
+                    true
+                }
+                None => false,
+            }
         };
         if !translated
             || !text_edits
