@@ -128,32 +128,35 @@ const CONFIGURATION_PULL_TIMEOUT: std::time::Duration = std::time::Duration::fro
 
 /// How a client-supplied configuration reached kakehashi.
 ///
-/// Only used to describe it back to the user: the two arrive by different
-/// routes, and a message naming the wrong one sends people looking for a
-/// notification they never sent.
-#[derive(Clone, Copy)]
+/// The two arrive by different routes, and a message naming the wrong one
+/// sends people looking for a notification they never sent. A pull also
+/// remembers the root it was asked at, since its answer describes that
+/// workspace.
 pub(crate) enum ConfigurationIngress {
     /// The client pushed `workspace/didChangeConfiguration`.
     Push,
-    /// kakehashi asked, via `workspace/configuration`.
-    Pull,
+    /// kakehashi asked, via `workspace/configuration`, while `asked_at` was
+    /// the selected configuration root.
+    Pull {
+        asked_at: Option<std::path::PathBuf>,
+    },
 }
 
 impl ConfigurationIngress {
-    fn describe(self) -> &'static str {
+    fn describe(&self) -> &'static str {
         match self {
             Self::Push => "workspace/didChangeConfiguration",
-            Self::Pull => "the configuration read from the client",
+            Self::Pull { .. } => "the configuration read from the client",
         }
     }
 
     /// What to say once the layer is in effect. A pull runs at startup for
     /// every capable client, where "Configuration updated!" would describe an
     /// event the user did not cause.
-    fn applied_message(self) -> &'static str {
+    fn applied_message(&self) -> &'static str {
         match self {
             Self::Push => "Configuration updated!",
-            Self::Pull => "Applied the configuration read from the client",
+            Self::Pull { .. } => "Applied the configuration read from the client",
         }
     }
 }
@@ -193,8 +196,9 @@ impl Kakehashi {
         }
 
         // One pull at a time, with a burst collapsed into at most one trailing
-        // pull. Startup pulls, and so does every no-payload notification, so
-        // two can be in flight at once — and since the reload lock is only
+        // pull. Startup pulls, and so do every no-payload notification and
+        // every folder change that moves the root, so two can be in flight at
+        // once — and since the reload lock is only
         // taken once an answer arrives, the older answer could apply last and
         // merge its snapshot over the newer one.
         //
@@ -203,6 +207,15 @@ impl Kakehashi {
         // trigger would lose the change until the next one. A rejected trigger
         // is recorded instead, and whoever holds the claim runs one more pull
         // before letting go.
+        //
+        // The handoff is two separate atomics, not one compare-and-swap, and
+        // that is sound only because neither side awaits in its window: a
+        // failed claim marks `pending` before yielding, and the owner releases
+        // the claim and reads `pending` before yielding. Every caller runs
+        // inside a service future (`initialized`, `didChangeConfiguration`,
+        // `didChangeWorkspaceFolders`), and tower-lsp polls all of those from
+        // one task, so the two windows cannot interleave. Calling this from a
+        // spawned task would break that, and needs a real handoff first.
         loop {
             {
                 let Some(_in_flight) = SingleFlightPull::claim(&self.configuration_pull_in_flight)
@@ -228,12 +241,14 @@ impl Kakehashi {
 
     /// One round trip: ask, and apply whatever comes back.
     async fn pull_client_configuration_once(&self) {
+        let asked_at = self.settings_manager.root_path().as_ref().clone();
         let items = vec![ConfigurationItem {
             scope_uri: None,
             section: Some("kakehashi".to_string()),
         }];
-        // Bounded by shutdown: this await lives in the `initialized` service
-        // future, which the server joins on, so a client that never answers
+        // Bounded by shutdown: this await lives in a service future —
+        // `initialized`, or the notification that triggered the pull — which
+        // the server joins on, so a client that never answers
         // would keep `serve` from returning after `exit`. The SIGTERM handler
         // rescues that on Unix and nothing does on Windows.
         let answered = match tokio::select! {
@@ -279,7 +294,7 @@ impl Kakehashi {
 
         self.apply_client_configuration(
             serde_json::json!({ "kakehashi": section }),
-            ConfigurationIngress::Pull,
+            ConfigurationIngress::Pull { asked_at },
         )
         .await;
     }
@@ -375,7 +390,7 @@ impl Kakehashi {
                 // the very section being pulled. Rejecting the layer over one
                 // of those would make the pull useless for the editors it
                 // exists for; the keys are dropped by parsing instead.
-                ConfigurationIngress::Pull => {
+                ConfigurationIngress::Pull { .. } => {
                     self.notifier()
                         .log_info(format!(
                             "Ignoring {} in the configuration read from the client",
@@ -416,6 +431,22 @@ impl Kakehashi {
         // left — permanently, since anchoring yields absolute paths that no
         // later reload re-bases.
         let reload = lock_settings_reload().await;
+
+        // Asked while the session sat at one root and answered after it moved
+        // to another: the answer was read for a workspace no longer selected.
+        // The root change that moved it pulls again, so this one is dropped
+        // rather than anchored to, and retained under, a root it never
+        // described.
+        if let ConfigurationIngress::Pull { asked_at } = &ingress
+            && *self.settings_manager.root_path() != *asked_at
+        {
+            drop(reload);
+            log::debug!(
+                target: "kakehashi::config",
+                "Discarding a configuration answer read at a root no longer selected: {asked_at:?}"
+            );
+            return;
+        }
 
         // A pushed path is workspace-local, matching `initializationOptions`:
         // the client knows the workspace it opened, not the directory the server
