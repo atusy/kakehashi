@@ -2043,6 +2043,7 @@ mod tests {
             virtual_content: String::new(),
             line_column_offsets: vec![0],
             contiguous: true,
+            gaps: Default::default(),
         }
     }
 

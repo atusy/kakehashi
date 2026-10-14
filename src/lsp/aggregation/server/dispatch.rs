@@ -349,6 +349,7 @@ mod tests {
                 virtual_content: String::new(),
                 line_column_offsets: vec![],
                 contiguous: true,
+                gaps: Default::default(),
             },
             region_end: None,
             configs: vec![],
