@@ -1583,6 +1583,11 @@ fn apply_edits(lines: &LineMap, edits: &[TextEdit]) -> Option<String> {
     let mut ranges = edits
         .iter()
         .map(|edit| {
+            // A reversed range is refused as sent: clamped past the end, both
+            // its ends would read as one insertion there.
+            if edit.range.start > edit.range.end {
+                return None;
+            }
             let start = lines.offset_clamped(edit.range.start);
             let end = lines.offset_clamped(edit.range.end);
             (start <= end).then_some((start..end, edit.new_text.as_str()))
@@ -1787,6 +1792,19 @@ fn diff_hunks(old: &str, new: &str) -> Vec<Hunk> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reversed_edit_past_the_end_is_refused() {
+        let prepared = apply_prepare_result("a", &VirtualLayout::single("a"), None)
+            .unwrap()
+            .map
+            .unwrap();
+        let reversed = TextEdit {
+            range: tower_lsp_server::ls_types::Range::new(Position::new(2, 0), Position::new(1, 0)),
+            new_text: "X".to_string(),
+        };
+        assert_eq!(prepared.map_edits(&[reversed], EditMode::Extent), None);
+    }
 
     #[test]
     fn a_column_past_any_line_names_no_location() {
