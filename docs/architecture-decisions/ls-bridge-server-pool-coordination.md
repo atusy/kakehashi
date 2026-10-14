@@ -108,10 +108,10 @@ the acquire path
 it is `Ready` but incapable, logs once and falls back to the per-root key — so a
 misconfigured opt-in degrades to per-root instances rather than wedging the
 2nd+ root on a server that ignores `rootUri`. The probe treats a
-still-`Initializing` shared connection optimistically as capable, so the acquire
-re-applies the same rule under the pool lock once the connection is `Ready`
-(and the waiting path again after its wait), refusing a root it does not serve
-so the acquisition re-resolves and diverts (#992). Marker-less documents are exempt
+still-`Initializing` shared connection optimistically as capable, so an acquire
+that finds the connection `Ready` re-applies the same rule (and the waiting
+path again after its wait), refusing a root it does not serve so the
+acquisition re-resolves and diverts (#992). Marker-less documents are exempt
 from that divert: they bring no marker root, so the missing capability never
 blocks them and they ride the incapable shared connection rather than fork the
 fallback — accepting that their didOpen may fall outside such a connection's
