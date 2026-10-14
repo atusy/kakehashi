@@ -8432,6 +8432,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_open_built_as_is_takes_a_newer_prepared_cached_text() {
+        use super::super::protocol::{VirtualLayout, apply_prepare_result};
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///test/as-is-open.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        // The pair gained its peer since the request resolved its text.
+        let prepared = apply_prepare_result("a", &VirtualLayout::single("a"), None).unwrap();
+        pool.record_latest_virtual_content(
+            &host_uri,
+            1,
+            "lua",
+            TEST_ULID_LUA_0,
+            SentText {
+                text: &prepared.text,
+                map: prepared.map.as_ref(),
+            },
+        );
+
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(1);
+        pool.ensure_document_opened(&mut sender, &host_uri, &virtual_uri, "old", &key)
+            .await
+            .unwrap();
+
+        let OutboundMessage::Untracked(message) = rx.try_recv().unwrap() else {
+            panic!("didOpen must be an untracked notification");
+        };
+        assert_eq!(message["params"]["textDocument"]["text"], "a");
+        let held = pool.held_text(&virtual_uri.to_uri_string(), &key).unwrap();
+        assert_eq!(held.map, prepared.map);
+    }
+
+    #[tokio::test]
     async fn an_unchanged_text_sent_with_another_map_is_held_under_it() {
         use super::super::protocol::{SegmentKind, VirtualLayout, apply_prepare_result};
         // `x = ${a}`: only the gap's host text changes, so the prepared text
