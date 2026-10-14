@@ -441,6 +441,20 @@ impl PrepareRegistry {
         let _ = slot.cell.outcome.set(outcome);
     }
 
+    /// A hook forgetting every answer that found no candidate to ask (sent as
+    /// is): a server that starts advertising the request may now prepare
+    /// them.
+    pub(crate) fn forget_answers_as_is_hook(&self) -> impl Fn() + Send + Sync + 'static {
+        let regions = Arc::clone(&self.regions);
+        move || {
+            for mut region in regions.iter_mut() {
+                region.slots.retain(|slot| {
+                    !matches!(slot.cell.outcome.get(), Some(Some(prepared)) if prepared.map.is_none())
+                });
+            }
+        }
+    }
+
     /// Keep only the regions `keep(host language, injection language,
     /// candidates)` accepts — after a settings change, those whose pair still
     /// lists the same servers with the same launch configs. With
@@ -1320,6 +1334,25 @@ mod tests {
             .expect("the attempt ends")
             .unwrap();
         assert!(!marker.exists(), "a revoked attempt started its peer");
+    }
+
+    #[test]
+    fn answers_as_is_are_forgotten_for_a_peer_that_starts_advertising() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let as_is = cell(&registry, &target, input(&host, "a"), Holder::Request);
+        let _ = as_is.outcome.set(Some(Arc::new(PreparedDocument {
+            text: "a".to_string(),
+            map: None,
+        })));
+        let failed = cell(&registry, &target, input(&host, "b"), Holder::LifecyclePass);
+        let _ = failed.outcome.set(None);
+        registry.forget_answers_as_is_hook()();
+        let fresh = cell(&registry, &target, input(&host, "a"), Holder::Request);
+        assert!(!Arc::ptr_eq(&as_is, &fresh));
+        let kept = cell(&registry, &target, input(&host, "b"), Holder::Request);
+        assert!(Arc::ptr_eq(&failed, &kept), "only answers as is go");
     }
 
     #[test]

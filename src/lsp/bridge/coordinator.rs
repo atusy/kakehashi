@@ -414,10 +414,13 @@ impl BridgeCoordinator {
     fn resync_when_a_peer_starts_advertising(&self) {
         let pool = Arc::downgrade(&self.pool);
         let resync = self.prepare.resync_sender();
+        let forget = self.prepare.forget_answers_as_is_hook();
         self.pool.set_prepare_advertised_hook(Box::new(move || {
             let Some(pool) = pool.upgrade() else {
                 return;
             };
+            // Answers that found no candidate would be served again.
+            forget();
             for host_uri in pool.open_host_uris() {
                 // The receiver is gone only at shutdown.
                 let _ = resync.send(super::Resync {
