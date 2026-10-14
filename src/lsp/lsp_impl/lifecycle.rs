@@ -839,6 +839,13 @@ impl Kakehashi {
                                 );
                                 true
                             } else {
+                                // Servers may still hold the text before, and
+                                // requests on it fail their wait, until the
+                                // next edit or save syncs the host.
+                                log::warn!(
+                                    target: "kakehashi::bridge::prepare",
+                                    "Gave up syncing the prepared virtual documents of {uri} after {MAX_RESYNC_RETRIES} retries; the next edit syncs them"
+                                );
                                 failures.remove(&uri);
                                 false
                             }
