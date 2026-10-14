@@ -612,7 +612,7 @@ pub struct LanguageServerPool {
     /// (`false` too for one that could not start), so a (host, injection)
     /// pair none of whose candidates prepares is not held back on each
     /// revision to find that out again.
-    prepare_advertisements: Arc<DashMap<String, bool>>,
+    prepare_advertisements: Arc<PrepareAdvertisements>,
 }
 
 impl Default for LanguageServerPool {
@@ -685,7 +685,7 @@ impl LanguageServerPool {
             client_progress_registry: Arc::new(super::ClientProgressRegistry::new()),
             inbound_request_registry: super::InboundRequestRegistry::default(),
             command_origins: Arc::new(CommandOriginRegistry::default()),
-            prepare_advertisements: Arc::new(DashMap::new()),
+            prepare_advertisements: Arc::default(),
         }
     }
 
@@ -693,15 +693,28 @@ impl LanguageServerPool {
     /// `kakehashi/virtualDocument/prepare`: its last handshake, a
     /// `MethodNotFound` answer since, or a failure to start it.
     pub(crate) fn record_prepare_advertisement(&self, server_name: &str, advertised: bool) {
-        record_prepare_advertisement(&self.prepare_advertisements, server_name, advertised);
+        self.prepare_advertisements.record(server_name, advertised);
     }
 
-    /// Whether `server_name` advertised `kakehashi/virtualDocument/prepare`
-    /// in its last handshake; `None` before it has had one.
+    /// Whether `server_name` advertises `kakehashi/virtualDocument/prepare`,
+    /// as last recorded (see [`Self::record_prepare_advertisement`]); `None`
+    /// before anything was.
     pub(crate) fn prepare_advertisement(&self, server_name: &str) -> Option<bool> {
-        self.prepare_advertisements
-            .get(server_name)
-            .map(|advertised| *advertised)
+        self.prepare_advertisements.get(server_name)
+    }
+
+    /// Run `hook` whenever a server recorded as not advertising
+    /// `kakehashi/virtualDocument/prepare` starts advertising it (set once).
+    pub(crate) fn set_prepare_advertised_hook(&self, hook: Box<dyn Fn() + Send + Sync>) {
+        let _ = self.prepare_advertisements.on_advertised.set(hook);
+    }
+
+    /// The host documents open in this pool.
+    pub(crate) fn open_host_uris(&self) -> Vec<Url> {
+        self.latest_virtual_contents
+            .iter()
+            .map(|host| host.key().clone())
+            .collect()
     }
 
     /// What is known about the raw palette command names downstream servers have
@@ -4541,11 +4554,8 @@ impl LanguageServerPool {
                     handle_for_handshake.set_bridge_routing(extensions.bridge_routing);
                     handle_for_handshake
                         .set_virtual_document_prepare(extensions.virtual_document_prepare);
-                    record_prepare_advertisement(
-                        &prepare_advertisements,
-                        &server_name_for_log,
-                        extensions.virtual_document_prepare,
-                    );
+                    prepare_advertisements
+                        .record(&server_name_for_log, extensions.virtual_document_prepare);
                     handle_for_handshake.set_type_hierarchy_provider(type_hierarchy_provider);
                     // Path a: push this server's settings now that `initialized`
                     // has been sent, so push-model servers are configured even
@@ -5271,6 +5281,44 @@ impl LanguageServerPool {
     }
 }
 
+/// Whether each server (by name) advertised
+/// `experimental.kakehashi.virtualDocumentPrepare` in its last handshake
+/// (`false` too for one that could not start, or answered `MethodNotFound`).
+#[derive(Default)]
+pub(crate) struct PrepareAdvertisements {
+    by_server: DashMap<String, bool>,
+    /// Run when a server recorded as not advertising starts advertising: its
+    /// pairs were sent as is meanwhile, and their documents should be
+    /// prepared without waiting for an edit.
+    on_advertised: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
+}
+
+impl PrepareAdvertisements {
+    /// Record `server_name`'s advertisement, cloning its name only when
+    /// first seen.
+    fn record(&self, server_name: &str, advertised: bool) {
+        let previous = match self.by_server.get_mut(server_name) {
+            Some(mut entry) => std::mem::replace(&mut *entry, advertised),
+            None => {
+                self.by_server.insert(server_name.to_string(), advertised);
+                return;
+            }
+        };
+        if advertised
+            && !previous
+            && let Some(hook) = self.on_advertised.get()
+        {
+            hook();
+        }
+    }
+
+    fn get(&self, server_name: &str) -> Option<bool> {
+        self.by_server
+            .get(server_name)
+            .map(|advertised| *advertised)
+    }
+}
+
 /// Served-root proof for the incapable-shared divert: whether `handle` — a
 /// Ready shared connection that will not act on `didChangeWorkspaceFolders` —
 /// is already serving the marker root `root`.
@@ -5284,20 +5332,6 @@ impl LanguageServerPool {
 /// Told-at-initialize folders prove nothing for a server that declared no
 /// folder support at all. All comparisons go through
 /// [`same_root_uri`](super::root_markers::same_root_uri).
-/// Update a server's advertisement, cloning its name only when first seen.
-fn record_prepare_advertisement(
-    advertisements: &DashMap<String, bool>,
-    server_name: &str,
-    advertised: bool,
-) {
-    match advertisements.get_mut(server_name) {
-        Some(mut entry) => *entry = advertised,
-        None => {
-            advertisements.insert(server_name.to_string(), advertised);
-        }
-    }
-}
-
 fn incapable_shared_serves(handle: &ConnectionHandle, root: &Url) -> bool {
     if handle
         .spawn_root()
@@ -5323,6 +5357,30 @@ fn incapable_shared_serves(handle: &ConnectionHandle, root: &Url) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_peer_starting_to_advertise_prepare_runs_the_hook_once() {
+        let pool = LanguageServerPool::new();
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&runs);
+        pool.set_prepare_advertised_hook(Box::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }));
+        let runs = || runs.load(std::sync::atomic::Ordering::Relaxed);
+        // A first handshake that advertises: nothing was sent as is for it.
+        pool.record_prepare_advertisement("tsudoi", true);
+        assert_eq!(runs(), 0);
+        pool.record_prepare_advertisement("tsudoi", true);
+        assert_eq!(runs(), 0);
+        // It did not start in time, then advertised once up.
+        pool.record_prepare_advertisement("late", false);
+        assert_eq!(pool.prepare_advertisement("late"), Some(false));
+        pool.record_prepare_advertisement("late", true);
+        assert_eq!(runs(), 1);
+        assert_eq!(pool.prepare_advertisement("late"), Some(true));
+        pool.record_prepare_advertisement("late", false);
+        assert_eq!(runs(), 1);
+    }
     use crate::lsp::bridge::actor::{OutboundMessage, RouteResult, spawn_reader_task};
     use crate::lsp::bridge::protocol::RegionOffset;
     use std::time::Duration;

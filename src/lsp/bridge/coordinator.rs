@@ -383,7 +383,7 @@ impl BridgeCoordinator {
     pub(crate) fn new() -> Self {
         let pool = Arc::new(LanguageServerPool::new());
         let cancel_forwarder = CancelForwarder::new(Arc::clone(&pool));
-        Self {
+        let coordinator = Self {
             pool,
             prepare: super::prepare_registry::PrepareRegistry::default(),
             warned_prepare_strategy: dashmap::DashSet::new(),
@@ -399,7 +399,31 @@ impl BridgeCoordinator {
             host_eager_open_generation: std::sync::atomic::AtomicU64::new(0),
             host_eager_open_tasks: DashMap::new(),
             config_memo: ArcSwap::new(Arc::new(ConfigMemo::empty(None))),
-        }
+        };
+        coordinator.resync_when_a_peer_starts_advertising();
+        coordinator
+    }
+
+    /// Sync every open host again when a server recorded as not advertising
+    /// `kakehashi/virtualDocument/prepare` starts advertising it (a peer that
+    /// missed its startup deadline, say): its pairs were sent as is, and the
+    /// requests prepared from now on would wait for prepared text no pass
+    /// sends until the next edit.
+    fn resync_when_a_peer_starts_advertising(&self) {
+        let pool = Arc::downgrade(&self.pool);
+        let resync = self.prepare.resync_sender();
+        self.pool.set_prepare_advertised_hook(Box::new(move || {
+            let Some(pool) = pool.upgrade() else {
+                return;
+            };
+            for host_uri in pool.open_host_uris() {
+                // The receiver is gone only at shutdown.
+                let _ = resync.send(super::Resync {
+                    host_uri,
+                    ready: false,
+                });
+            }
+        }));
     }
 
     /// Create a bridge coordinator with an existing pool and cancel forwarder.
@@ -413,7 +437,7 @@ impl BridgeCoordinator {
         pool: Arc<LanguageServerPool>,
         cancel_forwarder: CancelForwarder,
     ) -> Self {
-        Self {
+        let coordinator = Self {
             pool,
             prepare: super::prepare_registry::PrepareRegistry::default(),
             warned_prepare_strategy: dashmap::DashSet::new(),
@@ -429,7 +453,9 @@ impl BridgeCoordinator {
             host_eager_open_generation: std::sync::atomic::AtomicU64::new(0),
             host_eager_open_tasks: DashMap::new(),
             config_memo: ArcSwap::new(Arc::new(ConfigMemo::empty(None))),
-        }
+        };
+        coordinator.resync_when_a_peer_starts_advertising();
+        coordinator
     }
 
     // ========================================

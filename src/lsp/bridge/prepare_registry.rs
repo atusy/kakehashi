@@ -267,6 +267,12 @@ impl PrepareRegistry {
         });
     }
 
+    /// A sender of hosts to sync again, for others that find a host should be
+    /// (see [`Self::take_resync_rx`]).
+    pub(crate) fn resync_sender(&self) -> UnboundedSender<Resync> {
+        self.resync_tx.clone()
+    }
+
     /// Hosts to sync again: a held-back virtual document became ready, its
     /// answer came back unusable, or an attempt that got no answer finished
     /// its retry backoff. Taken once by the server loop.
