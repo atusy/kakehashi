@@ -233,10 +233,10 @@ comment, leaving `// ` in the host:
 ```
 
 The sequential formatter pipeline described above
-(`strategy = "concatenated"` in `bridge.<lang>.aggregation`, not in
-`layers.aggregation`) can format this one-line region into several lines. The
-`// ` stays outside the replaced text, in front of the first line only. It is
-not copied to the new lines:
+(`strategy = "concatenated"` in `bridge.json.aggregation`, the injected
+language's entry, not in `layers.aggregation`) can format this one-line region
+into several lines. The `// ` stays outside the replaced text, in front of the
+first line only. It is not copied to the new lines:
 
 ```rust
 // {
