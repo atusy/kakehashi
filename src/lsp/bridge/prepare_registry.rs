@@ -54,6 +54,10 @@ const SLOTS_PER_REGION: usize = 3;
 #[derive(Debug, Clone)]
 pub(crate) struct PrepareTarget {
     pub(crate) candidates: Arc<[ResolvedServerConfig]>,
+    /// The settings the candidates were resolved from: a request's target
+    /// from settings a change has since replaced is not let in (see
+    /// [`PrepareRegistry::retain`]).
+    pub(crate) settings: Arc<crate::config::WorkspaceSettings>,
 }
 
 /// One virtual document to prepare.
@@ -233,6 +237,9 @@ pub(crate) struct PrepareRegistry {
     /// document forgotten and prepared again (a settings change, a reopen)
     /// never repeats a version the peer saw.
     next_revision: Arc<AtomicI32>,
+    /// The settings the last settings change pruned regions under (`None`
+    /// before any): a request resolved from other settings gets no slot.
+    pruned_under: arc_swap::ArcSwapOption<crate::config::WorkspaceSettings>,
     resync_tx: UnboundedSender<Resync>,
     resync_rx: std::sync::Mutex<Option<UnboundedReceiver<Resync>>>,
 }
@@ -252,6 +259,7 @@ impl Default for PrepareRegistry {
             regions: Arc::default(),
             used: AtomicBool::new(false),
             next_revision: Arc::new(AtomicI32::new(1)),
+            pruned_under: arc_swap::ArcSwapOption::empty(),
             resync_tx,
             resync_rx: std::sync::Mutex::new(Some(resync_rx)),
         }
@@ -424,6 +432,7 @@ impl PrepareRegistry {
     pub(crate) fn hold_pending_for_test(&self, input: PrepareInput<'_>) {
         let target = PrepareTarget {
             candidates: Arc::new([]),
+            settings: Arc::default(),
         };
         self.slot(&target, input, Holder::LifecyclePass);
     }
@@ -438,6 +447,7 @@ impl PrepareRegistry {
     ) {
         let target = PrepareTarget {
             candidates: Arc::new([]),
+            settings: Arc::default(),
         };
         let slot = self
             .slot(&target, input, Holder::LifecyclePass)
@@ -465,17 +475,23 @@ impl PrepareRegistry {
     }
 
     /// Keep only the regions `keep(host language, injection language,
-    /// candidates)` accepts — after a settings change, those whose pair still
-    /// lists the same servers with the same launch configs. With
-    /// `drop_unusable`, answers cached as final go too: the change may have
-    /// fixed what made them unusable (a peer's command, say), and the caller
-    /// guarantees a pass that asks again. An attempt whose region (or slot)
-    /// goes is revoked: it starts no peer.
+    /// candidates)` accepts — after a settings change to `settings`, those
+    /// whose pair still lists the same servers with the same launch
+    /// configs. With `drop_unusable`, answers cached as final go too: the
+    /// change may have fixed what made them unusable (a peer's command,
+    /// say), and the caller guarantees a pass that asks again. An attempt
+    /// whose region (or slot) goes is revoked: it starts no peer.
+    ///
+    /// `settings` is recorded first: a request resolved from earlier
+    /// settings is let in no more, and one let in just before is let in
+    /// under its region's entry, which this pass then visits.
     pub(crate) fn retain(
         &self,
+        settings: &Arc<crate::config::WorkspaceSettings>,
         keep: impl Fn(&str, &str, &[ResolvedServerConfig]) -> bool,
         drop_unusable: bool,
     ) {
+        self.pruned_under.store(Some(Arc::clone(settings)));
         self.regions.retain(|_, region| {
             if !keep(
                 &region.host_language,
@@ -545,9 +561,10 @@ impl PrepareRegistry {
 
     /// The slot answering `input`, created when missing. `None` for a
     /// request under other candidates than the lifecycle pass looked the
-    /// region up under (settings in flight across a change): its answer
-    /// would be the old launch's, and asking would start a peer the
-    /// settings no longer name.
+    /// region up under, or resolved from settings a change has replaced
+    /// (settings in flight across a change): its answer would be the old
+    /// launch's, and asking would start a peer the settings no longer name
+    /// — recreating, if the change pruned it, the region with them.
     fn slot(
         &self,
         target: &PrepareTarget,
@@ -558,7 +575,19 @@ impl PrepareRegistry {
         let key = input_key(target, input);
         let host_uri = input.host_uri.as_str();
         let hash = region_hash(host_uri, input.injection_language, input.region_id);
-        let mut region = self.regions.entry(hash).or_insert_with(|| Region {
+        let entry = self.regions.entry(hash);
+        // Under the entry's lock: a change recording its settings after
+        // this check prunes what is inserted here.
+        if holder == Holder::Request
+            && self
+                .pruned_under
+                .load()
+                .as_ref()
+                .is_some_and(|current| !Arc::ptr_eq(current, &target.settings))
+        {
+            return None;
+        }
+        let mut region = entry.or_insert_with(|| Region {
             host_uri: host_uri.to_string(),
             injection_language: input.injection_language.to_string(),
             region_id: input.region_id.to_string(),
@@ -1025,6 +1054,7 @@ mod tests {
                     }),
                 })
                 .collect(),
+            settings: Arc::default(),
         }
     }
 
@@ -1501,6 +1531,35 @@ mod tests {
     }
 
     #[test]
+    fn a_request_resolved_before_a_settings_change_recreates_no_region() {
+        let registry = PrepareRegistry::default();
+        let host = Url::parse("file:///host.md").unwrap();
+        let before = target_of(&[("peer", &["deno"])]);
+        cell(&registry, &before, input(&host, "a"), Holder::LifecyclePass);
+        // The change no longer names the peer: its region goes.
+        let after = PrepareTarget {
+            settings: Arc::default(),
+            ..target_of(&[("other", &["bun"])])
+        };
+        registry.retain(&after.settings, |_, _, _| false, false);
+        assert!(registry.regions.is_empty());
+        // A request resolved from the settings before gets no slot, and
+        // brings no region back with the old peer.
+        assert!(
+            registry
+                .slot(&before, input(&host, "a"), Holder::Request)
+                .is_none()
+        );
+        assert!(registry.regions.is_empty());
+        // One resolved from the settings now does.
+        assert!(
+            registry
+                .slot(&after, input(&host, "a"), Holder::Request)
+                .is_some()
+        );
+    }
+
+    #[test]
     fn retain_sees_the_peer_config_answers_came_from() {
         let registry = PrepareRegistry::default();
         let target = target_of(&[("peer", &["deno"])]);
@@ -1512,9 +1571,9 @@ mod tests {
                 same_candidates(seen, &other.candidates)
             }
         };
-        registry.retain(same("deno"), false);
+        registry.retain(&target.settings, same("deno"), false);
         assert_eq!(registry.regions.len(), 1);
-        registry.retain(same("bun"), false);
+        registry.retain(&target.settings, same("bun"), false);
         assert!(
             registry.regions.is_empty(),
             "a relaunched peer prepares again"
@@ -1528,12 +1587,12 @@ mod tests {
         let host = Url::parse("file:///host.md").unwrap();
         let failed = cell(&registry, &target, input(&host, "a"), Holder::LifecyclePass);
         failed.outcome.set(None).unwrap();
-        registry.retain(|_, _, _| true, false);
+        registry.retain(&target.settings, |_, _, _| true, false);
         assert!(
             registry.held_failed(&host, "lua", REGION),
             "nothing would ask again"
         );
-        registry.retain(|_, _, _| true, true);
+        registry.retain(&target.settings, |_, _, _| true, true);
         let fresh = cell(&registry, &target, input(&host, "a"), Holder::LifecyclePass);
         assert!(
             fresh.outcome.get().is_none(),

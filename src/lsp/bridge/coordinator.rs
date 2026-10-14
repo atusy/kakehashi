@@ -617,7 +617,10 @@ impl BridgeCoordinator {
                 .filter_map(|name| configs.iter().find(|config| config.server_name == name))
                 .cloned()
                 .collect();
-        (!candidates.is_empty()).then_some(super::PrepareTarget { candidates })
+        (!candidates.is_empty()).then(|| super::PrepareTarget {
+            candidates,
+            settings: Arc::clone(settings),
+        })
     }
 
     /// After a settings change, drop prepared documents whose (host,
@@ -635,6 +638,7 @@ impl BridgeCoordinator {
     ) {
         self.warned_prepare_strategy.clear();
         self.prepare.retain(
+            settings,
             |host_language, injection_language, candidates| {
                 experimental
                     // The same names may now launch differently (or not at
