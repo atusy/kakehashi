@@ -118,6 +118,11 @@ struct Cell {
     /// changed): a request still holding it, waiting or not, takes it as
     /// no answer.
     revoked: AtomicBool,
+    /// The advertisement epoch its answer was checked against (see
+    /// `LanguageServerPool::prepare_advertised_epoch`), stored before the
+    /// answer: read under another epoch, the answer is outdated even before
+    /// it is revoked — every epoch move forgets every settled answer.
+    answered_epoch: std::sync::atomic::AtomicU64,
     /// Where the input was first looked up in the presentation order (see
     /// `protocol::next_presentation`): an answer to it is as new as its
     /// virtual text, not as the moment it came.
@@ -138,8 +143,15 @@ struct Cell {
 }
 
 impl Cell {
-    fn lookup(&self) -> Option<PrepareLookup> {
-        if self.revoked.load(Ordering::Acquire) {
+    /// Whether the answer, if any, still stands at `epoch`.
+    fn current(&self, epoch: u64) -> bool {
+        !self.revoked.load(Ordering::Acquire)
+            && (self.outcome.get().is_none()
+                || self.answered_epoch.load(Ordering::Acquire) == epoch)
+    }
+
+    fn lookup(&self, epoch: u64) -> Option<PrepareLookup> {
+        if !self.current(epoch) {
             return None;
         }
         self.outcome.get().map(|outcome| match outcome {
@@ -148,8 +160,8 @@ impl Cell {
         })
     }
 
-    fn settled(&self) -> Result<Arc<PreparedDocument>, PrepareMiss> {
-        if self.revoked.load(Ordering::Acquire) {
+    fn settled(&self, epoch: u64) -> Result<Arc<PreparedDocument>, PrepareMiss> {
+        if !self.current(epoch) {
             return Err(PrepareMiss::Unanswered);
         }
         match self.outcome.get() {
@@ -356,7 +368,7 @@ impl PrepareRegistry {
             }
             return PrepareLookup::Pending;
         };
-        if let Some(found) = slot.cell.lookup() {
+        if let Some(found) = slot.cell.lookup(pool.prepare_advertised_epoch()) {
             return found;
         }
         self.start(&slot, pool, target, input);
@@ -374,18 +386,18 @@ impl PrepareRegistry {
             return Err(PrepareMiss::Unanswered);
         };
         if slot.cell.outcome.get().is_some() {
-            return slot.cell.settled();
+            return slot.cell.settled(pool.prepare_advertised_epoch());
         }
         // Subscribe before starting, so the attempt's end cannot be missed.
         let mut attempts = slot.cell.attempts.subscribe();
         if !self.start(&slot, pool, target, input) && !slot.cell.in_flight.load(Ordering::Acquire) {
             // Backing off after a miss: do not queue another attempt per
             // request, each waiting out its own timeouts.
-            return slot.cell.settled();
+            return slot.cell.settled(pool.prepare_advertised_epoch());
         }
         // The attempt ends (answered or not) with a bump.
         let _ = attempts.changed().await;
-        slot.cell.settled()
+        slot.cell.settled(pool.prepare_advertised_epoch())
     }
 
     /// Whether any of `host_uri`'s documents the lifecycle pass holds back
@@ -737,6 +749,8 @@ impl PrepareRegistry {
             match run(&pool, &target, &job, &next_version, &admitted).await {
                 Ok((advertised_epoch, outcome)) => {
                     let ready = outcome.is_some();
+                    cell.answered_epoch
+                        .store(advertised_epoch, Ordering::Release);
                     let _ = cell.outcome.set(outcome);
                     let held = holds(&regions);
                     // An advertisement change after the attempt's last look
@@ -1781,6 +1795,24 @@ mod tests {
     }
 
     #[test]
+    fn an_answer_read_under_a_newer_epoch_is_outdated_before_it_is_revoked() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let answered = cell(&registry, &target, input(&host, "a"), Holder::Request);
+        answered.answered_epoch.store(3, Ordering::Release);
+        let _ = answered.outcome.set(Some(Arc::new(PreparedDocument {
+            text: "a".to_string(),
+            map: None,
+        })));
+        assert!(answered.settled(3).is_ok());
+        // The advertisements moved after it was checked, before the hook
+        // forgot it: no reader takes it.
+        assert_eq!(answered.settled(4).err(), Some(PrepareMiss::Unanswered));
+        assert!(answered.lookup(4).is_none());
+    }
+
+    #[test]
     fn settled_answers_are_forgotten_when_an_advertisement_changes() {
         let registry = PrepareRegistry::default();
         let target = unstartable_target();
@@ -1801,8 +1833,8 @@ mod tests {
         let kept = cell(&registry, &target, input(&host, "c"), Holder::Request);
         assert!(Arc::ptr_eq(&pending, &kept), "an attempt in flight stays");
         // A request still holding a forgotten answer takes it as none.
-        assert_eq!(as_is.settled().err(), Some(PrepareMiss::Unanswered));
-        assert!(as_is.lookup().is_none());
+        assert_eq!(as_is.settled(0).err(), Some(PrepareMiss::Unanswered));
+        assert!(as_is.lookup(0).is_none());
     }
 
     #[test]
