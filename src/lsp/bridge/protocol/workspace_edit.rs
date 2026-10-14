@@ -120,7 +120,9 @@ fn host_edits_keep_hidden_text(
         to_host(Position::new(0, 0)),
         to_host(prepared.virtual_end()),
     );
-    let set_keeps = |edits: Vec<(&Range, &str)>| {
+    // A set's edits reaching into the region, in V; `None` when one reaches
+    // in from outside it.
+    let in_region = |edits: &[(&Range, &str)]| {
         let mut in_region = Vec::new();
         for (range, new_text) in edits {
             match (to_virtual(&range.start), to_virtual(&range.end)) {
@@ -132,13 +134,35 @@ fn host_edits_keep_hidden_text(
                 // Meeting the region at its edge only.
                 (None, Some(_)) if range.end == region_start => {}
                 (Some(_), None) if range.start == region_end => {}
-                _ => return false,
+                _ => return None,
             }
         }
-        in_region.is_empty() || prepared.virtual_edits_keep_host_text(&in_region)
+        Some(in_region)
     };
-    let (changes, document_changes) = host_text_edits_by_kind(edit, host_uri);
-    set_keeps(changes.collect()) && set_keeps(document_changes.collect())
+    let keeps =
+        |edits: &[TextEdit]| edits.is_empty() || prepared.virtual_edits_keep_host_text(edits);
+    let (changes, entries) = host_text_edits_by_kind(edit, host_uri);
+    let changes: Vec<_> = changes.collect();
+    if !in_region(&changes).is_some_and(|edits| keeps(&edits)) {
+        return false;
+    }
+    // `documentChanges` entries apply one after another, each to the text
+    // the ones before it left: those reaching into the region are checked
+    // as one set only when there is one; several are refused, as an order
+    // of sets this check does not compose.
+    let mut reaching: Vec<Vec<TextEdit>> = Vec::new();
+    for entry in &entries {
+        match in_region(entry) {
+            None => return false,
+            Some(edits) if edits.is_empty() => {}
+            Some(edits) => reaching.push(edits),
+        }
+    }
+    match reaching.as_slice() {
+        [] => true,
+        [edits] => keeps(edits),
+        _ => false,
+    }
 }
 
 /// Whether any edit to `host_uri` ending right where a gap starts a line
@@ -212,9 +236,13 @@ fn host_edits_overlap(edit: &WorkspaceEdit, host_uri: &Uri) -> bool {
         ranges.sort_by_key(|range| (range.start, range.end));
         ranges.windows(2).any(|pair| pair[0].end > pair[1].start)
     };
-    let (changes, document_changes) = host_text_edits_by_kind(edit, host_uri);
+    let (changes, entries) = host_text_edits_by_kind(edit, host_uri);
+    // Each `documentChanges` entry applies to the text the ones before it
+    // left: only the edits of one entry are simultaneous.
     overlap(changes.map(|(range, _)| range).collect())
-        || overlap(document_changes.map(|(range, _)| range).collect())
+        || entries
+            .iter()
+            .any(|entry| overlap(entry.iter().map(|(range, _)| *range).collect()))
 }
 
 /// The range and new text of every edit a `WorkspaceEdit` makes to
@@ -223,19 +251,19 @@ fn host_text_edits<'a>(
     edit: &'a WorkspaceEdit,
     host_uri: &'a Uri,
 ) -> impl Iterator<Item = (&'a Range, &'a str)> {
-    let (changes, document_changes) = host_text_edits_by_kind(edit, host_uri);
-    changes.chain(document_changes)
+    let (changes, entries) = host_text_edits_by_kind(edit, host_uri);
+    changes.chain(entries.into_iter().flatten())
 }
 
+/// An edit's range and new text.
+type HostEdit<'a> = (&'a Range, &'a str);
+
 /// [`host_text_edits`], those in `changes` apart from those in
-/// `documentChanges`.
+/// `documentChanges`, kept per entry (applied in order).
 fn host_text_edits_by_kind<'a>(
     edit: &'a WorkspaceEdit,
     host_uri: &'a Uri,
-) -> (
-    impl Iterator<Item = (&'a Range, &'a str)>,
-    impl Iterator<Item = (&'a Range, &'a str)>,
-) {
+) -> (impl Iterator<Item = HostEdit<'a>>, Vec<Vec<HostEdit<'a>>>) {
     let changes = edit
         .changes
         .as_ref()
@@ -254,19 +282,24 @@ fn host_text_edits_by_kind<'a>(
             })
             .collect(),
     };
-    let document_changes = document_edits
+    let entries = document_edits
         .into_iter()
-        .filter(move |document_edit| &document_edit.text_document.uri == host_uri)
-        .flat_map(|document_edit| {
-            document_edit.edits.iter().map(|one_of| match one_of {
-                OneOf::Left(text_edit) => (&text_edit.range, text_edit.new_text.as_str()),
-                OneOf::Right(annotated) => (
-                    &annotated.text_edit.range,
-                    annotated.text_edit.new_text.as_str(),
-                ),
-            })
-        });
-    (changes, document_changes)
+        .filter(|document_edit| &document_edit.text_document.uri == host_uri)
+        .map(|document_edit| {
+            document_edit
+                .edits
+                .iter()
+                .map(|one_of| match one_of {
+                    OneOf::Left(text_edit) => (&text_edit.range, text_edit.new_text.as_str()),
+                    OneOf::Right(annotated) => (
+                        &annotated.text_edit.range,
+                        annotated.text_edit.new_text.as_str(),
+                    ),
+                })
+                .collect()
+        })
+        .collect();
+    (changes, entries)
 }
 
 /// The ranges of every edit a `WorkspaceEdit` makes to `host_uri`.
@@ -1102,6 +1135,54 @@ mod tests {
         }));
         assert!(!transform_workspace_edit_to_host(
             &mut edit,
+            &virtual_uri,
+            &host_uri,
+            &offset,
+        ));
+    }
+
+    #[test]
+    fn document_changes_entries_of_a_prepared_edit_apply_in_order() {
+        use super::super::prepare::{VirtualLayout, apply_prepare_result};
+        let virtual_text = "  a\n  b\n";
+        let result = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(result),
+        )
+        .unwrap();
+        // The region starts on line 1, after its opening fence.
+        let offset = RegionOffset::new(1, 0).with_prepared(prepared.map);
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let entry = |line: u32, start: u32, end: u32, text: &str| {
+            json!({
+                "textDocument": {"uri": host_uri.as_str(), "version": null},
+                "edits": [{"range": {"start": {"line": line, "character": start}, "end": {"line": line, "character": end}}, "newText": text}]
+            })
+        };
+        // The fence rewritten twice, one entry after the other: no overlap.
+        let mut fence = parse_workspace_edit(json!({
+            "documentChanges": [entry(0, 0, 3, "def"), entry(0, 0, 3, "ghi")]
+        }));
+        assert!(transform_workspace_edit_to_host(
+            &mut fence,
+            &virtual_uri,
+            &host_uri,
+            &offset,
+        ));
+        // Two entries reaching into the region, each applying to what the
+        // one before left: not checked as one set, so refused.
+        let mut region = parse_workspace_edit(json!({
+            "documentChanges": [entry(1, 2, 3, "x"), entry(2, 2, 3, "y")]
+        }));
+        assert!(!transform_workspace_edit_to_host(
+            &mut region,
             &virtual_uri,
             &host_uri,
             &offset,
