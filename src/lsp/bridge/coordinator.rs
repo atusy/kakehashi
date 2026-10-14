@@ -237,6 +237,10 @@ pub(crate) struct BridgeCoordinator {
     /// `preferred`, until the next settings change: the
     /// warning would otherwise repeat per region per edit.
     warned_prepare_strategy: dashmap::DashSet<(String, String)>,
+    /// A pair was looked up for its prepare peer with the experimental
+    /// feature on: until then an advertisement change has nothing to re-sync
+    /// (the feature stays dormant for those who never enabled it).
+    prepare_engaged: Arc<std::sync::atomic::AtomicBool>,
     /// Hosts owed a `workspace/diagnostic/refresh` once their documents
     /// waiting for prepare answers are sent (see
     /// [`Self::owe_pull_after_prepare`]).
@@ -389,6 +393,7 @@ impl BridgeCoordinator {
             pool,
             prepare: super::prepare_registry::PrepareRegistry::default(),
             warned_prepare_strategy: dashmap::DashSet::new(),
+            prepare_engaged: Arc::default(),
             prepare_pull_debts: dashmap::DashSet::new(),
             held_saves: DashMap::new(),
             node_tracker: Arc::new(NodeTracker::new()),
@@ -417,7 +422,13 @@ impl BridgeCoordinator {
         let pool = Arc::downgrade(&self.pool);
         let resync = self.prepare.resync_sender();
         let forget = self.prepare.forget_settled_answers_hook();
+        let engaged = Arc::clone(&self.prepare_engaged);
         self.pool.set_prepare_advertised_hook(Box::new(move || {
+            // Dormant until a pair was looked up for its peer: with the
+            // feature off nothing was prepared, nor is anything to be.
+            if !engaged.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
             let Some(pool) = pool.upgrade() else {
                 return;
             };
@@ -450,6 +461,7 @@ impl BridgeCoordinator {
             pool,
             prepare: super::prepare_registry::PrepareRegistry::default(),
             warned_prepare_strategy: dashmap::DashSet::new(),
+            prepare_engaged: Arc::default(),
             prepare_pull_debts: dashmap::DashSet::new(),
             held_saves: DashMap::new(),
             node_tracker: Arc::new(NodeTracker::new()),
@@ -533,6 +545,13 @@ impl BridgeCoordinator {
     ) -> Option<super::PrepareTarget> {
         if !experimental {
             return None;
+        }
+        if !self
+            .prepare_engaged
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.prepare_engaged
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
         // Memoized per settings snapshot: this runs per bridged region in
         // every lifecycle pass and request. The memoized `Arc` also lets the
@@ -5005,6 +5024,17 @@ mod tests {
         let host = url::Url::parse("file:///host.md").unwrap();
         coordinator.pool().open_host_incarnation(&host, 1).await;
         let peer = crate::lsp::bridge::pool::ConnectionKey::for_server("tsudoi");
+        // Dormant while the feature is off: nothing re-synced.
+        coordinator.pool().record_prepare_advertisement(&peer, true);
+        coordinator
+            .pool()
+            .record_prepare_advertisement(&peer, false);
+        assert!(
+            resync.try_recv().is_err(),
+            "nothing re-synced while dormant"
+        );
+        let settings = Arc::new(WorkspaceSettings::default());
+        coordinator.prepare_target(&settings, "markdown", "lua", true);
         coordinator.pool().record_prepare_advertisement(&peer, true);
         // Withdrawn: the host's documents go out as is from now on, and what
         // their prepared text published must go with it.
