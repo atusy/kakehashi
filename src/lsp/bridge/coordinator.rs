@@ -654,6 +654,16 @@ impl BridgeCoordinator {
         );
     }
 
+    /// After servers were sent other runtime settings: a peer may now
+    /// prepare differently, and answers given (or being given) under the
+    /// settings before are asked again. Nothing to do while nothing was
+    /// ever prepared.
+    pub(crate) fn invalidate_prepared_after_propagation(&self) {
+        if !self.prepare.unused() {
+            self.pool.invalidate_prepare_answers();
+        }
+    }
+
     /// The prepared form of a virtual document, without waiting: on a miss
     /// an attempt starts in the background, and the host is queued for a
     /// re-sync once it lands (see [`Self::take_prepare_resync_rx`]).

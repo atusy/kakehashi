@@ -735,6 +735,14 @@ impl LanguageServerPool {
             .load(Ordering::Acquire)
     }
 
+    /// Treat every prepare answer as possibly outdated, as a change of a
+    /// server's advertisement does (see [`Self::set_prepare_advertised_hook`]):
+    /// servers were sent other runtime settings, under which a peer may
+    /// prepare differently.
+    pub(crate) fn invalidate_prepare_answers(&self) {
+        self.prepare_advertisements.invalidate();
+    }
+
     /// Run `hook` whenever a server's recorded advertisement of
     /// `kakehashi/virtualDocument/prepare` changes (set once).
     pub(crate) fn set_prepare_advertised_hook(&self, hook: Box<dyn Fn() + Send + Sync>) {
@@ -5438,6 +5446,14 @@ impl PrepareAdvertisements {
         true
     }
 
+    /// As if an advertisement had changed: what candidates answer may have.
+    fn invalidate(&self) {
+        self.advertised_epoch.fetch_add(1, Ordering::AcqRel);
+        if let Some(hook) = self.on_advertised.get() {
+            hook();
+        }
+    }
+
     fn get(&self, server_name: &str) -> Option<bool> {
         self.by_server
             .get(server_name)
@@ -5510,6 +5526,10 @@ mod tests {
         pool.record_prepare_advertisement("late", false);
         assert_eq!(runs(), 2);
         assert_eq!(pool.prepare_advertised_epoch(), before + 2);
+        // Runtime settings propagated: as if an advertisement had changed.
+        pool.invalidate_prepare_answers();
+        assert_eq!(runs(), 3);
+        assert_eq!(pool.prepare_advertised_epoch(), before + 3);
     }
     use crate::lsp::bridge::actor::{OutboundMessage, RouteResult, spawn_reader_task};
     use crate::lsp::bridge::protocol::RegionOffset;
