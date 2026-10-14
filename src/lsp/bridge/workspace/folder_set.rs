@@ -41,7 +41,9 @@ impl WorkspaceFolderSet {
         }
     }
 
-    fn deduplicate(folders: Option<Vec<WorkspaceFolder>>) -> Option<Vec<WorkspaceFolder>> {
+    pub(super) fn deduplicate(
+        folders: Option<Vec<WorkspaceFolder>>,
+    ) -> Option<Vec<WorkspaceFolder>> {
         folders.map(|folders| {
             let mut unique = Vec::<WorkspaceFolder>::with_capacity(folders.len());
             for folder in folders {
@@ -64,6 +66,9 @@ impl WorkspaceFolderSet {
 
     /// Replace the complete set, preserving the protocol distinction between
     /// `None` (`null`) and `Some(vec![])` (an explicitly empty folder list).
+    /// Test-only: production sets are seeded at spawn and change only through
+    /// the announcing methods below.
+    #[cfg(test)]
     pub(crate) fn replace(&self, folders: Option<Vec<WorkspaceFolder>>) {
         *self
             .inner
@@ -85,18 +90,8 @@ impl WorkspaceFolderSet {
             .is_some_and(|folders| folders.iter().any(|existing| existing.uri == folder.uri))
     }
 
-    /// Apply an upstream workspace-folder change atomically. Removals match by
-    /// URI (folder names are display metadata), then additions append in event
-    /// order while preserving URI uniqueness.
-    pub(crate) fn apply_change(&self, added: Vec<WorkspaceFolder>, removed: &[WorkspaceFolder]) {
-        let mut guard = self
-            .inner
-            .lock()
-            .recover_poison("WorkspaceFolderSet::apply_change");
-        Self::apply_to(&mut guard, added, removed);
-    }
-
-    /// [`Self::apply_change`], announced: `announce` runs **while the set
+    /// Apply an upstream workspace-folder change ([`Self::apply_to`]),
+    /// announced: `announce` runs **while the set
     /// lock is held** (it enqueues `workspace/didChangeWorkspaceFolders`) and
     /// the change commits only when it returns `true`. A server that pulls
     /// `workspace/workspaceFolders` as soon as the notification arrives
@@ -121,7 +116,11 @@ impl WorkspaceFolderSet {
         true
     }
 
-    fn apply_to(
+    /// Apply a workspace-folder change to `folders`. Removals match by URI
+    /// (folder names are display metadata), then additions append in event
+    /// order while preserving URI uniqueness. A removal-only change leaves a
+    /// `None` set `None`.
+    pub(super) fn apply_to(
         folders: &mut Option<Vec<WorkspaceFolder>>,
         added: Vec<WorkspaceFolder>,
         removed: &[WorkspaceFolder],
@@ -348,13 +347,14 @@ mod tests {
     }
 
     #[test]
-    fn apply_change_removes_by_uri_and_adds_without_duplicates() {
+    fn change_removes_by_uri_and_adds_without_duplicates() {
         let set = WorkspaceFolderSet::new(Some(vec![folder("file:///a"), folder("file:///b")]));
 
-        set.apply_change(
+        assert!(set.change_and_announce(
             vec![folder("file:///b"), folder("file:///c")],
             &[folder("file:///a")],
-        );
+            || true,
+        ));
 
         assert_eq!(
             set.snapshot(),
@@ -366,7 +366,7 @@ mod tests {
     fn add_to_none_materializes_folder_set() {
         let set = WorkspaceFolderSet::new(None);
 
-        set.apply_change(vec![folder("file:///a")], &[]);
+        assert!(set.change_and_announce(vec![folder("file:///a")], &[], || true));
 
         assert_eq!(set.snapshot(), Some(vec![folder("file:///a")]));
     }
@@ -375,17 +375,8 @@ mod tests {
     fn removal_only_change_preserves_a_none_set() {
         let set = WorkspaceFolderSet::new(None);
 
-        set.apply_change(Vec::new(), &[folder("file:///absent")]);
+        assert!(set.change_and_announce(Vec::new(), &[folder("file:///absent")], || true));
 
         assert_eq!(set.snapshot(), None);
-    }
-
-    #[test]
-    fn replace_preserves_an_explicit_empty_set() {
-        let set = WorkspaceFolderSet::new(None);
-
-        set.replace(Some(Vec::new()));
-
-        assert_eq!(set.snapshot(), Some(Vec::new()));
     }
 }
