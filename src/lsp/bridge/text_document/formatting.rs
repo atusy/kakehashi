@@ -1716,6 +1716,74 @@ mod tests {
         );
     }
 
+    /// A Nix `''` string's JSON at host line 0, column 5, dedented by the
+    /// prepare peer: its virtual and host text, and the offset with the map.
+    fn prepared_nix_json() -> (&'static str, RegionOffset) {
+        use super::super::super::protocol::{VirtualLayout, apply_prepare_result};
+        let virtual_content = "\n    {\"a\":1}\n  ";
+        let result = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 4}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_content,
+            &VirtualLayout::single(virtual_content),
+            Some(result),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "\n{\"a\":1}\n  ");
+        (
+            virtual_content,
+            RegionOffset::new(0, 5).with_prepared(prepared.map),
+        )
+    }
+
+    /// `virtual_content` (a region at host line 0, column 5) with host
+    /// `edits` applied.
+    fn apply_host_edits(virtual_content: &str, edits: &[TextEdit]) -> String {
+        let unprepared = RegionOffset::new(0, 5);
+        let virtual_edits: Vec<TextEdit> = edits
+            .iter()
+            .map(|edit| {
+                let mut range = edit.range;
+                super::super::super::protocol::translate_host_range_to_virtual(
+                    &mut range,
+                    &unprepared,
+                );
+                TextEdit {
+                    range,
+                    new_text: edit.new_text.clone(),
+                }
+            })
+            .collect();
+        crate::text::edit::apply_text_edits(virtual_content, &virtual_edits)
+    }
+
+    #[test]
+    fn a_prepared_region_keeps_its_edges_through_a_whole_document_answer() {
+        // jsonls drops the line break after `''` and the closing indentation
+        // of the prepared text it formatted.
+        let (virtual_content, offset) = prepared_nix_json();
+        let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [
+            { "range": { "start": { "line": 0, "character": 0 },
+                         "end": { "line": 2, "character": 2 } },
+              "newText": "{\n  \"a\": 1\n}" }
+        ]});
+
+        let edits = transform_formatting_response_to_host(
+            response,
+            &offset,
+            "\n{\"a\":1}\n  ",
+            region_host_end(virtual_content, &offset.unprepared()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            apply_host_edits(virtual_content, &edits),
+            "\n    {\n      \"a\": 1\n    }\n  "
+        );
+    }
+
     #[test]
     fn an_end_past_eof_over_lone_cr_content_ends_at_the_region_end() {
         // A lone CR ends an LSP line, so "a\rb" has two lines. Counting only
