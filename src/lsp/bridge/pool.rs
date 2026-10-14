@@ -3145,8 +3145,9 @@ impl LanguageServerPool {
             .await
     }
 
-    /// Record `content`'s fingerprint as sent to this connection — call only after a
-    /// confirmed-enqueued didChange (#422). Delegates to
+    /// Record `content` (its fingerprint, and the map it was sent with) as what
+    /// this connection holds — call only after a confirmed-enqueued didOpen or
+    /// didChange (#422). Delegates to
     /// [`DocumentTracker::record_sent_content_fingerprint`].
     pub(super) async fn record_sent_content_fingerprint<'a>(
         &self,

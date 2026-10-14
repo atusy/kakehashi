@@ -781,8 +781,9 @@ impl Kakehashi {
 
         // Virtual documents held back for a prepare peer's answer are sent
         // once it arrives: the finished request names the host, and the
-        // injection pass re-run for it now finds the prepared text. (A failed
-        // attempt names the host again after its retry backoff.)
+        // injection pass re-run for it now finds the prepared text. (An
+        // unusable answer names it at once; an attempt that got no answer
+        // names it again after its retry backoff.)
         if let Some(mut resync_rx) = self.bridge.take_prepare_resync_rx() {
             let injection = self.injection_coordinator();
             let diagnostics = self.diagnostic_scheduler();
