@@ -321,12 +321,28 @@ pub(super) fn transform_completion_item(
                 ]
             }
         };
-        for (range, new_text) in ranges {
-            let Some(new_text) = snippet_expansion(new_text) else {
+        for (range, snippet_text) in ranges {
+            let Some(new_text) = snippet_expansion(snippet_text) else {
                 return false;
             };
             let expanded = tower_lsp_server::ls_types::TextEdit { range, new_text };
-            if translate_one_edit_to_host(expanded, offset).is_none() {
+            let Some(expanded) = translate_one_edit_to_host(expanded, offset) else {
+                return false;
+            };
+            // The snippet itself is what goes out, mapped as text: kept only
+            // when it lands where its expansion was checked and expands to
+            // that (an expansion opening with a line break can map across a
+            // removed indent the snippet's `$` does not).
+            let raw = tower_lsp_server::ls_types::TextEdit {
+                range,
+                new_text: snippet_text.clone(),
+            };
+            let Some(raw) = translate_one_edit_to_host(raw, offset) else {
+                return false;
+            };
+            if raw.range != expanded.range
+                || snippet_expansion(&raw.new_text).as_ref() != Some(&expanded.new_text)
+            {
                 return false;
             }
         }
@@ -1069,6 +1085,46 @@ mod tests {
         assert_eq!(expanded("${1:${2:${3:x}}}"), None);
         let deep = format!("{}x{}", "${1:".repeat(10_000), "}".repeat(10_000));
         assert_eq!(expanded(&deep), None);
+    }
+
+    #[rstest]
+    // An expansion opening with a line break maps across the removed indent,
+    // which the snippet's `$` does not: what goes out is not what was checked.
+    #[case::line_break_opening_its_default("${1:\n}x", false)]
+    #[case::plain_text_after_a_tabstop("x$0", true)]
+    fn a_prepared_snippet_is_kept_only_if_it_maps_as_its_expansion(
+        #[case] snippet: &str,
+        #[case] kept: bool,
+    ) {
+        use super::super::super::protocol::{VirtualLayout, apply_prepare_result};
+        // `  a\n`, dedented by two.
+        let result = serde_json::from_value(serde_json::json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared =
+            apply_prepare_result("  a\n", &VirtualLayout::single("  a\n"), Some(result)).unwrap();
+        let offset = RegionOffset::new(0, 0).with_prepared(prepared.map);
+        let mut item: tower_lsp_server::ls_types::CompletionItem = serde_json::from_value(
+            serde_json::json!({
+                "label": "x",
+                "insertTextFormat": 2,
+                "textEdit": {
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+                    "newText": snippet
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            transform_completion_item(
+                &mut item,
+                &offset,
+                Position::new(1, 0),
+                Some(Position::new(0, 2)),
+            ),
+            kept
+        );
     }
 
     #[test]
