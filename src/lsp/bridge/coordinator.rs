@@ -613,8 +613,10 @@ impl BridgeCoordinator {
     }
 
     /// After a settings change, drop prepared documents whose (host,
-    /// injection) pair no longer lists the candidates that prepared them,
-    /// so no path keeps translating through a map for text no longer sent.
+    /// injection) pair no longer lists the candidates that prepared them, so
+    /// no answer from a peer the settings no longer name, or name with
+    /// another launch config, is reused or re-sent (what servers hold, and
+    /// so how their coordinates translate, is kept with what they were sent).
     /// `reparsing`: the change re-runs every host's injection pass, so
     /// answers cached as unusable can go too and be asked again.
     pub(crate) fn prune_prepared(
