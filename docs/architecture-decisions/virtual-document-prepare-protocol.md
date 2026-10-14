@@ -255,8 +255,11 @@ server that starts after a save.
   only while the connection still holds that very text: the server may never
   publish again, and its next text may map differently. The same text held
   under another map (only its gaps changed) keeps it, placed through that
-  map. A push computed for the previous text but arriving after the new one
-  was sent cannot be told apart, as for any unprepared document.
+  map. A push naming another document version than the one its connection
+  was last sent was computed for an earlier text and places nowhere —
+  prepared or not, once anything was ever prepared; only a push without a
+  version, computed for the previous text but arriving after the new one
+  was sent, cannot be told apart.
 - **Cached answers follow the configuration.** An answer is the peer's for
   one launch configuration: a settings change that drops or retargets a
   pair's peer drops the pair's answers, and a request still carrying
