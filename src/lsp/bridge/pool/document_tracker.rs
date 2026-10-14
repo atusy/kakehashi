@@ -107,15 +107,6 @@ impl VirtualUriObserver {
     }
 }
 
-/// Hash of a virtual document's extracted content, used to skip re-sending an
-/// unchanged `didChange` (#422). Mirrors the host path's fingerprint
-/// (`text_document/host.rs`).
-///
-/// A 64-bit hash collision (two *different* contents hashing equal — astronomically
-/// unlikely for `DefaultHasher`) would make a genuinely changed region look unchanged
-/// and skip its re-sync: the downstream then analyzes stale content until a *later*
-/// edit happens to hash differently, and if no further edit occurs it stays stale.
-/// This is the standard fingerprint-guard tradeoff, accepted for the collision odds.
 /// Text sent downstream for a virtual document: the virtual text itself, or
 /// the text a peer prepared from it (`kakehashi/virtualDocument/prepare`)
 /// with the map back to it.
@@ -152,6 +143,15 @@ pub(crate) struct HeldText {
     pub(crate) generation: u64,
 }
 
+/// Hash of a virtual document's extracted content, used to skip re-sending an
+/// unchanged `didChange` (#422). Mirrors the host path's fingerprint
+/// (`text_document/host.rs`).
+///
+/// A 64-bit hash collision (two *different* contents hashing equal — astronomically
+/// unlikely for `DefaultHasher`) would make a genuinely changed region look unchanged
+/// and skip its re-sync: the downstream then analyzes stale content until a *later*
+/// edit happens to hash differently, and if no further edit occurs it stays stale.
+/// This is the standard fingerprint-guard tradeoff, accepted for the collision odds.
 pub(super) fn content_fingerprint(content: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
