@@ -263,24 +263,29 @@ pub(super) fn transform_completion_item(
     // The primary edit as the server sent it (the replace range of an
     // insert/replace one): the additional edits are checked together with it
     // below.
-    let primary = item.text_edit.as_ref().map(|text_edit| match text_edit {
-        tower_lsp_server::ls_types::CompletionTextEdit::Edit(edit) => edit.clone(),
-        tower_lsp_server::ls_types::CompletionTextEdit::InsertAndReplace(edit) => {
-            tower_lsp_server::ls_types::TextEdit {
-                range: edit.replace,
-                new_text: edit.new_text.clone(),
+    // Only a prepared document checks them together, and only when there are
+    // additional edits: the clone is per item, on the hottest response.
+    let primary = if offset.prepared().is_some() && item.additional_text_edits.is_some() {
+        item.text_edit.as_ref().map(|text_edit| match text_edit {
+            tower_lsp_server::ls_types::CompletionTextEdit::Edit(edit) => edit.clone(),
+            tower_lsp_server::ls_types::CompletionTextEdit::InsertAndReplace(edit) => {
+                tower_lsp_server::ls_types::TextEdit {
+                    range: edit.replace,
+                    new_text: edit.new_text.clone(),
+                }
             }
-        }
-    });
+        })
+    } else {
+        None
+    };
 
     // Transform text_edit if present
     if let Some(ref mut text_edit) = item.text_edit {
         match text_edit {
             tower_lsp_server::ls_types::CompletionTextEdit::Edit(edit) => {
-                let Some(mapped) = translate_one_edit_to_host(edit.clone(), offset) else {
+                if !translate_edit_to_host(edit, offset) {
                     return false;
-                };
-                *edit = mapped;
+                }
                 if !contains_request(&edit.range)
                     || !text_edit_safe_in_region(edit, offset, region_end)
                     || snippet_unsafe(&edit.new_text, Some(edit.range.start.line))
@@ -349,20 +354,27 @@ pub(super) fn transform_completion_item(
         // Mapped with the primary edit, as one set: edits harmless one by one
         // can combine into a corruption of the host text a prepared document
         // hides, or come to overlap once each regains a removed indent.
-        let set: Vec<_> = primary
-            .iter()
-            .cloned()
-            .chain(additional_edits.iter().cloned())
-            .collect();
-        let translated = match translate_virtual_text_edits_to_host(set, offset, EditMode::Extent) {
-            Some(mapped) => {
-                *additional_edits = mapped
-                    .into_iter()
-                    .skip(usize::from(primary.is_some()))
-                    .collect();
-                true
+        let translated = if offset.prepared().is_none() {
+            for edit in additional_edits.iter_mut() {
+                translate_virtual_range_to_host(&mut edit.range, offset);
             }
-            None => false,
+            true
+        } else {
+            let set: Vec<_> = primary
+                .iter()
+                .cloned()
+                .chain(additional_edits.iter().cloned())
+                .collect();
+            match translate_virtual_text_edits_to_host(set, offset, EditMode::Extent) {
+                Some(mapped) => {
+                    *additional_edits = mapped
+                        .into_iter()
+                        .skip(usize::from(primary.is_some()))
+                        .collect();
+                    true
+                }
+                None => false,
+            }
         };
         if !translated
             || !additional_edits
@@ -378,6 +390,27 @@ pub(super) fn transform_completion_item(
         }
     }
     true
+}
+
+/// Translate one edit to the virtual document into host coordinates in
+/// place, keeping its extent; `false` when the prepared map refuses it. An
+/// unprepared document's edit only has its range translated, allocating
+/// nothing.
+fn translate_edit_to_host(
+    edit: &mut tower_lsp_server::ls_types::TextEdit,
+    offset: &RegionOffset,
+) -> bool {
+    if offset.prepared().is_none() {
+        translate_virtual_range_to_host(&mut edit.range, offset);
+        return true;
+    }
+    match translate_one_edit_to_host(edit.clone(), offset) {
+        Some(mapped) => {
+            *edit = mapped;
+            true
+        }
+        None => false,
+    }
 }
 
 /// One edit to the virtual document in host coordinates, keeping its
