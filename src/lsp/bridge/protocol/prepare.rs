@@ -1442,8 +1442,10 @@ fn apply_edits(lines: &LineMap, edits: &[TextEdit]) -> Option<String> {
             (start <= end).then_some((start..end, edit.new_text.as_str()))
         })
         .collect::<Option<Vec<_>>>()?;
-    // Stable sort keeps same-position inserts in the order the server sent.
-    ranges.sort_by_key(|(range, _)| range.start);
+    // By start, then end, so an insertion goes before a replacement starting
+    // where it is, in whichever order they came; the sort is stable, keeping
+    // same-position insertions in the order the server sent them.
+    ranges.sort_by_key(|(range, _)| (range.start, range.end));
     if ranges
         .windows(2)
         .any(|pair| pair[0].0.end > pair[1].0.start)
@@ -2331,6 +2333,18 @@ mod tests {
             assert_eq!(apply_to(virtual_text, &mapped).len(), 3);
         }
         assert_eq!(map.map_edits(&[first, second], EditMode::Extent), None);
+    }
+
+    #[test]
+    fn an_insertion_and_a_replacement_at_one_place_apply_in_either_order() {
+        let (_, prepared) = dedented();
+        let map = prepared.map.unwrap();
+        let insert = edit((0, 0), (0, 0), "a");
+        let replace = edit((0, 0), (0, 2), "if");
+        let forward = map.map_edits(&[insert.clone(), replace.clone()], EditMode::Extent);
+        let backward = map.map_edits(&[replace, insert], EditMode::Extent);
+        assert!(forward.is_some());
+        assert!(backward.is_some());
     }
 
     #[test]
