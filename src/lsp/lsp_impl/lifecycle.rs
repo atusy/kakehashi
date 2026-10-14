@@ -806,14 +806,14 @@ impl Kakehashi {
                     // ready (a retry coming due sends nothing new yet).
                     let mut hosts = std::collections::HashMap::from([(
                         first.host_uri,
-                        (first.ready, first.failed),
+                        (first.ready, first.recollect),
                     )]);
                     while let Ok(resync) = resync_rx.try_recv() {
-                        let (ready, unusable) = hosts.entry(resync.host_uri).or_default();
+                        let (ready, recollect) = hosts.entry(resync.host_uri).or_default();
                         *ready |= resync.ready;
-                        *unusable |= resync.failed;
+                        *recollect |= resync.recollect;
                     }
-                    for (uri, (ready, unusable)) in hosts {
+                    for (uri, (ready, recollect)) in hosts {
                         // A send the pass could not queue leaves its server
                         // on the text before, and the answer is cached, so
                         // no resync would come again: retry with backoff,
@@ -839,7 +839,7 @@ impl Kakehashi {
                                     crate::lsp::bridge::Resync {
                                         host_uri: uri.clone(),
                                         ready,
-                                        failed: unusable,
+                                        recollect,
                                     },
                                     crate::lsp::bridge::prepare_retry_delay(*failed),
                                 );
@@ -872,9 +872,10 @@ impl Kakehashi {
                         // after retries ran out: servers may still hold the
                         // text before, and the next edit collects anyway. A
                         // region whose answer came back unusable is no longer
-                        // bridged: collecting again drops what its earlier
-                        // (prepared) text published.
-                        if (ready || unusable) && synchronized && looked && !retrying {
+                        // bridged, and one a peer's advertisement change
+                        // re-sent goes out otherwise: collecting again drops
+                        // what its earlier (prepared) text published.
+                        if (ready || recollect) && synchronized && looked && !retrying {
                             diagnostics.spawn_diagnostic_task_after_prepare(uri);
                         }
                     }

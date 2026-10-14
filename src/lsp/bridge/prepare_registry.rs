@@ -105,10 +105,11 @@ pub(crate) struct Resync {
     /// coming due, or an answer coming back unusable), so the host's
     /// diagnostics are collected again too.
     pub(crate) ready: bool,
-    /// A document held back got an unusable answer: it is no longer
-    /// bridged, so the host's diagnostics are collected again too, dropping
-    /// those placed from its earlier text.
-    pub(crate) failed: bool,
+    /// The host's diagnostics are collected again too, dropping those
+    /// placed from a document's earlier text: one held back got an unusable
+    /// answer (it is no longer bridged), or what its servers are sent changed
+    /// otherwise (a peer's advertisement did).
+    pub(crate) recollect: bool,
 }
 
 /// The answer for one input, and the attempts to get it.
@@ -363,7 +364,7 @@ impl PrepareRegistry {
                 let _ = self.resync_tx.send(Resync {
                     host_uri: input.host_uri.clone(),
                     ready: false,
-                    failed: false,
+                    recollect: false,
                 });
             }
             return PrepareLookup::Pending;
@@ -781,7 +782,7 @@ impl PrepareRegistry {
                             let _ = resync_tx.send(Resync {
                                 host_uri: job.host_uri.clone(),
                                 ready: false,
-                                failed: false,
+                                recollect: false,
                             });
                         }
                     }
@@ -794,7 +795,7 @@ impl PrepareRegistry {
                         let _ = resync_tx.send(Resync {
                             host_uri: job.host_uri.clone(),
                             ready,
-                            failed: !ready,
+                            recollect: !ready,
                         });
                     }
                 }
@@ -820,7 +821,7 @@ impl PrepareRegistry {
                             let _ = resync_tx.send(Resync {
                                 host_uri,
                                 ready: false,
-                                failed: false,
+                                recollect: false,
                             });
                         }
                     });
@@ -1244,7 +1245,7 @@ mod tests {
             Some(Resync {
                 host_uri: host,
                 ready: true,
-                failed: false
+                recollect: false
             })
         );
     }
@@ -1269,7 +1270,7 @@ mod tests {
             Some(Resync {
                 host_uri: host.clone(),
                 ready: true,
-                failed: false
+                recollect: false
             })
         );
         // An answer for text the lifecycle pass no longer holds on re-syncs
@@ -1369,7 +1370,7 @@ mod tests {
             Some(Resync {
                 host_uri: host.clone(),
                 ready: false,
-                failed: false
+                recollect: false
             })
         );
     }
@@ -1438,7 +1439,7 @@ mod tests {
             Some(Resync {
                 host_uri: host,
                 ready: false,
-                failed: true
+                recollect: true
             })
         );
     }
@@ -1732,7 +1733,7 @@ mod tests {
             Some(Resync {
                 host_uri: host.clone(),
                 ready: false,
-                failed: false
+                recollect: false
             })
         );
         // One resolved from the settings now does.

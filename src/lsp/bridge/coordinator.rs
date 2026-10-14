@@ -429,7 +429,7 @@ impl BridgeCoordinator {
                 let _ = resync.send(super::Resync {
                     host_uri,
                     ready: false,
-                    failed: false,
+                    recollect: true,
                 });
             }
         }));
@@ -710,7 +710,7 @@ impl BridgeCoordinator {
                 super::prepare_registry::Resync {
                     host_uri: host.clone(),
                     ready: false,
-                    failed: false,
+                    recollect: false,
                 },
                 std::time::Duration::ZERO,
             );
@@ -4996,6 +4996,29 @@ mod tests {
             true,
         );
         assert!(target("lua", true).is_some(), "a restart may advertise it");
+    }
+
+    #[tokio::test]
+    async fn an_advertisement_change_resyncs_open_hosts_and_collects_their_diagnostics() {
+        let coordinator = BridgeCoordinator::new();
+        let mut resync = coordinator.take_prepare_resync_rx().unwrap();
+        let host = url::Url::parse("file:///host.md").unwrap();
+        coordinator.pool().open_host_incarnation(&host, 1).await;
+        let peer = crate::lsp::bridge::pool::ConnectionKey::for_server("tsudoi");
+        coordinator.pool().record_prepare_advertisement(&peer, true);
+        // Withdrawn: the host's documents go out as is from now on, and what
+        // their prepared text published must go with it.
+        coordinator
+            .pool()
+            .record_prepare_advertisement(&peer, false);
+        assert_eq!(
+            resync.try_recv().ok(),
+            Some(super::super::prepare_registry::Resync {
+                host_uri: host,
+                ready: false,
+                recollect: true,
+            })
+        );
     }
 
     #[test]
