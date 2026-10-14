@@ -4,12 +4,14 @@
 //! The folder list and the root URI derived from it used to live in two
 //! independent cells — a [`WorkspaceFolderSet`](super::WorkspaceFolderSet)
 //! and an `ArcSwap` root — written one after the other by
-//! `workspace/didChangeWorkspaceFolders`. Two concurrent changes could then
-//! interleave their read-then-store so the root named a folder from the
-//! older change while the set held the newer one (#955), and a spawn reading
-//! the two cells separately could pair a root and a folder list that never
+//! `workspace/didChangeWorkspaceFolders`. Their agreement rested on the
+//! caller: two changes left the root naming a folder from the older one
+//! unless something serialized them (#955; the handler's settings-reload lock
+//! does, today), and readers outside that lock — a fallback spawn, a
+//! marker-less announce — could pair a root and a folder list that never
 //! coexisted. Here the root is not stored beside the folders; it is derived
-//! from them on read, under the same lock, so the two cannot diverge.
+//! from them on read, under the same lock, so the two cannot diverge whatever
+//! the callers do.
 //!
 //! The one piece of root state that is not a function of the folders is
 //! `initialize`'s: a client may send `rootUri` with an empty (or absent)
@@ -25,8 +27,9 @@ use tower_lsp_server::ls_types::WorkspaceFolder;
 use super::folder_set::WorkspaceFolderSet;
 use crate::error::LockResultExt;
 
-/// A consistent view of the client workspace: `root` is derived from the very
-/// `folders` it is returned with.
+/// A consistent view of the client workspace: `root` is the first of the very
+/// `folders` it is returned with, or — while they are empty and no change has
+/// named a folder — `initialize`'s root.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ClientWorkspaceSnapshot {
     pub(crate) root: Option<String>,
@@ -50,7 +53,8 @@ impl State {
     }
 }
 
-/// The upstream client's workspace folders and the root derived from them.
+/// The upstream client's workspace folders and the root that goes with them
+/// (see [`ClientWorkspaceSnapshot`]).
 #[derive(Default)]
 pub(crate) struct ClientWorkspace {
     inner: Mutex<State>,
@@ -85,7 +89,7 @@ impl ClientWorkspace {
         state.seed_root = None;
     }
 
-    /// The folders and the root derived from them, read under one lock.
+    /// The folders and their root, read under one lock.
     pub(crate) fn snapshot(&self) -> ClientWorkspaceSnapshot {
         let state = self
             .inner

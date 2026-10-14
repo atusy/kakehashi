@@ -522,8 +522,8 @@ pub struct LanguageServerPool {
     /// At `MAX_CONSECUTIVE_PANICS` we stop retrying, preventing an infinite
     /// retry loop when a connection's handshake consistently panics.
     consecutive_panic_counts: std::sync::Mutex<HashMap<ConnectionKey, u32>>,
-    /// The upstream client's workspace folders and the root URI derived from
-    /// them. Seeded during initialize, then updated by
+    /// The upstream client's workspace folders and the root URI that goes
+    /// with them. Seeded during initialize, then updated by
     /// `workspace/didChangeWorkspaceFolders` and snapshotted for each later
     /// downstream handshake, so servers can provide workspace-aware features
     /// (diagnostics, go-to-definition, etc.).
@@ -817,7 +817,7 @@ impl LanguageServerPool {
         self.client_workspace.seed(root_uri, folders);
     }
 
-    /// The client workspace folders and the root derived from them, read
+    /// The client workspace folders and their root, read
     /// together: callers needing both must take them from one snapshot.
     pub(crate) fn client_workspace(&self) -> super::ClientWorkspaceSnapshot {
         self.client_workspace.snapshot()
@@ -847,9 +847,10 @@ impl LanguageServerPool {
             return false;
         }
 
-        // The root is derived from the folder list inside this one critical
-        // section, so concurrent changes cannot publish a root from one
-        // change beside the folders of another (#955).
+        // The root is derived from the folder list on read, under the same
+        // lock, so no interleaving of changes and readers can pair a root
+        // with folders it does not belong to (#955) — whether or not the
+        // caller serializes changes.
         self.client_workspace.apply_change(added.clone(), removed);
 
         let mut connections = self.connections.lock().await;
@@ -3808,7 +3809,7 @@ impl LanguageServerPool {
             Some((_root, folder)) => vec![folder.clone()],
             None => {
                 // One snapshot for both rungs: the root must be the one
-                // derived from the folders just found empty.
+                // that goes with the folders just found empty.
                 let client = self.client_workspace();
                 let snapshot = client.folders.unwrap_or_default();
                 if !snapshot.is_empty() {
@@ -5365,10 +5366,11 @@ mod tests {
     }
 
     /// Concurrent folder changes must leave the forwarded root naming the
-    /// first folder of the set they converged on (#955). Each change replaces
-    /// the whole set with its own single folder, so whichever lands last
-    /// owns both the set and the root; a root published apart from the set
-    /// can be overwritten by an earlier change's stale read.
+    /// first folder of the set they converged on (#955), even without the
+    /// settings-reload lock the production handler serializes them under.
+    /// Each change replaces the whole set with its own single folder, so
+    /// whichever lands last owns both the set and the root; a root published
+    /// apart from the set can be overwritten by an earlier change's stale read.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn concurrent_workspace_folder_changes_keep_root_on_the_converged_set() {
         const WRITERS: usize = 8;
