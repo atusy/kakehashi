@@ -635,10 +635,14 @@ impl PrepareRegistry {
         };
         region.slots.insert(0, slot.clone());
         // Evict the least recently used beyond the bound, never the one the
-        // lifecycle pass holds on.
+        // lifecycle pass holds on, nor one whose attempt is in flight: a
+        // lookup for its input would start a second request for it. (The
+        // bound is exceeded only by the attempts running.)
         while region.slots.len() > SLOTS_PER_REGION + 1 {
             let held = region.held;
-            let Some(index) = region.slots.iter().rposition(|slot| Some(slot.key) != held) else {
+            let Some(index) = region.slots.iter().rposition(|slot| {
+                Some(slot.key) != held && !slot.cell.in_flight.load(Ordering::Acquire)
+            }) else {
                 break;
             };
             region.slots.remove(index);
@@ -1457,6 +1461,24 @@ mod tests {
         // asked now (and, never answering, leaves the input unanswered).
         assert!(sent(&first).contains(method));
         assert_eq!(miss.err(), Some(PrepareMiss::Unanswered));
+    }
+
+    #[test]
+    fn an_input_whose_attempt_is_in_flight_is_not_evicted() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let running = cell(&registry, &target, input(&host, "a"), Holder::Request);
+        running.in_flight.store(true, Ordering::Release);
+        let idle = cell(&registry, &target, input(&host, "b"), Holder::Request);
+        // A burst of other inputs past the bound.
+        for text in ["c", "d", "e", "f", "g"] {
+            cell(&registry, &target, input(&host, text), Holder::Request);
+        }
+        let again = cell(&registry, &target, input(&host, "a"), Holder::Request);
+        assert!(Arc::ptr_eq(&running, &again), "no second attempt for it");
+        let fresh = cell(&registry, &target, input(&host, "b"), Holder::Request);
+        assert!(!Arc::ptr_eq(&idle, &fresh), "an idle one is still evicted");
     }
 
     #[test]
