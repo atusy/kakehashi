@@ -206,11 +206,13 @@ The prepare request is made for each input (the virtual text and its
 segments, under the pair's candidates) until it is answered, and its answer
 is shared by every downstream server and every translation path. `didChange`
 to downstream servers stays a full-text sync of the prepared document, so
-open and change need no separate hooks. While a version's answer is
+open and change need no separate hooks. While an input's answer is
 pending, the document is held: not opened or changed downstream, nor
-closed — unless it still holds the unprepared text sent before its pair
-gained a peer, which is closed, since a prepared pair never bridges
-unprepared text. A save a held document misses is forwarded once its
+closed — unless a candidate is known to prepare the pair and a server still
+holds text sent as is (before the pair gained its peer) or nothing on
+record, which is closed, since a prepared pair never bridges unprepared
+text. While the candidates' handshakes have yet to tell whether any of them
+prepares the pair, its open documents stay as they are. A save a held document misses is forwarded once its
 prepared text is sent, if the host is still at the saved version, to the
 servers that have the document open or opening by then. A server that
 opens it later opens the saved text and gets no `didSave`, as with any
