@@ -692,6 +692,68 @@ mod tests {
         assert!(!check.holds(Some(&held("a", Some(prepare("a"))))));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_request_waits_for_its_text_until_the_budget_runs_out() {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let pool = Arc::new(LanguageServerPool::new());
+        let host_uri = Url::parse("file:///test/wait.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap(),
+            "lua",
+            TEST_ULID_LUA_0,
+        );
+        let uri = virtual_uri.to_uri_string();
+        let key = ConnectionKey::for_server("lua");
+        pool.register_opened_document(&host_uri, &virtual_uri, &key)
+            .await;
+        pool.record_sent_content_fingerprint(&virtual_uri, &key, "  a")
+            .await;
+        let result = serde_json::from_value(serde_json::json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared =
+            apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(result)).unwrap();
+        let offset = RegionOffset::new(0, 0).with_prepared(prepared.map.clone());
+        let check = HeldCheck::new(&offset, &prepared.text);
+
+        // Never sent: the request fails once the budget runs out.
+        let started = tokio::time::Instant::now();
+        assert!(pool.wait_for_held_text(&uri, &key, &check).await.is_err());
+        assert!(started.elapsed() >= PREPARED_SYNC_WAIT);
+
+        // Sent while it waits: the request goes on.
+        let sender = {
+            let pool = Arc::clone(&pool);
+            let virtual_uri = virtual_uri.clone();
+            let key = key.clone();
+            let prepared = prepared.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(PREPARED_SYNC_WAIT / 2).await;
+                pool.record_sent_content_fingerprint(
+                    &virtual_uri,
+                    &key,
+                    super::super::SentText {
+                        text: &prepared.text,
+                        map: prepared.map.as_ref(),
+                    },
+                )
+                .await;
+            })
+        };
+        let started = tokio::time::Instant::now();
+        assert!(pool.wait_for_held_text(&uri, &key, &check).await.is_ok());
+        assert!(started.elapsed() < PREPARED_SYNC_WAIT);
+        sender.await.unwrap();
+
+        // Not open on that connection: nothing to wait for (a lazy open sends
+        // the text).
+        let started = tokio::time::Instant::now();
+        let other = ConnectionKey::for_server("other");
+        assert!(pool.wait_for_held_text(&uri, &other, &check).await.is_ok());
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+    }
+
     fn start_observed_request(
         pool: Arc<LanguageServerPool>,
         handle: Arc<ConnectionHandle>,
