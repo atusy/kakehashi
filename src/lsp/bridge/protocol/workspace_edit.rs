@@ -147,21 +147,25 @@ fn host_edits_keep_hidden_text(
         return false;
     }
     // `documentChanges` entries apply one after another, each to the text
-    // the ones before it left: those reaching into the region are checked
-    // as one set only when there is one; several are refused, as an order
-    // of sets this check does not compose.
-    let mut reaching: Vec<Vec<TextEdit>> = Vec::new();
+    // the ones before it left, while every edit reaching into the region was
+    // translated through the region's geometry before any of them: an entry
+    // reaching into it is checked only as the document's one entry with
+    // edits — another could shift the region, or edit it, before it applies.
+    let mut reaching = None;
+    let mut with_edits = 0;
     for entry in &entries {
+        if !entry.is_empty() {
+            with_edits += 1;
+        }
         match in_region(entry) {
             None => return false,
             Some(edits) if edits.is_empty() => {}
-            Some(edits) => reaching.push(edits),
+            Some(edits) => reaching = Some(edits),
         }
     }
-    match reaching.as_slice() {
-        [] => true,
-        [edits] => keeps(edits),
-        _ => false,
+    match reaching {
+        None => true,
+        Some(edits) => with_edits == 1 && keeps(&edits),
     }
 }
 
@@ -1172,6 +1176,18 @@ mod tests {
         }));
         assert!(transform_workspace_edit_to_host(
             &mut fence,
+            &virtual_uri,
+            &host_uri,
+            &offset,
+        ));
+        // An entry shifting the region (a line inserted before it) ahead of
+        // one reaching into it, translated through the region's place before
+        // the shift: refused.
+        let mut shifted = parse_workspace_edit(json!({
+            "documentChanges": [entry(0, 0, 0, "new line\n"), entry(1, 2, 3, "x")]
+        }));
+        assert!(!transform_workspace_edit_to_host(
+            &mut shifted,
             &virtual_uri,
             &host_uri,
             &offset,
