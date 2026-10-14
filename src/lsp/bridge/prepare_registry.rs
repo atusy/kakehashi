@@ -712,6 +712,10 @@ impl PrepareRegistry {
     }
 }
 
+/// How many times one attempt goes through the candidates while some of
+/// them start advertising the request meanwhile.
+const MAX_CANDIDATE_PASSES: usize = 3;
+
 /// Backoff before retrying an attempt that got no answer: one second,
 /// doubling, at most a minute.
 pub(crate) fn retry_delay(misses: u32) -> Duration {
@@ -834,9 +838,6 @@ async fn try_run(
     revision: i32,
     admitted: &(dyn Fn() -> bool + Sync),
 ) -> std::io::Result<std::io::Result<PreparedDocument>> {
-    // Read first: a candidate passed over below may start advertising before
-    // this attempt ends, whose answer as is would then be outdated.
-    let advertised_epoch = pool.prepare_advertised_epoch();
     let host_uri = match crate::lsp::lsp_impl::url_to_uri(&job.host_uri) {
         Ok(host_uri) => host_uri,
         Err(error) => return Ok(Err(std::io::Error::other(error.to_string()))),
@@ -856,85 +857,89 @@ async fn try_run(
         },
         &layout,
     );
-    for candidate in target.candidates.iter() {
-        let name = &candidate.server_name;
-        if pool.prepare_advertisement(name) == Some(false) {
-            continue;
-        }
-        let handle = match pool
-            .get_or_create_connection_wait_ready_admitted(
-                name,
-                &candidate.config,
-                Some(&job.host_uri),
-                Duration::from_secs(super::INIT_TIMEOUT_SECS),
-                Some(admitted),
-                None,
-            )
-            .await
-        {
-            Ok(handle) => handle,
-            // Revoked: no answer for this input.
-            Err(error) if !admitted() => return Err(error),
-            // Advertising nothing until a handshake says otherwise, so later
-            // inputs are not held back to start it again.
-            Err(error) => {
-                // Passed over from now on, until its handshake advertises the
-                // request (its pairs go out as is unless a later candidate
-                // prepares them): worth seeing at the default level. Recorded
-                // below, it is not started again per input.
-                log::warn!(
-                    target: "kakehashi::bridge::prepare",
-                    "Prepare candidate {} for {} did not start; passing it over: {}",
-                    escape_terminal_controls(name),
-                    job.host_uri,
-                    escape_terminal_controls(&error.to_string()),
-                );
-                pool.record_prepare_advertisement(name, false);
+    // A candidate passed over below may start advertising before the loop
+    // ends, which makes an answer as is outdated: ask again then, a bounded
+    // number of times (advertisements flipping that often answer as is).
+    let mut advertised_epoch = pool.prepare_advertised_epoch();
+    for _ in 0..MAX_CANDIDATE_PASSES {
+        for candidate in target.candidates.iter() {
+            let name = &candidate.server_name;
+            if pool.prepare_advertisement(name) == Some(false) {
                 continue;
             }
-        };
-        if !handle.supports_virtual_document_prepare() {
-            continue;
-        }
-        let result = match handle.request_virtual_document_prepare(&params).await {
-            Ok(result) => result,
-            // It does not answer the request after all (`MethodNotFound`
-            // withdraws the advertisement): as if it had not advertised it.
-            Err(_) if !handle.supports_virtual_document_prepare() => {
-                pool.record_prepare_advertisement(name, false);
-                continue;
-            }
-            // Final for this input: an unusable answer (an error response or
-            // a malformed result).
-            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
-                return Ok(Err(std::io::Error::new(
-                    error.kind(),
-                    format!("{name} could not prepare it: {error}"),
-                )));
-            }
-            // No answer: timed out, cancelled by the peer, connection gone.
-            Err(error) => {
-                return Err(std::io::Error::new(
-                    error.kind(),
-                    format!("{name} did not answer: {error}"),
-                ));
-            }
-        };
-        return Ok(
-            apply_prepare_result(&job.virtual_text, &layout, result).map_err(|error| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("{name} answered unusably: {error}"),
+            let handle = match pool
+                .get_or_create_connection_wait_ready_admitted(
+                    name,
+                    &candidate.config,
+                    Some(&job.host_uri),
+                    Duration::from_secs(super::INIT_TIMEOUT_SECS),
+                    Some(admitted),
+                    None,
                 )
-            }),
-        );
-    }
-    if pool.prepare_advertised_epoch() != advertised_epoch {
-        // No answer, retried: the hook that ran forgot answers as is before
-        // this one was in.
-        return Err(std::io::Error::other(
-            "a candidate started advertising the request while none was asked",
-        ));
+                .await
+            {
+                Ok(handle) => handle,
+                // Revoked: no answer for this input.
+                Err(error) if !admitted() => return Err(error),
+                // Advertising nothing until a handshake says otherwise, so later
+                // inputs are not held back to start it again.
+                Err(error) => {
+                    // Passed over from now on, until its handshake advertises the
+                    // request (its pairs go out as is unless a later candidate
+                    // prepares them): worth seeing at the default level. Recorded
+                    // below, it is not started again per input.
+                    log::warn!(
+                        target: "kakehashi::bridge::prepare",
+                        "Prepare candidate {} for {} did not start; passing it over: {}",
+                        escape_terminal_controls(name),
+                        job.host_uri,
+                        escape_terminal_controls(&error.to_string()),
+                    );
+                    pool.record_prepare_advertisement(name, false);
+                    continue;
+                }
+            };
+            if !handle.supports_virtual_document_prepare() {
+                continue;
+            }
+            let result = match handle.request_virtual_document_prepare(&params).await {
+                Ok(result) => result,
+                // It does not answer the request after all (`MethodNotFound`
+                // withdraws the advertisement): as if it had not advertised it.
+                Err(_) if !handle.supports_virtual_document_prepare() => {
+                    pool.record_prepare_advertisement(name, false);
+                    continue;
+                }
+                // Final for this input: an unusable answer (an error response or
+                // a malformed result).
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                    return Ok(Err(std::io::Error::new(
+                        error.kind(),
+                        format!("{name} could not prepare it: {error}"),
+                    )));
+                }
+                // No answer: timed out, cancelled by the peer, connection gone.
+                Err(error) => {
+                    return Err(std::io::Error::new(
+                        error.kind(),
+                        format!("{name} did not answer: {error}"),
+                    ));
+                }
+            };
+            return Ok(
+                apply_prepare_result(&job.virtual_text, &layout, result).map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("{name} answered unusably: {error}"),
+                    )
+                }),
+            );
+        }
+        let epoch = pool.prepare_advertised_epoch();
+        if epoch == advertised_epoch {
+            break;
+        }
+        advertised_epoch = epoch;
     }
     Ok(Ok(PreparedDocument {
         text: job.virtual_text.clone(),
