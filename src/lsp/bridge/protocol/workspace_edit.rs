@@ -102,16 +102,6 @@ fn host_edits_keep_hidden_text(
         return true;
     };
     let unprepared = offset.unprepared();
-    // The region position `position` names, if it names one: translated
-    // back, it must come out the same (host text before the region, after
-    // it, or in a line's host prefix does not).
-    let to_virtual = |position: &Position| {
-        let mut translated = *position;
-        super::translation::translate_host_position_to_virtual(&mut translated, &unprepared);
-        let mut back = translated;
-        super::translation::translate_virtual_position_to_host(&mut back, &unprepared);
-        (back == *position && prepared.names_virtual_position(translated)).then_some(translated)
-    };
     let to_host = |mut position: Position| {
         super::translation::translate_virtual_position_to_host(&mut position, &unprepared);
         position
@@ -120,6 +110,31 @@ fn host_edits_keep_hidden_text(
         to_host(Position::new(0, 0)),
         to_host(prepared.virtual_end()),
     );
+    // The region position `position` names, if it names one: translated
+    // back, it must come out the same (host text before the region, after
+    // it, or in a line's host prefix does not) — but for a column past its
+    // line's end before the region's end, which a client clamps to the line
+    // end (LSP), and which is clamped here the same.
+    let to_virtual = |position: &Position| {
+        let mut translated = *position;
+        super::translation::translate_host_position_to_virtual(&mut translated, &unprepared);
+        let mut back = translated;
+        super::translation::translate_virtual_position_to_host(&mut back, &unprepared);
+        if back == *position && prepared.names_virtual_position(translated) {
+            return Some(translated);
+        }
+        if *position >= region_start && *position < region_end && back.line == position.line {
+            let clamped = prepared.clamp_virtual_position(translated)?;
+            let mut clamped_back = clamped;
+            super::translation::translate_virtual_position_to_host(&mut clamped_back, &unprepared);
+            // Only a column past the line's end clamps; one in the line's
+            // host prefix stays outside the region.
+            if clamped != translated && clamped_back.character < position.character {
+                return Some(clamped);
+            }
+        }
+        None
+    };
     // A set's edits reaching into the region, in V; `None` when one reaches
     // in from outside it.
     let in_region = |edits: &[(&Range, &str)]| {
@@ -1073,6 +1088,39 @@ mod tests {
         ));
         assert!(transform_workspace_edit_to_host(
             &mut edit("y"),
+            &virtual_uri,
+            &host_uri,
+            &offset,
+        ));
+    }
+
+    #[test]
+    fn a_direct_host_edit_with_overlong_columns_is_clamped_into_the_region() {
+        use super::super::prepare::{VirtualLayout, apply_prepare_result};
+        // `\n\nabc`, both leading blank lines deleted by the peer.
+        let virtual_text = "\n\nabc";
+        let result = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(result),
+        )
+        .unwrap();
+        let offset = RegionOffset::new(0, 0).with_prepared(prepared.map);
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        // A client clamps both ends to their lines' ends: it deletes a hidden
+        // blank line.
+        let mut edit = parse_workspace_edit(json!({
+            "changes": { host_uri.as_str(): [
+                {"range": {"start": {"line": 0, "character": 100}, "end": {"line": 1, "character": 100}}, "newText": ""}
+            ]}
+        }));
+        assert!(!transform_workspace_edit_to_host(
+            &mut edit,
             &virtual_uri,
             &host_uri,
             &offset,

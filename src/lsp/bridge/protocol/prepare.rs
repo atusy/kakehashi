@@ -930,6 +930,16 @@ impl PreparedMap {
         self.virtual_lines.offset_strict(position).is_some()
     }
 
+    /// `position` with a column past its line clamped to the line's end, as
+    /// LSP reads such a column; `None` for a line past V's end.
+    pub(crate) fn clamp_virtual_position(&self, position: Position) -> Option<Position> {
+        self.virtual_lines.index.0.line(position.line)?;
+        Some(
+            self.virtual_lines
+                .position(self.virtual_lines.offset_clamped(position)),
+        )
+    }
+
     /// [`Self::mapped_edits_keep_host_text`] for edits already in V (a
     /// merged set: the mapped edits with edits made to the host directly):
     /// `false` too when one names no location in V, or reaches into text
