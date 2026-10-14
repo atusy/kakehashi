@@ -472,7 +472,16 @@ pub(super) fn transform_completion_item(
                     item.insert_text_mode = Some(tower_lsp_server::ls_types::InsertTextMode::AS_IS);
                 }
                 ClientInsertMode::AdjustsIndentation => return false,
-                ClientInsertMode::AsIs => {}
+                // The client's default inserts as is; an item asking it to
+                // adjust instead (honored if the client supports that
+                // override) is cleared back to the default.
+                ClientInsertMode::AsIs => {
+                    if item.insert_text_mode
+                        == Some(tower_lsp_server::ls_types::InsertTextMode::ADJUST_INDENTATION)
+                    {
+                        item.insert_text_mode = None;
+                    }
+                }
             }
         }
     }
@@ -1375,7 +1384,7 @@ mod tests {
             ),
             kept
         );
-        if kept && mode.is_some() {
+        if kept {
             assert_eq!(item.insert_text_mode, mode);
         }
     }
