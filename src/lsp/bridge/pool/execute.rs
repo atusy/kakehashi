@@ -227,11 +227,18 @@ impl LanguageServerPool {
         let virtual_uri = VirtualDocumentUri::new(&host_uri_lsp, injection_language, region_id);
 
         let uri_string = virtual_uri.to_uri_string();
+        // An unprepared request reads any text held as is, which is all a
+        // connection can hold while no prepared text was ever sent: nothing
+        // to check then.
         let held_check = HeldCheck::new(offset, virtual_content);
+        let checks_held =
+            !matches!(held_check, HeldCheck::AsIs) || self.document_tracker.ever_held_prepared();
         // Before the host lifecycle guard: the wait can last the whole sync
         // budget, and a didClose or reopen must not queue behind it.
-        self.wait_for_held_text(&uri_string, connection_key, &held_check)
-            .await?;
+        if checks_held {
+            self.wait_for_held_text(&uri_string, connection_key, &held_check)
+                .await?;
+        }
 
         let host_lifecycle = match expected_incarnation {
             Some(expected) => {
@@ -240,7 +247,7 @@ impl LanguageServerPool {
             }
             None => self.request_host_lifecycle(host_uri).await?,
         };
-        let routing_uri = url::Url::parse(&virtual_uri.to_uri_string())
+        let routing_uri = url::Url::parse(&uri_string)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         if self
             .host_routing_by_server(&routing_uri, connection_key.server())
@@ -341,11 +348,13 @@ impl LanguageServerPool {
 
             // The open above may have sent newer cached text instead, or
             // the text may have changed since the wait.
-            if !held_check.holds(
-                self.document_tracker
-                    .held_text(&uri_string, connection_key)
-                    .as_ref(),
-            ) {
+            if checks_held
+                && !held_check.holds(
+                    self.document_tracker
+                        .held_text(&uri_string, connection_key)
+                        .as_ref(),
+                )
+            {
                 drop(connections);
                 if let Some(ref id) = upstream_request_id {
                     self.unregister_upstream_request(id, connection_key);
