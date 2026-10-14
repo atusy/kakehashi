@@ -889,16 +889,27 @@ impl PreparedMap {
     }
 
     /// The diff hunks of a replayed set: the edited P against P, diffed
-    /// piece by piece between the gaps the peer emptied. A whole diff could
-    /// slide an insertion across such a gap where the text on both sides
-    /// matches (inserting `c` at the end of `ab` in `ab${x}cd`, prepared
-    /// as `abcd`), moving it from one host string into the next; the edits
-    /// as sent say on which side of each gap their text lands — an
-    /// insertion right at one, before it.
+    /// piece by piece between the gaps. A whole diff could slide a change
+    /// across a gap where the text on both sides matches — an emptied one
+    /// (inserting `c` at the end of `ab` in `ab${x}cd`, prepared as `abcd`)
+    /// or one whose replacement repeats its neighbor (inserting `a` at the
+    /// start of `a${x}a`, prepared as `aaa`) — moving it from one host
+    /// string into another; the edits as sent say on which side of each gap
+    /// their text lands: an insertion right at a gap's start goes before
+    /// it, one right at its end after it.
     fn replayed_hunks(&self, edits: &[TextEdit], edited: &str) -> Vec<Hunk> {
         let prepared = self.prepared_lines.text();
-        let mut joints = self.emptied_gap_offsets().peekable();
-        if joints.peek().is_none() {
+        // Each joint, and whether an insertion right at it goes before it.
+        let joints: Vec<(usize, bool)> = self
+            .runs
+            .iter()
+            .filter(|run| run.kind == RunKind::Gap)
+            .flat_map(|gap| {
+                std::iter::once((gap.prepared.start, true))
+                    .chain((!gap.prepared.is_empty()).then_some((gap.prepared.end, false)))
+            })
+            .collect();
+        if joints.is_empty() {
             return diff_hunks(prepared, edited);
         }
         let mut spans: Vec<(usize, usize, usize)> = edits
@@ -911,17 +922,20 @@ impl PreparedMap {
             .collect();
         spans.sort_by_key(|&(start, end, _)| (start, end));
         // Where P offset `joint` lands in the edited P: after every edit
-        // ending at or before it.
-        let edited_at = |joint: usize| {
+        // ending before it, or at it unless an insertion that goes after.
+        let edited_at = |joint: usize, insertions_before: bool| {
             spans
                 .iter()
-                .take_while(|&&(_, end, _)| end <= joint)
+                .take_while(|&&(start, end, _)| {
+                    end < joint || (end == joint && (insertions_before || start < end))
+                })
                 .fold(joint, |at, &(start, end, len)| at + len - (end - start))
         };
         let mut hunks = Vec::new();
         let (mut piece, mut edited_piece) = (0, 0);
         for (joint, edited_joint) in joints
-            .map(|joint| (joint, edited_at(joint)))
+            .into_iter()
+            .map(|(joint, before)| (joint, edited_at(joint, before)))
             .chain([(prepared.len(), edited.len())])
         {
             hunks.extend(
@@ -1864,6 +1878,45 @@ mod tests {
             apply_edits(&virtual_lines, &mapped).unwrap(),
             "  a\n  b\n  c\n"
         );
+    }
+
+    #[test]
+    fn a_replayed_insertion_stays_on_its_side_of_a_gap_repeating_its_neighbor() {
+        // `a${x}a`, the interpolation prepared as `a`: `aaa`.
+        let virtual_text = "a    a";
+        let layout = VirtualLayout::from_pieces(
+            virtual_text,
+            [
+                (SegmentKind::Content, 0..1, String::new()),
+                (SegmentKind::Gap, 1..5, "${x}".to_string()),
+                (SegmentKind::Content, 5..6, String::new()),
+            ],
+        );
+        let result = serde_json::from_value(json!({"segments": [
+            {"type": "content"}, {"type": "gap", "content": "a"}, {"type": "content"}
+        ]}))
+        .unwrap();
+        let prepared = apply_prepare_result(virtual_text, &layout, Some(result))
+            .unwrap()
+            .map
+            .unwrap();
+        assert_eq!(prepared.prepared_text(), "aaa");
+        // An `a` inserted at the start stays in the first string, before
+        // the gap (V column 1), not after it.
+        let mapped = prepared
+            .map_edits(
+                &[TextEdit {
+                    range: tower_lsp_server::ls_types::Range::new(
+                        Position::new(0, 0),
+                        Position::new(0, 0),
+                    ),
+                    new_text: "a".to_string(),
+                }],
+                EditMode::Replay,
+            )
+            .unwrap();
+        assert_eq!(mapped.len(), 1);
+        assert!(mapped[0].range.end <= Position::new(0, 1), "{mapped:?}");
     }
 
     #[test]
