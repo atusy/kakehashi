@@ -141,6 +141,9 @@ pub(crate) struct HeldText {
     /// Changes whenever the text does: anything the server computed (a
     /// push) is in the coordinates of the generation it held.
     pub(crate) generation: u64,
+    /// The document version the text was sent under, which a server's push
+    /// may name.
+    pub(crate) version: Option<i32>,
 }
 
 /// Hash of a virtual document's extracted content, used to skip re-sending an
@@ -718,6 +721,16 @@ impl DocumentTracker {
         if map.is_some() {
             self.ever_held_prepared.store(true, Ordering::Release);
         }
+        // The version this text went out under: the send it follows bumped
+        // the counter before enqueueing, under the transition lock the caller
+        // still holds.
+        let version = self
+            .document_versions
+            .lock()
+            .await
+            .get(connection_key)
+            .and_then(|docs| docs.get(&uri_string))
+            .copied();
         let mut fingerprints = self
             .document_fingerprints
             .lock()
@@ -731,7 +744,10 @@ impl DocumentTracker {
         match docs.get_mut(&uri_string) {
             // The same text: what the server computed stays in the same
             // coordinates, even when it maps back differently now.
-            Some(held) if held.fingerprint == fingerprint => held.map = map,
+            Some(held) if held.fingerprint == fingerprint => {
+                held.map = map;
+                held.version = version;
+            }
             _ => {
                 let generation = self.held_generations.fetch_add(1, Ordering::Relaxed) + 1;
                 docs.insert(
@@ -740,6 +756,7 @@ impl DocumentTracker {
                         fingerprint,
                         map,
                         generation,
+                        version,
                     },
                 );
             }

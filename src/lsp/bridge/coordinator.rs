@@ -772,16 +772,31 @@ impl BridgeCoordinator {
     /// What `connection` holds for `virtual_uri` now, to stamp a push it
     /// sent with (see [`crate::lsp::diagnostic_cache::HeldStamp`]); `None`
     /// when no connection was ever sent a prepared text — every one then
-    /// holds its text as is, which needs no stamp.
+    /// holds its text as is, which needs no stamp. A push naming a document
+    /// `version` other than the one the connection was last sent was
+    /// computed for an earlier text (prepared or not, whatever the
+    /// connection holds now), and is stamped to place nowhere.
     pub(crate) fn held_stamp(
         &self,
         virtual_uri: &str,
         connection: &crate::lsp::bridge::pool::ConnectionKey,
+        version: Option<i32>,
     ) -> Option<crate::lsp::diagnostic_cache::HeldStamp> {
         if !self.pool.ever_held_prepared() {
             return None;
         }
         let held = self.pool.held_text(virtual_uri, connection);
+        if let Some(version) = version
+            && held
+                .as_ref()
+                .is_some_and(|held| held.version != Some(version))
+        {
+            return Some(crate::lsp::diagnostic_cache::HeldStamp {
+                connection: connection.clone(),
+                generation: None,
+                prepared: true,
+            });
+        }
         Some(crate::lsp::diagnostic_cache::HeldStamp {
             connection: connection.clone(),
             generation: held.as_ref().map(|held| held.generation),
@@ -3124,7 +3139,7 @@ mod tests {
             .record_sent_content_for_test(&virtual_uri, &connection, "x")
             .await;
         // Nothing was ever sent prepared: no stamp needed.
-        assert_eq!(coordinator.held_stamp(&uri, &connection), None);
+        assert_eq!(coordinator.held_stamp(&uri, &connection, None), None);
         let prepared = apply_prepare_result("x", &VirtualLayout::single("x"), None).unwrap();
         coordinator
             .record_sent_content_for_test(
@@ -3136,7 +3151,7 @@ mod tests {
                 },
             )
             .await;
-        let stamp = coordinator.held_stamp(&uri, &connection).unwrap();
+        let stamp = coordinator.held_stamp(&uri, &connection, None).unwrap();
         assert_eq!(stamp.connection, connection);
         assert!(stamp.prepared);
         assert_eq!(
@@ -3147,7 +3162,7 @@ mod tests {
                 .map(|held| held.generation)
         );
         // Another connection with nothing on record.
-        let unrecorded = coordinator.held_stamp(&uri, &other).unwrap();
+        let unrecorded = coordinator.held_stamp(&uri, &other, None).unwrap();
         assert_eq!(unrecorded.generation, None);
         assert!(!unrecorded.prepared);
     }

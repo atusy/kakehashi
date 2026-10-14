@@ -672,6 +672,7 @@ mod tests {
                 fingerprint: super::super::document_tracker::content_fingerprint(text),
                 map,
                 generation: 0,
+                version: None,
             }
         };
         // A prepared request: exactly its text, under its map (an equal map

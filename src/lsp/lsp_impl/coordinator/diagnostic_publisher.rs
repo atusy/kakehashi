@@ -684,25 +684,15 @@ impl DiagnosticPublisher {
             .into_iter()
             .map(|push| {
                 let held = VirtualDocumentUri::is_virtual_uri(&push.uri)
-                    .then(|| self.bridge.held_stamp(&push.uri, &push.connection))
+                    .then(|| {
+                        self.bridge
+                            .held_stamp(&push.uri, &push.connection, push.version)
+                    })
                     .flatten();
                 (push, held)
             })
             .collect();
-        for (push, mut held) in stamped {
-            // A push for a prepared text that names another version than the
-            // one its connection was sent last was computed for an earlier
-            // text, however late it arrived: it places nowhere.
-            if let (Some(stamp), Some(version)) = (held.as_mut(), push.version)
-                && stamp.prepared
-                && self
-                    .bridge
-                    .virtual_document_version(&push.uri, &stamp.connection)
-                    .await
-                    != Some(version)
-            {
-                stamp.generation = None;
-            }
+        for (push, held) in stamped {
             let recorded = if VirtualDocumentUri::is_virtual_uri(&push.uri) {
                 self.record_region_push(
                     &push.uri,
@@ -997,6 +987,7 @@ impl DiagnosticPublisher {
         let held = self.bridge.held_stamp(
             virtual_uri,
             &crate::lsp::bridge::ConnectionKey::for_server(&server),
+            None,
         );
         if let Some(RecordedPush { host, changed }) = self
             .record_region_push(virtual_uri, server, connection_id, held, diagnostics)
@@ -3512,6 +3503,25 @@ mod tests {
         publisher
             .publish_push_batch(vec![push(held.map(|version| version - 1))])
             .await;
+        let stale = stamp();
+        assert!(stale.prepared && stale.generation.is_none());
+
+        // A didChange whose send failed bumped the counter, not what the
+        // server holds: its pushes for the text it holds still place.
+        server
+            .bridge
+            .increment_document_version_for_test(&virtual_uri, &connection)
+            .await;
+        publisher.publish_push_batch(vec![push(held)]).await;
+        assert!(stamp().generation.is_some(), "the version actually sent");
+
+        // Sent as is since (its pair lost its peer): a push for the prepared
+        // text before is no less stale.
+        server
+            .bridge
+            .record_sent_content_for_test(&virtual_uri, &connection, "{ }")
+            .await;
+        publisher.publish_push_batch(vec![push(held)]).await;
         let stale = stamp();
         assert!(stale.prepared && stale.generation.is_none());
     }
