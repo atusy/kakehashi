@@ -1,0 +1,164 @@
+[
+  {
+    "mode": "single",
+    "scenario": "rust-large",
+    "paired_median_delta_percent": -53.24374926762955,
+    "paired_delta_range_percent": [
+      -56.1281782040027,
+      -45.55230053823654
+    ],
+    "A": {
+      "median_of_run_medians_ms": 481.7286457493901,
+      "run_p95_range_ms": [
+        507.5364159941673,
+        544.6195410192013
+      ],
+      "refreshes": 120,
+      "cancellations": 120
+    },
+    "B": {
+      "median_of_run_medians_ms": 225.23226049542427,
+      "run_p95_range_ms": [
+        253.2319159805775,
+        325.9719170033932
+      ],
+      "refreshes": 0,
+      "cancellations": 0
+    }
+  },
+  {
+    "mode": "single",
+    "scenario": "markdown-large",
+    "paired_median_delta_percent": -62.82775982265606,
+    "paired_delta_range_percent": [
+      -65.11833759959404,
+      -57.243642093233206
+    ],
+    "A": {
+      "median_of_run_medians_ms": 368.5083437561989,
+      "run_p95_range_ms": [
+        394.1240420043468,
+        434.770457983017
+      ],
+      "refreshes": 120,
+      "cancellations": 120
+    },
+    "B": {
+      "median_of_run_medians_ms": 136.66537499427795,
+      "run_p95_range_ms": [
+        168.6975419819355,
+        204.8895000219345
+      ],
+      "refreshes": 0,
+      "cancellations": 0
+    }
+  },
+  {
+    "mode": "single",
+    "scenario": "rust-common",
+    "paired_median_delta_percent": -34.887746610668174,
+    "paired_delta_range_percent": [
+      -35.32236756007395,
+      -34.11587016176296
+    ],
+    "A": {
+      "median_of_run_medians_ms": 231.4845105111599,
+      "run_p95_range_ms": [
+        237.2254170179367,
+        241.6312920153141
+      ],
+      "refreshes": 120,
+      "cancellations": 120
+    },
+    "B": {
+      "median_of_run_medians_ms": 150.4669374972582,
+      "run_p95_range_ms": [
+        163.9423750042915,
+        167.8957920074463
+      ],
+      "refreshes": 0,
+      "cancellations": 0
+    }
+  },
+  {
+    "mode": "single",
+    "scenario": "rust-small",
+    "paired_median_delta_percent": -28.52837253477864,
+    "paired_delta_range_percent": [
+      -29.053624677947344,
+      -28.263881408578772
+    ],
+    "A": {
+      "median_of_run_medians_ms": 209.76832299679518,
+      "run_p95_range_ms": [
+        212.7319160103798,
+        348.7644999921322
+      ],
+      "refreshes": 120,
+      "cancellations": 120
+    },
+    "B": {
+      "median_of_run_medians_ms": 149.92480225116014,
+      "run_p95_range_ms": [
+        154.0103750228882,
+        156.3527090251446
+      ],
+      "refreshes": 0,
+      "cancellations": 0
+    }
+  },
+  {
+    "mode": "burst",
+    "scenario": "rust-large",
+    "paired_median_delta_percent": -48.74654502054577,
+    "paired_delta_range_percent": [
+      -53.774294793151846,
+      -37.736495412185114
+    ],
+    "A": {
+      "median_of_run_medians_ms": 557.1469997540116,
+      "run_p95_range_ms": [
+        655.7230829894543,
+        958.0349169969559
+      ],
+      "refreshes": 279,
+      "cancellations": 326
+    },
+    "B": {
+      "median_of_run_medians_ms": 310.1711352467537,
+      "run_p95_range_ms": [
+        402.8448329865932,
+        707.3602499961853
+      ],
+      "refreshes": 0,
+      "cancellations": 168
+    }
+  },
+  {
+    "mode": "burst",
+    "scenario": "markdown-large",
+    "paired_median_delta_percent": -49.26059695903773,
+    "paired_delta_range_percent": [
+      -63.037172130743826,
+      -31.047068257677367
+    ],
+    "A": {
+      "median_of_run_medians_ms": 487.9142814949155,
+      "run_p95_range_ms": [
+        543.6096250116825,
+        827.3202919960022
+      ],
+      "refreshes": 300,
+      "cancellations": 353
+    },
+    "B": {
+      "median_of_run_medians_ms": 251.6465940028429,
+      "run_p95_range_ms": [
+        304.8522090017796,
+        436.137374997139
+      ],
+      "refreshes": 0,
+      "cancellations": 182
+    }
+  }
+]
