@@ -178,6 +178,8 @@ impl Kakehashi {
             let mut cp_minted: Vec<NumberOrString> = Vec::new();
 
             let mut seen_edit_ranges = std::collections::HashSet::new();
+            // Every region's context first: their prepare waits run together.
+            let mut contexts = Vec::new();
             for resolved in all_regions.iter() {
                 // Non-contiguous combined injections contain masked host-only
                 // gaps. Even a covering range may fall back to full formatting,
@@ -284,16 +286,19 @@ impl Kakehashi {
                     max_fan_out: agg.max_fan_out,
                     client_progress_token: None,
                 };
-                let Some(region_ctx) =
-                    crate::lsp::lsp_impl::bridge_context::prepare_request_context(
-                        &self.bridge,
-                        &self.settings_manager.load_settings(),
-                        self.experimental_enabled(),
-                        &language_name,
-                        region_ctx,
-                    )
-                    .await
-                else {
+                contexts.push(((is_covering, clipped_host_range), region_ctx));
+            }
+            for ((is_covering, clipped_host_range), region_ctx) in
+                crate::lsp::lsp_impl::bridge_context::prepare_request_contexts(
+                    &self.bridge,
+                    &self.settings_manager.load_settings(),
+                    self.experimental_enabled(),
+                    &language_name,
+                    contexts,
+                )
+                .await
+            {
+                let Some(region_ctx) = region_ctx else {
                     continue;
                 };
                 if !region_ctx.resolved.contiguous && region_ctx.prepared.is_none() {

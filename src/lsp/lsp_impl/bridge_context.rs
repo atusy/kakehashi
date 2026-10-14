@@ -238,6 +238,31 @@ pub(crate) async fn prepare_request_context(
         .ok()
 }
 
+/// [`prepare_request_context`] for each of a request's documents, in their
+/// order, each with what its caller keeps beside it: the waits run
+/// together — awaited one by one, slow peers' timeouts would add up.
+pub(crate) async fn prepare_request_contexts<T>(
+    bridge: &crate::lsp::bridge::BridgeCoordinator,
+    settings: &std::sync::Arc<WorkspaceSettings>,
+    experimental: bool,
+    host_language: &str,
+    contexts: Vec<(T, DocumentRequestContext)>,
+) -> Vec<(T, Option<DocumentRequestContext>)> {
+    if !experimental {
+        return contexts
+            .into_iter()
+            .map(|(kept, ctx)| (kept, Some(ctx)))
+            .collect();
+    }
+    let (kept, contexts): (Vec<T>, Vec<DocumentRequestContext>) = contexts.into_iter().unzip();
+    let prepared =
+        futures::future::join_all(contexts.into_iter().map(|ctx| {
+            prepare_request_context(bridge, settings, experimental, host_language, ctx)
+        }))
+        .await;
+    kept.into_iter().zip(prepared).collect()
+}
+
 /// [`prepare_request_context`], telling why a document has nothing to send.
 pub(crate) async fn prepare_request_context_or_miss(
     bridge: &crate::lsp::bridge::BridgeCoordinator,

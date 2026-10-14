@@ -306,6 +306,8 @@ impl Kakehashi {
         let mut cp_minted: Vec<NumberOrString> = Vec::new();
 
         let mut seen_edit_ranges = std::collections::HashSet::new();
+        // Every region's context first: their prepare waits run together.
+        let mut contexts = Vec::new();
         for resolved in all_regions.iter() {
             // Non-contiguous combined injections contain masked host-only gaps.
             // A formatter returns a contiguous whole-document replacement, which
@@ -375,15 +377,19 @@ impl Kakehashi {
                 max_fan_out: agg.max_fan_out,
                 client_progress_token: None,
             };
-            let Some(region_ctx) = crate::lsp::lsp_impl::bridge_context::prepare_request_context(
+            contexts.push((pipeline, region_ctx));
+        }
+        for (pipeline, region_ctx) in
+            crate::lsp::lsp_impl::bridge_context::prepare_request_contexts(
                 &self.bridge,
                 &self.settings_manager.load_settings(),
                 self.experimental_enabled(),
                 language_name,
-                region_ctx,
+                contexts,
             )
             .await
-            else {
+        {
+            let Some(region_ctx) = region_ctx else {
                 // The peer could not prepare the region: it is left
                 // unformatted, which the CLI must not report as success.
                 count_request_errors(&cancel_state.request_error_sink, 1);
