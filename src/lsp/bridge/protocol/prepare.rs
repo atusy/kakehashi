@@ -963,9 +963,9 @@ impl PreparedMap {
             // A line break at the run's edge is hidden when P does not show
             // it there: one the peer's text shows too (a gap replaced by text
             // ending with the same CR) was the server's to join.
-            let cr_hidden = text.ends_with('\r') && !prepared[..run.prepared.end].ends_with('\r');
-            let lf_hidden =
-                text.starts_with('\n') && !prepared[run.prepared.start..].starts_with('\n');
+            let shown = &prepared[run.prepared.clone()];
+            let cr_hidden = text.ends_with('\r') && !shown.ends_with('\r');
+            let lf_hidden = text.starts_with('\n') && !shown.starts_with('\n');
             let fused_after = cr_hidden
                 && edited[end..].starts_with('\n')
                 && !virtual_text[run.virtual_.end..].starts_with('\n');
@@ -2413,6 +2413,36 @@ mod tests {
             .map_edits(&[edit((1, 0), (1, 0), "\n")], EditMode::Extent)
             .unwrap();
         assert_eq!(apply_to(virtual_text, &mapped), "a \r\nb");
+    }
+
+    #[test]
+    fn an_emptied_gaps_line_break_stays_hidden_beside_content_showing_one() {
+        // `a\r${x\r}b`, the gap emptied: P shows the content's CR, never
+        // the gap's, which an LF right after the gap would fuse with.
+        let virtual_text = "a\r \rb";
+        let layout = VirtualLayout::from_pieces(
+            virtual_text,
+            [
+                (SegmentKind::Content, 0..2, String::new()),
+                (SegmentKind::Gap, 2..4, "x\r".to_string()),
+                (SegmentKind::Content, 4..5, String::new()),
+            ],
+        );
+        let map = apply_prepare_result(
+            virtual_text,
+            &layout,
+            result(json!({"segments": [
+                {"type": "content"}, {"type": "gap", "content": ""}, {"type": "content"}
+            ]})),
+        )
+        .unwrap()
+        .map
+        .unwrap();
+        assert_eq!(map.prepared_text(), "a\rb");
+        assert_eq!(
+            map.map_edits(&[edit((1, 0), (1, 1), "\nc")], EditMode::Extent),
+            None
+        );
     }
 
     #[test]
