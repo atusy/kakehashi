@@ -71,6 +71,7 @@ impl ShowDocumentTranslator {
         &self,
         mut params: ShowDocumentParams,
         connection: &crate::lsp::bridge::ConnectionKey,
+        held_through: u64,
     ) -> ShowDocumentParams {
         // `external: true` is a browser/OS resource, never a virtual document.
         if params.external == Some(true) {
@@ -91,7 +92,7 @@ impl ShowDocumentTranslator {
         // Only a selection needs the (live-parse) region offset, so skip
         // resolving it when there's nothing to translate.
         if params.selection.is_some() {
-            match self.region_offset(&host_url, &region_id, connection) {
+            match self.region_offset(&host_url, &region_id, connection, held_through) {
                 Some(offset) => return Self::apply_host_translation(params, host_uri, &offset),
                 // Offset unavailable (region invalidated by edits, or otherwise
                 // unresolvable): drop the selection we can't translate — a
@@ -131,6 +132,7 @@ impl ShowDocumentTranslator {
         host_url: &Url,
         region_id: &str,
         connection: &crate::lsp::bridge::ConnectionKey,
+        held_through: u64,
     ) -> Option<RegionOffset> {
         let (offset, _region_end, _contiguous, _language) = resolve_region_offset_for_connection(
             &self.documents,
@@ -139,6 +141,7 @@ impl ShowDocumentTranslator {
             host_url,
             region_id,
             connection,
+            held_through,
         )?;
         Some(offset)
     }
@@ -175,6 +178,7 @@ mod tests {
             .translate(
                 original.clone(),
                 &crate::lsp::bridge::ConnectionKey::for_server("test"),
+                u64::MAX,
             )
             .await;
         assert_eq!(out, original);
@@ -188,6 +192,7 @@ mod tests {
             .translate(
                 original.clone(),
                 &crate::lsp::bridge::ConnectionKey::for_server("test"),
+                u64::MAX,
             )
             .await;
         assert_eq!(out, original);
@@ -207,6 +212,7 @@ mod tests {
             .translate(
                 original.clone(),
                 &crate::lsp::bridge::ConnectionKey::for_server("test"),
+                u64::MAX,
             )
             .await;
         assert_eq!(out, original);

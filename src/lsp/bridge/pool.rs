@@ -2075,6 +2075,12 @@ impl LanguageServerPool {
         self.document_tracker.held_text(virtual_uri, connection_key)
     }
 
+    /// See `DocumentTracker::held_through`.
+    #[cfg(test)]
+    pub(crate) fn held_through(&self) -> u64 {
+        self.document_tracker.held_through()
+    }
+
     /// See `DocumentTracker::held_stamp`.
     #[cfg(test)]
     pub(crate) fn held_stamp(

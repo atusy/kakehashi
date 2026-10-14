@@ -183,6 +183,10 @@ pub(crate) enum UpstreamRequest {
         /// The connection the request arrived on: a selection in a virtual
         /// document is in the coordinates of the text it was sent.
         connection: ConnectionKey,
+        /// What the connection could hold when the request arrived (see
+        /// `DocumentTracker::held_through`): a text sent since is not the
+        /// one the selection is in.
+        held_through: u64,
         reply: oneshot::Sender<bool>,
         cancel: ForwardedRequestCancel,
     },
@@ -201,6 +205,10 @@ pub(crate) enum UpstreamRequest {
         /// (each connection's didOpen starts its own counter), so the
         /// translation must know which connection's version space applies.
         connection: ConnectionKey,
+        /// What the connection could hold when the request arrived (see
+        /// `DocumentTracker::held_through`): a text sent since is not the
+        /// one the edit was computed for.
+        held_through: u64,
         reply: oneshot::Sender<tower_lsp_server::ls_types::ApplyWorkspaceEditResponse>,
         cancel: ForwardedRequestCancel,
     },

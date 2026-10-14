@@ -825,6 +825,18 @@ impl DocumentTracker {
         self.record_sent(virtual_uri, connection_key, content, None);
     }
 
+    /// The newest [`HeldText::generation`] given out so far: a text held
+    /// with a newer one was sent after this was read. Read under the lock
+    /// generations are given out under, so no text taking one before this
+    /// read is recorded after it.
+    pub(in crate::lsp::bridge) fn held_through(&self) -> u64 {
+        let _docs = self
+            .document_fingerprints
+            .lock()
+            .recover_poison("DocumentTracker::document_fingerprints");
+        self.held_generations.load(Ordering::Relaxed)
+    }
+
     /// What `connection` holds for `virtual_uri` now, to stamp a push it
     /// sent with (see [`crate::lsp::diagnostic_cache::HeldStamp`]); `None`
     /// when no connection was ever sent a prepared text — every one then

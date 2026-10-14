@@ -175,7 +175,8 @@ pub(super) fn resolve_region_offset(
 /// [`resolve_region_offset`] for coordinates `connection` sent unprompted
 /// (an inbound edit, a showDocument selection): the offset translates
 /// through the map of the text that connection holds, and `None` when that
-/// text describes no current host position (see
+/// text describes no current host position, or was sent after the request
+/// arrived (newer than `held_through`; see
 /// [`BridgeCoordinator::held_presentation`]).
 pub(super) fn resolve_region_offset_for_connection(
     documents: &DocumentStore,
@@ -184,6 +185,7 @@ pub(super) fn resolve_region_offset_for_connection(
     host_url: &Url,
     region_id: &str,
     connection: &crate::lsp::bridge::ConnectionKey,
+    held_through: u64,
 ) -> Option<(RegionOffset, Position, bool, String)> {
     let resolved = resolve_region(documents, language, bridge, host_url, region_id)?;
     let presentation = bridge.held_presentation(
@@ -192,6 +194,7 @@ pub(super) fn resolve_region_offset_for_connection(
         region_id,
         &resolved.virtual_content,
         connection,
+        held_through,
     );
     let (offset, region_end, contiguous, injection_language) = resolved_region_geometry(resolved);
     Some((

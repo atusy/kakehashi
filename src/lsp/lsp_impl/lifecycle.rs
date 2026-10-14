@@ -2076,6 +2076,7 @@ fn spawn_upstream_request(
             UpstreamRequest::ShowDocument {
                 params,
                 connection,
+                held_through,
                 reply,
                 cancel,
             } => {
@@ -2089,7 +2090,7 @@ fn spawn_upstream_request(
                     Some(translators) => {
                         translators
                             .show_document
-                            .translate(params, &connection)
+                            .translate(params, &connection, held_through)
                             .await
                     }
                     None => params,
@@ -2112,6 +2113,7 @@ fn spawn_upstream_request(
             UpstreamRequest::ApplyEdit {
                 params,
                 connection,
+                held_through,
                 reply,
                 cancel,
             } => {
@@ -2157,7 +2159,10 @@ fn spawn_upstream_request(
                     super::apply_edit_translation::document_change_count(&params);
                 let params = match &translators {
                     Some(translators) => {
-                        translators.apply_edit.translate(params, &connection).await
+                        translators
+                            .apply_edit
+                            .translate(params, &connection, held_through)
+                            .await
                     }
                     None => Ok(params),
                 };
@@ -4842,6 +4847,7 @@ mod tests {
                 params: serde_json::from_value(serde_json::json!({ "uri": "file:///x.rs" }))
                     .unwrap(),
                 connection: crate::lsp::bridge::ConnectionKey::for_server("test"),
+                held_through: u64::MAX,
                 reply: reply_tx,
                 cancel: test_forwarded_cancel(),
             })
@@ -4907,6 +4913,7 @@ mod tests {
                 }))
                 .unwrap(),
                 connection: crate::lsp::bridge::ConnectionKey::for_server("test"),
+                held_through: u64::MAX,
                 reply: reply_tx,
                 cancel: forwarded_cancel,
             })
@@ -4984,6 +4991,7 @@ mod tests {
         request_tx
             .send(UpstreamRequest::ApplyEdit {
                 connection: crate::lsp::bridge::ConnectionKey::for_server("test"),
+                held_through: u64::MAX,
                 params: serde_json::from_value(serde_json::json!({
                     "edit": { "changes": { "file:///x.rs": [] } }
                 }))
@@ -5075,6 +5083,7 @@ mod tests {
         request_tx
             .send(UpstreamRequest::ApplyEdit {
                 connection: crate::lsp::bridge::ConnectionKey::for_server("test"),
+                held_through: u64::MAX,
                 params: serde_json::from_value(serde_json::json!({
                     "edit": { "documentChanges": [
                         {
@@ -5110,6 +5119,7 @@ mod tests {
         request_tx
             .send(UpstreamRequest::ApplyEdit {
                 connection: crate::lsp::bridge::ConnectionKey::for_server("test"),
+                held_through: u64::MAX,
                 params: serde_json::from_value(serde_json::json!({
                     "edit": { "documentChanges": [real_edit] }
                 }))
@@ -5186,6 +5196,7 @@ mod tests {
         request_tx
             .send(UpstreamRequest::ApplyEdit {
                 connection: crate::lsp::bridge::ConnectionKey::for_server("test"),
+                held_through: u64::MAX,
                 // A NON-empty edit against a virtual URI that resolves to no open
                 // document: the translator can't map it, so the loop must reject
                 // it locally. (An empty edit array would be a no-op removed

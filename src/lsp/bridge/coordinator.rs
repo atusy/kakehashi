@@ -737,7 +737,10 @@ impl BridgeCoordinator {
     /// the peer answered unusably is not bridged, a prepared text built from
     /// another virtual text describes no current host position, and a region
     /// the lifecycle pass prepares translates nothing through text held as
-    /// is (or with nothing on record): all [`HeldPresentation::Unavailable`].
+    /// is (or with nothing on record), and coordinates the connection sent
+    /// before it was sent the text it holds now (one with a generation newer
+    /// than `held_through`) are in a text it no longer holds: all
+    /// [`HeldPresentation::Unavailable`].
     pub(crate) fn held_presentation(
         &self,
         host_uri: &Url,
@@ -745,6 +748,7 @@ impl BridgeCoordinator {
         region_id: &str,
         virtual_text: &str,
         connection: &crate::lsp::bridge::pool::ConnectionKey,
+        held_through: u64,
     ) -> HeldPresentation {
         if self
             .prepare
@@ -760,6 +764,12 @@ impl BridgeCoordinator {
         let held = self
             .pool
             .held_text(&virtual_uri.to_uri_string(), connection);
+        if held
+            .as_ref()
+            .is_some_and(|held| held.generation > held_through)
+        {
+            return HeldPresentation::Unavailable;
+        }
         // A region the lifecycle pass prepares is bridged only through a
         // prepared text: one held as is was sent before its pair gained its
         // peer, and nothing on record (a didOpen still being recorded) is
@@ -772,6 +782,13 @@ impl BridgeCoordinator {
             return HeldPresentation::Unavailable;
         }
         held_presentation(held, virtual_text)
+    }
+
+    /// See `DocumentTracker::held_through` (the reader reads it as an
+    /// inbound request arrives).
+    #[cfg(test)]
+    pub(crate) fn held_through(&self) -> u64 {
+        self.pool.held_through()
     }
 
     /// What `connection` holds for `virtual_uri` now, to stamp a push it
@@ -5244,7 +5261,7 @@ mod tests {
             Placement::Skip
         ));
         assert!(matches!(
-            coordinator.held_presentation(&host, "json", region, "x\n", &connection),
+            coordinator.held_presentation(&host, "json", region, "x\n", &connection, u64::MAX),
             HeldPresentation::Unavailable
         ));
         assert!(coordinator.region_is_prepared(&host, "json", region));
@@ -5274,7 +5291,7 @@ mod tests {
         assert!(matches!(place(Some(&stale)), Placement::Skip));
         assert!(matches!(place(None), Placement::Offset));
         assert!(matches!(
-            coordinator.held_presentation(&host, "json", region, "x\n", &connection),
+            coordinator.held_presentation(&host, "json", region, "x\n", &connection, u64::MAX),
             HeldPresentation::AsIs
         ));
         // Prepared (its answer pending here): the text the connection was
@@ -5292,7 +5309,7 @@ mod tests {
         assert!(matches!(place(Some(&unrecorded)), Placement::Skip));
         assert!(matches!(place(None), Placement::Skip));
         assert!(matches!(
-            coordinator.held_presentation(&host, "json", region, "x\n", &connection),
+            coordinator.held_presentation(&host, "json", region, "x\n", &connection, u64::MAX),
             HeldPresentation::Unavailable
         ));
         // Nor through the text sent before the pair gained its peer: a
@@ -5309,7 +5326,7 @@ mod tests {
         let as_is = stamp_now(&coordinator, &virtual_uri.to_uri_string(), &connection);
         assert!(matches!(place(Some(&as_is)), Placement::Skip));
         assert!(matches!(
-            coordinator.held_presentation(&host, "json", region, "x\n", &connection),
+            coordinator.held_presentation(&host, "json", region, "x\n", &connection, u64::MAX),
             HeldPresentation::Unavailable
         ));
     }

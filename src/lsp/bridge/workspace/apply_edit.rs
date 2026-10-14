@@ -117,6 +117,7 @@ pub(in crate::lsp::bridge) fn handle(
         .send(UpstreamRequest::ApplyEdit {
             params,
             connection: deps.connection_key.clone(),
+            held_through: deps.document_tracker.held_through(),
             reply: reply_tx,
             cancel,
         })
