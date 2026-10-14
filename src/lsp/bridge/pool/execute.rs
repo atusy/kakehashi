@@ -350,7 +350,19 @@ impl LanguageServerPool {
             // the text may have changed since the wait.
             // Read again: a prepared text may have been sent for the first
             // time since the wait (a peer that started advertising).
-            if (checks_held || self.document_tracker.ever_held_prepared())
+            let checks_held = checks_held || self.document_tracker.ever_held_prepared();
+            // Through the enqueue: a didChange records and queues newer text
+            // under the document's transition, not under `connections`, so
+            // without it one could land between this check and the request.
+            // (After the open above, which takes it itself; the same
+            // connections → transition order as didChange.)
+            let transition =
+                checks_held.then(|| self.open_transition_lock(&virtual_uri, connection_key));
+            let _transition_guard = match &transition {
+                Some(transition) => Some(transition.lock().await),
+                None => None,
+            };
+            if checks_held
                 && !held_check.holds(
                     self.document_tracker
                         .held_text(&uri_string, connection_key)
