@@ -543,6 +543,21 @@ fn insertion_point_prefixed(offset: &RegionOffset, region_end: Position, host_li
 /// left at its default (and variables empty): what the client inserts unless
 /// the user types over it.
 fn snippet_expansion(snippet: &str) -> String {
+    /// Skip a tabstop number (digits only: `$0name` is tabstop 0, then text)
+    /// or a variable name.
+    fn skip_tabstop_or_name(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+        let tabstop = chars.peek().is_some_and(char::is_ascii_digit);
+        while chars.peek().is_some_and(|c| {
+            if tabstop {
+                c.is_ascii_digit()
+            } else {
+                c.is_ascii_alphanumeric() || *c == '_'
+            }
+        }) {
+            chars.next();
+        }
+    }
+
     fn expand(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, nested: bool) -> String {
         let mut out = String::new();
         while let Some(c) = chars.next() {
@@ -559,13 +574,7 @@ fn snippet_expansion(snippet: &str) -> String {
                 '$' => match chars.peek().copied() {
                     Some('{') => {
                         chars.next();
-                        // A tabstop number or a variable name.
-                        while chars
-                            .peek()
-                            .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
-                        {
-                            chars.next();
-                        }
+                        skip_tabstop_or_name(chars);
                         match chars.next() {
                             Some(':') => out.push_str(&expand(chars, true)),
                             Some('|') => {
@@ -603,12 +612,7 @@ fn snippet_expansion(snippet: &str) -> String {
                         }
                     }
                     Some(c) if c.is_ascii_alphanumeric() || c == '_' => {
-                        while chars
-                            .peek()
-                            .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
-                        {
-                            chars.next();
-                        }
+                        skip_tabstop_or_name(chars);
                     }
                     _ => out.push('$'),
                 },
@@ -928,6 +932,8 @@ mod tests {
         assert_eq!(snippet_expansion("${1|a,b|}c"), "ac");
         assert_eq!(snippet_expansion("\\$1 \\} $TM_X ${NAME:d}"), "$1 }  d");
         assert_eq!(snippet_expansion("cost: $"), "cost: $");
+        assert_eq!(snippet_expansion("$0name\n"), "name\n");
+        assert_eq!(snippet_expansion("${1}x$12y"), "xy");
     }
 
     #[test]
