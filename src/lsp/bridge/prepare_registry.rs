@@ -532,18 +532,26 @@ impl PrepareRegistry {
         drop_unusable: bool,
     ) {
         self.pruned_under.store(Some(Arc::clone(settings)));
+        // A request still holding a dropped cell takes no answer from it:
+        // one coming from the launch the settings no longer name.
+        let revoke = |slot: &Slot| slot.cell.revoked.store(true, Ordering::Release);
         self.regions.retain(|_, region| {
             if !keep(
                 &region.host_language,
                 &region.injection_language,
                 &region.candidates,
             ) {
+                region.slots.iter().for_each(revoke);
                 return false;
             }
             if drop_unusable {
-                region
-                    .slots
-                    .retain(|slot| !matches!(slot.cell.outcome.get(), Some(None)));
+                region.slots.retain(|slot| {
+                    let unusable = matches!(slot.cell.outcome.get(), Some(None));
+                    if unusable {
+                        revoke(slot);
+                    }
+                    !unusable
+                });
             }
             true
         });
@@ -747,6 +755,11 @@ impl PrepareRegistry {
                 version
             };
             match run(&pool, &target, &job, &next_version, &admitted).await {
+                // Revoked while it asked (its region pruned by a settings
+                // change, say): its answer is for no one.
+                Ok(_) if !admitted() => {
+                    cell.revoked.store(true, Ordering::Release);
+                }
                 Ok((advertised_epoch, outcome)) => {
                     let ready = outcome.is_some();
                     cell.answered_epoch
@@ -1728,6 +1741,23 @@ mod tests {
                 .slot(&after, input(&host, "a"), Holder::Request)
                 .is_some()
         );
+    }
+
+    #[test]
+    fn a_settings_change_revokes_the_answers_it_drops() {
+        let registry = PrepareRegistry::default();
+        let target = target_of(&[("peer", &["deno"])]);
+        let host = Url::parse("file:///host.md").unwrap();
+        let held = cell(&registry, &target, input(&host, "a"), Holder::Request);
+        let _ = held.outcome.set(Some(Arc::new(PreparedDocument {
+            text: "a".to_string(),
+            map: None,
+        })));
+        assert!(held.settled(0).is_ok());
+        // The pair's peer changed: a request still holding the cell takes no
+        // answer from the old launch.
+        registry.retain(&target.settings, |_, _, _| false, false);
+        assert_eq!(held.settled(0).err(), Some(PrepareMiss::Unanswered));
     }
 
     #[test]
