@@ -766,13 +766,15 @@ async fn run(
     revision: i32,
     admitted: &(dyn Fn() -> bool + Sync),
 ) -> Result<Outcome, ()> {
+    // The error carries the peer's own text (its error object, the variant
+    // names of a malformed answer): escaped, as is the language name.
     let log_failure = |error: &dyn std::fmt::Display| {
         log::warn!(
             target: "kakehashi::bridge::prepare",
             "Not sending the {} virtual document of {}: {}",
-            job.injection_language,
+            escape_terminal_controls(&job.injection_language),
             job.host_uri,
-            error
+            escape_terminal_controls(&error.to_string())
         );
     };
     match try_run(pool, target, job, revision, admitted).await {
