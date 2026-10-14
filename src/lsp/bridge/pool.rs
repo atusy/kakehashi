@@ -2610,7 +2610,10 @@ impl LanguageServerPool {
 
     /// Open or synchronize a virtual document from a revision-validated snapshot.
     /// The caller keeps that revision stable until enqueue completes.
-    pub(crate) async fn ensure_document_opened_from_snapshot<'a, S: message_sender::MessageSender>(
+    pub(crate) async fn ensure_document_opened_from_snapshot<
+        'a,
+        S: message_sender::MessageSender,
+    >(
         &self,
         sender: &mut S,
         host_uri: &Url,
@@ -2909,8 +2912,7 @@ impl LanguageServerPool {
         };
         if let Some(regions) = host.contents.get(language) {
             if regions.get(region_id).is_some_and(|cached| {
-                cached.text == content.text
-                    && cached.map.as_deref() == content.map.map(Arc::as_ref)
+                cached.text == content.text && cached.map.as_deref() == content.map.map(Arc::as_ref)
             }) {
                 return;
             }
@@ -3234,7 +3236,7 @@ impl LanguageServerPool {
         .await
     }
 
-    pub(super) async fn get_or_create_connection_wait_ready_admitted(
+    pub(in crate::lsp::bridge) async fn get_or_create_connection_wait_ready_admitted(
         &self,
         server_name: &str,
         server_config: &crate::config::settings::BridgeServerConfig,

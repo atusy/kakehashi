@@ -761,7 +761,11 @@ impl PreparedMap {
                 .map(|edit| {
                     let start = self.prepared_lines.offset_clamped(edit.range.start);
                     let end = self.prepared_lines.offset_clamped(edit.range.end);
-                    (start..end, edit.new_text.as_str(), prepared[end..].chars().next())
+                    (
+                        start..end,
+                        edit.new_text.as_str(),
+                        prepared[end..].chars().next(),
+                    )
                 })
                 .collect(),
             EditMode::Formatting | EditMode::Replay => {
@@ -881,7 +885,9 @@ impl PreparedMap {
         let line_starts = self
             .runs
             .iter()
-            .filter(|run| run.kind == RunKind::Gap && is_line_start(virtual_text, run.virtual_.start))
+            .filter(|run| {
+                run.kind == RunKind::Gap && is_line_start(virtual_text, run.virtual_.start)
+            })
             .chain(first_closing_line);
         for run in line_starts {
             let start = shifted(run.virtual_.start);
@@ -893,7 +899,8 @@ impl PreparedMap {
             matches!(
                 run.kind,
                 RunKind::Gap | RunKind::LeadingLines | RunKind::TrailingLines
-            ) && virtual_text[run.virtual_.clone()] != self.prepared_lines.text()[run.prepared.clone()]
+            ) && virtual_text[run.virtual_.clone()]
+                != self.prepared_lines.text()[run.prepared.clone()]
         });
         for run in hidden {
             let text = &virtual_text[run.virtual_.clone()];
@@ -1703,7 +1710,10 @@ mod tests {
     #[test]
     fn a_joint_within_a_line_is_left_to_the_formatter() {
         // An emptied interpolation between tokens on one line is no layout.
-        assert_eq!(restore_joined_layout("\na b\n", "a\nb", [2], true), "\na\nb\n");
+        assert_eq!(
+            restore_joined_layout("\na b\n", "a\nb", [2], true),
+            "\na\nb\n"
+        );
     }
 
     #[test]

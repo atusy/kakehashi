@@ -3045,7 +3045,8 @@ mod tests {
     fn combined_content_skips_empty_ranges_before_later_content() {
         let text = "abcdef";
 
-        let (content, offsets, _) = build_combined_virtual_content(text, 0..text.len(), &[2..2, 4..5]);
+        let (content, offsets, _) =
+            build_combined_virtual_content(text, 0..text.len(), &[2..2, 4..5]);
 
         assert_eq!(content, "e ");
         assert_eq!(offsets, vec![4]);
