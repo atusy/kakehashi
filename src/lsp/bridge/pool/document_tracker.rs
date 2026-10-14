@@ -756,10 +756,16 @@ impl DocumentTracker {
         connection_key: &ConnectionKey,
         content: SentText<'_>,
     ) {
-        let fingerprint = content_fingerprint(content.text);
-        if content.map.is_some() {
+        if content.map.is_none() {
+            // Every unchanged region takes this path per edit: with nothing
+            // ever held prepared, every held map is already `None`.
+            if !self.ever_held_prepared() {
+                return;
+            }
+        } else {
             self.ever_held_prepared.store(true, Ordering::Release);
         }
+        let fingerprint = content_fingerprint(content.text);
         let mut fingerprints = self
             .document_fingerprints
             .lock()
