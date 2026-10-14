@@ -62,9 +62,12 @@ priorities = ["tsudoi"]
   Failure). A configured `concatenated` is ignored with a warning.
 - When no candidate advertises the request, the document is sent as is.
   Each server's advertisement is remembered from its last handshake (a
-  server that could not start, or answered `MethodNotFound`, counts as not
-  advertising until its next one), so a pair none of whose candidates
-  advertises it is not held back per edit to find that out again. Any
+  server that answered `MethodNotFound` counts as not advertising until its
+  next one; one that could not start is passed over for that host's
+  documents only, until then, a settings change or the host closing — its
+  connection for another workspace root may be healthy), so a pair none of
+  whose candidates advertises it is not held back per edit to find that
+  out again. Any
   change of a server's advertisement forgets the answers settled before it
   and re-syncs open documents without waiting for an edit: a server that
   starts advertising later has its pairs' documents prepared, and one that

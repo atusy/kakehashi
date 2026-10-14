@@ -637,6 +637,7 @@ impl BridgeCoordinator {
         reparsing: bool,
     ) {
         self.warned_prepare_strategy.clear();
+        self.pool.forget_prepare_start_failures(None);
         self.prepare.retain(
             settings,
             |host_language, injection_language, candidates| {
@@ -985,6 +986,7 @@ impl BridgeCoordinator {
         self.prepare_pull_debts.remove(host_uri);
         self.held_saves.remove(host_uri);
         self.prepare.forget_host(host_uri);
+        self.pool.forget_prepare_start_failures(Some(host_uri));
     }
 
     /// Get a cloneable reference to the pool for use in spawned tasks.

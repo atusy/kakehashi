@@ -945,14 +945,16 @@ async fn try_run(
     // ends, which makes the answer outdated — as is, or a later candidate's,
     // while one ahead of it would answer now: ask again then, a bounded
     // number of times (the last pass's answer stands). A change this
-    // attempt records itself (a candidate it could not start, or that
-    // answered `MethodNotFound`) is accounted for as it is made.
+    // attempt records itself (a candidate that answered `MethodNotFound`)
+    // is accounted for as it is made.
     let mut pass = 1;
     loop {
         let answer = 'candidates: {
             for candidate in target.candidates.iter() {
                 let name = &candidate.server_name;
-                if pool.prepare_advertisement(name) == Some(false) {
+                if pool.prepare_advertisement(name) == Some(false)
+                    || pool.prepare_start_failed(name, &job.host_uri)
+                {
                     continue;
                 }
                 let handle = match pool
@@ -969,8 +971,9 @@ async fn try_run(
                     Ok(handle) => handle,
                     // Revoked: no answer for this input.
                     Err(error) if !admitted() => return Err(error),
-                    // Advertising nothing until a handshake says otherwise, so later
-                    // inputs are not held back to start it again.
+                    // Passed over for this host's documents, so later inputs are
+                    // not held back to start it again: only for this host, whose
+                    // workspace root may be the one it cannot start in.
                     Err(error) => {
                         // Passed over from now on, until its handshake advertises the
                         // request (its pairs go out as is unless a later candidate
@@ -983,9 +986,7 @@ async fn try_run(
                             job.host_uri,
                             escape_terminal_controls(&error.to_string()),
                         );
-                        if pool.record_prepare_advertisement(name, false) {
-                            advertised_epoch += 1;
-                        }
+                        pool.record_prepare_start_failure(name, &job.host_uri);
                         continue;
                     }
                 };
@@ -1098,8 +1099,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_input_no_candidate_prepares_is_sent_as_is() {
-        // A candidate that cannot start advertises nothing: with no other,
-        // the document goes out unprepared, and that is final for the input.
+        // A candidate that cannot start prepares nothing: with no other, the
+        // document goes out unprepared, and that is final for the input.
         let registry = PrepareRegistry::default();
         let mut resync = registry.take_resync_rx().unwrap();
         let pool = Arc::new(LanguageServerPool::new());
@@ -1122,9 +1123,14 @@ mod tests {
         let cell = cell(&registry, &target, input(&host, "a"), Holder::Request);
         assert!(!cell.in_flight.load(Ordering::Acquire));
         assert_eq!(*cell.attempts.borrow(), 1, "the input was not retried");
-        // Not started again for each input to find that out (its next
-        // handshake, when it is started to be bridged, says otherwise).
-        assert_eq!(pool.prepare_advertisement("peer"), Some(false));
+        // Not started again for each of this host's inputs to find that out
+        // (its next handshake, when it is started to be bridged, says
+        // otherwise), and passed over for this host only: another host's
+        // workspace root may be one it starts in.
+        assert!(pool.prepare_start_failed("peer", &host));
+        let other = Url::parse("file:///elsewhere/host.md").unwrap();
+        assert!(!pool.prepare_start_failed("peer", &other));
+        assert_eq!(pool.prepare_advertisement("peer"), None);
         // The document the lifecycle pass held back became ready to send.
         assert_eq!(
             resync.try_recv().ok(),

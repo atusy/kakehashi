@@ -735,6 +735,31 @@ impl LanguageServerPool {
             .load(Ordering::Acquire)
     }
 
+    /// Note that `server_name` could not be started for `host_uri`'s
+    /// documents to prepare them (see `PrepareAdvertisements::start_failures`).
+    pub(crate) fn record_prepare_start_failure(&self, server_name: &str, host_uri: &Url) {
+        self.prepare_advertisements
+            .start_failures
+            .insert((server_name.to_string(), host_uri.clone()));
+    }
+
+    /// Whether `server_name` could not be started for `host_uri`'s
+    /// documents (see [`Self::record_prepare_start_failure`]).
+    pub(crate) fn prepare_start_failed(&self, server_name: &str, host_uri: &Url) -> bool {
+        let failures = &self.prepare_advertisements.start_failures;
+        !failures.is_empty() && failures.contains(&(server_name.to_string(), host_uri.clone()))
+    }
+
+    /// Forget the start failures recorded for `host_uri` (`None`: for every
+    /// host — the settings that failed to start them changed).
+    pub(crate) fn forget_prepare_start_failures(&self, host_uri: Option<&Url>) {
+        let failures = &self.prepare_advertisements.start_failures;
+        match host_uri {
+            Some(host_uri) => failures.retain(|(_, host)| host != host_uri),
+            None => failures.clear(),
+        }
+    }
+
     /// Treat every prepare answer as possibly outdated, as a change of a
     /// server's advertisement does (see [`Self::set_prepare_advertised_hook`]):
     /// servers were sent other runtime settings, under which a peer may
@@ -5418,6 +5443,12 @@ pub(crate) struct PrepareAdvertisements {
     /// and either way their documents should be synced again without
     /// waiting for an edit.
     on_advertised: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// (server, host document) pairs the server could not be started for
+    /// to prepare: passed over for that host's documents — another workspace
+    /// root's healthy connection keeps preparing — until the server's next
+    /// handshake that advertises the request, a settings change, or the
+    /// host closing.
+    start_failures: dashmap::DashSet<(String, Url)>,
     /// Bumped whenever a server's recorded advertisement changes, before the
     /// hook runs: an attempt that answered meanwhile knows a candidate ahead
     /// of the one answering (or behind one withdrawing) may answer now.
@@ -5429,6 +5460,12 @@ impl PrepareAdvertisements {
     /// first seen; `true` when it changed a recorded one. (A first record
     /// changes no candidate's selection: an unrecorded candidate is asked.)
     fn record(&self, server_name: &str, advertised: bool) -> bool {
+        // A handshake advertising the request: the server started somewhere,
+        // and is tried again where it could not be.
+        if advertised && !self.start_failures.is_empty() {
+            self.start_failures
+                .retain(|(server, _)| server != server_name);
+        }
         let previous = match self.by_server.get_mut(server_name) {
             Some(mut entry) => std::mem::replace(&mut *entry, advertised),
             None => {
@@ -5499,6 +5536,38 @@ fn incapable_shared_serves(handle: &ConnectionHandle, root: &Url) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_prepare_start_failure_holds_for_its_host_until_a_handshake_settings_or_close() {
+        let pool = LanguageServerPool::new();
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&runs);
+        pool.set_prepare_advertised_hook(Box::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }));
+        let a = Url::parse("file:///a/doc.md").unwrap();
+        let b = Url::parse("file:///b/doc.md").unwrap();
+        pool.record_prepare_advertisement("peer", true);
+        let epoch = pool.prepare_advertised_epoch();
+        pool.record_prepare_start_failure("peer", &b);
+        assert!(pool.prepare_start_failed("peer", &b));
+        assert!(!pool.prepare_start_failed("peer", &a));
+        // Another root's healthy connection keeps its advertisement.
+        assert_eq!(pool.prepare_advertisement("peer"), Some(true));
+        assert_eq!(pool.prepare_advertised_epoch(), epoch);
+        assert_eq!(runs.load(std::sync::atomic::Ordering::Relaxed), 0);
+        // A handshake advertising the request tries it again.
+        pool.record_prepare_advertisement("peer", true);
+        assert!(!pool.prepare_start_failed("peer", &b));
+        pool.record_prepare_start_failure("peer", &b);
+        pool.forget_prepare_start_failures(Some(&a));
+        assert!(pool.prepare_start_failed("peer", &b));
+        pool.forget_prepare_start_failures(Some(&b));
+        assert!(!pool.prepare_start_failed("peer", &b));
+        pool.record_prepare_start_failure("peer", &b);
+        pool.forget_prepare_start_failures(None);
+        assert!(!pool.prepare_start_failed("peer", &b));
+    }
 
     #[test]
     fn a_change_of_prepare_advertisement_runs_the_hook() {
