@@ -305,7 +305,6 @@ impl Kakehashi {
         });
         let mut cp_minted: Vec<NumberOrString> = Vec::new();
 
-        let mut seen_edit_ranges = std::collections::HashSet::new();
         // Every region's context first: their prepare waits run together.
         let mut contexts = Vec::new();
         for resolved in all_regions.iter() {
@@ -354,17 +353,10 @@ impl Kakehashi {
                 }
                 RegionFormatPlan::Concatenated(_) | RegionFormatPlan::Preferred => {}
             }
-            // Same-range query alternatives are tried in discovery priority
-            // order, but an unconfigured or explicitly disabled language is
-            // not a winner. Reserve the span only after planning so the first
-            // executable alternative formats it; later executable layers are
-            // suppressed to keep emitted edits non-overlapping.
-            if !seen_edit_ranges.insert((
+            let span = (
                 resolved.region.byte_range.start,
                 resolved.region.byte_range.end,
-            )) {
-                continue;
-            }
+            );
             let region_ctx = DocumentRequestContext {
                 prepared: None,
                 uri: uri.clone(),
@@ -377,9 +369,10 @@ impl Kakehashi {
                 max_fan_out: agg.max_fan_out,
                 client_progress_token: None,
             };
-            contexts.push((pipeline, region_ctx));
+            contexts.push(((pipeline, span), region_ctx));
         }
-        for (pipeline, region_ctx) in
+        let mut spans = SpanReservations::default();
+        for ((pipeline, span), region_ctx) in
             crate::lsp::lsp_impl::bridge_context::prepare_request_contexts(
                 &self.bridge,
                 &self.settings_manager.load_settings(),
@@ -389,15 +382,11 @@ impl Kakehashi {
             )
             .await
         {
-            let Some(region_ctx) = region_ctx else {
-                // The peer could not prepare the region: it is left
-                // unformatted, which the CLI must not report as success.
-                count_request_errors(&cancel_state.request_error_sink, 1);
+            let Some(region_ctx) = spans.admit(span, region_ctx, |ctx| {
+                ctx.resolved.contiguous || ctx.prepared.is_some()
+            }) else {
                 continue;
             };
-            if !region_ctx.resolved.contiguous && region_ctx.prepared.is_none() {
-                continue;
-            }
             // Decide how this region formats — concatenated pipeline, preferred
             // fan-out, or skip — from its resolved aggregation config. See
             // [`plan_region_format`] for the allowlist rule
@@ -502,6 +491,9 @@ impl Kakehashi {
                 }
             });
         }
+        // A span no alternative could format for want of its prepared text
+        // is left unformatted, which the CLI must not report as success.
+        count_request_errors(&cancel_state.request_error_sink, spans.unprepared());
 
         // One teardown guard for the whole request, held across the edit
         // collection so the synthetic terminal `End` fires once, after every
@@ -630,6 +622,51 @@ impl Kakehashi {
             }
             FanInResult::Cancelled => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
         }
+    }
+}
+
+/// Which same-range query alternative formats each host byte span.
+///
+/// Discovery orders same-range alternate languages by query-pattern
+/// priority, but an unconfigured or explicitly disabled language (never
+/// offered here), one the peer could not prepare, or one that cannot run
+/// (`runnable`) is not a winner: the span is reserved only by the first
+/// alternative that can format it, and later ones are suppressed to keep
+/// emitted edits non-overlapping.
+#[derive(Default)]
+pub(super) struct SpanReservations {
+    reserved: std::collections::HashSet<(usize, usize)>,
+    /// Spans an alternative was offered for whose prepared text is missing.
+    unprepared: std::collections::HashSet<(usize, usize)>,
+}
+
+impl SpanReservations {
+    /// The context to format `span` with, offered in discovery order:
+    /// `None` when an earlier alternative reserved the span, or this one
+    /// has no prepared context or cannot run.
+    pub(super) fn admit<T>(
+        &mut self,
+        span: (usize, usize),
+        ctx: Option<T>,
+        runnable: impl FnOnce(&T) -> bool,
+    ) -> Option<T> {
+        if self.reserved.contains(&span) {
+            return None;
+        }
+        let Some(ctx) = ctx else {
+            self.unprepared.insert(span);
+            return None;
+        };
+        if !runnable(&ctx) {
+            return None;
+        }
+        self.reserved.insert(span);
+        Some(ctx)
+    }
+
+    /// How many spans no alternative formats for want of prepared text.
+    pub(super) fn unprepared(&self) -> usize {
+        self.unprepared.difference(&self.reserved).count()
     }
 }
 
@@ -2154,6 +2191,22 @@ pub(super) async fn finalize_formatting_edits(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_span_goes_to_the_first_alternative_that_can_format_it() {
+        let mut spans = SpanReservations::default();
+        let runnable = |ctx: &&str| *ctx != "gapped";
+        // The first alternative's peer could not prepare it: the next one
+        // that can run formats the span.
+        assert_eq!(spans.admit((0, 4), None, runnable), None);
+        assert_eq!(spans.admit((0, 4), Some("gapped"), runnable), None);
+        assert_eq!(spans.admit((0, 4), Some("lua"), runnable), Some("lua"));
+        assert_eq!(spans.admit((0, 4), Some("vim"), runnable), None);
+        // A span only an unprepared alternative was offered for is left
+        // unformatted.
+        assert_eq!(spans.admit((5, 9), None, runnable), None);
+        assert_eq!(spans.unprepared(), 1);
+    }
     use tower_lsp_server::ls_types::{Position, Range};
 
     fn resolved_region(

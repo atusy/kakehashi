@@ -177,7 +177,7 @@ impl Kakehashi {
             });
             let mut cp_minted: Vec<NumberOrString> = Vec::new();
 
-            let mut seen_edit_ranges = std::collections::HashSet::new();
+            let mut spans = super::formatting::SpanReservations::default();
             // Every region's context first: their prepare waits run together.
             let mut contexts = Vec::new();
             for resolved in all_regions.iter() {
@@ -264,16 +264,10 @@ impl Kakehashi {
                     }
                     RegionFormatPlan::Concatenated(_) | RegionFormatPlan::Preferred => {}
                 }
-                // Preserve discovery priority among executable same-range
-                // alternatives. Unconfigured/disabled layers deliberately do
-                // not reserve the span, allowing the first configured layer to
-                // format it while preventing overlapping edits from later ones.
-                if !seen_edit_ranges.insert((
+                let span = (
                     resolved.region.byte_range.start,
                     resolved.region.byte_range.end,
-                )) {
-                    continue;
-                }
+                );
                 let region_ctx = DocumentRequestContext {
                     prepared: None,
                     uri: uri.clone(),
@@ -286,9 +280,9 @@ impl Kakehashi {
                     max_fan_out: agg.max_fan_out,
                     client_progress_token: None,
                 };
-                contexts.push(((is_covering, clipped_host_range), region_ctx));
+                contexts.push(((is_covering, clipped_host_range, span), region_ctx));
             }
-            for ((is_covering, clipped_host_range), region_ctx) in
+            for ((is_covering, clipped_host_range, span), region_ctx) in
                 crate::lsp::lsp_impl::bridge_context::prepare_request_contexts(
                     &self.bridge,
                     &self.settings_manager.load_settings(),
@@ -298,12 +292,11 @@ impl Kakehashi {
                 )
                 .await
             {
-                let Some(region_ctx) = region_ctx else {
+                let Some(region_ctx) = spans.admit(span, region_ctx, |ctx| {
+                    ctx.resolved.contiguous || ctx.prepared.is_some()
+                }) else {
                     continue;
                 };
-                if !region_ctx.resolved.contiguous && region_ctx.prepared.is_none() {
-                    continue;
-                }
                 // Mint this region's tracked-source token into the shared
                 // aggregator (the per-region map dispatch hands to its winning
                 // downstream).
