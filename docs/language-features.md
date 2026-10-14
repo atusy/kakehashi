@@ -222,6 +222,60 @@ into the closing fence) is dropped **whole** — a formatter answer is one
 atomic diff, so applying only its safe edits could duplicate or lose content.
 The same rule covers range and on-type formatting.
 
+#### Host text on lines a formatter adds
+
+A custom injection query can leave part of a host line out of the region. For
+example, a query using `#offset!` can extract the JSON from a Rust line
+comment, leaving `// ` in the host:
+
+```rust
+// {"a":1,"b":2}
+```
+
+The sequential formatter pipeline described above can format this one-line
+region into several lines. It runs when the injected language's bridge entry
+sets `strategy = "concatenated"` on the `textDocument/formatting` key, here
+`bridge.json.aggregation."textDocument/formatting"`; the same setting in
+`layers.aggregation` does not select it. The `// ` stays outside the replaced
+text, in front of the first line only. It is not copied to the new lines:
+
+```rust
+// {
+  "a": 1,
+  "b": 2
+}
+```
+
+Restore the comment markers yourself:
+
+```rust
+// {
+//   "a": 1,
+//   "b": 2
+// }
+```
+
+Until you do, the new lines are outside the comment. The Rust file may no
+longer compile, or may mean something else. A query that removes host text
+from a region decides what the server sees. It does not tell formatting to
+repeat that text on lines the formatter adds. For a region like this one, the
+pipeline repeats left-out text only when it holds nothing but `>` markers and
+indentation, as a blockquote's line prefix does.
+
+Under the default `preferred` server strategy, and for range and on-type
+formatting, an answer that adds line breaks to this region is dropped whole,
+like one that breaks a `> ` prefix, and the line is left as it was: the region
+ends on the line it starts on, so a line break would split that host line.
+This guard does not cover a region that also takes its line break, such as one
+from a query capturing the text of a Rust `///` doc comment. There a formatter
+can add lines without the `///` under either server strategy, and in range and
+on-type formatting, as long as the answer passes the other checks above.
+
+This differs from a fenced code block inside a Markdown blockquote. There the
+text before each line holds only `>` markers and indentation, so the sequential
+pipeline reads it as a line prefix and puts it back on the lines a formatter
+adds.
+
 ### Range formatting
 
 [`textDocument/rangeFormatting`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_rangeFormatting)

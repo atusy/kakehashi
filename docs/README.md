@@ -1163,6 +1163,12 @@ in the editor as well as here. On-type formatting is left as the server
 answers: it reformats the line being typed, which at the end of an unclosed
 fence is the region's last line.
 
+Host text that a custom injection query leaves out of a region, such as the
+`// ` before JSON extracted from a Rust comment, is not always repeated on lines
+a formatter adds, and then has to be restored by hand. See
+[Host text on lines a formatter adds](language-features.md#host-text-on-lines-a-formatter-adds)
+for when this happens.
+
 ```bash
 # Format files in place
 kakehashi format README.md docs/
