@@ -1772,22 +1772,27 @@ fn prepared_pipeline_edits(
         .iter()
         .skip(usize::from(opens_after_a_delimiter))
         .any(|prefix| !prefix.is_empty());
-    let edits = (!prefixed)
-        .then(|| {
-            let mapper = crate::text::PositionMapper::new(prepared);
-            crate::lsp::bridge::translate_virtual_text_edits_to_host(
-                vec![TextEdit {
-                    range: tower_lsp_server::ls_types::Range::new(
-                        tower_lsp_server::ls_types::Position::new(0, 0),
-                        mapper.byte_to_position(prepared.len()).unwrap_or_default(),
-                    ),
-                    new_text: restored,
-                }],
-                offset,
-                crate::lsp::bridge::EditMode::Formatting,
-            )
-        })
-        .flatten();
+    if prefixed {
+        log::warn!(
+            target: "kakehashi::formatting",
+            "concatenated formatting result for {} is dropped: host line prefixes are not re-applied to a prepared virtual document",
+            uri
+        );
+        count_request_errors(failure_sink, 1);
+        return None;
+    }
+    let mapper = crate::text::PositionMapper::new(prepared);
+    let edits = crate::lsp::bridge::translate_virtual_text_edits_to_host(
+        vec![TextEdit {
+            range: tower_lsp_server::ls_types::Range::new(
+                tower_lsp_server::ls_types::Position::new(0, 0),
+                mapper.byte_to_position(prepared.len()).unwrap_or_default(),
+            ),
+            new_text: restored,
+        }],
+        offset,
+        crate::lsp::bridge::EditMode::Formatting,
+    );
     if edits.is_none() {
         log::warn!(
             target: "kakehashi::formatting",
