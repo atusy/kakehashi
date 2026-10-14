@@ -904,21 +904,6 @@ impl PreparedMap {
         })
     }
 
-    /// Whether V edits, mapped one by one, keep apart and keep the host
-    /// text V holds that P does not show as it stands:
-    ///
-    /// - host text that starts a line in V — a gap such as a closing fence
-    ///   between combined blocks, or the document's deleted closing lines —
-    ///   still starts one: a change ending right before it ends with a line
-    ///   break or deletes whole lines, as at the region's own end;
-    /// - a line break P hides — a deleted edge line's, or a gap's the peer
-    ///   replaced — does not fuse with one beside it into a single CRLF,
-    ///   which would drop a line P keeps apart from it. One P shows is the
-    ///   edits' own doing.
-    ///
-    /// Checked on the edited V as a whole: a completion's main edit and its
-    /// additional edits, say, each fine alone, can fuse a CR and an LF only
-    /// together.
     /// Where V ends.
     pub(crate) fn virtual_end(&self) -> Position {
         self.virtual_lines.position(self.virtual_lines.text().len())
@@ -964,6 +949,21 @@ impl PreparedMap {
         self.mapped_edits_keep_host_text(&mapped)
     }
 
+    /// Whether V edits, mapped one by one, keep apart and keep the host
+    /// text V holds that P does not show as it stands:
+    ///
+    /// - host text that starts a line in V — a gap such as a closing fence
+    ///   between combined blocks, or the document's deleted closing lines —
+    ///   still starts one: a change ending right before it ends with a line
+    ///   break or deletes whole lines, as at the region's own end;
+    /// - a line break P hides — a deleted edge line's, or a gap's the peer
+    ///   replaced — does not fuse with one beside it into a single CRLF,
+    ///   which would drop a line P keeps apart from it. One P shows is the
+    ///   edits' own doing.
+    ///
+    /// Checked on the edited V as a whole: a completion's main edit and its
+    /// additional edits, say, each fine alone, can fuse a CR and an LF only
+    /// together.
     fn mapped_edits_keep_host_text(&self, mapped: &[(Range<usize>, String)]) -> bool {
         let virtual_text = self.virtual_lines.text();
         let mut sorted: Vec<&(Range<usize>, String)> = mapped.iter().collect();
