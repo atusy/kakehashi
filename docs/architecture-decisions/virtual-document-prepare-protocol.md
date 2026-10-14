@@ -64,9 +64,11 @@ priorities = ["tsudoi"]
   Each server's advertisement is remembered from its last handshake (a
   server that could not start, or answered `MethodNotFound`, counts as not
   advertising until its next one), so a pair none of whose candidates
-  advertises it is not held back per edit to find that out again; a server
-  that starts advertising later has its pairs' open documents prepared
-  without waiting for an edit.
+  advertises it is not held back per edit to find that out again. Any
+  change of a server's advertisement forgets the answers settled before it
+  and re-syncs open documents without waiting for an edit: a server that
+  starts advertising later has its pairs' documents prepared, and one that
+  withdraws it has them asked of the next candidate (or sent as is).
 
 The feature is dormant unless `KAKEHASHI_EXPERIMENTAL=true`. Only pairs
 that are bridged and have a server for the injection language are

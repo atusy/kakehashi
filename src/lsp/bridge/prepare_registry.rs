@@ -441,16 +441,21 @@ impl PrepareRegistry {
         let _ = slot.cell.outcome.set(outcome);
     }
 
-    /// A hook forgetting every answer that found no candidate to ask (sent as
-    /// is): a server that starts advertising the request may now prepare
-    /// them.
-    pub(crate) fn forget_answers_as_is_hook(&self) -> impl Fn() + Send + Sync + 'static {
+    /// A hook forgetting every settled answer, for when a server's
+    /// advertisement of the request changes: the change may alter which
+    /// candidate is asked. An answer that found no candidate (sent as is) may
+    /// now be prepared by one that starts advertising; one a withdrawing peer
+    /// gave, prepared or unusable, would keep its text, or keep the region
+    /// unbridged, where another candidate (or none: as is) answers now.
+    /// Attempts in flight stay: they pick their candidate again when the
+    /// advertisements move under them.
+    pub(crate) fn forget_settled_answers_hook(&self) -> impl Fn() + Send + Sync + 'static {
         let regions = Arc::clone(&self.regions);
         move || {
             for mut region in regions.iter_mut() {
-                region.slots.retain(|slot| {
-                    !matches!(slot.cell.outcome.get(), Some(Some(prepared)) if prepared.map.is_none())
-                });
+                region
+                    .slots
+                    .retain(|slot| slot.cell.outcome.get().is_none());
             }
         }
     }
@@ -1356,7 +1361,7 @@ mod tests {
     }
 
     #[test]
-    fn answers_as_is_are_forgotten_for_a_peer_that_starts_advertising() {
+    fn settled_answers_are_forgotten_when_an_advertisement_changes() {
         let registry = PrepareRegistry::default();
         let target = unstartable_target();
         let host = Url::parse("file:///host.md").unwrap();
@@ -1367,11 +1372,14 @@ mod tests {
         })));
         let failed = cell(&registry, &target, input(&host, "b"), Holder::LifecyclePass);
         let _ = failed.outcome.set(None);
-        registry.forget_answers_as_is_hook()();
+        let pending = cell(&registry, &target, input(&host, "c"), Holder::Request);
+        registry.forget_settled_answers_hook()();
         let fresh = cell(&registry, &target, input(&host, "a"), Holder::Request);
-        assert!(!Arc::ptr_eq(&as_is, &fresh));
-        let kept = cell(&registry, &target, input(&host, "b"), Holder::Request);
-        assert!(Arc::ptr_eq(&failed, &kept), "only answers as is go");
+        assert!(!Arc::ptr_eq(&as_is, &fresh), "an answer as is goes");
+        let fresh = cell(&registry, &target, input(&host, "b"), Holder::LifecyclePass);
+        assert!(!Arc::ptr_eq(&failed, &fresh), "a final failure goes");
+        let kept = cell(&registry, &target, input(&host, "c"), Holder::Request);
+        assert!(Arc::ptr_eq(&pending, &kept), "an attempt in flight stays");
     }
 
     #[test]
