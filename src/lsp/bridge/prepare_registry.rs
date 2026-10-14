@@ -635,17 +635,18 @@ impl PrepareRegistry {
         };
         region.slots.insert(0, slot.clone());
         // Evict the least recently used beyond the bound, never the one the
-        // lifecycle pass holds on, nor one whose attempt is in flight: a
-        // lookup for its input would start a second request for it. (The
-        // bound is exceeded only by the attempts running.)
+        // lifecycle pass holds on, nor one whose attempt is in flight (a
+        // lookup for its input would start a second request for it), nor the
+        // one being looked up, at the front. (The bound is exceeded only by
+        // the attempts running.)
         while region.slots.len() > SLOTS_PER_REGION + 1 {
             let held = region.held;
-            let Some(index) = region.slots.iter().rposition(|slot| {
+            let Some(index) = region.slots[1..].iter().rposition(|slot| {
                 Some(slot.key) != held && !slot.cell.in_flight.load(Ordering::Acquire)
             }) else {
                 break;
             };
-            region.slots.remove(index);
+            region.slots.remove(index + 1);
         }
         Some(slot)
     }
@@ -1479,6 +1480,21 @@ mod tests {
         assert!(Arc::ptr_eq(&running, &again), "no second attempt for it");
         let fresh = cell(&registry, &target, input(&host, "b"), Holder::Request);
         assert!(!Arc::ptr_eq(&idle, &fresh), "an idle one is still evicted");
+    }
+
+    #[test]
+    fn a_fresh_lookup_is_not_evicted_by_running_slots() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        for text in ["a", "b", "c", "d"] {
+            cell(&registry, &target, input(&host, text), Holder::Request)
+                .in_flight
+                .store(true, Ordering::Release);
+        }
+        let fresh = cell(&registry, &target, input(&host, "e"), Holder::Request);
+        let again = cell(&registry, &target, input(&host, "e"), Holder::Request);
+        assert!(Arc::ptr_eq(&fresh, &again), "the slot looked up stays");
     }
 
     #[test]
