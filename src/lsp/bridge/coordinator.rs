@@ -3205,6 +3205,10 @@ mod tests {
         let unrecorded = coordinator.held_stamp(&uri, &other, None).unwrap();
         assert_eq!(unrecorded.generation, None);
         assert!(!unrecorded.prepared);
+        // Naming a version with nothing on record (closed since): stale.
+        let closed = coordinator.held_stamp(&uri, &other, Some(1)).unwrap();
+        assert_eq!(closed.generation, None);
+        assert!(closed.prepared, "places nowhere");
     }
 
     #[tokio::test]

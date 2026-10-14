@@ -939,7 +939,9 @@ impl DocumentTracker {
     /// holds its text as is, which needs no stamp. A push naming a document
     /// `version` other than the one the connection was last sent was
     /// computed for an earlier text (prepared or not, whatever the
-    /// connection holds now), and is stamped to place nowhere.
+    /// connection holds now), and is stamped to place nowhere — as is one
+    /// naming a version with nothing on record: every send is recorded
+    /// before it goes out, so its document was closed since.
     pub(in crate::lsp::bridge) fn held_stamp(
         &self,
         virtual_uri: &str,
@@ -953,7 +955,7 @@ impl DocumentTracker {
         if let Some(version) = version
             && held
                 .as_ref()
-                .is_some_and(|held| held.version != Some(version))
+                .is_none_or(|held| held.version != Some(version))
         {
             return Some(crate::lsp::diagnostic_cache::HeldStamp {
                 connection: connection.clone(),
