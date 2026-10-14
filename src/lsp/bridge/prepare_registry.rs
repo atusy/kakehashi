@@ -330,6 +330,16 @@ impl PrepareRegistry {
         holder: Holder,
     ) -> PrepareLookup {
         let Some(slot) = self.slot(target, input, holder) else {
+            // A lifecycle pass from replaced settings holds the document
+            // with no answer coming: sync the host again, under the
+            // current ones.
+            if holder == Holder::LifecyclePass {
+                let _ = self.resync_tx.send(Resync {
+                    host_uri: input.host_uri.clone(),
+                    ready: false,
+                    failed: false,
+                });
+            }
             return PrepareLookup::Pending;
         };
         if let Some(found) = slot.cell.lookup() {
@@ -560,11 +570,11 @@ impl PrepareRegistry {
     }
 
     /// The slot answering `input`, created when missing. `None` for a
-    /// request under other candidates than the lifecycle pass looked the
-    /// region up under, or resolved from settings a change has replaced
-    /// (settings in flight across a change): its answer would be the old
-    /// launch's, and asking would start a peer the settings no longer name
-    /// — recreating, if the change pruned it, the region with them.
+    /// lookup resolved from settings a change has replaced, or a request
+    /// under other candidates than the lifecycle pass looked the region up
+    /// under (settings in flight across a change): its answer would be the
+    /// old launch's, and asking would start a peer the settings no longer
+    /// name — recreating, if the change pruned it, the region with them.
     fn slot(
         &self,
         target: &PrepareTarget,
@@ -578,12 +588,11 @@ impl PrepareRegistry {
         let entry = self.regions.entry(hash);
         // Under the entry's lock: a change recording its settings after
         // this check prunes what is inserted here.
-        if holder == Holder::Request
-            && self
-                .pruned_under
-                .load()
-                .as_ref()
-                .is_some_and(|current| !Arc::ptr_eq(current, &target.settings))
+        if self
+            .pruned_under
+            .load()
+            .as_ref()
+            .is_some_and(|current| !Arc::ptr_eq(current, &target.settings))
         {
             return None;
         }
@@ -1530,9 +1539,11 @@ mod tests {
         assert!(!registry.held_failed(&host, "lua", REGION));
     }
 
-    #[test]
-    fn a_request_resolved_before_a_settings_change_recreates_no_region() {
+    #[tokio::test]
+    async fn a_lookup_resolved_before_a_settings_change_recreates_no_region() {
         let registry = PrepareRegistry::default();
+        let mut resync = registry.take_resync_rx().unwrap();
+        let pool = Arc::new(LanguageServerPool::new());
         let host = Url::parse("file:///host.md").unwrap();
         let before = target_of(&[("peer", &["deno"])]);
         cell(&registry, &before, input(&host, "a"), Holder::LifecyclePass);
@@ -1551,6 +1562,21 @@ mod tests {
                 .is_none()
         );
         assert!(registry.regions.is_empty());
+        // Nor does a lifecycle pass: it syncs the host again, which looks
+        // the region up under the settings now.
+        assert!(matches!(
+            registry.lookup_or_start(&pool, &before, input(&host, "a")),
+            PrepareLookup::Pending
+        ));
+        assert!(registry.regions.is_empty());
+        assert_eq!(
+            resync.try_recv().ok(),
+            Some(Resync {
+                host_uri: host.clone(),
+                ready: false,
+                failed: false
+            })
+        );
         // One resolved from the settings now does.
         assert!(
             registry
