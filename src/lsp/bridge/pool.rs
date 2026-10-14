@@ -5594,11 +5594,16 @@ impl PrepareAdvertisements {
     /// [`Self::record`] for `handle`'s advertisement, unless another
     /// connection has taken its key since.
     fn record_from(&self, handle: &ConnectionHandle, advertised: bool) -> bool {
-        let replaced = self
-            .current
-            .get(handle.key())
-            .is_some_and(|current| !std::ptr::eq(current.as_ptr(), std::ptr::from_ref(handle)));
-        !replaced && self.record(handle.key(), advertised)
+        // Held across the record: a replacement adopting the key meanwhile
+        // waits, and records after.
+        let current = self.current.get(handle.key());
+        if current
+            .as_ref()
+            .is_some_and(|current| !std::ptr::eq(current.as_ptr(), std::ptr::from_ref(handle)))
+        {
+            return false;
+        }
+        self.record(handle.key(), advertised)
     }
 
     /// Whether a server's connections advertise the request: while any
