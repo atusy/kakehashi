@@ -745,18 +745,21 @@ impl LanguageServerPool {
     /// documents to prepare them (see `PrepareAdvertisements::start_failures`)
     /// — unless failures were cleared since `cleared` was read: the
     /// settings that failed to start it changed, or it started since.
+    /// `false` then: the failure says nothing current.
     pub(crate) fn record_prepare_start_failure(
         &self,
         server_name: &str,
         host_uri: &Url,
         cleared: u64,
-    ) {
+    ) -> bool {
         let mut failures = self.prepare_advertisements.start_failures();
-        if failures.cleared == cleared {
-            failures
-                .failed
-                .insert((server_name.to_string(), host_uri.clone()));
+        if failures.cleared != cleared {
+            return false;
         }
+        failures
+            .failed
+            .insert((server_name.to_string(), host_uri.clone()));
+        true
     }
 
     /// Whether `server_name` could not be started for `host_uri`'s
@@ -5610,7 +5613,11 @@ mod tests {
         let b = Url::parse("file:///b/doc.md").unwrap();
         pool.record_prepare_advertisement("peer", true);
         let epoch = pool.prepare_advertised_epoch();
-        pool.record_prepare_start_failure("peer", &b, pool.prepare_start_failures_cleared());
+        assert!(pool.record_prepare_start_failure(
+            "peer",
+            &b,
+            pool.prepare_start_failures_cleared()
+        ));
         assert!(pool.prepare_start_failed("peer", &b));
         assert!(!pool.prepare_start_failed("peer", &a));
         // Another root's healthy connection keeps its advertisement.
@@ -5623,7 +5630,11 @@ mod tests {
         assert!(!pool.prepare_start_failed("peer", &b));
         assert_eq!(pool.prepare_advertised_epoch(), epoch + 1);
         assert_eq!(runs.load(std::sync::atomic::Ordering::Relaxed), 1);
-        pool.record_prepare_start_failure("peer", &b, pool.prepare_start_failures_cleared());
+        assert!(pool.record_prepare_start_failure(
+            "peer",
+            &b,
+            pool.prepare_start_failures_cleared()
+        ));
         pool.forget_prepare_start_failures(Some(&a));
         assert!(pool.prepare_start_failed("peer", &b));
         pool.forget_prepare_start_failures(Some(&b));
@@ -5634,10 +5645,14 @@ mod tests {
         // recorded after: the peer may have started since.
         let seen = pool.prepare_start_failures_cleared();
         pool.forget_prepare_start_failures(Some(&a));
-        pool.record_prepare_start_failure("peer", &b, seen);
+        assert!(!pool.record_prepare_start_failure("peer", &b, seen));
         assert!(!pool.prepare_start_failed("peer", &b));
         // A settings change does ask again.
-        pool.record_prepare_start_failure("peer", &b, pool.prepare_start_failures_cleared());
+        assert!(pool.record_prepare_start_failure(
+            "peer",
+            &b,
+            pool.prepare_start_failures_cleared()
+        ));
         pool.forget_prepare_start_failures(None);
         assert!(!pool.prepare_start_failed("peer", &b));
         assert_eq!(runs.load(std::sync::atomic::Ordering::Relaxed), 2);

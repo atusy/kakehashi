@@ -949,6 +949,10 @@ async fn try_run(
     // is accounted for as it is made.
     let mut pass = 1;
     loop {
+        // A candidate's start failure that failures were cleared since: the
+        // answer passing it over may be outdated, like one passing over a
+        // candidate that starts advertising.
+        let mut outdated_failure = false;
         let answer = 'candidates: {
             for candidate in target.candidates.iter() {
                 let name = &candidate.server_name;
@@ -987,7 +991,11 @@ async fn try_run(
                             job.host_uri,
                             escape_terminal_controls(&error.to_string()),
                         );
-                        pool.record_prepare_start_failure(name, &job.host_uri, failures_cleared);
+                        outdated_failure |= !pool.record_prepare_start_failure(
+                            name,
+                            &job.host_uri,
+                            failures_cleared,
+                        );
                         continue;
                     }
                 };
@@ -1037,7 +1045,13 @@ async fn try_run(
             })
         };
         let epoch = pool.prepare_advertised_epoch();
-        if epoch == advertised_epoch || pass == MAX_CANDIDATE_PASSES {
+        if (epoch == advertised_epoch && !outdated_failure) || pass == MAX_CANDIDATE_PASSES {
+            if outdated_failure {
+                // No answer that would stand: retried after a backoff.
+                return Err(std::io::Error::other(
+                    "a candidate's start failure was outdated while asking",
+                ));
+            }
             return Ok((advertised_epoch, answer));
         }
         advertised_epoch = epoch;
@@ -1096,6 +1110,28 @@ mod tests {
     fn held_cell(registry: &PrepareRegistry) -> Arc<Cell> {
         let region = registry.regions.iter().next().unwrap();
         Arc::clone(&region.held_slot().unwrap().cell)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_answer_passing_over_a_failure_cleared_meanwhile_is_not_kept() {
+        let registry = PrepareRegistry::default();
+        let pool = Arc::new(LanguageServerPool::new());
+        let host = Url::parse("file:///host.md").unwrap();
+        // Starts, then exits before its handshake completes.
+        let target = target_of(&[("peer", &["sh", "-c", "sleep 0.3"])]);
+        registry.slot(&target, input(&host, "a"), Holder::LifecyclePass);
+        let clear = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            // Another host closing clears failures while it starts.
+            let other = Url::parse("file:///other.md").unwrap();
+            pool.forget_prepare_start_failures(Some(&other));
+        };
+        let (answer, ()) = tokio::join!(registry.prepare(&pool, &target, input(&host, "a")), clear);
+        // Its failure said nothing current: it was asked again, and only
+        // the answer as is that its current failure gives is kept.
+        assert!(answer.unwrap().map.is_none());
+        assert!(pool.prepare_start_failed("peer", &host));
     }
 
     #[tokio::test]
