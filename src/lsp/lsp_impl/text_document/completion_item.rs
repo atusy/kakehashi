@@ -104,11 +104,12 @@ impl Kakehashi {
                             &host_url,
                             &region.injection_language,
                             &envelope.region_id,
-                        ) || self
-                            .document_language(&host_url)
-                            .is_some_and(|host_language| {
-                                self.prepares(&host_language, &region.injection_language)
-                            })
+                        ) || self.experimental_enabled()
+                            && self
+                                .document_language(&host_url)
+                                .is_some_and(|host_language| {
+                                    self.prepares(&host_language, &region.injection_language)
+                                })
                         {
                             return None;
                         }
