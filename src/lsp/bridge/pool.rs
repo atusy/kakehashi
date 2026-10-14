@@ -750,13 +750,24 @@ impl LanguageServerPool {
         !failures.is_empty() && failures.contains(&(server_name.to_string(), host_uri.clone()))
     }
 
-    /// Forget the start failures recorded for `host_uri` (`None`: for every
-    /// host — the settings that failed to start them changed).
+    /// Forget the start failures recorded for `host_uri` (closed: its
+    /// answers go with it), or for every host when `None` — the settings
+    /// that failed to start them changed, and the answers given without
+    /// them are asked again (as an advertisement change has them).
     pub(crate) fn forget_prepare_start_failures(&self, host_uri: Option<&Url>) {
-        let failures = &self.prepare_advertisements.start_failures;
+        let advertisements = &self.prepare_advertisements;
+        if advertisements.start_failures.is_empty() {
+            return;
+        }
         match host_uri {
-            Some(host_uri) => failures.retain(|(_, host)| host != host_uri),
-            None => failures.clear(),
+            Some(host_uri) => {
+                advertisements.forget_start_failures(|_, host| host == host_uri);
+            }
+            None => {
+                if advertisements.forget_start_failures(|_, _| true) {
+                    advertisements.invalidate();
+                }
+            }
         }
     }
 
@@ -5461,19 +5472,25 @@ impl PrepareAdvertisements {
     /// changes no candidate's selection: an unrecorded candidate is asked.)
     fn record(&self, server_name: &str, advertised: bool) -> bool {
         // A handshake advertising the request: the server started somewhere,
-        // and is tried again where it could not be.
-        if advertised && !self.start_failures.is_empty() {
-            self.start_failures
-                .retain(|(server, _)| server != server_name);
-        }
+        // and is tried again where it could not be — the answers given
+        // without it (as is, or a later candidate's) are asked again.
+        let retried = advertised
+            && !self.start_failures.is_empty()
+            && self.forget_start_failures(|server, _| server == server_name);
         let previous = match self.by_server.get_mut(server_name) {
             Some(mut entry) => std::mem::replace(&mut *entry, advertised),
             None => {
                 self.by_server.insert(server_name.to_string(), advertised);
+                if retried {
+                    self.invalidate();
+                }
                 return false;
             }
         };
         if advertised == previous {
+            if retried {
+                self.invalidate();
+            }
             return false;
         }
         self.advertised_epoch.fetch_add(1, Ordering::AcqRel);
@@ -5481,6 +5498,14 @@ impl PrepareAdvertisements {
             hook();
         }
         true
+    }
+
+    /// Forget the start failures `matches` accepts; `true` when any went.
+    fn forget_start_failures(&self, matches: impl Fn(&str, &Url) -> bool) -> bool {
+        let before = self.start_failures.len();
+        self.start_failures
+            .retain(|(server, host)| !matches(server, host));
+        self.start_failures.len() != before
     }
 
     /// As if an advertisement had changed: what candidates answer may have.
@@ -5556,17 +5581,24 @@ mod tests {
         assert_eq!(pool.prepare_advertisement("peer"), Some(true));
         assert_eq!(pool.prepare_advertised_epoch(), epoch);
         assert_eq!(runs.load(std::sync::atomic::Ordering::Relaxed), 0);
-        // A handshake advertising the request tries it again.
+        // A handshake advertising the request tries it again, asking again
+        // what was answered without it.
         pool.record_prepare_advertisement("peer", true);
         assert!(!pool.prepare_start_failed("peer", &b));
+        assert_eq!(pool.prepare_advertised_epoch(), epoch + 1);
+        assert_eq!(runs.load(std::sync::atomic::Ordering::Relaxed), 1);
         pool.record_prepare_start_failure("peer", &b);
         pool.forget_prepare_start_failures(Some(&a));
         assert!(pool.prepare_start_failed("peer", &b));
         pool.forget_prepare_start_failures(Some(&b));
         assert!(!pool.prepare_start_failed("peer", &b));
+        // A closed host's answers go with it: nothing to ask again.
+        assert_eq!(runs.load(std::sync::atomic::Ordering::Relaxed), 1);
+        // A settings change does ask again.
         pool.record_prepare_start_failure("peer", &b);
         pool.forget_prepare_start_failures(None);
         assert!(!pool.prepare_start_failed("peer", &b));
+        assert_eq!(runs.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     #[test]
