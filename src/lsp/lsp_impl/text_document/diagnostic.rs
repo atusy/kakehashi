@@ -298,7 +298,18 @@ impl Kakehashi {
                     // the peer could not prepare never reached them either,
                     // and its pushes are dropped — not a clean result.
                     // Only a caller counting failures (CLI diagnose) waits
-                    // for the answer to find out; an editor's pull does not.
+                    // for the answer to find out; an editor's pull does not,
+                    // but while the answer is pending the region's pushes are
+                    // left out of this result: owe a refresh once it is sent.
+                    if external_error_sink.is_none()
+                        && self.bridge.prepare_region_pending(
+                            &uri,
+                            &resolved.injection_language,
+                            &resolved.region.region_id,
+                        )
+                    {
+                        prepare_skipped.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                     if external_error_sink.is_some()
                         && let Some(target) = self.bridge.prepare_target(
                             &settings,
@@ -1358,6 +1369,110 @@ mod tests {
         assert_ne!(id, diagnostic_result_id(&changed_message));
         assert_ne!(id, diagnostic_result_id(&changed_severity));
         assert_ne!(id, diagnostic_result_id(&shrunk));
+    }
+
+    /// An editor's pull skips a push-only region whose document waits for
+    /// its prepare answer: that region's pushes are not in the result, so
+    /// the pull owes a refresh once the prepared text is sent instead of
+    /// counting as covered.
+    #[tokio::test]
+    async fn pull_owes_a_refresh_for_a_push_only_region_awaiting_preparation() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server.set_experimental(true);
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("markdown".to_string(), tree_sitter_md::LANGUAGE.into());
+        let markdown: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let injection_query = tree_sitter::Query::new(
+            &markdown,
+            r#"
+            (fenced_code_block
+              (info_string
+                (language) @injection.language)
+              (code_fence_content) @injection.content)
+            "#,
+        )
+        .expect("valid markdown injection query");
+        server
+            .language
+            .query_store()
+            .insert_injection_query("markdown".to_string(), std::sync::Arc::new(injection_query));
+        server
+            .settings_manager
+            .apply_settings(crate::config::WorkspaceSettings {
+                auto_install: false,
+                language_servers: std::collections::HashMap::from([(
+                    "lua-bridge".to_string(),
+                    crate::config::settings::BridgeServerConfig {
+                        cmd: Some(vec![
+                            "sh".to_string(),
+                            "-c".to_string(),
+                            "cat > /dev/null".to_string(),
+                        ]),
+                        languages: Some(vec!["lua".to_string()]),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            });
+        // Ready without a diagnostic provider: push-only.
+        server
+            .bridge
+            .insert_ready_test_connection("lua-bridge")
+            .await;
+
+        let uri = Url::parse("file:///test/pull_awaiting_preparation.md").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "```lua\nprint(1)\n```\n".to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("markdown"), None, None)
+            .await;
+        let snapshot = server
+            .documents
+            .latest_snapshot(&uri)
+            .and_then(|view| view.slot.snapshot)
+            .expect("parsed");
+        let regions = server
+            .whole_document_regions(&uri, &snapshot)
+            .expect("regions resolved");
+        let region = regions.first().expect("one lua region");
+        server
+            .bridge
+            .hold_prepare_pending_for_test(crate::lsp::bridge::PrepareInput {
+                host_uri: &uri,
+                host_language: "markdown",
+                injection_language: &region.injection_language,
+                region_id: &region.region.region_id,
+                virtual_text: &region.virtual_content,
+                gaps: &region.gaps,
+            });
+
+        server
+            .diagnostic_impl(DocumentDiagnosticParams {
+                text_document: tower_lsp_server::ls_types::TextDocumentIdentifier {
+                    uri: "file:///test/pull_awaiting_preparation.md"
+                        .parse()
+                        .expect("uri"),
+                },
+                identifier: None,
+                previous_result_id: None,
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await
+            .expect("pull answers");
+
+        assert!(
+            server.bridge.take_pull_debt_after_prepare(&uri),
+            "the pull left the waiting region's pushes out and owes a refresh"
+        );
     }
 
     #[tokio::test]
