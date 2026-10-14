@@ -78,7 +78,8 @@ pub(crate) enum HeldPresentation {
     /// prepared from the region's current virtual text.
     Prepared(Arc<super::protocol::PreparedMap>),
     /// Not at all: the connection holds a text prepared from another virtual
-    /// text, or the region is not bridged.
+    /// text, the region is not bridged, or the region is prepared and the
+    /// connection holds no prepared text (one as is, or nothing on record).
     Unavailable,
 }
 
@@ -721,11 +722,11 @@ impl BridgeCoordinator {
 
     /// How coordinates `connection` computed for a region translate to the
     /// host while the region's virtual text is `virtual_text`: through the
-    /// map of the text the connection holds, whatever the region's current
-    /// preparation says. A region whose current input the peer answered
-    /// unusably is not bridged, and a prepared text built from another
-    /// virtual text describes no current host position: both
-    /// [`HeldPresentation::Unavailable`].
+    /// map of the text the connection holds. A region whose current input
+    /// the peer answered unusably is not bridged, a prepared text built from
+    /// another virtual text describes no current host position, and a region
+    /// the lifecycle pass prepares translates nothing through text held as
+    /// is (or with nothing on record): all [`HeldPresentation::Unavailable`].
     pub(crate) fn held_presentation(
         &self,
         host_uri: &Url,
@@ -796,7 +797,9 @@ impl BridgeCoordinator {
     /// it was pushed for only: once its connection was sent another, it
     /// describes nothing current (a server publishing on open only keeps it
     /// otherwise, placed through a map it was not computed against). Pushes
-    /// for text held as is place as on any unprepared path.
+    /// for text held as is place as on any unprepared path — except in a
+    /// region the lifecycle pass prepares, which places nothing but pushes
+    /// for its prepared text.
     pub(crate) fn place_push(
         &self,
         host_uri: &Url,
