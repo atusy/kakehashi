@@ -2225,7 +2225,7 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             let mut attempt = 0;
             loop {
-                let probe_key = ConnectionKey::for_server(&format!("probe-{attempt}"));
+                let probe_key = ConnectionKey::for_server(format!("probe-{attempt}"));
                 attempt += 1;
                 let mut all_current = true;
                 for (before, after) in old.iter().zip(&current) {
