@@ -41,6 +41,7 @@ use super::protocol::{
     VirtualDocumentUri, VirtualLayout, apply_prepare_result,
 };
 use crate::language::injection::VirtualGap;
+use crate::text::terminal::escape_terminal_controls;
 
 /// Answers kept per region besides the one the lifecycle pass holds its
 /// document on: enough for an undo, or a request on text an edit or two
@@ -844,10 +845,15 @@ async fn try_run(
             // Advertising nothing until a handshake says otherwise, so later
             // inputs are not held back to start it again.
             Err(error) => {
-                log::debug!(
+                // Its pairs go out unprepared from now on, until its handshake
+                // advertises the request: worth seeing at the default level.
+                // Recorded below, it is not started again per input.
+                log::warn!(
                     target: "kakehashi::bridge::prepare",
-                    "Prepare candidate {name} for {} did not start: {error}",
-                    job.host_uri
+                    "Prepare candidate {} for {} did not start; sending its documents as is: {}",
+                    escape_terminal_controls(name),
+                    job.host_uri,
+                    escape_terminal_controls(&error.to_string()),
                 );
                 pool.record_prepare_advertisement(name, false);
                 continue;
