@@ -50,8 +50,19 @@ pub(crate) enum BridgeError {
     /// Carried as `io::ErrorKind::Interrupted`: the acquisition was overtaken
     /// by the server, not failed by it. Unlike the other interrupted
     /// acquisitions (shutdown, supersession), re-resolving now diverts the
-    /// root, so acquisition entry points retry exactly this one.
+    /// root, so acquisition entry points retry it (see
+    /// [`BridgeError::reroutes`]).
     FolderSupportWithdrawn,
+    /// Routing chose a shared instance that, by the time the acquire found it
+    /// `Ready`, lacks folder-change support and does not serve the
+    /// acquisition's marker root: typically routing probed it still
+    /// `Initializing` and its handshake completed before the acquire (#992),
+    /// or an unregistration landed after a probe that saw it capable (#968).
+    ///
+    /// Carried as `io::ErrorKind::Interrupted` for the same reason as
+    /// [`BridgeError::FolderSupportWithdrawn`]: re-resolving now diverts the
+    /// root, so acquisition entry points retry it.
+    SharedRootUnserved,
 }
 
 impl BridgeError {
@@ -75,6 +86,28 @@ impl BridgeError {
             .get_ref()
             .and_then(|inner| inner.downcast_ref::<BridgeError>())
             .is_some_and(|inner| *inner == BridgeError::FolderSupportWithdrawn)
+    }
+
+    /// Whether `error` refused an acquisition that re-resolving would route
+    /// elsewhere — [`BridgeError::FolderSupportWithdrawn`] or
+    /// [`BridgeError::SharedRootUnserved`] — so the entry point should
+    /// retry it rather than fail.
+    pub(crate) fn reroutes(error: &io::Error) -> bool {
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<BridgeError>())
+            .is_some_and(|inner| {
+                matches!(
+                    inner,
+                    BridgeError::FolderSupportWithdrawn | BridgeError::SharedRootUnserved
+                )
+            })
+    }
+
+    /// [`BridgeError::SharedRootUnserved`] as the `Interrupted` error it
+    /// travels as.
+    pub(crate) fn shared_root_unserved() -> io::Error {
+        io::Error::new(io::ErrorKind::Interrupted, BridgeError::SharedRootUnserved)
     }
 
     /// [`BridgeError::FolderSupportWithdrawn`] as the `Interrupted` error it
@@ -121,6 +154,11 @@ impl std::fmt::Display for BridgeError {
                 f,
                 "bridge: shared instance withdrew folder-change support before \
                  this root was announced"
+            ),
+            BridgeError::SharedRootUnserved => write!(
+                f,
+                "bridge: shared instance lacks folder-change support and does \
+                 not serve this root"
             ),
         }
     }
