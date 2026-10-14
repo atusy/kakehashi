@@ -73,7 +73,7 @@ impl LanguageServerPool {
                 incarnation,
                 &injection.language,
                 &injection.region_id,
-                &injection.content,
+                injection.sent(),
             );
             let virtual_uri =
                 VirtualDocumentUri::new(&host_uri_lsp, &injection.language, &injection.region_id);
@@ -116,22 +116,15 @@ impl LanguageServerPool {
                     )
                     .await
                 {
-                    let outcome = Self::send_didchange_for_virtual_doc(
+                    Some(self.send_didchange_recorded(
                         &handle,
-                        &virtual_uri.to_uri_string(),
-                        &injection.content,
+                        &virtual_uri,
+                        &connection_key,
+                        injection.sent(),
                         version,
-                    );
-                    if matches!(outcome, NotificationSendResult::Queued) {
-                        self.record_sent_content_fingerprint(
-                            &virtual_uri,
-                            &connection_key,
-                            &injection.content,
-                        )
-                        .await;
-                    }
-                    Some(outcome)
+                    ))
                 } else {
+                    self.rehold_unchanged_content(&virtual_uri, &connection_key, injection.sent());
                     None
                 };
 
@@ -252,6 +245,8 @@ mod tests {
 
         let host_uri = Url::parse("file:///test/save.md").unwrap();
         let injection = BridgeInjection {
+            held: false,
+            prepared: None,
             language: "lua".to_string(),
             region_id: ulid::Ulid::generate().to_string(),
             content: "print(1)".to_string(),

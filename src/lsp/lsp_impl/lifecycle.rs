@@ -96,6 +96,10 @@ enum ClientRoot<'a> {
     LegacyPath(&'a str),
 }
 
+/// Times a prepare resync pass whose sends failed is retried (with the
+/// prepare backoff: one second, doubling) before waiting for the next edit.
+const MAX_RESYNC_RETRIES: u32 = 6;
+
 impl ClientRoot<'_> {
     /// How this root's origin reads in the startup log.
     fn source(&self) -> &'static str {
@@ -775,6 +779,110 @@ impl Kakehashi {
             ));
         }
 
+        // Virtual documents held back for a prepare peer's answer are sent
+        // once it arrives: the finished request names the host, and the
+        // injection pass re-run for it now finds the prepared text. (An
+        // unusable answer names it at once; an attempt that got no answer
+        // names it again after its retry backoff.)
+        if let Some(mut resync_rx) = self.bridge.take_prepare_resync_rx() {
+            let injection = self.injection_coordinator();
+            let diagnostics = self.diagnostic_scheduler();
+            let bridge = std::sync::Arc::clone(&self.bridge);
+            let token = self.shutdown_token.clone();
+            tokio::spawn(async move {
+                // Consecutive passes per host whose sends failed.
+                let mut failures: std::collections::HashMap<Url, u32> =
+                    std::collections::HashMap::new();
+                loop {
+                    let first = tokio::select! {
+                        _ = token.cancelled() => return,
+                        resync = resync_rx.recv() => match resync {
+                            Some(resync) => resync,
+                            None => return,
+                        },
+                    };
+                    // Several documents of one host usually finish together;
+                    // a host is re-diagnosed when any of its documents became
+                    // ready (a retry coming due sends nothing new yet).
+                    let mut hosts = std::collections::HashMap::from([(
+                        first.host_uri,
+                        (first.ready, first.recollect),
+                    )]);
+                    while let Ok(resync) = resync_rx.try_recv() {
+                        let (ready, recollect) = hosts.entry(resync.host_uri).or_default();
+                        *ready |= resync.ready;
+                        *recollect |= resync.recollect;
+                    }
+                    for (uri, (ready, recollect)) in hosts {
+                        // A send the pass could not queue leaves its server
+                        // on the text before, and the answer is cached, so
+                        // no resync would come again: retry with backoff,
+                        // a bounded number of times, while the host is open.
+                        let synchronized = injection.process_injections_synchronized(&uri).await;
+                        // A pass the host's regions could not be looked at
+                        // for (a reload in progress) deferred its work to a
+                        // retry that only syncs documents: retried likewise,
+                        // so the diagnostics owed below are not lost.
+                        let looked =
+                            matches!(injection.bridge_injections(&uri), Some((_, Some(_))));
+                        // A save the held regions missed is replayed too; one
+                        // the regions could not be looked at for is kept.
+                        let replayed = injection.replay_held_save(&uri).await;
+                        let retrying = if synchronized && looked && replayed {
+                            failures.remove(&uri);
+                            false
+                        } else if injection.document_incarnation(&uri).is_some() {
+                            let failed = failures.entry(uri.clone()).or_default();
+                            *failed += 1;
+                            if *failed <= MAX_RESYNC_RETRIES {
+                                bridge.requeue_prepare_resync(
+                                    crate::lsp::bridge::Resync {
+                                        host_uri: uri.clone(),
+                                        ready,
+                                        recollect,
+                                    },
+                                    crate::lsp::bridge::prepare_retry_delay(*failed),
+                                );
+                                true
+                            } else {
+                                // Servers may still hold the text before, and
+                                // requests on it fail their wait, until the
+                                // next edit or save syncs the host.
+                                log::warn!(
+                                    target: "kakehashi::bridge::prepare",
+                                    "Gave up syncing the prepared virtual documents of {uri} after {MAX_RESYNC_RETRIES} retries; the next edit syncs them"
+                                );
+                                failures.remove(&uri);
+                                false
+                            }
+                        } else {
+                            failures.remove(&uri);
+                            false
+                        };
+                        // A pull owed a refresh waits for a pass that reached
+                        // every server: one now would re-pull from a server
+                        // still holding the text before.
+                        if synchronized && looked {
+                            diagnostics.settle_pull_debt_after_prepare(&uri, ready);
+                        }
+                        // The diagnostic pass that ran when the host opened
+                        // or changed skipped the held regions; run it again
+                        // now that they reached their servers — or once the
+                        // retry carrying this readiness gets through. Not
+                        // after retries ran out: servers may still hold the
+                        // text before, and the next edit collects anyway. A
+                        // region whose answer came back unusable is no longer
+                        // bridged, and one a peer's advertisement change
+                        // re-sent goes out otherwise: collecting again drops
+                        // what its earlier (prepared) text published.
+                        if (ready || recollect) && synchronized && looked && !retrying {
+                            diagnostics.spawn_diagnostic_task_after_prepare(uri);
+                        }
+                    }
+                }
+            });
+        }
+
         // Ask a pull-capable client for its configuration now that the
         // handshake is complete. Editors that send `didChangeConfiguration`
         // with no usable `settings` have no other way to configure kakehashi
@@ -1126,11 +1234,13 @@ async fn deliver_upstream_batch(
                 uri,
                 server,
                 connection_id,
+                held,
                 diagnostics,
             } => pushes.push(DiagnosticPush {
                 uri,
                 server,
                 connection_id,
+                held,
                 diagnostics,
             }),
             barrier => {
@@ -1229,6 +1339,7 @@ fn coalesce_upstream_batch(
                 uri,
                 server,
                 connection_id,
+                held,
                 diagnostics,
             } => {
                 let idx = output.len();
@@ -1245,6 +1356,7 @@ fn coalesce_upstream_batch(
                     uri,
                     server,
                     connection_id,
+                    held,
                     diagnostics,
                 }));
             }
@@ -1964,6 +2076,8 @@ fn spawn_upstream_request(
             }
             UpstreamRequest::ShowDocument {
                 params,
+                connection,
+                held_through,
                 reply,
                 cancel,
             } => {
@@ -1974,7 +2088,12 @@ fn spawn_upstream_request(
                 // rebuilt); only a non-virtual/unresolvable URI is forwarded
                 // unchanged. See `ShowDocumentTranslator::translate`.
                 let params = match &translators {
-                    Some(translators) => translators.show_document.translate(params).await,
+                    Some(translators) => {
+                        translators
+                            .show_document
+                            .translate(params, &connection, held_through)
+                            .await
+                    }
                     None => params,
                 };
                 let id = client.next_request_id();
@@ -1995,6 +2114,7 @@ fn spawn_upstream_request(
             UpstreamRequest::ApplyEdit {
                 params,
                 connection,
+                held_through,
                 reply,
                 cancel,
             } => {
@@ -2040,7 +2160,10 @@ fn spawn_upstream_request(
                     super::apply_edit_translation::document_change_count(&params);
                 let params = match &translators {
                     Some(translators) => {
-                        translators.apply_edit.translate(params, &connection).await
+                        translators
+                            .apply_edit
+                            .translate(params, &connection, held_through)
+                            .await
                     }
                     None => Ok(params),
                 };
@@ -2173,6 +2296,7 @@ async fn deliver_upstream_notification(
             uri,
             server,
             connection_id,
+            held,
             diagnostics,
         } => {
             // Cache the downstream push and republish the merged host set
@@ -2185,7 +2309,7 @@ async fn deliver_upstream_notification(
                 delivery_context.map(|context| context.diagnostic_publisher.as_ref())
             {
                 publisher
-                    .publish_push(uri, server, connection_id, diagnostics)
+                    .publish_push(uri, server, connection_id, held, diagnostics)
                     .await;
             }
         }
@@ -3346,6 +3470,7 @@ mod tests {
                 uri: uri.to_string(),
                 server: "srv".to_string(),
                 connection_id: ProgressConnectionId::for_test(conn),
+                held: None,
                 diagnostics: vec![Diagnostic {
                     message: msg.to_string(),
                     ..Default::default()
@@ -3359,6 +3484,7 @@ mod tests {
                 uri: uri.to_string(),
                 server: "srv".to_string(),
                 connection_id: ProgressConnectionId::for_test(conn),
+                held: None,
                 diagnostics: vec![],
             }
         }
@@ -4721,6 +4847,8 @@ mod tests {
             .send(UpstreamRequest::ShowDocument {
                 params: serde_json::from_value(serde_json::json!({ "uri": "file:///x.rs" }))
                     .unwrap(),
+                connection: crate::lsp::bridge::ConnectionKey::for_server("test"),
+                held_through: u64::MAX,
                 reply: reply_tx,
                 cancel: test_forwarded_cancel(),
             })
@@ -4786,6 +4914,7 @@ mod tests {
                 }))
                 .unwrap(),
                 connection: crate::lsp::bridge::ConnectionKey::for_server("test"),
+                held_through: u64::MAX,
                 reply: reply_tx,
                 cancel: forwarded_cancel,
             })
@@ -4863,6 +4992,7 @@ mod tests {
         request_tx
             .send(UpstreamRequest::ApplyEdit {
                 connection: crate::lsp::bridge::ConnectionKey::for_server("test"),
+                held_through: u64::MAX,
                 params: serde_json::from_value(serde_json::json!({
                     "edit": { "changes": { "file:///x.rs": [] } }
                 }))
@@ -4954,6 +5084,7 @@ mod tests {
         request_tx
             .send(UpstreamRequest::ApplyEdit {
                 connection: crate::lsp::bridge::ConnectionKey::for_server("test"),
+                held_through: u64::MAX,
                 params: serde_json::from_value(serde_json::json!({
                     "edit": { "documentChanges": [
                         {
@@ -4989,6 +5120,7 @@ mod tests {
         request_tx
             .send(UpstreamRequest::ApplyEdit {
                 connection: crate::lsp::bridge::ConnectionKey::for_server("test"),
+                held_through: u64::MAX,
                 params: serde_json::from_value(serde_json::json!({
                     "edit": { "documentChanges": [real_edit] }
                 }))
@@ -5065,6 +5197,7 @@ mod tests {
         request_tx
             .send(UpstreamRequest::ApplyEdit {
                 connection: crate::lsp::bridge::ConnectionKey::for_server("test"),
+                held_through: u64::MAX,
                 // A NON-empty edit against a virtual URI that resolves to no open
                 // document: the translator can't map it, so the loop must reject
                 // it locally. (An empty edit array would be a no-op removed

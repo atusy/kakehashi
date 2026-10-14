@@ -241,8 +241,9 @@ impl Kakehashi {
     }
 
     /// Format every safe bridge virtual document (the **virt** layer): resolve
-    /// from the parsed snapshot, skip non-contiguous groups, format each
-    /// remaining document, and concatenate its disjoint edits.
+    /// from the parsed snapshot, skip non-contiguous groups (unless prepared,
+    /// whose map keeps edits off their gaps), format each remaining document,
+    /// and concatenate its disjoint edits.
     #[allow(clippy::too_many_arguments)]
     async fn virt_format_edits(
         &self,
@@ -304,12 +305,15 @@ impl Kakehashi {
         });
         let mut cp_minted: Vec<NumberOrString> = Vec::new();
 
-        let mut seen_edit_ranges = std::collections::HashSet::new();
+        // Every region's context first: their prepare waits run together.
+        let mut contexts = Vec::new();
         for resolved in all_regions.iter() {
             // Non-contiguous combined injections contain masked host-only gaps.
             // A formatter returns a contiguous whole-document replacement, which
-            // would replace those real host gaps as well and corrupt the document.
-            if !resolved.contiguous {
+            // would replace those real host gaps as well and corrupt the document
+            // — unless a prepare peer's map re-diffs the result and refuses any
+            // change to a gap (checked again once the context is prepared).
+            if !resolved.contiguous && !self.prepares(language_name, &resolved.injection_language) {
                 continue;
             }
             let configs = self
@@ -349,18 +353,12 @@ impl Kakehashi {
                 }
                 RegionFormatPlan::Concatenated(_) | RegionFormatPlan::Preferred => {}
             }
-            // Same-range query alternatives are tried in discovery priority
-            // order, but an unconfigured or explicitly disabled language is
-            // not a winner. Reserve the span only after planning so the first
-            // executable alternative formats it; later executable layers are
-            // suppressed to keep emitted edits non-overlapping.
-            if !seen_edit_ranges.insert((
+            let span = (
                 resolved.region.byte_range.start,
                 resolved.region.byte_range.end,
-            )) {
-                continue;
-            }
+            );
             let region_ctx = DocumentRequestContext {
+                prepared: None,
                 uri: uri.clone(),
                 resolved: resolved.clone(),
                 region_end: None,
@@ -370,6 +368,24 @@ impl Kakehashi {
                 strategy: agg.strategy,
                 max_fan_out: agg.max_fan_out,
                 client_progress_token: None,
+            };
+            contexts.push(((pipeline, span), region_ctx));
+        }
+        let mut spans = SpanReservations::default();
+        for ((pipeline, span), region_ctx) in
+            crate::lsp::lsp_impl::bridge_context::prepare_request_contexts(
+                &self.bridge,
+                &self.settings_manager.load_settings(),
+                self.experimental_enabled(),
+                language_name,
+                contexts,
+            )
+            .await
+        {
+            let Some(region_ctx) = spans.admit(span, region_ctx, |ctx| {
+                ctx.resolved.contiguous || ctx.prepared.is_some()
+            }) else {
+                continue;
             };
             // Decide how this region formats — concatenated pipeline, preferred
             // fan-out, or skip — from its resolved aggregation config. See
@@ -403,8 +419,18 @@ impl Kakehashi {
                     // Capture the region's per-line host prefixes now, while
                     // the host snapshot is at hand: the pipeline's whole-region
                     // replacement must re-apply them to its multi-line output
-                    // (Decision point 4, `reapply_host_line_prefixes`).
-                    let virtual_line_count = lsp_line_count(&region_ctx.resolved.virtual_content);
+                    // (Decision point 4, `reapply_host_line_prefixes`). The
+                    // prefixes are per host line, so count the virtual
+                    // document's lines: a prepared one may have fewer, its
+                    // edge blank lines deleted.
+                    let virtual_line_count = lsp_line_count(
+                        region_ctx
+                            .prepared
+                            .as_deref()
+                            .map_or(&region_ctx.resolved.virtual_content, |map| {
+                                map.virtual_text()
+                            }),
+                    );
                     let mapper = host_mapper
                         .get_or_insert_with(|| crate::text::PositionMapper::new(snapshot.text()));
                     let host_line_prefixes = extract_host_line_prefixes(
@@ -465,6 +491,9 @@ impl Kakehashi {
                 }
             });
         }
+        // A span no alternative could format for want of its prepared text
+        // is left unformatted, which the CLI must not report as success.
+        count_request_errors(&cancel_state.request_error_sink, spans.unprepared());
 
         // One teardown guard for the whole request, held across the edit
         // collection so the synthetic terminal `End` fires once, after every
@@ -593,6 +622,51 @@ impl Kakehashi {
             }
             FanInResult::Cancelled => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
         }
+    }
+}
+
+/// Which same-range query alternative formats each host byte span.
+///
+/// Discovery orders same-range alternate languages by query-pattern
+/// priority, but an unconfigured or explicitly disabled language (never
+/// offered here), one the peer could not prepare, or one that cannot run
+/// (`runnable`) is not a winner: the span is reserved only by the first
+/// alternative that can format it, and later ones are suppressed to keep
+/// emitted edits non-overlapping.
+#[derive(Default)]
+pub(super) struct SpanReservations {
+    reserved: std::collections::HashSet<(usize, usize)>,
+    /// Spans an alternative was offered for whose prepared text is missing.
+    unprepared: std::collections::HashSet<(usize, usize)>,
+}
+
+impl SpanReservations {
+    /// The context to format `span` with, offered in discovery order:
+    /// `None` when an earlier alternative reserved the span, or this one
+    /// has no prepared context or cannot run.
+    pub(super) fn admit<T>(
+        &mut self,
+        span: (usize, usize),
+        ctx: Option<T>,
+        runnable: impl FnOnce(&T) -> bool,
+    ) -> Option<T> {
+        if self.reserved.contains(&span) {
+            return None;
+        }
+        let Some(ctx) = ctx else {
+            self.unprepared.insert(span);
+            return None;
+        };
+        if !runnable(&ctx) {
+            return None;
+        }
+        self.reserved.insert(span);
+        Some(ctx)
+    }
+
+    /// How many spans no alternative formats for want of prepared text.
+    pub(super) fn unprepared(&self) -> usize {
+        self.unprepared.difference(&self.reserved).count()
     }
 }
 
@@ -959,8 +1033,18 @@ async fn dispatch_concatenated_formatting(
     let offset = RegionOffset::with_per_line_offsets(
         region_ctx.resolved.region.line_range.start,
         region_ctx.resolved.line_column_offsets.clone(),
-    );
+    )
+    .with_prepared(region_ctx.prepared.clone());
     let original_virtual = region_ctx.resolved.virtual_content.clone();
+    // A prepared document's whole-region result goes back through the
+    // prepared map below; precompute its extent (in prepared coordinates)
+    // before `original_virtual` moves into the pipeline.
+    let prepared_failure_sink = request_error_sink.clone();
+    let prepared_end = region_ctx.prepared.as_ref().map(|_| {
+        crate::text::PositionMapper::new(&original_virtual)
+            .byte_to_position(original_virtual.len())
+            .unwrap_or_default()
+    });
     // Precompute the host replacement range now, while we still hold
     // `original_virtual`, so it can be moved into the pipeline below without a
     // second clone. An unresolvable end position means we emit no edit (bounded
@@ -1375,9 +1459,22 @@ async fn dispatch_concatenated_formatting(
         return None;
     }
 
+    let final_text = final_text?;
+    if prepared_end.is_some()
+        && let Some(map) = &region_ctx.prepared
+    {
+        return prepared_pipeline_edits(
+            map,
+            &final_text,
+            &offset,
+            &host_line_prefixes,
+            &region_ctx.uri,
+            &prepared_failure_sink,
+        );
+    }
     let final_text = pipeline_region_text(
         &region_ctx.resolved.virtual_content,
-        &final_text?,
+        &final_text,
         &offset,
         &host_line_prefixes,
     )?;
@@ -1684,6 +1781,82 @@ fn extract_host_line_prefixes(
         .collect()
 }
 
+/// The edits a concatenated pipeline's result over a prepared document
+/// makes to the host: the result keeps the edge layout of each string the
+/// prepared text joins (see [`crate::lsp::bridge::restore_joined_layout`]),
+/// then goes back through the prepared map as one formatting answer, which
+/// restores dedented indentation and refuses a result rewriting host-owned
+/// text (a gap). Host line prefixes are not re-applied on this path, so a
+/// prefixed region fails closed, as does a refused result; both count as
+/// request errors. `None` also when the result changes nothing.
+fn prepared_pipeline_edits(
+    map: &crate::lsp::bridge::PreparedMap,
+    final_text: &str,
+    offset: &RegionOffset,
+    host_line_prefixes: &[String],
+    uri: &url::Url,
+    failure_sink: &RequestErrorSink,
+) -> Option<Vec<TextEdit>> {
+    let prepared = map.prepared_text();
+    let opens_after_a_delimiter = opens_after_a_delimiter(offset, host_line_prefixes);
+    let restored = crate::lsp::bridge::restore_joined_layout(
+        prepared,
+        final_text,
+        map.emptied_gap_offsets(),
+        opens_after_a_delimiter,
+    );
+    if restored == prepared {
+        return None;
+    }
+    let prefixed = host_line_prefixes
+        .iter()
+        .skip(usize::from(opens_after_a_delimiter))
+        .any(|prefix| !prefix.is_empty());
+    if prefixed {
+        log::warn!(
+            target: "kakehashi::formatting",
+            "concatenated formatting result for {} is dropped: host line prefixes are not re-applied to a prepared virtual document",
+            uri
+        );
+        count_request_errors(failure_sink, 1);
+        return None;
+    }
+    let mapper = crate::text::PositionMapper::new(prepared);
+    let edits = crate::lsp::bridge::translate_virtual_text_edits_to_host(
+        vec![TextEdit {
+            range: tower_lsp_server::ls_types::Range::new(
+                tower_lsp_server::ls_types::Position::new(0, 0),
+                mapper.byte_to_position(prepared.len()).unwrap_or_default(),
+            ),
+            new_text: restored,
+        }],
+        offset,
+        crate::lsp::bridge::EditMode::Formatting,
+    );
+    if edits.is_none() {
+        log::warn!(
+            target: "kakehashi::formatting",
+            "concatenated formatting result for {} edits host-owned text of a prepared virtual document; dropping it",
+            uri
+        );
+        count_request_errors(failure_sink, 1);
+    }
+    edits
+}
+
+/// Whether a region opens mid-line, after a delimiter on its first line (a
+/// Nix `''`): its leading line break is then layout, and its first line has
+/// no line prefix. One column offset is also the shape of a blockquoted or
+/// list-item fence ending at EOF, which opens at a line start behind its
+/// prefix; a line prefix is made of container markers and indentation only,
+/// a delimiter's line is not.
+fn opens_after_a_delimiter(offset: &RegionOffset, host_line_prefixes: &[String]) -> bool {
+    offset.opens_mid_line()
+        && host_line_prefixes
+            .first()
+            .is_some_and(|text| text.chars().any(|c| !(c == '>' || c.is_whitespace())))
+}
+
 /// The host text replacing the region after the concatenated pipeline
 /// formatted `original_virtual` into `final_text`, or `None` when the region
 /// is left as it was.
@@ -1695,14 +1868,8 @@ fn pipeline_region_text(
 ) -> Option<String> {
     // A region opening mid-line, after a delimiter on its first line (a Nix
     // `''`), has its leading line break as layout and no line prefix: the
-    // host text before it is the delimiter's line. One column offset is also
-    // the shape of a blockquoted or list-item fence ending at EOF, which
-    // opens at a line start behind its prefix; a line prefix is made of
-    // container markers and indentation only, a delimiter's line is not.
-    let opens_after_a_delimiter = offset.opens_mid_line()
-        && host_line_prefixes
-            .first()
-            .is_some_and(|text| text.chars().any(|c| !(c == '>' || c.is_whitespace())));
+    // host text before it is the delimiter's line.
+    let opens_after_a_delimiter = opens_after_a_delimiter(offset, host_line_prefixes);
     // Each step keeps the edge layout of its own text, but formats with a zero
     // offset, which reads as a region opening at a line start: only the
     // region tells whether its leading line break is layout.
@@ -2024,6 +2191,22 @@ pub(super) async fn finalize_formatting_edits(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_span_goes_to_the_first_alternative_that_can_format_it() {
+        let mut spans = SpanReservations::default();
+        let runnable = |ctx: &&str| *ctx != "gapped";
+        // The first alternative's peer could not prepare it: the next one
+        // that can run formats the span.
+        assert_eq!(spans.admit((0, 4), None, runnable), None);
+        assert_eq!(spans.admit((0, 4), Some("gapped"), runnable), None);
+        assert_eq!(spans.admit((0, 4), Some("lua"), runnable), Some("lua"));
+        assert_eq!(spans.admit((0, 4), Some("vim"), runnable), None);
+        // A span only an unprepared alternative was offered for is left
+        // unformatted.
+        assert_eq!(spans.admit((5, 9), None, runnable), None);
+        assert_eq!(spans.unprepared(), 1);
+    }
     use tower_lsp_server::ls_types::{Position, Range};
 
     fn resolved_region(
@@ -2043,6 +2226,7 @@ mod tests {
             virtual_content: String::new(),
             line_column_offsets: vec![0],
             contiguous: true,
+            gaps: Default::default(),
         }
     }
 

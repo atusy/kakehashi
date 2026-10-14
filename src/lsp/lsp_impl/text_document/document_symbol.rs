@@ -124,6 +124,8 @@ impl Kakehashi {
             )
             .await;
 
+        // Every region's context first: their prepare waits run together.
+        let mut contexts = Vec::new();
         for (region_index, resolved) in all_regions.iter().enumerate() {
             // Get ALL bridge server configs for this injection language
             let mut configs = self
@@ -141,6 +143,7 @@ impl Kakehashi {
                 METHOD,
             );
             let region_ctx = DocumentRequestContext {
+                prepared: None,
                 uri: uri.clone(),
                 resolved: resolved.clone(),
                 region_end: None,
@@ -150,6 +153,21 @@ impl Kakehashi {
                 strategy: agg.strategy,
                 max_fan_out: agg.max_fan_out,
                 client_progress_token: None,
+            };
+            contexts.push((region_index, region_ctx));
+        }
+        for (region_index, region_ctx) in
+            crate::lsp::lsp_impl::bridge_context::prepare_request_contexts(
+                &self.bridge,
+                &self.settings_manager.load_settings(),
+                self.experimental_enabled(),
+                language_name,
+                contexts,
+            )
+            .await
+        {
+            let Some(region_ctx) = region_ctx else {
+                continue;
             };
 
             // Mint this region's tracked-source token into the shared aggregator

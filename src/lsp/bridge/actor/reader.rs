@@ -84,6 +84,10 @@ pub(crate) enum UpstreamNotification {
         /// cached slot so a later reader exit can evict only this connection's slots,
         /// never a restarted connection's (which gets a fresh id) (#469).
         connection_id: crate::lsp::bridge::ProgressConnectionId,
+        /// What the originating connection held for the published document
+        /// as the push was read (a region push, once any prepared text was
+        /// sent): decides how its coordinates translate.
+        held: Option<crate::lsp::diagnostic_cache::HeldStamp>,
         /// The pushed diagnostics, in the published document's own coordinates
         /// (virtual for a region push, host for a `_self` push).
         diagnostics: Vec<tower_lsp_server::ls_types::Diagnostic>,
@@ -176,6 +180,13 @@ pub(crate) enum UpstreamRequest {
     /// virtual-document URIs); the editor's success flag is relayed back.
     ShowDocument {
         params: tower_lsp_server::ls_types::ShowDocumentParams,
+        /// The connection the request arrived on: a selection in a virtual
+        /// document is in the coordinates of the text it was sent.
+        connection: ConnectionKey,
+        /// What the connection could hold when the request arrived (see
+        /// `DocumentTracker::held_through`): a text sent since is not the
+        /// one the selection is in.
+        held_through: u64,
         reply: oneshot::Sender<bool>,
         cancel: ForwardedRequestCancel,
     },
@@ -194,6 +205,10 @@ pub(crate) enum UpstreamRequest {
         /// (each connection's didOpen starts its own counter), so the
         /// translation must know which connection's version space applies.
         connection: ConnectionKey,
+        /// What the connection could hold when the request arrived (see
+        /// `DocumentTracker::held_through`): a text sent since is not the
+        /// one the edit was computed for.
+        held_through: u64,
         reply: oneshot::Sender<tower_lsp_server::ls_types::ApplyWorkspaceEditResponse>,
         cancel: ForwardedRequestCancel,
     },
@@ -335,6 +350,9 @@ pub(crate) struct ServerRequestDeps {
     /// Routes bridge-minted client-progress tokens (`kakehashi/bridge/cprog/*`)
     /// to their aggregator (ls-bridge-client-progress).
     pub(crate) client_progress_registry: Arc<crate::lsp::bridge::ClientProgressRegistry>,
+    /// What each connection holds for each virtual document: a region push
+    /// is stamped with what this connection holds as the push is read.
+    pub(crate) document_tracker: Arc<crate::lsp::bridge::pool::DocumentTracker>,
 }
 
 /// RAII guard that purges this connection's progress-token mappings when the
@@ -620,6 +638,7 @@ where
             workspace_folders: WorkspaceFolderSet::new(None),
             progress_registry,
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
             progress_connection_id,
         },
     )
@@ -717,6 +736,7 @@ async fn reader_loop(
         inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
         progress_registry,
         client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+        document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
         progress_connection_id,
     };
     reader_loop_with_liveness(reader, router, cancel_token, liveness, server_request_deps).await
@@ -850,7 +870,17 @@ async fn reader_loop_with_liveness<R: tokio::io::AsyncRead + Unpin>(
                         // Reset liveness timer on any message activity (ls-bridge-async-connection)
                         liveness.reset(&server_prefix);
 
-                        handle_message(message, &router, &server_prefix, &server_request_deps).await;
+                        // What connections hold as the message arrived: an inbound
+                        // edit or selection was computed for no newer text.
+                        let held_through = server_request_deps.document_tracker.held_through();
+                        handle_message(
+                            message,
+                            &router,
+                            &server_prefix,
+                            &server_request_deps,
+                            held_through,
+                        )
+                        .await;
 
                         // Check if pending count returned to 0 - stop timer
                         if liveness.is_active() && router.awaiting_downstream_count() == 0 {
@@ -901,11 +931,14 @@ fn classify_message(message: &serde_json::Value) -> MessageKind {
 }
 
 /// Handle a single message from the downstream server.
+/// `held_through`: the held-text watermark taken as the message arrived
+/// (see `DocumentTracker::held_through`).
 async fn handle_message(
     message: serde_json::Value,
     router: &ResponseRouter,
     server_prefix: &str,
     deps: &ServerRequestDeps,
+    held_through: u64,
 ) {
     match classify_message(&message) {
         MessageKind::Response => {
@@ -937,7 +970,7 @@ async fn handle_message(
             }
         }
         MessageKind::ServerRequest => {
-            handle_server_request(message, server_prefix, deps).await;
+            handle_server_request(message, server_prefix, deps, held_through).await;
         }
         MessageKind::Notification => {
             // `publishDiagnostics` targeting a pipeline *scratch* document is
@@ -957,7 +990,7 @@ async fn handle_message(
                 // (push-propagation-diagnostic-forwarding) instead of dropping (#380).
                 // `message` is owned and discarded after this arm, so move it in and
                 // deserialize the diagnostics by value (no string clones).
-                text_document::publish_diagnostics::forward_push(message, deps);
+                text_document::publish_diagnostics::forward_push(message, deps, held_through);
             } else if message["method"].as_str() == Some("$/progress") {
                 window::progress::forward(&message, server_prefix, deps);
             } else if message["method"].as_str() == Some("$/cancelRequest") {
@@ -1032,6 +1065,7 @@ async fn handle_server_request(
     message: serde_json::Value,
     server_prefix: &str,
     deps: &ServerRequestDeps,
+    held_through: u64,
 ) {
     let id: jsonrpc::Id = message
         .get("id")
@@ -1052,11 +1086,11 @@ async fn handle_server_request(
             return;
         }
         "window/showDocument" => {
-            window::show_document::handle(&message, id, server_prefix, deps);
+            window::show_document::handle(&message, id, server_prefix, deps, held_through);
             return;
         }
         "workspace/applyEdit" => {
-            workspace::apply_edit::handle(&message, id, server_prefix, deps);
+            workspace::apply_edit::handle(&message, id, server_prefix, deps, held_through);
             return;
         }
         "kakehashi/bridge/peer/request" if deps.experimental_enabled => {
@@ -1238,7 +1272,7 @@ mod tests {
             "result": null
         });
 
-        handle_message(response, &router, "", &deps).await;
+        handle_message(response, &router, "", &deps, u64::MAX).await;
 
         // Receiver should have the response
         // We can't block on rx.await here in a sync test, but we can check
@@ -1260,7 +1294,7 @@ mod tests {
             "params": {}
         });
 
-        handle_message(notification, &router, "", &deps).await;
+        handle_message(notification, &router, "", &deps, u64::MAX).await;
 
         // Pending count should still be 1 (notification was ignored)
         assert_eq!(router.pending_count(), 1);
@@ -1287,6 +1321,7 @@ mod tests {
             &router,
             "",
             &deps,
+            u64::MAX,
         )
         .await;
         assert!(
@@ -1301,6 +1336,7 @@ mod tests {
             &router,
             "",
             &deps,
+            u64::MAX,
         )
         .await;
         assert!(!other.is_cancelled(), "unknown id must not cancel anything");
@@ -1347,6 +1383,7 @@ mod tests {
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry,
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
             progress_connection_id,
         };
         (deps, window_rx, (rx, upstream_rx))
@@ -1369,6 +1406,7 @@ mod tests {
             &router,
             "",
             &deps,
+            u64::MAX,
         )
         .await;
         handle_message(
@@ -1380,6 +1418,7 @@ mod tests {
             &router,
             "",
             &deps,
+            u64::MAX,
         )
         .await;
 
@@ -1401,7 +1440,7 @@ mod tests {
             "params": { "type": 3, "message": "downstream says hi" }
         });
 
-        handle_message(notification, &router, "", &deps).await;
+        handle_message(notification, &router, "", &deps, u64::MAX).await;
 
         let forwarded = window_rx
             .try_recv()
@@ -1426,7 +1465,7 @@ mod tests {
             "params": { "message": 42 }
         });
 
-        handle_message(notification, &router, "", &deps).await;
+        handle_message(notification, &router, "", &deps, u64::MAX).await;
 
         assert!(
             window_rx.try_recv().is_err(),
@@ -1445,7 +1484,7 @@ mod tests {
             "params": { "type": 1, "message": "important popup" }
         });
 
-        handle_message(notification, &router, "", &deps).await;
+        handle_message(notification, &router, "", &deps, u64::MAX).await;
 
         let forwarded = window_rx
             .try_recv()
@@ -1486,6 +1525,7 @@ mod tests {
             workspace_folders: WorkspaceFolderSet::new(None),
             progress_registry,
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
             progress_connection_id,
         };
 
@@ -1500,8 +1540,8 @@ mod tests {
         // Capacity 1: the first message fills the queue, the second must be
         // dropped without blocking (this await completing IS the assertion
         // that the reader path stays non-blocking on a full queue).
-        handle_message(notification("first"), &router, "", &deps).await;
-        handle_message(notification("second"), &router, "", &deps).await;
+        handle_message(notification("first"), &router, "", &deps, u64::MAX).await;
+        handle_message(notification("second"), &router, "", &deps, u64::MAX).await;
 
         let forwarded = window_rx.try_recv().expect("first message is delivered");
         assert_eq!(
@@ -1569,6 +1609,7 @@ mod tests {
                     crate::lsp::bridge::ClientProgressRegistry::new(),
                 ),
                 progress_connection_id: conn,
+                document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
             },
         );
 
@@ -1986,7 +2027,7 @@ mod tests {
             "params": {}
         });
 
-        handle_message(server_request, &router, "", &deps).await;
+        handle_message(server_request, &router, "", &deps, u64::MAX).await;
 
         // The server request should NOT be routed as a response.
         // Pending count must remain 1 (the registered request is still waiting).
@@ -2023,6 +2064,7 @@ mod tests {
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
 
@@ -2041,7 +2083,7 @@ mod tests {
             }
         });
 
-        handle_message(message, &router, "", &deps).await;
+        handle_message(message, &router, "", &deps, u64::MAX).await;
 
         // Registry should have the registration
         assert!(dynamic_capabilities.has_registration("textDocument/diagnostic"));
@@ -2101,6 +2143,7 @@ mod tests {
                 &router,
                 "",
                 &deps,
+                u64::MAX,
             )
             .await;
 
@@ -2138,6 +2181,7 @@ mod tests {
             &router,
             "[tsudoi] ",
             &deps,
+            u64::MAX,
         )
         .await;
 
@@ -2175,6 +2219,7 @@ mod tests {
             &router,
             "[tsudoi] ",
             &deps,
+            u64::MAX,
         )
         .await;
 
@@ -2234,6 +2279,7 @@ mod tests {
             router,
             "[tsudoi] ",
             deps,
+            u64::MAX,
         )
         .await;
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -2276,6 +2322,7 @@ mod tests {
             &router,
             "[tsudoi] ",
             &deps,
+            u64::MAX,
         )
         .await;
 
@@ -2390,6 +2437,7 @@ mod tests {
             &router,
             "[tsudoi] ",
             &deps,
+            u64::MAX,
         )
         .await;
 
@@ -2444,6 +2492,7 @@ mod tests {
             &router,
             "[tsudoi] ",
             &deps,
+            u64::MAX,
         )
         .await;
 
@@ -2506,6 +2555,7 @@ mod tests {
             &router,
             "[tsudoi] ",
             &deps,
+            u64::MAX,
         )
         .await;
 
@@ -2547,6 +2597,7 @@ mod tests {
             &router,
             "[tsudoi] ",
             &deps,
+            u64::MAX,
         ));
         tokio::select! {
             biased;
@@ -2600,6 +2651,7 @@ mod tests {
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
 
@@ -2618,7 +2670,7 @@ mod tests {
             }
         });
 
-        handle_message(message, &router, "", &deps).await;
+        handle_message(message, &router, "", &deps, u64::MAX).await;
 
         // Registry should no longer have the registration
         assert!(!dynamic_capabilities.has_registration("textDocument/diagnostic"));
@@ -2665,6 +2717,7 @@ mod tests {
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::clone(&progress_registry),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
             progress_connection_id,
         };
 
@@ -2675,7 +2728,7 @@ mod tests {
             "params": { "token": "some-token" }
         });
 
-        handle_message(message, &router, "", &deps).await;
+        handle_message(message, &router, "", &deps, u64::MAX).await;
 
         // Downstream gets an immediate success ack.
         let response = response_rx.try_recv().expect("should have response");
@@ -2710,7 +2763,7 @@ mod tests {
                 "value": { "kind": "begin", "title": "Indexing" }
             }
         });
-        handle_message(begin, &router, "", &deps).await;
+        handle_message(begin, &router, "", &deps, u64::MAX).await;
         let UpstreamNotification::CreateWorkDoneProgress { token } = upstream_rx
             .try_recv()
             .expect("renderable begin should announce the token")
@@ -2757,6 +2810,7 @@ mod tests {
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::clone(&progress_registry),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
             progress_connection_id,
         };
 
@@ -2766,19 +2820,19 @@ mod tests {
             "method": "window/workDoneProgress/create",
             "params": { "token": "storm" }
         });
-        handle_message(create, &router, "", &deps).await;
+        handle_message(create, &router, "", &deps, u64::MAX).await;
         let begin = json!({
             "jsonrpc": "2.0",
             "method": "$/progress",
             "params": { "token": "storm", "value": { "kind": "begin", "title": "" } }
         });
-        handle_message(begin, &router, "", &deps).await;
+        handle_message(begin, &router, "", &deps, u64::MAX).await;
         let end = json!({
             "jsonrpc": "2.0",
             "method": "$/progress",
             "params": { "token": "storm", "value": { "kind": "end" } }
         });
-        handle_message(end, &router, "", &deps).await;
+        handle_message(end, &router, "", &deps, u64::MAX).await;
 
         assert!(
             upstream_rx.try_recv().is_err(),
@@ -2820,6 +2874,7 @@ mod tests {
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::clone(&progress_registry),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
             progress_connection_id,
         };
 
@@ -2829,7 +2884,7 @@ mod tests {
             "method": "window/workDoneProgress/create",
             "params": { "token": "msg-only" }
         });
-        handle_message(create, &router, "", &deps).await;
+        handle_message(create, &router, "", &deps, u64::MAX).await;
         let begin = json!({
             "jsonrpc": "2.0",
             "method": "$/progress",
@@ -2838,7 +2893,7 @@ mod tests {
                 "value": { "kind": "begin", "title": "", "message": "Indexing 42%" }
             }
         });
-        handle_message(begin, &router, "", &deps).await;
+        handle_message(begin, &router, "", &deps, u64::MAX).await;
 
         let UpstreamNotification::CreateWorkDoneProgress { .. } = upstream_rx
             .try_recv()
@@ -2881,6 +2936,7 @@ mod tests {
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::clone(&progress_registry),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
             progress_connection_id,
         };
 
@@ -2890,7 +2946,7 @@ mod tests {
             "method": "window/workDoneProgress/create",
             "params": { "token": "cancellable-only" }
         });
-        handle_message(create, &router, "", &deps).await;
+        handle_message(create, &router, "", &deps, u64::MAX).await;
         let begin = json!({
             "jsonrpc": "2.0",
             "method": "$/progress",
@@ -2899,7 +2955,7 @@ mod tests {
                 "value": { "kind": "begin", "title": "", "cancellable": true }
             }
         });
-        handle_message(begin, &router, "", &deps).await;
+        handle_message(begin, &router, "", &deps, u64::MAX).await;
 
         assert!(
             matches!(
@@ -2943,6 +2999,7 @@ mod tests {
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::clone(&progress_registry),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
             progress_connection_id,
         };
 
@@ -2952,13 +3009,13 @@ mod tests {
             "method": "window/workDoneProgress/create",
             "params": { "token": "reused" }
         });
-        handle_message(create, &router, "", &deps).await;
+        handle_message(create, &router, "", &deps, u64::MAX).await;
         let blank = json!({
             "jsonrpc": "2.0",
             "method": "$/progress",
             "params": { "token": "reused", "value": { "kind": "begin", "title": "" } }
         });
-        handle_message(blank, &router, "", &deps).await;
+        handle_message(blank, &router, "", &deps, u64::MAX).await;
         assert!(
             upstream_rx.try_recv().is_err(),
             "blank begin is swallowed first"
@@ -2969,7 +3026,7 @@ mod tests {
             "method": "$/progress",
             "params": { "token": "reused", "value": { "kind": "begin", "title": "Indexing" } }
         });
-        handle_message(renderable, &router, "", &deps).await;
+        handle_message(renderable, &router, "", &deps, u64::MAX).await;
         assert!(
             matches!(
                 upstream_rx.try_recv(),
@@ -3014,6 +3071,7 @@ mod tests {
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry,
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
             progress_connection_id,
         };
 
@@ -3026,11 +3084,11 @@ mod tests {
             })
         };
 
-        handle_message(make(), &router, "", &deps).await;
+        handle_message(make(), &router, "", &deps, u64::MAX).await;
 
         // Re-create before any begin: the first token was never announced, so
         // nothing is forgotten (and nothing was created).
-        handle_message(make(), &router, "", &deps).await;
+        handle_message(make(), &router, "", &deps, u64::MAX).await;
         assert!(
             upstream_rx.try_recv().is_err(),
             "unannounced stale token needs no Forget"
@@ -3042,7 +3100,7 @@ mod tests {
             "method": "$/progress",
             "params": { "token": "dup", "value": { "kind": "begin", "title": "Indexing" } }
         });
-        handle_message(begin, &router, "", &deps).await;
+        handle_message(begin, &router, "", &deps, u64::MAX).await;
         let UpstreamNotification::CreateWorkDoneProgress { token: announced } =
             upstream_rx.try_recv().expect("announce create")
         else {
@@ -3054,7 +3112,7 @@ mod tests {
         };
 
         // ...then a third create for the SAME downstream token forgets it.
-        handle_message(make(), &router, "", &deps).await;
+        handle_message(make(), &router, "", &deps, u64::MAX).await;
         let UpstreamNotification::ForgetWorkDoneProgress(forgotten) =
             upstream_rx.try_recv().expect("forget stale")
         else {
@@ -3068,7 +3126,7 @@ mod tests {
             "method": "$/progress",
             "params": { "token": "dup", "value": { "kind": "begin", "title": "Indexing" } }
         });
-        handle_message(begin2, &router, "", &deps).await;
+        handle_message(begin2, &router, "", &deps, u64::MAX).await;
         let UpstreamNotification::CreateWorkDoneProgress { token: reannounced } =
             upstream_rx.try_recv().expect("re-announce create")
         else {
@@ -3103,6 +3161,7 @@ mod tests {
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry,
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
             progress_connection_id,
         };
 
@@ -3113,7 +3172,7 @@ mod tests {
             "params": {}
         });
 
-        handle_message(message, &router, "", &deps).await;
+        handle_message(message, &router, "", &deps, u64::MAX).await;
 
         // An error response is returned and nothing is bridged upstream.
         let response = response_rx.try_recv().expect("should have response");
@@ -3163,6 +3222,7 @@ mod tests {
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::clone(&progress_registry),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
             progress_connection_id,
         };
 
@@ -3176,7 +3236,7 @@ mod tests {
                 "value": { "kind": "begin", "title": "Indexing" }
             }
         });
-        handle_message(begin, &router, "", &deps).await;
+        handle_message(begin, &router, "", &deps, u64::MAX).await;
         let UpstreamNotification::CreateWorkDoneProgress { token } =
             upstream_rx.try_recv().expect("begin should announce")
         else {
@@ -3197,7 +3257,7 @@ mod tests {
             "method": "$/progress",
             "params": { "token": 1, "value": { "kind": "report", "message": "50%" } }
         });
-        handle_message(report, &router, "", &deps).await;
+        handle_message(report, &router, "", &deps, u64::MAX).await;
         let UpstreamNotification::Progress { params } =
             upstream_rx.try_recv().expect("report should forward")
         else {
@@ -3216,7 +3276,7 @@ mod tests {
             "method": "$/progress",
             "params": { "token": 1, "value": { "kind": "end" } }
         });
-        handle_message(end, &router, "", &deps).await;
+        handle_message(end, &router, "", &deps, u64::MAX).await;
         assert!(upstream_rx.try_recv().is_ok(), "end should forward");
         assert_eq!(
             progress_registry.translate(progress_connection_id, &downstream_token),
@@ -3251,6 +3311,7 @@ mod tests {
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry,
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
             progress_connection_id,
         };
 
@@ -3259,7 +3320,7 @@ mod tests {
             "method": "$/progress",
             "params": { "token": "never-registered", "value": { "kind": "begin", "title": "x" } }
         });
-        handle_message(progress, &router, "", &deps).await;
+        handle_message(progress, &router, "", &deps, u64::MAX).await;
 
         assert!(
             upstream_rx.try_recv().is_err(),
@@ -3294,6 +3355,7 @@ mod tests {
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
 
@@ -3304,7 +3366,7 @@ mod tests {
             "params": null
         });
 
-        handle_message(message, &router, "", &deps).await;
+        handle_message(message, &router, "", &deps, u64::MAX).await;
 
         // The response is queued before prefetch can be triggered upstream.
         let response = response_rx.try_recv().expect("should have response");
@@ -3353,6 +3415,7 @@ mod tests {
             workspace_folders: WorkspaceFolderSet::new(Some(folders)),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
 
@@ -3363,7 +3426,7 @@ mod tests {
             "params": null
         });
 
-        handle_message(message, &router, "", &deps).await;
+        handle_message(message, &router, "", &deps, u64::MAX).await;
 
         let response = response_rx.try_recv().expect("should have response");
         match response {
@@ -3401,6 +3464,7 @@ mod tests {
             workspace_folders: WorkspaceFolderSet::new(None),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
 
@@ -3411,7 +3475,7 @@ mod tests {
             "params": null
         });
 
-        handle_message(message, &router, "", &deps).await;
+        handle_message(message, &router, "", &deps, u64::MAX).await;
 
         let response = response_rx.try_recv().expect("should have response");
         match response {
@@ -3449,6 +3513,7 @@ mod tests {
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
 
@@ -3467,7 +3532,7 @@ mod tests {
             }
         });
 
-        handle_message(message, &router, "", &deps).await;
+        handle_message(message, &router, "", &deps, u64::MAX).await;
 
         assert!(
             upstream_rx.try_recv().is_err(),
@@ -3482,6 +3547,92 @@ mod tests {
     /// A non-scratch push for an injection region's virtual document is routed
     /// upstream as `PublishDiagnostics` (push-propagation-diagnostic-forwarding),
     /// carrying the originating server name and the pushed diagnostics.
+    #[tokio::test]
+    async fn a_region_push_is_stamped_with_what_its_connection_held_when_read() {
+        use crate::lsp::bridge::protocol::{
+            VirtualDocumentUri, VirtualLayout, apply_prepare_result,
+        };
+        let router = Arc::new(ResponseRouter::new());
+        let (response_tx, _response_rx) = mpsc::channel(16);
+        let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(16);
+        let tracker = Arc::new(crate::lsp::bridge::pool::DocumentTracker::new());
+        let connection = ConnectionKey::for_server("test");
+        let deps = ServerRequestDeps {
+            experimental_enabled: true,
+            settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+            server_name: Some("luals".to_string()),
+            connection_key: connection.clone(),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
+            response_tx,
+            dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
+            upstream_tx,
+            workspace_folders: WorkspaceFolderSet::new(None),
+            window_tx,
+            upstream_request_tx: mpsc::unbounded_channel().0,
+            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
+            progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            document_tracker: Arc::clone(&tracker),
+            progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+        };
+        let host =
+            crate::lsp::lsp_impl::url_to_uri(&url::Url::parse("file:///project/doc.md").unwrap())
+                .unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&host, "lua", "REGION");
+        let uri = virtual_uri.to_uri_string();
+        let send = |text: &str| {
+            let prepared = apply_prepare_result(text, &VirtualLayout::single(text), None).unwrap();
+            tracker.record_sent_for_test(
+                &virtual_uri,
+                &connection,
+                crate::lsp::bridge::pool::SentText {
+                    text: &prepared.text,
+                    map: prepared.map.as_ref(),
+                },
+            );
+        };
+        send("a");
+        let when_read = tracker
+            .held_stamp(&uri, &connection, None, u64::MAX)
+            .unwrap();
+        let message = json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": {"uri": uri, "diagnostics": []}
+        });
+        handle_message(message, &router, "", &deps, u64::MAX).await;
+        // The next text goes out while the push waits upstream.
+        send("b");
+        let now = tracker
+            .held_stamp(&uri, &connection, None, u64::MAX)
+            .unwrap();
+        assert_ne!(when_read.generation, now.generation);
+        match upstream_rx.try_recv().expect("the push is routed upstream") {
+            UpstreamNotification::PublishDiagnostics { held, .. } => {
+                assert_eq!(held, Some(when_read));
+            }
+            _ => panic!("expected PublishDiagnostics"),
+        }
+        // Arrived before the next text was recorded, but read after: it
+        // was not computed for that text, and places nowhere.
+        let arrived = tracker.held_through();
+        send("c");
+        let message = json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": {"uri": uri, "diagnostics": []}
+        });
+        handle_message(message, &router, "", &deps, arrived).await;
+        match upstream_rx.try_recv().expect("the push is routed upstream") {
+            UpstreamNotification::PublishDiagnostics { held, .. } => {
+                let held = held.unwrap();
+                assert!(held.prepared && held.generation.is_none(), "{held:?}");
+            }
+            _ => panic!("expected PublishDiagnostics"),
+        }
+    }
+
     #[tokio::test]
     async fn handle_message_routes_non_scratch_publish_diagnostics_for_virtual_uri() {
         let router = ResponseRouter::new();
@@ -3503,6 +3654,7 @@ mod tests {
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
 
@@ -3518,7 +3670,7 @@ mod tests {
             }
         });
 
-        handle_message(message, &router, "", &deps).await;
+        handle_message(message, &router, "", &deps, u64::MAX).await;
 
         match upstream_rx
             .try_recv()
@@ -3528,9 +3680,12 @@ mod tests {
                 uri,
                 server,
                 connection_id,
+                held,
                 diagnostics,
             } => {
                 assert_eq!(connection_id, deps.progress_connection_id);
+                // Nothing prepared was ever sent: no stamp to place by.
+                assert_eq!(held, None);
                 assert!(uri.contains("kakehashi-virtual-uri-REGION"));
                 assert_eq!(server, "luals");
                 assert_eq!(diagnostics.len(), 1);
@@ -3565,6 +3720,7 @@ mod tests {
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
 
@@ -3580,7 +3736,7 @@ mod tests {
             }
         });
 
-        handle_message(message, &router, "", &deps).await;
+        handle_message(message, &router, "", &deps, u64::MAX).await;
 
         match upstream_rx
             .try_recv()
@@ -3623,6 +3779,7 @@ mod tests {
                     crate::lsp::bridge::ClientProgressRegistry::new(),
                 ),
                 progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+                document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
             };
             (deps, upstream_rx)
         };
@@ -3635,7 +3792,7 @@ mod tests {
             "method": "textDocument/publishDiagnostics",
             "params": {"uri": uri, "diagnostics": [{"range": "not-a-range"}]}
         });
-        handle_message(malformed, &ResponseRouter::new(), "", &deps).await;
+        handle_message(malformed, &ResponseRouter::new(), "", &deps, u64::MAX).await;
         assert!(
             upstream_rx.try_recv().is_err(),
             "malformed diagnostics must be dropped, not routed"
@@ -3648,7 +3805,7 @@ mod tests {
             "method": "textDocument/publishDiagnostics",
             "params": {"uri": uri, "diagnostics": []}
         });
-        handle_message(empty, &ResponseRouter::new(), "", &deps).await;
+        handle_message(empty, &ResponseRouter::new(), "", &deps, u64::MAX).await;
         match upstream_rx
             .try_recv()
             .expect("empty array should be routed")
@@ -3666,7 +3823,7 @@ mod tests {
             "method": "textDocument/publishDiagnostics",
             "params": "not-an-object"
         });
-        handle_message(bad_params, &ResponseRouter::new(), "", &deps).await;
+        handle_message(bad_params, &ResponseRouter::new(), "", &deps, u64::MAX).await;
         assert!(
             upstream_rx.try_recv().is_err(),
             "a non-object params must be dropped without panicking"
@@ -3679,7 +3836,7 @@ mod tests {
             "method": "textDocument/publishDiagnostics",
             "params": {"diagnostics": []}
         });
-        handle_message(no_uri, &ResponseRouter::new(), "", &deps).await;
+        handle_message(no_uri, &ResponseRouter::new(), "", &deps, u64::MAX).await;
         assert!(upstream_rx.try_recv().is_err(), "missing uri is dropped");
     }
 
@@ -3705,6 +3862,7 @@ mod tests {
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
 
@@ -3715,7 +3873,7 @@ mod tests {
             "params": {}
         });
 
-        handle_message(message, &router, "", &deps).await;
+        handle_message(message, &router, "", &deps, u64::MAX).await;
 
         let response = response_rx.try_recv().expect("should have response");
         match response {
@@ -3749,6 +3907,7 @@ mod tests {
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
 
@@ -3759,7 +3918,7 @@ mod tests {
             "method": "client/registerCapability"
         });
 
-        handle_message(message, &router, "", &deps).await;
+        handle_message(message, &router, "", &deps, u64::MAX).await;
 
         // Should respond with InvalidParams error (-32602)
         let response = response_rx.try_recv().expect("should have response");
@@ -3808,6 +3967,7 @@ mod tests {
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
 
@@ -3818,7 +3978,7 @@ mod tests {
             "method": "client/unregisterCapability"
         });
 
-        handle_message(message, &router, "", &deps).await;
+        handle_message(message, &router, "", &deps, u64::MAX).await;
 
         // Should respond with InvalidParams error (-32602)
         let response = response_rx.try_recv().expect("should have response");
@@ -3878,6 +4038,7 @@ mod tests {
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
         let handle = tokio::spawn(async move {
@@ -3887,7 +4048,7 @@ mod tests {
                 "method": "window/workDoneProgress/create",
                 "params": { "token": "test" }
             });
-            handle_server_request(message, "", &deps).await;
+            handle_server_request(message, "", &deps, u64::MAX).await;
         });
 
         // Give handle_server_request a moment to start waiting
@@ -3943,6 +4104,7 @@ mod tests {
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
 
@@ -3954,7 +4116,7 @@ mod tests {
         });
 
         // Should not panic
-        handle_server_request(message, "", &deps).await;
+        handle_server_request(message, "", &deps, u64::MAX).await;
     }
 
     // ============================================================
@@ -4425,7 +4587,7 @@ mod tests {
             "method": "telemetry/event",
             "params": { "kind": "metric", "value": 42 }
         });
-        handle_message(notification, &router, "", &deps).await;
+        handle_message(notification, &router, "", &deps, u64::MAX).await;
 
         match window_rx
             .try_recv()
@@ -4466,6 +4628,7 @@ mod tests {
             workspace_folders: WorkspaceFolderSet::new(None),
             progress_registry,
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
             progress_connection_id,
         };
         (deps, response_rx, upstream_request_rx)
@@ -4496,7 +4659,7 @@ mod tests {
                 "actions": [{ "title": "Retry" }, { "title": "Cancel" }]
             }
         });
-        handle_message(request, &router, "", &deps).await;
+        handle_message(request, &router, "", &deps, u64::MAX).await;
 
         // The bridge forwards an UpstreamRequest carrying the reply channel.
         let UpstreamRequest::ShowMessageRequest {
@@ -4538,7 +4701,7 @@ mod tests {
             "method": "window/showMessageRequest",
             "params": { "type": 1, "message": "oops" }
         });
-        handle_message(request, &router, "", &deps).await;
+        handle_message(request, &router, "", &deps, u64::MAX).await;
 
         // Dropping the request (and its reply sender) simulates the editor failing
         // to answer; the downstream must still get a `null` (no selection).
@@ -4562,7 +4725,7 @@ mod tests {
             "method": "window/showMessageRequest",
             "params": { "message": "no type" }
         });
-        handle_message(request, &router, "", &deps).await;
+        handle_message(request, &router, "", &deps, u64::MAX).await;
 
         let response = recv_untracked(&mut response_rx).await;
         assert_eq!(response["id"], 9);
@@ -4587,7 +4750,7 @@ mod tests {
             "method": "window/showDocument",
             "params": { "uri": virtual_uri }
         });
-        handle_message(request, &router, "", &deps).await;
+        handle_message(request, &router, "", &deps, u64::MAX).await;
 
         let UpstreamRequest::ShowDocument { params, reply, .. } = request_rx
             .recv()
@@ -4616,7 +4779,7 @@ mod tests {
             "method": "window/showDocument",
             "params": { "uri": "file:///nope.rs" }
         });
-        handle_message(request, &router, "", &deps).await;
+        handle_message(request, &router, "", &deps, u64::MAX).await;
 
         let UpstreamRequest::ShowDocument { reply, .. } =
             request_rx.recv().await.expect("forwarded")
@@ -4643,7 +4806,7 @@ mod tests {
             "method": "window/showDocument",
             "params": { "external": true }
         });
-        handle_message(request, &router, "", &deps).await;
+        handle_message(request, &router, "", &deps, u64::MAX).await;
 
         let response = recv_untracked(&mut response_rx).await;
         assert_eq!(response["id"], 13);
@@ -4668,7 +4831,7 @@ mod tests {
             "method": "window/showDocument",
             "params": { "uri": "file:///x.rs" }
         });
-        handle_message(request, &router, "", &deps).await;
+        handle_message(request, &router, "", &deps, u64::MAX).await;
 
         let response = recv_untracked(&mut response_rx).await;
         assert_eq!(response["id"], 12);
@@ -4689,7 +4852,7 @@ mod tests {
                 "edit": { "changes": { "file:///p/main.rs": [] } }
             }
         });
-        handle_message(request, &router, "", &deps).await;
+        handle_message(request, &router, "", &deps, u64::MAX).await;
 
         let UpstreamRequest::ApplyEdit { params, reply, .. } = request_rx
             .recv()
@@ -4731,7 +4894,7 @@ mod tests {
             "method": "workspace/applyEdit",
             "params": { "edit": {} }
         });
-        handle_message(request, &router, "", &deps).await;
+        handle_message(request, &router, "", &deps, u64::MAX).await;
 
         // Dropping the request (and its reply sender) simulates the editor
         // failing to answer; the downstream must still get `applied: false`.
@@ -4759,7 +4922,7 @@ mod tests {
             "method": "workspace/applyEdit",
             "params": { "label": "no edit" }
         });
-        handle_message(request, &router, "", &deps).await;
+        handle_message(request, &router, "", &deps, u64::MAX).await;
 
         let response = recv_untracked(&mut response_rx).await;
         assert_eq!(response["id"], 22);
@@ -4787,6 +4950,7 @@ mod tests {
             jsonrpc::Id::Number(9),
             "[test] ",
             &deps,
+            u64::MAX,
         );
 
         let sent = tokio::time::timeout(std::time::Duration::from_secs(5), response_rx.recv())
@@ -4821,6 +4985,7 @@ mod tests {
             jsonrpc::Id::Number(10),
             "[test] ",
             &deps,
+            u64::MAX,
         );
 
         let forwarded = tokio::time::timeout(std::time::Duration::from_secs(5), request_rx.recv())
@@ -4868,6 +5033,7 @@ mod tests {
             jsonrpc::Id::Number(11),
             "[test] ",
             &deps,
+            u64::MAX,
         );
 
         let sent = tokio::time::timeout(std::time::Duration::from_secs(5), response_rx.recv())
@@ -4920,6 +5086,7 @@ mod tests {
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry,
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
             progress_connection_id,
         };
         (deps, (rx, upstream_rx, window_rx))

@@ -141,7 +141,7 @@ impl Kakehashi {
         // server the region now routes to. An envelope with no language
         // (cleared by the client) names no region.
         .is_some_and(|(live_offset, _, _, live_language)| {
-            live_offset == RegionOffset::from(offset) && live_language == injection_language
+            offset.describes(&live_offset) && live_language == injection_language
         })
     }
 }
@@ -154,6 +154,10 @@ impl Kakehashi {
 /// whether the virtual content maps to one contiguous host span; the fourth
 /// is the region's live injection language, so a resolve gate can refuse an
 /// envelope whose echoed language no longer names this region.
+///
+/// A region the lifecycle pass prepares (or holds back for its peer) reads as
+/// not rebuildable: an offset kept from one of its earlier texts — a resolve
+/// envelope's — no longer describes what its servers hold.
 pub(super) fn resolve_region_offset(
     documents: &DocumentStore,
     language: &Arc<LanguageCoordinator>,
@@ -161,7 +165,44 @@ pub(super) fn resolve_region_offset(
     host_url: &Url,
     region_id: &str,
 ) -> Option<(RegionOffset, Position, bool, String)> {
-    resolve_region(documents, language, bridge, host_url, region_id).map(resolved_region_geometry)
+    let resolved = resolve_region(documents, language, bridge, host_url, region_id)?;
+    if bridge.region_is_prepared(host_url, &resolved.injection_language, region_id) {
+        return None;
+    }
+    Some(resolved_region_geometry(resolved))
+}
+
+/// [`resolve_region_offset`] for coordinates `connection` sent unprompted
+/// (an inbound edit, a showDocument selection): the offset translates
+/// through the map of the text that connection holds, and `None` when that
+/// text describes no current host position, or was sent after the request
+/// arrived (newer than `held_through`; see
+/// [`BridgeCoordinator::held_presentation`]).
+pub(super) fn resolve_region_offset_for_connection(
+    documents: &DocumentStore,
+    language: &Arc<LanguageCoordinator>,
+    bridge: &BridgeCoordinator,
+    host_url: &Url,
+    region_id: &str,
+    connection: &crate::lsp::bridge::ConnectionKey,
+    held_through: u64,
+) -> Option<(RegionOffset, Position, bool, String)> {
+    let resolved = resolve_region(documents, language, bridge, host_url, region_id)?;
+    let presentation = bridge.held_presentation(
+        host_url,
+        &resolved.injection_language,
+        region_id,
+        &resolved.virtual_content,
+        connection,
+        held_through,
+    );
+    let (offset, region_end, contiguous, injection_language) = resolved_region_geometry(resolved);
+    Some((
+        presentation.offset(offset)?,
+        region_end,
+        contiguous,
+        injection_language,
+    ))
 }
 
 /// Resolve geometry and content from the same current snapshot.
@@ -242,6 +283,7 @@ mod tests {
             virtual_content: "x".to_string(),
             line_column_offsets: vec![3],
             contiguous: true,
+            gaps: Default::default(),
         };
 
         let (_, region_end, _, _) = resolved_region_geometry(resolved);

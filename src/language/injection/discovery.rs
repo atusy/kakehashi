@@ -951,6 +951,22 @@ pub(crate) struct ResolvedInjection {
     /// gaps and excluded prefix/child bytes. A combined pattern that currently
     /// matches one capture uses the ordinary mapping and remains `true`.
     pub contiguous: bool,
+    /// Host text the virtual document does not carry verbatim, in order:
+    /// masked spans and host-only lines' line breaks (a non-empty
+    /// `virtual_range`), and stripped text such as line prefixes (an empty
+    /// one). Empty for an isolated region, which is all content.
+    pub gaps: std::sync::Arc<[VirtualGap]>,
+}
+
+/// Host text standing between (or inside) the injected content of a
+/// combined virtual document.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct VirtualGap {
+    /// Byte range in the virtual document: the coordinate-preserving
+    /// whitespace standing for the host text, or empty when it was stripped.
+    pub virtual_range: Range<usize>,
+    /// The host text itself.
+    pub host_text: String,
 }
 
 /// Central service for resolving injection regions at LSP positions
@@ -1140,6 +1156,7 @@ impl InjectionResolver {
             virtual_content,
             line_column_offsets,
             contiguous: true,
+            gaps: Default::default(),
         })
     }
 
@@ -1193,6 +1210,7 @@ impl InjectionResolver {
                 virtual_content,
                 line_column_offsets,
                 contiguous: true,
+                gaps: Default::default(),
             });
         }
         let included_sets: Vec<_> = regions
@@ -1234,6 +1252,7 @@ impl InjectionResolver {
                 virtual_content,
                 line_column_offsets,
                 contiguous: true,
+                gaps: Default::default(),
             });
         }
         let anchor_index = active_indices.iter().copied().min_by_key(|&index| {
@@ -1271,7 +1290,7 @@ impl InjectionResolver {
             covered_until = covered_until.max(range.end);
             true
         }) && covered_until >= group_end;
-        let (virtual_content, line_column_offsets) =
+        let (virtual_content, line_column_offsets, gaps) =
             build_combined_virtual_content(text, group_start..group_end, &included);
 
         let mut combined_region = first_cacheable.clone();
@@ -1290,6 +1309,7 @@ impl InjectionResolver {
             virtual_content,
             line_column_offsets,
             contiguous,
+            gaps: gaps.into(),
         })
     }
 
@@ -1511,6 +1531,7 @@ impl InjectionResolver {
                     virtual_content,
                     line_column_offsets,
                     contiguous: true,
+                    gaps: Default::default(),
                 });
             } else {
                 let (tracker, uri, incarnation, lone_crs) =
@@ -1532,10 +1553,16 @@ impl InjectionResolver {
     }
 }
 
-fn mask_outside_ranges(text: &str, span: Range<usize>, included: &[Range<usize>]) -> String {
+fn mask_outside_ranges(
+    text: &str,
+    span: Range<usize>,
+    included: &[Range<usize>],
+    output: &mut String,
+    gaps: &mut Vec<VirtualGap>,
+) {
     // The output is the span verbatim with excluded bytes turned to spaces
-    // (multi-byte chars can shrink it, never grow it) — preallocate the span.
-    let mut output = String::with_capacity(span.len());
+    // (multi-byte chars can shrink it, never grow it).
+    output.reserve(span.len());
     let mut cursor = span.start;
     for range in included {
         if range.end <= cursor {
@@ -1546,12 +1573,36 @@ fn mask_outside_ranges(text: &str, span: Range<usize>, included: &[Range<usize>]
         }
         let start = range.start.clamp(cursor, span.end);
         let end = range.end.clamp(start, span.end);
-        push_coordinate_whitespace(&mut output, clamped_slice(text, cursor..start));
+        push_masked_gap(output, gaps, clamped_slice(text, cursor..start));
         output.push_str(clamped_slice(text, start..end));
         cursor = end;
     }
-    push_coordinate_whitespace(&mut output, clamped_slice(text, cursor..span.end));
-    output
+    push_masked_gap(output, gaps, clamped_slice(text, cursor..span.end));
+}
+
+/// Mask host-only text with coordinate-preserving whitespace, recording it
+/// as a gap.
+fn push_masked_gap(output: &mut String, gaps: &mut Vec<VirtualGap>, host_text: &str) {
+    if host_text.is_empty() {
+        return;
+    }
+    let start = output.len();
+    push_coordinate_whitespace(output, host_text);
+    gaps.push(VirtualGap {
+        virtual_range: start..output.len(),
+        host_text: host_text.to_string(),
+    });
+}
+
+/// Record host text the virtual document strips (empty in it) as a gap.
+fn push_stripped_gap(output: &str, gaps: &mut Vec<VirtualGap>, host_text: &str) {
+    if host_text.is_empty() {
+        return;
+    }
+    gaps.push(VirtualGap {
+        virtual_range: output.len()..output.len(),
+        host_text: host_text.to_string(),
+    });
 }
 
 /// Build a line-preserving combined document while stripping excluded prefixes.
@@ -1562,20 +1613,25 @@ fn mask_outside_ranges(text: &str, span: Range<usize>, included: &[Range<usize>]
 /// offset, matching the isolated-region `extract_clean_content` contract. Any
 /// later gaps on the same line remain coordinate-preserving whitespace because
 /// the bridge offset model supports one translation offset per line.
+///
+/// Every host byte the virtual document does not carry verbatim is also
+/// returned as a [`VirtualGap`], in order, so the bridge can present the
+/// document as content and gap segments (`kakehashi/virtualDocument/prepare`).
 fn build_combined_virtual_content(
     text: &str,
     span: Range<usize>,
     included: &[Range<usize>],
-) -> (String, Vec<u32>) {
+) -> (String, Vec<u32>, Vec<VirtualGap>) {
     // Tree-sitter byte ranges are only valid for the exact parsed text. A
     // stale tree must not turn a combined-document rebuild into an invalid
     // UTF-8 slice or an oversized allocation.
     let span = text.ceil_char_boundary(span.start)..text.floor_char_boundary(span.end);
     if span.start >= span.end {
-        return (String::new(), Vec::new());
+        return (String::new(), Vec::new(), Vec::new());
     }
     let mut output = String::with_capacity(span.len());
     let mut offsets = Vec::new();
+    let mut gaps = Vec::new();
     let mut line_start = span.start;
     let mut range_index = 0;
     // Lines are LSP lines, as the virtual document is read: LF, CRLF, and a
@@ -1627,21 +1683,49 @@ fn build_combined_virtual_content(
                     .encode_utf16()
                     .count() as u32,
             );
-            output.push_str(&mask_outside_ranges(
+            push_stripped_gap(
+                &output,
+                &mut gaps,
+                clamped_slice(text, line_start..first_included),
+            );
+            mask_outside_ranges(
                 text,
                 first_included..line_end,
                 &included[range_index..],
-            ));
+                &mut output,
+                &mut gaps,
+            );
         } else {
             offsets.push(0);
-            output.push_str(clamped_slice(text, content_end..line_end));
+            push_stripped_gap(
+                &output,
+                &mut gaps,
+                clamped_slice(text, line_start..content_end),
+            );
+            let line_break = clamped_slice(text, content_end..line_end);
+            let start = output.len();
+            output.push_str(line_break);
+            if !line_break.is_empty() {
+                gaps.push(VirtualGap {
+                    virtual_range: start..output.len(),
+                    host_text: line_break.to_string(),
+                });
+            }
         }
 
         if cr_cut_from_lf && output.ends_with('\r') {
             // A CR the virtual document keeps would end a line there; keep
-            // its one column as whitespace instead.
+            // its one column as whitespace instead, standing for host text.
             output.pop();
             output.push(' ');
+            match gaps.last_mut() {
+                // Masked already, as the end of a gap: it stays that gap's.
+                Some(gap) if gap.virtual_range.end == output.len() => {}
+                _ => gaps.push(VirtualGap {
+                    virtual_range: output.len() - 1..output.len(),
+                    host_text: "\r".to_string(),
+                }),
+            }
         }
 
         line_start = line_end;
@@ -1651,7 +1735,7 @@ fn build_combined_virtual_content(
     if output.ends_with(['\n', '\r']) {
         offsets.push(0);
     }
-    (output, offsets)
+    (output, offsets, gaps)
 }
 
 fn push_coordinate_whitespace(output: &mut String, text: &str) {
@@ -2868,7 +2952,7 @@ mod tests {
     #[test]
     fn combined_content_snaps_stale_included_start_to_char_boundary() {
         let text = "éx\n";
-        let (content, offsets) = build_combined_virtual_content(
+        let (content, offsets, _) = build_combined_virtual_content(
             text,
             0..text.len(),
             std::slice::from_ref(&(1..usize::MAX)),
@@ -2882,7 +2966,7 @@ mod tests {
     fn combined_content_snaps_stale_span_start_before_slicing() {
         let text = "éx\n";
 
-        let (content, offsets) = build_combined_virtual_content(
+        let (content, offsets, _) = build_combined_virtual_content(
             text,
             1..text.len(),
             std::slice::from_ref(&(1..text.len())),
@@ -2895,7 +2979,7 @@ mod tests {
     #[test]
     fn combined_blank_included_line_records_its_prefix_offset() {
         let text = "> \n";
-        let (content, offsets) = build_combined_virtual_content(
+        let (content, offsets, _) = build_combined_virtual_content(
             text,
             0..text.len(),
             std::slice::from_ref(&(2..text.len())),
@@ -2911,7 +2995,7 @@ mod tests {
         // keeps its own "> " offset and the prefix after it is stripped.
         let text = "> a\r> b\n";
 
-        let (content, offsets) =
+        let (content, offsets, _) =
             build_combined_virtual_content(text, 0..text.len(), &[2..4, 6..text.len()]);
 
         assert_eq!(content, "a\rb\n");
@@ -2924,7 +3008,7 @@ mod tests {
     fn combined_content_records_the_empty_line_after_a_final_line_end(#[case] text: &str) {
         // A trailing line end opens one more (empty) virtual line, whichever
         // terminator it is.
-        let (_, offsets) = build_combined_virtual_content(text, 2..text.len(), &[2..4, 6..8]);
+        let (_, offsets, _) = build_combined_virtual_content(text, 2..text.len(), &[2..4, 6..8]);
 
         assert_eq!(offsets, vec![2, 2, 0]);
     }
@@ -2936,7 +3020,7 @@ mod tests {
         // the CR's one column as whitespace.
         let text = "> a\r\n";
 
-        let (content, offsets) =
+        let (content, offsets, _) =
             build_combined_virtual_content(text, 0..4, std::slice::from_ref(&(2..4)));
 
         assert_eq!(content, "a ");
@@ -2947,7 +3031,7 @@ mod tests {
     fn combined_content_measures_the_first_line_from_a_lone_cr() {
         let text = "ab\r  x\n";
 
-        let (content, offsets) = build_combined_virtual_content(
+        let (content, offsets, _) = build_combined_virtual_content(
             text,
             3..text.len(),
             std::slice::from_ref(&(5..text.len())),
@@ -2961,10 +3045,76 @@ mod tests {
     fn combined_content_skips_empty_ranges_before_later_content() {
         let text = "abcdef";
 
-        let (content, offsets) = build_combined_virtual_content(text, 0..text.len(), &[2..2, 4..5]);
+        let (content, offsets, _) =
+            build_combined_virtual_content(text, 0..text.len(), &[2..2, 4..5]);
 
         assert_eq!(content, "e ");
         assert_eq!(offsets, vec![4]);
+    }
+
+    fn gap(virtual_range: Range<usize>, host_text: &str) -> VirtualGap {
+        VirtualGap {
+            virtual_range,
+            host_text: host_text.to_string(),
+        }
+    }
+
+    #[test]
+    fn combined_content_records_stripped_line_prefixes_as_empty_gaps() {
+        let text = "> a\n> b\n";
+
+        let (content, _, gaps) = build_combined_virtual_content(text, 0..text.len(), &[2..4, 6..8]);
+
+        assert_eq!(content, "a\nb\n");
+        assert_eq!(gaps, vec![gap(0..0, "> "), gap(2..2, "> ")]);
+    }
+
+    #[test]
+    fn combined_content_records_masked_text_and_host_only_lines_in_order() {
+        // `${c}` interrupts a line; `ZZ` is a host-only line, stripped, whose
+        // line break stays in the virtual document.
+        let text = "ab${c}de\nZZ\nf\n";
+
+        let (content, _, gaps) =
+            build_combined_virtual_content(text, 0..text.len(), &[0..2, 6..9, 12..14]);
+
+        assert_eq!(content, "ab    de\n\nf\n");
+        assert_eq!(
+            gaps,
+            vec![gap(2..6, "${c}"), gap(9..9, "ZZ"), gap(9..10, "\n")]
+        );
+    }
+
+    #[test]
+    fn combined_content_records_a_host_only_line_ended_by_a_lone_cr() {
+        let text = "a\rZZ\rb\r";
+
+        let (content, _, gaps) = build_combined_virtual_content(text, 0..text.len(), &[0..2, 5..7]);
+
+        assert_eq!(content, "a\r\rb\r");
+        assert_eq!(gaps, vec![gap(2..2, "ZZ"), gap(2..3, "\r")]);
+    }
+
+    #[test]
+    fn combined_content_records_a_cr_cut_from_its_lf_as_a_gap() {
+        // The CR the virtual document shows as a space is host text, not
+        // content a downstream edit may rewrite.
+        let text = "> a\r\n";
+
+        let (content, _, gaps) =
+            build_combined_virtual_content(text, 0..4, std::slice::from_ref(&(2..4)));
+
+        assert_eq!(content, "a ");
+        assert_eq!(gaps, vec![gap(0..0, "> "), gap(1..2, "\r")]);
+    }
+
+    #[test]
+    fn combined_content_records_trailing_masked_text() {
+        let text = "abcdef";
+
+        let (_, _, gaps) = build_combined_virtual_content(text, 0..text.len(), &[2..2, 4..5]);
+
+        assert_eq!(gaps, vec![gap(0..0, "abcd"), gap(1..2, "f")]);
     }
 
     #[test]

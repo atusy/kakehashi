@@ -17,7 +17,8 @@ use super::{
 };
 use crate::lsp::bridge::actor::RouterCleanupGuard;
 use crate::lsp::bridge::protocol::{
-    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, host_position_within_region_bounds,
+    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, host_position_in_prepared_gap,
+    host_position_in_removed_edge_lines, host_position_within_region_bounds,
 };
 
 /// Context provided to response transformers during bridge request execution.
@@ -56,6 +57,59 @@ impl Drop for RequestHostLifecycle<'_> {
         self.pool
             .remove_host_lifecycle_lock_if_unshared(self.host_uri, &self.lifecycle);
     }
+}
+
+/// How long a request waits for the lifecycle pass to sync the text it was
+/// built for — a prepared one, or text as is in place of a prepared one (see
+/// `LanguageServerPool::wait_for_held_text`). The answer is already in
+/// by then and the sync follows it within a lifecycle pass; a request whose
+/// text a newer edit superseded never sees its text sent and fails here
+/// (the pool cannot tell supersession from a slow pass, and the editor
+/// usually cancels such a request first).
+const PREPARED_SYNC_WAIT: std::time::Duration = super::super::protocol::PREPARE_TIMEOUT;
+const PREPARED_SYNC_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// What a request's server must hold for the request's coordinates to
+/// describe its answer.
+enum HeldCheck<'a> {
+    /// The prepared text with this map (compared by fingerprint: an equal
+    /// answer may come in another allocation).
+    Prepared {
+        fingerprint: u64,
+        map: &'a super::super::protocol::PreparedMap,
+    },
+    /// Any text sent as is, as on every unprepared path (an edit's didChange
+    /// is ordered ahead of the request) — but not a prepared one, which
+    /// stays until the lifecycle pass replaces it.
+    AsIs,
+}
+
+impl<'a> HeldCheck<'a> {
+    fn new(offset: &'a RegionOffset, virtual_content: &str) -> Self {
+        match offset.prepared() {
+            Some(map) => Self::Prepared {
+                fingerprint: super::document_tracker::content_fingerprint(virtual_content),
+                map,
+            },
+            None => Self::AsIs,
+        }
+    }
+
+    fn holds(&self, held: Option<&super::HeldText>) -> bool {
+        match self {
+            Self::Prepared { fingerprint, map } => held.is_some_and(|held| {
+                held.fingerprint == *fingerprint && held.map.as_deref() == Some(*map)
+            }),
+            Self::AsIs => held.is_none_or(|held| held.map.is_none()),
+        }
+    }
+}
+
+fn prepared_text_not_synced(connection_key: &super::ConnectionKey) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::WouldBlock,
+        format!("{connection_key} does not hold the text this request was built for"),
+    )
 }
 
 impl LanguageServerPool {
@@ -172,6 +226,20 @@ impl LanguageServerPool {
         // Build virtual document URI
         let virtual_uri = VirtualDocumentUri::new(&host_uri_lsp, injection_language, region_id);
 
+        let uri_string = virtual_uri.to_uri_string();
+        // An unprepared request reads any text held as is, which is all a
+        // connection can hold while no prepared text was ever sent: nothing
+        // to check then.
+        let held_check = HeldCheck::new(offset, virtual_content);
+        let checks_held =
+            !matches!(held_check, HeldCheck::AsIs) || self.document_tracker.ever_held_prepared();
+        // Before the host lifecycle guard: the wait can last the whole sync
+        // budget, and a didClose or reopen must not queue behind it.
+        if checks_held {
+            self.wait_for_held_text(&uri_string, connection_key, &held_check)
+                .await?;
+        }
+
         let host_lifecycle = match expected_incarnation {
             Some(expected) => {
                 self.request_host_lifecycle_for_incarnation(host_uri, expected)
@@ -179,7 +247,7 @@ impl LanguageServerPool {
             }
             None => self.request_host_lifecycle(host_uri).await?,
         };
-        let routing_uri = url::Url::parse(&virtual_uri.to_uri_string())
+        let routing_uri = url::Url::parse(&uri_string)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         if self
             .host_routing_by_server(&routing_uri, connection_key.server())
@@ -262,7 +330,10 @@ impl LanguageServerPool {
                     &mut ConnectionHandleSender(&handle),
                     host_uri,
                     &virtual_uri,
-                    virtual_content,
+                    super::SentText {
+                        text: virtual_content,
+                        map: offset.prepared_map(),
+                    },
                     connection_key,
                 )
                 .await
@@ -273,6 +344,36 @@ impl LanguageServerPool {
                     self.unregister_upstream_request(id, connection_key);
                 }
                 return Err(e);
+            }
+
+            // The open above may have sent newer cached text instead, or
+            // the text may have changed since the wait.
+            // Read again: a prepared text may have been sent for the first
+            // time since the wait (a peer that started advertising).
+            let checks_held = checks_held || self.document_tracker.ever_held_prepared();
+            // Through the enqueue: a didChange records and queues newer text
+            // under the document's transition, not under `connections`, so
+            // without it one could land between this check and the request.
+            // (After the open above, which takes it itself; the same
+            // connections → transition order as didChange.)
+            let transition =
+                checks_held.then(|| self.open_transition_lock(&virtual_uri, connection_key));
+            let _transition_guard = match &transition {
+                Some(transition) => Some(transition.lock().await),
+                None => None,
+            };
+            if checks_held
+                && !held_check.holds(
+                    self.document_tracker
+                        .held_text(&uri_string, connection_key)
+                        .as_ref(),
+                )
+            {
+                drop(connections);
+                if let Some(ref id) = upstream_request_id {
+                    self.unregister_upstream_request(id, connection_key);
+                }
+                return Err(prepared_text_not_synced(connection_key));
             }
 
             // Queue the request via single-writer loop (ls-bridge-message-ordering)
@@ -306,6 +407,44 @@ impl LanguageServerPool {
         };
 
         Ok(transform_response(response?, &context))
+    }
+
+    /// Wait (briefly) until a connection that has the document open holds
+    /// the text `check` describes.
+    ///
+    /// A request is prepared for the newest virtual text, while the lifecycle
+    /// pass sends that text only once its prepare answer is in — so right
+    /// after an edit, an open document can still hold the previous prepared
+    /// text, and its answer would be in coordinates the request's map
+    /// misreads. Likewise right after a settings change adds or drops the
+    /// pair's peer: the request is prepared or not at once, the document is
+    /// not until the lifecycle pass sends it. The lifecycle pass is the only
+    /// sender (a request sending here could overtake a newer text), so the
+    /// request waits for it and fails if it does not come.
+    async fn wait_for_held_text(
+        &self,
+        uri_string: &str,
+        connection_key: &super::ConnectionKey,
+        check: &HeldCheck<'_>,
+    ) -> io::Result<()> {
+        let deadline = tokio::time::Instant::now() + PREPARED_SYNC_WAIT;
+        loop {
+            if !self
+                .document_tracker
+                .is_virtual_doc_open_on_connection(uri_string, connection_key)
+                || check.holds(
+                    self.document_tracker
+                        .held_text(uri_string, connection_key)
+                        .as_ref(),
+                )
+            {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(prepared_text_not_synced(connection_key));
+            }
+            tokio::time::sleep(PREPARED_SYNC_POLL).await;
+        }
     }
 
     /// Like [`execute_bridge_request_with_handle`](Self::execute_bridge_request_with_handle)
@@ -432,8 +571,29 @@ impl LanguageServerPool {
         // the content actually opened — the same in-flight staleness every
         // LSP position request has, which downstream servers clamp. Closing
         // it needs generation-bound opens (issue #996).
-        if !host_position_within_region_bounds(host_position, offset, region_end) {
-            if host_position.line < offset.line() {
+        if !host_position_within_region_bounds(host_position, offset, region_end)
+            || host_position_in_prepared_gap(host_position, offset)
+            || host_position_in_removed_edge_lines(host_position, offset)
+        {
+            if host_position_in_prepared_gap(host_position, offset) {
+                log::debug!(
+                    target: "kakehashi::bridge",
+                    "{method}: host position (line {}, char {}) is inside a prepared gap; \
+                     aborting request",
+                    host_position.line,
+                    host_position.character,
+                );
+            } else if host_position_in_removed_edge_lines(host_position, offset) {
+                // A blank line the prepare peer deleted: downstream has no
+                // such line, and would answer for the next one.
+                log::debug!(
+                    target: "kakehashi::bridge",
+                    "{method}: host position (line {}, char {}) is on a blank line the prepare \
+                     peer deleted; aborting request",
+                    host_position.line,
+                    host_position.character,
+                );
+            } else if host_position.line < offset.line() {
                 // Line above the region → almost certainly stale region data
                 // (a concurrent host edit shifted the region). Unexpected.
                 warn!(
@@ -509,6 +669,105 @@ mod tests {
     use crate::lsp::bridge::pool::test_helpers::*;
     use crate::lsp::bridge::protocol::region_host_end;
     use std::sync::Arc;
+
+    #[test]
+    fn a_request_reads_only_the_text_its_coordinates_describe() {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let prepare = |text: &str| {
+            apply_prepare_result(text, &VirtualLayout::single(text), None)
+                .unwrap()
+                .map
+                .unwrap()
+        };
+        let held = |text: &str, map: Option<Arc<crate::lsp::bridge::protocol::PreparedMap>>| {
+            super::super::HeldText {
+                fingerprint: super::super::document_tracker::content_fingerprint(text),
+                map,
+                generation: 0,
+                version: None,
+            }
+        };
+        // A prepared request: exactly its text, under its map (an equal map
+        // in another allocation included).
+        let offset = RegionOffset::new(0, 0).with_prepared(Some(prepare("a")));
+        let check = HeldCheck::new(&offset, "a");
+        assert!(check.holds(Some(&held("a", Some(prepare("a"))))));
+        assert!(!check.holds(Some(&held("a", None))), "held unprepared");
+        assert!(
+            !check.holds(Some(&held("b", Some(prepare("b"))))),
+            "another text"
+        );
+        assert!(!check.holds(None));
+        // An unprepared request: any text held as is, as before — but not a
+        // prepared one, which stays until the lifecycle pass replaces it.
+        let offset = RegionOffset::new(0, 0);
+        let check = HeldCheck::new(&offset, "a");
+        assert!(check.holds(None));
+        assert!(check.holds(Some(&held("older", None))));
+        assert!(!check.holds(Some(&held("a", Some(prepare("a"))))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_waits_for_its_text_until_the_budget_runs_out() {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let pool = Arc::new(LanguageServerPool::new());
+        let host_uri = Url::parse("file:///test/wait.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap(),
+            "lua",
+            TEST_ULID_LUA_0,
+        );
+        let uri = virtual_uri.to_uri_string();
+        let key = ConnectionKey::for_server("lua");
+        pool.register_opened_document(&host_uri, &virtual_uri, &key)
+            .await;
+        pool.record_sent_content_fingerprint(&virtual_uri, &key, "  a")
+            .await;
+        let result = serde_json::from_value(serde_json::json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared =
+            apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(result)).unwrap();
+        let offset = RegionOffset::new(0, 0).with_prepared(prepared.map.clone());
+        let check = HeldCheck::new(&offset, &prepared.text);
+
+        // Never sent: the request fails once the budget runs out.
+        let started = tokio::time::Instant::now();
+        assert!(pool.wait_for_held_text(&uri, &key, &check).await.is_err());
+        assert!(started.elapsed() >= PREPARED_SYNC_WAIT);
+
+        // Sent while it waits: the request goes on.
+        let sender = {
+            let pool = Arc::clone(&pool);
+            let virtual_uri = virtual_uri.clone();
+            let key = key.clone();
+            let prepared = prepared.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(PREPARED_SYNC_WAIT / 2).await;
+                pool.record_sent_content_fingerprint(
+                    &virtual_uri,
+                    &key,
+                    super::super::SentText {
+                        text: &prepared.text,
+                        map: prepared.map.as_ref(),
+                    },
+                )
+                .await;
+            })
+        };
+        let started = tokio::time::Instant::now();
+        assert!(pool.wait_for_held_text(&uri, &key, &check).await.is_ok());
+        assert!(started.elapsed() < PREPARED_SYNC_WAIT);
+        sender.await.unwrap();
+
+        // Not open on that connection: nothing to wait for (a lazy open sends
+        // the text).
+        let started = tokio::time::Instant::now();
+        let other = ConnectionKey::for_server("other");
+        assert!(pool.wait_for_held_text(&uri, &other, &check).await.is_ok());
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+    }
 
     fn start_observed_request(
         pool: Arc<LanguageServerPool>,

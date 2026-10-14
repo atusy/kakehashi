@@ -66,7 +66,7 @@ impl LanguageServerPool {
                 incarnation,
                 &injection.language,
                 &injection.region_id,
-                &injection.content,
+                injection.sent(),
             );
             let virtual_uri =
                 VirtualDocumentUri::new(&host_uri_lsp, &injection.language, &injection.region_id);
@@ -118,34 +118,62 @@ impl LanguageServerPool {
                     )
                     .await
                 else {
+                    // The same text may map back differently now (its gaps
+                    // changed, which the prepared text hides): the server
+                    // holds it under the new map.
+                    self.rehold_unchanged_content(&virtual_uri, &connection_key, injection.sent());
+                    drop(transition_guard);
                     continue;
                 };
 
                 // Send didChange notification via single-writer loop (ls-bridge-message-ordering).
-                // This is non-blocking and maintains FIFO ordering.
-                let send_result = Self::send_didchange_for_virtual_doc(
+                // This is non-blocking and maintains FIFO ordering. A dropped
+                // send (full/closed queue) leaves the old fingerprint so the
+                // next edit re-sends (#422).
+                let send_result = self.send_didchange_recorded(
                     &handle,
-                    &virtual_uri.to_uri_string(),
-                    &injection.content,
+                    &virtual_uri,
+                    &connection_key,
+                    injection.sent(),
                     version,
                 );
-                // Record the fingerprint ONLY on a confirmed enqueue (#422): a dropped
-                // send (full/closed queue) must leave the old fingerprint so the next
-                // edit re-sends, rather than marking content the server never received.
-                if matches!(send_result, NotificationSendResult::Queued) {
-                    self.record_sent_content_fingerprint(
-                        &virtual_uri,
-                        &connection_key,
-                        &injection.content,
-                    )
-                    .await;
-                } else {
+                if !matches!(send_result, NotificationSendResult::Queued) {
                     synchronized = false;
                 }
                 drop(transition_guard);
             }
         }
         synchronized
+    }
+
+    /// Send a didChange of `content` and record it as what the connection
+    /// holds (see `DocumentTracker::record_around`): recorded first, so a
+    /// push the server answers it with already finds it, and taken back
+    /// unless the send was queued — all before any push is stamped.
+    pub(super) fn send_didchange_recorded(
+        &self,
+        handle: &Arc<ConnectionHandle>,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &crate::lsp::bridge::ConnectionKey,
+        content: crate::lsp::bridge::pool::SentText<'_>,
+        version: i32,
+    ) -> NotificationSendResult {
+        let text = content.text;
+        self.record_around(
+            virtual_uri,
+            connection_key,
+            content,
+            version,
+            || {
+                Self::send_didchange_for_virtual_doc(
+                    handle,
+                    &virtual_uri.to_uri_string(),
+                    text,
+                    version,
+                )
+            },
+            |result| matches!(result, NotificationSendResult::Queued),
+        )
     }
 
     /// Send a didChange notification for a virtual document, returning the

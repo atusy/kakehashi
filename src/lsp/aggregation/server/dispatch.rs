@@ -335,6 +335,7 @@ mod tests {
         use crate::language::injection::{CacheableInjectionRegion, ResolvedInjection};
 
         DocumentRequestContext {
+            prepared: None,
             uri: url::Url::parse("file:///suppression.md").expect("valid URI"),
             resolved: ResolvedInjection {
                 region: CacheableInjectionRegion {
@@ -349,6 +350,7 @@ mod tests {
                 virtual_content: String::new(),
                 line_column_offsets: vec![],
                 contiguous: true,
+                gaps: Default::default(),
             },
             region_end: None,
             configs: vec![],

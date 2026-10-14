@@ -36,6 +36,7 @@ pub(in crate::lsp::bridge) fn handle(
     id: jsonrpc::Id,
     server_prefix: &str,
     deps: &ServerRequestDeps,
+    held_through: u64,
 ) {
     let response_tx = deps.response_tx.clone();
     let server_prefix_owned = server_prefix.to_string();
@@ -93,6 +94,8 @@ pub(in crate::lsp::bridge) fn handle(
         .upstream_request_tx
         .send(UpstreamRequest::ShowDocument {
             params,
+            connection: deps.connection_key.clone(),
+            held_through,
             reply: reply_tx,
             cancel,
         })

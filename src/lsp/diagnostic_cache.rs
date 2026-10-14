@@ -103,6 +103,36 @@ pub(crate) struct SlotEntry {
     /// ([`DiagnosticAggregator::evict_connection`]) drop only the dead connection's
     /// slots, never a live restart's (#469).
     pub(crate) connection_id: Option<ProgressConnectionId>,
+    /// What the connection held for the region's virtual document when it
+    /// pushed this slot (see [`HeldStamp`]); `None` for a slot not recorded
+    /// against one.
+    pub(crate) held: Option<HeldStamp>,
+}
+
+/// The text a connection held when it pushed a region slot: the generation
+/// of its record (see the bridge's `HeldText`; `None` with nothing on record
+/// yet), and whether that text was prepared. A slot pushed for a prepared
+/// text, or read while its connection holds one, is in the coordinates of
+/// that generation only. A push that named another document version than
+/// the one its connection was last sent is stamped `prepared` with no
+/// generation: it was computed for an earlier text, and places nowhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HeldStamp {
+    pub(crate) connection: crate::lsp::bridge::ConnectionKey,
+    pub(crate) generation: Option<u64>,
+    pub(crate) prepared: bool,
+}
+
+/// How a cached region slot translates to the host (see
+/// [`merge_cached_diagnostics`]).
+#[derive(Debug, Clone)]
+pub(crate) enum Placement {
+    /// Through the region's current offset.
+    Offset,
+    /// Through this prepared map, then the region's current offset.
+    Prepared(std::sync::Arc<crate::lsp::bridge::PreparedMap>),
+    /// Not at all: its coordinates describe no current text.
+    Skip,
 }
 
 /// `server name → slot`. Several servers can attach to one source.
@@ -131,6 +161,7 @@ pub(crate) fn merge_cached_diagnostics(
     host: &Url,
     snapshot: SourceSlots,
     region_offsets: &HashMap<String, RegionOffset>,
+    place: impl Fn(&str, &SlotEntry) -> Placement,
 ) -> Vec<Diagnostic> {
     let host_str = host.as_str();
     let mut merged = Vec::new();
@@ -144,8 +175,11 @@ pub(crate) fn merge_cached_diagnostics(
                     continue;
                 };
                 for slot in servers.into_values() {
+                    let Some(offset) = placed_offset(offset, place(&region_id, &slot)) else {
+                        continue;
+                    };
                     for mut diagnostic in slot.diagnostics {
-                        transform_region_diagnostic(&mut diagnostic, offset, host_str);
+                        transform_region_diagnostic(&mut diagnostic, &offset, host_str);
                         merged.push(diagnostic);
                     }
                 }
@@ -236,6 +270,7 @@ pub(crate) fn cached_push_diagnostics(
     host: &Url,
     snapshot: SourceSlots,
     region_offsets: &HashMap<String, RegionOffset>,
+    place: impl Fn(&str, &SlotEntry) -> Placement,
     include: impl Fn(&DiagnosticSource, &str) -> bool,
 ) -> (Vec<Diagnostic>, Vec<Diagnostic>) {
     let host_str = host.as_str();
@@ -252,8 +287,11 @@ pub(crate) fn cached_push_diagnostics(
                     if !include(&source, &server) {
                         continue;
                     }
+                    let Some(offset) = placed_offset(offset, place(region_id, &slot)) else {
+                        continue;
+                    };
                     for mut diagnostic in slot.diagnostics {
-                        transform_region_diagnostic(&mut diagnostic, offset, host_str);
+                        transform_region_diagnostic(&mut diagnostic, &offset, host_str);
                         region_items.push(diagnostic);
                     }
                 }
@@ -269,6 +307,21 @@ pub(crate) fn cached_push_diagnostics(
         }
     }
     (region_items, host_items)
+}
+
+/// `offset` as `placement` reads a slot's coordinates: borrowed unless a
+/// prepared map goes in front of it.
+fn placed_offset(
+    offset: &RegionOffset,
+    placement: Placement,
+) -> Option<std::borrow::Cow<'_, RegionOffset>> {
+    match placement {
+        Placement::Offset => Some(std::borrow::Cow::Borrowed(offset)),
+        Placement::Prepared(map) => Some(std::borrow::Cow::Owned(
+            offset.clone().with_prepared(Some(map)),
+        )),
+        Placement::Skip => None,
+    }
 }
 
 /// Largest set for which the serialization-free O(n²) match is used; above this, a
@@ -1062,6 +1115,20 @@ impl DiagnosticAggregator {
         connection_id: Option<ProgressConnectionId>,
         diagnostics: Vec<Diagnostic>,
     ) -> bool {
+        self.record_held(host, source, server, connection_id, None, diagnostics)
+    }
+
+    /// [`Self::record`], stamped with what the connection held (see
+    /// [`HeldStamp`]).
+    pub(crate) fn record_held(
+        &self,
+        host: &Url,
+        source: DiagnosticSource,
+        server: String,
+        connection_id: Option<ProgressConnectionId>,
+        held: Option<HeldStamp>,
+        diagnostics: Vec<Diagnostic>,
+    ) -> bool {
         let mut revisions = self
             .cache_revisions
             .lock()
@@ -1074,15 +1141,17 @@ impl DiagnosticAggregator {
         } else {
             cache.entry(host.clone()).or_default()
         };
+        // A new stamp can change how the same diagnostics place.
         let changed = source_slots
             .get(&source)
             .and_then(|servers| servers.get(&server))
-            .is_none_or(|slot| slot.diagnostics != diagnostics);
+            .is_none_or(|slot| slot.diagnostics != diagnostics || slot.held != held);
         source_slots.entry(source).or_default().insert(
             server,
             SlotEntry {
                 diagnostics,
                 connection_id,
+                held,
             },
         );
         if changed {
@@ -1305,6 +1374,7 @@ impl DiagnosticAggregator {
                 SlotEntry {
                     diagnostics,
                     connection_id: None,
+                    held: None,
                 },
             );
         if changed {
@@ -3341,7 +3411,10 @@ mod tests {
     fn merge_concatenates_pull_layer() {
         let agg = DiagnosticAggregator::new();
         agg.set_pull_layer(&host(), vec![diag("a"), diag("b")]);
-        let merged = merge_cached_diagnostics(&host(), agg.snapshot(&host()), &HashMap::new());
+        let merged =
+            merge_cached_diagnostics(&host(), agg.snapshot(&host()), &HashMap::new(), |_, _| {
+                Placement::Offset
+            });
         let mut msgs: Vec<&str> = merged.iter().map(|d| d.message.as_str()).collect();
         msgs.sort();
         assert_eq!(msgs, vec!["a", "b"]);
@@ -3349,7 +3422,12 @@ mod tests {
 
     #[test]
     fn merge_of_empty_snapshot_is_empty() {
-        assert!(merge_cached_diagnostics(&host(), SourceSlots::new(), &HashMap::new()).is_empty());
+        assert!(
+            merge_cached_diagnostics(&host(), SourceSlots::new(), &HashMap::new(), |_, _| {
+                Placement::Offset
+            })
+            .is_empty()
+        );
     }
 
     #[test]
@@ -3365,7 +3443,9 @@ mod tests {
         let mut offsets = HashMap::new();
         // Region r1 sits at host line 5, column offset 4 on its first line.
         offsets.insert("r1".to_string(), RegionOffset::new(5, 4));
-        let merged = merge_cached_diagnostics(&host(), agg.snapshot(&host()), &offsets);
+        let merged = merge_cached_diagnostics(&host(), agg.snapshot(&host()), &offsets, |_, _| {
+            Placement::Offset
+        });
         assert_eq!(merged.len(), 1);
         // line 0 -> 0+5, character 2 -> 2+4
         assert_eq!(merged[0].range.start, Position::new(5, 6));
@@ -3401,7 +3481,9 @@ mod tests {
         );
         let mut offsets = HashMap::new();
         offsets.insert("r1".to_string(), RegionOffset::new(5, 0));
-        let merged = merge_cached_diagnostics(&host(), agg.snapshot(&host()), &offsets);
+        let merged = merge_cached_diagnostics(&host(), agg.snapshot(&host()), &offsets, |_, _| {
+            Placement::Offset
+        });
 
         let related = merged[0].related_information.as_ref().unwrap();
         assert_eq!(related.len(), 2, "virtual-URI related info is dropped");
@@ -3436,7 +3518,10 @@ mod tests {
             vec![diag("stale")],
         );
         // No offset for "gone" -> region is stale -> skipped.
-        let merged = merge_cached_diagnostics(&host(), agg.snapshot(&host()), &HashMap::new());
+        let merged =
+            merge_cached_diagnostics(&host(), agg.snapshot(&host()), &HashMap::new(), |_, _| {
+                Placement::Offset
+            });
         assert!(merged.is_empty());
     }
 
@@ -3453,7 +3538,9 @@ mod tests {
         agg.set_pull_layer(&host(), vec![diag_at("pull", 9, 0)]);
         let mut offsets = HashMap::new();
         offsets.insert("r1".to_string(), RegionOffset::new(2, 0));
-        let merged = merge_cached_diagnostics(&host(), agg.snapshot(&host()), &offsets);
+        let merged = merge_cached_diagnostics(&host(), agg.snapshot(&host()), &offsets, |_, _| {
+            Placement::Offset
+        });
         let mut msgs: Vec<&str> = merged.iter().map(|d| d.message.as_str()).collect();
         msgs.sort();
         assert_eq!(msgs, vec!["pull", "push"]);
@@ -3478,7 +3565,10 @@ mod tests {
             Some(ProgressConnectionId::for_test(1)),
             vec![diag_at("hostB", 8, 0)],
         );
-        let merged = merge_cached_diagnostics(&host(), agg.snapshot(&host()), &HashMap::new());
+        let merged =
+            merge_cached_diagnostics(&host(), agg.snapshot(&host()), &HashMap::new(), |_, _| {
+                Placement::Offset
+            });
         let mut by_msg: Vec<(&str, Position)> = merged
             .iter()
             .map(|d| (d.message.as_str(), d.range.start))
@@ -3549,6 +3639,7 @@ mod tests {
             &host(),
             agg.snapshot(&host()),
             &offsets,
+            |_, _| Placement::Offset,
             |_source, _server| true,
         );
 
@@ -3602,6 +3693,7 @@ mod tests {
             &host(),
             agg.snapshot(&host()),
             &offsets,
+            |_, _| Placement::Offset,
             |_source, server| server == "linter",
         );
 
@@ -3643,7 +3735,10 @@ mod tests {
             Some(ProgressConnectionId::for_test(1)),
             vec![diag_at("line5", 5, 0)],
         );
-        let merged = merge_cached_diagnostics(&host(), agg.snapshot(&host()), &HashMap::new());
+        let merged =
+            merge_cached_diagnostics(&host(), agg.snapshot(&host()), &HashMap::new(), |_, _| {
+                Placement::Offset
+            });
         let lines: Vec<u32> = merged.iter().map(|d| d.range.start.line).collect();
         assert_eq!(
             lines,
@@ -3676,7 +3771,10 @@ mod tests {
             Some(ProgressConnectionId::for_test(1)),
             vec![err],
         );
-        let merged = merge_cached_diagnostics(&host(), agg.snapshot(&host()), &HashMap::new());
+        let merged =
+            merge_cached_diagnostics(&host(), agg.snapshot(&host()), &HashMap::new(), |_, _| {
+                Placement::Offset
+            });
         let sevs: Vec<_> = merged.iter().map(|d| d.severity).collect();
         assert_eq!(
             sevs,
@@ -3707,7 +3805,10 @@ mod tests {
             Some(ProgressConnectionId::for_test(1)),
             vec![diag_at("apple", 3, 0)],
         );
-        let merged = merge_cached_diagnostics(&host(), agg.snapshot(&host()), &HashMap::new());
+        let merged =
+            merge_cached_diagnostics(&host(), agg.snapshot(&host()), &HashMap::new(), |_, _| {
+                Placement::Offset
+            });
         let msgs: Vec<&str> = merged.iter().map(|d| d.message.as_str()).collect();
         assert_eq!(msgs, vec!["apple", "zebra"], "ties break by message");
     }
@@ -3734,7 +3835,10 @@ mod tests {
             Some(ProgressConnectionId::for_test(1)),
             vec![from_a],
         );
-        let merged = merge_cached_diagnostics(&host(), agg.snapshot(&host()), &HashMap::new());
+        let merged =
+            merge_cached_diagnostics(&host(), agg.snapshot(&host()), &HashMap::new(), |_, _| {
+                Placement::Offset
+            });
         let sources: Vec<_> = merged.iter().map(|d| d.source.clone()).collect();
         assert_eq!(
             sources,
@@ -3767,11 +3871,19 @@ mod tests {
             Some(ProgressConnectionId::for_test(1)),
             vec![d2.clone()],
         );
-        let first = merge_cached_diagnostics(&host(), agg.snapshot(&host()), &HashMap::new());
+        let first =
+            merge_cached_diagnostics(&host(), agg.snapshot(&host()), &HashMap::new(), |_, _| {
+                Placement::Offset
+            });
         // Re-merge a few times: a HashMap-order fallback would eventually flip; the
         // serialized tiebreak must keep the order stable across merges.
         for _ in 0..5 {
-            let again = merge_cached_diagnostics(&host(), agg.snapshot(&host()), &HashMap::new());
+            let again = merge_cached_diagnostics(
+                &host(),
+                agg.snapshot(&host()),
+                &HashMap::new(),
+                |_, _| Placement::Offset,
+            );
             assert_eq!(
                 again.iter().map(|d| &d.data).collect::<Vec<_>>(),
                 first.iter().map(|d| &d.data).collect::<Vec<_>>(),

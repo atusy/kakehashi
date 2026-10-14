@@ -35,7 +35,7 @@ use crate::lsp::aggregation::server::{
     dispatch_host_preferred, dispatch_preferred,
 };
 use crate::lsp::bridge::{
-    CodeActionEnvelope, HostDocument, RegionOffset, UpstreamCodeActionCaps, bridge_code_actions,
+    CodeActionEnvelope, HostDocument, UpstreamCodeActionCaps, bridge_code_actions,
     extract_code_action_envelope, parse_code_actions_leniently,
 };
 
@@ -388,7 +388,7 @@ impl Kakehashi {
         // per-line column offset (e.g. a blockquote-prefix edit that left the
         // start line intact) would translate the resolved edit to wrong host
         // columns. Fail soft on any divergence.
-        if live_offset != RegionOffset::from(&envelope.offset) {
+        if !envelope.offset.describes(&live_offset) {
             return None;
         }
         Some(region_end)

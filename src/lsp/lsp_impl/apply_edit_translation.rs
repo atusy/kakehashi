@@ -85,7 +85,7 @@ use crate::lsp::bridge::{
     workspace_edit_preserves_line_prefixes, workspace_edit_within_region,
 };
 
-use super::region_offset::resolve_region_offset;
+use super::region_offset::resolve_region_offset_for_connection;
 
 /// Translates `workspace/applyEdit` params whose edit targets a virtual
 /// document back to the host document + host coordinates. Holds shared
@@ -126,6 +126,7 @@ impl ApplyEditTranslator {
         &self,
         mut params: ApplyWorkspaceEditParams,
         connection: &ConnectionKey,
+        held_through: u64,
     ) -> Result<ApplyWorkspaceEditParams, String> {
         // A versioned virtual-document edit pins the content revision the
         // downstream computed against; validate it against the version this
@@ -171,16 +172,22 @@ impl ApplyEditTranslator {
                 "kakehashi: the virtual document's host URI is unmappable: {host_url}"
             ));
         };
-        let Some((offset, region_end, contiguous, _)) = resolve_region_offset(
+        // Through the map of the text the sending connection holds: an
+        // unversioned edit skips the version check, and a versioned one can
+        // pass it just before a send replaces that text.
+        let Some((offset, region_end, contiguous, _)) = resolve_region_offset_for_connection(
             &self.documents,
             &self.language,
             &self.bridge,
             &host_url,
             &region_id,
+            connection,
+            held_through,
         ) else {
             // The region moved or was removed since the downstream produced
-            // the edit; translating against a stale offset would edit the
-            // wrong host text.
+            // the edit, or the connection holds a text that no longer
+            // describes it; translating against a stale offset would edit
+            // the wrong host text.
             return Err(
                 "kakehashi: the injected region changed before the edit could be applied"
                     .to_string(),
@@ -548,7 +555,7 @@ mod tests {
         }))
         .unwrap();
         let out = translator()
-            .translate(original.clone(), &test_connection())
+            .translate(original.clone(), &test_connection(), u64::MAX)
             .await
             .expect("real-file edit must pass through");
         assert_eq!(out, original);
@@ -569,7 +576,7 @@ mod tests {
         }))
         .unwrap();
         let out = translator()
-            .translate(original, &test_connection())
+            .translate(original, &test_connection(), u64::MAX)
             .await
             .expect("real-file edit must pass through");
         match out.edit.document_changes.as_ref().unwrap() {
@@ -590,7 +597,7 @@ mod tests {
         let uri = virtual_uri("01ARZ3NDEKTSV4RRFFQ69G5FAV");
         let original = params_with_edit(json!({ "changes": { uri.clone(): [text_edit(0)] } }));
         let reason = translator()
-            .translate(original, &test_connection())
+            .translate(original, &test_connection(), u64::MAX)
             .await
             .expect_err("unknown virtual document must be rejected");
         assert!(
@@ -610,7 +617,7 @@ mod tests {
             }
         }));
         let reason = translator()
-            .translate(original, &test_connection())
+            .translate(original, &test_connection(), u64::MAX)
             .await
             .expect_err("multi-region edit must be rejected");
         assert!(
@@ -633,7 +640,7 @@ mod tests {
             }]
         }));
         let reason = translator()
-            .translate(original, &test_connection())
+            .translate(original, &test_connection(), u64::MAX)
             .await
             .unwrap_err();
         assert!(
@@ -656,6 +663,119 @@ mod tests {
             .register_opened_document_for_test(&host_url, &typed_uri, connection)
             .await;
         (bridge, typed_uri)
+    }
+
+    #[tokio::test]
+    async fn an_inbound_edit_translates_through_the_text_its_connection_holds() {
+        use crate::lsp::bridge::{HeldPresentation, VirtualLayout, apply_prepare_result};
+        let region_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let connection = test_connection();
+        let (bridge, typed_uri) = bridge_with_open_document(region_id, &connection).await;
+        let host_url = url::Url::parse("file:///project/doc.md").unwrap();
+        let dedented = |virtual_text: &str| {
+            let result = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+            ]}]}))
+            .unwrap();
+            apply_prepare_result(
+                virtual_text,
+                &VirtualLayout::single(virtual_text),
+                Some(result),
+            )
+            .unwrap()
+        };
+        let presentation = || {
+            bridge.held_presentation(&host_url, "lua", region_id, "  a\n", &connection, u64::MAX)
+        };
+        // Held as is (or never recorded): as on any unprepared path.
+        assert!(matches!(presentation(), HeldPresentation::AsIs));
+        bridge
+            .record_sent_content_for_test(&typed_uri, &connection, "  a\n")
+            .await;
+        assert!(matches!(presentation(), HeldPresentation::AsIs));
+        // Held prepared from the current virtual text: through its map.
+        let current = dedented("  a\n");
+        bridge
+            .record_sent_content_for_test(
+                &typed_uri,
+                &connection,
+                crate::lsp::bridge::SentText {
+                    text: &current.text,
+                    map: current.map.as_ref(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(presentation(), HeldPresentation::Prepared(map) if Some(&map) == current.map.as_ref())
+        );
+        // Held prepared from an earlier virtual text: no current position.
+        let earlier = dedented("  ab\n");
+        bridge
+            .record_sent_content_for_test(
+                &typed_uri,
+                &connection,
+                crate::lsp::bridge::SentText {
+                    text: &earlier.text,
+                    map: earlier.map.as_ref(),
+                },
+            )
+            .await;
+        assert!(matches!(presentation(), HeldPresentation::Unavailable));
+    }
+
+    #[tokio::test]
+    async fn an_inbound_edit_received_before_its_text_was_replaced_translates_nothing() {
+        use crate::lsp::bridge::{HeldPresentation, VirtualLayout, apply_prepare_result};
+        let region_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let connection = test_connection();
+        let (bridge, typed_uri) = bridge_with_open_document(region_id, &connection).await;
+        let host_url = url::Url::parse("file:///project/doc.md").unwrap();
+        let send = |prepared: crate::lsp::bridge::PreparedDocument| {
+            let bridge = Arc::clone(&bridge);
+            let typed_uri = typed_uri.clone();
+            let connection = connection.clone();
+            async move {
+                bridge
+                    .record_sent_content_for_test(
+                        &typed_uri,
+                        &connection,
+                        crate::lsp::bridge::SentText {
+                            text: &prepared.text,
+                            map: prepared.map.as_ref(),
+                        },
+                    )
+                    .await;
+            }
+        };
+        let virtual_text = "\na\nb\n";
+        // The leading blank line deleted, then (the same virtual text)
+        // kept: an edit computed for the first text targets other lines.
+        let deleted = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let layout = VirtualLayout::single(virtual_text);
+        send(apply_prepare_result(virtual_text, &layout, Some(deleted)).unwrap()).await;
+        let received = bridge.held_through();
+        send(apply_prepare_result(virtual_text, &layout, None).unwrap()).await;
+        let presentation = |held_through| {
+            bridge.held_presentation(
+                &host_url,
+                "lua",
+                region_id,
+                virtual_text,
+                &connection,
+                held_through,
+            )
+        };
+        assert!(matches!(
+            presentation(received),
+            HeldPresentation::Unavailable
+        ));
+        assert!(matches!(
+            presentation(bridge.held_through()),
+            HeldPresentation::Prepared(_)
+        ));
     }
 
     #[tokio::test]
@@ -683,7 +803,7 @@ mod tests {
         }));
 
         let reason = translator_with_bridge(bridge)
-            .translate(params, &connection)
+            .translate(params, &connection, u64::MAX)
             .await
             .expect_err("a stale versioned edit must be rejected");
         assert!(
@@ -708,7 +828,7 @@ mod tests {
         }));
 
         let reason = translator_with_bridge(bridge)
-            .translate(params, &connection)
+            .translate(params, &connection, u64::MAX)
             .await
             .expect_err("a version ahead of the tracked one must be rejected");
         assert!(
@@ -735,7 +855,7 @@ mod tests {
         }));
 
         let reason = translator_with_bridge(bridge)
-            .translate(params, &test_connection())
+            .translate(params, &test_connection(), u64::MAX)
             .await
             .expect_err(
                 "a versioned edit for a doc this connection no longer has must be rejected",
@@ -769,7 +889,7 @@ mod tests {
         }));
 
         let reason = translator_with_bridge(bridge)
-            .translate(params, &connection)
+            .translate(params, &connection, u64::MAX)
             .await
             .expect_err("empty document store cannot resolve the region");
         assert!(
@@ -804,7 +924,7 @@ mod tests {
         }));
 
         let reason = translator()
-            .translate(params, &connection)
+            .translate(params, &connection, u64::MAX)
             .await
             .expect_err("a versioned no-op entry is a precondition and must be validated");
         assert!(
@@ -838,7 +958,7 @@ mod tests {
         }));
 
         let out = translator()
-            .translate(params, &test_connection())
+            .translate(params, &test_connection(), u64::MAX)
             .await
             .expect("an unversioned no-op virtual entry must not trip anything");
         assert_eq!(
@@ -877,7 +997,7 @@ mod tests {
         }));
 
         let out = translator()
-            .translate(params, &test_connection())
+            .translate(params, &test_connection(), u64::MAX)
             .await
             .expect("a removable no-op virtual entry must not fail the apply");
         assert_eq!(
@@ -914,7 +1034,7 @@ mod tests {
         }));
 
         let reason = translator_with_bridge(bridge)
-            .translate(params, &connection)
+            .translate(params, &connection, u64::MAX)
             .await
             .expect_err("conflicting versions for one document must be rejected");
         assert!(

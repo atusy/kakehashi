@@ -319,7 +319,15 @@ impl LanguageServerPool {
             .await
         {
             Some(mut resolved) => {
-                if transform_completion_item(&mut resolved, &offset, region_end, None) {
+                if transform_completion_item(
+                    &mut resolved,
+                    &offset,
+                    region_end,
+                    None,
+                    super::completion::ClientInsertMode::from_capabilities(
+                        self.client_capabilities().as_ref(),
+                    ),
+                ) {
                     // A client may resolve this result again. Its ranges now
                     // use the live geometry, so their next inverse mapping
                     // must use that same geometry rather than the producer's.
@@ -470,24 +478,18 @@ impl LanguageServerPool {
                         &document.text,
                     )
                     .await
-                {
-                    if !matches!(
-                        Self::send_didchange_for_virtual_doc(
+                    && !matches!(
+                        self.send_didchange_recorded(
                             handle,
-                            &virtual_uri.to_uri_string(),
-                            &document.text,
+                            &virtual_uri,
+                            connection_key,
+                            (&*document.text).into(),
                             version,
                         ),
                         NotificationSendResult::Queued
-                    ) {
-                        return Err(io::Error::other("completion text sync was not queued"));
-                    }
-                    self.record_sent_content_fingerprint(
-                        &virtual_uri,
-                        connection_key,
-                        &document.text,
                     )
-                    .await;
+                {
+                    return Err(io::Error::other("completion text sync was not queued"));
                 }
                 handle
                     .send_request(request, request_id)
@@ -634,6 +636,7 @@ mod tests {
                 line: 5,
                 column: 0,
                 line_column_offsets: None,
+                prepared: false,
             },
             region_end: Some((9, 0)),
             host_layer: false,
@@ -959,7 +962,8 @@ mod tests {
             EnvelopeOffset {
                 line: 5,
                 column: 0,
-                line_column_offsets: Some(vec![0])
+                line_column_offsets: Some(vec![0]),
+                prepared: false
             }
         );
     }
@@ -1027,6 +1031,7 @@ mod tests {
                 line: 5,
                 column: 0,
                 line_column_offsets: None,
+                prepared: false,
             },
             region_end: Some((9, 0)),
             host_layer: false,
@@ -1272,7 +1277,8 @@ mod tests {
             EnvelopeOffset {
                 line: 5,
                 column: 0,
-                line_column_offsets: Some(vec![0])
+                line_column_offsets: Some(vec![0]),
+                prepared: false
             }
         );
     }

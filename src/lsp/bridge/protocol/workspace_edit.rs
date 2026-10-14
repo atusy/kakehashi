@@ -12,8 +12,8 @@
 use std::collections::HashMap;
 
 use tower_lsp_server::ls_types::{
-    AnnotatedTextEdit, DocumentChangeOperation, DocumentChanges, OneOf, Position, ResourceOp,
-    TextDocumentEdit, TextEdit, Uri, WorkspaceEdit,
+    AnnotatedTextEdit, DocumentChangeOperation, DocumentChanges, OneOf, Position, Range,
+    ResourceOp, TextDocumentEdit, TextEdit, Uri, WorkspaceEdit,
 };
 
 use super::translation::{RegionOffset, translate_virtual_range_to_host};
@@ -46,6 +46,24 @@ pub(crate) fn transform_workspace_edit_to_host(
         }
     }
 
+    // Edits to a prepared document go back to the virtual document first, as
+    // whole edits (restoring indentation, refusing gaps); a refused edit
+    // refuses the whole WorkspaceEdit, since applying the rest of a rename
+    // or fix would corrupt it.
+    let prepared = offset.prepared().is_some();
+    let original = offset;
+    let unprepared;
+    let offset = match offset.prepared() {
+        Some(prepared) => {
+            if !request_edits_to_virtual(edit, request_virtual_uri, prepared) {
+                return false;
+            }
+            unprepared = offset.unprepared();
+            &unprepared
+        }
+        None => offset,
+    };
+
     // Transform changes map: { [uri: string]: TextEdit[] }
     if let Some(changes) = &mut edit.changes {
         transform_changes_map(changes, request_virtual_uri, host_uri, offset);
@@ -56,7 +74,339 @@ pub(crate) fn transform_workspace_edit_to_host(
         transform_document_changes(doc_changes, request_virtual_uri, host_uri, offset);
     }
 
-    true
+    // A prepared document's edits gain removed indents when mapped, so the
+    // host edits they merge with (a server editing the host URI directly)
+    // can come to overlap them. And a server editing the host URI directly
+    // bypasses the prepared map, so its edits must keep off the gaps too.
+    !(prepared
+        && (host_edits_overlap(edit, host_uri)
+            || host_edits_touch_gaps(edit, host_uri, original)
+            || host_edits_join_gap_lines(edit, host_uri, original)
+            || !host_edits_keep_hidden_text(edit, host_uri, original)))
+}
+
+/// Whether the edits to `host_uri` that reach into the region, mapped ones
+/// and ones made to the host directly together, keep the text the prepared
+/// document hides (see `PreparedMap::virtual_edits_keep_host_text`): each
+/// set passed alone, but a hidden CR may still fuse with an LF only the
+/// two together bring next to it. Each representation (`changes`,
+/// `documentChanges`) is one set. An edit reaching into the region from
+/// outside it is refused; one only meeting it (a fence line replaced up to
+/// where the region starts) is not in it.
+fn host_edits_keep_hidden_text(
+    edit: &WorkspaceEdit,
+    host_uri: &Uri,
+    offset: &RegionOffset,
+) -> bool {
+    let Some(prepared) = offset.prepared() else {
+        return true;
+    };
+    let unprepared = offset.unprepared();
+    let to_host = |mut position: Position| {
+        super::translation::translate_virtual_position_to_host(&mut position, &unprepared);
+        position
+    };
+    let (region_start, region_end) = (
+        to_host(Position::new(0, 0)),
+        to_host(prepared.virtual_end()),
+    );
+    // The region position `position` names, if it names one: translated
+    // back, it must come out the same (host text before the region, after
+    // it, or in a line's host prefix does not) — but for a column past its
+    // line's end before the region's end, which a client clamps to the line
+    // end (LSP), and which is clamped here the same.
+    let to_virtual = |position: &Position| {
+        let mut translated = *position;
+        super::translation::translate_host_position_to_virtual(&mut translated, &unprepared);
+        let mut back = translated;
+        super::translation::translate_virtual_position_to_host(&mut back, &unprepared);
+        if back == *position && prepared.names_virtual_position(translated) {
+            return Some(translated);
+        }
+        if *position >= region_start && *position < region_end && back.line == position.line {
+            let clamped = prepared.clamp_virtual_position(translated)?;
+            let mut clamped_back = clamped;
+            super::translation::translate_virtual_position_to_host(&mut clamped_back, &unprepared);
+            // Only a column past the line's end clamps; one in the line's
+            // host prefix stays outside the region.
+            if clamped != translated && clamped_back.character < position.character {
+                return Some(clamped);
+            }
+        }
+        None
+    };
+    // A set's edits reaching into the region, in V; `None` when one reaches
+    // in from outside it.
+    let in_region = |edits: &[(&Range, &str)]| {
+        let mut in_region = Vec::new();
+        for (range, new_text) in edits {
+            match (to_virtual(&range.start), to_virtual(&range.end)) {
+                (Some(start), Some(end)) => in_region.push(TextEdit {
+                    range: Range { start, end },
+                    new_text: new_text.to_string(),
+                }),
+                (None, None) => {}
+                // Meeting the region at its edge only.
+                (None, Some(_)) if range.end == region_start => {}
+                (Some(_), None) if range.start == region_end => {}
+                _ => return None,
+            }
+        }
+        Some(in_region)
+    };
+    let keeps =
+        |edits: &[TextEdit]| edits.is_empty() || prepared.virtual_edits_keep_host_text(edits);
+    let (changes, entries) = host_text_edits_by_kind(edit, host_uri);
+    let changes: Vec<_> = changes.collect();
+    if !in_region(&changes).is_some_and(|edits| keeps(&edits)) {
+        return false;
+    }
+    // `documentChanges` entries apply one after another, each to the text
+    // the ones before it left, while every edit reaching into the region was
+    // translated through the region's geometry before any of them: an entry
+    // reaching into it is checked only as the document's one entry with
+    // edits — another could shift the region, or edit it, before it applies.
+    let mut reaching = None;
+    let mut with_edits = 0;
+    for entry in &entries {
+        if !entry.is_empty() {
+            with_edits += 1;
+        }
+        match in_region(entry) {
+            None => return false,
+            Some(edits) if edits.is_empty() => {}
+            Some(edits) => reaching = Some(edits),
+        }
+    }
+    match reaching {
+        None => true,
+        Some(edits) => with_edits == 1 && keeps(&edits),
+    }
+}
+
+/// Whether any edit to `host_uri` ending right where a gap starts a line
+/// (a closing fence between combined blocks) would leave that line joined
+/// to the text before it: it must end with a line break or delete whole
+/// lines, as edits mapped through the prepared document must.
+fn host_edits_join_gap_lines(edit: &WorkspaceEdit, host_uri: &Uri, offset: &RegionOffset) -> bool {
+    let Some(prepared) = offset.prepared() else {
+        return false;
+    };
+    let unprepared = offset.unprepared();
+    let gap_starts: Vec<Position> = prepared
+        .line_start_gap_positions()
+        .map(|mut position| {
+            super::translation::translate_virtual_position_to_host(&mut position, &unprepared);
+            position
+        })
+        .collect();
+    if gap_starts.is_empty() {
+        return false;
+    }
+    host_text_edits(edit, host_uri).any(|(range, new_text)| {
+        if !gap_starts.contains(&range.end) {
+            return false;
+        }
+        let breaks_line = new_text.ends_with(['\n', '\r']);
+        let whole_lines = new_text.is_empty() && {
+            // The start of a host line, or of a region line after its
+            // host prefix (a blockquote's `> `).
+            let mut start = range.start;
+            super::translation::translate_host_position_to_virtual(&mut start, &unprepared);
+            range.start.character == 0 || range.start.line >= offset.line() && start.character == 0
+        };
+        !(breaks_line || whole_lines)
+    })
+}
+
+/// Whether any edit to `host_uri` reaches into a gap of the prepared
+/// document `offset` describes (in host coordinates).
+fn host_edits_touch_gaps(edit: &WorkspaceEdit, host_uri: &Uri, offset: &RegionOffset) -> bool {
+    let Some(prepared) = offset.prepared() else {
+        return false;
+    };
+    let unprepared = offset.unprepared();
+    let gaps: Vec<Range> = prepared
+        .virtual_gap_ranges()
+        .map(|mut gap| {
+            super::translation::translate_virtual_range_to_host(&mut gap, &unprepared);
+            gap
+        })
+        .collect();
+    let touches = |range: &Range| {
+        gaps.iter().any(|gap| {
+            if range.start == range.end {
+                gap.start < range.start && range.start < gap.end
+            } else {
+                gap.start < range.end && range.start < gap.end
+            }
+        })
+    };
+    host_edit_ranges(edit, host_uri).any(touches)
+}
+
+/// Whether the edits a `WorkspaceEdit` makes to `host_uri` overlap, in
+/// `changes` or in `documentChanges`: they are alternatives (a client
+/// applies `documentChanges` when it supports them, `changes` otherwise),
+/// so an edit in one never meets an edit in the other.
+fn host_edits_overlap(edit: &WorkspaceEdit, host_uri: &Uri) -> bool {
+    let overlap = |ranges: Vec<&Range>| {
+        let mut ranges = ranges;
+        ranges.sort_by_key(|range| (range.start, range.end));
+        ranges.windows(2).any(|pair| pair[0].end > pair[1].start)
+    };
+    let (changes, entries) = host_text_edits_by_kind(edit, host_uri);
+    // Each `documentChanges` entry applies to the text the ones before it
+    // left: only the edits of one entry are simultaneous.
+    overlap(changes.map(|(range, _)| range).collect())
+        || entries
+            .iter()
+            .any(|entry| overlap(entry.iter().map(|(range, _)| *range).collect()))
+}
+
+/// The range and new text of every edit a `WorkspaceEdit` makes to
+/// `host_uri`.
+fn host_text_edits<'a>(
+    edit: &'a WorkspaceEdit,
+    host_uri: &'a Uri,
+) -> impl Iterator<Item = (&'a Range, &'a str)> {
+    let (changes, entries) = host_text_edits_by_kind(edit, host_uri);
+    changes.chain(entries.into_iter().flatten())
+}
+
+/// An edit's range and new text.
+type HostEdit<'a> = (&'a Range, &'a str);
+
+/// [`host_text_edits`], those in `changes` apart from those in
+/// `documentChanges`, kept per entry (applied in order).
+fn host_text_edits_by_kind<'a>(
+    edit: &'a WorkspaceEdit,
+    host_uri: &'a Uri,
+) -> (impl Iterator<Item = HostEdit<'a>>, Vec<Vec<HostEdit<'a>>>) {
+    let changes = edit
+        .changes
+        .as_ref()
+        .and_then(|changes| changes.get(host_uri))
+        .into_iter()
+        .flatten()
+        .map(|edit| (&edit.range, edit.new_text.as_str()));
+    let document_edits: Vec<&TextDocumentEdit> = match &edit.document_changes {
+        None => Vec::new(),
+        Some(DocumentChanges::Edits(edits)) => edits.iter().collect(),
+        Some(DocumentChanges::Operations(ops)) => ops
+            .iter()
+            .filter_map(|op| match op {
+                DocumentChangeOperation::Edit(edit) => Some(edit),
+                DocumentChangeOperation::Op(_) => None,
+            })
+            .collect(),
+    };
+    let entries = document_edits
+        .into_iter()
+        .filter(|document_edit| &document_edit.text_document.uri == host_uri)
+        .map(|document_edit| {
+            document_edit
+                .edits
+                .iter()
+                .map(|one_of| match one_of {
+                    OneOf::Left(text_edit) => (&text_edit.range, text_edit.new_text.as_str()),
+                    OneOf::Right(annotated) => (
+                        &annotated.text_edit.range,
+                        annotated.text_edit.new_text.as_str(),
+                    ),
+                })
+                .collect()
+        })
+        .collect();
+    (changes, entries)
+}
+
+/// The ranges of every edit a `WorkspaceEdit` makes to `host_uri`.
+fn host_edit_ranges<'a>(
+    edit: &'a WorkspaceEdit,
+    host_uri: &'a Uri,
+) -> impl Iterator<Item = &'a Range> {
+    host_text_edits(edit, host_uri).map(|(range, _)| range)
+}
+
+/// Rewrite every edit to the request's (prepared) virtual document into
+/// virtual-document coordinates. `false` when any edit is refused.
+fn request_edits_to_virtual(
+    edit: &mut WorkspaceEdit,
+    request_virtual_uri: &str,
+    prepared: &super::prepare::PreparedMap,
+) -> bool {
+    // One document's plain edits are replayed together, through the
+    // prepared text: mapped one by one, adjacent edits at a dedented line
+    // could both claim its removed indent and overlap. Their extents keep off
+    // the gaps as sent — the diff would let an edit spanning a gap through as
+    // long as it rewrote the gap's replacement unchanged. Annotated edits
+    // must keep their identity, so they map with their extents, as a set
+    // that must keep apart.
+    use super::prepare::EditMode;
+    let rewrite_set = |edits: &mut Vec<TextEdit>| match prepared.map_edits(edits, EditMode::Replay)
+    {
+        Some(mapped) => {
+            *edits = mapped;
+            true
+        }
+        None => false,
+    };
+    let rewrite_document_edit = |document_edit: &mut TextDocumentEdit| {
+        if document_edit.text_document.uri.as_str() != request_virtual_uri {
+            return true;
+        }
+        if document_edit
+            .edits
+            .iter()
+            .all(|one_of| matches!(one_of, OneOf::Left(_)))
+        {
+            let mut edits: Vec<TextEdit> = document_edit
+                .edits
+                .drain(..)
+                .filter_map(|one_of| match one_of {
+                    OneOf::Left(text_edit) => Some(text_edit),
+                    OneOf::Right(_) => None,
+                })
+                .collect();
+            let mapped = rewrite_set(&mut edits);
+            document_edit.edits = edits.into_iter().map(OneOf::Left).collect();
+            return mapped;
+        }
+        let edits: Vec<TextEdit> = document_edit
+            .edits
+            .iter()
+            .map(|one_of| match one_of {
+                OneOf::Left(text_edit) => text_edit.clone(),
+                OneOf::Right(annotated) => annotated.text_edit.clone(),
+            })
+            .collect();
+        let Some(mapped) = prepared.map_edits(&edits, EditMode::Extent) else {
+            return false;
+        };
+        for (one_of, mapped) in document_edit.edits.iter_mut().zip(mapped) {
+            match one_of {
+                OneOf::Left(text_edit) => *text_edit = mapped,
+                OneOf::Right(annotated) => annotated.text_edit = mapped,
+            }
+        }
+        true
+    };
+    let changes_ok = edit.changes.as_mut().is_none_or(|changes| {
+        changes
+            .iter_mut()
+            .filter(|(uri, _)| uri.as_str() == request_virtual_uri)
+            .all(|(_, edits)| rewrite_set(edits))
+    });
+    let document_changes_ok = match &mut edit.document_changes {
+        None => true,
+        Some(DocumentChanges::Edits(edits)) => edits.iter_mut().all(rewrite_document_edit),
+        Some(DocumentChanges::Operations(ops)) => ops.iter_mut().all(|op| match op {
+            DocumentChangeOperation::Edit(document_edit) => rewrite_document_edit(document_edit),
+            DocumentChangeOperation::Op(_) => true,
+        }),
+    };
+    changes_ok && document_changes_ok
 }
 
 /// Whether a `WorkspaceEdit` contains at least one actual change.
@@ -556,6 +906,536 @@ mod tests {
 
     fn parse_workspace_edit(value: serde_json::Value) -> WorkspaceEdit {
         serde_json::from_value(value).unwrap()
+    }
+
+    /// `x = ${a}` prepared as `x = None` (a gap placeholder), at host line 10.
+    fn interpolated_offset() -> RegionOffset {
+        use super::super::prepare::{SegmentKind, VirtualLayout, apply_prepare_result};
+        let virtual_text = "x =     \n";
+        let layout = VirtualLayout::from_pieces(
+            virtual_text,
+            [
+                (SegmentKind::Content, 0..4, String::new()),
+                (SegmentKind::Gap, 4..8, "${a}".to_string()),
+                (SegmentKind::Content, 8..9, String::new()),
+            ],
+        );
+        let result = serde_json::from_value(json!({"segments": [
+            {"type": "content"}, {"type": "gap", "content": "None"}, {"type": "content"}
+        ]}))
+        .unwrap();
+        let prepared = apply_prepare_result(virtual_text, &layout, Some(result)).unwrap();
+        RegionOffset::new(10, 0).with_prepared(prepared.map)
+    }
+
+    fn rename_of(virtual_uri: &str, start: u32, end: u32) -> WorkspaceEdit {
+        parse_workspace_edit(json!({
+            "changes": { virtual_uri: [{
+                "range": {
+                    "start": { "line": 0, "character": start },
+                    "end": { "line": 0, "character": end }
+                },
+                "newText": "y"
+            }]}
+        }))
+    }
+
+    #[test]
+    fn prepared_edits_map_through_the_prepared_document() {
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let mut edit = rename_of(&virtual_uri, 0, 1);
+        assert!(transform_workspace_edit_to_host(
+            &mut edit,
+            &virtual_uri,
+            &host_uri,
+            &interpolated_offset(),
+        ));
+        let edits = &edit.changes.unwrap()[&host_uri];
+        assert_eq!(edits[0].range.start, Position::new(10, 0));
+        assert_eq!(edits[0].range.end, Position::new(10, 1));
+    }
+
+    #[test]
+    fn adjacent_prepared_line_edits_map_as_one_set() {
+        use super::super::prepare::{VirtualLayout, apply_prepare_result};
+        let virtual_text = "  a\n  b\n  c\n";
+        let result = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(result),
+        )
+        .unwrap();
+        let offset = RegionOffset::new(0, 0).with_prepared(prepared.map);
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        // Two adjacent line deletions: mapped one by one, both would claim
+        // `b`'s removed indent.
+        let mut edit = parse_workspace_edit(json!({
+            "changes": { virtual_uri.clone(): [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""},
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""}
+            ]}
+        }));
+        assert!(transform_workspace_edit_to_host(
+            &mut edit,
+            &virtual_uri,
+            &host_uri,
+            &offset,
+        ));
+        let edits = &edit.changes.unwrap()[&host_uri];
+        let mut ranges: Vec<_> = edits.iter().map(|edit| edit.range).collect();
+        ranges.sort_by_key(|range| (range.start, range.end));
+        assert!(ranges.windows(2).all(|pair| pair[0].end <= pair[1].start));
+        let mut text = virtual_text.to_string();
+        let mut sorted: Vec<_> = edits.iter().collect();
+        sorted.sort_by_key(|edit| std::cmp::Reverse(edit.range.start));
+        for edit in sorted {
+            let offset_of = |position: Position| {
+                text.split_inclusive('\n')
+                    .take(position.line as usize)
+                    .map(str::len)
+                    .sum::<usize>()
+                    + position.character as usize
+            };
+            let (start, end) = (offset_of(edit.range.start), offset_of(edit.range.end));
+            text.replace_range(start..end, &edit.new_text);
+        }
+        assert_eq!(text, "  c\n");
+    }
+
+    #[test]
+    fn prepared_edits_overlapping_host_edits_refuse_the_whole_edit() {
+        use super::super::prepare::{VirtualLayout, apply_prepare_result};
+        let virtual_text = "  a\n";
+        let result = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(result),
+        )
+        .unwrap();
+        let offset = RegionOffset::new(0, 0).with_prepared(prepared.map);
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        // The server also edits the host's indentation directly; the virtual
+        // edit, clearing the dedented line, maps over that indent.
+        let mut edit = parse_workspace_edit(json!({
+            "changes": {
+                virtual_uri.clone(): [
+                    {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "newText": ""}
+                ],
+                host_uri.as_str(): [
+                    {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": "\t"}
+                ]
+            }
+        }));
+        assert!(!transform_workspace_edit_to_host(
+            &mut edit,
+            &virtual_uri,
+            &host_uri,
+            &offset,
+        ));
+    }
+
+    #[test]
+    fn mapped_and_direct_host_edits_together_keep_a_hidden_line_break_apart() {
+        use super::super::prepare::{VirtualLayout, apply_prepare_result};
+        // `\rab\n`, its lone-CR leading line deleted: `ab\n`.
+        let virtual_text = "\rab\n";
+        let result = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(result),
+        )
+        .unwrap();
+        let offset = RegionOffset::new(0, 0).with_prepared(prepared.map);
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let edit = |host_text: &str| {
+            parse_workspace_edit(json!({
+                "changes": {
+                    // `a`, through the prepared document…
+                    virtual_uri.clone(): [
+                        {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "newText": ""}
+                    ],
+                    // …and `b`, on the host directly.
+                    host_uri.as_str(): [
+                        {"range": {"start": {"line": 1, "character": 1}, "end": {"line": 1, "character": 2}}, "newText": host_text}
+                    ]
+                }
+            }))
+        };
+        // Both deleted: the hidden CR meets the LF.
+        assert!(!transform_workspace_edit_to_host(
+            &mut edit(""),
+            &virtual_uri,
+            &host_uri,
+            &offset,
+        ));
+        assert!(transform_workspace_edit_to_host(
+            &mut edit("y"),
+            &virtual_uri,
+            &host_uri,
+            &offset,
+        ));
+    }
+
+    #[test]
+    fn a_direct_host_edit_with_overlong_columns_is_clamped_into_the_region() {
+        use super::super::prepare::{VirtualLayout, apply_prepare_result};
+        // `\n\nabc`, both leading blank lines deleted by the peer.
+        let virtual_text = "\n\nabc";
+        let result = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(result),
+        )
+        .unwrap();
+        let offset = RegionOffset::new(0, 0).with_prepared(prepared.map);
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        // A client clamps both ends to their lines' ends: it deletes a hidden
+        // blank line.
+        let mut edit = parse_workspace_edit(json!({
+            "changes": { host_uri.as_str(): [
+                {"range": {"start": {"line": 0, "character": 100}, "end": {"line": 1, "character": 100}}, "newText": ""}
+            ]}
+        }));
+        assert!(!transform_workspace_edit_to_host(
+            &mut edit,
+            &virtual_uri,
+            &host_uri,
+            &offset,
+        ));
+    }
+
+    #[test]
+    fn a_direct_host_edit_meeting_a_prepared_region_at_its_edge_is_not_in_it() {
+        use super::super::prepare::{VirtualLayout, apply_prepare_result};
+        let virtual_text = "  a\n";
+        let result = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(result),
+        )
+        .unwrap();
+        // The region starts on line 1, after its opening fence.
+        let offset = RegionOffset::new(1, 0).with_prepared(prepared.map);
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let mut edit = parse_workspace_edit(json!({
+            "changes": { host_uri.as_str(): [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": "~~~lua\n"}
+            ]}
+        }));
+        assert!(transform_workspace_edit_to_host(
+            &mut edit,
+            &virtual_uri,
+            &host_uri,
+            &offset,
+        ));
+    }
+
+    #[rstest::rstest]
+    #[case::hidden_lone_cr_line("\rab\n", 2)]
+    #[case::hidden_lf_line("\nabc", 1)]
+    fn a_direct_host_edit_over_a_hidden_edge_line_is_refused(
+        #[case] virtual_text: &str,
+        #[case] end_line: u32,
+    ) {
+        use super::super::prepare::{VirtualLayout, apply_prepare_result};
+        // The leading line deleted by the peer.
+        let result = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(result),
+        )
+        .unwrap();
+        let offset = RegionOffset::new(0, 0).with_prepared(prepared.map);
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let mut edit = parse_workspace_edit(json!({
+            "changes": { host_uri.as_str(): [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": end_line, "character": 0}}, "newText": ""}
+            ]}
+        }));
+        assert!(!transform_workspace_edit_to_host(
+            &mut edit,
+            &virtual_uri,
+            &host_uri,
+            &offset,
+        ));
+    }
+
+    #[rstest::rstest]
+    // The closing line's indent, deleted with the closing blank line: edge
+    // text, refused.
+    #[case::closing_indent((2, 0), (2, 2), false)]
+    #[case::insertion_inside_the_closing_indent((2, 1), (2, 1), false)]
+    // A content line's dedent: editable.
+    #[case::content_dedent((0, 0), (0, 2), true)]
+    fn a_direct_host_edit_over_the_deleted_closing_indent_is_refused(
+        #[case] start: (u32, u32),
+        #[case] end: (u32, u32),
+        #[case] kept: bool,
+    ) {
+        use super::super::prepare::{VirtualLayout, apply_prepare_result};
+        let virtual_text = "  a\n\n  ";
+        let result = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""},
+            {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(result),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "a\n");
+        let offset = RegionOffset::new(0, 0).with_prepared(prepared.map);
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let mut edit = parse_workspace_edit(json!({
+            "changes": { host_uri.as_str(): [
+                {"range": {"start": {"line": start.0, "character": start.1}, "end": {"line": end.0, "character": end.1}}, "newText": "X"}
+            ]}
+        }));
+        assert_eq!(
+            transform_workspace_edit_to_host(&mut edit, &virtual_uri, &host_uri, &offset),
+            kept
+        );
+    }
+
+    #[test]
+    fn document_changes_entries_of_a_prepared_edit_apply_in_order() {
+        use super::super::prepare::{VirtualLayout, apply_prepare_result};
+        let virtual_text = "  a\n  b\n";
+        let result = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(result),
+        )
+        .unwrap();
+        // The region starts on line 1, after its opening fence.
+        let offset = RegionOffset::new(1, 0).with_prepared(prepared.map);
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let entry = |line: u32, start: u32, end: u32, text: &str| {
+            json!({
+                "textDocument": {"uri": host_uri.as_str(), "version": null},
+                "edits": [{"range": {"start": {"line": line, "character": start}, "end": {"line": line, "character": end}}, "newText": text}]
+            })
+        };
+        // The fence rewritten twice, one entry after the other: no overlap.
+        let mut fence = parse_workspace_edit(json!({
+            "documentChanges": [entry(0, 0, 3, "def"), entry(0, 0, 3, "ghi")]
+        }));
+        assert!(transform_workspace_edit_to_host(
+            &mut fence,
+            &virtual_uri,
+            &host_uri,
+            &offset,
+        ));
+        // An entry shifting the region (a line inserted before it) ahead of
+        // one reaching into it, translated through the region's place before
+        // the shift: refused.
+        let mut shifted = parse_workspace_edit(json!({
+            "documentChanges": [entry(0, 0, 0, "new line\n"), entry(1, 2, 3, "x")]
+        }));
+        assert!(!transform_workspace_edit_to_host(
+            &mut shifted,
+            &virtual_uri,
+            &host_uri,
+            &offset,
+        ));
+        // Two entries reaching into the region, each applying to what the
+        // one before left: not checked as one set, so refused.
+        let mut region = parse_workspace_edit(json!({
+            "documentChanges": [entry(1, 2, 3, "x"), entry(2, 2, 3, "y")]
+        }));
+        assert!(!transform_workspace_edit_to_host(
+            &mut region,
+            &virtual_uri,
+            &host_uri,
+            &offset,
+        ));
+    }
+
+    #[test]
+    fn the_same_prepared_edit_in_both_representations_is_no_overlap() {
+        use super::super::prepare::{VirtualLayout, apply_prepare_result};
+        let virtual_text = "  a\n";
+        let result = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(result),
+        )
+        .unwrap();
+        let offset = RegionOffset::new(0, 0).with_prepared(prepared.map);
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        // A rename sending its edit both ways: a client applies one of them.
+        let rename = json!([
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "newText": "b"}
+        ]);
+        let mut edit = parse_workspace_edit(json!({
+            "changes": { virtual_uri.clone(): rename },
+            "documentChanges": [{
+                "textDocument": {"uri": virtual_uri.clone(), "version": null},
+                "edits": rename
+            }]
+        }));
+        assert!(transform_workspace_edit_to_host(
+            &mut edit,
+            &virtual_uri,
+            &host_uri,
+            &offset,
+        ));
+    }
+
+    #[test]
+    fn a_host_edit_into_a_prepared_gap_refuses_the_whole_edit() {
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let host_edit = |line: u32, start: u32, end: u32| {
+            parse_workspace_edit(json!({
+                "changes": { host_uri.as_str(): [{
+                    "range": {
+                        "start": { "line": line, "character": start },
+                        "end": { "line": line, "character": end }
+                    },
+                    "newText": "BROKEN"
+                }]}
+            }))
+        };
+        // `${a}` sits at host (10, 4)..(10, 8).
+        let mut into_gap = host_edit(10, 5, 6);
+        assert!(!transform_workspace_edit_to_host(
+            &mut into_gap,
+            &virtual_uri,
+            &host_uri,
+            &interpolated_offset(),
+        ));
+        let mut elsewhere = host_edit(20, 0, 1);
+        assert!(transform_workspace_edit_to_host(
+            &mut elsewhere,
+            &virtual_uri,
+            &host_uri,
+            &interpolated_offset(),
+        ));
+    }
+
+    #[test]
+    fn a_prepared_edit_touching_a_gap_refuses_the_whole_edit() {
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        // Renaming the placeholder `None` would overwrite `${a}` in the host.
+        let mut edit = rename_of(&virtual_uri, 4, 8);
+        assert!(!transform_workspace_edit_to_host(
+            &mut edit,
+            &virtual_uri,
+            &host_uri,
+            &interpolated_offset(),
+        ));
+    }
+
+    #[test]
+    fn a_host_edit_joining_a_line_onto_a_gap_refuses_the_whole_edit() {
+        use super::super::prepare::{SegmentKind, VirtualLayout, apply_prepare_result};
+        // `foo()` and `bar()` in two combined blocks at host line 10; the
+        // closing fence, prose and opening fence between them are a gap
+        // starting host line 11.
+        let virtual_text = "foo()\n\n\n\nbar()\n";
+        let layout = VirtualLayout::from_pieces(
+            virtual_text,
+            [
+                (SegmentKind::Content, 0..6, String::new()),
+                (SegmentKind::Gap, 6..9, "```\ntext\n```lua\n".to_string()),
+                (SegmentKind::Content, 9..15, String::new()),
+            ],
+        );
+        let prepared = apply_prepare_result(virtual_text, &layout, None).unwrap();
+        let offset = RegionOffset::new(10, 0).with_prepared(prepared.map);
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let host_edit = |start: (u32, u32), end: (u32, u32), new_text: &str| {
+            parse_workspace_edit(json!({
+                "changes": { host_uri.as_str(): [{
+                    "range": {
+                        "start": { "line": start.0, "character": start.1 },
+                        "end": { "line": end.0, "character": end.1 }
+                    },
+                    "newText": new_text
+                }]}
+            }))
+        };
+        let accepts = |mut edit: WorkspaceEdit| {
+            transform_workspace_edit_to_host(&mut edit, &virtual_uri, &host_uri, &offset)
+        };
+        assert!(!accepts(host_edit((10, 5), (11, 0), "")), "foo()```");
+        assert!(!accepts(host_edit((11, 0), (11, 0), ";")), ";```");
+        assert!(accepts(host_edit((10, 0), (11, 0), "")), "whole line");
+        assert!(accepts(host_edit((11, 0), (11, 0), "baz()\n")), "own line");
+    }
+
+    #[test]
+    fn a_prepared_edit_spanning_a_gap_unchanged_refuses_the_whole_edit() {
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        // `x = None` → `y = None` as one edit over the placeholder: the
+        // server rewrote the text standing for `${a}`, even if unchanged.
+        let mut edit = parse_workspace_edit(json!({
+            "changes": { virtual_uri.clone(): [{
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 0, "character": 8 }
+                },
+                "newText": "y = None"
+            }]}
+        }));
+        assert!(!transform_workspace_edit_to_host(
+            &mut edit,
+            &virtual_uri,
+            &host_uri,
+            &interpolated_offset(),
+        ));
     }
 
     #[test]

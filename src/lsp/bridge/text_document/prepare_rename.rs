@@ -18,7 +18,8 @@ use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::translate_virtual_range_to_host;
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request,
-    host_position_within_region_bounds, response_has_jsonrpc_error,
+    host_position_in_removed_edge_lines, host_position_within_region_bounds,
+    response_has_jsonrpc_error,
 };
 
 impl LanguageServerPool {
@@ -58,7 +59,11 @@ impl LanguageServerPool {
                 // enforces: a caret outside the region's content is not
                 // renameable-at-position, and a phantom DefaultBehavior would
                 // win preferred aggregation over real lower-priority results.
-                if !host_position_within_region_bounds(host_position, &offset, region_end) {
+                // Nor is a caret on a blank line the prepare peer deleted,
+                // where the rename itself would be aborted.
+                if !host_position_within_region_bounds(host_position, &offset, region_end)
+                    || host_position_in_removed_edge_lines(host_position, &offset)
+                {
                     return Ok(None);
                 }
                 return Ok(Some(PrepareRenameResponse::DefaultBehavior {

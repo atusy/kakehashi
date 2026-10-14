@@ -41,7 +41,10 @@ use tower_lsp_server::ls_types::{
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
-use super::super::protocol::translate_virtual_range_to_host;
+use super::super::protocol::{
+    EditMode, apply_text_edits_clamped, restore_joined_layout, translate_virtual_range_to_host,
+    translate_virtual_text_edits_to_host,
+};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, region_host_end,
     response_has_jsonrpc_error, text_edit_safe_in_region,
@@ -220,6 +223,41 @@ fn keep_edge_layout(
     // boundary within `virtual_content`, so a position always exists today.
     // Should one not, the answer passes as received rather than being lost.
     replacement_between(virtual_content, &restored).map_or(edits, |edit| vec![edit])
+}
+
+/// [`keep_edge_layout`] for a prepared document: the edge layout of each
+/// string `prepared_text` joins (see [`restore_joined_layout`]) is restored,
+/// and the answer becomes one replacement of the prepared text, which the
+/// prepared map diffs back anyway. Edits that do not apply in order pass as
+/// received, for the map to refuse.
+fn keep_prepared_edge_layout(
+    edits: Vec<TextEdit>,
+    prepared_text: &str,
+    map: &super::super::protocol::PreparedMap,
+    offset: &RegionOffset,
+) -> Vec<TextEdit> {
+    if edits.is_empty() {
+        return edits;
+    }
+    let Some(formatted) = apply_text_edits_clamped(prepared_text, &edits) else {
+        return edits;
+    };
+    let restored = restore_joined_layout(
+        prepared_text,
+        &formatted,
+        map.emptied_gap_offsets(),
+        offset.opens_mid_line(),
+    );
+    if restored == formatted {
+        return edits;
+    }
+    let end = PositionMapper::new(prepared_text)
+        .byte_to_position(prepared_text.len())
+        .unwrap_or_default();
+    vec![TextEdit {
+        range: Range::new(Position::new(0, 0), end),
+        new_text: restored,
+    }]
 }
 
 /// Whether every edit starts after the first character of `text`'s content
@@ -648,12 +686,38 @@ fn transform_formatting_style_response(
         return Ok(Vec::new());
     }
 
-    if keep_edges {
-        edits = keep_edge_layout(edits, virtual_content, offset);
-    }
-
-    for edit in &mut edits {
-        translate_virtual_range_to_host(&mut edit.range, offset);
+    match offset.prepared() {
+        // The server formatted the prepared text: its answer goes back
+        // through the prepared map, which restores dedented indentation and
+        // refuses an answer rewriting host-owned text (a gap). The deleted
+        // edge lines stay in the host; the edges kept are the prepared
+        // text's, per string it joins. A refused answer fails the request
+        // (the CLI reports it), unlike the malformed answers dropped below:
+        // the server did its job, and the region is left unformatted only
+        // because its result would rewrite the host.
+        Some(map) => {
+            if keep_edges {
+                edits = keep_prepared_edge_layout(edits, virtual_content, map, offset);
+            }
+            edits = translate_virtual_text_edits_to_host(edits, offset, EditMode::Formatting)
+                .ok_or_else(|| {
+                    warn!(
+                        target: "kakehashi::bridge",
+                        "Refused a formatting response: it edits host-owned text of a prepared virtual document"
+                    );
+                    io::Error::other(
+                        "formatting response edits host-owned text of a prepared virtual document",
+                    )
+                })?;
+        }
+        None => {
+            if keep_edges {
+                edits = keep_edge_layout(edits, virtual_content, offset);
+            }
+            for edit in &mut edits {
+                translate_virtual_range_to_host(&mut edit.range, offset);
+            }
+        }
     }
 
     // Clamp positions past the end of the last content line into the region:
@@ -1649,6 +1713,74 @@ mod tests {
                 .map(|edit| edit.new_text.as_str())
                 .collect::<Vec<_>>(),
             ["x", "y"]
+        );
+    }
+
+    /// A Nix `''` string's JSON at host line 0, column 5, dedented by the
+    /// prepare peer: its virtual and host text, and the offset with the map.
+    fn prepared_nix_json() -> (&'static str, RegionOffset) {
+        use super::super::super::protocol::{VirtualLayout, apply_prepare_result};
+        let virtual_content = "\n    {\"a\":1}\n  ";
+        let result = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 4}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_content,
+            &VirtualLayout::single(virtual_content),
+            Some(result),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "\n{\"a\":1}\n  ");
+        (
+            virtual_content,
+            RegionOffset::new(0, 5).with_prepared(prepared.map),
+        )
+    }
+
+    /// `virtual_content` (a region at host line 0, column 5) with host
+    /// `edits` applied.
+    fn apply_host_edits(virtual_content: &str, edits: &[TextEdit]) -> String {
+        let unprepared = RegionOffset::new(0, 5);
+        let virtual_edits: Vec<TextEdit> = edits
+            .iter()
+            .map(|edit| {
+                let mut range = edit.range;
+                super::super::super::protocol::translate_host_range_to_virtual(
+                    &mut range,
+                    &unprepared,
+                );
+                TextEdit {
+                    range,
+                    new_text: edit.new_text.clone(),
+                }
+            })
+            .collect();
+        crate::text::edit::apply_text_edits(virtual_content, &virtual_edits)
+    }
+
+    #[test]
+    fn a_prepared_region_keeps_its_edges_through_a_whole_document_answer() {
+        // jsonls drops the line break after `''` and the closing indentation
+        // of the prepared text it formatted.
+        let (virtual_content, offset) = prepared_nix_json();
+        let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [
+            { "range": { "start": { "line": 0, "character": 0 },
+                         "end": { "line": 2, "character": 2 } },
+              "newText": "{\n  \"a\": 1\n}" }
+        ]});
+
+        let edits = transform_formatting_response_to_host(
+            response,
+            &offset,
+            "\n{\"a\":1}\n  ",
+            region_host_end(virtual_content, &offset.unprepared()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            apply_host_edits(virtual_content, &edits),
+            "\n    {\n      \"a\": 1\n    }\n  "
         );
     }
 

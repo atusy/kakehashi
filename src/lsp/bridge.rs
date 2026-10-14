@@ -36,6 +36,11 @@ mod inbound_request_registry;
 mod peer;
 mod pool;
 pub(crate) use pool::{HostLanguageAdmission, INIT_TIMEOUT_SECS};
+mod prepare_registry;
+pub(crate) use prepare_registry::{
+    PrepareInput, PrepareLookup, PrepareMiss, PrepareTarget, Resync,
+    retry_delay as prepare_retry_delay,
+};
 mod progress_registry;
 mod protocol;
 mod root_markers;
@@ -59,6 +64,8 @@ pub(crate) use client_progress::{
     ClientProgressAggregator, ClientProgressDeregisterGuard, ClientProgressRegistry,
 };
 pub(crate) use coordinator::BridgeCoordinator;
+#[cfg(test)]
+pub(crate) use coordinator::HeldPresentation;
 pub(crate) use coordinator::ResolvedServerConfig;
 pub(crate) use envelope::HostRevision;
 pub(crate) use inbound_request_registry::InboundRequestRegistry;
@@ -67,6 +74,8 @@ pub use pool::LanguageServerPool;
 /// The re-open budget, shared so the server-side handler bounds its work by the
 /// same value requests wait on (execute-command-routing-token).
 pub(crate) use pool::REOPEN_WAIT;
+#[cfg(test)]
+pub(crate) use pool::SentText;
 pub(crate) use pool::UpstreamId;
 /// Re-exported for the capability-prefilter regression test in `lsp_impl`, which
 /// seeds a `Ready` downstream to exercise `collect_push_diagnostics`' filter.
@@ -88,6 +97,12 @@ pub(crate) use protocol::translate_virtual_range_to_host;
 pub(crate) use protocol::workspace_edit_has_effect;
 pub(crate) use protocol::workspace_edit_preserves_line_prefixes;
 pub(crate) use protocol::workspace_edit_within_region;
+pub(crate) use protocol::{
+    EditMode, PreparedDocument, PreparedMap, restore_joined_layout,
+    translate_virtual_text_edits_to_host,
+};
+#[cfg(test)]
+pub(crate) use protocol::{VirtualLayout, apply_prepare_result};
 pub(crate) use text_document::completion_item::CompletionResolveDocument;
 pub(crate) use text_document::host::HostResolveSnapshot;
 pub(crate) use text_document::host::{HostDocument, HostTextReader, normalize_host_goto_result};

@@ -39,6 +39,7 @@ pub(in crate::lsp::bridge) fn is_scratch_publish_diagnostics(message: &serde_jso
 pub(in crate::lsp::bridge) fn forward_push(
     mut message: serde_json::Value,
     deps: &crate::lsp::bridge::actor::ServerRequestDeps,
+    received: u64,
 ) {
     // The server name keys the cache slot; production always sets it (readers are
     // spawned with `Some(server_name)`). Check it by reference up front so a push
@@ -64,6 +65,12 @@ pub(in crate::lsp::bridge) fn forward_push(
     let Some(serde_json::Value::String(uri)) = params.remove("uri") else {
         return;
     };
+    // The document version the server computed these for, when it says
+    // (LSP: optional): what tells a push for an earlier text.
+    let version = params
+        .get("version")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|version| i32::try_from(version).ok());
     // Deserialize the moved-out diagnostics value (no clone) — `from_value` moves
     // the diagnostics' owned strings. A parse failure (including an absent or
     // non-array `diagnostics`) is *dropped* (not treated as an empty/clearing push,
@@ -85,11 +92,20 @@ pub(in crate::lsp::bridge) fn forward_push(
         }
     };
 
+    // Stamped as read, before the push waits in the upstream channel: a send
+    // queued meanwhile must not make it read as computed for newer text.
+    let held = crate::lsp::bridge::protocol::VirtualDocumentUri::is_virtual_uri(&uri)
+        .then(|| {
+            deps.document_tracker
+                .held_stamp(&uri, &deps.connection_key, version, received)
+        })
+        .flatten();
     let _ = deps.upstream_tx.send(
         crate::lsp::bridge::actor::UpstreamNotification::PublishDiagnostics {
             uri,
             server: server_name.to_owned(),
             connection_id: deps.progress_connection_id,
+            held,
             diagnostics,
         },
     );

@@ -382,6 +382,7 @@ pub(super) async fn apply_shared_settings_locked(
         (None, false) => {}
     }
     let settings = settings_manager.load_settings();
+    bridge.prune_prepared(&settings, crate::experimental::enabled(), reload_languages);
     // Update the reader-side copy before propagating downstream settings so a
     // newly suppressed log cannot occupy the bounded window queue after this
     // configuration application completes.
@@ -404,6 +405,11 @@ pub(super) async fn apply_shared_settings_locked(
     // At initialize time there are no connections yet, so it is a clean no-op
     // (downstream-settings-propagation).
     let pushed = bridge.propagate_settings(&settings).await;
+    // Answers a peer gave between the prune above and its new runtime
+    // settings were prepared under the old ones.
+    if pushed > 0 {
+        bridge.invalidate_prepared_after_propagation();
+    }
     // After propagation, not before: propagation evicts connections whose
     // launch config changed, and a warm-up started ahead of it would be
     // spawned only to be torn down by the same reload. Every settings

@@ -1,0 +1,1967 @@
+//! Answers to `kakehashi/virtualDocument/prepare`: cache, single flight and
+//! retries.
+//!
+//! Every path that hands a virtual document to downstream servers — the
+//! didOpen/didChange pass, requests, the one-shot CLI — looks its prepared
+//! form up here by the exact input it was built from (virtual text, gaps,
+//! host language and the candidate servers' launch configs), so one input
+//! gets one answer, shared by all of them.
+//!
+//! This registry only answers. What each server holds, and so which map its
+//! coordinates follow, is recorded by the paths that send, with the text
+//! (see the document tracker's `HeldText`).
+//!
+//! The lifecycle pass must not wait for the peer under the document's edit
+//! lock, so it only looks up: on a miss it starts the request and holds the
+//! document back, and the finished request asks for the host to be synced
+//! again ([`Resync`]). Requests wait for the answer instead.
+//!
+//! Every attempt runs on its own task, so a cancelled request cannot strand
+//! one half-done, and all waiters share it. An attempt that gets no answer
+//! from the peer it chose (it crashes, times out, or cancels) is retried
+//! with backoff by syncing the host again; one that gets an unusable answer
+//! is final for that input, as is one that finds no candidate to ask (the
+//! document is then sent as is). A candidate that cannot start is passed
+//! over, as one that does not advertise the request.
+
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::time::Duration;
+
+use dashmap::DashMap;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::time::Instant;
+use url::Url;
+
+use super::ResolvedServerConfig;
+use super::pool::LanguageServerPool;
+use super::protocol::{
+    PrepareHostTextDocument, PrepareParams, PrepareTextDocument, PreparedDocument,
+    VirtualDocumentUri, VirtualLayout, apply_prepare_result_at,
+};
+use crate::language::injection::VirtualGap;
+use crate::text::terminal::escape_terminal_controls;
+
+/// Answers kept per region besides the one the lifecycle pass holds its
+/// document on: enough for an undo, or a request on text an edit or two
+/// old, to find its answer without asking again.
+const SLOTS_PER_REGION: usize = 3;
+
+/// The servers that may prepare one (host, injection) pair's virtual
+/// documents, in priority order: the first of them advertising the request
+/// prepares each input (the `preferred` strategy).
+#[derive(Debug, Clone)]
+pub(crate) struct PrepareTarget {
+    pub(crate) candidates: Arc<[ResolvedServerConfig]>,
+    /// The settings the candidates were resolved from: a request's target
+    /// from settings a change has since replaced is not let in (see
+    /// [`PrepareRegistry::retain`]).
+    pub(crate) settings: Arc<crate::config::WorkspaceSettings>,
+}
+
+/// One virtual document to prepare.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PrepareInput<'a> {
+    pub(crate) host_uri: &'a Url,
+    pub(crate) host_language: &'a str,
+    pub(crate) injection_language: &'a str,
+    pub(crate) region_id: &'a str,
+    pub(crate) virtual_text: &'a str,
+    pub(crate) gaps: &'a [VirtualGap],
+}
+
+/// What a lookup found without waiting.
+#[derive(Debug, Clone)]
+pub(crate) enum PrepareLookup {
+    /// The document to send: prepared, or (without a map) as is, when no
+    /// candidate prepares it.
+    Ready(Arc<PreparedDocument>),
+    /// The peer could not prepare this input: send nothing.
+    Failed,
+    /// No answer yet: send nothing now; the host is synced again when it
+    /// arrives.
+    Pending,
+}
+
+/// Why waiting gave no document to send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrepareMiss {
+    /// No answer is in (yet): the attempt got none, or a retry is backing
+    /// off; a later one may bring it.
+    Unanswered,
+    /// The peer's answer was unusable, final for this input.
+    Failed,
+}
+
+/// `None` is an answer the peer gave unusably.
+type Outcome = Option<Arc<PreparedDocument>>;
+
+/// A host to sync again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Resync {
+    pub(crate) host_uri: Url,
+    /// A document held back became ready to send (rather than a retry
+    /// coming due, or an answer coming back unusable), so the host's
+    /// diagnostics are collected again too.
+    pub(crate) ready: bool,
+    /// The host's diagnostics are collected again too, dropping those
+    /// placed from a document's earlier text: one held back got an unusable
+    /// answer (it is no longer bridged), or what its servers are sent changed
+    /// otherwise (a peer's advertisement did).
+    pub(crate) recollect: bool,
+}
+
+/// The answer for one input, and the attempts to get it.
+#[derive(Default)]
+struct Cell {
+    /// Its answer was found outdated (an advertisement or runtime settings
+    /// changed): a request still holding it, waiting or not, takes it as
+    /// no answer.
+    revoked: AtomicBool,
+    /// The advertisement epoch its answer was checked against (see
+    /// `LanguageServerPool::prepare_advertised_epoch`), stored before the
+    /// answer: read under another epoch, the answer is outdated even before
+    /// it is revoked — every epoch move forgets every settled answer.
+    answered_epoch: std::sync::atomic::AtomicU64,
+    /// Where the input was first looked up in the presentation order (see
+    /// `protocol::next_presentation`): an answer to it is as new as its
+    /// virtual text, not as the moment it came.
+    taken: u64,
+    /// Set once an attempt got an answer.
+    outcome: std::sync::OnceLock<Outcome>,
+    /// An attempt is running.
+    in_flight: AtomicBool,
+    /// Attempts that got no answer, for the backoff.
+    misses: AtomicU32,
+    /// No new attempt before this, after a miss.
+    retry_at: std::sync::Mutex<Option<Instant>>,
+    /// Bumped after every attempt, answered or not.
+    attempts: tokio::sync::watch::Sender<u32>,
+    /// The `textDocument.version` of each attempt, in order.
+    #[cfg(test)]
+    versions: std::sync::Mutex<Vec<i32>>,
+}
+
+impl Cell {
+    /// The answer, if any, while it still stands at `epoch`; `Err` when it
+    /// is outdated. The answer is read once, before its epoch is: read after
+    /// a check that found none, an answer an old attempt published meanwhile
+    /// would be served unchecked. (Its epoch is stored before it, so read
+    /// after it, the epoch is its own.)
+    fn standing(&self, epoch: u64) -> Result<Option<&Outcome>, ()> {
+        let outcome = self.outcome.get();
+        if self.revoked.load(Ordering::Acquire)
+            || outcome.is_some() && self.answered_epoch.load(Ordering::Acquire) != epoch
+        {
+            return Err(());
+        }
+        Ok(outcome)
+    }
+
+    fn lookup(&self, epoch: u64) -> Option<PrepareLookup> {
+        self.standing(epoch).ok()?.map(|outcome| match outcome {
+            Some(prepared) => PrepareLookup::Ready(Arc::clone(prepared)),
+            None => PrepareLookup::Failed,
+        })
+    }
+
+    fn settled(&self, epoch: u64) -> Result<Arc<PreparedDocument>, PrepareMiss> {
+        match self.standing(epoch) {
+            Ok(Some(Some(prepared))) => Ok(Arc::clone(prepared)),
+            Ok(Some(None)) => Err(PrepareMiss::Failed),
+            Ok(None) | Err(()) => Err(PrepareMiss::Unanswered),
+        }
+    }
+
+    fn backing_off(&self) -> bool {
+        self.retry_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some_and(|retry_at| Instant::now() < retry_at)
+    }
+}
+
+/// Ends an attempt however its task ends — a panic included — so waiters
+/// wake and the next lookup may start another. Every release of a claim goes
+/// through it, a claim that ran no attempt included: a waiter that saw the
+/// claim waits for this bump.
+struct AttemptEnd(Arc<Cell>);
+
+impl Drop for AttemptEnd {
+    fn drop(&mut self) {
+        self.0.in_flight.store(false, Ordering::Release);
+        self.0.attempts.send_modify(|attempts| *attempts += 1);
+    }
+}
+
+/// One input's cell.
+#[derive(Clone)]
+struct Slot {
+    key: u64,
+    cell: Arc<Cell>,
+}
+
+/// One region's answers.
+struct Region {
+    /// The region this is for (the map key is their hash).
+    host_uri: String,
+    injection_language: String,
+    region_id: String,
+    /// The host language and candidates the lifecycle pass last looked the
+    /// region up under. Answers under other ones are not kept: the same
+    /// servers launched differently answer differently.
+    host_language: String,
+    candidates: Arc<[ResolvedServerConfig]>,
+    /// Most recently used first.
+    slots: Vec<Slot>,
+    /// The input the lifecycle pass holds the document on: only its answer
+    /// re-syncs the host, whoever started the attempt.
+    held: Option<u64>,
+}
+
+impl Region {
+    fn is(&self, host_uri: &str, injection_language: &str, region_id: &str) -> bool {
+        self.host_uri == host_uri
+            && self.injection_language == injection_language
+            && self.region_id == region_id
+    }
+
+    fn holds(&self, key: u64) -> bool {
+        self.held == Some(key)
+    }
+
+    fn has(&self, cell: &Arc<Cell>) -> bool {
+        self.slots.iter().any(|slot| Arc::ptr_eq(&slot.cell, cell))
+    }
+
+    fn held_slot(&self) -> Option<&Slot> {
+        let held = self.held?;
+        self.slots.iter().find(|slot| slot.key == held)
+    }
+}
+
+type Regions = DashMap<u64, Region>;
+
+/// Who looks a document up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Holder {
+    /// The lifecycle pass, which holds the document until the answer
+    /// re-syncs it.
+    LifecyclePass,
+    /// A request (or snapshot), which waits for the answer itself, or does
+    /// without: it never displaces what the lifecycle pass holds on.
+    Request,
+}
+
+pub(crate) struct PrepareRegistry {
+    /// Keyed by a hash of (host URI, injection language, region id), so a
+    /// lookup allocates nothing; the entry holds the identity it checks.
+    regions: Arc<Regions>,
+    /// Some region was ever looked up: until then every query answers "no
+    /// region" without touching the map, which the paths every bridged
+    /// region takes per edit rely on when nothing is prepared.
+    used: AtomicBool,
+    /// Source of `textDocument.version`: shared by all documents, so a
+    /// document forgotten and prepared again (a settings change, a reopen)
+    /// never repeats a version the peer saw.
+    next_revision: Arc<AtomicI32>,
+    /// The settings the last settings change pruned regions under (`None`
+    /// before any): a request resolved from other settings gets no slot.
+    pruned_under: arc_swap::ArcSwapOption<crate::config::WorkspaceSettings>,
+    resync_tx: UnboundedSender<Resync>,
+    resync_rx: std::sync::Mutex<Option<UnboundedReceiver<Resync>>>,
+}
+
+impl std::fmt::Debug for PrepareRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrepareRegistry")
+            .field("regions", &self.regions.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for PrepareRegistry {
+    fn default() -> Self {
+        let (resync_tx, resync_rx) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            regions: Arc::default(),
+            used: AtomicBool::new(false),
+            next_revision: Arc::new(AtomicI32::new(1)),
+            pruned_under: arc_swap::ArcSwapOption::empty(),
+            resync_tx,
+            resync_rx: std::sync::Mutex::new(Some(resync_rx)),
+        }
+    }
+}
+
+impl PrepareRegistry {
+    /// Whether no region was ever looked up (see `used`).
+    pub(crate) fn unused(&self) -> bool {
+        !self.used.load(Ordering::Acquire)
+    }
+
+    /// Queue `resync` again after `delay` — for a pass whose sends failed,
+    /// which nothing else would repeat. A shutdown drops it.
+    pub(crate) fn requeue_resync(&self, resync: Resync, delay: Duration) {
+        let resync_tx = self.resync_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = resync_tx.send(resync);
+        });
+    }
+
+    /// A sender of hosts to sync again, for others that find a host should be
+    /// (see [`Self::take_resync_rx`]).
+    pub(crate) fn resync_sender(&self) -> UnboundedSender<Resync> {
+        self.resync_tx.clone()
+    }
+
+    /// Hosts to sync again: a held-back virtual document became ready, its
+    /// answer came back unusable, or an attempt that got no answer finished
+    /// its retry backoff. Taken once by the server loop.
+    pub(crate) fn take_resync_rx(&self) -> Option<UnboundedReceiver<Resync>> {
+        self.resync_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// Look up for the lifecycle pass without waiting, which then holds the
+    /// document on this input; on a miss, start an attempt in the background
+    /// and report [`PrepareLookup::Pending`].
+    pub(crate) fn lookup_or_start(
+        &self,
+        pool: &Arc<LanguageServerPool>,
+        target: &PrepareTarget,
+        input: PrepareInput<'_>,
+    ) -> PrepareLookup {
+        self.lookup_now(pool, target, input, Holder::LifecyclePass)
+    }
+
+    /// [`Self::lookup_or_start`] for a request that cannot wait (a
+    /// diagnostic snapshot): it never moves what the lifecycle pass holds
+    /// the document on.
+    pub(crate) fn lookup_or_start_for_request(
+        &self,
+        pool: &Arc<LanguageServerPool>,
+        target: &PrepareTarget,
+        input: PrepareInput<'_>,
+    ) -> PrepareLookup {
+        self.lookup_now(pool, target, input, Holder::Request)
+    }
+
+    fn lookup_now(
+        &self,
+        pool: &Arc<LanguageServerPool>,
+        target: &PrepareTarget,
+        input: PrepareInput<'_>,
+        holder: Holder,
+    ) -> PrepareLookup {
+        let Some(slot) = self.slot(target, input, holder) else {
+            // A lifecycle pass from replaced settings holds the document
+            // with no answer coming: sync the host again, under the
+            // current ones.
+            if holder == Holder::LifecyclePass {
+                let _ = self.resync_tx.send(Resync {
+                    host_uri: input.host_uri.clone(),
+                    ready: false,
+                    recollect: false,
+                });
+            }
+            return PrepareLookup::Pending;
+        };
+        if let Some(found) = slot.cell.lookup(pool.prepare_advertised_epoch()) {
+            return found;
+        }
+        self.start(&slot, pool, target, input);
+        PrepareLookup::Pending
+    }
+
+    /// Wait for the document to send, sharing an attempt already running.
+    pub(crate) async fn prepare(
+        &self,
+        pool: &Arc<LanguageServerPool>,
+        target: &PrepareTarget,
+        input: PrepareInput<'_>,
+    ) -> Result<Arc<PreparedDocument>, PrepareMiss> {
+        let Some(slot) = self.slot(target, input, Holder::Request) else {
+            return Err(PrepareMiss::Unanswered);
+        };
+        if slot.cell.outcome.get().is_some() {
+            return slot.cell.settled(pool.prepare_advertised_epoch());
+        }
+        // Subscribe before starting, so the attempt's end cannot be missed.
+        let mut attempts = slot.cell.attempts.subscribe();
+        if !self.start(&slot, pool, target, input) && !slot.cell.in_flight.load(Ordering::Acquire) {
+            // Backing off after a miss: do not queue another attempt per
+            // request, each waiting out its own timeouts.
+            return slot.cell.settled(pool.prepare_advertised_epoch());
+        }
+        // The attempt ends (answered or not) with a bump.
+        let _ = attempts.changed().await;
+        slot.cell.settled(pool.prepare_advertised_epoch())
+    }
+
+    /// Whether any of `host_uri`'s documents the lifecycle pass holds back
+    /// still waits for its answer (one is running, or a retry is due).
+    pub(crate) fn host_has_pending(&self, host_uri: &Url) -> bool {
+        if self.unused() {
+            return false;
+        }
+        self.regions.iter().any(|region| {
+            region.host_uri == host_uri.as_str()
+                && region
+                    .held_slot()
+                    .is_some_and(|slot| slot.cell.outcome.get().is_none())
+        })
+    }
+
+    /// Whether the peer answered the input the lifecycle pass holds a
+    /// region's document on unusably: that document is not bridged, so
+    /// nothing a server computed for an earlier text of it is either.
+    pub(crate) fn held_failed(
+        &self,
+        host_uri: &Url,
+        injection_language: &str,
+        region_id: &str,
+    ) -> bool {
+        if self.unused() {
+            return false;
+        }
+        let host_uri = host_uri.as_str();
+        self.regions
+            .get(&region_hash(host_uri, injection_language, region_id))
+            .filter(|region| region.is(host_uri, injection_language, region_id))
+            .and_then(|region| {
+                region
+                    .held_slot()
+                    .map(|slot| matches!(slot.cell.outcome.get(), Some(None)))
+            })
+            .unwrap_or(false)
+    }
+
+    /// Whether the lifecycle pass holds a region's document on a prepared
+    /// answer, or on one it still waits for (or that failed): either way,
+    /// not on the virtual text as is.
+    pub(crate) fn held_is_prepared(
+        &self,
+        host_uri: &Url,
+        injection_language: &str,
+        region_id: &str,
+    ) -> bool {
+        if self.unused() {
+            return false;
+        }
+        let host_uri = host_uri.as_str();
+        self.regions
+            .get(&region_hash(host_uri, injection_language, region_id))
+            .filter(|region| region.is(host_uri, injection_language, region_id))
+            .and_then(|region| {
+                region.held_slot().map(|slot| {
+                    !matches!(slot.cell.outcome.get(), Some(Some(prepared)) if prepared.map.is_none())
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    /// Hold a region's document on an input whose answer is not in, as the
+    /// lifecycle pass does, without asking anyone.
+    #[cfg(test)]
+    pub(crate) fn hold_pending_for_test(&self, input: PrepareInput<'_>) {
+        let target = PrepareTarget {
+            candidates: Arc::new([]),
+            settings: Arc::default(),
+        };
+        self.slot(&target, input, Holder::LifecyclePass);
+    }
+
+    /// Hold a region's document on an input the peer answered with
+    /// `outcome` (`None`: unusably), as the lifecycle pass does.
+    #[cfg(test)]
+    pub(crate) fn hold_answered_for_test(
+        &self,
+        input: PrepareInput<'_>,
+        outcome: Option<Arc<PreparedDocument>>,
+    ) {
+        let target = PrepareTarget {
+            candidates: Arc::new([]),
+            settings: Arc::default(),
+        };
+        let slot = self
+            .slot(&target, input, Holder::LifecyclePass)
+            .expect("the lifecycle pass always gets a slot");
+        let _ = slot.cell.outcome.set(outcome);
+    }
+
+    /// A hook forgetting every settled answer, for when a server's
+    /// advertisement of the request changes: the change may alter which
+    /// candidate is asked. An answer that found no candidate (sent as is) may
+    /// now be prepared by one that starts advertising; one a withdrawing peer
+    /// gave, prepared or unusable, would keep its text, or keep the region
+    /// unbridged, where another candidate (or none: as is) answers now.
+    /// Attempts in flight stay: they pick their candidate again when the
+    /// advertisements move under them.
+    pub(crate) fn forget_settled_answers_hook(&self) -> impl Fn() + Send + Sync + 'static {
+        let regions = Arc::clone(&self.regions);
+        move || {
+            for mut region in regions.iter_mut() {
+                region.slots.retain(|slot| {
+                    let settled = slot.cell.outcome.get().is_some();
+                    if settled {
+                        slot.cell.revoked.store(true, Ordering::Release);
+                    }
+                    !settled
+                });
+            }
+        }
+    }
+
+    /// Keep only the regions `keep(host language, injection language,
+    /// candidates)` accepts — after a settings change to `settings`, those
+    /// whose pair still lists the same servers with the same launch
+    /// configs. With `drop_unusable`, answers cached as final go too: the
+    /// change may have fixed what made them unusable (a peer's command,
+    /// say), and the caller guarantees a pass that asks again. An attempt
+    /// whose region (or slot) goes is revoked: it starts no peer.
+    ///
+    /// `settings` is recorded first: a request resolved from earlier
+    /// settings is let in no more, and one let in just before is let in
+    /// under its region's entry, which this pass then visits.
+    pub(crate) fn retain(
+        &self,
+        settings: &Arc<crate::config::WorkspaceSettings>,
+        keep: impl Fn(&str, &str, &[ResolvedServerConfig]) -> bool,
+        drop_unusable: bool,
+    ) {
+        self.pruned_under.store(Some(Arc::clone(settings)));
+        // A request still holding a dropped cell takes no answer from it:
+        // one coming from the launch the settings no longer name.
+        let revoke = |slot: &Slot| slot.cell.revoked.store(true, Ordering::Release);
+        self.regions.retain(|_, region| {
+            if !keep(
+                &region.host_language,
+                &region.injection_language,
+                &region.candidates,
+            ) {
+                region.slots.iter().for_each(revoke);
+                return false;
+            }
+            if drop_unusable {
+                region.slots.retain(|slot| {
+                    let unusable = matches!(slot.cell.outcome.get(), Some(None));
+                    if unusable {
+                        revoke(slot);
+                    }
+                    !unusable
+                });
+            }
+            true
+        });
+    }
+
+    /// Forget one region: it was replaced or invalidated, or its pair lost
+    /// its peer. `injection_language` `None` forgets it under every language.
+    pub(crate) fn forget_region(
+        &self,
+        host_uri: &Url,
+        injection_language: Option<&str>,
+        region_id: &str,
+    ) {
+        if self.unused() {
+            return;
+        }
+        let host_uri = host_uri.as_str();
+        match injection_language {
+            Some(language) => {
+                self.regions
+                    .remove_if(&region_hash(host_uri, language, region_id), |_, region| {
+                        region.is(host_uri, language, region_id)
+                    });
+            }
+            None => self.regions.retain(|_, region| {
+                !(region.host_uri == host_uri && region.region_id == region_id)
+            }),
+        }
+    }
+
+    /// Forget a replaced region under every language but the one it resolves
+    /// to now (`None`: every one): a region re-routed to another language
+    /// keeps its id, and its document under the new language may be being
+    /// prepared already.
+    pub(crate) fn forget_region_except(&self, host_uri: &Url, region_id: &str, keep: Option<&str>) {
+        if self.unused() {
+            return;
+        }
+        let host_uri = host_uri.as_str();
+        self.regions.retain(|_, region| {
+            !(region.host_uri == host_uri
+                && region.region_id == region_id
+                && Some(region.injection_language.as_str()) != keep)
+        });
+    }
+
+    /// Forget a closed host's documents.
+    pub(crate) fn forget_host(&self, host_uri: &Url) {
+        if self.unused() {
+            return;
+        }
+        self.regions
+            .retain(|_, region| region.host_uri != host_uri.as_str());
+    }
+
+    /// The slot answering `input`, created when missing. `None` for a
+    /// lookup resolved from settings a change has replaced, or a request
+    /// under other candidates than the lifecycle pass looked the region up
+    /// under (settings in flight across a change): its answer would be the
+    /// old launch's, and asking would start a peer the settings no longer
+    /// name — recreating, if the change pruned it, the region with them.
+    fn slot(
+        &self,
+        target: &PrepareTarget,
+        input: PrepareInput<'_>,
+        holder: Holder,
+    ) -> Option<Slot> {
+        self.used.store(true, Ordering::Release);
+        let key = input_key(target, input);
+        let host_uri = input.host_uri.as_str();
+        let hash = region_hash(host_uri, input.injection_language, input.region_id);
+        let entry = self.regions.entry(hash);
+        // Under the entry's lock: a change recording its settings after
+        // this check prunes what is inserted here.
+        if self
+            .pruned_under
+            .load()
+            .as_ref()
+            .is_some_and(|current| !Arc::ptr_eq(current, &target.settings))
+        {
+            return None;
+        }
+        let mut region = entry.or_insert_with(|| Region {
+            host_uri: host_uri.to_string(),
+            injection_language: input.injection_language.to_string(),
+            region_id: input.region_id.to_string(),
+            host_language: input.host_language.to_string(),
+            candidates: Arc::clone(&target.candidates),
+            slots: Vec::new(),
+            held: None,
+        });
+        let same_region = region.is(host_uri, input.injection_language, input.region_id);
+        if !same_region || !same_candidates(&region.candidates, &target.candidates) {
+            if holder == Holder::Request && same_region {
+                return None;
+            }
+            // Another launch config (the lifecycle pass brings the current
+            // settings), or a hash collision with another region: start
+            // over.
+            *region = Region {
+                host_uri: host_uri.to_string(),
+                injection_language: input.injection_language.to_string(),
+                region_id: input.region_id.to_string(),
+                host_language: input.host_language.to_string(),
+                candidates: Arc::clone(&target.candidates),
+                slots: Vec::new(),
+                held: None,
+            };
+        }
+        if holder == Holder::LifecyclePass {
+            region.held = Some(key);
+        }
+        let slot = match region.slots.iter().position(|slot| slot.key == key) {
+            Some(index) => region.slots.remove(index),
+            None => Slot {
+                key,
+                cell: Arc::new(Cell {
+                    taken: super::protocol::next_presentation(),
+                    ..Cell::default()
+                }),
+            },
+        };
+        region.slots.insert(0, slot.clone());
+        // Evict the least recently used beyond the bound, never the one the
+        // lifecycle pass holds on, nor one in use: returned to a lookup that
+        // has yet to start or wait on it, or with its attempt in flight (an
+        // evicted one's attempt is refused admission, and a lookup for its
+        // input would start a second request for it), nor the one being
+        // looked up, at the front. Only the region's own reference is unused:
+        // a reference is only taken under this region's guard, so a count
+        // read here can only overstate use. (The bound is exceeded only by
+        // the slots in use.)
+        while region.slots.len() > SLOTS_PER_REGION + 1 {
+            let held = region.held;
+            let Some(index) = region.slots[1..].iter().rposition(|slot| {
+                Some(slot.key) != held
+                    && !slot.cell.in_flight.load(Ordering::Acquire)
+                    && Arc::strong_count(&slot.cell) == 1
+            }) else {
+                break;
+            };
+            region.slots.remove(index + 1);
+        }
+        Some(slot)
+    }
+
+    /// Start an attempt unless one is running, an answer is in, or a miss is
+    /// backing off. `true` when this call started it.
+    fn start(
+        &self,
+        slot: &Slot,
+        pool: &Arc<LanguageServerPool>,
+        target: &PrepareTarget,
+        input: PrepareInput<'_>,
+    ) -> bool {
+        let cell = &slot.cell;
+        if cell.outcome.get().is_some() || cell.backing_off() {
+            return false;
+        }
+        if cell.in_flight.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        // An attempt that ended between the checks above and the claim (it
+        // sets its outcome or backoff before releasing `in_flight`) still
+        // decides: no second request for an answered input, and none inside
+        // the backoff that attempt just set.
+        if cell.outcome.get().is_some() || cell.backing_off() {
+            drop(AttemptEnd(Arc::clone(cell)));
+            return false;
+        }
+        let end = AttemptEnd(Arc::clone(cell));
+        let regions = Arc::clone(&self.regions);
+        let region = region_hash(
+            input.host_uri.as_str(),
+            input.injection_language,
+            input.region_id,
+        );
+        let key = slot.key;
+        // Every request takes the next version as it goes out: a retry after
+        // another input was asked (an undo while the first was backing off)
+        // must not reuse an older one. (Attempts for different inputs run on
+        // their own tasks, so two started together may still reach the peer
+        // in either order.)
+        let revisions = Arc::clone(&self.next_revision);
+        let pool = Arc::clone(pool);
+        let target = target.clone();
+        let job = PrepareJob::new(input, cell.taken);
+        let resync_tx = self.resync_tx.clone();
+        tokio::spawn(async move {
+            let cell = Arc::clone(&end.0);
+            // A settings change or close that dropped this cell revokes the
+            // attempt: it must not start (or replace) a peer the settings no
+            // longer name.
+            let admitted = || regions.get(&region).is_some_and(|region| region.has(&cell));
+            let holds = |regions: &Regions| {
+                regions
+                    .get(&region)
+                    .is_some_and(|region| region.has(&cell) && region.holds(key))
+            };
+            let next_version = || {
+                let version = next_revision(&revisions);
+                #[cfg(test)]
+                cell.versions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(version);
+                version
+            };
+            match run(&pool, &target, &job, &next_version, &admitted).await {
+                // Revoked while it asked (its region pruned by a settings
+                // change, say): its answer is for no one.
+                Ok(_) if !admitted() => {
+                    cell.revoked.store(true, Ordering::Release);
+                }
+                Ok((advertised_epoch, outcome)) => {
+                    let ready = outcome.is_some();
+                    cell.answered_epoch
+                        .store(advertised_epoch, Ordering::Release);
+                    let _ = cell.outcome.set(outcome);
+                    let held = holds(&regions);
+                    // An advertisement change after the attempt's last look
+                    // may have had its hook forget settled answers before
+                    // this one was set: forget it here then, and sync the
+                    // host again if it holds the document on it (the hook's
+                    // own pass may have found it still in flight).
+                    if pool.prepare_advertised_epoch() != advertised_epoch {
+                        // Before the attempt's end wakes those waiting on it.
+                        cell.revoked.store(true, Ordering::Release);
+                        if let Some(mut region) = regions.get_mut(&region) {
+                            region.slots.retain(|slot| !Arc::ptr_eq(&slot.cell, &cell));
+                        }
+                        if held {
+                            let _ = resync_tx.send(Resync {
+                                host_uri: job.host_uri.clone(),
+                                ready: false,
+                                recollect: false,
+                            });
+                        }
+                    }
+                    // The answer the lifecycle pass holds the document on
+                    // re-syncs the host, whoever asked. An unusable one
+                    // does too, unready: nothing more is coming for this
+                    // input, which a pull owed a refresh must learn.
+                    else if held {
+                        // The receiver is gone only at shutdown.
+                        let _ = resync_tx.send(Resync {
+                            host_uri: job.host_uri.clone(),
+                            ready,
+                            recollect: !ready,
+                        });
+                    }
+                }
+                Err(()) => {
+                    let misses = cell.misses.fetch_add(1, Ordering::AcqRel) + 1;
+                    let delay = retry_delay(misses);
+                    *cell
+                        .retry_at
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(Instant::now() + delay);
+                    // Nothing else would look the document up again before
+                    // the next edit: sync the host once the backoff ends,
+                    // unless newer text has taken over by then.
+                    let host_uri = job.host_uri.clone();
+                    let cell = Arc::clone(&cell);
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        let still_held = regions
+                            .get(&region)
+                            .is_some_and(|region| region.has(&cell) && region.holds(key));
+                        if still_held {
+                            let _ = resync_tx.send(Resync {
+                                host_uri,
+                                ready: false,
+                                recollect: false,
+                            });
+                        }
+                    });
+                }
+            }
+            drop(end);
+        });
+        true
+    }
+}
+
+fn next_revision(counter: &AtomicI32) -> i32 {
+    // Wraps after 2^31 prepares; the peer only compares a document's
+    // versions over its lifetime.
+    counter.fetch_add(1, Ordering::Relaxed)
+}
+
+/// How many times one attempt goes through the candidates while some of
+/// them start advertising the request meanwhile.
+const MAX_CANDIDATE_PASSES: usize = 3;
+
+/// Backoff before retrying an attempt that got no answer: one second,
+/// doubling, at most a minute.
+pub(crate) fn retry_delay(misses: u32) -> Duration {
+    Duration::from_secs((1u64 << misses.saturating_sub(1).min(6)).min(60))
+}
+
+fn region_hash(host_uri: &str, injection_language: &str, region_id: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (host_uri, injection_language, region_id).hash(&mut hasher);
+    hasher.finish()
+}
+
+fn input_key(target: &PrepareTarget, input: PrepareInput<'_>) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for candidate in target.candidates.iter() {
+        candidate.server_name.hash(&mut hasher);
+    }
+    input.host_language.hash(&mut hasher);
+    input.virtual_text.hash(&mut hasher);
+    input.gaps.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Whether two candidate lists are the same servers with the same launch
+/// configs: by identity first (a target resolved under one settings snapshot
+/// shares its `Arc`s), by value across snapshots.
+pub(crate) fn same_candidates(a: &[ResolvedServerConfig], b: &[ResolvedServerConfig]) -> bool {
+    std::ptr::eq(a, b)
+        || a.len() == b.len()
+            && a.iter().zip(b).all(|(a, b)| {
+                a.server_name == b.server_name
+                    && (Arc::ptr_eq(&a.config, &b.config) || a.config == b.config)
+            })
+}
+
+/// An owned [`PrepareInput`], for the background request.
+struct PrepareJob {
+    /// See `Cell::taken`.
+    taken: u64,
+    host_uri: Url,
+    host_language: String,
+    injection_language: String,
+    region_id: String,
+    virtual_text: String,
+    gaps: Vec<VirtualGap>,
+}
+
+impl PrepareJob {
+    fn new(input: PrepareInput<'_>, taken: u64) -> Self {
+        Self {
+            taken,
+            host_uri: input.host_uri.clone(),
+            host_language: input.host_language.to_string(),
+            injection_language: input.injection_language.to_string(),
+            region_id: input.region_id.to_string(),
+            virtual_text: input.virtual_text.to_string(),
+            gaps: input.gaps.to_vec(),
+        }
+    }
+}
+
+/// Ask the first candidate advertising the request and apply its answer.
+/// `Ok(None)` is an answer kakehashi refused (or the peer refused to give);
+/// `Err` is no answer at all. Both are logged; neither lets the document
+/// through unprepared. An input no candidate advertises the request for is
+/// sent as is (a document without a map).
+async fn run(
+    pool: &LanguageServerPool,
+    target: &PrepareTarget,
+    job: &PrepareJob,
+    next_version: &(dyn Fn() -> i32 + Sync),
+    admitted: &(dyn Fn() -> bool + Sync),
+) -> Result<(u64, Outcome), ()> {
+    // The error carries the peer's own text (its error object, the variant
+    // names of a malformed answer): escaped, as is the language name.
+    let log_failure = |error: &dyn std::fmt::Display| {
+        log::warn!(
+            target: "kakehashi::bridge::prepare",
+            "Not sending the {} virtual document of {}: {}",
+            escape_terminal_controls(&job.injection_language),
+            job.host_uri,
+            escape_terminal_controls(&error.to_string())
+        );
+    };
+    match try_run(pool, target, job, next_version, admitted).await {
+        Ok((epoch, Ok(prepared))) => Ok((epoch, Some(Arc::new(prepared)))),
+        Ok((epoch, Err(refused))) => {
+            log_failure(&refused);
+            Ok((epoch, None))
+        }
+        Err(unanswered) => {
+            // A revoked attempt (its host closed, a settings change dropped
+            // its pair, the pair lost its peer, or its input was evicted or
+            // replaced meanwhile) is no failure worth a warning.
+            if admitted() {
+                log_failure(&unanswered);
+            } else {
+                log::debug!(
+                    target: "kakehashi::bridge::prepare",
+                    "Dropped a revoked prepare attempt for {}: {}",
+                    job.host_uri,
+                    escape_terminal_controls(&unanswered.to_string())
+                );
+            }
+            Err(())
+        }
+    }
+}
+
+/// The outer `Err` is a failure to get an answer (worth retrying); the
+/// inner one is final for the input: an answer that cannot be used (an
+/// error response, a malformed or refused result).
+///
+/// Candidates are asked strictly in priority order: one still starting is
+/// waited for, and one that cannot start, or does not advertise the request,
+/// is passed over. Only the first that advertises it is asked, and its
+/// answer stands — a failure does not fall through to the next, which would
+/// let a flaky peer switch which preparation servers see.
+///
+/// An answer comes with the advertisement epoch it was checked against (see
+/// [`LanguageServerPool::prepare_advertised_epoch`]).
+async fn try_run(
+    pool: &LanguageServerPool,
+    target: &PrepareTarget,
+    job: &PrepareJob,
+    next_version: &(dyn Fn() -> i32 + Sync),
+    admitted: &(dyn Fn() -> bool + Sync),
+) -> std::io::Result<(u64, std::io::Result<PreparedDocument>)> {
+    let mut advertised_epoch = pool.prepare_advertised_epoch();
+    let host_uri = match crate::lsp::lsp_impl::url_to_uri(&job.host_uri) {
+        Ok(host_uri) => host_uri,
+        Err(error) => {
+            return Ok((
+                advertised_epoch,
+                Err(std::io::Error::other(error.to_string())),
+            ));
+        }
+    };
+    let virtual_uri =
+        VirtualDocumentUri::new(&host_uri, &job.injection_language, &job.region_id).to_uri_string();
+    let layout = VirtualLayout::from_gaps(&job.virtual_text, &job.gaps);
+    // Every request takes the next version as it goes out: one asked again
+    // in a later pass must not repeat the version it was asked with.
+    let params = |version| {
+        PrepareParams::new(
+            PrepareTextDocument {
+                uri: &virtual_uri,
+                language_id: &job.injection_language,
+                version,
+            },
+            PrepareHostTextDocument {
+                uri: job.host_uri.as_str(),
+                language_id: &job.host_language,
+            },
+            &layout,
+        )
+    };
+    // A candidate passed over below may start advertising before the loop
+    // ends, which makes the answer outdated — as is, or a later candidate's,
+    // while one ahead of it would answer now: ask again then, a bounded
+    // number of times (the last pass's answer stands). A change this
+    // attempt records itself (a candidate that answered `MethodNotFound`)
+    // is accounted for as it is made.
+    let mut pass = 1;
+    loop {
+        // A candidate's start failure that failures were cleared since: the
+        // answer passing it over may be outdated, like one passing over a
+        // candidate that starts advertising.
+        let mut outdated_failure = false;
+        let answer = 'candidates: {
+            for candidate in target.candidates.iter() {
+                let name = &candidate.server_name;
+                if pool.prepare_advertisement(name) == Some(false)
+                    || pool.prepare_start_failed(name, &job.host_uri)
+                {
+                    continue;
+                }
+                let failures_cleared = pool.prepare_start_failures_cleared();
+                let handle = match pool
+                    .get_or_create_connection_wait_ready_admitted(
+                        name,
+                        &candidate.config,
+                        Some(&job.host_uri),
+                        Duration::from_secs(super::INIT_TIMEOUT_SECS),
+                        Some(admitted),
+                        None,
+                    )
+                    .await
+                {
+                    Ok(handle) => handle,
+                    // Revoked: no answer for this input.
+                    Err(error) if !admitted() => return Err(error),
+                    // Passed over for this host's documents, so later inputs are
+                    // not held back to start it again: only for this host, whose
+                    // workspace root may be the one it cannot start in.
+                    Err(error) => {
+                        // Passed over from now on, until its handshake advertises the
+                        // request (its pairs go out as is unless a later candidate
+                        // prepares them): worth seeing at the default level. Recorded
+                        // below, it is not started again per input.
+                        log::warn!(
+                            target: "kakehashi::bridge::prepare",
+                            "Prepare candidate {} for {} did not start; passing it over: {}",
+                            escape_terminal_controls(name),
+                            job.host_uri,
+                            escape_terminal_controls(&error.to_string()),
+                        );
+                        outdated_failure |= !pool.record_prepare_start_failure(
+                            name,
+                            &job.host_uri,
+                            failures_cleared,
+                        );
+                        continue;
+                    }
+                };
+                if !handle.supports_virtual_document_prepare() {
+                    continue;
+                }
+                // Revoked while the candidate started (its region pruned by a
+                // settings change, say): no request with the text it was for.
+                if !admitted() {
+                    return Err(std::io::Error::other(
+                        "revoked before its prepare request went out",
+                    ));
+                }
+                let result = match handle
+                    .request_virtual_document_prepare(&params(next_version()))
+                    .await
+                {
+                    Ok(result) => result,
+                    // It does not answer the request after all (`MethodNotFound`
+                    // withdraws the advertisement): as if it had not advertised it.
+                    Err(_) if !handle.supports_virtual_document_prepare() => {
+                        if pool.record_prepare_advertisement_from(&handle, false) {
+                            advertised_epoch += 1;
+                        }
+                        continue;
+                    }
+                    // Final for this input: an unusable answer (an error response or
+                    // a malformed result).
+                    Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                        break 'candidates Err(std::io::Error::new(
+                            error.kind(),
+                            format!("{name} could not prepare it: {error}"),
+                        ));
+                    }
+                    // No answer: timed out, cancelled by the peer, connection gone.
+                    Err(error) => {
+                        return Err(std::io::Error::new(
+                            error.kind(),
+                            format!("{name} did not answer: {error}"),
+                        ));
+                    }
+                };
+                break 'candidates apply_prepare_result_at(
+                    &job.virtual_text,
+                    &layout,
+                    result,
+                    job.taken,
+                )
+                .map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("{name} answered unusably: {error}"),
+                    )
+                });
+            }
+            Ok(PreparedDocument {
+                text: job.virtual_text.clone(),
+                map: None,
+            })
+        };
+        let epoch = pool.prepare_advertised_epoch();
+        if (epoch == advertised_epoch && !outdated_failure) || pass == MAX_CANDIDATE_PASSES {
+            if outdated_failure {
+                // No answer that would stand: retried after a backoff.
+                return Err(std::io::Error::other(
+                    "a candidate's start failure was outdated while asking",
+                ));
+            }
+            return Ok((advertised_epoch, answer));
+        }
+        advertised_epoch = epoch;
+        pass += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::settings::BridgeServerConfig;
+
+    const REGION: &str = "01J0000000000000000000000A";
+
+    /// Candidates named and launched as given, in this order.
+    fn target_of(candidates: &[(&str, &[&str])]) -> PrepareTarget {
+        PrepareTarget {
+            candidates: candidates
+                .iter()
+                .map(|(name, command)| ResolvedServerConfig {
+                    server_name: name.to_string(),
+                    config: Arc::new(BridgeServerConfig {
+                        cmd: Some(command.iter().map(|part| part.to_string()).collect()),
+                        ..Default::default()
+                    }),
+                })
+                .collect(),
+            settings: Arc::default(),
+        }
+    }
+
+    fn unstartable_target() -> PrepareTarget {
+        target_of(&[("peer", &["/nonexistent/kakehashi-prepare-peer"])])
+    }
+
+    fn input<'a>(host: &'a Url, text: &'a str) -> PrepareInput<'a> {
+        PrepareInput {
+            host_uri: host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: REGION,
+            virtual_text: text,
+            gaps: &[],
+        }
+    }
+
+    fn cell(
+        registry: &PrepareRegistry,
+        target: &PrepareTarget,
+        input: PrepareInput<'_>,
+        holder: Holder,
+    ) -> Arc<Cell> {
+        registry.slot(target, input, holder).unwrap().cell
+    }
+
+    fn held_cell(registry: &PrepareRegistry) -> Arc<Cell> {
+        let region = registry.regions.iter().next().unwrap();
+        Arc::clone(&region.held_slot().unwrap().cell)
+    }
+
+    #[test]
+    fn a_slot_returned_to_a_lookup_is_not_evicted_before_it_starts() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        // Looked up, its attempt not yet started.
+        let first = registry
+            .slot(&target, input(&host, "a"), Holder::Request)
+            .unwrap();
+        // Lookups for newer texts push it past the bound.
+        for text in ["b", "c", "d", "e", "f"] {
+            registry.slot(&target, input(&host, text), Holder::Request);
+        }
+        let region = registry.regions.iter().next().unwrap();
+        assert!(
+            region.has(&first.cell),
+            "a slot still in a lookup's hands keeps its place"
+        );
+        drop(region);
+        drop(first);
+        // Once released, it is the least recently used, and goes.
+        registry.slot(&target, input(&host, "g"), Holder::Request);
+        let region = registry.regions.iter().next().unwrap();
+        assert_eq!(region.slots.len(), SLOTS_PER_REGION + 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_answer_passing_over_a_failure_cleared_meanwhile_is_not_kept() {
+        let registry = PrepareRegistry::default();
+        let pool = Arc::new(LanguageServerPool::new());
+        let host = Url::parse("file:///host.md").unwrap();
+        // Starts, then exits before its handshake completes.
+        let target = target_of(&[("peer", &["sh", "-c", "sleep 0.3"])]);
+        registry.slot(&target, input(&host, "a"), Holder::LifecyclePass);
+        let clear = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            // Another host closing clears failures while it starts.
+            let other = Url::parse("file:///other.md").unwrap();
+            pool.forget_prepare_start_failures(Some(&other));
+        };
+        let (answer, ()) = tokio::join!(registry.prepare(&pool, &target, input(&host, "a")), clear);
+        // Its failure said nothing current: it was asked again, and only
+        // the answer as is that its current failure gives is kept.
+        assert!(answer.unwrap().map.is_none());
+        assert!(pool.prepare_start_failed("peer", &host));
+    }
+
+    #[tokio::test]
+    async fn an_input_no_candidate_prepares_is_sent_as_is() {
+        // A candidate that cannot start prepares nothing: with no other, the
+        // document goes out unprepared, and that is final for the input.
+        let registry = PrepareRegistry::default();
+        let mut resync = registry.take_resync_rx().unwrap();
+        let pool = Arc::new(LanguageServerPool::new());
+        let host = Url::parse("file:///host.md").unwrap();
+        let target = unstartable_target();
+        assert!(matches!(
+            registry.lookup_or_start(&pool, &target, input(&host, "a")),
+            PrepareLookup::Pending
+        ));
+        let sent = registry
+            .prepare(&pool, &target, input(&host, "a"))
+            .await
+            .unwrap();
+        assert_eq!(sent.text, "a");
+        assert!(sent.map.is_none());
+        assert!(matches!(
+            registry.lookup_or_start(&pool, &target, input(&host, "a")),
+            PrepareLookup::Ready(sent) if sent.map.is_none()
+        ));
+        let cell = cell(&registry, &target, input(&host, "a"), Holder::Request);
+        assert!(!cell.in_flight.load(Ordering::Acquire));
+        assert_eq!(*cell.attempts.borrow(), 1, "the input was not retried");
+        // Not started again for each of this host's inputs to find that out
+        // (its next handshake, when it is started to be bridged, says
+        // otherwise), and passed over for this host only: another host's
+        // workspace root may be one it starts in.
+        assert!(pool.prepare_start_failed("peer", &host));
+        let other = Url::parse("file:///elsewhere/host.md").unwrap();
+        assert!(!pool.prepare_start_failed("peer", &other));
+        assert_eq!(pool.prepare_advertisement("peer"), None);
+        // The document the lifecycle pass held back became ready to send.
+        assert_eq!(
+            resync.try_recv().ok(),
+            Some(Resync {
+                host_uri: host,
+                ready: true,
+                recollect: false
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn the_held_input_resyncs_whoever_started_its_attempt() {
+        let registry = PrepareRegistry::default();
+        let mut resync = registry.take_resync_rx().unwrap();
+        let pool = Arc::new(LanguageServerPool::new());
+        let host = Url::parse("file:///host.md").unwrap();
+        let target = unstartable_target();
+        // A request sees the edited text first and starts the attempt; the
+        // lifecycle pass shares it and holds the document on it.
+        let started = cell(&registry, &target, input(&host, "v2"), Holder::Request);
+        let mut attempts = started.attempts.subscribe();
+        registry.lookup_or_start_for_request(&pool, &target, input(&host, "v2"));
+        registry.lookup_or_start(&pool, &target, input(&host, "v2"));
+        assert!(Arc::ptr_eq(&held_cell(&registry), &started));
+        attempts.changed().await.unwrap();
+        assert_eq!(
+            resync.try_recv().ok(),
+            Some(Resync {
+                host_uri: host.clone(),
+                ready: true,
+                recollect: false
+            })
+        );
+        // An answer for text the lifecycle pass no longer holds on re-syncs
+        // nothing.
+        let old = cell(&registry, &target, input(&host, "v1"), Holder::Request);
+        let mut attempts = old.attempts.subscribe();
+        registry.lookup_or_start_for_request(&pool, &target, input(&host, "v1"));
+        attempts.changed().await.unwrap();
+        assert!(resync.try_recv().is_err());
+    }
+
+    /// A ready connection for `name` that records what it is sent and
+    /// never answers, advertising the prepare request or not.
+    #[cfg(unix)]
+    async fn recording_candidate(
+        pool: &LanguageServerPool,
+        name: &str,
+        advertised: bool,
+        path: &std::path::Path,
+    ) {
+        use crate::lsp::bridge::pool::test_helpers::{
+            advertise_prepare_for_test, create_handle_with_command,
+        };
+        use crate::lsp::bridge::pool::{ConnectionKey, ConnectionState};
+        let (handle, _) = create_handle_with_command(
+            ConnectionState::Ready,
+            ConnectionKey::for_server(name),
+            vec![
+                "sh".into(),
+                "-c".into(),
+                "cat > \"$1\"".into(),
+                "record".into(),
+                path.to_str().unwrap().into(),
+            ],
+            None,
+        )
+        .await;
+        advertise_prepare_for_test(&handle, advertised);
+        pool.insert_connection(handle).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_first_advertising_candidate_alone_is_asked_and_retried() {
+        let registry = PrepareRegistry::default();
+        let mut resync = registry.take_resync_rx().unwrap();
+        let pool = Arc::new(LanguageServerPool::new());
+        let dir = tempfile::tempdir().unwrap();
+        let sent = |name: &str| std::fs::read_to_string(dir.path().join(name)).unwrap_or_default();
+        recording_candidate(&pool, "quiet", false, &dir.path().join("quiet")).await;
+        recording_candidate(&pool, "first", true, &dir.path().join("first")).await;
+        recording_candidate(&pool, "second", true, &dir.path().join("second")).await;
+        let host = Url::parse("file:///host.md").unwrap();
+        let target = target_of(&[
+            ("quiet", &["quiet"]),
+            ("first", &["first"]),
+            ("second", &["second"]),
+        ]);
+        // The lifecycle pass holds the document on this input.
+        registry.slot(&target, input(&host, "a"), Holder::LifecyclePass);
+        // `first` never answers: no answer, not cached, so the document is
+        // still pending, and `second` is not asked instead.
+        assert_eq!(
+            registry
+                .prepare(&pool, &target, input(&host, "a"))
+                .await
+                .err(),
+            Some(PrepareMiss::Unanswered)
+        );
+        let method = crate::lsp::bridge::protocol::PREPARE_METHOD;
+        assert!(!sent("quiet").contains(method));
+        assert!(sent("first").contains(method));
+        assert!(!sent("second").contains(method));
+        let cell = cell(&registry, &target, input(&host, "a"), Holder::Request);
+        assert!(cell.outcome.get().is_none());
+        assert_eq!(cell.misses.load(Ordering::Acquire), 1);
+        // …but backing off: neither a lookup nor a request starts another
+        // attempt yet.
+        assert!(matches!(
+            registry.lookup_or_start(&pool, &target, input(&host, "a")),
+            PrepareLookup::Pending
+        ));
+        assert_eq!(
+            registry
+                .prepare(&pool, &target, input(&host, "a"))
+                .await
+                .err(),
+            Some(PrepareMiss::Unanswered)
+        );
+        assert_eq!(*cell.attempts.borrow(), 1);
+        // The host is synced again once the backoff ends.
+        let resynced = tokio::time::timeout(Duration::from_secs(5), resync.recv())
+            .await
+            .expect("a re-sync after the backoff");
+        assert_eq!(
+            resynced,
+            Some(Resync {
+                host_uri: host.clone(),
+                ready: false,
+                recollect: false
+            })
+        );
+    }
+
+    /// A candidate advertising the request that refuses it (its first
+    /// request, id 2) `delay` seconds after it arrived, recording what it
+    /// was sent at `path`.
+    #[cfg(unix)]
+    async fn refusing_candidate(
+        pool: &LanguageServerPool,
+        name: &str,
+        path: &std::path::Path,
+        delay: f64,
+    ) {
+        use crate::lsp::bridge::pool::test_helpers::{
+            advertise_prepare_for_test, create_handle_with_command,
+        };
+        use crate::lsp::bridge::pool::{ConnectionKey, ConnectionState};
+        let refusal = r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32603,"message":"no"}}"#;
+        let script = format!(
+            // An asynchronous list reads /dev/null unless given stdin.
+            "exec 3<&0; (cat <&3 > \"$1\") & \
+             while ! grep -q virtualDocument \"$1\" 2>/dev/null; do sleep 0.05; done; \
+             sleep {delay}; printf 'Content-Length: {}\\r\\n\\r\\n%s' '{refusal}'; wait",
+            refusal.len()
+        );
+        let (handle, _) = create_handle_with_command(
+            ConnectionState::Ready,
+            ConnectionKey::for_server(name),
+            vec![
+                "sh".into(),
+                "-c".into(),
+                script,
+                "refuse".into(),
+                path.to_str().unwrap().into(),
+            ],
+            None,
+        )
+        .await;
+        advertise_prepare_for_test(&handle, true);
+        pool.insert_connection(handle).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unusable_answer_resyncs_its_host_as_failed() {
+        let registry = PrepareRegistry::default();
+        let mut resync = registry.take_resync_rx().unwrap();
+        let pool = Arc::new(LanguageServerPool::new());
+        let dir = tempfile::tempdir().unwrap();
+        refusing_candidate(&pool, "peer", &dir.path().join("peer"), 0.0).await;
+        let host = Url::parse("file:///host.md").unwrap();
+        let target = target_of(&[("peer", &["peer"])]);
+        registry.slot(&target, input(&host, "a"), Holder::LifecyclePass);
+        assert_eq!(
+            registry
+                .prepare(&pool, &target, input(&host, "a"))
+                .await
+                .err(),
+            Some(PrepareMiss::Failed)
+        );
+        // Diagnostics placed from the region's earlier text are collected
+        // away; the pull debt still waits for the host's other answers.
+        assert_eq!(
+            resync.try_recv().ok(),
+            Some(Resync {
+                host_uri: host,
+                ready: false,
+                recollect: true
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_answer_given_while_its_peer_withdraws_is_asked_of_the_next_candidate() {
+        let registry = PrepareRegistry::default();
+        let pool = Arc::new(LanguageServerPool::new());
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        let sent = |path: &std::path::Path| std::fs::read_to_string(path).unwrap_or_default();
+        // `first` answers a while after the request arrived, having
+        // withdrawn its advertisement meanwhile.
+        refusing_candidate(&pool, "first", &first, 0.5).await;
+        pool.record_prepare_advertisement(
+            &crate::lsp::bridge::pool::ConnectionKey::for_server("first"),
+            true,
+        );
+        recording_candidate(&pool, "second", true, &second).await;
+        let host = Url::parse("file:///host.md").unwrap();
+        let target = target_of(&[("first", &["first"]), ("second", &["second"])]);
+        registry.slot(&target, input(&host, "a"), Holder::LifecyclePass);
+        let method = crate::lsp::bridge::protocol::PREPARE_METHOD;
+        let withdraw = async {
+            while !sent(&first).contains(method) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            pool.record_prepare_advertisement(
+                &crate::lsp::bridge::pool::ConnectionKey::for_server("first"),
+                false,
+            );
+        };
+        let (miss, ()) = tokio::join!(
+            registry.prepare(&pool, &target, input(&host, "a")),
+            withdraw
+        );
+        // `first`'s answer is not the answer: `second` is asked now (and,
+        // never answering, leaves the input unanswered).
+        assert!(sent(&second).contains(method));
+        assert_eq!(miss.err(), Some(PrepareMiss::Unanswered));
+        // Each request went out with a version of its own.
+        let versions = cell(&registry, &target, input(&host, "a"), Holder::Request)
+            .versions
+            .lock()
+            .unwrap()
+            .clone();
+        assert!(
+            versions.len() == 2 && versions[0] < versions[1],
+            "{versions:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_answer_given_while_a_passed_over_candidate_starts_advertising_is_asked_again() {
+        let registry = PrepareRegistry::default();
+        let pool = Arc::new(LanguageServerPool::new());
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        let sent = |path: &std::path::Path| std::fs::read_to_string(path).unwrap_or_default();
+        // `first` has not advertised the request so far: passed over.
+        recording_candidate(&pool, "first", true, &first).await;
+        pool.record_prepare_advertisement(
+            &crate::lsp::bridge::pool::ConnectionKey::for_server("first"),
+            false,
+        );
+        // `second` refuses the request, but only a while after it arrived:
+        // `first` starts advertising meanwhile.
+        refusing_candidate(&pool, "second", &second, 0.5).await;
+        let host = Url::parse("file:///host.md").unwrap();
+        let target = target_of(&[("first", &["first"]), ("second", &["second"])]);
+        registry.slot(&target, input(&host, "a"), Holder::LifecyclePass);
+        let method = crate::lsp::bridge::protocol::PREPARE_METHOD;
+        let advertise = async {
+            while !sent(&second).contains(method) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            pool.record_prepare_advertisement(
+                &crate::lsp::bridge::pool::ConnectionKey::for_server("first"),
+                true,
+            );
+        };
+        let (miss, ()) = tokio::join!(
+            registry.prepare(&pool, &target, input(&host, "a")),
+            advertise
+        );
+        // `second`'s refusal is not the answer: `first`, ahead of it, is
+        // asked now (and, never answering, leaves the input unanswered).
+        assert!(sent(&first).contains(method));
+        assert_eq!(miss.err(), Some(PrepareMiss::Unanswered));
+    }
+
+    #[test]
+    fn an_input_whose_attempt_is_in_flight_is_not_evicted() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let running = cell(&registry, &target, input(&host, "a"), Holder::Request);
+        running.in_flight.store(true, Ordering::Release);
+        // Looked up and released: idle.
+        cell(&registry, &target, input(&host, "b"), Holder::Request);
+        // A burst of other inputs past the bound.
+        for text in ["c", "d", "e", "f", "g"] {
+            cell(&registry, &target, input(&host, text), Holder::Request);
+        }
+        let again = cell(&registry, &target, input(&host, "a"), Holder::Request);
+        assert!(Arc::ptr_eq(&running, &again), "no second attempt for it");
+        let region = registry.regions.iter().next().unwrap();
+        let idle = input_key(&target, input(&host, "b"));
+        assert!(
+            region.slots.iter().all(|slot| slot.key != idle),
+            "an idle one is still evicted"
+        );
+    }
+
+    #[test]
+    fn a_fresh_lookup_is_not_evicted_by_running_slots() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        for text in ["a", "b", "c", "d"] {
+            cell(&registry, &target, input(&host, text), Holder::Request)
+                .in_flight
+                .store(true, Ordering::Release);
+        }
+        let fresh = cell(&registry, &target, input(&host, "e"), Holder::Request);
+        let again = cell(&registry, &target, input(&host, "e"), Holder::Request);
+        assert!(Arc::ptr_eq(&fresh, &again), "the slot looked up stays");
+    }
+
+    #[test]
+    fn requests_find_older_answers_without_moving_the_held_input() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let v1 = cell(
+            &registry,
+            &target,
+            input(&host, "v1"),
+            Holder::LifecyclePass,
+        );
+        let v2 = cell(
+            &registry,
+            &target,
+            input(&host, "v2"),
+            Holder::LifecyclePass,
+        );
+        // A request still on v1 shares v1's cell; the document stays held on
+        // v2.
+        let again = cell(&registry, &target, input(&host, "v1"), Holder::Request);
+        assert!(Arc::ptr_eq(&v1, &again));
+        assert!(Arc::ptr_eq(&held_cell(&registry), &v2));
+        // Undo to v1: the lifecycle pass shares its attempt and holds on it.
+        let undone = cell(
+            &registry,
+            &target,
+            input(&host, "v1"),
+            Holder::LifecyclePass,
+        );
+        assert!(Arc::ptr_eq(&v1, &undone));
+        assert!(Arc::ptr_eq(&held_cell(&registry), &v1));
+        drop((v1, v2, again, undone));
+        // Requests on many older texts evict the least recently used, never
+        // the held one.
+        for text in ["r1", "r2", "r3", "r4", "r5"] {
+            cell(&registry, &target, input(&host, text), Holder::Request);
+        }
+        let held = input_key(&target, input(&host, "v1"));
+        let region = registry.regions.iter().next().unwrap();
+        assert_eq!(region.held, Some(held));
+        let kept: Vec<u64> = region.slots.iter().map(|slot| slot.key).collect();
+        let key = |text| input_key(&target, input(&host, text));
+        assert_eq!(kept, vec![key("r5"), key("r4"), key("r3"), key("v1")]);
+    }
+
+    #[test]
+    fn another_peer_config_never_reuses_an_answer() {
+        let registry = PrepareRegistry::default();
+        let target = |command: &str| target_of(&[("peer", &[command])]);
+        let host = Url::parse("file:///host.md").unwrap();
+        let old = cell(
+            &registry,
+            &target("deno"),
+            input(&host, "a"),
+            Holder::LifecyclePass,
+        );
+        let _ = old.outcome.set(None);
+        let new = cell(
+            &registry,
+            &target("bun"),
+            input(&host, "a"),
+            Holder::LifecyclePass,
+        );
+        assert!(!Arc::ptr_eq(&old, &new));
+        assert!(
+            new.outcome.get().is_none(),
+            "the old launch's failure is not reused"
+        );
+        // A request under the old config gets no slot: it neither sees the
+        // new launch's answers nor starts the old one's peer.
+        assert!(
+            registry
+                .slot(&target("deno"), input(&host, "a"), Holder::Request)
+                .is_none()
+        );
+        assert!(Arc::ptr_eq(&held_cell(&registry), &new));
+    }
+
+    #[tokio::test]
+    async fn a_request_under_old_settings_answers_nothing() {
+        let registry = PrepareRegistry::default();
+        let pool = Arc::new(LanguageServerPool::new());
+        let target = |command: &str| target_of(&[("peer", &[command])]);
+        let host = Url::parse("file:///host.md").unwrap();
+        cell(
+            &registry,
+            &target("bun"),
+            input(&host, "a"),
+            Holder::LifecyclePass,
+        );
+        assert!(matches!(
+            registry.lookup_or_start_for_request(&pool, &target("deno"), input(&host, "a")),
+            PrepareLookup::Pending
+        ));
+        assert_eq!(
+            registry
+                .prepare(&pool, &target("deno"), input(&host, "a"))
+                .await
+                .err(),
+            Some(PrepareMiss::Unanswered)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_miss_tells_a_final_failure_from_a_pending_answer() {
+        let registry = PrepareRegistry::default();
+        let pool = Arc::new(LanguageServerPool::new());
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let pending = cell(&registry, &target, input(&host, "a"), Holder::LifecyclePass);
+        assert!(registry.host_has_pending(&host), "no answer yet");
+        assert!(!registry.held_failed(&host, "lua", REGION));
+        let _ = pending.outcome.set(None);
+        assert!(!registry.host_has_pending(&host));
+        assert!(registry.held_failed(&host, "lua", REGION));
+        assert_eq!(
+            registry
+                .prepare(&pool, &target, input(&host, "a"))
+                .await
+                .err(),
+            Some(PrepareMiss::Failed),
+            "an unusable answer is final"
+        );
+        // An undo to an answered input reads as available again.
+        let answered = cell(&registry, &target, input(&host, "b"), Holder::LifecyclePass);
+        let _ = answered.outcome.set(Some(Arc::new(PreparedDocument {
+            text: "b".to_string(),
+            map: None,
+        })));
+        assert!(!registry.held_failed(&host, "lua", REGION));
+    }
+
+    #[tokio::test]
+    async fn a_lookup_resolved_before_a_settings_change_recreates_no_region() {
+        let registry = PrepareRegistry::default();
+        let mut resync = registry.take_resync_rx().unwrap();
+        let pool = Arc::new(LanguageServerPool::new());
+        let host = Url::parse("file:///host.md").unwrap();
+        let before = target_of(&[("peer", &["deno"])]);
+        cell(&registry, &before, input(&host, "a"), Holder::LifecyclePass);
+        // The change no longer names the peer: its region goes.
+        let after = PrepareTarget {
+            settings: Arc::default(),
+            ..target_of(&[("other", &["bun"])])
+        };
+        registry.retain(&after.settings, |_, _, _| false, false);
+        assert!(registry.regions.is_empty());
+        // A request resolved from the settings before gets no slot, and
+        // brings no region back with the old peer.
+        assert!(
+            registry
+                .slot(&before, input(&host, "a"), Holder::Request)
+                .is_none()
+        );
+        assert!(registry.regions.is_empty());
+        // Nor does a lifecycle pass: it syncs the host again, which looks
+        // the region up under the settings now.
+        assert!(matches!(
+            registry.lookup_or_start(&pool, &before, input(&host, "a")),
+            PrepareLookup::Pending
+        ));
+        assert!(registry.regions.is_empty());
+        assert_eq!(
+            resync.try_recv().ok(),
+            Some(Resync {
+                host_uri: host.clone(),
+                ready: false,
+                recollect: false
+            })
+        );
+        // One resolved from the settings now does.
+        assert!(
+            registry
+                .slot(&after, input(&host, "a"), Holder::Request)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_settings_change_revokes_the_answers_it_drops() {
+        let registry = PrepareRegistry::default();
+        let target = target_of(&[("peer", &["deno"])]);
+        let host = Url::parse("file:///host.md").unwrap();
+        let held = cell(&registry, &target, input(&host, "a"), Holder::Request);
+        let _ = held.outcome.set(Some(Arc::new(PreparedDocument {
+            text: "a".to_string(),
+            map: None,
+        })));
+        assert!(held.settled(0).is_ok());
+        // The pair's peer changed: a request still holding the cell takes no
+        // answer from the old launch.
+        registry.retain(&target.settings, |_, _, _| false, false);
+        assert_eq!(held.settled(0).err(), Some(PrepareMiss::Unanswered));
+    }
+
+    #[test]
+    fn retain_sees_the_peer_config_answers_came_from() {
+        let registry = PrepareRegistry::default();
+        let target = target_of(&[("peer", &["deno"])]);
+        let host = Url::parse("file:///host.md").unwrap();
+        cell(&registry, &target, input(&host, "a"), Holder::Request);
+        let same = |command: &str| {
+            let other = target_of(&[("peer", &[command])]);
+            move |_: &str, _: &str, seen: &[ResolvedServerConfig]| {
+                same_candidates(seen, &other.candidates)
+            }
+        };
+        registry.retain(&target.settings, same("deno"), false);
+        assert_eq!(registry.regions.len(), 1);
+        registry.retain(&target.settings, same("bun"), false);
+        assert!(
+            registry.regions.is_empty(),
+            "a relaunched peer prepares again"
+        );
+    }
+
+    #[test]
+    fn a_settings_change_drops_final_failures_only_when_asking_again() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let failed = cell(&registry, &target, input(&host, "a"), Holder::LifecyclePass);
+        failed.outcome.set(None).unwrap();
+        registry.retain(&target.settings, |_, _, _| true, false);
+        assert!(
+            registry.held_failed(&host, "lua", REGION),
+            "nothing would ask again"
+        );
+        registry.retain(&target.settings, |_, _, _| true, true);
+        let fresh = cell(&registry, &target, input(&host, "a"), Holder::LifecyclePass);
+        assert!(
+            fresh.outcome.get().is_none(),
+            "a fixed config may now prepare it"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_forgotten_attempt_does_not_start_its_peer() {
+        let registry = PrepareRegistry::default();
+        let pool = Arc::new(LanguageServerPool::new());
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("spawned");
+        let touch = format!("touch '{}'", marker.display());
+        let target = target_of(&[("peer", &["sh", "-c", &touch])]);
+        let host = Url::parse("file:///host.md").unwrap();
+        // The attempt is spawned but (on this single-threaded runtime) has
+        // not run yet when its region is forgotten — the host closed, say.
+        registry.lookup_or_start(&pool, &target, input(&host, "a"));
+        let cell = held_cell(&registry);
+        let mut attempts = cell.attempts.subscribe();
+        registry.forget_host(&host);
+        tokio::time::timeout(Duration::from_secs(10), attempts.changed())
+            .await
+            .expect("the attempt ends")
+            .unwrap();
+        assert!(!marker.exists(), "a revoked attempt started its peer");
+    }
+
+    #[test]
+    fn an_answer_read_under_a_newer_epoch_is_outdated_before_it_is_revoked() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let answered = cell(&registry, &target, input(&host, "a"), Holder::Request);
+        answered.answered_epoch.store(3, Ordering::Release);
+        let _ = answered.outcome.set(Some(Arc::new(PreparedDocument {
+            text: "a".to_string(),
+            map: None,
+        })));
+        assert!(answered.settled(3).is_ok());
+        // The advertisements moved after it was checked, before the hook
+        // forgot it: no reader takes it.
+        assert_eq!(answered.settled(4).err(), Some(PrepareMiss::Unanswered));
+        assert!(answered.lookup(4).is_none());
+    }
+
+    #[test]
+    fn settled_answers_are_forgotten_when_an_advertisement_changes() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        let as_is = cell(&registry, &target, input(&host, "a"), Holder::Request);
+        let _ = as_is.outcome.set(Some(Arc::new(PreparedDocument {
+            text: "a".to_string(),
+            map: None,
+        })));
+        let failed = cell(&registry, &target, input(&host, "b"), Holder::LifecyclePass);
+        let _ = failed.outcome.set(None);
+        let pending = cell(&registry, &target, input(&host, "c"), Holder::Request);
+        registry.forget_settled_answers_hook()();
+        let fresh = cell(&registry, &target, input(&host, "a"), Holder::Request);
+        assert!(!Arc::ptr_eq(&as_is, &fresh), "an answer as is goes");
+        let fresh = cell(&registry, &target, input(&host, "b"), Holder::LifecyclePass);
+        assert!(!Arc::ptr_eq(&failed, &fresh), "a final failure goes");
+        let kept = cell(&registry, &target, input(&host, "c"), Holder::Request);
+        assert!(Arc::ptr_eq(&pending, &kept), "an attempt in flight stays");
+        // A request still holding a forgotten answer takes it as none.
+        assert_eq!(as_is.settled(0).err(), Some(PrepareMiss::Unanswered));
+        assert!(as_is.lookup(0).is_none());
+    }
+
+    #[test]
+    fn retries_back_off_to_a_minute() {
+        assert_eq!(retry_delay(1), Duration::from_secs(1));
+        assert_eq!(retry_delay(2), Duration::from_secs(2));
+        assert_eq!(retry_delay(6), Duration::from_secs(32));
+        assert_eq!(retry_delay(7), Duration::from_secs(60));
+        assert_eq!(retry_delay(100), Duration::from_secs(60));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_goes_out_with_a_newer_version_than_requests_made_meanwhile() {
+        let registry = PrepareRegistry::default();
+        let pool = Arc::new(LanguageServerPool::new());
+        let dir = tempfile::tempdir().unwrap();
+        recording_candidate(&pool, "peer", true, &dir.path().join("peer")).await;
+        let target = target_of(&[("peer", &["peer"])]);
+        let host = Url::parse("file:///host.md").unwrap();
+        let versions = |text| {
+            cell(&registry, &target, input(&host, text), Holder::Request)
+                .versions
+                .lock()
+                .unwrap()
+                .clone()
+        };
+        // `a` gets no answer and backs off; `b` is asked meanwhile.
+        registry.slot(&target, input(&host, "a"), Holder::LifecyclePass);
+        let _ = registry.prepare(&pool, &target, input(&host, "a")).await;
+        let _ = registry.prepare(&pool, &target, input(&host, "b")).await;
+        // Its backoff over, `a` is asked again.
+        tokio::time::sleep(retry_delay(1) * 2).await;
+        let _ = registry.prepare(&pool, &target, input(&host, "a")).await;
+
+        let (a, b) = (versions("a"), versions("b"));
+        assert_eq!(a.len(), 2, "{a:?}");
+        assert_eq!(b.len(), 1, "{b:?}");
+        assert!(a[0] < b[0] && b[0] < a[1], "a: {a:?}, b: {b:?}");
+    }
+
+    #[test]
+    fn regions_are_forgotten_by_language_and_host() {
+        let registry = PrepareRegistry::default();
+        let target = unstartable_target();
+        let host = Url::parse("file:///host.md").unwrap();
+        cell(&registry, &target, input(&host, "b"), Holder::Request);
+        registry.forget_region(&host, Some("python"), REGION);
+        assert_eq!(registry.regions.len(), 1, "another language's region stays");
+        registry.forget_region_except(&host, REGION, Some("lua"));
+        assert_eq!(registry.regions.len(), 1, "the current language stays");
+        registry.forget_region_except(&host, REGION, Some("ruby"));
+        assert!(registry.regions.is_empty());
+        cell(&registry, &target, input(&host, "b"), Holder::Request);
+        registry.forget_host(&host);
+        assert!(registry.regions.is_empty());
+    }
+}
