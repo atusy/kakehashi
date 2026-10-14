@@ -123,12 +123,12 @@ impl LanguageServerPool {
                         version,
                     );
                     if matches!(outcome, NotificationSendResult::Queued) {
-                        self.record_sent_content_fingerprint(
+                        self.record_sent_content(
                             &virtual_uri,
                             &connection_key,
                             injection.sent(),
-                        )
-                        .await;
+                            Some(version),
+                        );
                     }
                     Some(outcome)
                 } else {

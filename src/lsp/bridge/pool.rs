@@ -2726,8 +2726,7 @@ impl LanguageServerPool {
             sender
                 .send_notification(JsonRpcNotification::new("textDocument/didChange", params))
                 .await?;
-            self.record_sent_content_fingerprint(virtual_uri, connection_key, content)
-                .await;
+            self.record_sent_content(virtual_uri, connection_key, content, Some(version));
         } else {
             // Unchanged text is held again under its current map too.
             self.rehold_unchanged_content(virtual_uri, connection_key, content);
@@ -3160,6 +3159,7 @@ impl LanguageServerPool {
     /// this connection holds — call only after a confirmed-enqueued didOpen or
     /// didChange (#422). Delegates to
     /// [`DocumentTracker::record_sent_content_fingerprint`].
+    #[cfg(test)]
     pub(super) async fn record_sent_content_fingerprint<'a>(
         &self,
         virtual_uri: &VirtualDocumentUri,
@@ -3169,6 +3169,19 @@ impl LanguageServerPool {
         self.document_tracker
             .record_sent_content_fingerprint(virtual_uri, connection_key, content.into())
             .await
+    }
+
+    /// [`Self::record_sent_content_fingerprint`] for a send that knows its
+    /// version: synchronous, so it cannot be cancelled away from its send.
+    pub(super) fn record_sent_content(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+        content: SentText<'_>,
+        version: Option<i32>,
+    ) {
+        self.document_tracker
+            .record_sent(virtual_uri, connection_key, content, version);
     }
 
     /// Re-hold the text `connection_key` already holds for `virtual_uri`

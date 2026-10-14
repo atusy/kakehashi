@@ -715,12 +715,6 @@ impl DocumentTracker {
         connection_key: &ConnectionKey,
         content: SentText<'_>,
     ) {
-        let uri_string = virtual_uri.to_uri_string();
-        let fingerprint = content_fingerprint(content.text);
-        let map = content.map.cloned();
-        if map.is_some() {
-            self.ever_held_prepared.store(true, Ordering::Release);
-        }
         // The version this text went out under: the send it follows bumped
         // the counter before enqueueing, under the transition lock the caller
         // still holds.
@@ -729,8 +723,27 @@ impl DocumentTracker {
             .lock()
             .await
             .get(connection_key)
-            .and_then(|docs| docs.get(&uri_string))
+            .and_then(|docs| docs.get(&virtual_uri.to_uri_string()))
             .copied();
+        self.record_sent(virtual_uri, connection_key, content, version);
+    }
+
+    /// [`Self::record_sent_content_fingerprint`] for a send that knows the
+    /// version it went out under: synchronous, so a caller cancelled once
+    /// its didChange is enqueued cannot leave the record behind.
+    pub(super) fn record_sent(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+        content: SentText<'_>,
+        version: Option<i32>,
+    ) {
+        let uri_string = virtual_uri.to_uri_string();
+        let fingerprint = content_fingerprint(content.text);
+        let map = content.map.cloned();
+        if map.is_some() {
+            self.ever_held_prepared.store(true, Ordering::Release);
+        }
         let mut fingerprints = self
             .document_fingerprints
             .lock()

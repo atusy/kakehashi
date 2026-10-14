@@ -138,12 +138,12 @@ impl LanguageServerPool {
                 // send (full/closed queue) must leave the old fingerprint so the next
                 // edit re-sends, rather than marking content the server never received.
                 if matches!(send_result, NotificationSendResult::Queued) {
-                    self.record_sent_content_fingerprint(
+                    self.record_sent_content(
                         &virtual_uri,
                         &connection_key,
                         injection.sent(),
-                    )
-                    .await;
+                        Some(version),
+                    );
                 } else {
                     synchronized = false;
                 }

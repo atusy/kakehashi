@@ -482,12 +482,12 @@ impl LanguageServerPool {
                     ) {
                         return Err(io::Error::other("completion text sync was not queued"));
                     }
-                    self.record_sent_content_fingerprint(
+                    self.record_sent_content(
                         &virtual_uri,
                         connection_key,
-                        &*document.text,
-                    )
-                    .await;
+                        (&*document.text).into(),
+                        Some(version),
+                    );
                 }
                 handle
                     .send_request(request, request_id)
