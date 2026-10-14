@@ -790,18 +790,48 @@ impl PreparedMap {
         let prepared = self.prepared_lines.text();
         let edited = apply_edits(&self.prepared_lines, edits)?;
         let hunks: Vec<(Range<usize>, &str, Option<char>)> = match mode {
-            EditMode::Extent => edits
-                .iter()
-                .map(|edit| {
-                    let start = self.prepared_lines.offset_clamped(edit.range.start);
-                    let end = self.prepared_lines.offset_clamped(edit.range.end);
-                    (
-                        start..end,
-                        edit.new_text.as_str(),
-                        prepared[end..].chars().next(),
-                    )
-                })
-                .collect(),
+            EditMode::Extent => {
+                let ranges: Vec<Range<usize>> = edits
+                    .iter()
+                    .map(|edit| {
+                        self.prepared_lines.offset_clamped(edit.range.start)
+                            ..self.prepared_lines.offset_clamped(edit.range.end)
+                    })
+                    .collect();
+                // In the order `apply_edits` applies them (by start, then
+                // end, same-position insertions as sent).
+                let mut order: Vec<usize> = (0..edits.len()).collect();
+                order.sort_by_key(|&index| (ranges[index].start, ranges[index].end));
+                // What follows an edit in the edited text: the next edit's
+                // inserted text when one goes right after it (a line one
+                // inserts is followed by what the next one inserts there),
+                // else P past every edit deleting from there.
+                let following = |at: usize| {
+                    let mut position = ranges[order[at]].end;
+                    for &next in &order[at + 1..] {
+                        if ranges[next].start != position {
+                            break;
+                        }
+                        if let Some(first) = edits[next].new_text.chars().next() {
+                            return Some(first);
+                        }
+                        position = ranges[next].end;
+                    }
+                    prepared[position..].chars().next()
+                };
+                let mut hunks = vec![None; edits.len()];
+                for (at, &index) in order.iter().enumerate() {
+                    hunks[index] = Some((
+                        ranges[index].clone(),
+                        edits[index].new_text.as_str(),
+                        following(at),
+                    ));
+                }
+                hunks
+                    .into_iter()
+                    .map(|hunk| hunk.expect("every edit is placed"))
+                    .collect()
+            }
             EditMode::Formatting | EditMode::Replay => {
                 let hunks = if mode == EditMode::Replay {
                     if self.edits_touch_gap(edits) {
@@ -1818,6 +1848,23 @@ fn diff_hunks(old: &str, new: &str) -> Vec<Hunk> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_inserted_line_regains_its_indent_when_another_insertion_follows_it() {
+        let prepared = dedent_by_two("  a\n  c\n");
+        let insert = |text: &str| TextEdit {
+            range: tower_lsp_server::ls_types::Range::new(Position::new(0, 1), Position::new(0, 1)),
+            new_text: text.to_string(),
+        };
+        let mapped = prepared
+            .map_edits(&[insert("\n"), insert("b")], EditMode::Extent)
+            .unwrap();
+        let virtual_lines = LineMap::new("  a\n  c\n".to_string());
+        assert_eq!(
+            apply_edits(&virtual_lines, &mapped).unwrap(),
+            "  a\n  b\n  c\n"
+        );
+    }
 
     #[test]
     fn a_reversed_edit_past_the_end_is_refused() {
