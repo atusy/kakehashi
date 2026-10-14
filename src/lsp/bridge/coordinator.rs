@@ -402,16 +402,18 @@ impl BridgeCoordinator {
             host_eager_open_tasks: DashMap::new(),
             config_memo: ArcSwap::new(Arc::new(ConfigMemo::empty(None))),
         };
-        coordinator.resync_when_a_peer_starts_advertising();
+        coordinator.resync_when_a_prepare_advertisement_changes();
         coordinator
     }
 
-    /// Sync every open host again when a server recorded as not advertising
-    /// `kakehashi/virtualDocument/prepare` starts advertising it (a peer that
-    /// missed its startup deadline, say): its pairs were sent as is, and the
-    /// requests prepared from now on would wait for prepared text no pass
-    /// sends until the next edit.
-    fn resync_when_a_peer_starts_advertising(&self) {
+    /// Sync every open host again when a server's recorded advertisement of
+    /// `kakehashi/virtualDocument/prepare` changes. One that starts
+    /// advertising (a peer that missed its startup deadline, say) had its
+    /// pairs sent as is, and the requests prepared from now on would wait for
+    /// prepared text no pass sends until the next edit; one that withdraws it
+    /// leaves other hosts' documents holding its prepared text, which the
+    /// requests now built as is would wait out the same way.
+    fn resync_when_a_prepare_advertisement_changes(&self) {
         let pool = Arc::downgrade(&self.pool);
         let resync = self.prepare.resync_sender();
         let forget = self.prepare.forget_answers_as_is_hook();
@@ -459,7 +461,7 @@ impl BridgeCoordinator {
             host_eager_open_tasks: DashMap::new(),
             config_memo: ArcSwap::new(Arc::new(ConfigMemo::empty(None))),
         };
-        coordinator.resync_when_a_peer_starts_advertising();
+        coordinator.resync_when_a_prepare_advertisement_changes();
         coordinator
     }
 

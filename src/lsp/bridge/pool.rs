@@ -711,8 +711,8 @@ impl LanguageServerPool {
             .load(Ordering::Acquire)
     }
 
-    /// Run `hook` whenever a server recorded as not advertising
-    /// `kakehashi/virtualDocument/prepare` starts advertising it (set once).
+    /// Run `hook` whenever a server's recorded advertisement of
+    /// `kakehashi/virtualDocument/prepare` changes (set once).
     pub(crate) fn set_prepare_advertised_hook(&self, hook: Box<dyn Fn() + Send + Sync>) {
         let _ = self.prepare_advertisements.on_advertised.set(hook);
     }
@@ -5317,9 +5317,11 @@ impl LanguageServerPool {
 #[derive(Default)]
 pub(crate) struct PrepareAdvertisements {
     by_server: DashMap<String, bool>,
-    /// Run when a server recorded as not advertising starts advertising: its
-    /// pairs were sent as is meanwhile, and their documents should be
-    /// prepared without waiting for an edit.
+    /// Run when a server's recorded advertisement changes: one that starts
+    /// advertising had its pairs sent as is meanwhile, one that withdraws
+    /// it (a `MethodNotFound`) leaves documents holding its prepared text,
+    /// and either way their documents should be synced again without
+    /// waiting for an edit.
     on_advertised: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
     /// Bumped whenever a server starts advertising after being recorded as
     /// not advertising, before the hook runs: an attempt that found no
@@ -5338,11 +5340,14 @@ impl PrepareAdvertisements {
                 return;
             }
         };
-        if advertised && !previous {
+        if advertised == previous {
+            return;
+        }
+        if advertised {
             self.advertised_epoch.fetch_add(1, Ordering::AcqRel);
-            if let Some(hook) = self.on_advertised.get() {
-                hook();
-            }
+        }
+        if let Some(hook) = self.on_advertised.get() {
+            hook();
         }
     }
 
@@ -5393,7 +5398,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_peer_starting_to_advertise_prepare_runs_the_hook_once() {
+    fn a_change_of_prepare_advertisement_runs_the_hook() {
         let pool = LanguageServerPool::new();
         let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = Arc::clone(&runs);
@@ -5414,8 +5419,10 @@ mod tests {
         assert_eq!(runs(), 1);
         assert_eq!(pool.prepare_advertised_epoch(), before + 1);
         assert_eq!(pool.prepare_advertisement("late"), Some(true));
+        // Withdrawn (a `MethodNotFound`): its documents hold prepared text.
         pool.record_prepare_advertisement("late", false);
-        assert_eq!(runs(), 1);
+        assert_eq!(runs(), 2);
+        assert_eq!(pool.prepare_advertised_epoch(), before + 1);
     }
     use crate::lsp::bridge::actor::{OutboundMessage, RouteResult, spawn_reader_task};
     use crate::lsp::bridge::protocol::RegionOffset;
