@@ -4210,9 +4210,9 @@ impl LanguageServerPool {
                     // path, not only the one that waits (#992): an incapable
                     // shared connection takes no marker root it does not
                     // already serve. Refused, the entry point re-resolves,
-                    // and routing now sees it Ready+incapable and diverts.
+                    // and routing now sees it Ready+incapable and diverts
+                    // (logging the fallback there).
                     if incapable_shared_refuses(&handle, &marker) {
-                        handle.log_incapable_fallback_once(server_name);
                         return Err(BridgeError::shared_root_unserved());
                     }
                     self.announce_shared_root(&handle, &marker).await?;
