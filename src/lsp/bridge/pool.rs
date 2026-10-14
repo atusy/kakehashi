@@ -735,19 +735,38 @@ impl LanguageServerPool {
             .load(Ordering::Acquire)
     }
 
+    /// The start failures' clearing count, read by an attempt before it
+    /// acquires a candidate (see [`Self::record_prepare_start_failure`]).
+    pub(crate) fn prepare_start_failures_cleared(&self) -> u64 {
+        self.prepare_advertisements.start_failures().cleared
+    }
+
     /// Note that `server_name` could not be started for `host_uri`'s
-    /// documents to prepare them (see `PrepareAdvertisements::start_failures`).
-    pub(crate) fn record_prepare_start_failure(&self, server_name: &str, host_uri: &Url) {
-        self.prepare_advertisements
-            .start_failures
-            .insert((server_name.to_string(), host_uri.clone()));
+    /// documents to prepare them (see `PrepareAdvertisements::start_failures`)
+    /// — unless failures were cleared since `cleared` was read: the
+    /// settings that failed to start it changed, or it started since.
+    pub(crate) fn record_prepare_start_failure(
+        &self,
+        server_name: &str,
+        host_uri: &Url,
+        cleared: u64,
+    ) {
+        let mut failures = self.prepare_advertisements.start_failures();
+        if failures.cleared == cleared {
+            failures
+                .failed
+                .insert((server_name.to_string(), host_uri.clone()));
+        }
     }
 
     /// Whether `server_name` could not be started for `host_uri`'s
     /// documents (see [`Self::record_prepare_start_failure`]).
     pub(crate) fn prepare_start_failed(&self, server_name: &str, host_uri: &Url) -> bool {
-        let failures = &self.prepare_advertisements.start_failures;
-        !failures.is_empty() && failures.contains(&(server_name.to_string(), host_uri.clone()))
+        let failures = self.prepare_advertisements.start_failures();
+        !failures.failed.is_empty()
+            && failures
+                .failed
+                .contains(&(server_name.to_string(), host_uri.clone()))
     }
 
     /// Forget the start failures recorded for `host_uri` (closed: its
@@ -756,9 +775,6 @@ impl LanguageServerPool {
     /// them are asked again (as an advertisement change has them).
     pub(crate) fn forget_prepare_start_failures(&self, host_uri: Option<&Url>) {
         let advertisements = &self.prepare_advertisements;
-        if advertisements.start_failures.is_empty() {
-            return;
-        }
         match host_uri {
             Some(host_uri) => {
                 advertisements.forget_start_failures(|_, host| host == host_uri);
@@ -5459,14 +5475,29 @@ pub(crate) struct PrepareAdvertisements {
     /// root's healthy connection keeps preparing — until the server's next
     /// handshake that advertises the request, a settings change, or the
     /// host closing.
-    start_failures: dashmap::DashSet<(String, Url)>,
+    start_failures: std::sync::Mutex<StartFailures>,
     /// Bumped whenever a server's recorded advertisement changes, before the
     /// hook runs: an attempt that answered meanwhile knows a candidate ahead
     /// of the one answering (or behind one withdrawing) may answer now.
     advertised_epoch: std::sync::atomic::AtomicU64,
 }
 
+/// See `PrepareAdvertisements::start_failures`.
+#[derive(Default)]
+struct StartFailures {
+    failed: std::collections::HashSet<(String, Url)>,
+    /// Bumped by every clearing: a failure seen by an attempt that began
+    /// acquiring before one is not recorded after it.
+    cleared: u64,
+}
+
 impl PrepareAdvertisements {
+    fn start_failures(&self) -> std::sync::MutexGuard<'_, StartFailures> {
+        self.start_failures
+            .lock()
+            .recover_poison("PrepareAdvertisements::start_failures")
+    }
+
     /// Record `server_name`'s advertisement, cloning its name only when
     /// first seen; `true` when it changed a recorded one. (A first record
     /// changes no candidate's selection: an unrecorded candidate is asked.)
@@ -5474,9 +5505,7 @@ impl PrepareAdvertisements {
         // A handshake advertising the request: the server started somewhere,
         // and is tried again where it could not be — the answers given
         // without it (as is, or a later candidate's) are asked again.
-        let retried = advertised
-            && !self.start_failures.is_empty()
-            && self.forget_start_failures(|server, _| server == server_name);
+        let retried = advertised && self.forget_start_failures(|server, _| server == server_name);
         let previous = match self.by_server.get_mut(server_name) {
             Some(mut entry) => std::mem::replace(&mut *entry, advertised),
             None => {
@@ -5501,11 +5530,18 @@ impl PrepareAdvertisements {
     }
 
     /// Forget the start failures `matches` accepts; `true` when any went.
+    /// A clearing either way: a failure an attempt saw before it is not
+    /// recorded (see [`StartFailures::cleared`]).
     fn forget_start_failures(&self, matches: impl Fn(&str, &Url) -> bool) -> bool {
-        let before = self.start_failures.len();
-        self.start_failures
-            .retain(|(server, host)| !matches(server, host));
-        self.start_failures.len() != before
+        let mut failures = self.start_failures();
+        failures.cleared += 1;
+        let mut removed = false;
+        failures.failed.retain(|(server, host)| {
+            let goes = matches(server, host);
+            removed |= goes;
+            !goes
+        });
+        removed
     }
 
     /// As if an advertisement had changed: what candidates answer may have.
@@ -5574,7 +5610,7 @@ mod tests {
         let b = Url::parse("file:///b/doc.md").unwrap();
         pool.record_prepare_advertisement("peer", true);
         let epoch = pool.prepare_advertised_epoch();
-        pool.record_prepare_start_failure("peer", &b);
+        pool.record_prepare_start_failure("peer", &b, pool.prepare_start_failures_cleared());
         assert!(pool.prepare_start_failed("peer", &b));
         assert!(!pool.prepare_start_failed("peer", &a));
         // Another root's healthy connection keeps its advertisement.
@@ -5587,15 +5623,21 @@ mod tests {
         assert!(!pool.prepare_start_failed("peer", &b));
         assert_eq!(pool.prepare_advertised_epoch(), epoch + 1);
         assert_eq!(runs.load(std::sync::atomic::Ordering::Relaxed), 1);
-        pool.record_prepare_start_failure("peer", &b);
+        pool.record_prepare_start_failure("peer", &b, pool.prepare_start_failures_cleared());
         pool.forget_prepare_start_failures(Some(&a));
         assert!(pool.prepare_start_failed("peer", &b));
         pool.forget_prepare_start_failures(Some(&b));
         assert!(!pool.prepare_start_failed("peer", &b));
         // A closed host's answers go with it: nothing to ask again.
         assert_eq!(runs.load(std::sync::atomic::Ordering::Relaxed), 1);
+        // A failure an attempt saw before failures were cleared is not
+        // recorded after: the peer may have started since.
+        let seen = pool.prepare_start_failures_cleared();
+        pool.forget_prepare_start_failures(Some(&a));
+        pool.record_prepare_start_failure("peer", &b, seen);
+        assert!(!pool.prepare_start_failed("peer", &b));
         // A settings change does ask again.
-        pool.record_prepare_start_failure("peer", &b);
+        pool.record_prepare_start_failure("peer", &b, pool.prepare_start_failures_cleared());
         pool.forget_prepare_start_failures(None);
         assert!(!pool.prepare_start_failed("peer", &b));
         assert_eq!(runs.load(std::sync::atomic::Ordering::Relaxed), 2);

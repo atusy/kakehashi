@@ -957,6 +957,7 @@ async fn try_run(
                 {
                     continue;
                 }
+                let failures_cleared = pool.prepare_start_failures_cleared();
                 let handle = match pool
                     .get_or_create_connection_wait_ready_admitted(
                         name,
@@ -986,7 +987,7 @@ async fn try_run(
                             job.host_uri,
                             escape_terminal_controls(&error.to_string()),
                         );
-                        pool.record_prepare_start_failure(name, &job.host_uri);
+                        pool.record_prepare_start_failure(name, &job.host_uri, failures_cleared);
                         continue;
                     }
                 };
