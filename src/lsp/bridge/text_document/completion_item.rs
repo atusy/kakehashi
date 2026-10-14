@@ -485,7 +485,7 @@ impl LanguageServerPool {
                     self.record_sent_content_fingerprint(
                         &virtual_uri,
                         connection_key,
-                        &document.text,
+                        &*document.text,
                     )
                     .await;
                 }

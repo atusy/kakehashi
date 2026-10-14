@@ -49,7 +49,7 @@ pub(crate) struct CrashedConnection {
 }
 pub(crate) use crash_recovery::{RecoveryDecision, Reservation};
 pub(in crate::lsp::bridge) use document_tracker::DocumentTracker;
-pub(crate) use document_tracker::{OpenedVirtualDoc, VirtualUriObserver};
+pub(crate) use document_tracker::{OpenedVirtualDoc, SentText, VirtualUriObserver};
 pub(crate) use dynamic_capability_registry::DynamicCapabilityRegistry;
 pub(crate) use message_sender::{ConnectionHandleSender, MessageSender};
 use pending_reopen::PendingReopenRegistry;
@@ -324,8 +324,8 @@ pub(in crate::lsp::bridge) type HostDocuments =
     Mutex<HashMap<String, HashMap<ConnectionKey, HostDocSyncState>>>;
 
 enum VirtualOpenContent<'a> {
-    LatestKnown(&'a str),
-    Snapshot(&'a str),
+    LatestKnown(SentText<'a>),
+    Snapshot(SentText<'a>),
 }
 
 /// Cancellation-safe rollback for the pre-send virtual-document claim.
@@ -360,7 +360,25 @@ pub(crate) struct HostVirtualContents {
     /// Only accepted parse-label promotions establish this admission fence.
     /// Explicit aliases keep their existing canonical request behavior.
     promoted_language: Option<HostLanguageAdmission>,
-    contents: DashMap<String, DashMap<String, Arc<str>>>,
+    contents: DashMap<String, DashMap<String, Arc<LatestText>>>,
+}
+
+/// The latest text forwarded for a virtual document, which a deferred
+/// didOpen substitutes: what downstream servers are sent, with the prepared
+/// map when a peer prepared it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct LatestText {
+    text: String,
+    map: Option<Arc<super::protocol::PreparedMap>>,
+}
+
+impl LatestText {
+    fn as_sent(&self) -> SentText<'_> {
+        SentText {
+            text: &self.text,
+            map: self.map.as_ref(),
+        }
+    }
 }
 
 pub(crate) struct HostLanguageAdmission {
@@ -2570,19 +2588,19 @@ impl LanguageServerPool {
 
     /// Open or synchronize a virtual document from a revision-validated snapshot.
     /// The caller keeps that revision stable until enqueue completes.
-    pub(crate) async fn ensure_document_opened_from_snapshot<S: message_sender::MessageSender>(
+    pub(crate) async fn ensure_document_opened_from_snapshot<'a, S: message_sender::MessageSender>(
         &self,
         sender: &mut S,
         host_uri: &Url,
         virtual_uri: &VirtualDocumentUri,
-        virtual_content: &str,
+        virtual_content: impl Into<SentText<'a>>,
         connection_key: &ConnectionKey,
     ) -> io::Result<()> {
         self.ensure_document_opened_with_content(
             sender,
             host_uri,
             virtual_uri,
-            VirtualOpenContent::Snapshot(virtual_content),
+            VirtualOpenContent::Snapshot(virtual_content.into()),
             connection_key,
         )
         .await
@@ -2599,19 +2617,19 @@ impl LanguageServerPool {
     ///
     /// Generic over `MessageSender` (channel or `ConnectionHandleSender`) for
     /// the single-writer-loop architecture (ls-bridge-message-ordering).
-    pub(crate) async fn ensure_document_opened<S: message_sender::MessageSender>(
+    pub(crate) async fn ensure_document_opened<'a, S: message_sender::MessageSender>(
         &self,
         sender: &mut S,
         host_uri: &Url,
         virtual_uri: &VirtualDocumentUri,
-        virtual_content: &str,
+        virtual_content: impl Into<SentText<'a>>,
         connection_key: &ConnectionKey,
     ) -> io::Result<()> {
         self.ensure_document_opened_with_content(
             sender,
             host_uri,
             virtual_uri,
-            VirtualOpenContent::LatestKnown(virtual_content),
+            VirtualOpenContent::LatestKnown(virtual_content.into()),
             connection_key,
         )
         .await
@@ -2624,7 +2642,7 @@ impl LanguageServerPool {
         &self,
         sender: &mut S,
         virtual_uri: &VirtualDocumentUri,
-        content: &str,
+        content: SentText<'_>,
         connection_key: &ConnectionKey,
     ) -> io::Result<()> {
         let uri = virtual_uri
@@ -2632,7 +2650,7 @@ impl LanguageServerPool {
             .parse()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         if let Some(version) = self
-            .increment_version_if_content_changed(virtual_uri, connection_key, content)
+            .increment_version_if_content_changed(virtual_uri, connection_key, content.text)
             .await
         {
             let params = DidChangeTextDocumentParams {
@@ -2640,7 +2658,7 @@ impl LanguageServerPool {
                 content_changes: vec![TextDocumentContentChangeEvent {
                     range: None,
                     range_length: None,
-                    text: content.to_owned(),
+                    text: content.text.to_owned(),
                 }],
             };
             sender
@@ -2771,8 +2789,10 @@ impl LanguageServerPool {
             ),
             VirtualOpenContent::Snapshot(provided) => (provided, None),
         };
-        let virtual_content = current_content.as_deref().unwrap_or(provided);
-        let did_open = build_didopen_notification(virtual_uri, virtual_content);
+        let virtual_content = current_content
+            .as_deref()
+            .map_or(provided, LatestText::as_sent);
+        let did_open = build_didopen_notification(virtual_uri, virtual_content.text);
         if let Err(e) = sender.send_notification(did_open).await {
             self.document_tracker
                 .rollback_open_claim_if(host_uri, virtual_uri, connection_key, &claim)
@@ -2844,34 +2864,41 @@ impl LanguageServerPool {
         Ok(())
     }
 
-    pub(crate) fn record_latest_virtual_content(
+    pub(crate) fn record_latest_virtual_content<'a>(
         &self,
         host_uri: &Url,
         incarnation: u64,
         language: &str,
         region_id: &str,
-        content: &str,
+        content: impl Into<SentText<'a>>,
     ) {
+        let content = content.into();
         let Some(host) = self.latest_virtual_contents.get(host_uri) else {
             return;
         };
         if host.incarnation != incarnation {
             return;
         }
+        let latest = || {
+            Arc::new(LatestText {
+                text: content.text.to_string(),
+                map: content.map.cloned(),
+            })
+        };
         if let Some(regions) = host.contents.get(language) {
-            if regions
-                .get(region_id)
-                .is_some_and(|cached| cached.as_ref() == content)
-            {
+            if regions.get(region_id).is_some_and(|cached| {
+                cached.text == content.text
+                    && cached.map.as_deref() == content.map.map(Arc::as_ref)
+            }) {
                 return;
             }
-            regions.insert(region_id.to_string(), Arc::<str>::from(content));
+            regions.insert(region_id.to_string(), latest());
             return;
         }
         host.contents
             .entry(language.to_string())
             .or_default()
-            .insert(region_id.to_string(), Arc::<str>::from(content));
+            .insert(region_id.to_string(), latest());
     }
 
     /// The document's lifecycle lock, created on first use. Transitions lock it
@@ -3044,14 +3071,14 @@ impl LanguageServerPool {
     /// Record `content`'s fingerprint as sent to this connection — call only after a
     /// confirmed-enqueued didChange (#422). Delegates to
     /// [`DocumentTracker::record_sent_content_fingerprint`].
-    pub(super) async fn record_sent_content_fingerprint(
+    pub(super) async fn record_sent_content_fingerprint<'a>(
         &self,
         virtual_uri: &VirtualDocumentUri,
         connection_key: &ConnectionKey,
-        content: &str,
+        content: impl Into<SentText<'a>>,
     ) {
         self.document_tracker
-            .record_sent_content_fingerprint(virtual_uri, connection_key, content)
+            .record_sent_content_fingerprint(virtual_uri, connection_key, content.into())
             .await
     }
 

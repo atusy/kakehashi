@@ -18,7 +18,7 @@ use crate::error::LockResultExt;
 use url::Url;
 
 use super::ConnectionKey;
-use crate::lsp::bridge::protocol::VirtualDocumentUri;
+use crate::lsp::bridge::protocol::{PreparedMap, VirtualDocumentUri};
 
 #[derive(Default)]
 struct VirtualUriProvenance {
@@ -116,6 +116,42 @@ impl VirtualUriObserver {
 /// and skip its re-sync: the downstream then analyzes stale content until a *later*
 /// edit happens to hash differently, and if no further edit occurs it stays stale.
 /// This is the standard fingerprint-guard tradeoff, accepted for the collision odds.
+/// Text sent downstream for a virtual document: the virtual text itself, or
+/// the text a peer prepared from it (`kakehashi/virtualDocument/prepare`)
+/// with the map back to it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SentText<'a> {
+    pub(crate) text: &'a str,
+    pub(crate) map: Option<&'a Arc<PreparedMap>>,
+}
+
+impl<'a> From<&'a str> for SentText<'a> {
+    fn from(text: &'a str) -> Self {
+        Self { text, map: None }
+    }
+}
+
+impl<'a> From<&'a String> for SentText<'a> {
+    fn from(text: &'a String) -> Self {
+        text.as_str().into()
+    }
+}
+
+/// What a connection holds for a virtual document: the text it was last
+/// sent, and how that text maps back to the virtual document.
+#[derive(Debug, Clone)]
+pub(crate) struct HeldText {
+    /// [`content_fingerprint`] of the text.
+    pub(crate) fingerprint: u64,
+    /// The prepared map the text was sent with; `None` for a virtual text
+    /// sent as is. Replaced, without a new generation, when the same text is
+    /// later sent (or held) with another map.
+    pub(crate) map: Option<Arc<PreparedMap>>,
+    /// Changes whenever the text does: anything the server computed (a
+    /// push) is in the coordinates of the generation it held.
+    pub(crate) generation: u64,
+}
+
 fn content_fingerprint(content: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -174,7 +210,12 @@ pub(crate) struct DocumentTracker {
     /// op, never across an `.await`, so the async mutex's overhead is unwanted (mirrors
     /// `DiagnosticAggregator::last_published`). Poisoning is recovered via
     /// `LockResultExt::recover_poison`.
-    document_fingerprints: std::sync::Mutex<HashMap<ConnectionKey, HashMap<String, u64>>>,
+    ///
+    /// The entry is also the record of what the connection holds (see
+    /// [`HeldText`]): the only writers are the paths that send the text.
+    document_fingerprints: std::sync::Mutex<HashMap<ConnectionKey, HashMap<String, HeldText>>>,
+    /// Source of [`HeldText::generation`].
+    held_generations: std::sync::atomic::AtomicU64,
     /// Tracks which virtual documents were opened for each host document.
     ///
     /// Each OpenedVirtualDoc stores its connection key for reverse lookup during didClose.
@@ -213,6 +254,7 @@ impl DocumentTracker {
         Self {
             document_versions: Mutex::new(HashMap::new()),
             document_fingerprints: std::sync::Mutex::new(HashMap::new()),
+            held_generations: std::sync::atomic::AtomicU64::new(0),
             host_to_virtual: Mutex::new(HashMap::new()),
             opened_documents: DashMap::new(),
             virtual_to_servers: DashMap::new(),
@@ -637,7 +679,7 @@ impl DocumentTracker {
             if fingerprints
                 .get(connection_key)
                 .and_then(|docs| docs.get(&uri_string))
-                == Some(&fp)
+                .is_some_and(|held| held.fingerprint == fp)
             {
                 return None;
             }
@@ -652,33 +694,62 @@ impl DocumentTracker {
         Some(*version)
     }
 
-    /// Record the fingerprint of the content just **successfully enqueued** as a
-    /// `didChange` to this connection, so a later edit leaving the region's content
-    /// identical is skipped (#422). Call this only after the send returns `Queued` —
-    /// recording before the send (or on a dropped send) would mark content the server
-    /// never received, defeating the self-heal on the next edit.
+    /// Record the content just **successfully enqueued** (`didOpen` or
+    /// `didChange`) to this connection: its fingerprint, so a later edit
+    /// leaving the region's content identical is skipped (#422), and the
+    /// prepared map it was sent with (see [`HeldText`]). Call this only after
+    /// the send returns `Queued` — recording before the send (or on a dropped
+    /// send) would mark content the server never received, defeating the
+    /// self-heal on the next edit.
     pub(super) async fn record_sent_content_fingerprint(
         &self,
         virtual_uri: &VirtualDocumentUri,
         connection_key: &ConnectionKey,
-        content: &str,
+        content: SentText<'_>,
     ) {
         let uri_string = virtual_uri.to_uri_string();
-        let fp = content_fingerprint(content);
+        let fingerprint = content_fingerprint(content.text);
+        let map = content.map.cloned();
         let mut fingerprints = self
             .document_fingerprints
             .lock()
             .recover_poison("DocumentTracker::document_fingerprints");
         // Clone the connection key only when first inserting it (common path: the
         // connection is already present, so look up by borrow).
-        if let Some(docs) = fingerprints.get_mut(connection_key) {
-            docs.insert(uri_string, fp);
-        } else {
-            fingerprints
-                .entry(connection_key.clone())
-                .or_default()
-                .insert(uri_string, fp);
+        let docs = match fingerprints.get_mut(connection_key) {
+            Some(docs) => docs,
+            None => fingerprints.entry(connection_key.clone()).or_default(),
+        };
+        match docs.get_mut(&uri_string) {
+            // The same text: what the server computed stays in the same
+            // coordinates, even when it maps back differently now.
+            Some(held) if held.fingerprint == fingerprint => held.map = map,
+            _ => {
+                let generation = self.held_generations.fetch_add(1, Ordering::Relaxed) + 1;
+                docs.insert(
+                    uri_string,
+                    HeldText {
+                        fingerprint,
+                        map,
+                        generation,
+                    },
+                );
+            }
         }
+    }
+
+    /// What this connection was last sent for the document, if anything.
+    pub(super) fn held_text(
+        &self,
+        virtual_uri: &str,
+        connection_key: &ConnectionKey,
+    ) -> Option<HeldText> {
+        self.document_fingerprints
+            .lock()
+            .recover_poison("DocumentTracker::document_fingerprints")
+            .get(connection_key)
+            .and_then(|docs| docs.get(virtual_uri))
+            .cloned()
     }
 
     /// Remove a document from `document_versions` and `opened_documents`.
@@ -1651,7 +1722,7 @@ mod tests {
             "first didChange sends and bumps the version"
         );
         tracker
-            .record_sent_content_fingerprint(&virtual_uri, &conn, "local x = 1")
+            .record_sent_content_fingerprint(&virtual_uri, &conn, "local x = 1".into())
             .await;
         // Same content now recorded-as-sent → skip (no bump, no re-send).
         assert_eq!(
@@ -1669,6 +1740,52 @@ mod tests {
             Some(3),
             "changed content sends and bumps"
         );
+    }
+
+    #[tokio::test]
+    async fn the_held_text_changes_generation_only_with_the_text() {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let uri = virtual_uri.to_uri_string();
+        let conn = ConnectionKey::for_server("lua");
+        let map = |text: &str| {
+            apply_prepare_result(text, &VirtualLayout::single(text), None)
+                .unwrap()
+                .map
+                .unwrap()
+        };
+        assert!(tracker.held_text(&uri, &conn).is_none());
+
+        tracker
+            .record_sent_content_fingerprint(&virtual_uri, &conn, "a".into())
+            .await;
+        let first = tracker.held_text(&uri, &conn).unwrap();
+        assert!(first.map.is_none());
+
+        // The same text held with a map: same coordinates, another mapping.
+        let mapped = map("a");
+        tracker
+            .record_sent_content_fingerprint(
+                &virtual_uri,
+                &conn,
+                SentText {
+                    text: "a",
+                    map: Some(&mapped),
+                },
+            )
+            .await;
+        let remapped = tracker.held_text(&uri, &conn).unwrap();
+        assert_eq!(remapped.generation, first.generation);
+        assert!(Arc::ptr_eq(remapped.map.as_ref().unwrap(), &mapped));
+
+        tracker
+            .record_sent_content_fingerprint(&virtual_uri, &conn, "b".into())
+            .await;
+        let changed = tracker.held_text(&uri, &conn).unwrap();
+        assert_ne!(changed.generation, first.generation);
+        assert!(changed.map.is_none());
     }
 
     #[tokio::test]
