@@ -257,9 +257,9 @@ Restore the comment markers yourself:
 Until you do, the new lines are outside the comment. The Rust file may no
 longer compile, or may mean something else. A query that removes host text
 from a region decides what the server sees. It does not tell formatting to
-repeat that text on lines the formatter adds. The pipeline repeats left-out
-text only when it holds nothing but `>` markers and indentation, as a
-blockquote's line prefix does.
+repeat that text on lines the formatter adds. For a region like this one, the
+pipeline repeats left-out text only when it holds nothing but `>` markers and
+indentation, as a blockquote's line prefix does.
 
 Under the default `preferred` server strategy, and for range and on-type
 formatting, an answer that adds line breaks to this region is dropped whole,
