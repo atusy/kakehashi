@@ -167,8 +167,9 @@ pub(crate) struct DocumentParams {
 
 /// Convert a `VirtualDocumentUri` to a `ls_types::Uri`.
 ///
-/// Delegates to [`VirtualDocumentUri::to_lsp_uri()`] which handles parse
-/// failures gracefully (logs + falls back to host URI).
+/// Delegates to [`VirtualDocumentUri::to_lsp_uri()`], which returns the URI
+/// validated once at render time (or, on its logged last resort, the host
+/// URI).
 pub(crate) fn virtual_uri_to_lsp_uri(virtual_uri: &VirtualDocumentUri) -> Uri {
     virtual_uri.to_lsp_uri()
 }
