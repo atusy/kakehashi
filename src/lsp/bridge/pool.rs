@@ -3880,6 +3880,10 @@ impl LanguageServerPool {
             // unannounced: refuse, so the acquisition re-resolves and diverts.
             // Only that transition: a server that never registered was never
             // told of any root, and announcing to it stays a no-op.
+            // Acquisitions refuse such a root earlier, in
+            // `get_or_create_connection_resolved` (`incapable_shared_refuses`,
+            // #992), for either kind of server; this catches an unregistration
+            // landing after that check, and callers that do not pre-check.
             if let Some((root, _folder)) = marker
                 && handle
                     .dynamic_capabilities()
