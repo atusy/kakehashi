@@ -1896,9 +1896,10 @@ mod tests {
         let bridgeable = |user: &str| {
             let user: RawWorkspaceSettings = toml::from_str(user).unwrap();
             let merged = merge_workspace_settings(Some(default_settings()), Some(user)).unwrap();
-            let markdown =
-                resolve_with_wildcard(&merged.languages, "markdown", merge_language_settings)
-                    .unwrap();
+            // As the settings resolve each language through its base chain.
+            let markdown = resolve_base_configs(&merged.languages)
+                .remove("markdown")
+                .unwrap();
             ["python", "rust"].map(|language| markdown.is_language_bridgeable(language))
         };
         let host = r#"
