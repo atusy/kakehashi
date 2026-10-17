@@ -10,8 +10,9 @@
 //! An answer stands only under the epoch it was asked in (see
 //! [`PrepareEpoch`]): whatever can change which candidate answers, or how —
 //! an advertisement, a start failure cleared, settings — moves the epoch, and
-//! every lookup after that is a new input. Nothing is forgotten or revoked to
-//! get there; outdated answers age out of their region's slots.
+//! every lookup after that is a new input. No answer is forgotten to get
+//! there; outdated answers age out of their region's slots, and an attempt
+//! still running across the move is no longer admitted to ask its peer.
 //!
 //! This registry only answers. What each server holds, and so which map its
 //! coordinates follow, is recorded by the paths that send, with the text
@@ -20,7 +21,9 @@
 //! The lifecycle pass must not wait for the peer under the document's edit
 //! lock, so it only looks up: on a miss it starts the attempt and holds the
 //! document back, and the attempt's end asks for the host to be synced again
-//! ([`Resync`]). Requests wait for the answer instead.
+//! ([`Resync`]). Requests that can wait for the answer do; those that cannot
+//! (a diagnostic snapshot, a pull folding pushes) look up without waiting,
+//! never moving what the pass holds the document on.
 //!
 //! Every attempt runs on its own task, so a cancelled request cannot strand
 //! one half-done, and all waiters share it. An attempt that gets no answer
@@ -333,8 +336,10 @@ impl PrepareRegistry {
     }
 
     /// Hosts to sync again: a held-back virtual document became ready, its
-    /// answer came back unusable, or an attempt that got no answer finished
-    /// its retry backoff. Taken once by the server loop.
+    /// answer came back unusable, an attempt that got no answer finished its
+    /// retry backoff, a pass whose sends failed is retried
+    /// ([`Self::requeue_resync`]), or a lifecycle lookup found its target
+    /// resolved under a moved epoch. Taken once by the server loop.
     pub(crate) fn take_resync_rx(&self) -> Option<UnboundedReceiver<Resync>> {
         self.resync_rx
             .lock()
@@ -573,10 +578,6 @@ impl PrepareRegistry {
         self.held_changes.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// The slot answering `input` under `epoch`, created when missing.
-    /// `None` for a target resolved under another epoch (settings changed
-    /// since, say): its candidates may not be the ones to ask, and asking
-    /// could start a peer the settings no longer name.
     /// Settle `input`'s answer as an attempt would, the lifecycle pass
     /// holding its document on it when `held`.
     #[cfg(test)]
@@ -599,6 +600,11 @@ impl PrepareRegistry {
         self.held_changes.fetch_add(1, Ordering::AcqRel);
     }
 
+    /// The slot answering `input` under `epoch`, created when missing.
+    /// `None` for a target resolved under another epoch (settings changed
+    /// since, say): its candidates may not be the ones to ask, and asking
+    /// could start a peer the settings no longer name. `None` too for a
+    /// closed host.
     fn slot(
         &self,
         target: &PrepareTarget,
@@ -915,9 +921,10 @@ async fn run(
     }
 }
 
-/// The outer `Err` is a failure to get an answer (worth retrying); the
-/// inner one is final for the input: an answer that cannot be used (an
-/// error response, a malformed or refused result). `Ok(Ok(None))`: no
+/// The outer `Err` is a failure to get an answer (worth retrying, a
+/// retryable cancellation included); the inner one is final for the input:
+/// an answer that cannot be used (an error response other than a retryable
+/// cancellation, a malformed or refused result). `Ok(Ok(None))`: no
 /// candidate prepares it.
 ///
 /// Candidates are asked strictly in priority order: one still starting is

@@ -100,8 +100,9 @@ enum PrepareHolder {
 /// What one injection pass over a host did.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct InjectionPass {
-    /// Every send it made could be queued (`false` also when the document
-    /// is gone).
+    /// Every send it made could be queued (`false` also when the pass did
+    /// nothing: the document is gone, has no detected language, or is not
+    /// the lifetime it was asked for).
     pub(crate) synchronized: bool,
     /// Its regions could be looked at (not, during a reload): a pass that
     /// could not look deferred its work to a retry that only syncs

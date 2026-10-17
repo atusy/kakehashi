@@ -151,7 +151,8 @@ impl Kakehashi {
         {
             // Held documents (waiting for their prepare answers, or answered
             // unusably) are not sent, their save included: it is forwarded
-            // to each once its prepared text is sent.
+            // to each whose prepared text is sent while the host is still at
+            // the saved version (one answered unusably never is).
             let held: Vec<String> = injections
                 .iter()
                 .filter(|injection| injection.held)

@@ -287,9 +287,11 @@ pub(crate) struct DocumentTracker {
     /// `LockResultExt::recover_poison`.
     ///
     /// The entry is also the record of what the connection holds (see
-    /// [`HeldText`]), written only by the paths that send the text: before
-    /// the send is queued, so whatever the server answers it with finds it,
-    /// and taken back if the send is not queued.
+    /// [`HeldText`]), written by the paths that send the text: before the
+    /// send is queued, so whatever the server answers it with finds it, and
+    /// taken back if the send is not queued. The one write without a send is
+    /// the same text held under another map (only its gaps changed: see
+    /// `increment_version_if_content_changed`), which sends nothing new.
     document_fingerprints: std::sync::Mutex<HashMap<ConnectionKey, HashMap<String, HeldText>>>,
     /// Source of [`HeldText::generation`]: the newest generation given out,
     /// published once its record is in (see [`Self::held_through`]).
@@ -303,12 +305,15 @@ pub(crate) struct DocumentTracker {
     held_waiters: std::sync::atomic::AtomicUsize,
     /// Some connection was ever sent a prepared text: until then every held
     /// text is a virtual text as is, which lets paths skip looking up what a
-    /// connection holds.
+    /// connection holds. Set as a prepared text is recorded, before its send
+    /// is queued, and not undone by a take-back: it only ever makes the
+    /// paths look.
     ever_held_prepared: AtomicBool,
     /// The documents each connection was ever sent a prepared text of, kept
     /// past their records (a document closed since): coordinates such a
     /// connection computed may be in a prepared text's, which no record says
-    /// any more. Written under `document_fingerprints`'s lock, read under it
+    /// any more. Written under `document_fingerprints`'s lock, as a prepared
+    /// text is recorded (a take-back keeps it: conservative), read under it
     /// too (that lock first). Dropped with the connection, and with its host.
     /// Keyed by virtual URI, with the host URI each belongs to.
     prepared_history: std::sync::Mutex<HashMap<ConnectionKey, HashMap<String, String>>>,

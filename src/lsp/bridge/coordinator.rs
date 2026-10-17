@@ -39,8 +39,10 @@ pub(crate) struct BridgeInjection {
     pub(crate) content: String,
     /// Not to be sent: its prepared form is not available
     /// (`kakehashi/virtualDocument/prepare` pending or failed). A held
-    /// injection still exists — its open document stays open — but neither
-    /// opens nor changes downstream.
+    /// injection still exists — its open document stays open, unless a
+    /// server holds it as is once a peer is known (see
+    /// `close_unprepared_held_docs`) — but neither opens nor changes
+    /// downstream.
     pub(crate) held: bool,
     /// The map from `content` back to the virtual document, for a prepared
     /// one: sent along with it, so each connection's record of what it holds

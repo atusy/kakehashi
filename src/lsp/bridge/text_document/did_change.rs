@@ -27,8 +27,9 @@ impl LanguageServerPool {
     /// false if any attempted enqueue fails, leaving its sent fingerprint old
     /// so a synchronization waiter can retry.
     ///
-    /// Notifications go through `send_notification()` (single writer task,
-    /// ls-bridge-message-ordering) for FIFO order — fire-and-forget but no reordering.
+    /// Notifications are recorded and queued together on the connection's
+    /// single writer task (`record_and_queue`, ls-bridge-message-ordering)
+    /// for FIFO order — fire-and-forget but no reordering.
     // TODO: switch to TextDocumentSyncKind::Incremental for large documents.
     pub(crate) async fn forward_didchange_to_opened_docs(
         &self,

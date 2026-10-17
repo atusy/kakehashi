@@ -1213,6 +1213,10 @@ impl Kakehashi {
             return None;
         };
 
+        // At once on what the lifecycle pass knows, a pending answer
+        // included (most likely prepared); checked again with the answer in
+        // (see `prepare_request_context_for`). Formatting waits instead (see
+        // `method_gate`).
         if method_closed_to(
             &resolved,
             method_name,
@@ -1456,12 +1460,19 @@ impl Kakehashi {
         prepare_request_context_for(&self.bridge, &preamble.language_name, ctx, method_name).await
     }
 
-    /// Whether `method` is open to a region of a `host_language` host: not
-    /// by [`method_closed_to`] under what the lifecycle pass knows, nor — for
-    /// an edit method on a region the pass has not looked up yet — once the
-    /// prepare answer for its current text is in (waited for, as a request
-    /// is): only a document sent as is takes edits. One its peer could not
-    /// prepare is told apart: it is not bridged at all.
+    /// Whether `method` is open to a region of a `host_language` host, for
+    /// formatting. Closed by the region's shape ([`method_closed_to`]);
+    /// unprepared when the lifecycle pass holds it on an unusable answer;
+    /// otherwise, for a method the rule closes on a prepared document, by
+    /// the prepare answer for its current text, waited for: only a document
+    /// sent as is takes edits, and one its peer could not prepare is told
+    /// apart (not bridged at all).
+    ///
+    /// Unlike a request's preamble, which closes an edit method at once on
+    /// what the lifecycle pass knows (a pending answer included) and checks
+    /// again once the answer is in, this waits even while the pass holds the
+    /// document pending: formatting must tell a failed peer apart, which the
+    /// CLI counts as a failure, rather than answer nothing.
     pub(crate) async fn method_gate(
         &self,
         uri: &Url,

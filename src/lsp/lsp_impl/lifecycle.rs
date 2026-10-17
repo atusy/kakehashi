@@ -96,8 +96,9 @@ enum ClientRoot<'a> {
     LegacyPath(&'a str),
 }
 
-/// Times a prepare resync pass whose sends failed is retried (with the
-/// prepare backoff: one second, doubling) before waiting for the next edit.
+/// Times a prepare resync pass is retried (with the prepare backoff: one
+/// second, doubling) before waiting for the next edit: one whose sends
+/// failed, or whose regions could not be looked at (see `after_resync_pass`).
 const MAX_RESYNC_RETRIES: u32 = 6;
 
 /// The resyncs an epoch move asks for: every open host, even with nothing
@@ -872,7 +873,8 @@ impl Kakehashi {
         let bridge = Arc::clone(&self.bridge);
         let token = self.shutdown_token.clone();
         tokio::spawn(async move {
-            // Consecutive passes per host whose sends failed.
+            // Consecutive passes per host that did not sync (sends failed, or
+            // regions not looked at).
             let mut failures: std::collections::HashMap<Url, u32> =
                 std::collections::HashMap::new();
             loop {

@@ -100,8 +100,9 @@ impl SyntheticDiagnosticsManager {
 
     /// Register work for one document version and trigger. Lexicographic
     /// lineage ordering prevents late old-lifetime/version work from replacing
-    /// newer work; at the same version and settings generation, save outranks
-    /// change, which outranks open.
+    /// newer work; at the same version and settings generation, save (and a
+    /// collection after prepare, which ranks with it) outranks change, which
+    /// outranks open.
     pub(crate) fn register_task_for_lineage(
         &self,
         uri: Url,
