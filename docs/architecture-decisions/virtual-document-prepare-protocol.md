@@ -222,13 +222,14 @@ prepares the pair, its open documents stay as they are.
 When the answer the lifecycle pass holds a document on lands, its host is
 synced again: the prepared text is sent, the host's diagnostics are
 collected again (through the edit's debounce when the answer is an edit's
-under an unmoved epoch, at once otherwise), an editor pull answered without the document while it
-waited is owed a `workspace/diagnostic/refresh`, and a save the held
-document missed is forwarded, if the host is still at the saved version. A
-pass whose sends could not all be queued, or whose regions could not be
-looked at (a reload in progress), is retried with backoff, a bounded number
-of times. A request opening a document lazily opens the newer of its
-own text and the latest the lifecycle pass recorded.
+under an unmoved epoch, at once otherwise), an editor pull answered
+without the document while it waited is owed a
+`workspace/diagnostic/refresh`, and a save the held document missed is
+forwarded, if the host is still at the saved version. A pass whose sends
+could not all be queued, or whose regions could not be looked at (a reload
+in progress), is retried with backoff, a bounded number of times. A
+request opening a document lazily opens the newer of its own text and the
+latest the lifecycle pass recorded.
 
 ## Invariants
 
