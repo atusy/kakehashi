@@ -270,6 +270,10 @@ pub(crate) struct PrepareRegistry {
     /// The last scan of [`Self::any_region_prepared`]: `(epoch, held
     /// changes, result)`.
     prepared_scan: std::sync::Mutex<Option<(u64, u64, bool)>>,
+    /// Hosts closed since their lifecycle pass last ran: a request still
+    /// running past the close looks nothing up for them, and an attempt for
+    /// one asks no peer. Shared with the attempts.
+    closed_hosts: Arc<dashmap::DashSet<String>>,
     /// Source of `textDocument.version`: shared by all documents, so a
     /// document forgotten and prepared again (a reopen) never repeats a
     /// version the peer saw.
@@ -294,6 +298,7 @@ impl Default for PrepareRegistry {
             used: AtomicBool::new(false),
             held_changes: Arc::default(),
             prepared_scan: std::sync::Mutex::new(None),
+            closed_hosts: Arc::default(),
             next_revision: Arc::new(AtomicI32::new(1)),
             resync_tx,
             resync_rx: std::sync::Mutex::new(Some(resync_rx)),
@@ -510,8 +515,15 @@ impl PrepareRegistry {
         self.held_changes.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// Forget a closed host's documents.
+    /// Whether `host_uri` closed since its lifecycle pass last ran.
+    pub(crate) fn host_closed(&self, host_uri: &Url) -> bool {
+        self.closed_hosts.contains(host_uri.as_str())
+    }
+
+    /// Forget a closed host's documents: until its lifecycle pass runs again
+    /// (a reopen), nothing is looked up for it.
     pub(crate) fn forget_host(&self, host_uri: &Url) {
+        self.closed_hosts.insert(host_uri.to_string());
         self.regions
             .retain(|_, region| region.host_uri != host_uri.as_str());
         self.held_changes.fetch_add(1, Ordering::AcqRel);
@@ -553,9 +565,16 @@ impl PrepareRegistry {
         if target.epoch != epoch {
             return None;
         }
+        let host_uri = input.host_uri.as_str();
+        // Only the lifecycle pass reopens a closed host: a request still
+        // running past the close finds nothing, and starts nothing.
+        if holder == Holder::LifecyclePass {
+            self.closed_hosts.remove(host_uri);
+        } else if self.closed_hosts.contains(host_uri) {
+            return None;
+        }
         self.used.store(true, Ordering::Release);
         let key = input_key(target, input);
-        let host_uri = input.host_uri.as_str();
         let hash = region_hash(host_uri, input.injection_language, input.region_id);
         let mut region = self.regions.entry(hash).or_insert_with(|| Region {
             host_uri: host_uri.to_string(),
@@ -651,6 +670,7 @@ impl PrepareRegistry {
         let job = PrepareJob::new(input, cell.taken);
         let resync_tx = self.resync_tx.clone();
         let held_changes = Arc::clone(&self.held_changes);
+        let closed_hosts = Arc::clone(&self.closed_hosts);
         tokio::spawn(async move {
             let cell = Arc::clone(&end.0);
             // Its cell still stands: kept by its region, under the current
@@ -659,6 +679,7 @@ impl PrepareRegistry {
             // the settings may no longer name.
             let admitted = || {
                 pool.prepare_epoch() == cell.epoch
+                    && !closed_hosts.contains(job.host_uri.as_str())
                     && regions.get(&region).is_some_and(|region| region.has(&cell))
             };
             let held = || {
@@ -1710,6 +1731,41 @@ mod tests {
             !sent.contains(crate::lsp::bridge::protocol::PREPARE_METHOD),
             "{sent}"
         );
+    }
+
+    /// A closed host gets nothing looked up for it by a request still
+    /// running past the close — no region comes back, no attempt starts —
+    /// until its lifecycle pass runs again on a reopen.
+    #[tokio::test]
+    async fn a_closed_host_is_looked_up_again_only_by_its_lifecycle_pass() {
+        let registry = PrepareRegistry::default();
+        let pool = Arc::new(LanguageServerPool::preparing());
+        let target = unstartable_target(&pool);
+        let host = Url::parse("file:///closed.md").unwrap();
+        registry.slot(
+            &target,
+            input(&host, "a"),
+            Holder::LifecyclePass,
+            target.epoch,
+        );
+        registry.forget_host(&host);
+        assert!(registry.host_closed(&host));
+
+        assert!(matches!(
+            registry.lookup_for_request(&pool, &target, input(&host, "a")),
+            PrepareLookup::Pending
+        ));
+        assert!(
+            registry.regions.is_empty(),
+            "a request re-created the region"
+        );
+
+        assert!(matches!(
+            registry.lookup_or_start(&pool, &target, input(&host, "a")),
+            PrepareLookup::Pending
+        ));
+        assert!(!registry.host_closed(&host));
+        assert_eq!(registry.regions.len(), 1);
     }
 
     #[test]
