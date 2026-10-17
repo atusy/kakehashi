@@ -889,12 +889,11 @@ impl Kakehashi {
                         .chain(std::iter::from_fn(|| resync_rx.try_recv().ok())),
                 );
                 for (uri, (ready, recollect)) in hosts {
-                    let synchronized = injection.process_injections_synchronized(&uri).await;
-                    let looked = matches!(injection.bridge_injections(&uri), Some((_, Some(_))));
-                    // A save the held regions missed is replayed too; one
-                    // the regions could not be looked at for is kept.
-                    let replayed = injection.replay_held_save(&uri).await;
-                    let synced = synchronized && looked && replayed;
+                    // A save the held regions missed is replayed by the
+                    // pass too; one it could not look at the regions for
+                    // keeps it, and is retried.
+                    let pass = injection.process_injections_for_resync(&uri).await;
+                    let synced = pass.synchronized && pass.looked;
                     let open = injection.document_incarnation(&uri).is_some();
                     let failed = failures.remove(&uri).unwrap_or_default();
                     match after_resync_pass(synced, open, failed) {
