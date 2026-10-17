@@ -655,6 +655,26 @@ mod tests {
     use rstest::rstest;
     use serde_json::json;
 
+    /// An envelope minted from a prepared document never resolves, even
+    /// against a live offset equal to its own (the region's pair lost its
+    /// peer since): the map it was minted through is not carried. The mark
+    /// survives the round trip through the client.
+    #[test]
+    fn an_envelope_from_a_prepared_document_describes_no_live_offset() {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let map = apply_prepare_result("a", &VirtualLayout::single("a"), None)
+            .unwrap()
+            .map;
+        let live = RegionOffset::new(3, 2);
+        let as_is = EnvelopeOffset::from(&live);
+        assert!(as_is.describes(&live));
+        let prepared = EnvelopeOffset::from(&live.clone().with_prepared(map));
+        assert!(!prepared.describes(&live));
+        let round_trip: EnvelopeOffset =
+            serde_json::from_value(serde_json::to_value(&prepared).unwrap()).unwrap();
+        assert!(!round_trip.describes(&live));
+    }
+
     /// Run the virt transform for a NON-resolving origin, the shape most
     /// coordinate tests want: ranges translate, `data` passes through bare.
     /// (The codeLens and documentLink twins default the other way — their

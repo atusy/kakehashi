@@ -141,6 +141,49 @@ mod tests {
     // Request builder tests
     // ==========================================================================
 
+    /// A prepared document's lines need not be the virtual document's: each
+    /// endpoint maps through the prepared map before the region's offset,
+    /// and an absent character stays absent.
+    #[test]
+    fn a_prepared_folding_range_maps_its_lines_through_the_map() {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        // The peer deletes the two leading blank lines: prepared line 0 is
+        // virtual line 2.
+        let virtual_text = "\n\nfoo\n  bar\nend";
+        let answer = serde_json::from_value(serde_json::json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let map = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(answer),
+        )
+        .unwrap()
+        .map;
+        let response = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": [
+            {"startLine": 0, "endLine": 2},
+            {"startLine": 1, "startCharacter": 2, "endLine": 2, "endCharacter": 3}
+        ]});
+        let ranges = transform_folding_range_response_to_host(
+            response,
+            &RegionOffset::new(10, 0).with_prepared(map),
+        )
+        .unwrap();
+        assert_eq!((ranges[0].start_line, ranges[0].end_line), (12, 14));
+        assert_eq!(ranges[0].start_character, None);
+        assert_eq!(ranges[0].end_character, None);
+        assert_eq!(
+            (
+                ranges[1].start_line,
+                ranges[1].start_character,
+                ranges[1].end_line,
+                ranges[1].end_character
+            ),
+            (13, Some(2), 14, Some(3))
+        );
+    }
+
     #[test]
     fn folding_range_request_uses_virtual_uri() {
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
