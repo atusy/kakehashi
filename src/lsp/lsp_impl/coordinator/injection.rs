@@ -269,12 +269,10 @@ impl InjectionCoordinator {
             host_language,
             self.cache.semantic_token_generation(),
         ) {
-            let regions = regions
+            let regions: Vec<_> = regions
                 .iter()
                 .map(|region| {
-                    self.prepared_bridge_injection(
-                        uri,
-                        host_language,
+                    (
                         BridgeInjection {
                             language: region.language.clone(),
                             region_id: region.region_id.clone(),
@@ -282,11 +280,11 @@ impl InjectionCoordinator {
                             held: false,
                             prepared: None,
                         },
-                        &region.gaps,
+                        std::sync::Arc::clone(&region.gaps),
                     )
                 })
                 .collect();
-            return settled().then_some(regions);
+            return settled().then(|| self.prepared_bridge_injections(uri, host_language, regions));
         }
 
         // `None` below means "could not be looked at", which the re-open sweep
@@ -359,9 +357,7 @@ impl InjectionCoordinator {
         )
         .into_iter()
         .map(|region| {
-            self.prepared_bridge_injection(
-                uri,
-                host_language,
+            (
                 BridgeInjection {
                     language: region.injection_language,
                     region_id: region.region.region_id,
@@ -369,11 +365,32 @@ impl InjectionCoordinator {
                     held: false,
                     prepared: None,
                 },
-                &region.gaps,
+                region.gaps,
             )
         })
         .collect();
-        settled().then_some(resolved)
+        settled().then(|| self.prepared_bridge_injections(uri, host_language, resolved))
+    }
+
+    /// [`Self::prepared_bridge_injection`] for each of a settled resolution's
+    /// documents: only once it is known to stand, so a resolution discarded
+    /// as unsettled neither moves what the lifecycle pass holds a document on
+    /// nor starts an attempt for text no pass sends.
+    fn prepared_bridge_injections(
+        &self,
+        uri: &Url,
+        host_language: &str,
+        regions: Vec<(
+            BridgeInjection,
+            std::sync::Arc<[crate::language::injection::VirtualGap]>,
+        )>,
+    ) -> Vec<BridgeInjection> {
+        regions
+            .into_iter()
+            .map(|(injection, gaps)| {
+                self.prepared_bridge_injection(uri, host_language, injection, &gaps)
+            })
+            .collect()
     }
 
     /// The bridge payload for one resolved virtual document: its text as
