@@ -631,7 +631,9 @@ pub struct LanguageServerPool {
     /// in its last handshake, so a (host, injection) pair none of whose
     /// candidates prepares is not held back on each revision to find that
     /// out again; and the prepare epoch.
-    prepare_advertisements: Arc<PrepareAdvertisements>,
+    /// `None` with experimental features off (decided once, at
+    /// construction): no connection's advertisement is then recorded.
+    prepare_advertisements: Option<Arc<PrepareAdvertisements>>,
 }
 
 impl Default for LanguageServerPool {
@@ -705,7 +707,7 @@ impl LanguageServerPool {
             client_progress_registry: Arc::new(super::ClientProgressRegistry::new()),
             inbound_request_registry: super::InboundRequestRegistry::default(),
             command_origins: Arc::new(CommandOriginRegistry::default()),
-            prepare_advertisements: Arc::default(),
+            prepare_advertisements: crate::experimental::enabled().then(Arc::default),
         }
     }
 
@@ -984,7 +986,9 @@ impl LanguageServerPool {
         for key in invalidated {
             if let Some(handle) = connections.get(&key) {
                 handle.begin_shutdown();
-                self.prepare_advertisements.retire(handle);
+                if let Some(advertisements) = &self.prepare_advertisements {
+                    advertisements.retire(handle);
+                }
             }
             self.host_documents.lock().await.retain(|_, connections| {
                 connections.remove(&key);
@@ -2131,7 +2135,9 @@ impl LanguageServerPool {
         // Failed/SpawnNew path and repeats the idempotent purge instead of
         // leaving a Closing entry that fails fast forever.
         failed_handle.set_state(ConnectionState::Failed);
-        self.prepare_advertisements.retire(failed_handle);
+        if let Some(advertisements) = &self.prepare_advertisements {
+            advertisements.retire(failed_handle);
+        }
         // Own teardown independently of this cleanup future. The purge below
         // can await several locks and be cancelled; the detached, bounded
         // shutdown must still retire the live process before a replacement is
@@ -4597,7 +4603,9 @@ impl LanguageServerPool {
 
         // Insert into pool immediately so concurrent requests see Initializing state
         connections.insert(connection_key.clone(), Arc::clone(&handle));
-        self.prepare_advertisements.adopt(&handle);
+        if let Some(advertisements) = &self.prepare_advertisements {
+            advertisements.adopt(&handle);
+        }
         self.peer_directory.register(&handle);
 
         // Release lock before spawning handshake task
@@ -4625,7 +4633,7 @@ impl LanguageServerPool {
         let command_registration_key = connection_key.clone();
         let upstream_request_tx = self.upstream_request_tx.clone();
         let pending_reopen = Arc::clone(&self.pending_reopen);
-        let prepare_advertisements = Arc::clone(&self.prepare_advertisements);
+        let prepare_advertisements = self.prepare_advertisements.clone();
         // The editor accepts a dynamic `workspace/executeCommand` registration
         // only if it advertised `dynamicRegistration` (LSP spec). Compute once.
         let supports_dynamic_command_registration =
@@ -4718,8 +4726,12 @@ impl LanguageServerPool {
                     // advertisement of `kakehashi/virtualDocument/prepare`: one
                     // retired during its handshake (a settings reload replacing
                     // it) must not overwrite what its replacement recorded.
-                    prepare_advertisements
-                        .record_from(&handle_for_handshake, extensions.virtual_document_prepare);
+                    if let Some(advertisements) = &prepare_advertisements {
+                        advertisements.record_from(
+                            &handle_for_handshake,
+                            extensions.virtual_document_prepare,
+                        );
+                    }
                     // Record advertised palette command names AFTER Ready, so a
                     // command fired without an action context (raw name) routes
                     // back to a Ready connection (#628). Dedup is by name across
@@ -5624,6 +5636,16 @@ impl PrepareAdvertisements {
     reason = "the prepare registry asks candidates through these, next"
 )]
 impl LanguageServerPool {
+    /// A pool recording prepare advertisements, as with experimental
+    /// features on.
+    #[cfg(test)]
+    pub(crate) fn preparing() -> Self {
+        Self {
+            prepare_advertisements: Some(Arc::default()),
+            ..Self::new()
+        }
+    }
+
     /// Record whether `handle`'s connection advertises
     /// `kakehashi/virtualDocument/prepare` (its handshake, or a
     /// `MethodNotFound` answer since), unless another connection has
@@ -5634,7 +5656,9 @@ impl LanguageServerPool {
         handle: &ConnectionHandle,
         advertised: bool,
     ) -> bool {
-        self.prepare_advertisements.record_from(handle, advertised)
+        self.prepare_advertisements
+            .as_ref()
+            .is_some_and(|advertisements| advertisements.record_from(handle, advertised))
     }
 
     /// [`Self::record_prepare_advertisement_from`] by the connection's key,
@@ -5645,13 +5669,17 @@ impl LanguageServerPool {
         connection: &ConnectionKey,
         advertised: bool,
     ) -> bool {
-        self.prepare_advertisements.record(connection, advertised)
+        self.prepare_advertisements
+            .as_ref()
+            .is_some_and(|advertisements| advertisements.record(connection, advertised))
     }
 
     /// Whether `server_name` advertises `kakehashi/virtualDocument/prepare`,
     /// as last recorded; `None` before anything was.
     pub(crate) fn prepare_advertisement(&self, server_name: &str) -> Option<bool> {
-        self.prepare_advertisements.get(server_name)
+        self.prepare_advertisements
+            .as_ref()
+            .and_then(|advertisements| advertisements.get(server_name))
     }
 
     /// The prepare epoch: an answer to `kakehashi/virtualDocument/prepare`
@@ -5660,26 +5688,34 @@ impl LanguageServerPool {
     /// advertisement, start failures cleared (but a host's closing, which
     /// takes its answers with it), and [`Self::advance_prepare_epoch`].
     pub(crate) fn prepare_epoch(&self) -> u64 {
-        *self.prepare_advertisements.epoch.borrow()
+        self.prepare_advertisements
+            .as_ref()
+            .map_or(0, |advertisements| *advertisements.epoch.borrow())
     }
 
     /// Watch the prepare epoch move: hosts whose documents were prepared, or
     /// sent as is, under the epoch before are synced again.
-    pub(crate) fn subscribe_prepare_epoch(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.prepare_advertisements.epoch.subscribe()
+    pub(crate) fn subscribe_prepare_epoch(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        self.prepare_advertisements
+            .as_ref()
+            .map(|advertisements| advertisements.epoch.subscribe())
     }
 
     /// Move the prepare epoch for a change outside the pool: settings, or
     /// runtime settings pushed to servers, under which a peer may prepare
     /// differently.
     pub(crate) fn advance_prepare_epoch(&self) {
-        self.prepare_advertisements.advance();
+        if let Some(advertisements) = &self.prepare_advertisements {
+            advertisements.advance();
+        }
     }
 
     /// The start failures' clearing count, read by an attempt before it
     /// acquires a candidate (see [`Self::record_prepare_start_failure`]).
     pub(crate) fn prepare_start_failures_cleared(&self) -> u64 {
-        self.prepare_advertisements.start_failures().cleared
+        self.prepare_advertisements
+            .as_ref()
+            .map_or(0, |advertisements| advertisements.start_failures().cleared)
     }
 
     /// Note that `server_name` could not be started for `host_uri`'s
@@ -5692,7 +5728,10 @@ impl LanguageServerPool {
         host_uri: &Url,
         cleared: u64,
     ) -> bool {
-        let mut failures = self.prepare_advertisements.start_failures();
+        let Some(advertisements) = &self.prepare_advertisements else {
+            return false;
+        };
+        let mut failures = advertisements.start_failures();
         if failures.cleared != cleared {
             return false;
         }
@@ -5705,7 +5744,10 @@ impl LanguageServerPool {
     /// Whether `server_name` could not be started for `host_uri`'s
     /// documents (see [`Self::record_prepare_start_failure`]).
     pub(crate) fn prepare_start_failed(&self, server_name: &str, host_uri: &Url) -> bool {
-        let failures = self.prepare_advertisements.start_failures();
+        let Some(advertisements) = &self.prepare_advertisements else {
+            return false;
+        };
+        let failures = advertisements.start_failures();
         !failures.failed.is_empty()
             && failures
                 .failed
@@ -5717,7 +5759,9 @@ impl LanguageServerPool {
     /// that failed to start them changed, and the answers given without
     /// them stand no more.
     pub(crate) fn forget_prepare_start_failures(&self, host_uri: Option<&Url>) {
-        let advertisements = &self.prepare_advertisements;
+        let Some(advertisements) = &self.prepare_advertisements else {
+            return;
+        };
         match host_uri {
             Some(host_uri) => {
                 advertisements.forget_start_failures(|_, host| host == host_uri);
@@ -5751,7 +5795,7 @@ mod tests {
 
     #[test]
     fn a_prepare_start_failure_holds_for_its_host_until_a_handshake_settings_or_close() {
-        let pool = LanguageServerPool::new();
+        let pool = LanguageServerPool::preparing();
         let a = Url::parse("file:///a/doc.md").unwrap();
         let b = Url::parse("file:///b/doc.md").unwrap();
         pool.record_prepare_advertisement(&ConnectionKey::for_server("peer"), true);
@@ -5801,14 +5845,20 @@ mod tests {
 
     #[tokio::test]
     async fn a_replaced_connection_records_no_prepare_advertisement() {
-        let pool = LanguageServerPool::new();
+        let pool = LanguageServerPool::preparing();
         let key = ConnectionKey::for_server("peer");
         let retired =
             test_helpers::create_handle_with_key(ConnectionState::Ready, key.clone()).await;
-        pool.prepare_advertisements.adopt(&retired);
+        pool.prepare_advertisements
+            .as_ref()
+            .unwrap()
+            .adopt(&retired);
         let replacement =
             test_helpers::create_handle_with_key(ConnectionState::Ready, key.clone()).await;
-        pool.prepare_advertisements.adopt(&replacement);
+        pool.prepare_advertisements
+            .as_ref()
+            .unwrap()
+            .adopt(&replacement);
         assert!(!pool.record_prepare_advertisement_from(&replacement, true));
         assert_eq!(pool.prepare_advertisement("peer"), Some(true));
         // The retired connection's handshake, finishing late, changes nothing.
@@ -5818,11 +5868,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_replacement_starts_with_nothing_advertised_for_its_key() {
-        let pool = LanguageServerPool::new();
+        let pool = LanguageServerPool::preparing();
         let key = ConnectionKey::for_server("peer");
         let failed =
             test_helpers::create_handle_with_key(ConnectionState::Ready, key.clone()).await;
-        pool.prepare_advertisements.adopt(&failed);
+        pool.prepare_advertisements.as_ref().unwrap().adopt(&failed);
         pool.record_prepare_advertisement_from(&failed, true);
         assert_eq!(pool.prepare_advertisement("peer"), Some(true));
         let epoch = pool.prepare_epoch();
@@ -5831,7 +5881,10 @@ mod tests {
         // may fail, has recorded nothing yet.
         let replacement =
             test_helpers::create_handle_with_key(ConnectionState::Initializing, key.clone()).await;
-        pool.prepare_advertisements.adopt(&replacement);
+        pool.prepare_advertisements
+            .as_ref()
+            .unwrap()
+            .adopt(&replacement);
         assert_eq!(
             pool.prepare_advertisement("peer"),
             None,
@@ -5842,15 +5895,21 @@ mod tests {
 
     #[tokio::test]
     async fn a_retired_connection_stops_advertising_prepare() {
-        let pool = LanguageServerPool::new();
+        let pool = LanguageServerPool::preparing();
         let a = ConnectionKey::new("peer", Some("file:///a".to_string()));
         let b = ConnectionKey::new("peer", Some("file:///b".to_string()));
         let handle_a =
             test_helpers::create_handle_with_key(ConnectionState::Ready, a.clone()).await;
         let handle_b =
             test_helpers::create_handle_with_key(ConnectionState::Ready, b.clone()).await;
-        pool.prepare_advertisements.adopt(&handle_a);
-        pool.prepare_advertisements.adopt(&handle_b);
+        pool.prepare_advertisements
+            .as_ref()
+            .unwrap()
+            .adopt(&handle_a);
+        pool.prepare_advertisements
+            .as_ref()
+            .unwrap()
+            .adopt(&handle_b);
         pool.insert_connection(Arc::clone(&handle_a)).await;
         pool.insert_connection(Arc::clone(&handle_b)).await;
         pool.record_prepare_advertisement_from(&handle_a, true);
@@ -5878,7 +5937,7 @@ mod tests {
 
     #[test]
     fn a_server_advertises_prepare_while_any_of_its_connections_does() {
-        let pool = LanguageServerPool::new();
+        let pool = LanguageServerPool::preparing();
         let a = ConnectionKey::new("peer", Some("file:///a".to_string()));
         let b = ConnectionKey::new("peer", Some("file:///b".to_string()));
         pool.record_prepare_advertisement(&a, true);
@@ -5904,8 +5963,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_prepare_epoch_move_is_seen_by_its_watchers() {
-        let pool = LanguageServerPool::new();
-        let mut epochs = pool.subscribe_prepare_epoch();
+        let pool = LanguageServerPool::preparing();
+        let mut epochs = pool.subscribe_prepare_epoch().unwrap();
         // A first handshake that advertises: nothing was sent as is for it.
         pool.record_prepare_advertisement(&ConnectionKey::for_server("tsudoi"), true);
         assert!(!epochs.has_changed().unwrap());
