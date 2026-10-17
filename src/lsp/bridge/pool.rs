@@ -3037,11 +3037,17 @@ impl LanguageServerPool {
     ) {
         if let Some(host) = self.latest_virtual_contents.get(host_uri)
             && host.incarnation == incarnation
-            && host
+        {
+            // Counted before it is held, undone if it was held already: the
+            // count never reads below what `held` holds (removals take the
+            // entry out first), so no open sees a held region as free.
+            host.held_count.fetch_add(1, Ordering::AcqRel);
+            if !host
                 .held
                 .insert((language.to_string(), region_id.to_string()))
-        {
-            host.held_count.fetch_add(1, Ordering::AcqRel);
+            {
+                host.held_count.fetch_sub(1, Ordering::AcqRel);
+            }
         }
     }
 
