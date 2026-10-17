@@ -76,19 +76,6 @@ impl RegionOffset {
         self.prepared.as_deref()
     }
 
-    /// This offset without its prepared map: virtual ↔ host only.
-    #[allow(
-        dead_code,
-        reason = "the prepare layer that presents documents through it comes next"
-    )]
-    fn unprepared(&self) -> Self {
-        Self {
-            line: self.line,
-            columns: self.columns.clone(),
-            prepared: None,
-        }
-    }
-
     /// Get the starting line of the injection region.
     pub(crate) fn line(&self) -> u32 {
         self.line
@@ -223,7 +210,7 @@ pub(crate) fn host_position_hidden_by_prepare(
         return false;
     };
     let mut position = host_position;
-    translate_host_position_to_virtual(&mut position, &offset.unprepared());
+    translate_host_position_to_unprepared_virtual(&mut position, offset);
     prepared.virtual_position_in_gap(position)
         || prepared.virtual_position_in_removed_lines(position)
 }
@@ -262,15 +249,21 @@ fn translate_host_position_to_virtual_biased(
     offset: &RegionOffset,
     bias: Bias,
 ) {
+    translate_host_position_to_unprepared_virtual(pos, offset);
+    if let Some(prepared) = offset.prepared() {
+        *pos = prepared.to_prepared(*pos, bias);
+    }
+}
+
+/// Host → V only, ignoring `offset`'s prepared map: the virtual document's
+/// coordinates, before the prepared document's.
+fn translate_host_position_to_unprepared_virtual(pos: &mut Position, offset: &RegionOffset) {
     let underflowed = pos.line < offset.line();
     pos.line = pos.line.saturating_sub(offset.line());
     if !underflowed {
         pos.character = pos
             .character
             .saturating_sub(offset.column_for_line(pos.line));
-    }
-    if let Some(prepared) = offset.prepared() {
-        *pos = prepared.to_prepared(*pos, bias);
     }
 }
 
