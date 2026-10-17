@@ -85,6 +85,18 @@ pub(crate) struct InjectionCoordinator {
     shutdown: tokio_util::sync::CancellationToken,
 }
 
+/// Who looks a document's prepare answer up while resolving injections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrepareHolder {
+    /// The lifecycle pass, under the document's edit lock: the document is
+    /// held on this input until its answer lands, which syncs the host.
+    LifecyclePass,
+    /// Anything else (a re-open sweep, a recovery probe, a save): it reads
+    /// the answer, or starts the attempt, without moving what the document
+    /// is held on.
+    Probe,
+}
+
 /// What one injection pass over a host did.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct InjectionPass {
@@ -265,6 +277,20 @@ impl InjectionCoordinator {
         uri: &Url,
         host_language: &str,
     ) -> Option<Vec<BridgeInjection>> {
+        self.resolve_injection_data_as(uri, host_language, PrepareHolder::Probe)
+    }
+
+    /// [`Self::resolve_injection_data`] as `holder` looks the documents'
+    /// prepare answers up: only the lifecycle pass, under the document's edit
+    /// lock, holds each document on the input it resolves. A probe off that
+    /// lock reading an older snapshot would otherwise move what a document
+    /// is held on back to an older input, whose answer then resyncs nothing.
+    fn resolve_injection_data_as(
+        &self,
+        uri: &Url,
+        host_language: &str,
+        holder: PrepareHolder,
+    ) -> Option<Vec<BridgeInjection>> {
         // A reload in progress makes nothing below evidence — not even the
         // snapshot fast path: a parse that checked its parser out just before
         // the reload began can publish regions derived from the OLD query
@@ -321,7 +347,8 @@ impl InjectionCoordinator {
                     )
                 })
                 .collect();
-            return settled().then(|| self.prepared_bridge_injections(uri, host_language, regions));
+            return settled()
+                .then(|| self.prepared_bridge_injections(uri, host_language, regions, holder));
         }
 
         // `None` below means "could not be looked at", which the re-open sweep
@@ -406,7 +433,7 @@ impl InjectionCoordinator {
             )
         })
         .collect();
-        settled().then(|| self.prepared_bridge_injections(uri, host_language, resolved))
+        settled().then(|| self.prepared_bridge_injections(uri, host_language, resolved, holder))
     }
 
     /// [`Self::prepared_bridge_injection`] for each of a settled resolution's
@@ -421,11 +448,12 @@ impl InjectionCoordinator {
             BridgeInjection,
             std::sync::Arc<[crate::language::injection::VirtualGap]>,
         )>,
+        holder: PrepareHolder,
     ) -> Vec<BridgeInjection> {
         regions
             .into_iter()
             .map(|(injection, gaps)| {
-                self.prepared_bridge_injection(uri, host_language, injection, &gaps)
+                self.prepared_bridge_injection(uri, host_language, injection, &gaps, holder)
             })
             .collect()
     }
@@ -441,6 +469,7 @@ impl InjectionCoordinator {
         host_language: &str,
         injection: BridgeInjection,
         gaps: &[crate::language::injection::VirtualGap],
+        holder: PrepareHolder,
     ) -> BridgeInjection {
         let Some(target) = self
             .bridge
@@ -463,7 +492,12 @@ impl InjectionCoordinator {
             virtual_text: &injection.content,
             gaps,
         };
-        let lookup = self.bridge.prepared_document_now(&target, input);
+        let lookup = match holder {
+            PrepareHolder::LifecyclePass => self.bridge.prepared_document_now(&target, input),
+            PrepareHolder::Probe => self
+                .bridge
+                .prepared_document_now_for_request(&target, input),
+        };
         presented_injection(injection, lookup)
     }
 
@@ -592,7 +626,9 @@ impl InjectionCoordinator {
         // publishing, or it has no tree yet). Leave whatever is open alone —
         // there is no evidence anything changed — and let the parse that
         // lands once the language is in place run this pass for real.
-        let Some(injections) = self.resolve_injection_data(uri, &host_language) else {
+        let Some(injections) =
+            self.resolve_injection_data_as(uri, &host_language, PrepareHolder::LifecyclePass)
+        else {
             // Nothing else re-runs this pass for a document whose sole parse
             // overlapped a publication or reload window (an injected
             // language's auto-install reload does not reparse hosts), so
@@ -2244,6 +2280,77 @@ mod tests {
                 .await,
             "same-revision enrichment must retain open downstream eligibility"
         );
+    }
+
+    /// Only the lifecycle pass holds a document on the input it resolves: a
+    /// probe off the edit lock (a re-open sweep, a recovery probe, a save)
+    /// reading an older text must not move what the document waits for.
+    #[tokio::test]
+    async fn only_the_lifecycle_pass_holds_a_document_on_its_input() {
+        let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
+        let (service, _socket) = LspService::new(|client| {
+            crate::lsp::lsp_impl::Kakehashi::with_cancel_forwarder(
+                client,
+                Arc::clone(&pool),
+                crate::lsp::CancelForwarder::new(Arc::clone(&pool)),
+            )
+        });
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), language.clone());
+        server.language.query_store().insert_injection_query(
+            "rust".into(),
+            Arc::new(
+                tree_sitter::Query::new(
+                    &language,
+                    r#"((string_literal) @injection.content (#set! injection.language "rust"))"#,
+                )
+                .unwrap(),
+            ),
+        );
+        server
+            .bridge
+            .prepare_settings_changed(&Arc::new(crate::config::WorkspaceSettings {
+                auto_install: false,
+                language_servers: [(
+                    "peer".to_string(),
+                    crate::lsp::bridge::test_helpers::devnull_config_for_language("rust"),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            }));
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let uri = Url::parse("file:///held-by-the-pass.rs").unwrap();
+        let text = r#"fn main() { let x = "a"; }"#;
+        server.documents.insert(
+            uri.clone(),
+            text.into(),
+            Some("rust".into()),
+            parser.parse(text, None),
+        );
+        let injection = server.injection_coordinator();
+        let held = |injections: &[super::BridgeInjection]| {
+            injections.iter().all(|injection| {
+                server
+                    .bridge
+                    .prepare_region(&uri, &injection.language, &injection.region_id)
+                    .prepared
+            })
+        };
+
+        let probed = injection.resolve_injection_data(&uri, "rust").unwrap();
+        assert_eq!(probed.len(), 1);
+        assert!(probed[0].held, "no answer yet: not sent");
+        assert!(!held(&probed), "a probe holds nothing");
+        let passed = injection
+            .resolve_injection_data_as(&uri, "rust", super::PrepareHolder::LifecyclePass)
+            .unwrap();
+        assert!(held(&passed), "the pass holds the document on its input");
     }
 
     /// Publish `tree` as `uri`'s current parse snapshot under `language`,
