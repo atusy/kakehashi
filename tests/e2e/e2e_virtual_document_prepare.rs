@@ -44,6 +44,8 @@ struct Setup {
     /// Have both mocks log every message they receive to `wire.log` in the
     /// test's directory.
     wire_log: bool,
+    /// `KAKEHASHI_EXPERIMENTAL`, which the prepare layer requires.
+    experimental: bool,
 }
 
 impl Default for Setup {
@@ -56,6 +58,7 @@ impl Default for Setup {
             capabilities: json!({}),
             prepare_priorities: json!(["peer"]),
             wire_log: false,
+            experimental: true,
         }
     }
 }
@@ -86,7 +89,10 @@ impl Setup {
         let mut builder = LspClient::builder()
             .arg("--config-file")
             .arg(config_path.to_str().expect("UTF-8 config path"))
-            .env("KAKEHASHI_EXPERIMENTAL", "true")
+            .env(
+                "KAKEHASHI_EXPERIMENTAL",
+                if self.experimental { "true" } else { "false" },
+            )
             .env("MOCK_PREPARE_PLACEHOLDER", self.placeholder);
         if self.wire_log {
             builder = builder.env(
@@ -482,6 +488,36 @@ fn an_unprepared_document_answers_promptly_beside_a_prepared_one() {
         "x = 1\ny = 2\n",
         "an answer from the text before the edit"
     );
+}
+
+#[test]
+fn without_experimental_features_nothing_is_prepared() {
+    // The peer advertises the request and is configured to prepare lua, but
+    // with experimental features off it is never asked: the document goes
+    // as is, and edits through it are not closed.
+    let (mut client, dir) = Setup {
+        wire_log: true,
+        experimental: false,
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/flag-off.md";
+    let text = "# t\n\n```lua\n  local x = 1\n```\n";
+    open(&mut client, uri, text);
+    let answer = hover_with_retry(&mut client, uri, 3, 4);
+    assert_eq!(hover_text(&answer), "  local x = 1\n");
+    let response = client.send_request(
+        "textDocument/rename",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 3, "character": 8 },
+            "newName": "y"
+        }),
+    );
+    assert!(!response["result"].is_null(), "{response}");
+    let log = std::fs::read_to_string(dir.path().join("wire.log")).expect("wire log");
+    assert!(log.contains("textDocument/didOpen\t"), "{log}");
+    assert!(!log.contains("kakehashi/virtualDocument/prepare"), "{log}");
 }
 
 #[test]
