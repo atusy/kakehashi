@@ -217,10 +217,9 @@ impl InjectionCoordinator {
         // recreate the slot we just evicted. The merge already *skips* a region with
         // no current offset, so the editor never sees stale diagnostics; this
         // reclaims the lingering slot on the edit that orphaned it.
-        for ulid in invalidated_ulids {
-            let region_id = ulid.to_string();
-            self.bridge
-                .forget_prepared_region(host_uri, None, &region_id);
+        let region_ids: Vec<String> = invalidated_ulids.iter().map(ToString::to_string).collect();
+        self.bridge.forget_prepared_regions(host_uri, &region_ids);
+        for region_id in region_ids {
             self.diagnostics
                 .evict_source(host_uri, &DiagnosticSource::Region(region_id));
         }
