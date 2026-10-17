@@ -332,23 +332,25 @@ impl InjectionCoordinator {
             host_language,
             self.cache.semantic_token_generation(),
         ) {
-            let regions: Vec<_> = regions
-                .iter()
-                .map(|region| {
-                    (
-                        BridgeInjection {
-                            language: region.language.clone(),
-                            region_id: region.region_id.clone(),
-                            content: region.content.clone(),
-                            held: false,
-                            prepared: None,
-                        },
-                        std::sync::Arc::clone(&region.gaps),
-                    )
-                })
-                .collect();
-            return settled()
-                .then(|| self.prepared_bridge_injections(uri, host_language, regions, holder));
+            let injection =
+                |region: &crate::document::injections::DiscoveredBridgeRegion| BridgeInjection {
+                    language: region.language.clone(),
+                    region_id: region.region_id.clone(),
+                    content: region.content.clone(),
+                    held: false,
+                    prepared: None,
+                };
+            if self.bridge.pool().prepares() {
+                let regions: Vec<_> = regions
+                    .iter()
+                    .map(|region| (injection(region), std::sync::Arc::clone(&region.gaps)))
+                    .collect();
+                return settled()
+                    .then(|| self.prepared_bridge_injections(uri, host_language, regions, holder));
+            }
+            let injections: Vec<_> = regions.iter().map(injection).collect();
+            // Without the prepare layer every document goes as is.
+            return settled().then_some(injections);
         }
 
         // `None` below means "could not be looked at", which the re-open sweep
