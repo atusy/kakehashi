@@ -455,6 +455,53 @@ impl InjectionCoordinator {
         presented_injection(injection, lookup)
     }
 
+    /// Forward a save `uri`'s held regions missed to those now sent, while
+    /// the host is still at the saved version (under its edit lock, like the
+    /// save itself). Regions still held keep waiting. `false` when the
+    /// regions could not be looked at (a reload in progress): the save is
+    /// kept for a later pass.
+    pub(crate) async fn replay_held_save(&self, uri: &Url) -> bool {
+        let Some(mut held) = self.bridge.take_held_save(uri) else {
+            return true;
+        };
+        let edit_lock = self.documents.edit_lock(uri);
+        let _guard = edit_lock.lock().await;
+        let current = self
+            .documents
+            .get(uri)
+            .map(|document| (document.incarnation(), document.content_version()));
+        if current != Some((held.incarnation, held.content_version)) {
+            // Edited (or closed) since: the next save is the one to forward.
+            return true;
+        }
+        let Some((_, Some(injections))) = self.bridge_injections(uri) else {
+            self.bridge
+                .hold_save(uri, held.incarnation, held.content_version, held.region_ids);
+            return false;
+        };
+        let (sent, still_held): (Vec<_>, Vec<_>) = injections
+            .into_iter()
+            .filter(|injection| held.region_ids.contains(&injection.region_id))
+            .partition(|injection| !injection.held);
+        if !sent.is_empty() {
+            // Fire-and-forget like any didSave forward: the debt is the save
+            // the held regions missed, not its delivery.
+            self.bridge
+                .pool()
+                .sync_and_forward_did_save_to_virtual_docs(uri, held.incarnation, &sent)
+                .await;
+        }
+        if !still_held.is_empty() {
+            held.region_ids = still_held
+                .into_iter()
+                .map(|injection| injection.region_id)
+                .collect();
+            self.bridge
+                .hold_save(uri, held.incarnation, held.content_version, held.region_ids);
+        }
+        true
+    }
+
     /// Process injected languages: resolve injection data, optionally forward didChange,
     /// auto-install missing parsers, and eagerly open virtual documents.
     ///

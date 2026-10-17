@@ -35,6 +35,18 @@ pub(crate) struct PrepareLayer {
     /// their prepare answers: owed a refresh once they are sent. One per
     /// host: each refresh's re-pull records it again while anything waits.
     pull_debts: DashSet<Url>,
+    /// Saves held virtual documents missed: forwarded to each once its
+    /// prepared text is sent, while the host is still at the saved version.
+    held_saves: DashMap<Url, HeldSave>,
+}
+
+/// A save that reached a host while some of its virtual documents were held
+/// back for their prepare answers.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct HeldSave {
+    pub(crate) incarnation: u64,
+    pub(crate) content_version: u64,
+    pub(crate) region_ids: std::collections::HashSet<String>,
 }
 
 impl PrepareLayer {
@@ -47,6 +59,7 @@ impl PrepareLayer {
             })),
             warned_strategy: DashSet::new(),
             pull_debts: DashSet::new(),
+            held_saves: DashMap::new(),
         }
     }
 }
@@ -400,10 +413,44 @@ impl super::BridgeCoordinator {
         }
     }
 
+    /// Remember that a save of `host_uri` at `(incarnation, content_version)`
+    /// reached it while these regions were held, so it is forwarded to them
+    /// once they are sent. A newer save supersedes what an older one missed.
+    pub(crate) fn hold_save(
+        &self,
+        host_uri: &Url,
+        incarnation: u64,
+        content_version: u64,
+        region_ids: impl IntoIterator<Item = String>,
+    ) {
+        let Some(layer) = &self.prepare else {
+            return;
+        };
+        let mut held = layer.held_saves.entry(host_uri.clone()).or_default();
+        if (held.incarnation, held.content_version) != (incarnation, content_version) {
+            *held = HeldSave {
+                incarnation,
+                content_version,
+                region_ids: Default::default(),
+            };
+        }
+        held.region_ids.extend(region_ids);
+    }
+
+    /// Take the save `host_uri`'s held regions missed, if any.
+    pub(crate) fn take_held_save(&self, host_uri: &Url) -> Option<HeldSave> {
+        self.prepare
+            .as_ref()?
+            .held_saves
+            .remove(host_uri)
+            .map(|(_, held)| held)
+    }
+
     /// Drop a closed host's answers and the start failures recorded for it.
     pub(crate) fn forget_prepared_host(&self, host_uri: &Url) {
         if let Some(layer) = &self.prepare {
             layer.pull_debts.remove(host_uri);
+            layer.held_saves.remove(host_uri);
             layer.registry.forget_host(host_uri);
             self.pool.forget_prepare_start_failures(Some(host_uri));
         }
@@ -655,6 +702,49 @@ mod tests {
         let other = coordinator.prepare_target("markdown", "lua").unwrap();
         assert!(!Arc::ptr_eq(&first.candidates, &other.candidates));
         assert!(other.epoch > first.epoch);
+    }
+
+    /// A save held regions missed accumulates their ids per saved version;
+    /// a newer save supersedes it, taking it is one-shot, and a closed host
+    /// owes none. Without the layer nothing is held.
+    #[test]
+    fn a_save_held_regions_missed_is_kept_for_the_saved_version() {
+        let pool = Arc::new(LanguageServerPool::preparing());
+        let coordinator = BridgeCoordinator::with_cancel_forwarder(
+            Arc::clone(&pool),
+            CancelForwarder::new(Arc::clone(&pool)),
+        );
+        let host = Url::parse("file:///test/save.md").unwrap();
+        let ids = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+        let held = |incarnation, content_version, region_ids: &[&str]| super::HeldSave {
+            incarnation,
+            content_version,
+            region_ids: region_ids.iter().map(|id| id.to_string()).collect(),
+        };
+
+        coordinator.hold_save(&host, 1, 2, ids(&["a"]));
+        coordinator.hold_save(&host, 1, 2, ids(&["b"]));
+        assert_eq!(
+            coordinator.take_held_save(&host),
+            Some(held(1, 2, &["a", "b"]))
+        );
+        assert_eq!(coordinator.take_held_save(&host), None);
+
+        coordinator.hold_save(&host, 1, 2, ids(&["a"]));
+        coordinator.hold_save(&host, 1, 3, ids(&["c"]));
+        assert_eq!(coordinator.take_held_save(&host), Some(held(1, 3, &["c"])));
+
+        coordinator.hold_save(&host, 1, 3, ids(&["c"]));
+        coordinator.forget_prepared_host(&host);
+        assert_eq!(coordinator.take_held_save(&host), None);
+
+        let off = Arc::new(LanguageServerPool::new());
+        let off = BridgeCoordinator::with_cancel_forwarder(
+            Arc::clone(&off),
+            CancelForwarder::new(Arc::clone(&off)),
+        );
+        off.hold_save(&host, 1, 2, ids(&["a"]));
+        assert_eq!(off.take_held_save(&host), None);
     }
 
     #[test]
