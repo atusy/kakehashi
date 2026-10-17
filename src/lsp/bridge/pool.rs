@@ -5924,6 +5924,25 @@ mod tests {
         assert!(pool.prepare_epoch() > epoch);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_replacement_whose_handshake_fails_forgets_what_its_key_advertised() {
+        let pool = LanguageServerPool::preparing();
+        pool.record_prepare_advertisement(&ConnectionKey::for_server("peer"), true);
+        let epoch = pool.prepare_epoch();
+        let config = BridgeServerConfig {
+            cmd: Some(vec!["sh".into(), "-c".into(), "exit 1".into()]),
+            ..Default::default()
+        };
+        assert!(
+            pool.get_or_create_connection_wait_ready("peer", &config, None, Duration::from_secs(5))
+                .await
+                .is_err()
+        );
+        assert_eq!(pool.prepare_advertisement("peer"), None);
+        assert!(pool.prepare_epoch() > epoch);
+    }
+
     #[tokio::test]
     async fn a_restarted_non_peer_moves_no_epoch() {
         let pool = LanguageServerPool::preparing();

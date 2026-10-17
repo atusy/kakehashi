@@ -2554,6 +2554,51 @@ mod tests {
     use crate::lsp::bridge::ConnectionKey;
     use crate::lsp::bridge::pool::ConnectionState;
 
+    #[tokio::test]
+    async fn a_held_region_closes_only_where_its_text_is_held_unprepared() {
+        use crate::lsp::bridge::pool::test_helpers::{
+            TEST_ULID_LUA_0, TEST_ULID_LUA_1, TEST_ULID_PYTHON_0,
+        };
+        use crate::lsp::bridge::protocol::{
+            VirtualDocumentUri, VirtualLayout, apply_prepare_result,
+        };
+        let pool = Arc::new(LanguageServerPool::preparing());
+        let coordinator = BridgeCoordinator::with_cancel_forwarder(
+            Arc::clone(&pool),
+            CancelForwarder::new(Arc::clone(&pool)),
+        );
+        coordinator.insert_ready_test_connection("ls").await;
+        let key = ConnectionKey::for_server("ls");
+        let host = Url::parse("file:///test/held.md").unwrap();
+        let host_lsp = crate::lsp::lsp_impl::url_to_uri(&host).unwrap();
+        let unprepared = VirtualDocumentUri::new(&host_lsp, "lua", TEST_ULID_LUA_0);
+        let prepared = VirtualDocumentUri::new(&host_lsp, "lua", TEST_ULID_LUA_1);
+        let other = VirtualDocumentUri::new(&host_lsp, "python", TEST_ULID_PYTHON_0);
+        let map = apply_prepare_result("x", &VirtualLayout::single("x"), None)
+            .unwrap()
+            .map;
+        for (uri, map) in [(&unprepared, None), (&prepared, Some(&map)), (&other, None)] {
+            pool.register_opened_document(&host, uri, &key).await;
+            pool.record_sent_for_test(
+                uri,
+                &key,
+                crate::lsp::bridge::pool::SentText { text: "x", map },
+            );
+        }
+        let closed = coordinator
+            .close_unprepared_held_docs(
+                &host,
+                &[("lua", TEST_ULID_LUA_0), ("lua", TEST_ULID_LUA_1)],
+            )
+            .await;
+        // Held and holding its text as is: closed. Held but prepared, or
+        // not held: left open.
+        assert_eq!(closed, vec![TEST_ULID_LUA_0.to_string()]);
+        assert!(!pool.is_document_opened(&unprepared));
+        assert!(pool.is_document_opened(&prepared));
+        assert!(pool.is_document_opened(&other));
+    }
+
     #[test]
     fn reload_resolution_does_not_resurrect_deleted_server_from_wildcard() {
         let mut settings = WorkspaceSettings::default();
