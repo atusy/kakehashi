@@ -59,7 +59,11 @@ jobs:
       - uses: actions/checkout@v7
       # Each test drives a mock prepare peer and a downstream mock, and some
       # assert on response latency: two at a time, like the job above.
-      - run: "cargo test --features e2e --test e2e e2e_virtual_document_prepare:: -- --test-threads=2"
+      - run: >-
+          cargo test --features e2e --test e2e --
+          e2e_virtual_document_prepare::
+          e2e_cli_format::e2e_format_counts_a_region_its_prepare_peer_failed_as_a_failure
+          --test-threads=2
 
   fmt:
     name: Format
