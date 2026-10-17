@@ -185,13 +185,14 @@ impl Kakehashi {
                 // A prepared document's edits are not mapped back through its
                 // map: closed as a non-contiguous one is.
                 if self
-                    .method_closed_to_region(
+                    .method_gate(
                         &uri,
                         &language_name,
                         resolved,
                         "textDocument/rangeFormatting",
                     )
                     .await
+                    != crate::lsp::lsp_impl::bridge_context::MethodGate::Open
                 {
                     continue;
                 }

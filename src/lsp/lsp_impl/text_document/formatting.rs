@@ -311,11 +311,18 @@ impl Kakehashi {
             // would replace those real host gaps as well and corrupt the document.
             // A prepared document's edits are not mapped back through its map:
             // closed as a non-contiguous one is.
-            if self
-                .method_closed_to_region(uri, language_name, resolved, "textDocument/formatting")
+            match self
+                .method_gate(uri, language_name, resolved, "textDocument/formatting")
                 .await
             {
-                continue;
+                crate::lsp::lsp_impl::bridge_context::MethodGate::Open => {}
+                crate::lsp::lsp_impl::bridge_context::MethodGate::Closed => continue,
+                // Left unformatted because its peer failed: a failed request
+                // (`kakehashi format` exits 2), as `diagnose` counts it.
+                crate::lsp::lsp_impl::bridge_context::MethodGate::Unprepared => {
+                    count_request_errors(&cancel_state.request_error_sink, 1);
+                    continue;
+                }
             }
             let configs = self
                 .bridge_configs_for_injection_language(language_name, &resolved.injection_language);
