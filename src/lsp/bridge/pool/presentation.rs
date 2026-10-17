@@ -38,6 +38,15 @@ impl Presentation {
             Self::Unavailable => None,
         }
     }
+
+    /// [`Self::offset`] of an owned `offset`: moved, not copied, as is.
+    pub(crate) fn into_offset(self, offset: RegionOffset) -> Option<RegionOffset> {
+        match self {
+            Self::AsIs => Some(offset),
+            Self::Prepared(map) => Some(offset.with_prepared(map)),
+            Self::Unavailable => None,
+        }
+    }
 }
 
 /// What a connection held when kakehashi read coordinates it sent (or is

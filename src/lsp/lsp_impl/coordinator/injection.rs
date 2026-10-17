@@ -420,21 +420,25 @@ impl InjectionCoordinator {
             &regions,
             &text,
             incarnation,
-        )
-        .into_iter()
-        .map(|region| {
-            (
-                BridgeInjection {
-                    language: region.injection_language,
-                    region_id: region.region.region_id,
-                    content: region.virtual_content,
-                    held: false,
-                    prepared: None,
-                },
-                region.gaps,
-            )
-        })
-        .collect();
+        );
+        let injection = |region: crate::language::injection::ResolvedInjection| BridgeInjection {
+            language: region.injection_language,
+            region_id: region.region.region_id,
+            content: region.virtual_content,
+            held: false,
+            prepared: None,
+        };
+        if !self.bridge.pool().prepares() {
+            // Without the prepare layer every document goes as is.
+            return settled().then(|| resolved.into_iter().map(injection).collect());
+        }
+        let resolved = resolved
+            .into_iter()
+            .map(|region| {
+                let gaps = std::sync::Arc::clone(&region.gaps);
+                (injection(region), gaps)
+            })
+            .collect();
         settled().then(|| self.prepared_bridge_injections(uri, host_language, resolved, holder))
     }
 
