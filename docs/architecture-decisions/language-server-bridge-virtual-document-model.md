@@ -112,7 +112,9 @@ For non-contiguous combined documents, read-only bridge features remain
 available. Edit-producing methods are disabled until edit translation can
 validate the individual allowed host spans rather than only the combined
 document's outer range; this prevents masked gaps from becoming edits over
-real host text.
+real host text. A document prepared through virtual-document-prepare-protocol
+is closed to edit-producing methods as well, contiguous or not: no edit is
+mapped back through its prepared map.
 
 #### Feature-Specific Isolation Overrides
 
@@ -218,3 +220,4 @@ One language server process handles **all virtual documents** for that language,
 
 - [language-server-bridge](language-server-bridge.md): Core LSP bridge architecture
 - [language-server-bridge-request-strategies](language-server-bridge-request-strategies.md): Per-method bridge strategies
+- [virtual-document-prepare-protocol](virtual-document-prepare-protocol.md): A peer rewrites virtual documents (dedent, gap placeholders) before downstream servers see them
