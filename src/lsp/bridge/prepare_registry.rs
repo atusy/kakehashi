@@ -504,16 +504,34 @@ impl PrepareRegistry {
         let host_uri = host_uri.as_str();
         match injection_language {
             Some(language) => {
-                self.regions
+                if self
+                    .regions
                     .remove_if(&region_hash(host_uri, language, region_id), |_, region| {
                         region.is(host_uri, language, region_id)
-                    });
+                    })
+                    .is_some()
+                {
+                    self.held_changes.fetch_add(1, Ordering::AcqRel);
+                }
             }
-            None => self.regions.retain(|_, region| {
-                !(region.host_uri == host_uri && region.region_id == region_id)
+            None => self.forget_where(|region| {
+                region.host_uri == host_uri && region.region_id == region_id
             }),
         }
-        self.held_changes.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Forget the regions `goes` accepts, noting a change of what is held
+    /// only when one went (an unchanged registry keeps its cached scan).
+    fn forget_where(&self, goes: impl Fn(&Region) -> bool) {
+        let mut removed = false;
+        self.regions.retain(|_, region| {
+            let gone = goes(region);
+            removed |= gone;
+            !gone
+        });
+        if removed {
+            self.held_changes.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     /// Forget `host_uri`'s regions of `region_ids` under every language, in
@@ -523,10 +541,9 @@ impl PrepareRegistry {
             return;
         }
         let host_uri = host_uri.as_str();
-        self.regions.retain(|_, region| {
-            !(region.host_uri == host_uri && region_ids.contains(&region.region_id))
+        self.forget_where(|region| {
+            region.host_uri == host_uri && region_ids.contains(&region.region_id)
         });
-        self.held_changes.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Forget a replaced region under every language but the one it resolves
@@ -535,12 +552,11 @@ impl PrepareRegistry {
     /// prepared already.
     pub(crate) fn forget_region_except(&self, host_uri: &Url, region_id: &str, keep: Option<&str>) {
         let host_uri = host_uri.as_str();
-        self.regions.retain(|_, region| {
-            !(region.host_uri == host_uri
+        self.forget_where(|region| {
+            region.host_uri == host_uri
                 && region.region_id == region_id
-                && Some(region.injection_language.as_str()) != keep)
+                && Some(region.injection_language.as_str()) != keep
         });
-        self.held_changes.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Whether `host_uri` closed (see `closed_hosts`).
@@ -569,9 +585,7 @@ impl PrepareRegistry {
         {
             self.closed_hosts.remove(&oldest);
         }
-        self.regions
-            .retain(|_, region| region.host_uri != host_uri.as_str());
-        self.held_changes.fetch_add(1, Ordering::AcqRel);
+        self.forget_where(|region| region.host_uri == host_uri.as_str());
     }
 
     /// Settle `input`'s answer as an attempt would, the lifecycle pass
@@ -1921,6 +1935,32 @@ mod tests {
         assert_eq!(registry.regions.len(), 1);
         registry.forget_region(&host, None, REGION);
         assert!(registry.regions.is_empty());
+    }
+
+    /// Forgetting what is not there changes nothing held: the cached scan
+    /// of prepared regions stands (a pass with no peer forgets every region
+    /// it sends as is, on every keystroke).
+    #[test]
+    fn forgetting_nothing_keeps_the_prepared_scan() {
+        let registry = PrepareRegistry::default();
+        let pool = LanguageServerPool::preparing();
+        let target = unstartable_target(&pool);
+        let host = Url::parse("file:///host.md").unwrap();
+        registry.slot(
+            &target,
+            input(&host, "a"),
+            Holder::LifecyclePass,
+            target.epoch,
+        );
+        let changes = || registry.held_changes.load(Ordering::Acquire);
+        let before = changes();
+        registry.forget_region(&host, Some("lua"), "01J0000000000000000000000Z");
+        registry.forget_region(&host, None, "01J0000000000000000000000Z");
+        registry.forget_region_except(&host, "01J0000000000000000000000Z", None);
+        registry.forget_regions(&host, &["01J0000000000000000000000Z".to_string()]);
+        assert_eq!(changes(), before);
+        registry.forget_region(&host, Some("lua"), REGION);
+        assert!(changes() > before);
     }
 
     #[test]
