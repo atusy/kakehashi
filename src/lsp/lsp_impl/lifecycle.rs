@@ -100,6 +100,25 @@ enum ClientRoot<'a> {
 /// prepare backoff: one second, doubling) before waiting for the next edit.
 const MAX_RESYNC_RETRIES: u32 = 6;
 
+/// The resyncs an epoch move asks for: every open host, even with nothing
+/// looked up yet — a pair no candidate advertised the request for was never
+/// looked up, and the move may give it one. Their diagnostics are collected
+/// again only once something was looked up: before that, none was placed
+/// through a prepared text.
+fn resyncs_on_epoch_move(
+    open_hosts: impl IntoIterator<Item = Url>,
+    nothing_looked_up: bool,
+) -> Vec<crate::lsp::bridge::Resync> {
+    open_hosts
+        .into_iter()
+        .map(|host_uri| crate::lsp::bridge::Resync {
+            host_uri,
+            ready: false,
+            recollect: !nothing_looked_up,
+        })
+        .collect()
+}
+
 /// Hosts to sync again, each once: several documents of one host usually
 /// finish together. `(ready, recollect)` of any of a host's resyncs.
 fn merge_resyncs(
@@ -867,18 +886,7 @@ impl Kakehashi {
                         if changed.is_err() {
                             return;
                         }
-                        // Even with nothing looked up yet: a pair with no
-                        // candidate advertising the request was never
-                        // looked up, and the move may give it one.
-                        injection
-                            .open_host_uris()
-                            .into_iter()
-                            .map(|host_uri| crate::lsp::bridge::Resync {
-                                host_uri,
-                                ready: false,
-                                recollect: true,
-                            })
-                            .collect()
+                        resyncs_on_epoch_move(injection.open_host_uris(), bridge.prepare_unused())
                     },
                 };
                 let hosts = merge_resyncs(
@@ -3141,6 +3149,27 @@ async fn upstream_forwarding_loop_with_cancel(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_epoch_move_syncs_every_open_host_even_before_any_lookup() {
+        use crate::lsp::bridge::Resync;
+        let hosts =
+            || ["a", "b"].map(|name| url::Url::parse(&format!("file:///{name}.md")).unwrap());
+        let resync = |host: url::Url, recollect| Resync {
+            host_uri: host,
+            ready: false,
+            recollect,
+        };
+        let [a, b] = hosts();
+        assert_eq!(
+            super::resyncs_on_epoch_move(hosts(), true),
+            [resync(a.clone(), false), resync(b.clone(), false)]
+        );
+        assert_eq!(
+            super::resyncs_on_epoch_move(hosts(), false),
+            [resync(a, true), resync(b, true)]
+        );
+    }
+
     #[test]
     fn a_host_is_synced_again_once_per_batch_of_resyncs() {
         use crate::lsp::bridge::Resync;
