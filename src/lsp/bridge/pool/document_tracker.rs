@@ -772,6 +772,9 @@ impl DocumentTracker {
                 } else {
                     held.map = None;
                 }
+                // The same text under another map is what a request built
+                // on that map waits for.
+                self.held_changed.notify_waiters();
                 return None;
             }
         }
