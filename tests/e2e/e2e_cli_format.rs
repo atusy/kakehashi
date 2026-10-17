@@ -597,11 +597,68 @@ languages = ["lua"]
         "a region its prepare peer failed must exit 2; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("1 downstream formatting operation(s) failed"),
+        "stderr should report the failed region; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(
         read(ws.path(), "doc.md"),
         markdown,
         "the file must be left untouched"
     );
+}
+
+#[test]
+fn e2e_format_does_not_count_a_region_its_prepare_peer_prepared() {
+    // The same region, prepared by its peer, is no failure: the run
+    // exits 0.
+    let markdown = "# Test\n\n```lua\nprint('ok')\n```\n";
+    let ws = workspace_with(&[("doc.md", markdown)]);
+    std::fs::write(
+        ws.path().join("kakehashi.toml"),
+        format!(
+            r#"autoInstall = false
+
+[languages.markdown.bridge.lua.aggregation."kakehashi/virtualDocument/prepare"]
+priorities = ["peer"]
+
+[languages.markdown.bridge.lua.aggregation._]
+priorities = ["mock-upper"]
+
+[languageServers.peer]
+cmd = ['{bin}', 'prepare-peer']
+languages = ["lua"]
+
+[languageServers.mock-upper]
+cmd = ['{bin}', 'upper']
+languages = ["lua"]
+"#,
+            bin = env!("CARGO_BIN_EXE_mock-lsp-formatter")
+        ),
+    )
+    .expect("write prepare config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .arg("format")
+        .arg("--config-file")
+        .arg("kakehashi.toml")
+        .arg("doc.md")
+        .current_dir(ws.path())
+        .env("KAKEHASHI_DATA_DIR", data_dir())
+        .env("KAKEHASHI_EXPERIMENTAL", "true")
+        .output()
+        .expect("spawn kakehashi format");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a region its prepare peer prepared must exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Formatting is closed to a prepared document: the region is left as
+    // is, which the run does not count as a failure.
+    assert_eq!(read(ws.path(), "doc.md"), markdown);
 }
 
 #[test]
