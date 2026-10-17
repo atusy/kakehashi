@@ -21,10 +21,6 @@ mod client_capabilities;
 mod command_routing;
 mod jsonrpc;
 mod lifecycle;
-#[allow(
-    dead_code,
-    reason = "the prepare layer that presents documents through it comes next"
-)]
 mod prepare;
 mod request;
 mod request_id;
@@ -43,7 +39,7 @@ pub(crate) use lifecycle::*;
 #[cfg(test)]
 pub(crate) use prepare::apply_prepare_result;
 pub(crate) use prepare::{
-    PREPARE_METHOD, PREPARE_TIMEOUT, PrepareHostTextDocument, PrepareParams, PrepareResult,
+    Bias, PREPARE_METHOD, PREPARE_TIMEOUT, PrepareHostTextDocument, PrepareParams, PrepareResult,
     PrepareTextDocument, PreparedDocument, PreparedMap, VirtualLayout, apply_prepare_result_at,
     next_presentation, parse_prepare_response,
 };

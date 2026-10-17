@@ -309,7 +309,9 @@ impl Kakehashi {
             // Non-contiguous combined injections contain masked host-only gaps.
             // A formatter returns a contiguous whole-document replacement, which
             // would replace those real host gaps as well and corrupt the document.
-            if !resolved.contiguous {
+            // A prepared document's edits are not mapped back through its map:
+            // closed as a non-contiguous one is.
+            if !resolved.contiguous || self.region_prepared(uri, resolved) {
                 continue;
             }
             let configs = self
@@ -361,6 +363,7 @@ impl Kakehashi {
                 continue;
             }
             let region_ctx = DocumentRequestContext {
+                prepared: None,
                 uri: uri.clone(),
                 resolved: resolved.clone(),
                 region_end: None,

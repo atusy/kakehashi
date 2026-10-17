@@ -580,10 +580,6 @@ impl ConnectionHandle {
     /// answer also clears it until the next handshake), `InvalidData` for an
     /// unusable answer, `Interrupted` for a cancellation LSP lets a client
     /// retry, and another kind when no answer came.
-    #[allow(
-        dead_code,
-        reason = "the prepare registry asks candidates through these, next"
-    )]
     pub(crate) async fn request_virtual_document_prepare(
         &self,
         params: &PrepareParams<'_>,
@@ -850,10 +846,6 @@ impl ConnectionHandle {
     }
 
     /// Whether the downstream answers `kakehashi/virtualDocument/prepare`.
-    #[allow(
-        dead_code,
-        reason = "the prepare registry asks candidates through these, next"
-    )]
     pub(crate) fn supports_virtual_document_prepare(&self) -> bool {
         self.virtual_document_prepare.load(Ordering::Acquire)
     }

@@ -141,7 +141,7 @@ impl Kakehashi {
         // server the region now routes to. An envelope with no language
         // (cleared by the client) names no region.
         .is_some_and(|(live_offset, _, _, live_language)| {
-            live_offset == RegionOffset::from(offset) && live_language == injection_language
+            offset.describes(&live_offset) && live_language == injection_language
         })
     }
 }
@@ -154,6 +154,11 @@ impl Kakehashi {
 /// whether the virtual content maps to one contiguous host span; the fourth
 /// is the region's live injection language, so a resolve gate can refuse an
 /// envelope whose echoed language no longer names this region.
+///
+/// A region whose document is prepared (or held back for its peer), or a
+/// prepared text of which a server still holds, reads as not rebuildable: an
+/// offset kept from one of its texts — a resolve envelope's — carries no map
+/// and describes nothing its servers hold.
 pub(super) fn resolve_region_offset(
     documents: &DocumentStore,
     language: &Arc<LanguageCoordinator>,
@@ -161,7 +166,11 @@ pub(super) fn resolve_region_offset(
     host_url: &Url,
     region_id: &str,
 ) -> Option<(RegionOffset, Position, bool, String)> {
-    resolve_region(documents, language, bridge, host_url, region_id).map(resolved_region_geometry)
+    let resolved = resolve_region(documents, language, bridge, host_url, region_id)?;
+    if bridge.region_is_prepared(host_url, &resolved.injection_language, region_id) {
+        return None;
+    }
+    Some(resolved_region_geometry(resolved))
 }
 
 /// Resolve geometry and content from the same current snapshot.

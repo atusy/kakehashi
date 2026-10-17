@@ -22,10 +22,6 @@ mod handshake;
 mod liveness_timeout;
 mod message_sender;
 mod pending_reopen;
-#[allow(
-    dead_code,
-    reason = "the prepare layer reads coordinates through it, next"
-)]
 mod presentation;
 mod shutdown;
 mod shutdown_timeout;
@@ -61,10 +57,6 @@ use pending_reopen::PendingReopenRegistry;
 /// Re-exported so the server-side re-open handler bounds its work by the same
 /// budget requests wait on — the two must not drift apart.
 pub(crate) use pending_reopen::REOPEN_WAIT;
-#[allow(
-    unused_imports,
-    reason = "the prepare layer reads coordinates through it, next"
-)]
 pub(crate) use presentation::{Observed, Presentation, RegionPrepare};
 pub(crate) use shutdown_timeout::GlobalShutdownTimeout;
 
@@ -2054,7 +2046,7 @@ impl LanguageServerPool {
     ///
     /// Used by did_change to forward notifications to every connection that has
     /// the document open, not just the first one found.
-    pub(super) fn get_all_connections_for_virtual_uri(
+    pub(in crate::lsp::bridge) fn get_all_connections_for_virtual_uri(
         &self,
         virtual_uri: &VirtualDocumentUri,
     ) -> Vec<ConnectionKey> {
@@ -5639,10 +5631,6 @@ impl PrepareAdvertisements {
         self.epoch.send_modify(|epoch| *epoch += 1);
     }
 
-    #[allow(
-        dead_code,
-        reason = "the prepare registry asks candidates through these, next"
-    )]
     fn get(&self, server_name: &str) -> Option<bool> {
         self.by_server
             .get(server_name)
@@ -5650,10 +5638,6 @@ impl PrepareAdvertisements {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "the prepare registry asks candidates through these, next"
-)]
 impl LanguageServerPool {
     /// Whether this pool records prepare advertisements (experimental
     /// features on): the bridge's prepare layer exists exactly then.

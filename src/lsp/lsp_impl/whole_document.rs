@@ -171,6 +171,7 @@ impl Kakehashi {
                     method_name,
                 );
                 let region_ctx = DocumentRequestContext {
+                    prepared: None,
                     uri: uri.clone(),
                     resolved: resolved.clone(),
                     region_end: None,
@@ -180,6 +181,17 @@ impl Kakehashi {
                     strategy: agg.strategy,
                     max_fan_out: agg.max_fan_out,
                     client_progress_token: None,
+                };
+                // The lifecycle pass has started every region's attempt already:
+                // waiting for each in turn costs the slowest one.
+                let Ok(region_ctx) = crate::lsp::lsp_impl::bridge_context::prepare_request_context(
+                    &self.bridge,
+                    &language_name,
+                    region_ctx,
+                )
+                .await
+                else {
+                    continue;
                 };
                 // Mint this region's tracked-source token into the shared
                 // aggregator (no-op when there's no client token).

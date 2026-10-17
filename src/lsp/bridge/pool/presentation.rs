@@ -28,6 +28,10 @@ pub(crate) enum Presentation {
 }
 
 impl Presentation {
+    #[allow(
+        dead_code,
+        reason = "pushes and inbound requests read coordinates through it, next"
+    )]
     /// `offset` as coordinates under this presentation follow it, `None`
     /// when unavailable.
     pub(crate) fn offset(self, offset: RegionOffset) -> Option<RegionOffset> {
@@ -41,6 +45,10 @@ impl Presentation {
 
 /// What a connection held when kakehashi read coordinates it sent (or is
 /// about to send it a request on).
+#[allow(
+    dead_code,
+    reason = "pushes and inbound requests read coordinates through it, next"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Observed {
     /// Read while no connection had ever been sent a prepared text: the

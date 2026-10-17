@@ -166,10 +166,6 @@ pub(crate) struct HeldText {
     pub(crate) map: Option<Arc<PreparedMap>>,
     /// Changes whenever the text does: anything the server computed (a push,
     /// an inbound edit) is in the coordinates of the generation it held.
-    #[allow(
-        dead_code,
-        reason = "read by the presentation of what a connection holds, next"
-    )]
     pub(crate) generation: u64,
     /// The document version the text was sent under, which a server's push
     /// may name.
@@ -865,6 +861,14 @@ impl DocumentTracker {
         }
     }
 
+    /// Whether what connections hold can make [`Self::presentation`] other
+    /// than as is for a region the lifecycle pass knows `region` of. A
+    /// shortcut of the rule, not another: with no prepared text ever sent,
+    /// no record holds a map, none has a history, and no read saw either.
+    pub(super) fn held_texts_matter(&self, region: super::RegionPrepare) -> bool {
+        region != super::RegionPrepare::default() || self.ever_held_prepared()
+    }
+
     /// What `connection_key` holds for `virtual_uri` now, and whether it was
     /// ever sent a prepared text of it, from one read.
     fn held_now(
@@ -896,7 +900,7 @@ impl DocumentTracker {
     /// prepared text, without reading any record.
     #[allow(
         dead_code,
-        reason = "the prepare layer reads coordinates through it, next"
+        reason = "pushes and inbound requests read coordinates through it, next"
     )]
     pub(super) fn observe(
         &self,
@@ -965,10 +969,6 @@ impl DocumentTracker {
     }
 
     /// Whether any connection was ever sent a prepared text.
-    #[allow(
-        dead_code,
-        reason = "read by the presentation of what a connection holds, next"
-    )]
     pub(super) fn ever_held_prepared(&self) -> bool {
         self.ever_held_prepared.load(Ordering::Acquire)
     }
@@ -978,7 +978,7 @@ impl DocumentTracker {
     /// reader to take as each message arrives.
     #[allow(
         dead_code,
-        reason = "read by the presentation of what a connection holds, next"
+        reason = "pushes and inbound requests read coordinates through it, next"
     )]
     pub(super) fn held_through(&self) -> u64 {
         self.held_generations.load(Ordering::Acquire)
@@ -989,10 +989,6 @@ impl DocumentTracker {
     /// [`super::presentation::presentation`]). Until any connection was sent
     /// a prepared text, and while the lifecycle pass prepares nothing of the
     /// region, every connection holds its text as is: no record is read.
-    #[allow(
-        dead_code,
-        reason = "the prepare layer reads coordinates through it, next"
-    )]
     pub(super) fn presentation(
         &self,
         virtual_uri: &str,
@@ -1001,10 +997,7 @@ impl DocumentTracker {
         region: super::RegionPrepare,
         virtual_text: &str,
     ) -> super::Presentation {
-        // A shortcut of the rule, not another: with no prepared text ever
-        // sent, no record holds a map, none has a history, and no read saw
-        // either.
-        if region == super::RegionPrepare::default() && !self.ever_held_prepared() {
+        if !self.held_texts_matter(region) {
             return super::Presentation::AsIs;
         }
         let (held, history) = self.held_now(virtual_uri, connection_key);
@@ -1012,10 +1005,6 @@ impl DocumentTracker {
     }
 
     /// What this connection was last sent for the document, if anything.
-    #[allow(
-        dead_code,
-        reason = "read by the presentation of what a connection holds, next"
-    )]
     pub(super) fn held_text(
         &self,
         virtual_uri: &str,

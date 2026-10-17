@@ -178,6 +178,7 @@ fn completion_geometry_matches(
 ) -> bool {
     let produced_at = RegionOffset::from(&envelope.offset);
     !envelope.region_id.is_empty()
+        && !envelope.offset.prepared
         && contiguous
         // The start identifies the region; the per-line columns below it
         // grow with the region and are read live for translation.

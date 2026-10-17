@@ -955,10 +955,6 @@ pub(crate) struct ResolvedInjection {
     /// masked spans and host-only lines' line breaks (a non-empty
     /// `virtual_range`), and stripped text such as line prefixes (an empty
     /// one). Empty for an isolated region, which is all content.
-    #[allow(
-        dead_code,
-        reason = "the prepare layer that presents documents through it comes next"
-    )]
     pub gaps: std::sync::Arc<[VirtualGap]>,
 }
 

@@ -628,6 +628,7 @@ mod tests {
                 line: 5,
                 column: 0,
                 line_column_offsets: None,
+                prepared: false,
             },
             region_end: Some((9, 0)),
             host_layer: false,
@@ -953,7 +954,8 @@ mod tests {
             EnvelopeOffset {
                 line: 5,
                 column: 0,
-                line_column_offsets: Some(vec![0])
+                line_column_offsets: Some(vec![0]),
+                prepared: false,
             }
         );
     }
@@ -1021,6 +1023,7 @@ mod tests {
                 line: 5,
                 column: 0,
                 line_column_offsets: None,
+                prepared: false,
             },
             region_end: Some((9, 0)),
             host_layer: false,
@@ -1266,7 +1269,8 @@ mod tests {
             EnvelopeOffset {
                 line: 5,
                 column: 0,
-                line_column_offsets: Some(vec![0])
+                line_column_offsets: Some(vec![0]),
+                prepared: false,
             }
         );
     }

@@ -207,7 +207,6 @@ impl super::BridgeCoordinator {
     }
 
     /// A request's wait for a virtual document's answer.
-    #[allow(dead_code, reason = "requests wait for their answers through it, next")]
     pub(crate) async fn prepared_document(
         &self,
         target: &super::PrepareTarget,
@@ -221,7 +220,6 @@ impl super::BridgeCoordinator {
 
     /// What the lifecycle pass knows of a region's current document (see
     /// [`RegionPrepare`]).
-    #[allow(dead_code, reason = "requests wait for their answers through it, next")]
     pub(crate) fn prepare_region(
         &self,
         host_uri: &Url,
@@ -239,8 +237,45 @@ impl super::BridgeCoordinator {
         }
     }
 
+    /// Whether a region is prepared: the lifecycle pass prepares its document
+    /// (or holds it back for its peer), or a server still holds a prepared
+    /// text of it (right after its pair lost its peer).
+    pub(crate) fn region_is_prepared(
+        &self,
+        host_uri: &Url,
+        injection_language: &str,
+        region_id: &str,
+    ) -> bool {
+        if self.prepare.is_none() {
+            return false;
+        }
+        if self
+            .prepare_region(host_uri, injection_language, region_id)
+            .prepared
+        {
+            return true;
+        }
+        let Ok(host) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
+            return false;
+        };
+        let virtual_uri =
+            super::protocol::VirtualDocumentUri::new(&host, injection_language, region_id);
+        let uri = virtual_uri.to_uri_string();
+        self.pool
+            .get_all_connections_for_virtual_uri(&virtual_uri)
+            .iter()
+            .any(|connection| {
+                self.pool
+                    .held_text(&uri, connection)
+                    .is_some_and(|held| held.map.is_some())
+            })
+    }
+
     /// Whether any of `host_uri`'s documents still waits for its answer.
-    #[allow(dead_code, reason = "requests wait for their answers through it, next")]
+    #[allow(
+        dead_code,
+        reason = "pushes and inbound requests read coordinates through it, next"
+    )]
     pub(crate) fn prepare_host_has_pending(&self, host_uri: &Url) -> bool {
         self.prepare.as_ref().is_some_and(|layer| {
             layer

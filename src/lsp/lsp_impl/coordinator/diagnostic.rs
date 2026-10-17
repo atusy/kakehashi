@@ -559,6 +559,7 @@ impl DiagnosticSnapshotPreparer {
                         };
 
                         contexts.push(DocumentRequestContext {
+                            prepared: None,
                             uri: uri.clone(),
                             resolved: resolved.clone(),
                             region_end: None,

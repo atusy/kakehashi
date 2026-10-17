@@ -39,7 +39,7 @@ pub(crate) use pool::{HostLanguageAdmission, INIT_TIMEOUT_SECS};
 mod prepare_layer;
 mod prepare_registry;
 pub(crate) use prepare_registry::{
-    Answer as PrepareAnswer, PrepareInput, PrepareLookup, PrepareTarget, Resync,
+    Answer as PrepareAnswer, PrepareInput, PrepareLookup, PrepareMiss, PrepareTarget, Resync,
     retry_delay as prepare_retry_delay,
 };
 mod progress_registry;
@@ -81,6 +81,7 @@ pub(crate) use pool::test_helpers;
 pub(crate) use pool::{ConnectionHandle, ConnectionKey};
 pub(crate) use pool::{RecoveryDecision, Reservation};
 pub(crate) use progress_registry::{ProgressConnectionId, ProgressRegistry};
+pub(crate) use protocol::PreparedMap;
 pub(crate) use protocol::RegionOffset;
 pub(crate) use protocol::RequestId;
 pub(crate) use protocol::VirtualDocumentUri;

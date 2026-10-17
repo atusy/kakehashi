@@ -182,7 +182,9 @@ impl Kakehashi {
                 // Non-contiguous combined injections contain masked host-only
                 // gaps. Even a covering range may fall back to full formatting,
                 // whose single replacement would overwrite those real gaps.
-                if !resolved.contiguous {
+                // A prepared document's edits are not mapped back through its
+                // map: closed as a non-contiguous one is.
+                if !resolved.contiguous || self.region_prepared(&uri, resolved) {
                     continue;
                 }
                 // A covering request (its byte span encloses the whole region)
@@ -271,6 +273,7 @@ impl Kakehashi {
                     continue;
                 }
                 let region_ctx = DocumentRequestContext {
+                    prepared: None,
                     uri: uri.clone(),
                     resolved: resolved.clone(),
                     region_end: None,
