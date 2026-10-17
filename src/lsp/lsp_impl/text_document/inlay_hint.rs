@@ -418,6 +418,99 @@ mod tests {
         .unwrap()
     }
 
+    /// A hint minted while its document went as is, resolved once the
+    /// region is prepared: the region is not rebuilt for it, so the resolve
+    /// goes nowhere — edits its server computes now are in a prepared
+    /// text's coordinates, which the as-is envelope cannot map back.
+    #[tokio::test]
+    async fn a_hint_minted_as_is_is_not_resolved_once_its_region_is_prepared() {
+        use std::sync::Arc;
+        let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
+        let (service, _socket) = tower_lsp_server::LspService::new(|client| {
+            crate::lsp::lsp_impl::Kakehashi::with_cancel_forwarder(
+                client,
+                Arc::clone(&pool),
+                crate::lsp::CancelForwarder::new(Arc::clone(&pool)),
+            )
+        });
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), language.clone());
+        server.language.query_store().insert_injection_query(
+            "rust".into(),
+            Arc::new(
+                tree_sitter::Query::new(
+                    &language,
+                    r#"((string_literal) @injection.content (#set! injection.language "rust"))"#,
+                )
+                .unwrap(),
+            ),
+        );
+        server
+            .bridge
+            .prepare_settings_changed(&Arc::new(crate::config::WorkspaceSettings {
+                auto_install: false,
+                language_servers: [(
+                    "peer".to_string(),
+                    crate::lsp::bridge::test_helpers::devnull_config_for_language("rust"),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            }));
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let uri = url::Url::parse("file:///hinted.rs").unwrap();
+        let text = r#"fn main() { let x = "a"; }"#;
+        server.documents.insert(
+            uri.clone(),
+            text.into(),
+            Some("rust".into()),
+            parser.parse(text, None),
+        );
+        let region = server
+            .injection_coordinator()
+            .resolve_injection_data(&uri, "rust")
+            .unwrap()
+            .remove(0);
+        let mut envelope = envelope();
+        envelope.host_uri = uri.to_string();
+        envelope.region_id = region.region_id.clone();
+        envelope.injection_language = "rust".to_string();
+
+        // As is: the region is rebuilt for the resolve.
+        assert!(server.inlay_hint_region_geometry(&uri, &envelope).is_some());
+
+        // Prepared since (the pair gained its peer): not rebuilt.
+        let target = server.bridge.prepare_target("rust", "rust").unwrap();
+        let answer =
+            serde_json::from_value(serde_json::json!({"segments": [{"type": "content"}]})).unwrap();
+        server.bridge.answer_prepare_for_test(
+            &target,
+            crate::lsp::bridge::PrepareInput {
+                host_uri: &uri,
+                host_language: "rust",
+                injection_language: "rust",
+                region_id: &region.region_id,
+                virtual_text: &region.content,
+                gaps: &[],
+            },
+            crate::lsp::bridge::PrepareAnswer::Prepared(Arc::new(
+                crate::lsp::bridge::apply_prepare_result(
+                    &region.content,
+                    &crate::lsp::bridge::VirtualLayout::single(&region.content),
+                    Some(answer),
+                )
+                .unwrap(),
+            )),
+            true,
+        );
+        assert!(server.inlay_hint_region_geometry(&uri, &envelope).is_none());
+    }
+
     #[test]
     fn inlay_hint_resolve_rejects_non_contiguous_region() {
         let envelope = envelope();
