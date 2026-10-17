@@ -50,6 +50,11 @@ use crate::language::injection::VirtualGap;
 use crate::lsp::bridge::pool::RegionPrepare;
 use crate::text::terminal::escape_terminal_controls;
 
+/// How long a closed host is remembered as closed: longer than any request
+/// resolved before the close keeps looking its documents up (it waits at
+/// most for an answer, then for its text).
+const CLOSED_HOST_TTL: Duration = Duration::from_secs(60);
+
 /// Answers kept per region besides the one the lifecycle pass holds its
 /// document on: enough for an undo, or a request on text an edit or two
 /// old, to find its answer without asking again.
@@ -270,10 +275,12 @@ pub(crate) struct PrepareRegistry {
     /// The last scan of [`Self::any_region_prepared`]: `(epoch, held
     /// changes, result)`.
     prepared_scan: std::sync::Mutex<Option<(u64, u64, bool)>>,
-    /// Hosts closed since their lifecycle pass last ran: a request still
-    /// running past the close looks nothing up for them, and an attempt for
-    /// one asks no peer. Shared with the attempts.
-    closed_hosts: Arc<dashmap::DashSet<String>>,
+    /// Hosts closed with documents looked up, until reopened: a request
+    /// still running past the close looks nothing up for them, and an
+    /// attempt for one asks no peer. Shared with the attempts. Each entry
+    /// goes on a reopen, or once [`CLOSED_HOST_TTL`] passed — by then no
+    /// request from before the close is still looking up.
+    closed_hosts: Arc<DashMap<String, Instant>>,
     /// Source of `textDocument.version`: shared by all documents, so a
     /// document forgotten and prepared again (a reopen) never repeats a
     /// version the peer saw.
@@ -515,15 +522,29 @@ impl PrepareRegistry {
         self.held_changes.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// Whether `host_uri` closed since its lifecycle pass last ran.
+    /// Whether `host_uri` closed (see `closed_hosts`).
     pub(crate) fn host_closed(&self, host_uri: &Url) -> bool {
-        self.closed_hosts.contains(host_uri.as_str())
+        self.closed_hosts.contains_key(host_uri.as_str())
     }
 
-    /// Forget a closed host's documents: until its lifecycle pass runs again
-    /// (a reopen), nothing is looked up for it.
+    /// `host_uri` opened (again): its documents are looked up as any.
+    pub(crate) fn host_opened(&self, host_uri: &Url) {
+        self.closed_hosts.remove(host_uri.as_str());
+    }
+
+    /// Forget a closed host's documents: until it opens again, nothing is
+    /// looked up for it.
     pub(crate) fn forget_host(&self, host_uri: &Url) {
-        self.closed_hosts.insert(host_uri.to_string());
+        let now = Instant::now();
+        self.closed_hosts
+            .retain(|_, closed| now.duration_since(*closed) < CLOSED_HOST_TTL);
+        let looked_up = self
+            .regions
+            .iter()
+            .any(|region| region.host_uri == host_uri.as_str());
+        if looked_up {
+            self.closed_hosts.insert(host_uri.to_string(), now);
+        }
         self.regions
             .retain(|_, region| region.host_uri != host_uri.as_str());
         self.held_changes.fetch_add(1, Ordering::AcqRel);
@@ -566,11 +587,9 @@ impl PrepareRegistry {
             return None;
         }
         let host_uri = input.host_uri.as_str();
-        // Only the lifecycle pass reopens a closed host: a request still
-        // running past the close finds nothing, and starts nothing.
-        if holder == Holder::LifecyclePass {
-            self.closed_hosts.remove(host_uri);
-        } else if self.closed_hosts.contains(host_uri) {
+        // Closed: whatever still runs past the close finds nothing, and
+        // starts nothing.
+        if self.closed_hosts.contains_key(host_uri) {
             return None;
         }
         self.used.store(true, Ordering::Release);
@@ -679,7 +698,7 @@ impl PrepareRegistry {
             // the settings may no longer name.
             let admitted = || {
                 pool.prepare_epoch() == cell.epoch
-                    && !closed_hosts.contains(job.host_uri.as_str())
+                    && !closed_hosts.contains_key(job.host_uri.as_str())
                     && regions.get(&region).is_some_and(|region| region.has(&cell))
             };
             let held = || {
@@ -1733,11 +1752,11 @@ mod tests {
         );
     }
 
-    /// A closed host gets nothing looked up for it by a request still
-    /// running past the close — no region comes back, no attempt starts —
-    /// until its lifecycle pass runs again on a reopen.
+    /// A closed host gets nothing looked up for it by whatever still runs
+    /// past the close — no region comes back, no attempt starts — until it
+    /// opens again.
     #[tokio::test]
-    async fn a_closed_host_is_looked_up_again_only_by_its_lifecycle_pass() {
+    async fn a_closed_host_is_looked_up_again_only_once_reopened() {
         let registry = PrepareRegistry::default();
         let pool = Arc::new(LanguageServerPool::preparing());
         let target = unstartable_target(&pool);
@@ -1764,8 +1783,18 @@ mod tests {
             registry.lookup_or_start(&pool, &target, input(&host, "a")),
             PrepareLookup::Pending
         ));
+        assert!(registry.regions.is_empty(), "a pass re-created the region");
+
+        // Reopened.
+        registry.host_opened(&host);
         assert!(!registry.host_closed(&host));
+        registry.lookup_or_start(&pool, &target, input(&host, "a"));
         assert_eq!(registry.regions.len(), 1);
+
+        // A host closed with nothing looked up is not remembered.
+        let other = Url::parse("file:///untouched.md").unwrap();
+        registry.forget_host(&other);
+        assert!(!registry.host_closed(&other));
     }
 
     #[test]
