@@ -318,6 +318,10 @@ impl BridgeCoordinator {
     pub(crate) fn new() -> Self {
         let pool = Arc::new(LanguageServerPool::new());
         let cancel_forwarder = CancelForwarder::new(Arc::clone(&pool));
+        // One switch: the layer exists where the pool records advertisements.
+        let prepare = pool
+            .prepares()
+            .then(super::prepare_layer::PrepareLayer::new);
         Self {
             pool,
             node_tracker: Arc::new(NodeTracker::new()),
@@ -330,7 +334,7 @@ impl BridgeCoordinator {
             host_eager_open_generation: std::sync::atomic::AtomicU64::new(0),
             host_eager_open_tasks: DashMap::new(),
             config_memo: ArcSwap::new(Arc::new(ConfigMemo::empty(None))),
-            prepare: crate::experimental::enabled().then(super::prepare_layer::PrepareLayer::new),
+            prepare,
         }
     }
 
@@ -345,6 +349,9 @@ impl BridgeCoordinator {
         pool: Arc<LanguageServerPool>,
         cancel_forwarder: CancelForwarder,
     ) -> Self {
+        let prepare = pool
+            .prepares()
+            .then(super::prepare_layer::PrepareLayer::new);
         Self {
             pool,
             node_tracker: Arc::new(NodeTracker::new()),
@@ -357,7 +364,7 @@ impl BridgeCoordinator {
             host_eager_open_generation: std::sync::atomic::AtomicU64::new(0),
             host_eager_open_tasks: DashMap::new(),
             config_memo: ArcSwap::new(Arc::new(ConfigMemo::empty(None))),
-            prepare: crate::experimental::enabled().then(super::prepare_layer::PrepareLayer::new),
+            prepare,
         }
     }
 

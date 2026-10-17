@@ -5655,6 +5655,12 @@ impl PrepareAdvertisements {
     reason = "the prepare registry asks candidates through these, next"
 )]
 impl LanguageServerPool {
+    /// Whether this pool records prepare advertisements (experimental
+    /// features on): the bridge's prepare layer exists exactly then.
+    pub(crate) fn prepares(&self) -> bool {
+        self.prepare_advertisements.is_some()
+    }
+
     /// A pool recording prepare advertisements, as with experimental
     /// features on.
     #[cfg(test)]
