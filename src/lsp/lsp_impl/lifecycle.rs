@@ -171,6 +171,22 @@ fn collect_after_resync(resync: &crate::lsp::bridge::Resync) -> Option<CollectAf
     }
 }
 
+/// Collect `uri`'s diagnostics as [`collect_after_resync`] has it, after a
+/// resync pass synced it.
+fn collect_diagnostics_after_resync(
+    diagnostics: &super::coordinator::DiagnosticScheduler,
+    uri: Url,
+    resync: &crate::lsp::bridge::Resync,
+) {
+    match collect_after_resync(resync) {
+        Some(CollectAfterResync::AtOnce) => diagnostics.spawn_diagnostic_task_after_prepare(uri),
+        Some(CollectAfterResync::Debounced) => {
+            diagnostics.schedule_debounced_diagnostic_after_prepare(uri);
+        }
+        None => {}
+    }
+}
+
 /// What a resync pass over a host leads to.
 #[derive(Debug, PartialEq, Eq)]
 enum AfterResyncPass {
@@ -948,15 +964,7 @@ impl Kakehashi {
                             // The servers now hold the texts the answers
                             // gave; what they diagnosed before was for other
                             // texts.
-                            match collect_after_resync(&resync) {
-                                Some(CollectAfterResync::AtOnce) => {
-                                    diagnostics.spawn_diagnostic_task_after_prepare(uri);
-                                }
-                                Some(CollectAfterResync::Debounced) => {
-                                    diagnostics.schedule_debounced_diagnostic_after_prepare(uri);
-                                }
-                                None => {}
-                            }
+                            collect_diagnostics_after_resync(&diagnostics, uri, &resync);
                         }
                         AfterResyncPass::Retry { failed } => {
                             bridge.requeue_prepare_resync(
@@ -3241,6 +3249,35 @@ mod tests {
         let flags = |resync: &Resync| (resync.ready, resync.recollect, resync.edited);
         assert_eq!(flags(&hosts[&host("a")]), (true, true, false));
         assert_eq!(flags(&hosts[&host("b")]), (false, false, false));
+    }
+
+    /// The pass collects an edit's answer through the debounce, and any
+    /// other at once.
+    #[tokio::test]
+    async fn a_resync_pass_routes_an_edits_answer_to_the_debounce() {
+        use crate::lsp::bridge::Resync;
+        let (service, _socket) =
+            tower_lsp_server::LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let uri = url::Url::parse("file:///test/routed.md").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "# routed\n".to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let diagnostics = server.diagnostic_scheduler();
+        let resync = |edited| Resync {
+            host_uri: uri.clone(),
+            ready: true,
+            recollect: false,
+            edited,
+        };
+        super::collect_diagnostics_after_resync(&diagnostics, uri.clone(), &resync(false));
+        assert!(!server.debounced_diagnostics.has_active_timer(&uri));
+        super::collect_diagnostics_after_resync(&diagnostics, uri.clone(), &resync(true));
+        assert!(server.debounced_diagnostics.has_active_timer(&uri));
+        server.debounced_diagnostics.cancel_all();
     }
 
     /// A keystroke's answer is collected by the edit's debounced collection,
