@@ -559,6 +559,54 @@ mod tests {
         assert!(!coordinator.take_pull_debt_after_prepare(&host));
     }
 
+    /// A region reads prepared for resolve paths while any connection still
+    /// holds a prepared text of it, though the lifecycle pass no longer
+    /// prepares it (its pair just lost its peer): resolving through the
+    /// offset alone would misplace what that server computed.
+    #[tokio::test]
+    async fn a_region_reads_prepared_while_a_server_holds_a_prepared_text() {
+        let pool = Arc::new(LanguageServerPool::preparing());
+        let coordinator = BridgeCoordinator::with_cancel_forwarder(
+            Arc::clone(&pool),
+            CancelForwarder::new(Arc::clone(&pool)),
+        );
+        let host = Url::parse("file:///test/resolve.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host).unwrap(),
+            "lua",
+            TEST_ULID_LUA_0,
+        );
+        let key = ConnectionKey::for_server("lua");
+        pool.register_opened_document(&host, &virtual_uri, &key)
+            .await;
+        let prepared = |coordinator: &BridgeCoordinator| {
+            coordinator.region_is_prepared(&host, "lua", TEST_ULID_LUA_0)
+        };
+
+        pool.record_sent_for_test(&virtual_uri, &key, "  a".into());
+        assert!(!prepared(&coordinator));
+        let text = dedented("  a");
+        pool.record_sent_for_test(
+            &virtual_uri,
+            &key,
+            SentText {
+                text: &text.text,
+                map: Some(&text.map),
+            },
+        );
+        assert!(prepared(&coordinator));
+        pool.record_sent_for_test(&virtual_uri, &key, "  a".into());
+        assert!(!prepared(&coordinator));
+
+        // Without the layer nothing is prepared.
+        let off = Arc::new(LanguageServerPool::new());
+        let off = BridgeCoordinator::with_cancel_forwarder(
+            Arc::clone(&off),
+            CancelForwarder::new(Arc::clone(&off)),
+        );
+        assert!(!prepared(&off));
+    }
+
     #[test]
     fn an_unrecorded_text_places_as_is_only_outside_prepared_regions() {
         let pool = LanguageServerPool::preparing();

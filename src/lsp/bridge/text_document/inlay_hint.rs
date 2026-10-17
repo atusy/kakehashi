@@ -1084,6 +1084,56 @@ mod tests {
     // Inlay hint request builder tests
     // ==========================================================================
 
+    /// A hint from a prepared document is placed through its map, and its
+    /// edits are dropped: none is mapped back through a prepared document.
+    /// From an unprepared one, its edits are kept and translated.
+    #[test]
+    fn a_prepared_hint_is_shown_without_its_edits() {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let host_uri: Uri = "file:///test.md".parse().unwrap();
+        // The peer strips the first two columns of "  a".
+        let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let map = apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(answer))
+            .unwrap()
+            .map;
+        let hint = || -> InlayHint {
+            serde_json::from_value(json!({
+                "position": {"line": 0, "character": 1},
+                "label": ": x",
+                "textEdits": [{
+                    "range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 1}},
+                    "newText": ": x"
+                }]
+            }))
+            .unwrap()
+        };
+        let transform = |hint: &mut InlayHint, offset: &RegionOffset| {
+            transform_inlay_hint_to_host(
+                hint,
+                "file:///test.md/kakehashi-virtual-uri-R.lua",
+                &host_uri,
+                offset,
+                Position::new(10, 0),
+                &ConnectionKey::for_server("lua"),
+                "textDocument/inlayHint",
+            );
+        };
+
+        let mut prepared = hint();
+        transform(&mut prepared, &RegionOffset::new(3, 2).with_prepared(map));
+        assert_eq!(prepared.position, Position::new(3, 5));
+        assert!(prepared.text_edits.is_none());
+
+        let mut as_is = hint();
+        transform(&mut as_is, &RegionOffset::new(3, 2));
+        assert_eq!(as_is.position, Position::new(3, 3));
+        let edits = as_is.text_edits.expect("edits of an unprepared hint stay");
+        assert_eq!(edits[0].range.start, Position::new(3, 3));
+    }
+
     #[test]
     fn inlay_hint_response_wraps_downstream_data_for_resolve_routing() {
         let host_uri: Uri = "file:///test.md".parse().unwrap();

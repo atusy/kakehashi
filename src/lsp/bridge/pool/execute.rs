@@ -1388,6 +1388,69 @@ mod tests {
         );
     }
 
+    /// A position the prepared document has no place for — here a blank line
+    /// the peer deleted — aborts before any request is made: the server would
+    /// answer for the next line. The sink server never answers, so a prompt
+    /// `Ok(None)` proves nothing was sent.
+    #[tokio::test]
+    async fn position_request_aborts_where_the_prepared_document_has_no_place() {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        use tower_lsp_server::ls_types::{HoverProviderCapability, Position, ServerCapabilities};
+
+        let pool = Arc::new(LanguageServerPool::preparing());
+        let config = devnull_config();
+        {
+            let handle = create_handle_with_key(
+                ConnectionState::Ready,
+                ConnectionKey::for_server("test-server"),
+            )
+            .await;
+            handle.set_server_capabilities(ServerCapabilities {
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
+                ..Default::default()
+            });
+            pool.connections
+                .lock()
+                .await
+                .insert(ConnectionKey::for_server("test-server"), handle);
+        }
+        let virtual_text = "\nprint('hello')";
+        let answer = serde_json::from_value(serde_json::json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let map = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(answer),
+        )
+        .unwrap()
+        .map;
+        let offset = RegionOffset::new(10, 0).with_prepared(map);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            pool.send_hover_request(
+                "test-server",
+                &config,
+                &test_host_uri("doc"),
+                Position {
+                    line: 10,
+                    character: 0,
+                },
+                region_host_end(virtual_text, &offset),
+                "lua",
+                TEST_ULID_LUA_0,
+                offset.clone(),
+                virtual_text,
+                None,
+            ),
+        )
+        .await
+        .expect("the request must abort before it is sent");
+        assert!(result.unwrap().is_none());
+    }
+
     /// Test that send_document_link_request returns Ok(None) when server lacks documentLink capability.
     ///
     /// Same pattern as send_hover_request_returns_none_when_no_hover_capability:
