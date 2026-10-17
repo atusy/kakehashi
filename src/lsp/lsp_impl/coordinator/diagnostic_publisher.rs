@@ -2648,6 +2648,49 @@ mod tests {
         );
     }
 
+    /// A prefetch pulled under a prepare epoch that moved since was pulled
+    /// against the texts before: the resync after the move re-sends what the
+    /// prepared regions hold, and its collection may already have committed.
+    #[tokio::test]
+    async fn a_prefetch_under_a_moved_prepare_epoch_counts_as_incomplete_coverage() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        register_rust(server);
+        server.settings_manager.apply_settings(rust_settings(true));
+
+        let uri = Url::parse("file:///test/moved_epoch_prefetch.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let (incarnation, content_version) = {
+            let doc = server.documents.get(&uri).expect("doc just inserted");
+            (doc.incarnation(), doc.content_version())
+        };
+        let lineage =
+            crate::lsp::lsp_impl::text_document::publish_diagnostic::DiagnosticSnapshotLineage {
+                incarnation,
+                content_version,
+                settings_generation: server.settings_manager.settings_generation(),
+            };
+
+        let publisher = DiagnosticPublisher::new(server);
+        let summary = publisher
+            .commit_refresh_prefetch(
+                &uri,
+                lineage,
+                server.bridge.pool().prepare_epoch() + 1,
+                PullLayerOutcome::Publish(vec![diag("before-the-move")]),
+            )
+            .await;
+
+        assert!(summary.coverage_incomplete);
+        assert!(!summary.set_changed);
+        assert!(server.diagnostics.snapshot(&uri).is_empty());
+    }
+
     /// A tree-less editor pull cannot see the virt layer at all — its answer
     /// is missing everything a cached non-empty PullLayer holds — so it must
     /// be treated as DEGRADED (like the cached-Region case) rather than as a

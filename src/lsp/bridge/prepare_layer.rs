@@ -535,6 +535,30 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn a_pull_owed_a_refresh_is_settled_once_and_forgotten_with_its_host() {
+        let pool = Arc::new(LanguageServerPool::preparing());
+        let coordinator = BridgeCoordinator::with_cancel_forwarder(
+            Arc::clone(&pool),
+            CancelForwarder::new(Arc::clone(&pool)),
+        );
+        let (mut resyncs, _epochs) = coordinator.take_prepare_resyncs().unwrap();
+        let host = Url::parse("file:///test/owed.md").unwrap();
+
+        // Nothing pending any more: the host is synced again, so a pass
+        // reaches the debt.
+        coordinator.owe_pull_after_prepare(&host);
+        let resync = resyncs.recv().await.unwrap();
+        assert_eq!(resync.host_uri, host);
+        assert!(coordinator.take_pull_debt_after_prepare(&host));
+        assert!(!coordinator.take_pull_debt_after_prepare(&host));
+
+        // A closed host owes nothing.
+        coordinator.owe_pull_after_prepare(&host);
+        coordinator.forget_prepared_host(&host);
+        assert!(!coordinator.take_pull_debt_after_prepare(&host));
+    }
+
     #[test]
     fn an_unrecorded_text_places_as_is_only_outside_prepared_regions() {
         let pool = LanguageServerPool::preparing();
