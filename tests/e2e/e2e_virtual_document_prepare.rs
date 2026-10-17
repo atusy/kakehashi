@@ -41,6 +41,9 @@ struct Setup {
     capabilities: Value,
     /// The prepare method's `priorities` for markdown's lua documents.
     prepare_priorities: Value,
+    /// Have both mocks log every message they receive to `wire.log` in the
+    /// test's directory.
+    wire_log: bool,
 }
 
 impl Default for Setup {
@@ -52,6 +55,7 @@ impl Default for Setup {
             unprepared_python: false,
             capabilities: json!({}),
             prepare_priorities: json!(["peer"]),
+            wire_log: false,
         }
     }
 }
@@ -79,12 +83,21 @@ impl Setup {
                 "kind": "injections"
             }]);
         }
-        let mut client = LspClient::builder()
+        let mut builder = LspClient::builder()
             .arg("--config-file")
             .arg(config_path.to_str().expect("UTF-8 config path"))
             .env("KAKEHASHI_EXPERIMENTAL", "true")
-            .env("MOCK_PREPARE_PLACEHOLDER", self.placeholder)
-            .build();
+            .env("MOCK_PREPARE_PLACEHOLDER", self.placeholder);
+        if self.wire_log {
+            builder = builder.env(
+                "MOCK_LSP_WIRE_LOG",
+                dir.path()
+                    .join("wire.log")
+                    .to_str()
+                    .expect("UTF-8 wire log path"),
+            );
+        }
+        let mut client = builder.build();
         client.send_request(
             "initialize",
             json!({
@@ -473,7 +486,11 @@ fn an_unprepared_document_answers_promptly_beside_a_prepared_one() {
 
 #[test]
 fn a_document_the_peer_cannot_prepare_is_not_bridged() {
-    let (mut client, _dir) = Setup::default().start();
+    let (mut client, dir) = Setup {
+        wire_log: true,
+        ..Setup::default()
+    }
+    .start();
     let uri = "file:///prepare/failure.md";
     let text = "```lua\nprint(1)\n```\n\n```lua\nprint('FAIL')\n```\n";
     open(&mut client, uri, text);
@@ -492,6 +509,14 @@ fn a_document_the_peer_cannot_prepare_is_not_bridged() {
         assert!(response["result"].is_null(), "{response}");
         std::thread::sleep(Duration::from_millis(200));
     }
+    // No server was ever sent it: every document opened is the first
+    // block's.
+    let log = std::fs::read_to_string(dir.path().join("wire.log")).expect("wire log");
+    let opened: std::collections::HashSet<&str> = log
+        .lines()
+        .filter_map(|line| line.strip_prefix("textDocument/didOpen\t"))
+        .collect();
+    assert_eq!(opened.len(), 1, "{log}");
 }
 
 #[test]
