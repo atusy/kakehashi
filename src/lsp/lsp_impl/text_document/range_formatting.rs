@@ -183,7 +183,10 @@ impl Kakehashi {
                 // gaps. Even a covering range may fall back to full formatting,
                 // whose single replacement would overwrite those real gaps.
                 // A prepared document's edits are not mapped back through its
-                // map: closed as a non-contiguous one is.
+                // map: closed as a non-contiguous one is. One left unformatted
+                // because its peer failed (`Unprepared`) is skipped alike, not
+                // counted as `formatting` counts it: no one-shot run range-
+                // formats, so no failure count reads it.
                 if self
                     .method_gate(
                         &uri,
