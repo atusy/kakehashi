@@ -201,6 +201,9 @@ pub(super) fn holds_request_text(
 ) -> bool {
     match presentation {
         super::Presentation::Prepared(held) => request_map.is_some_and(|map| *map == *held),
+        // Unreachable with a map today (a request with one asks the rule
+        // with its region prepared, which never answers as is), kept so the
+        // answer does not rest on how the caller builds the region.
         super::Presentation::AsIs => request_map.is_none(),
         super::Presentation::Unavailable => false,
     }

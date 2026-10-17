@@ -349,6 +349,9 @@ impl super::BridgeCoordinator {
         if !self.pool.held_texts_matter(region) {
             return super::Presentation::AsIs;
         }
+        // Unstamped: read while the pool stamped nothing, which a pool that
+        // prepares never does. Asked through the rule all the same, so a
+        // region the lifecycle pass prepares is never placed as is.
         let Some(stamp) = held else {
             return self.pool.unrecorded_presentation(region);
         };
