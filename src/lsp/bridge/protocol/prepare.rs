@@ -1825,6 +1825,86 @@ mod tests {
         assert!(!map.virtual_position_in_removed_lines(pos(1, 1)));
     }
 
+    fn deleting(virtual_text: &str, changes: serde_json::Value) -> PreparedDocument {
+        apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            result(json!({"segments": [{"type": "content", "changes": changes}]})),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_position_on_the_first_deleted_closing_line_is_removed() {
+        let (_, prepared) = trailing_blank_dedented();
+        let map = prepared.map;
+        assert!(!map.virtual_position_in_removed_lines(pos(0, 3)));
+        for removed in [pos(1, 0), pos(1, 1), pos(2, 0)] {
+            assert!(
+                map.virtual_position_in_removed_lines(removed),
+                "{removed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn closing_lines_deleted_one_by_one_are_removed_from_the_first() {
+        let map = deleting(
+            "a\n\n\n",
+            json!([
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""},
+                {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 3, "character": 0}}, "newText": ""}
+            ]),
+        )
+        .map;
+        assert!(!map.virtual_position_in_removed_lines(pos(0, 1)));
+        assert!(map.virtual_position_in_removed_lines(pos(1, 0)));
+        assert!(map.virtual_position_in_removed_lines(pos(3, 0)));
+    }
+
+    #[test]
+    fn the_end_of_a_deleted_closing_indent_is_removed() {
+        let map = deleting(
+            "  a\n\n  ",
+            json!([
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""},
+                {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
+            ]),
+        )
+        .map;
+        for removed in [pos(1, 0), pos(2, 0), pos(2, 2)] {
+            assert!(
+                map.virtual_position_in_removed_lines(removed),
+                "{removed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_all_blank_document_starts_after_its_deleted_lines() {
+        let prepared = deleting(
+            "\n",
+            json!([
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""}
+            ]),
+        );
+        assert_eq!(prepared.text, "");
+        assert_eq!(prepared.map.to_virtual(pos(0, 0), Bias::Start), pos(1, 0));
+    }
+
+    #[test]
+    fn an_indent_only_document_starts_after_its_removed_indent() {
+        let prepared = deleting(
+            "  ",
+            json!([
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+            ]),
+        );
+        assert_eq!(prepared.text, "");
+        assert_eq!(prepared.map.to_virtual(pos(0, 0), Bias::Start), pos(0, 2));
+    }
+
     #[test]
     fn the_document_end_before_an_emptied_trailing_gap() {
         let virtual_text = "ab   ".to_string();
