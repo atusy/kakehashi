@@ -945,7 +945,12 @@ impl DocumentTracker {
     /// about the document arrive — a push naming document `version`, a
     /// showDocument selection — to decide their [`super::Presentation`] by,
     /// later. Read as they arrive; while no connection was ever sent a
-    /// prepared text, without reading any record.
+    /// prepared text, without reading any record. A connection that holds
+    /// no prepared text of the document, and never did, observes it as is
+    /// whatever its record: the rule places such coordinates the same either
+    /// way (a prepared text sent later shows in the record at placement), and
+    /// identical pushes then stamp alike rather than each counting as a
+    /// change.
     pub(in crate::lsp::bridge) fn observe(
         &self,
         virtual_uri: &str,
@@ -956,6 +961,9 @@ impl DocumentTracker {
             return super::Observed::AsIsThen;
         }
         let (held, history) = self.held_now(virtual_uri, connection_key);
+        if !history && held.as_ref().is_none_or(|held| held.map.is_none()) {
+            return super::Observed::AsIsThen;
+        }
         super::Observed::Read {
             generation: held.as_ref().map(|held| held.generation),
             prepared: history || held.as_ref().is_some_and(|held| held.map.is_some()),
@@ -2370,6 +2378,34 @@ mod tests {
         ));
     }
 
+    /// Once anything was prepared, a document no prepared text of which its
+    /// connection ever held stamps its pushes alike across its sends: the
+    /// same diagnostics pushed again are no change.
+    #[test]
+    fn an_uninvolved_document_observes_alike_across_sends() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let involved = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let other = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_1);
+        let conn = ConnectionKey::for_server("lua");
+        let map = prepared_text("a");
+        tracker.record_sent_for_test(
+            &involved,
+            &conn,
+            SentText {
+                text: "a",
+                map: Some(&map),
+            },
+            1,
+        );
+        let uri = other.to_uri_string();
+        tracker.record_sent_for_test(&other, &conn, "x".into(), 1);
+        let first = tracker.observe(&uri, &conn, Some(1));
+        tracker.record_sent_for_test(&other, &conn, "y".into(), 2);
+        assert_eq!(tracker.observe(&uri, &conn, Some(2)), first);
+        assert_eq!(first, Observed::AsIsThen);
+    }
+
     #[tokio::test]
     async fn a_closed_host_takes_its_documents_prepared_history_with_it() {
         let tracker = DocumentTracker::new();
@@ -2392,14 +2428,7 @@ mod tests {
         tracker.forget_prepared_history(&url_to_uri(&host_uri));
         // Reopened as is under the same region id: nothing prepared involved.
         tracker.record_sent_for_test(&virtual_uri, &conn, "a".into(), 1);
-        assert_eq!(
-            tracker.observe(&uri, &conn, Some(1)),
-            Observed::Read {
-                generation: tracker.held_text(&uri, &conn).map(|held| held.generation),
-                prepared: false,
-                stale_version: false,
-            }
-        );
+        assert_eq!(tracker.observe(&uri, &conn, Some(1)), Observed::AsIsThen);
     }
 
     #[test]
