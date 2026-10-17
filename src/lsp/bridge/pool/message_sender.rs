@@ -37,7 +37,11 @@ pub(crate) trait MessageSender: Send {
     fn send_notification<P: serde::Serialize + Send>(
         &mut self,
         notification: JsonRpcNotification<P>,
-    ) -> impl std::future::Future<Output = io::Result<()>> + Send;
+    ) -> impl std::future::Future<Output = io::Result<()>> + Send {
+        let result =
+            serialize_notification(notification).and_then(|payload| self.send_serialized(payload));
+        std::future::ready(result)
+    }
 
     /// Queue a notification serialized beforehand, at once, without
     /// awaiting: for a send whose record must be taken back, under a lock,
@@ -54,13 +58,6 @@ pub(crate) fn serialize_notification<P: serde::Serialize>(
 
 // Implementation for channel-based sends
 impl MessageSender for mpsc::Sender<OutboundMessage> {
-    async fn send_notification<P: serde::Serialize + Send>(
-        &mut self,
-        notification: JsonRpcNotification<P>,
-    ) -> io::Result<()> {
-        self.send_serialized(serialize_notification(notification)?)
-    }
-
     fn send_serialized(&mut self, payload: serde_json::Value) -> io::Result<()> {
         // Use try_send for non-blocking backpressure per ls-bridge-message-ordering
         self.try_send(OutboundMessage::Untracked(payload))
@@ -89,13 +86,6 @@ pub(crate) struct ConnectionHandleSender<'a>(pub(crate) &'a Arc<ConnectionHandle
 // - ChannelClosed -> BrokenPipe (terminal failure)
 // - SerializationFailed -> InvalidData (bug in caller)
 impl MessageSender for ConnectionHandleSender<'_> {
-    async fn send_notification<P: serde::Serialize + Send>(
-        &mut self,
-        notification: JsonRpcNotification<P>,
-    ) -> io::Result<()> {
-        self.send_serialized(serialize_notification(notification)?)
-    }
-
     fn send_serialized(&mut self, payload: serde_json::Value) -> io::Result<()> {
         match self.0.send_serialized_notification(payload) {
             NotificationSendResult::Queued => Ok(()),
