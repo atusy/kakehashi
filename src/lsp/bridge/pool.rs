@@ -2135,9 +2135,8 @@ impl LanguageServerPool {
         // Failed/SpawnNew path and repeats the idempotent purge instead of
         // leaving a Closing entry that fails fast forever.
         failed_handle.set_state(ConnectionState::Failed);
-        if let Some(advertisements) = &self.prepare_advertisements {
-            advertisements.retire(failed_handle);
-        }
+        // What it advertised stands for the replacement that is most
+        // likely coming (see `PrepareAdvertisements::adopt`).
         // Own teardown independently of this cleanup future. The purge below
         // can await several locks and be cancelled; the detached, bounded
         // shutdown must still retire the live process before a replacement is
@@ -4891,6 +4890,11 @@ impl LanguageServerPool {
                         e
                     );
                     handle_for_handshake.set_state(ConnectionState::Failed);
+                    // What the connection it replaced advertised describes
+                    // no running server any more.
+                    if let Some(advertisements) = &prepare_advertisements {
+                        advertisements.retire(&handle_for_handshake);
+                    }
                     Err(io::Error::new(
                         e.kind(),
                         format!("bridge: handshake failed: {}", e),
@@ -4904,6 +4908,9 @@ impl LanguageServerPool {
                         server_name_for_log
                     );
                     handle_for_handshake.set_state(ConnectionState::Failed);
+                    if let Some(advertisements) = &prepare_advertisements {
+                        advertisements.retire(&handle_for_handshake);
+                    }
                     Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "bridge: initialize timeout",
@@ -5510,18 +5517,12 @@ impl PrepareAdvertisements {
     }
 
     /// Take `handle` as the connection serving its key from now on. What the
-    /// connection it replaces advertised goes with it: until `handle`'s own
-    /// handshake records, the key advertises nothing — and should that
-    /// handshake fail, the server is not left counting a connection gone.
+    /// connection it replaces advertised stands until `handle`'s handshake
+    /// records its own (or fails, which [`Self::retire`]s it): a server
+    /// restarted under the same key most likely advertises what it did, and
+    /// forgetting it would hold its pairs' documents back again meanwhile.
     fn adopt(&self, handle: &Arc<ConnectionHandle>) {
-        // Held across the removal, as in `record_from`.
-        let mut current = self.current.entry(handle.key().clone()).or_default();
-        *current = Arc::downgrade(handle);
-        let removed = self.forget(handle.key());
-        drop(current);
-        if removed {
-            self.advance();
-        }
+        *self.current.entry(handle.key().clone()).or_default() = Arc::downgrade(handle);
     }
 
     /// Drop `connection`'s record; `true` when there was one.
@@ -5544,9 +5545,13 @@ impl PrepareAdvertisements {
             return;
         }
         *current = std::sync::Weak::new();
-        let removed = self.forget(handle.key());
+        let server = handle.key().server();
+        let before = self.get(server);
+        self.forget(handle.key());
+        let after = self.get(server);
         drop(current);
-        if removed {
+        // Only a change of what the server advertises changes an answer.
+        if before != after {
             self.advance();
         }
     }
@@ -5867,7 +5872,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_replacement_starts_with_nothing_advertised_for_its_key() {
+    async fn a_replacement_keeps_what_its_key_advertised_until_it_says_otherwise() {
         let pool = LanguageServerPool::preparing();
         let key = ConnectionKey::for_server("peer");
         let failed =
@@ -5877,20 +5882,46 @@ mod tests {
         assert_eq!(pool.prepare_advertisement("peer"), Some(true));
         let epoch = pool.prepare_epoch();
 
-        // Replaced (say after a crash): the replacement's handshake, which
-        // may fail, has recorded nothing yet.
+        // Replaced (say after a crash): what it advertised stands for the
+        // replacement until its handshake says otherwise.
         let replacement =
             test_helpers::create_handle_with_key(ConnectionState::Initializing, key.clone()).await;
         pool.prepare_advertisements
             .as_ref()
             .unwrap()
             .adopt(&replacement);
-        assert_eq!(
-            pool.prepare_advertisement("peer"),
-            None,
-            "the replaced connection's advertisement went with it"
-        );
+        assert_eq!(pool.prepare_advertisement("peer"), Some(true));
+        assert_eq!(pool.prepare_epoch(), epoch);
+        // The same answer moves nothing.
+        assert!(!pool.record_prepare_advertisement_from(&replacement, true));
+        assert_eq!(pool.prepare_epoch(), epoch);
+        // Its handshake failing: what it would advertise is unknown again.
+        pool.prepare_advertisements
+            .as_ref()
+            .unwrap()
+            .retire(&replacement);
+        assert_eq!(pool.prepare_advertisement("peer"), None);
         assert!(pool.prepare_epoch() > epoch);
+    }
+
+    #[tokio::test]
+    async fn a_restarted_non_peer_moves_no_epoch() {
+        let pool = LanguageServerPool::preparing();
+        let key = ConnectionKey::for_server("lua_ls");
+        let advertisements = pool.prepare_advertisements.as_ref().unwrap();
+        let crashed =
+            test_helpers::create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        advertisements.adopt(&crashed);
+        pool.record_prepare_advertisement_from(&crashed, false);
+        let epoch = pool.prepare_epoch();
+        let replacement =
+            test_helpers::create_handle_with_key(ConnectionState::Initializing, key.clone()).await;
+        advertisements.adopt(&replacement);
+        // Still known not to prepare while the replacement starts: its pairs
+        // are not held back to find that out again.
+        assert_eq!(pool.prepare_advertisement("lua_ls"), Some(false));
+        assert!(!pool.record_prepare_advertisement_from(&replacement, false));
+        assert_eq!(pool.prepare_epoch(), epoch);
     }
 
     #[tokio::test]
