@@ -38,11 +38,26 @@ pub(crate) trait MessageSender: Send {
         &mut self,
         notification: JsonRpcNotification<P>,
     ) -> impl std::future::Future<Output = io::Result<()>> + Send;
+
+    /// [`Self::send_notification`] queued at once, without awaiting: for a
+    /// send whose record must be taken back, under a lock, unless it was
+    /// queued (see `DocumentTracker::record_and_queue`).
+    fn send_now<P: serde::Serialize + Send>(
+        &mut self,
+        notification: JsonRpcNotification<P>,
+    ) -> io::Result<()>;
 }
 
 // Implementation for channel-based sends
 impl MessageSender for mpsc::Sender<OutboundMessage> {
     async fn send_notification<P: serde::Serialize + Send>(
+        &mut self,
+        notification: JsonRpcNotification<P>,
+    ) -> io::Result<()> {
+        self.send_now(notification)
+    }
+
+    fn send_now<P: serde::Serialize + Send>(
         &mut self,
         notification: JsonRpcNotification<P>,
     ) -> io::Result<()> {
@@ -76,6 +91,13 @@ pub(crate) struct ConnectionHandleSender<'a>(pub(crate) &'a Arc<ConnectionHandle
 // - SerializationFailed -> InvalidData (bug in caller)
 impl MessageSender for ConnectionHandleSender<'_> {
     async fn send_notification<P: serde::Serialize + Send>(
+        &mut self,
+        notification: JsonRpcNotification<P>,
+    ) -> io::Result<()> {
+        self.send_now(notification)
+    }
+
+    fn send_now<P: serde::Serialize + Send>(
         &mut self,
         notification: JsonRpcNotification<P>,
     ) -> io::Result<()> {

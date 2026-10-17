@@ -19,7 +19,7 @@ use tower_lsp_server::ls_types::{
 use url::Url;
 
 use super::super::pool::{
-    ConnectionHandle, ConnectionState, LanguageServerPool, NotificationSendResult,
+    ConnectionHandle, ConnectionState, LanguageServerPool, NotificationSendResult, SentText,
 };
 use super::super::protocol::{JsonRpcNotification, VirtualDocumentUri};
 
@@ -110,36 +110,31 @@ impl LanguageServerPool {
                 // region's extracted content is unchanged since the last didChange to
                 // this connection, so a position-only host edit doesn't re-analyze
                 // every region (#422). Mirrors the host path's fingerprint guard.
+                let content = SentText::from(&injection.content);
                 let Some(version) = self
                     .increment_version_if_content_changed(
                         &virtual_uri,
                         &connection_key,
-                        &injection.content,
+                        content.text,
                     )
                     .await
                 else {
+                    self.rehold_unchanged_content(&virtual_uri, &connection_key, content);
                     continue;
                 };
 
                 // Send didChange notification via single-writer loop (ls-bridge-message-ordering).
-                // This is non-blocking and maintains FIFO ordering.
-                let send_result = Self::send_didchange_for_virtual_doc(
+                // This is non-blocking and maintains FIFO ordering. A dropped
+                // send (full/closed queue) leaves the old fingerprint so the
+                // next edit re-sends (#422).
+                let send_result = self.send_didchange_recorded(
                     &handle,
-                    &virtual_uri.to_uri_string(),
-                    &injection.content,
+                    &virtual_uri,
+                    &connection_key,
+                    content,
                     version,
                 );
-                // Record the fingerprint ONLY on a confirmed enqueue (#422): a dropped
-                // send (full/closed queue) must leave the old fingerprint so the next
-                // edit re-sends, rather than marking content the server never received.
-                if matches!(send_result, NotificationSendResult::Queued) {
-                    self.record_sent_content_fingerprint(
-                        &virtual_uri,
-                        &connection_key,
-                        &injection.content,
-                    )
-                    .await;
-                } else {
+                if !matches!(send_result, NotificationSendResult::Queued) {
                     synchronized = false;
                 }
                 drop(transition_guard);
@@ -155,7 +150,7 @@ impl LanguageServerPool {
     /// if the queue is full the notification is dropped with a warning log. The
     /// returned [`NotificationSendResult`] lets the caller record the content
     /// fingerprint only on a confirmed `Queued` enqueue (#422).
-    pub(super) fn send_didchange_for_virtual_doc(
+    pub(in crate::lsp::bridge) fn send_didchange_for_virtual_doc(
         handle: &Arc<ConnectionHandle>,
         virtual_uri: &str,
         content: &str,

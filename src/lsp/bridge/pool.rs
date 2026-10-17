@@ -49,7 +49,7 @@ pub(crate) struct CrashedConnection {
 }
 pub(crate) use crash_recovery::{RecoveryDecision, Reservation};
 pub(in crate::lsp::bridge) use document_tracker::DocumentTracker;
-pub(crate) use document_tracker::{OpenedVirtualDoc, VirtualUriObserver};
+pub(crate) use document_tracker::{OpenedVirtualDoc, SentText, VirtualUriObserver};
 pub(crate) use dynamic_capability_registry::DynamicCapabilityRegistry;
 pub(crate) use message_sender::{ConnectionHandleSender, MessageSender};
 use pending_reopen::PendingReopenRegistry;
@@ -324,8 +324,8 @@ pub(in crate::lsp::bridge) type HostDocuments =
     Mutex<HashMap<String, HashMap<ConnectionKey, HostDocSyncState>>>;
 
 enum VirtualOpenContent<'a> {
-    LatestKnown(&'a str),
-    Snapshot(&'a str),
+    LatestKnown(SentText<'a>),
+    Snapshot(SentText<'a>),
 }
 
 /// Cancellation-safe rollback for the pre-send virtual-document claim.
@@ -2568,19 +2568,22 @@ impl LanguageServerPool {
 
     /// Open or synchronize a virtual document from a revision-validated snapshot.
     /// The caller keeps that revision stable until enqueue completes.
-    pub(crate) async fn ensure_document_opened_from_snapshot<S: message_sender::MessageSender>(
+    pub(crate) async fn ensure_document_opened_from_snapshot<
+        'a,
+        S: message_sender::MessageSender,
+    >(
         &self,
         sender: &mut S,
         host_uri: &Url,
         virtual_uri: &VirtualDocumentUri,
-        virtual_content: &str,
+        virtual_content: impl Into<SentText<'a>>,
         connection_key: &ConnectionKey,
     ) -> io::Result<()> {
         self.ensure_document_opened_with_content(
             sender,
             host_uri,
             virtual_uri,
-            VirtualOpenContent::Snapshot(virtual_content),
+            VirtualOpenContent::Snapshot(virtual_content.into()),
             connection_key,
         )
         .await
@@ -2597,57 +2600,63 @@ impl LanguageServerPool {
     ///
     /// Generic over `MessageSender` (channel or `ConnectionHandleSender`) for
     /// the single-writer-loop architecture (ls-bridge-message-ordering).
-    pub(crate) async fn ensure_document_opened<S: message_sender::MessageSender>(
+    pub(crate) async fn ensure_document_opened<'a, S: message_sender::MessageSender>(
         &self,
         sender: &mut S,
         host_uri: &Url,
         virtual_uri: &VirtualDocumentUri,
-        virtual_content: &str,
+        virtual_content: impl Into<SentText<'a>>,
         connection_key: &ConnectionKey,
     ) -> io::Result<()> {
         self.ensure_document_opened_with_content(
             sender,
             host_uri,
             virtual_uri,
-            VirtualOpenContent::LatestKnown(virtual_content),
+            VirtualOpenContent::LatestKnown(virtual_content.into()),
             connection_key,
         )
         .await
     }
 
     /// Called with the document transition lock held so the repair cannot race
-    /// another open or content update. Only confirmed sends advance the content
+    /// another open or content update. Only queued sends advance the content
     /// fingerprint, allowing a failed enqueue to be retried.
     async fn sync_open_document_from_snapshot<S: message_sender::MessageSender>(
         &self,
         sender: &mut S,
         virtual_uri: &VirtualDocumentUri,
-        content: &str,
+        content: SentText<'_>,
         connection_key: &ConnectionKey,
     ) -> io::Result<()> {
         let uri = virtual_uri
             .to_uri_string()
             .parse()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        if let Some(version) = self
-            .increment_version_if_content_changed(virtual_uri, connection_key, content)
+        let Some(version) = self
+            .increment_version_if_content_changed(virtual_uri, connection_key, content.text)
             .await
-        {
-            let params = DidChangeTextDocumentParams {
-                text_document: VersionedTextDocumentIdentifier::new(uri, version),
-                content_changes: vec![TextDocumentContentChangeEvent {
-                    range: None,
-                    range_length: None,
-                    text: content.to_owned(),
-                }],
-            };
-            sender
-                .send_notification(JsonRpcNotification::new("textDocument/didChange", params))
-                .await?;
-            self.record_sent_content_fingerprint(virtual_uri, connection_key, content)
-                .await;
-        }
-        Ok(())
+        else {
+            self.document_tracker
+                .rehold_unchanged(virtual_uri, connection_key, content);
+            return Ok(());
+        };
+        let params = DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier::new(uri, version),
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: content.text.to_owned(),
+            }],
+        };
+        let notification = JsonRpcNotification::new("textDocument/didChange", params);
+        self.document_tracker.record_and_queue(
+            virtual_uri,
+            connection_key,
+            content,
+            version,
+            || sender.send_now(notification),
+            io::Result::is_ok,
+        )
     }
 
     async fn ensure_document_opened_with_content<S: message_sender::MessageSender>(
@@ -2769,8 +2778,18 @@ impl LanguageServerPool {
             ),
             VirtualOpenContent::Snapshot(provided) => (provided, None),
         };
-        let virtual_content = current_content.as_deref().unwrap_or(provided);
-        let did_open = build_didopen_notification(virtual_uri, virtual_content);
+        let virtual_content = current_content.as_deref().map_or(provided, SentText::from);
+        let did_open = build_didopen_notification(virtual_uri, virtual_content.text);
+        // What the connection holds is recorded before the didOpen can reach
+        // it: a server pushing diagnostics the moment it opens the document
+        // finds its text on record. (The fingerprint also keeps the first
+        // position-only host edit, which leaves this region's content
+        // unchanged, from re-sending a didChange — and flickering a server
+        // that clears on didChange, #422.) A didOpen that never goes out
+        // takes the record back with its claim: the rollback below, or the
+        // claim guard's on cancellation.
+        self.document_tracker
+            .record_opening(virtual_uri, connection_key, virtual_content);
         if let Err(e) = sender.send_notification(did_open).await {
             self.document_tracker
                 .rollback_open_claim_if(host_uri, virtual_uri, connection_key, &claim)
@@ -2830,15 +2849,6 @@ impl LanguageServerPool {
                 "bridge: didOpen claim invalidated during enqueue",
             ));
         }
-        // The didOpen was confirmed enqueued (the `MessageSender` maps `Queued` →
-        // `Ok`), so seed the content fingerprint with the opened content. Without
-        // this, the FIRST position-only host edit — which leaves this region's
-        // content unchanged — would still re-send a didChange (and, for a server that
-        // clears on didChange, flicker the diagnostics) because no fingerprint existed
-        // to compare against (#422).
-        self.document_tracker
-            .record_sent_content_fingerprint(virtual_uri, connection_key, virtual_content)
-            .await;
         Ok(())
     }
 
@@ -3039,18 +3049,57 @@ impl LanguageServerPool {
             .await
     }
 
-    /// Record `content`'s fingerprint as sent to this connection — call only after a
-    /// confirmed-enqueued didChange (#422). Delegates to
-    /// [`DocumentTracker::record_sent_content_fingerprint`].
-    pub(super) async fn record_sent_content_fingerprint(
+    /// Send a didChange of `content` and record it as what the connection
+    /// holds (see `DocumentTracker::record_and_queue`): recorded first, so a
+    /// push the server answers it with already finds it, and taken back
+    /// unless the send was queued.
+    pub(in crate::lsp::bridge) fn send_didchange_recorded(
+        &self,
+        handle: &Arc<ConnectionHandle>,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+        content: SentText<'_>,
+        version: i32,
+    ) -> NotificationSendResult {
+        self.document_tracker.record_and_queue(
+            virtual_uri,
+            connection_key,
+            content,
+            version,
+            || {
+                Self::send_didchange_for_virtual_doc(
+                    handle,
+                    &virtual_uri.to_uri_string(),
+                    content.text,
+                    version,
+                )
+            },
+            |result| matches!(result, NotificationSendResult::Queued),
+        )
+    }
+
+    /// Hold `content` again under its map where it is unchanged (see
+    /// [`DocumentTracker::rehold_unchanged`]).
+    pub(super) fn rehold_unchanged_content(
         &self,
         virtual_uri: &VirtualDocumentUri,
         connection_key: &ConnectionKey,
-        content: &str,
+        content: SentText<'_>,
     ) {
         self.document_tracker
-            .record_sent_content_fingerprint(virtual_uri, connection_key, content)
-            .await
+            .rehold_unchanged(virtual_uri, connection_key, content);
+    }
+
+    /// Record `content` as sent to this connection, as a queued send would.
+    #[cfg(test)]
+    pub(super) fn record_sent_for_test(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+        content: SentText<'_>,
+    ) {
+        self.document_tracker
+            .record_sent_for_test(virtual_uri, connection_key, content, 1);
     }
 
     /// Get or create a connection for the specified server, spawning the server
@@ -9222,6 +9271,13 @@ mod tests {
         }
 
         impl message_sender::MessageSender for BlockingSender {
+            fn send_now<P: serde::Serialize + Send>(
+                &mut self,
+                _notification: JsonRpcNotification<P>,
+            ) -> io::Result<()> {
+                unreachable!("only didOpen goes through this sender")
+            }
+
             async fn send_notification<P: serde::Serialize + Send>(
                 &mut self,
                 _notification: JsonRpcNotification<P>,
@@ -9302,6 +9358,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_didopen_finds_its_text_on_record_as_it_goes_out_and_takes_it_back_if_not() {
+        struct BlockingSender {
+            entered: Arc<tokio::sync::Notify>,
+        }
+
+        impl message_sender::MessageSender for BlockingSender {
+            fn send_now<P: serde::Serialize + Send>(
+                &mut self,
+                _notification: JsonRpcNotification<P>,
+            ) -> io::Result<()> {
+                unreachable!("only didOpen goes through this sender")
+            }
+
+            async fn send_notification<P: serde::Serialize + Send>(
+                &mut self,
+                _notification: JsonRpcNotification<P>,
+            ) -> io::Result<()> {
+                self.entered.notify_one();
+                std::future::pending().await
+            }
+        }
+
+        let pool = Arc::new(LanguageServerPool::new());
+        let host_uri = Url::parse("file:///test/record-open.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let uri = virtual_uri.to_uri_string();
+        let connection_key = ConnectionKey::for_server("lua");
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let task = {
+            let pool = Arc::clone(&pool);
+            let host_uri = host_uri.clone();
+            let virtual_uri = virtual_uri.clone();
+            let connection_key = connection_key.clone();
+            let entered = Arc::clone(&entered);
+            tokio::spawn(async move {
+                let mut sender = BlockingSender { entered };
+                pool.ensure_document_opened(
+                    &mut sender,
+                    &host_uri,
+                    &virtual_uri,
+                    "print('old')",
+                    &connection_key,
+                )
+                .await
+            })
+        };
+        entered.notified().await;
+        let held = pool
+            .document_tracker
+            .held_text(&uri, &connection_key)
+            .expect("a didOpen is on record before it can reach the server");
+        assert_eq!(held.version, crate::lsp::bridge::protocol::DIDOPEN_VERSION);
+        task.abort();
+        let _ = task.await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool
+                .document_tracker
+                .held_text(&uri, &connection_key)
+                .is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a didOpen that never went out leaves nothing on record");
+    }
+
+    #[tokio::test]
     async fn ensure_document_opened_finishes_promotion_after_enqueue_when_caller_is_aborted() {
         struct GatedSender {
             entered: Arc<tokio::sync::Notify>,
@@ -9310,6 +9434,13 @@ mod tests {
         }
 
         impl message_sender::MessageSender for GatedSender {
+            fn send_now<P: serde::Serialize + Send>(
+                &mut self,
+                _notification: JsonRpcNotification<P>,
+            ) -> io::Result<()> {
+                unreachable!("only didOpen goes through this sender")
+            }
+
             async fn send_notification<P: serde::Serialize + Send>(
                 &mut self,
                 _notification: JsonRpcNotification<P>,
@@ -9428,6 +9559,13 @@ mod tests {
         }
 
         impl message_sender::MessageSender for GatedSender {
+            fn send_now<P: serde::Serialize + Send>(
+                &mut self,
+                _notification: JsonRpcNotification<P>,
+            ) -> io::Result<()> {
+                unreachable!("only didOpen goes through this sender")
+            }
+
             async fn send_notification<P: serde::Serialize + Send>(
                 &mut self,
                 _notification: JsonRpcNotification<P>,
