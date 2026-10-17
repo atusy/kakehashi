@@ -2632,14 +2632,14 @@ impl LanguageServerPool {
             .to_uri_string()
             .parse()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let Some(version) = self
+        let Some(change) = self
             .increment_version_if_content_changed(virtual_uri, connection_key, content)
             .await
         else {
             return Ok(());
         };
         let params = DidChangeTextDocumentParams {
-            text_document: VersionedTextDocumentIdentifier::new(uri, version),
+            text_document: VersionedTextDocumentIdentifier::new(uri, change.version),
             content_changes: vec![TextDocumentContentChangeEvent {
                 range: None,
                 range_length: None,
@@ -2656,7 +2656,7 @@ impl LanguageServerPool {
             virtual_uri,
             connection_key,
             content,
-            version,
+            change,
             || sender.send_serialized(payload),
             io::Result::is_ok,
         )
@@ -2804,7 +2804,7 @@ impl LanguageServerPool {
                 virtual_uri,
                 connection_key,
                 virtual_content,
-                crate::lsp::bridge::protocol::DIDOPEN_VERSION,
+                document_tracker::ContentChange::opening(virtual_content.text),
                 || sender.send_serialized(payload),
                 io::Result::is_ok,
             )
@@ -3062,7 +3062,7 @@ impl LanguageServerPool {
         virtual_uri: &VirtualDocumentUri,
         connection_key: &ConnectionKey,
         content: impl Into<SentText<'a>>,
-    ) -> Option<i32> {
+    ) -> Option<document_tracker::ContentChange> {
         self.document_tracker
             .increment_version_if_content_changed(virtual_uri, connection_key, content)
             .await
@@ -3078,12 +3078,12 @@ impl LanguageServerPool {
         virtual_uri: &VirtualDocumentUri,
         connection_key: &ConnectionKey,
         content: SentText<'_>,
-        version: i32,
+        change: document_tracker::ContentChange,
     ) -> NotificationSendResult {
         // Serialized before the record's lock is taken: only the enqueue
         // happens under it.
         let Some(payload) =
-            Self::didchange_payload(&virtual_uri.to_uri_string(), content.text, version)
+            Self::didchange_payload(&virtual_uri.to_uri_string(), content.text, change.version)
         else {
             return NotificationSendResult::SerializationFailed;
         };
@@ -3091,7 +3091,7 @@ impl LanguageServerPool {
             virtual_uri,
             connection_key,
             content,
-            version,
+            change,
             || handle.send_serialized_notification(payload),
             |result| matches!(result, NotificationSendResult::Queued),
         )

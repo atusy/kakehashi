@@ -128,6 +128,24 @@ impl<'a> From<&'a String> for SentText<'a> {
     }
 }
 
+/// A text a connection is about to be sent: the version it goes out under,
+/// and its fingerprint (hashed once, by the guard that decided to send it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContentChange {
+    pub(crate) version: i32,
+    pub(crate) fingerprint: u64,
+}
+
+impl ContentChange {
+    /// The didOpen of `text`.
+    pub(crate) fn opening(text: &str) -> Self {
+        Self {
+            version: crate::lsp::bridge::protocol::DIDOPEN_VERSION,
+            fingerprint: content_fingerprint(text),
+        }
+    }
+}
+
 /// What a connection holds for a virtual document: the text it was last
 /// sent, and how that text maps back to the virtual document.
 #[derive(Debug, Clone)]
@@ -712,7 +730,7 @@ impl DocumentTracker {
         virtual_uri: &VirtualDocumentUri,
         connection_key: &ConnectionKey,
         content: impl Into<SentText<'a>>,
-    ) -> Option<i32> {
+    ) -> Option<ContentChange> {
         let content = content.into();
         let uri_string = virtual_uri.to_uri_string();
         let fp = content_fingerprint(content.text);
@@ -748,10 +766,13 @@ impl DocumentTracker {
         let mut versions = self.document_versions.lock().await;
         let version = versions.get_mut(connection_key)?.get_mut(&uri_string)?;
         *version += 1;
-        Some(*version)
+        Some(ContentChange {
+            version: *version,
+            fingerprint: fp,
+        })
     }
 
-    /// Record `content` as what this connection holds, sent under `version`,
+    /// Record `content` as what this connection holds, sent as `change`,
     /// then `queue` its send — taking the record back unless `queued` says
     /// the send was queued. All under the lock what connections hold is read
     /// under, so no reader sees a record whose send then failed: a dropped
@@ -763,14 +784,11 @@ impl DocumentTracker {
         virtual_uri: &VirtualDocumentUri,
         connection_key: &ConnectionKey,
         content: SentText<'_>,
-        version: i32,
+        change: ContentChange,
         queue: impl FnOnce() -> R,
         queued: impl FnOnce(&R) -> bool,
     ) -> R {
-        // Hashed before the lock: only the record and the enqueue happen
-        // under it.
         let uri_string = virtual_uri.to_uri_string();
-        let fingerprint = content_fingerprint(content.text);
         let mut fingerprints = self
             .document_fingerprints
             .lock()
@@ -779,9 +797,9 @@ impl DocumentTracker {
             &mut fingerprints,
             &uri_string,
             connection_key,
-            fingerprint,
+            change.fingerprint,
             content.map,
-            version,
+            change.version,
         );
         let result = queue();
         if !queued(&result) {
@@ -885,11 +903,15 @@ impl DocumentTracker {
         content: SentText<'_>,
         version: i32,
     ) {
+        let change = ContentChange {
+            version,
+            fingerprint: content_fingerprint(content.text),
+        };
         self.record_and_queue(
             virtual_uri,
             connection_key,
             content,
-            version,
+            change,
             || (),
             |_| true,
         );
@@ -1860,7 +1882,8 @@ mod tests {
         assert_eq!(
             tracker
                 .increment_version_if_content_changed(&virtual_uri, &conn, "local x = 1")
-                .await,
+                .await
+                .map(|change| change.version),
             Some(2),
             "first didChange sends and bumps the version"
         );
@@ -1869,7 +1892,8 @@ mod tests {
         assert_eq!(
             tracker
                 .increment_version_if_content_changed(&virtual_uri, &conn, "local x = 1")
-                .await,
+                .await
+                .map(|change| change.version),
             None,
             "unchanged content must skip the re-send once recorded as sent"
         );
@@ -1877,7 +1901,8 @@ mod tests {
         assert_eq!(
             tracker
                 .increment_version_if_content_changed(&virtual_uri, &conn, "local x = 2")
-                .await,
+                .await
+                .map(|change| change.version),
             Some(3),
             "changed content sends and bumps"
         );
@@ -1947,7 +1972,8 @@ mod tests {
         assert_eq!(
             tracker
                 .increment_version_if_content_changed(&virtual_uri, &conn, sent)
-                .await,
+                .await
+                .map(|change| change.version),
             None
         );
         let remapped = tracker.held_text(&uri, &conn).unwrap();
@@ -1959,7 +1985,8 @@ mod tests {
         assert_eq!(
             tracker
                 .increment_version_if_content_changed(&virtual_uri, &conn, "a")
-                .await,
+                .await
+                .map(|change| change.version),
             None
         );
         assert!(tracker.held_text(&uri, &conn).unwrap().map.is_none());
@@ -1992,7 +2019,10 @@ mod tests {
             &virtual_uri,
             &conn,
             "b".into(),
-            2,
+            ContentChange {
+                version: 2,
+                fingerprint: content_fingerprint("b"),
+            },
             || {
                 assert!(
                     tracker.document_fingerprints.try_lock().is_err(),
@@ -2010,7 +2040,14 @@ mod tests {
 
         // A first send not queued leaves nothing on record.
         let other = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_1);
-        tracker.record_and_queue(&other, &conn, "c".into(), 2, || (), |_| false);
+        tracker.record_and_queue(
+            &other,
+            &conn,
+            "c".into(),
+            ContentChange::opening("c"),
+            || (),
+            |_| false,
+        );
         assert!(tracker.held_text(&other.to_uri_string(), &conn).is_none());
     }
 
@@ -2031,14 +2068,16 @@ mod tests {
         assert_eq!(
             tracker
                 .increment_version_if_content_changed(&virtual_uri, &conn, "local x = 1")
-                .await,
+                .await
+                .map(|change| change.version),
             Some(2),
         );
         // Same content re-sends (bumps again) because no fingerprint was recorded.
         assert_eq!(
             tracker
                 .increment_version_if_content_changed(&virtual_uri, &conn, "local x = 1")
-                .await,
+                .await
+                .map(|change| change.version),
             Some(3),
             "a dropped send must self-heal: identical content re-sends, not skips"
         );
@@ -2058,7 +2097,8 @@ mod tests {
                     &ConnectionKey::for_server("lua"),
                     "local x = 1",
                 )
-                .await,
+                .await
+                .map(|change| change.version),
             None,
         );
         tracker
@@ -2071,7 +2111,8 @@ mod tests {
                     &ConnectionKey::for_server("lua"),
                     "local x = 1",
                 )
-                .await,
+                .await
+                .map(|change| change.version),
             Some(2),
             "after registration the first send goes through even with the same content"
         );

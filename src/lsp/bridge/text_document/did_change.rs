@@ -108,7 +108,7 @@ impl LanguageServerPool {
                 // this connection, so a position-only host edit doesn't re-analyze
                 // every region (#422). Mirrors the host path's fingerprint guard.
                 let content = SentText::from(&injection.content);
-                let Some(version) = self
+                let Some(change) = self
                     .increment_version_if_content_changed(&virtual_uri, &connection_key, content)
                     .await
                 else {
@@ -124,7 +124,7 @@ impl LanguageServerPool {
                     &virtual_uri,
                     &connection_key,
                     content,
-                    version,
+                    change,
                 );
                 if !matches!(send_result, NotificationSendResult::Queued) {
                     synchronized = false;
@@ -135,11 +135,8 @@ impl LanguageServerPool {
         synchronized
     }
 
-    /// The serialized didChange notification for a virtual document, sent
-    /// through the channel-based single-writer loop (ls-bridge-message-ordering):
-    /// non-blocking, and if the queue is full the notification is dropped with
-    /// a warning log. `None` when it cannot be built: nothing is sent, nor
-    /// recorded as sent (#422).
+    /// The serialized didChange notification for a virtual document; `None`
+    /// when it cannot be built: nothing is sent, nor recorded as sent (#422).
     pub(in crate::lsp::bridge) fn didchange_payload(
         virtual_uri: &str,
         content: &str,
