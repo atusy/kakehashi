@@ -1,0 +1,1892 @@
+//! `kakehashi/virtualDocument/prepare`: let a peer rewrite a virtual document
+//! before downstream servers see it.
+//!
+//! kakehashi splits the virtual document (V) into ordered segments — injected
+//! `content` and host-owned `gap`s — and asks the peer how to present them.
+//! The answer may delete leading whitespace from content lines (dedent) and
+//! whole blank lines at the document's edges, and replace any gap with
+//! arbitrary text (placeholders). Applying it yields the prepared document
+//! (P) that downstream servers receive, plus a [`PreparedMap`] translating
+//! coordinates between P and V. V keeps its existing host translation
+//! ([`super::RegionOffset`]), so host ↔ P is the composition of the two.
+//!
+//! Content may only lose leading whitespace and edge blank lines so that
+//! every edit a downstream server makes in P can be mapped back
+//! unambiguously; gaps are opaque, so an edit touching one is refused rather
+//! than guessed.
+
+use std::ops::Range;
+use std::time::Duration;
+
+use line_index::{LineIndex, WideEncoding, WideLineCol};
+
+use crate::language::injection::VirtualGap;
+use crate::text::position::normalize_lone_carriage_returns;
+use serde::{Deserialize, Serialize};
+use tower_lsp_server::ls_types::{Position, TextEdit};
+
+/// The request kakehashi sends to the configured prepare peer.
+pub(crate) const PREPARE_METHOD: &str = "kakehashi/virtualDocument/prepare";
+
+/// How long one prepare request may wait for its answer (after the peer is
+/// up). A request that times out counts as no answer and is retried with
+/// backoff; the document is held back meanwhile.
+pub(crate) const PREPARE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Kind of a virtual-document segment, as named on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SegmentKind {
+    /// Injected text the downstream language owns.
+    Content,
+    /// Host-owned text between (or inside) injected content.
+    Gap,
+}
+
+/// One segment of a virtual document.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct Segment {
+    pub(crate) kind: SegmentKind,
+    /// Byte range in the virtual document text.
+    pub(crate) virtual_range: Range<usize>,
+    /// What the peer sees: the virtual text for content, the original host
+    /// text for a gap (whose virtual text is only coordinate-preserving
+    /// whitespace).
+    pub(crate) text: String,
+}
+
+/// The ordered segments covering a virtual document end to end.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct VirtualLayout {
+    segments: Vec<Segment>,
+}
+
+impl VirtualLayout {
+    /// A document that is all content (an isolated injection).
+    #[cfg(test)]
+    pub(crate) fn single(virtual_text: &str) -> Self {
+        Self {
+            segments: vec![Segment {
+                kind: SegmentKind::Content,
+                virtual_range: 0..virtual_text.len(),
+                text: virtual_text.to_string(),
+            }],
+        }
+    }
+
+    /// Present a virtual document as content and gap segments: the gaps the
+    /// resolver recorded (see [`VirtualGap`]), and content everywhere
+    /// between them. An isolated document is one content segment, an empty
+    /// one included.
+    pub(crate) fn from_gaps(virtual_text: &str, gaps: &[VirtualGap]) -> Self {
+        let mut pieces = Vec::with_capacity(gaps.len() * 2 + 1);
+        let mut cursor = 0;
+        for gap in gaps {
+            if cursor < gap.virtual_range.start {
+                pieces.push((
+                    SegmentKind::Content,
+                    cursor..gap.virtual_range.start,
+                    String::new(),
+                ));
+            }
+            pieces.push((
+                SegmentKind::Gap,
+                gap.virtual_range.clone(),
+                gap.host_text.clone(),
+            ));
+            cursor = cursor.max(gap.virtual_range.end);
+        }
+        if cursor < virtual_text.len() || pieces.is_empty() {
+            pieces.push((
+                SegmentKind::Content,
+                cursor..virtual_text.len(),
+                String::new(),
+            ));
+        }
+        Self::from_pieces(virtual_text, pieces)
+    }
+
+    /// Build a layout from adjacent pieces in virtual-text order.
+    ///
+    /// Adjacent pieces of one kind merge. A gap whose virtual text is empty
+    /// (stripped host text, such as a blockquote `> `) is not presented on its
+    /// own: between content it never reaches downstream servers, so there is
+    /// nothing to replace, and the content around it merges into one segment.
+    /// Next to a visible gap it is part of that gap's host text.
+    pub(crate) fn from_pieces(
+        virtual_text: &str,
+        pieces: impl IntoIterator<Item = (SegmentKind, Range<usize>, String)>,
+    ) -> Self {
+        let mut segments: Vec<Segment> = Vec::new();
+        let mut pending_gap_text = String::new();
+        for (kind, range, host_text) in pieces {
+            if kind == SegmentKind::Gap && range.is_empty() {
+                match segments.last_mut() {
+                    // Stripped text right after a visible gap is part of it.
+                    Some(last)
+                        if last.kind == SegmentKind::Gap
+                            && last.virtual_range.end == range.start =>
+                    {
+                        last.text.push_str(&host_text);
+                    }
+                    _ => pending_gap_text.push_str(&host_text),
+                }
+                continue;
+            }
+            match segments.last_mut() {
+                Some(last) if last.kind == kind && last.virtual_range.end == range.start => {
+                    last.virtual_range.end = range.end;
+                    match kind {
+                        SegmentKind::Content => {
+                            last.text.push_str(&virtual_text[range.clone()]);
+                        }
+                        SegmentKind::Gap => {
+                            last.text.push_str(&pending_gap_text);
+                            last.text.push_str(&host_text);
+                        }
+                    }
+                }
+                _ => {
+                    let text = match kind {
+                        SegmentKind::Content => virtual_text[range.clone()].to_string(),
+                        SegmentKind::Gap => {
+                            // A stripped prefix right before a visible gap is
+                            // host text that gap spans.
+                            let mut text = std::mem::take(&mut pending_gap_text);
+                            text.push_str(&host_text);
+                            text
+                        }
+                    };
+                    segments.push(Segment {
+                        kind,
+                        virtual_range: range,
+                        text,
+                    });
+                }
+            }
+            pending_gap_text.clear();
+        }
+        Self { segments }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn segments(&self) -> &[Segment] {
+        &self.segments
+    }
+}
+
+// =============================================================================
+// Wire types
+// =============================================================================
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PrepareTextDocument<'a> {
+    pub(crate) uri: &'a str,
+    pub(crate) language_id: &'a str,
+    pub(crate) version: i32,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PrepareHostTextDocument<'a> {
+    pub(crate) uri: &'a str,
+    pub(crate) language_id: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct WireSegment<'a> {
+    #[serde(rename = "type")]
+    kind: SegmentKind,
+    content: &'a str,
+}
+
+/// Params of [`PREPARE_METHOD`].
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PrepareParams<'a> {
+    text_document: PrepareTextDocument<'a>,
+    host_text_document: PrepareHostTextDocument<'a>,
+    segments: Vec<WireSegment<'a>>,
+}
+
+impl<'a> PrepareParams<'a> {
+    pub(crate) fn new(
+        text_document: PrepareTextDocument<'a>,
+        host_text_document: PrepareHostTextDocument<'a>,
+        layout: &'a VirtualLayout,
+    ) -> Self {
+        Self {
+            text_document,
+            host_text_document,
+            segments: layout
+                .segments
+                .iter()
+                .map(|segment| WireSegment {
+                    kind: segment.kind,
+                    content: &segment.text,
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum WireSegmentResult {
+    Content {
+        #[serde(default)]
+        changes: Option<Vec<TextEdit>>,
+    },
+    Gap {
+        #[serde(default)]
+        content: Option<String>,
+    },
+}
+
+/// Result of [`PREPARE_METHOD`]; `null` on the wire means "unchanged".
+#[derive(Debug, Deserialize)]
+pub(crate) struct PrepareResult {
+    segments: Vec<WireSegmentResult>,
+}
+
+/// Parse the response to [`PREPARE_METHOD`]. An error response or a
+/// malformed result is an `InvalidData` error — a failed prepare, never
+/// "unchanged".
+pub(crate) fn parse_prepare_response(
+    response: &serde_json::Value,
+) -> std::io::Result<Option<PrepareResult>> {
+    // Every unusable answer is `InvalidData`, which callers tell apart from
+    // a failure to get an answer at all. The cancellation codes LSP lets a
+    // client retry (RequestCancelled, ContentModified, ServerCancelled) are
+    // not answers.
+    if let Some(error) = response.get("error").filter(|error| !error.is_null()) {
+        let retryable = matches!(
+            error.get("code").and_then(serde_json::Value::as_i64),
+            Some(-32802..=-32800)
+        );
+        return Err(std::io::Error::new(
+            if retryable {
+                std::io::ErrorKind::Interrupted
+            } else {
+                std::io::ErrorKind::InvalidData
+            },
+            format!("bridge: prepare peer answered with an error: {error}"),
+        ));
+    }
+    let result = response.get("result").ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bridge: prepare response missing result",
+        )
+    })?;
+    serde_json::from_value(result.clone())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+/// Why a prepare answer was refused. A refused answer is a failed prepare:
+/// the document is not sent at all, never sent unprepared.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum PrepareError {
+    #[error("expected {expected} segments, got {actual}")]
+    SegmentCount { expected: usize, actual: usize },
+    #[error("segment {index}: expected type {expected:?}")]
+    SegmentKind { index: usize, expected: SegmentKind },
+    #[error("segment {index}: {reason}")]
+    InvalidChange { index: usize, reason: &'static str },
+}
+
+// =============================================================================
+// Applying an answer
+// =============================================================================
+
+/// A virtual document as downstream servers receive it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedDocument {
+    /// The text sent downstream.
+    pub(crate) text: String,
+    /// `Some` for every document that went through a peer, even when its
+    /// answer changed nothing; `None` when no candidate advertises the
+    /// request, and the virtual text is sent as is.
+    pub(crate) map: Option<std::sync::Arc<PreparedMap>>,
+}
+
+/// Apply a peer answer to the virtual document it was asked about.
+///
+/// `result` of `None` is the wire `null`: every gap keeps its
+/// coordinate-preserving whitespace and no content changes.
+/// [`apply_prepare_result_at`] taking its place in the presentation order
+/// now, as a test applying an answer directly does.
+#[cfg(test)]
+pub(crate) fn apply_prepare_result(
+    virtual_text: &str,
+    layout: &VirtualLayout,
+    result: Option<PrepareResult>,
+) -> Result<PreparedDocument, PrepareError> {
+    apply_prepare_result_at(virtual_text, layout, result, next_presentation())
+}
+
+/// [`apply_prepare_result`] for an answer to an input taken at `taken` in
+/// the presentation order (see [`next_presentation`]): what orders it
+/// against other texts is when its virtual text was read, not when the
+/// answer came — two attempts in flight can answer in either order.
+pub(crate) fn apply_prepare_result_at(
+    virtual_text: &str,
+    layout: &VirtualLayout,
+    result: Option<PrepareResult>,
+    taken: u64,
+) -> Result<PreparedDocument, PrepareError> {
+    // `null` keeps every segment, and still yields a map (see below).
+    let result = result.unwrap_or_else(|| PrepareResult {
+        segments: layout
+            .segments
+            .iter()
+            .map(|segment| match segment.kind {
+                SegmentKind::Content => WireSegmentResult::Content { changes: None },
+                SegmentKind::Gap => WireSegmentResult::Gap { content: None },
+            })
+            .collect(),
+    });
+    if result.segments.len() != layout.segments.len() {
+        return Err(PrepareError::SegmentCount {
+            expected: layout.segments.len(),
+            actual: result.segments.len(),
+        });
+    }
+
+    let mut text = String::with_capacity(virtual_text.len());
+    let mut runs: Vec<Run> = Vec::new();
+    let last_index = layout.segments.len().saturating_sub(1);
+    for (index, (segment, answer)) in layout.segments.iter().zip(result.segments).enumerate() {
+        let virtual_segment = &virtual_text[segment.virtual_range.clone()];
+        match (segment.kind, answer) {
+            (SegmentKind::Content, WireSegmentResult::Content { changes }) => {
+                let deletions = content_deletions(
+                    virtual_text,
+                    segment.virtual_range.start,
+                    virtual_segment,
+                    changes.unwrap_or_default(),
+                    DocumentEdges {
+                        start: index == 0,
+                        end: index == last_index,
+                    },
+                )
+                .map_err(|reason| PrepareError::InvalidChange { index, reason })?;
+                let mut cursor = segment.virtual_range.start;
+                for (deletion, kind) in deletions {
+                    push_run(
+                        &mut runs,
+                        &mut text,
+                        RunKind::Identity,
+                        cursor..deletion.start,
+                        virtual_text,
+                        "",
+                    );
+                    push_run(
+                        &mut runs,
+                        &mut text,
+                        kind,
+                        deletion.clone(),
+                        virtual_text,
+                        "",
+                    );
+                    cursor = deletion.end;
+                }
+                push_run(
+                    &mut runs,
+                    &mut text,
+                    RunKind::Identity,
+                    cursor..segment.virtual_range.end,
+                    virtual_text,
+                    "",
+                );
+            }
+            (SegmentKind::Gap, WireSegmentResult::Gap { content }) => {
+                let replacement = content.as_deref().unwrap_or(virtual_segment);
+                push_run(
+                    &mut runs,
+                    &mut text,
+                    RunKind::Gap,
+                    segment.virtual_range.clone(),
+                    virtual_text,
+                    replacement,
+                );
+            }
+            (expected, _) => return Err(PrepareError::SegmentKind { index, expected }),
+        }
+    }
+
+    // Even an answer that changed nothing yields a map: the map is how every
+    // later path knows the document went through the peer (and must wait
+    // for the prepared text to reach a server, keep off its gaps, …).
+    let fingerprint = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        virtual_text.hash(&mut hasher);
+        text.hash(&mut hasher);
+        runs.hash(&mut hasher);
+        hasher.finish()
+    };
+    let map = PreparedMap {
+        virtual_lines: LineMap::new(virtual_text.to_string()),
+        prepared_lines: LineMap::new(text.clone()),
+        runs,
+        fingerprint,
+        built: taken,
+    };
+    Ok(PreparedDocument {
+        text,
+        map: Some(std::sync::Arc::new(map)),
+    })
+}
+
+/// Which of the document's edges a content segment holds.
+#[derive(Clone, Copy)]
+struct DocumentEdges {
+    start: bool,
+    end: bool,
+}
+
+/// Validate a content segment's changes and return the byte ranges (in V)
+/// they delete, sorted, each with the kind of run it becomes.
+fn content_deletions(
+    virtual_text: &str,
+    segment_start: usize,
+    segment_text: &str,
+    changes: Vec<TextEdit>,
+    edges: DocumentEdges,
+) -> Result<Vec<(Range<usize>, RunKind)>, &'static str> {
+    let segment_lines = LineMap::new(segment_text.to_string());
+    let mut deletions = Vec::with_capacity(changes.len());
+    for change in changes {
+        if !change.new_text.is_empty() {
+            return Err("content changes may only delete text");
+        }
+        let start = segment_lines
+            .offset_strict(change.range.start)
+            .ok_or("change starts outside the segment")?;
+        let end = segment_lines
+            .offset_strict(change.range.end)
+            .ok_or("change ends outside the segment")?;
+        if start > end {
+            return Err("change range is reversed");
+        }
+        if start == end {
+            continue;
+        }
+        let deleted = &segment_text[start..end];
+        let absolute = segment_start + start;
+        let at_line_start = is_line_start(virtual_text, absolute);
+        if !deleted
+            .bytes()
+            .all(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
+        {
+            return Err("content changes may only delete whitespace");
+        }
+        let kind = if !deleted.contains(['\n', '\r']) {
+            if !at_line_start {
+                return Err("content changes may only delete leading whitespace");
+            }
+            RunKind::Deleted
+        } else if at_line_start
+            && is_line_start(virtual_text, segment_start + end)
+            && !splits_crlf(virtual_text, absolute)
+            && !splits_crlf(virtual_text, segment_start + end)
+        {
+            // Classified as leading or trailing below.
+            RunKind::LeadingLines
+        } else {
+            // Not whole lines in V: a line break deleted mid-line, such as
+            // the one opening a segment that starts after a gap on the same
+            // line, or a deletion ending mid-line or inside a CRLF.
+            return Err("content changes may only delete whole blank lines");
+        };
+        deletions.push((absolute..segment_start + end, kind));
+    }
+    deletions.sort_by_key(|(range, _)| range.start);
+    if deletions
+        .windows(2)
+        .any(|pair| pair[0].0.end > pair[1].0.start)
+    {
+        return Err("content changes overlap");
+    }
+    // Whole lines go only from the document's edges, where the host's
+    // string syntax drops them (the line break after a Nix `''`, the blank
+    // lines a YAML `|` block clips): those running from its start, then
+    // those running to its end — before a last line without a line break,
+    // which only indentation fills (the indentation before a closing `''`).
+    // Beside a gap they are inside the document, where a formatter may add
+    // a blank line back at the join and the host would hold it twice.
+    let mut leading_end = segment_start;
+    for (range, kind) in &deletions {
+        if edges.start && *kind == RunKind::LeadingLines && range.start == leading_end {
+            leading_end = range.end;
+        }
+    }
+    let segment_end = segment_start + segment_text.len();
+    let mut trailing_start = segment_text
+        .rfind(['\n', '\r'])
+        .map(|last| segment_start + last + 1)
+        .filter(|&last_line| {
+            virtual_text[last_line..segment_end]
+                .trim_matches([' ', '\t'])
+                .is_empty()
+        })
+        .unwrap_or(segment_end);
+    let closing_line = trailing_start;
+    for (range, kind) in deletions.iter_mut().rev() {
+        if *kind != RunKind::LeadingLines || range.end <= leading_end {
+            continue;
+        }
+        if !edges.end || range.end != trailing_start {
+            return Err("content changes may only delete blank lines at the document's edges");
+        }
+        *kind = RunKind::TrailingLines;
+        trailing_start = range.start;
+    }
+    // The closing line's indentation is no part of the value either, and
+    // with it gone P ends where the deleted lines were: no kept text starts
+    // there in P that positions or edits at P's end could belong to.
+    let has_trailing = deletions
+        .iter()
+        .any(|(_, kind)| *kind == RunKind::TrailingLines);
+    if has_trailing
+        && closing_line < segment_end
+        && !deletions
+            .iter()
+            .any(|(range, kind)| *kind == RunKind::Deleted && *range == (closing_line..segment_end))
+    {
+        return Err(
+            "content changes may only delete closing blank lines with all of the closing line's indentation",
+        );
+    }
+    // A segment with no content left beside its deleted lines puts them
+    // beside the gap that follows (or precedes) it — when that gap starts
+    // (or ends) a line: within a line, the blank text left is that line's
+    // indent or line break (`''\n  ${x}/bin/foo''`).
+    let is_blank = |text: &str| text.trim_matches([' ', '\t', '\n', '\r']).is_empty();
+    let beside_gap = (!edges.end
+        && leading_end > segment_start
+        && is_blank(&virtual_text[leading_end..segment_end])
+        && is_line_start(virtual_text, segment_end))
+        || (!edges.start
+            && has_trailing
+            && is_blank(&virtual_text[segment_start..trailing_start])
+            && is_line_start(virtual_text, segment_start));
+    if beside_gap {
+        return Err("content changes may only delete blank lines at the document's edges");
+    }
+    Ok(deletions)
+}
+
+fn push_run(
+    runs: &mut Vec<Run>,
+    text: &mut String,
+    kind: RunKind,
+    virtual_range: Range<usize>,
+    virtual_text: &str,
+    replacement: &str,
+) {
+    let prepared_text = match kind {
+        RunKind::Identity => &virtual_text[virtual_range.clone()],
+        RunKind::Deleted | RunKind::LeadingLines | RunKind::TrailingLines => "",
+        RunKind::Gap => replacement,
+    };
+    if kind == RunKind::Identity && virtual_range.is_empty() {
+        return;
+    }
+    let start = text.len();
+    text.push_str(prepared_text);
+    runs.push(Run {
+        kind,
+        prepared: start..text.len(),
+        virtual_: virtual_range,
+    });
+}
+
+// =============================================================================
+// The prepared ↔ virtual map
+// =============================================================================
+
+/// Which side of an opaque run a position strictly inside it resolves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Bias {
+    /// The run's start — for positions and range starts.
+    Start,
+    /// The run's end — for range ends, so a range over a replaced gap covers
+    /// the original gap.
+    End,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RunKind {
+    /// Text present unchanged in both documents.
+    Identity,
+    /// Leading whitespace of a content line, absent from P.
+    Deleted,
+    /// Whole blank lines opening the document (its first content segment),
+    /// absent from P.
+    LeadingLines,
+    /// Whole blank lines ending the document (its last content segment),
+    /// absent from P along with any closing indent after them. P's content
+    /// ends before them, so P's end maps before them too.
+    TrailingLines,
+    /// A host-owned gap, with any text in P.
+    Gap,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct Run {
+    kind: RunKind,
+    prepared: Range<usize>,
+    virtual_: Range<usize>,
+}
+
+/// Coordinates between a prepared document (P) and its virtual document (V).
+///
+/// Equality compares a fingerprint of both texts and the runs between them:
+/// region offsets carrying a map are compared on every resolve gate, which
+/// must not cost a full text comparison.
+#[derive(Debug)]
+pub(crate) struct PreparedMap {
+    virtual_lines: LineMap,
+    prepared_lines: LineMap,
+    runs: Vec<Run>,
+    fingerprint: u64,
+    /// Where the input its answer came from was taken in the presentation
+    /// order (see [`apply_prepare_result_at`]); not part of its equality.
+    built: u64,
+}
+
+/// A process-wide order of the decisions about what a virtual document's
+/// servers are sent: a prepared answer applied, a text recorded as the
+/// latest to send. Tells which of two such decisions is the newer.
+pub(crate) fn next_presentation() -> u64 {
+    static PRESENTATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    PRESENTATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+impl PartialEq for PreparedMap {
+    fn eq(&self, other: &Self) -> bool {
+        self.fingerprint == other.fingerprint
+    }
+}
+
+impl Eq for PreparedMap {}
+
+impl PreparedMap {
+    /// Where the input this map's answer came from was taken in the
+    /// presentation order (see [`apply_prepare_result_at`]).
+    pub(crate) fn built(&self) -> u64 {
+        self.built
+    }
+
+    /// Translate a position in P to V.
+    pub(crate) fn to_virtual(&self, position: Position, bias: Bias) -> Position {
+        let offset = self.prepared_lines.offset_clamped(position);
+        let mapped = map_offset(&self.runs, offset, bias, Side::Prepared);
+        self.virtual_lines.position(mapped)
+    }
+
+    /// Whether two P positions name the same offset once clamped onto P (a
+    /// column past a line's end means its end).
+    pub(crate) fn same_prepared_offset(&self, a: Position, b: Position) -> bool {
+        self.prepared_lines.offset_clamped(a) == self.prepared_lines.offset_clamped(b)
+    }
+
+    /// Translate a position in V to P.
+    pub(crate) fn to_prepared(&self, position: Position, bias: Bias) -> Position {
+        let offset = self.virtual_lines.offset_clamped(position);
+        let mapped = map_offset(&self.runs, offset, bias, Side::Virtual);
+        self.prepared_lines.position(mapped)
+    }
+
+    /// Whether a V position sits on the blank lines the peer deleted from
+    /// the document's edges (starts included): those lines are not in P at
+    /// all, so a request there would be answered for another line.
+    pub(crate) fn virtual_position_in_removed_lines(&self, position: Position) -> bool {
+        self.offset_in_removed_lines(self.virtual_lines.offset_clamped(position))
+    }
+
+    fn offset_in_removed_lines(&self, offset: usize) -> bool {
+        // From where the document's deleted closing lines start, V holds only
+        // what P dropped (those lines and the closing indent after them), up
+        // to its very end. P's end maps to that start, but what a client
+        // inserts at a caret there (a completion without a text edit) joins
+        // the first of those lines, which P does not have. Those are the runs
+        // empty in P at its end; the closing lines may be several runs,
+        // deleted one by one.
+        if let Some(lines) = self
+            .runs
+            .iter()
+            .rev()
+            .take_while(|run| run.prepared.is_empty())
+            .filter(|run| run.kind == RunKind::TrailingLines)
+            .last()
+            && offset >= lines.virtual_.start
+        {
+            return true;
+        }
+        self.runs_at_virtual(offset).any(|run| {
+            run.kind == RunKind::LeadingLines
+                && run.virtual_.start <= offset
+                && offset < run.virtual_.end
+        })
+    }
+
+    /// The runs whose V range may hold V `offset`.
+    fn runs_at_virtual(&self, offset: usize) -> impl Iterator<Item = &Run> {
+        let first = self.runs.partition_point(|run| run.virtual_.end <= offset);
+        self.runs[first..]
+            .iter()
+            .take_while(move |run| run.virtual_.start <= offset)
+    }
+
+    /// Whether a V position sits strictly inside a gap: host-owned text no
+    /// downstream position stands for.
+    pub(crate) fn virtual_position_in_gap(&self, position: Position) -> bool {
+        let offset = self.virtual_lines.offset_clamped(position);
+        self.virtual_range_touches_gap(offset, offset)
+    }
+
+    /// Whether the V range `start..end` reaches inside a gap's V text (an
+    /// empty range: whether it sits strictly inside one).
+    fn virtual_range_touches_gap(&self, start: usize, end: usize) -> bool {
+        let first = self.runs.partition_point(|run| run.virtual_.end <= start);
+        self.runs[first..]
+            .iter()
+            .take_while(|run| run.virtual_.start <= end)
+            .filter(|run| run.kind == RunKind::Gap)
+            .any(|gap| {
+                if start == end {
+                    gap.virtual_.start < start && start < gap.virtual_.end
+                } else {
+                    gap.virtual_.start < end && start < gap.virtual_.end
+                }
+            })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Side {
+    Prepared,
+    Virtual,
+}
+
+impl Side {
+    /// The run's (source, target) ranges when mapping from this side.
+    fn ranges(self, run: &Run) -> (&Range<usize>, &Range<usize>) {
+        match self {
+            Side::Prepared => (&run.prepared, &run.virtual_),
+            Side::Virtual => (&run.virtual_, &run.prepared),
+        }
+    }
+}
+
+/// Map a byte offset across the runs, in O(log runs).
+///
+/// Inside an identity run the offset moves by the run's shift. Inside an
+/// opaque run (a deleted indent, deleted edge lines or a gap) it lands on
+/// the run's start, or — strictly inside, with [`Bias::End`] — its end. On a
+/// boundary the run that *starts* there wins, so a P line start maps after
+/// the indent V deleted there: the host keeps its indentation and the edit
+/// lands on the content. Likewise P's start maps after the lines deleted
+/// from the document's start, and P's end, whatever the bias, before those
+/// deleted from its end.
+fn map_offset(runs: &[Run], offset: usize, bias: Bias, from: Side) -> usize {
+    // P's end, where the document's deleted closing lines were: the
+    // content ends there in V too, before them.
+    if matches!(from, Side::Prepared)
+        && let Some(lines) = empty_run(runs, offset, RunKind::TrailingLines)
+    {
+        return lines.virtual_.start;
+    }
+    // The end of a P range that reaches a gap the peer replaced with nothing
+    // stops before that gap: the range covers none of its host text.
+    if bias == Bias::End
+        && matches!(from, Side::Prepared)
+        && let Some(gap) = empty_run(runs, offset, RunKind::Gap)
+    {
+        return gap.virtual_.start;
+    }
+    // Runs tile both texts in order, so the run holding `offset` is the
+    // first that ends after it (runs empty on this side never hold one).
+    let index = runs.partition_point(|run| from.ranges(run).0.end <= offset);
+    if let Some(run) = runs.get(index) {
+        let (source, target) = from.ranges(run);
+        if source.start <= offset {
+            return match run.kind {
+                RunKind::Identity => target.start + (offset - source.start),
+                _ if offset == source.start => target.start,
+                _ => match bias {
+                    Bias::Start => target.start,
+                    Bias::End => target.end,
+                },
+            };
+        }
+    }
+    // Past every run non-empty on this side: the document end, unless a run
+    // empty on this side sits exactly here and the caller wants its start.
+    if bias == Bias::Start {
+        let first = runs.partition_point(|run| from.ranges(run).0.start < offset);
+        let mut passed = None;
+        for run in runs[first..]
+            .iter()
+            .take_while(|run| from.ranges(run).0.start == offset)
+            .filter(|run| from.ranges(run).0.is_empty())
+        {
+            let target = from.ranges(run).1;
+            // Lines deleted from the document's start and a removed indent
+            // at the very end are passed, as at any line start; a gap
+            // emptied there stays after the position.
+            match run.kind {
+                RunKind::LeadingLines => passed = Some(target.end),
+                RunKind::Deleted => return target.end,
+                _ => return target.start,
+            }
+        }
+        if let Some(end) = passed {
+            return end;
+        }
+    }
+    runs.last().map_or(0, |run| from.ranges(run).1.end)
+}
+
+/// The `kind` run that is empty in P and sits at P `offset`.
+fn empty_run(runs: &[Run], offset: usize, kind: RunKind) -> Option<&Run> {
+    let first = runs.partition_point(|run| run.prepared.start < offset);
+    runs[first..]
+        .iter()
+        .take_while(|run| run.prepared.start == offset)
+        .find(|run| run.kind == kind && run.prepared.is_empty())
+}
+
+// =============================================================================
+// Text helpers
+// =============================================================================
+
+/// An owned text with an LSP line index (UTF-16 columns, LF / CRLF / lone CR
+/// line terminators).
+#[derive(Debug, PartialEq, Eq)]
+struct LineMap {
+    text: String,
+    index: LineIndexEq,
+}
+
+impl LineMap {
+    fn new(text: String) -> Self {
+        let index = LineIndex::new(&normalize_lone_carriage_returns(&text));
+        Self {
+            text,
+            index: LineIndexEq(index),
+        }
+    }
+
+    /// Byte offset of `position`, or `None` unless it names a real location.
+    fn offset_strict(&self, position: Position) -> Option<usize> {
+        // A line has no more UTF-16 units than bytes: a column past its byte
+        // length names nothing, and is refused before the index adds it to
+        // the line's start (which a column near `u32::MAX` would overflow).
+        let line = self.index.0.line(position.line)?;
+        if position.character > u32::from(line.len()) {
+            return None;
+        }
+        let line_col = self.index.0.to_utf8(
+            WideEncoding::Utf16,
+            WideLineCol {
+                line: position.line,
+                col: position.character,
+            },
+        )?;
+        let offset: usize = self.index.0.offset(line_col)?.into();
+        (offset <= self.text.len()
+            && self.text.is_char_boundary(offset)
+            && self.position(offset) == position)
+            .then_some(offset)
+    }
+
+    /// Byte offset of `position`, clamped to its line's content (a column
+    /// past the end) or to the document end (a line past the end).
+    fn offset_clamped(&self, position: Position) -> usize {
+        let Some(line_range) = self.index.0.line(position.line) else {
+            return self.text.len();
+        };
+        let line_start: usize = line_range.start().into();
+        let line_end: usize = line_range.end().into();
+        let line = &self.text[line_start..line_end];
+        let content = line
+            .strip_suffix('\n')
+            .map(|line| line.strip_suffix('\r').unwrap_or(line))
+            .unwrap_or_else(|| line.strip_suffix('\r').unwrap_or(line));
+        let content_end = line_start + content.len();
+        // Through the index's per-line table of non-ASCII characters rather
+        // than a scan of the line. A line has no more UTF-16 units than
+        // bytes, so capping the column at the byte length keeps every column
+        // on the line while the byte it maps to cannot overflow; a column
+        // past the content clamps to its end, one inside a surrogate pair to
+        // the end of its character.
+        let character = position
+            .character
+            .min(u32::try_from(content.len()).unwrap_or(u32::MAX));
+        let byte = self
+            .index
+            .0
+            .to_utf8(
+                WideEncoding::Utf16,
+                WideLineCol {
+                    line: position.line,
+                    col: character,
+                },
+            )
+            .and_then(|line_col| self.index.0.offset(line_col))
+            .map_or(content_end, usize::from)
+            .min(content_end);
+        self.text.ceil_char_boundary(byte)
+    }
+
+    fn position(&self, offset: usize) -> Position {
+        let offset = self.text.floor_char_boundary(offset.min(self.text.len()));
+        let Some(line_col) = u32::try_from(offset)
+            .ok()
+            .and_then(|offset| self.index.0.try_line_col(offset.into()))
+        else {
+            return Position::new(0, 0);
+        };
+        self.index
+            .0
+            .to_wide(WideEncoding::Utf16, line_col)
+            .map_or(Position::new(line_col.line, line_col.col), |wide| {
+                Position::new(wide.line, wide.col)
+            })
+    }
+}
+
+/// `LineIndex` is a pure function of the text, so two indexes over equal text
+/// are equal; this lets `LineMap` derive equality from its text alone.
+#[derive(Debug)]
+struct LineIndexEq(LineIndex);
+
+impl PartialEq for LineIndexEq {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for LineIndexEq {}
+
+/// Whether `offset` sits between the CR and LF of a CRLF: past its line's
+/// content, where LSP clamps a position, yet a distinct byte offset.
+fn splits_crlf(text: &str, offset: usize) -> bool {
+    offset > 0
+        && text.as_bytes()[offset - 1] == b'\r'
+        && text.as_bytes().get(offset) == Some(&b'\n')
+}
+
+fn is_line_start(text: &str, offset: usize) -> bool {
+    offset == 0 || matches!(text.as_bytes().get(offset - 1), Some(b'\n' | b'\r'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_column_past_any_line_names_no_location() {
+        let lines = LineMap::new("\n ".to_string());
+        assert_eq!(lines.offset_strict(Position::new(1, u32::MAX)), None);
+        assert_eq!(lines.offset_strict(Position::new(1, 2)), None);
+        assert_eq!(lines.offset_strict(Position::new(1, 1)), Some(2));
+        assert_eq!(lines.offset_clamped(Position::new(1, u32::MAX)), 2);
+    }
+
+    #[test]
+    fn a_clamped_offset_is_where_a_scan_of_its_line_stops() {
+        // The column-by-column scan the indexed conversion replaces.
+        fn scanned(text: &str, position: Position) -> usize {
+            let mut lines = Vec::new();
+            let mut start = 0;
+            let bytes = text.as_bytes();
+            for (index, byte) in bytes.iter().enumerate() {
+                let ends =
+                    *byte == b'\n' || (*byte == b'\r' && bytes.get(index + 1) != Some(&b'\n'));
+                if ends {
+                    lines.push(start..index + 1);
+                    start = index + 1;
+                }
+            }
+            lines.push(start..text.len());
+            let Some(range) = lines.get(position.line as usize) else {
+                return text.len();
+            };
+            let line = &text[range.clone()];
+            let content = line
+                .strip_suffix('\n')
+                .map(|line| line.strip_suffix('\r').unwrap_or(line))
+                .unwrap_or_else(|| line.strip_suffix('\r').unwrap_or(line));
+            let mut units = 0u32;
+            for (byte, character) in content.char_indices() {
+                if units >= position.character {
+                    return range.start + byte;
+                }
+                units += character.len_utf16() as u32;
+            }
+            range.start + content.len()
+        }
+        let text = "a\u{1F600}b\u{e9}\r\n\u{3042}\rx\n\n\u{1F600}";
+        let lines = LineMap::new(text.to_string());
+        for line in 0..7 {
+            for character in (0..12).chain([u32::MAX]) {
+                let position = Position::new(line, character);
+                assert_eq!(
+                    lines.offset_clamped(position),
+                    scanned(text, position),
+                    "{position:?}"
+                );
+            }
+        }
+    }
+
+    use serde_json::json;
+
+    fn result(value: serde_json::Value) -> Option<PrepareResult> {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn pos(line: u32, character: u32) -> Position {
+        Position::new(line, character)
+    }
+
+    /// Two combined fenced blocks: the closing fence, the prose and the
+    /// opening fence between them are a gap starting a line.
+    fn fenced() -> (String, VirtualLayout) {
+        let virtual_text = "foo()\n\n\n\nbar()\n".to_string();
+        let layout = VirtualLayout::from_pieces(
+            &virtual_text,
+            [
+                (SegmentKind::Content, 0..6, String::new()),
+                (SegmentKind::Gap, 6..9, "```\ntext\n```lua\n".to_string()),
+                (SegmentKind::Content, 9..15, String::new()),
+            ],
+        );
+        (virtual_text, layout)
+    }
+
+    /// `x = ${a}\nprint(x)\n` as a combined document: the interpolation is a
+    /// gap, masked in V by coordinate-preserving whitespace.
+    fn interpolated() -> (String, VirtualLayout) {
+        let virtual_text = "x =     \nprint(x)\n".to_string();
+        let layout = VirtualLayout::from_pieces(
+            &virtual_text,
+            [
+                (SegmentKind::Content, 0..4, String::new()),
+                (SegmentKind::Gap, 4..8, "${a}".to_string()),
+                (SegmentKind::Content, 8..18, String::new()),
+            ],
+        );
+        (virtual_text, layout)
+    }
+
+    /// Two lines indented by two spaces, dedented by the peer.
+    fn dedented() -> (String, PreparedDocument) {
+        let virtual_text = "  if x:\n    y\n".to_string();
+        let layout = VirtualLayout::single(&virtual_text);
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &layout,
+            result(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+            ]}]})),
+        )
+        .unwrap();
+        (virtual_text, prepared)
+    }
+
+    #[test]
+    fn layout_presents_gap_host_text_and_merges_stripped_prefixes() {
+        let virtual_text = "a\nb\n  c";
+        let layout = VirtualLayout::from_pieces(
+            virtual_text,
+            [
+                (SegmentKind::Content, 0..2, String::new()),
+                // A stripped blockquote prefix: empty in V, not presented.
+                (SegmentKind::Gap, 2..2, "> ".to_string()),
+                (SegmentKind::Content, 2..4, String::new()),
+                (SegmentKind::Gap, 4..6, "${".to_string()),
+                (SegmentKind::Gap, 6..6, "}".to_string()),
+                (SegmentKind::Content, 6..7, String::new()),
+            ],
+        );
+        let kinds: Vec<_> = layout
+            .segments()
+            .iter()
+            .map(|s| (s.kind, s.virtual_range.clone(), s.text.as_str()))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (SegmentKind::Content, 0..4, "a\nb\n"),
+                (SegmentKind::Gap, 4..6, "${}"),
+                (SegmentKind::Content, 6..7, "c"),
+            ]
+        );
+    }
+
+    #[test]
+    fn error_responses_are_final_unless_retryable() {
+        let kind = |code: i64| {
+            parse_prepare_response(&json!({"error": {"code": code, "message": "x"}}))
+                .unwrap_err()
+                .kind()
+        };
+        assert_eq!(kind(-32603), std::io::ErrorKind::InvalidData);
+        for retryable in [-32800, -32801, -32802] {
+            assert_eq!(kind(retryable), std::io::ErrorKind::Interrupted);
+        }
+        assert_eq!(
+            parse_prepare_response(&json!({"result": {"segments": "x"}}))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert!(
+            parse_prepare_response(&json!({"result": null}))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn params_serialize_segments_in_order() {
+        let (_, layout) = interpolated();
+        let params = PrepareParams::new(
+            PrepareTextDocument {
+                uri: "file:///virtual.py",
+                language_id: "python",
+                version: 3,
+            },
+            PrepareHostTextDocument {
+                uri: "file:///host.nix",
+                language_id: "nix",
+            },
+            &layout,
+        );
+        assert_eq!(
+            serde_json::to_value(params).unwrap(),
+            json!({
+                "textDocument": {"uri": "file:///virtual.py", "languageId": "python", "version": 3},
+                "hostTextDocument": {"uri": "file:///host.nix", "languageId": "nix"},
+                "segments": [
+                    {"type": "content", "content": "x = "},
+                    {"type": "gap", "content": "${a}"},
+                    {"type": "content", "content": "\nprint(x)\n"}
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn null_answer_without_gaps_still_maps_identically() {
+        let layout = VirtualLayout::single("a\n");
+        let prepared = apply_prepare_result("a\n", &layout, None).unwrap();
+        assert_eq!(prepared.text, "a\n");
+        let map = prepared
+            .map
+            .expect("a prepared document always carries a map");
+        assert_eq!(map.to_virtual(pos(0, 1), Bias::Start), pos(0, 1));
+    }
+
+    #[test]
+    fn omitted_fields_keep_their_segments() {
+        let (virtual_text, layout) = interpolated();
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &layout,
+            result(
+                json!({"segments": [{"type": "content"}, {"type": "gap"}, {"type": "content"}]}),
+            ),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, virtual_text);
+    }
+
+    #[test]
+    fn gap_replacement_may_change_length() {
+        let (virtual_text, layout) = interpolated();
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &layout,
+            result(json!({"segments": [{"type": "content"}, {"type": "gap", "content": "None"}, {"type": "content"}]})),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "x = None\nprint(x)\n");
+        let map = prepared.map.unwrap();
+        // Content after the gap moves with the gap's new length…
+        assert_eq!(map.to_virtual(pos(1, 6), Bias::Start), pos(1, 6));
+        assert_eq!(map.to_prepared(pos(0, 2), Bias::Start), pos(0, 2));
+        // …and a range over the placeholder covers the whole original gap.
+        assert_eq!(map.to_virtual(pos(0, 4), Bias::Start), pos(0, 4));
+        assert_eq!(map.to_virtual(pos(0, 6), Bias::End), pos(0, 8));
+    }
+
+    #[test]
+    fn shrinking_gap_shifts_later_columns_on_its_line() {
+        let virtual_text = "f(    , b)".to_string();
+        let layout = VirtualLayout::from_pieces(
+            &virtual_text,
+            [
+                (SegmentKind::Content, 0..2, String::new()),
+                (SegmentKind::Gap, 2..6, "${a}".to_string()),
+                (SegmentKind::Content, 6..10, String::new()),
+            ],
+        );
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &layout,
+            result(json!({"segments": [{"type": "content"}, {"type": "gap", "content": "1"}, {"type": "content"}]})),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "f(1, b)");
+        let map = prepared.map.unwrap();
+        // `b` sits at column 5 in P and column 8 in V.
+        assert_eq!(map.to_virtual(pos(0, 5), Bias::Start), pos(0, 8));
+        assert_eq!(map.to_prepared(pos(0, 8), Bias::Start), pos(0, 5));
+    }
+
+    #[test]
+    fn multiline_gap_may_collapse_lines() {
+        let virtual_text = "a\n\n\nb".to_string();
+        let layout = VirtualLayout::from_pieces(
+            &virtual_text,
+            [
+                (SegmentKind::Content, 0..1, String::new()),
+                (SegmentKind::Gap, 1..4, "\n```\n```lua\n".to_string()),
+                (SegmentKind::Content, 4..5, String::new()),
+            ],
+        );
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &layout,
+            result(json!({"segments": [{"type": "content"}, {"type": "gap", "content": "\n"}, {"type": "content"}]})),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "a\nb");
+        let map = prepared.map.unwrap();
+        assert_eq!(map.to_virtual(pos(1, 0), Bias::Start), pos(3, 0));
+        assert_eq!(map.to_prepared(pos(3, 0), Bias::Start), pos(1, 0));
+    }
+
+    #[test]
+    fn dedent_shifts_columns_by_the_deleted_indent() {
+        let (_, prepared) = dedented();
+        assert_eq!(prepared.text, "if x:\n  y\n");
+        let map = prepared.map.unwrap();
+        assert_eq!(map.to_virtual(pos(1, 2), Bias::Start), pos(1, 4));
+        assert_eq!(map.to_prepared(pos(1, 4), Bias::Start), pos(1, 2));
+        // A V position inside the deleted indent lands on the P line start.
+        assert_eq!(map.to_prepared(pos(1, 1), Bias::Start), pos(1, 0));
+        // A P line start maps after the deleted indent.
+        assert_eq!(map.to_virtual(pos(1, 0), Bias::Start), pos(1, 2));
+    }
+
+    /// A Nix `''` string's content: the line break right after `''`, then
+    /// indented lines. The peer deletes the leading blank line and dedents.
+    fn leading_blank_dedented() -> (String, PreparedDocument) {
+        let virtual_text = "\n  a\n  b\n".to_string();
+        let layout = VirtualLayout::single(&virtual_text);
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &layout,
+            result(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""},
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""},
+                {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
+            ]}]})),
+        )
+        .unwrap();
+        (virtual_text, prepared)
+    }
+
+    #[test]
+    fn leading_blank_lines_are_deleted() {
+        let (_, prepared) = leading_blank_dedented();
+        assert_eq!(prepared.text, "a\nb\n");
+        let map = prepared.map.unwrap();
+        // P's first line is V's second, after its removed indent.
+        assert_eq!(map.to_virtual(pos(0, 0), Bias::Start), pos(1, 2));
+        assert_eq!(map.to_virtual(pos(1, 1), Bias::Start), pos(2, 3));
+        // A V position on the deleted line lands on P's start.
+        assert_eq!(map.to_prepared(pos(0, 0), Bias::Start), pos(0, 0));
+        assert_eq!(map.to_prepared(pos(2, 3), Bias::Start), pos(1, 1));
+    }
+
+    /// A YAML `|` block's content: the blank lines ending it are not part
+    /// of the value (clip). The peer deletes them and dedents.
+    fn trailing_blank_dedented() -> (String, PreparedDocument) {
+        let virtual_text = "  a\n  \n\n".to_string();
+        let layout = VirtualLayout::single(&virtual_text);
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &layout,
+            result(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 3, "character": 0}}, "newText": ""}
+            ]}]})),
+        )
+        .unwrap();
+        (virtual_text, prepared)
+    }
+
+    #[test]
+    fn trailing_blank_lines_are_deleted() {
+        let (_, prepared) = trailing_blank_dedented();
+        assert_eq!(prepared.text, "a\n");
+        let map = prepared.map.unwrap();
+        assert_eq!(map.to_virtual(pos(0, 1), Bias::Start), pos(0, 3));
+        // P's end is the content's end, before the deleted lines.
+        assert_eq!(map.to_virtual(pos(1, 0), Bias::Start), pos(1, 0));
+        assert_eq!(map.to_virtual(pos(1, 0), Bias::End), pos(1, 0));
+        assert_eq!(map.to_prepared(pos(2, 0), Bias::Start), pos(1, 0));
+        // V → P keeps to the content: P's end rule is for P offsets only.
+        assert_eq!(map.to_prepared(pos(0, 2), Bias::Start), pos(0, 0));
+        assert_eq!(map.to_prepared(pos(0, 3), Bias::Start), pos(0, 1));
+    }
+
+    #[test]
+    fn a_tab_indented_closing_line_goes_with_the_trailing_lines() {
+        let virtual_text = "  a\n\n\t\t".to_string();
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &VirtualLayout::single(&virtual_text),
+            result(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""},
+                {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
+            ]}]})),
+        )
+        .map(|prepared| prepared.text);
+        assert_eq!(prepared, Ok("  a\n".to_string()));
+    }
+
+    #[test]
+    fn trailing_lines_go_only_with_the_whole_closing_indent() {
+        // The indentation before a closing `''` is no part of the string's
+        // value either: a peer deleting the closing blank lines deletes it
+        // too, so P ends where they were.
+        let reason = "content changes may only delete closing blank lines with all of the closing line's indentation";
+        for (virtual_text, changes) in [
+            // The closing indent kept.
+            (
+                "  a\n\n\t\t",
+                json!([
+                    {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""}
+                ]),
+            ),
+            // Only part of it deleted.
+            (
+                "    a\n\n    ",
+                json!([
+                    {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+                    {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""},
+                    {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
+                ]),
+            ),
+        ] {
+            assert_eq!(
+                apply_prepare_result(
+                    virtual_text,
+                    &VirtualLayout::single(virtual_text),
+                    result(json!({"segments": [{"type": "content", "changes": changes}]})),
+                ),
+                Err(PrepareError::InvalidChange { index: 0, reason }),
+                "{virtual_text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_blank_lines_at_the_document_edges_may_be_deleted() {
+        let virtual_text = "\n\na\n\nb\n\n\n".to_string();
+        let prepare = |virtual_text: &str, changes: serde_json::Value| {
+            apply_prepare_result(
+                virtual_text,
+                &VirtualLayout::single(virtual_text),
+                result(json!({"segments": [{"type": "content", "changes": changes}]})),
+            )
+            .map(|prepared| prepared.text)
+        };
+        let prepared_text = |changes| prepare(&virtual_text, changes);
+        // Both leading lines, in one edit or one each, go.
+        let both = json!([{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""}]);
+        assert_eq!(prepared_text(both), Ok("a\n\nb\n\n\n".to_string()));
+        let each = json!([
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""},
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""}
+        ]);
+        assert_eq!(prepared_text(each), Ok("a\n\nb\n\n\n".to_string()));
+        // So do both trailing lines, in one edit or one each.
+        let trailing = json!([{"range": {"start": {"line": 5, "character": 0}, "end": {"line": 7, "character": 0}}, "newText": ""}]);
+        assert_eq!(prepared_text(trailing), Ok("\n\na\n\nb\n".to_string()));
+        let each = json!([
+            {"range": {"start": {"line": 5, "character": 0}, "end": {"line": 6, "character": 0}}, "newText": ""},
+            {"range": {"start": {"line": 6, "character": 0}, "end": {"line": 7, "character": 0}}, "newText": ""}
+        ]);
+        assert_eq!(prepared_text(each), Ok("\n\na\n\nb\n".to_string()));
+        let reason = "content changes may only delete blank lines at the document's edges";
+        for changes in [
+            // A blank line after one that stays.
+            json!([{"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""}]),
+            // A blank line between content lines.
+            json!([{"range": {"start": {"line": 3, "character": 0}, "end": {"line": 4, "character": 0}}, "newText": ""}]),
+            // A blank line before one that stays.
+            json!([{"range": {"start": {"line": 5, "character": 0}, "end": {"line": 6, "character": 0}}, "newText": ""}]),
+        ] {
+            assert_eq!(
+                prepared_text(changes),
+                Err(PrepareError::InvalidChange { index: 0, reason })
+            );
+        }
+        // Before a last line with content, a blank line is no closing one.
+        let before_content = json!([{"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""}]);
+        assert_eq!(
+            prepare("a\n\nb", before_content),
+            Err(PrepareError::InvalidChange { index: 0, reason })
+        );
+        let reason = "content changes may only delete whole blank lines";
+        for (virtual_text, changes) in [
+            // A line break alone, joining a line onto the previous one.
+            (
+                virtual_text.as_str(),
+                json!([{"range": {"start": {"line": 2, "character": 1}, "end": {"line": 3, "character": 0}}, "newText": ""}]),
+            ),
+            // A blank line and part of the next line's indent.
+            (
+                "\n  a\n",
+                json!([{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 1}}, "newText": ""}]),
+            ),
+        ] {
+            assert_eq!(
+                prepare(virtual_text, changes),
+                Err(PrepareError::InvalidChange { index: 0, reason })
+            );
+        }
+    }
+
+    #[test]
+    fn a_deletion_splitting_a_crlf_is_refused() {
+        // LSP treats CRLF as one line break, but a position between its CR
+        // and LF still names an offset: deleting up to or from there would
+        // leave a lone CR or LF the map does not count.
+        for (virtual_text, start, end) in [
+            ("\r\nfoo", (0, 0), (0, 1)),
+            ("  \r\nfoo", (0, 0), (0, 3)),
+            ("foo\r\n\r\n", (0, 4), (2, 0)),
+            ("a\r\n\r\n  ", (1, 1), (2, 0)),
+        ] {
+            let change = json!({"range": {
+                "start": {"line": start.0, "character": start.1},
+                "end": {"line": end.0, "character": end.1}
+            }, "newText": ""});
+            assert_eq!(
+                apply_prepare_result(
+                    virtual_text,
+                    &VirtualLayout::single(virtual_text),
+                    result(json!({"segments": [{"type": "content", "changes": [change]}]})),
+                ),
+                Err(PrepareError::InvalidChange {
+                    index: 0,
+                    reason: "content changes may only delete whole blank lines"
+                }),
+                "{virtual_text:?} {start:?}-{end:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn blank_lines_beside_a_gap_stay() {
+        // Two combined fences: the blank lines around the host text between
+        // them are inside the document, whatever segment they end or open.
+        let virtual_text = "foo\n\n\n\n\nbar\n".to_string();
+        let layout = VirtualLayout::from_pieces(
+            &virtual_text,
+            [
+                (SegmentKind::Content, 0..5, String::new()),
+                (SegmentKind::Gap, 5..7, "```\n```lua\n".to_string()),
+                (SegmentKind::Content, 7..12, String::new()),
+            ],
+        );
+        let line = json!([{"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""}]);
+        let opening = json!([{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""}]);
+        for (index, segments) in [
+            (
+                0,
+                json!([{"type": "content", "changes": line}, {"type": "gap"}, {"type": "content"}]),
+            ),
+            (
+                2,
+                json!([{"type": "content"}, {"type": "gap"}, {"type": "content", "changes": opening}]),
+            ),
+        ] {
+            assert_eq!(
+                apply_prepare_result(
+                    &virtual_text,
+                    &layout,
+                    result(json!({"segments": segments}))
+                ),
+                Err(PrepareError::InvalidChange {
+                    index,
+                    reason: "content changes may only delete blank lines at the document's edges"
+                })
+            );
+        }
+        // A first or last segment that is all blank lines is beside the gap
+        // too, though it holds the document's edge.
+        let virtual_text = "\n\n\n\n".to_string();
+        let layout = VirtualLayout::from_pieces(
+            &virtual_text,
+            [
+                (SegmentKind::Content, 0..1, String::new()),
+                (SegmentKind::Gap, 1..3, "```\n```lua\n".to_string()),
+                (SegmentKind::Content, 3..4, String::new()),
+            ],
+        );
+        let whole = json!([{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""}]);
+        for (index, segments) in [
+            (
+                0,
+                json!([{"type": "content", "changes": whole}, {"type": "gap"}, {"type": "content"}]),
+            ),
+            (
+                2,
+                json!([{"type": "content"}, {"type": "gap"}, {"type": "content", "changes": whole}]),
+            ),
+        ] {
+            assert_eq!(
+                apply_prepare_result(
+                    &virtual_text,
+                    &layout,
+                    result(json!({"segments": segments}))
+                ),
+                Err(PrepareError::InvalidChange {
+                    index,
+                    reason: "content changes may only delete blank lines at the document's edges"
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn edge_lines_beside_a_gap_within_a_line_go() {
+        // `''\n  ${x}/bin/foo\n''` and `''\n  a\n  ${x}\n\n''`: the gap
+        // sits within a line, so the blank text left beside it is that
+        // line's indent or line break, not blank lines beside the gap.
+        let first = "\n      /bin/foo\n";
+        let layout = VirtualLayout::from_pieces(
+            first,
+            [
+                (SegmentKind::Content, 0..3, String::new()),
+                (SegmentKind::Gap, 3..7, "${x}".to_string()),
+                (SegmentKind::Content, 7..16, String::new()),
+            ],
+        );
+        let opening = json!([{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""}]);
+        let prepared = apply_prepare_result(
+            first,
+            &layout,
+            result(json!({"segments": [{"type": "content", "changes": opening}, {"type": "gap"}, {"type": "content"}]})),
+        )
+        .map(|prepared| prepared.text);
+        assert_eq!(prepared, Ok("      /bin/foo\n".to_string()));
+        let last = "\n  a\n      \n\n";
+        let layout = VirtualLayout::from_pieces(
+            last,
+            [
+                (SegmentKind::Content, 0..7, String::new()),
+                (SegmentKind::Gap, 7..11, "${x}".to_string()),
+                (SegmentKind::Content, 11..13, String::new()),
+            ],
+        );
+        let closing = json!([{"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""}]);
+        let prepared = apply_prepare_result(
+            last,
+            &layout,
+            result(json!({"segments": [{"type": "content"}, {"type": "gap"}, {"type": "content", "changes": closing}]})),
+        )
+        .map(|prepared| prepared.text);
+        assert_eq!(prepared, Ok("\n  a\n      \n".to_string()));
+    }
+
+    #[test]
+    fn a_line_break_opening_a_segment_mid_line_stays() {
+        // `''\n  a\n'' + ''\n  b\n''`: the second string opens after the
+        // joining Nix on the same line, so its line break is no whole line.
+        let virtual_text = "\n  a\n       \n  b\n".to_string();
+        let layout = VirtualLayout::from_pieces(
+            &virtual_text,
+            [
+                (SegmentKind::Content, 0..5, String::new()),
+                (SegmentKind::Gap, 5..12, "'' + ''".to_string()),
+                (SegmentKind::Content, 12..17, String::new()),
+            ],
+        );
+        assert_eq!(
+            apply_prepare_result(
+                &virtual_text,
+                &layout,
+                result(json!({"segments": [
+                    {"type": "content"},
+                    {"type": "gap"},
+                    {"type": "content", "changes": [
+                        {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""}
+                    ]}
+                ]})),
+            ),
+            Err(PrepareError::InvalidChange {
+                index: 2,
+                reason: "content changes may only delete whole blank lines"
+            })
+        );
+    }
+
+    #[test]
+    fn content_change_must_delete_leading_whitespace_or_whole_lines() {
+        let virtual_text = "  a b\n".to_string();
+        let layout = VirtualLayout::single(&virtual_text);
+        for (change, reason) in [
+            (
+                json!({"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "newText": "x"}),
+                "content changes may only delete text",
+            ),
+            (
+                json!({"range": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 4}}, "newText": ""}),
+                "content changes may only delete leading whitespace",
+            ),
+            (
+                json!({"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}}, "newText": ""}),
+                "content changes may only delete whitespace",
+            ),
+            (
+                json!({"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 99}}, "newText": ""}),
+                "change ends outside the segment",
+            ),
+        ] {
+            assert_eq!(
+                apply_prepare_result(
+                    &virtual_text,
+                    &layout,
+                    result(json!({"segments": [{"type": "content", "changes": [change]}]})),
+                ),
+                Err(PrepareError::InvalidChange { index: 0, reason }),
+            );
+        }
+    }
+
+    #[test]
+    fn content_change_positions_are_segment_relative() {
+        let virtual_text = "x\n    \n  y\n".to_string();
+        let layout = VirtualLayout::from_pieces(
+            &virtual_text,
+            [
+                (SegmentKind::Content, 0..2, String::new()),
+                (SegmentKind::Gap, 2..7, "${a}\n".to_string()),
+                (SegmentKind::Content, 7..11, String::new()),
+            ],
+        );
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &layout,
+            result(json!({"segments": [
+                {"type": "content"},
+                {"type": "gap"},
+                {"type": "content", "changes": [
+                    {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+                ]}
+            ]})),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "x\n    \ny\n");
+    }
+
+    #[test]
+    fn mismatched_answers_are_refused() {
+        let (virtual_text, layout) = interpolated();
+        assert_eq!(
+            apply_prepare_result(
+                &virtual_text,
+                &layout,
+                result(json!({"segments": [{"type": "content"}]}))
+            ),
+            Err(PrepareError::SegmentCount {
+                expected: 3,
+                actual: 1
+            })
+        );
+        assert_eq!(
+            apply_prepare_result(
+                &virtual_text,
+                &layout,
+                result(
+                    json!({"segments": [{"type": "gap"}, {"type": "gap"}, {"type": "content"}]})
+                )
+            ),
+            Err(PrepareError::SegmentKind {
+                index: 0,
+                expected: SegmentKind::Content
+            })
+        );
+    }
+
+    /// `ab${x}cd` with the interpolation (a gap) replaced by nothing.
+    fn emptied_gap() -> (String, PreparedMap) {
+        let virtual_text = "ab    cd".to_string();
+        let layout = VirtualLayout::from_pieces(
+            &virtual_text,
+            [
+                (SegmentKind::Content, 0..2, String::new()),
+                (SegmentKind::Gap, 2..6, "${x}".to_string()),
+                (SegmentKind::Content, 6..8, String::new()),
+            ],
+        );
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &layout,
+            result(json!({"segments": [{"type": "content"}, {"type": "gap", "content": ""}, {"type": "content"}]})),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "abcd");
+        (
+            virtual_text,
+            std::sync::Arc::try_unwrap(prepared.map.unwrap()).unwrap(),
+        )
+    }
+
+    fn dedent_by_two(virtual_text: &str) -> PreparedMap {
+        let layout = VirtualLayout::single(virtual_text);
+        let changes: Vec<_> = virtual_text
+            .split('\n')
+            .enumerate()
+            .filter(|(_, line)| line.starts_with("  "))
+            .map(|(line, _)| json!({
+                "range": {"start": {"line": line, "character": 0}, "end": {"line": line, "character": 2}},
+                "newText": ""
+            }))
+            .collect();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &layout,
+            result(json!({"segments": [{"type": "content", "changes": changes}]})),
+        )
+        .unwrap();
+        std::sync::Arc::try_unwrap(prepared.map.unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_position_after_an_emptied_gap_lands_after_its_host_text() {
+        let (virtual_text, layout) = fenced();
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &layout,
+            result(json!({"segments": [{"type": "content"}, {"type": "gap", "content": ""}, {"type": "content"}]})),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "foo()\nbar()\n");
+        let map = prepared.map.unwrap();
+        // `bar()` starts P line 1 and V line 4, past the gap's lines.
+        assert_eq!(map.to_virtual(pos(1, 0), Bias::Start), pos(4, 0));
+        assert_eq!(map.to_prepared(pos(4, 0), Bias::Start), pos(1, 0));
+        // The gap's lines are inside it; the content around it is not.
+        assert!(map.virtual_position_in_gap(pos(2, 0)));
+        assert!(!map.virtual_position_in_gap(pos(0, 2)));
+        assert!(!map.virtual_position_in_gap(pos(4, 0)));
+    }
+
+    #[test]
+    fn a_range_end_at_an_emptied_gap_stops_before_it() {
+        let (_, map) = emptied_gap();
+        // P `ab|cd`: the end of `b` and the start of `c` share one offset,
+        // on either side of the gap's host text.
+        assert_eq!(map.to_virtual(pos(0, 2), Bias::End), pos(0, 2));
+        assert_eq!(map.to_virtual(pos(0, 2), Bias::Start), pos(0, 6));
+        assert_eq!(map.to_virtual(pos(0, 3), Bias::Start), pos(0, 7));
+        assert!(map.virtual_position_in_gap(pos(0, 4)));
+        // A V position inside the gap maps to where it was in P.
+        assert_eq!(map.to_prepared(pos(0, 4), Bias::Start), pos(0, 2));
+    }
+
+    #[test]
+    fn a_dedented_line_start_maps_past_its_removed_indent() {
+        let map = dedent_by_two("  a\n  b");
+        assert_eq!(map.to_virtual(pos(1, 0), Bias::Start), pos(1, 2));
+        // P's end too.
+        assert_eq!(map.to_virtual(pos(1, 1), Bias::End), pos(1, 3));
+        // A V position inside the removed indent maps to its line's start.
+        assert_eq!(map.to_prepared(pos(1, 1), Bias::Start), pos(1, 0));
+        assert!(!map.virtual_position_in_removed_lines(pos(1, 1)));
+    }
+
+    #[test]
+    fn the_document_end_before_an_emptied_trailing_gap() {
+        let virtual_text = "ab   ".to_string();
+        let layout = VirtualLayout::from_pieces(
+            &virtual_text,
+            [
+                (SegmentKind::Content, 0..2, String::new()),
+                (SegmentKind::Gap, 2..5, "${x}".to_string()),
+            ],
+        );
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &layout,
+            result(json!({"segments": [{"type": "content"}, {"type": "gap", "content": ""}]})),
+        )
+        .unwrap();
+        let map = prepared.map.unwrap();
+        assert_eq!(map.to_virtual(pos(0, 2), Bias::Start), pos(0, 2));
+        assert_eq!(map.to_virtual(pos(0, 1), Bias::Start), pos(0, 1));
+        assert_eq!(map.to_prepared(pos(0, 4), Bias::Start), pos(0, 2));
+    }
+
+    #[test]
+    fn lone_cr_lines_are_lines() {
+        let virtual_text = "  a\r  b".to_string();
+        let layout = VirtualLayout::single(&virtual_text);
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &layout,
+            result(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+            ]}]})),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "  a\rb");
+        assert_eq!(
+            prepared.map.unwrap().to_virtual(pos(1, 0), Bias::Start),
+            pos(1, 2)
+        );
+    }
+
+    #[test]
+    fn columns_after_a_placeholder_count_utf16_units() {
+        // `f(${a}, 𝄞é)`: the placeholder shrinks the gap, and the columns
+        // after it on that line count the surrogate pair as two units.
+        let virtual_text = "f(    , 𝄞é)".to_string();
+        let layout = VirtualLayout::from_pieces(
+            &virtual_text,
+            [
+                (SegmentKind::Content, 0..2, String::new()),
+                (SegmentKind::Gap, 2..6, "${a}".to_string()),
+                (SegmentKind::Content, 6..virtual_text.len(), String::new()),
+            ],
+        );
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &layout,
+            result(json!({"segments": [{"type": "content"}, {"type": "gap", "content": "1"}, {"type": "content"}]})),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "f(1, 𝄞é)");
+        let map = prepared.map.unwrap();
+        // `é` is P column 7 (f ( 1 , space 𝄞=2) and V column 10.
+        assert_eq!(map.to_virtual(pos(0, 7), Bias::Start), pos(0, 10));
+        assert_eq!(map.to_prepared(pos(0, 10), Bias::Start), pos(0, 7));
+    }
+}
