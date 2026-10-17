@@ -463,7 +463,7 @@ impl LanguageServerPool {
                 if !self.is_document_opened_on_connection(&virtual_uri, connection_key) {
                     return Err(io::Error::other("completion document is no longer open"));
                 }
-                if let Some(version) = self
+                if let Some(change) = self
                     .increment_version_if_content_changed(
                         &virtual_uri,
                         connection_key,
@@ -476,7 +476,7 @@ impl LanguageServerPool {
                             &virtual_uri,
                             connection_key,
                             SentText::from(&*document.text),
-                            version,
+                            change,
                         ),
                         NotificationSendResult::Queued
                     )

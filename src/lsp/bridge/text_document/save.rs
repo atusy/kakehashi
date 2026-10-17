@@ -112,13 +112,13 @@ impl LanguageServerPool {
                 let did_change = self
                     .increment_version_if_content_changed(&virtual_uri, &connection_key, content)
                     .await
-                    .map(|version| {
+                    .map(|change| {
                         self.send_didchange_recorded(
                             &handle,
                             &virtual_uri,
                             &connection_key,
                             content,
-                            version,
+                            change,
                         )
                     });
 
