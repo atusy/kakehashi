@@ -109,6 +109,8 @@ pub(crate) struct InjectionPass {
     /// could not look deferred its work to a retry that only syncs
     /// documents.
     pub(crate) looked: bool,
+    /// The revision of the host it synced, which what it sent describes.
+    pub(crate) revision: Option<crate::lsp::bridge::HostRevision>,
 }
 
 /// The injections to send downstream: all but the held ones (see
@@ -662,6 +664,10 @@ impl InjectionCoordinator {
             return InjectionPass {
                 synchronized: true,
                 looked: false,
+                revision: Some(crate::lsp::bridge::HostRevision {
+                    incarnation,
+                    content_version,
+                }),
             };
         };
         // Stop the previous pass before closing a replaced language-bearing URI;
@@ -681,6 +687,10 @@ impl InjectionCoordinator {
             return InjectionPass {
                 synchronized: true,
                 looked: true,
+                revision: Some(crate::lsp::bridge::HostRevision {
+                    incarnation,
+                    content_version,
+                }),
             };
         }
         let replaced_regions = self.bridge.close_replaced_docs(uri, &injections).await;
@@ -836,6 +846,10 @@ impl InjectionCoordinator {
         InjectionPass {
             synchronized,
             looked: true,
+            revision: Some(crate::lsp::bridge::HostRevision {
+                incarnation,
+                content_version,
+            }),
         }
     }
 
