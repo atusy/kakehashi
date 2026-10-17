@@ -3235,10 +3235,12 @@ impl LanguageServerPool {
         )
     }
 
-    /// Forget which of `documents` a connection was ever sent a prepared text
-    /// of (see `DocumentTracker::forget_prepared_history`).
-    pub(super) fn forget_prepared_history(&self, documents: &[OpenedVirtualDoc]) {
-        self.document_tracker.forget_prepared_history(documents);
+    /// Forget which of `host_uri`'s documents a connection was ever sent a
+    /// prepared text of (see `DocumentTracker::forget_prepared_history`).
+    pub(super) fn forget_prepared_history(&self, host_uri: &Url) {
+        if let Ok(host_uri) = crate::lsp::lsp_impl::url_to_uri(host_uri) {
+            self.document_tracker.forget_prepared_history(&host_uri);
+        }
     }
 
     /// What `connection_key` was last sent for `virtual_uri` (see
