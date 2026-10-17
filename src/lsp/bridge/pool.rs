@@ -2781,7 +2781,12 @@ impl LanguageServerPool {
             ),
             VirtualOpenContent::Snapshot(provided) => (provided, None),
         };
-        let virtual_content = current_content.as_deref().map_or(provided, SentText::from);
+        // The cache holds virtual text as is: it never stands in for a
+        // prepared text, whose map it would drop.
+        let virtual_content = current_content
+            .as_deref()
+            .filter(|_| provided.map.is_none())
+            .map_or(provided, SentText::from);
         let did_open = build_didopen_notification(virtual_uri, virtual_content.text);
         // What the connection holds is recorded before the didOpen can reach
         // it: a server pushing diagnostics the moment it opens the document
