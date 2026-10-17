@@ -280,6 +280,22 @@ impl super::BridgeCoordinator {
         }
     }
 
+    /// Settle `input`'s answer as a request's attempt would (see
+    /// `PrepareRegistry::answer_for_test`).
+    #[cfg(test)]
+    pub(crate) fn answer_prepare_for_test(
+        &self,
+        target: &super::PrepareTarget,
+        input: PrepareInput<'_>,
+        answer: super::prepare_registry::Answer,
+    ) {
+        self.prepare
+            .as_ref()
+            .expect("the prepare layer")
+            .registry
+            .answer_for_test(target, input, answer);
+    }
+
     /// What the lifecycle pass knows of a region's current document (see
     /// [`RegionPrepare`]).
     pub(crate) fn prepare_region(

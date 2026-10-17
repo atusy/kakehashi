@@ -480,6 +480,21 @@ impl PrepareRegistry {
     /// `None` for a target resolved under another epoch (settings changed
     /// since, say): its candidates may not be the ones to ask, and asking
     /// could start a peer the settings no longer name.
+    /// Settle `input`'s answer as a request's attempt would, without the
+    /// lifecycle pass holding its document on it.
+    #[cfg(test)]
+    pub(crate) fn answer_for_test(
+        &self,
+        target: &PrepareTarget,
+        input: PrepareInput<'_>,
+        answer: Answer,
+    ) {
+        let slot = self
+            .slot(target, input, Holder::Request, target.epoch)
+            .expect("an input under the current epoch");
+        assert!(slot.cell.outcome.set(answer).is_ok(), "answered already");
+    }
+
     fn slot(
         &self,
         target: &PrepareTarget,

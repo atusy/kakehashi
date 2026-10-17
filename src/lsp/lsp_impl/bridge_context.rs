@@ -84,6 +84,22 @@ pub(crate) fn method_closed_to(resolved: &ResolvedInjection, method: &str, prepa
         && (!resolved.contiguous || (prepared && method != "textDocument/inlayHint"))
 }
 
+/// [`prepare_request_context`] for a `method` request: `None` when the
+/// document could not be prepared, or when `method` is closed to it as
+/// prepared — checked again with the answer in, since the lifecycle pass may
+/// not have looked the region up yet.
+pub(crate) async fn prepare_request_context_for(
+    bridge: &crate::lsp::bridge::BridgeCoordinator,
+    host_language: &str,
+    ctx: DocumentRequestContext,
+    method: &str,
+) -> Option<DocumentRequestContext> {
+    let ctx = prepare_request_context(bridge, host_language, ctx)
+        .await
+        .ok()?;
+    (!method_closed_to(&ctx.resolved, method, ctx.prepared.is_some())).then_some(ctx)
+}
+
 /// Present `ctx`'s virtual document as downstream servers see it, waiting for
 /// the prepare peer when the (host, injection) pair has one: the context's
 /// virtual content becomes the prepared text and its fan-out translates
@@ -1425,15 +1441,7 @@ impl Kakehashi {
             max_fan_out: agg.max_fan_out,
             client_progress_token: None,
         };
-        let ctx = prepare_request_context(&self.bridge, &preamble.language_name, ctx)
-            .await
-            .ok()?;
-        // Checked again with the answer in: the lifecycle pass may not have
-        // looked the region up yet.
-        if method_closed_to(&ctx.resolved, method_name, ctx.prepared.is_some()) {
-            return None;
-        }
-        Some(ctx)
+        prepare_request_context_for(&self.bridge, &preamble.language_name, ctx, method_name).await
     }
 
     /// Whether `method` is closed to a region of a `host_language` host: by
@@ -2142,6 +2150,163 @@ mod tests {
     use crate::config::settings::{
         AggregationConfig, AggregationStrategy, BridgeLanguageConfig, LanguageSettings,
     };
+
+    /// A Kakehashi over a preparing pool whose markdown lua documents have
+    /// one candidate, and a region of it no lifecycle pass looked up.
+    fn kakehashi_with_an_unlooked_region() -> (
+        tower_lsp_server::LspService<crate::lsp::lsp_impl::Kakehashi>,
+        crate::language::injection::ResolvedInjection,
+        Url,
+    ) {
+        let pool = std::sync::Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
+        let (service, _socket) = tower_lsp_server::LspService::new(|client| {
+            crate::lsp::lsp_impl::Kakehashi::with_cancel_forwarder(
+                client,
+                std::sync::Arc::clone(&pool),
+                crate::lsp::CancelForwarder::new(std::sync::Arc::clone(&pool)),
+            )
+        });
+        let settings = std::sync::Arc::new(crate::config::WorkspaceSettings {
+            auto_install: false,
+            language_servers: [(
+                "peer".to_string(),
+                crate::lsp::bridge::test_helpers::devnull_config_for_language("lua"),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+        service.inner().bridge.prepare_settings_changed(&settings);
+        let resolved = crate::language::injection::ResolvedInjection {
+            region: crate::language::injection::CacheableInjectionRegion {
+                language: "lua".to_string(),
+                byte_range: 0..1,
+                line_range: 0..1,
+                start_column: 0,
+                region_id: "01J0000000000000000000000A".to_string(),
+                content_hash: 0,
+            },
+            injection_language: "lua".to_string(),
+            virtual_content: "  a".to_string(),
+            line_column_offsets: vec![0],
+            contiguous: true,
+            gaps: Default::default(),
+        };
+        (
+            service,
+            resolved,
+            Url::parse("file:///test/unlooked.md").unwrap(),
+        )
+    }
+
+    /// Answer the region's current text with `answer`, as a request's
+    /// attempt would — the lifecycle pass still holds nothing.
+    fn answer(
+        server: &crate::lsp::lsp_impl::Kakehashi,
+        uri: &Url,
+        resolved: &crate::language::injection::ResolvedInjection,
+        answer: crate::lsp::bridge::PrepareAnswer,
+    ) {
+        let target = server.bridge.prepare_target("markdown", "lua").unwrap();
+        server.bridge.answer_prepare_for_test(
+            &target,
+            crate::lsp::bridge::PrepareInput {
+                host_uri: uri,
+                host_language: "markdown",
+                injection_language: "lua",
+                region_id: &resolved.region.region_id,
+                virtual_text: &resolved.virtual_content,
+                gaps: &resolved.gaps,
+            },
+            answer,
+        );
+        assert!(!server.lifecycle_prepares(uri, resolved));
+    }
+
+    fn dedented() -> crate::lsp::bridge::PrepareAnswer {
+        let answer = serde_json::from_value(serde_json::json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        crate::lsp::bridge::PrepareAnswer::Prepared(std::sync::Arc::new(
+            crate::lsp::bridge::apply_prepare_result(
+                "  a",
+                &crate::lsp::bridge::VirtualLayout::single("  a"),
+                Some(answer),
+            )
+            .unwrap(),
+        ))
+    }
+
+    /// An edit method on a region the lifecycle pass has not looked up yet
+    /// is closed once its answer is in, unless the document goes as is;
+    /// inlay hints stay open (their edits are dropped instead).
+    #[tokio::test]
+    async fn an_answer_closes_edit_methods_before_the_lifecycle_pass_looks() {
+        let (service, resolved, uri) = kakehashi_with_an_unlooked_region();
+        let server = service.inner();
+        answer(server, &uri, &resolved, dedented());
+        let closed = |method| server.method_closed_to_region(&uri, "markdown", &resolved, method);
+        assert!(closed("textDocument/formatting").await);
+        assert!(closed("textDocument/rangeFormatting").await);
+        assert!(!closed("textDocument/inlayHint").await);
+
+        let ctx = || DocumentRequestContext {
+            prepared: None,
+            uri: uri.clone(),
+            resolved: resolved.clone(),
+            region_end: None,
+            configs: Vec::new(),
+            upstream_request_id: None,
+            priorities: vec!["*".to_string()],
+            strategy: AggregationStrategy::Preferred,
+            max_fan_out: None,
+            client_progress_token: None,
+        };
+        let for_method =
+            |method| prepare_request_context_for(&server.bridge, "markdown", ctx(), method);
+        assert!(for_method("textDocument/rename").await.is_none());
+        assert!(for_method("textDocument/completion").await.is_none());
+        let hint = for_method("textDocument/inlayHint")
+            .await
+            .expect("hints stay open");
+        assert!(hint.prepared.is_some());
+        assert_eq!(hint.resolved.virtual_content, "a");
+    }
+
+    #[tokio::test]
+    async fn an_answer_sending_the_document_as_is_keeps_edit_methods_open() {
+        let (service, resolved, uri) = kakehashi_with_an_unlooked_region();
+        let server = service.inner();
+        answer(
+            server,
+            &uri,
+            &resolved,
+            crate::lsp::bridge::PrepareAnswer::AsIs,
+        );
+        assert!(
+            !server
+                .method_closed_to_region(&uri, "markdown", &resolved, "textDocument/formatting")
+                .await
+        );
+        let ctx = DocumentRequestContext {
+            prepared: None,
+            uri: uri.clone(),
+            resolved: resolved.clone(),
+            region_end: None,
+            configs: Vec::new(),
+            upstream_request_id: None,
+            priorities: vec!["*".to_string()],
+            strategy: AggregationStrategy::Preferred,
+            max_fan_out: None,
+            client_progress_token: None,
+        };
+        let ctx =
+            prepare_request_context_for(&server.bridge, "markdown", ctx, "textDocument/rename")
+                .await
+                .expect("a document sent as is takes edits");
+        assert!(ctx.prepared.is_none());
+    }
 
     #[test]
     fn a_prepared_document_is_closed_to_edit_methods_but_not_inlay_hints() {
