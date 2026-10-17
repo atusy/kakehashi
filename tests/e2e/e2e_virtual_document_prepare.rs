@@ -638,6 +638,7 @@ fn an_editor_pull_while_preparing_waits_for_the_prepared_text() {
     // answer past one pull's budget), never with the text before.
     let deadline = Instant::now() + Duration::from_secs(30);
     let items = loop {
+        let started = Instant::now();
         let report = pull(&mut client, uri);
         let items = echo_items(&report);
         assert!(
@@ -647,6 +648,11 @@ fn an_editor_pull_while_preparing_waits_for_the_prepared_text() {
         if !items.is_empty() {
             break items;
         }
+        // Empty only after waiting out the answer's budget (5 s).
+        assert!(
+            started.elapsed() >= Duration::from_secs(4),
+            "the pull did not wait for the prepared text: {report}"
+        );
         assert!(Instant::now() < deadline, "{report}");
         std::thread::sleep(Duration::from_millis(100));
     };
