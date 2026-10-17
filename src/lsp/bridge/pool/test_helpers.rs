@@ -19,6 +19,16 @@ use crate::lsp::bridge::protocol::RequestId;
 
 // Test ULID constants - valid 26-char alphanumeric strings matching ULID format.
 // Using realistic ULIDs ensures tests reflect actual runtime behavior.
+/// Make `handle` advertise `kakehashi/virtualDocument/prepare` (or not), as
+/// its handshake would have.
+#[allow(
+    dead_code,
+    reason = "the prepare registry asks candidates through these, next"
+)]
+pub(crate) fn advertise_prepare_for_test(handle: &ConnectionHandle, advertised: bool) {
+    handle.set_virtual_document_prepare(advertised);
+}
+
 pub(in crate::lsp::bridge) const TEST_ULID_LUA_0: &str = "01JPMQ8ZYYQA1W3AVPW4JDRZFR";
 pub(in crate::lsp::bridge) const TEST_ULID_LUA_1: &str = "01JPMQ8ZYYQA1W3AVPW4JDRZFS";
 pub(in crate::lsp::bridge) const TEST_ULID_PYTHON_0: &str = "01JPMQ8ZYYQA1W3AVPW4JDRZFT";
