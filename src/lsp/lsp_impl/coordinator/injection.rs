@@ -85,6 +85,18 @@ pub(crate) struct InjectionCoordinator {
     shutdown: tokio_util::sync::CancellationToken,
 }
 
+/// What one injection pass over a host did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InjectionPass {
+    /// Every send it made could be queued (`false` also when the document
+    /// is gone).
+    pub(crate) synchronized: bool,
+    /// Its regions could be looked at (not, during a reload): a pass that
+    /// could not look deferred its work to a retry that only syncs
+    /// documents.
+    pub(crate) looked: bool,
+}
+
 /// The injections to send downstream: all but the held ones (see
 /// `BridgeInjection::held`).
 pub(crate) fn sendable_injections(injections: Vec<BridgeInjection>) -> Vec<BridgeInjection> {
@@ -455,53 +467,6 @@ impl InjectionCoordinator {
         presented_injection(injection, lookup)
     }
 
-    /// Forward a save `uri`'s held regions missed to those now sent, while
-    /// the host is still at the saved version (under its edit lock, like the
-    /// save itself). Regions still held keep waiting. `false` when the
-    /// regions could not be looked at (a reload in progress): the save is
-    /// kept for a later pass.
-    pub(crate) async fn replay_held_save(&self, uri: &Url) -> bool {
-        let Some(mut held) = self.bridge.take_held_save(uri) else {
-            return true;
-        };
-        let edit_lock = self.documents.edit_lock(uri);
-        let _guard = edit_lock.lock().await;
-        let current = self
-            .documents
-            .get(uri)
-            .map(|document| (document.incarnation(), document.content_version()));
-        if current != Some((held.incarnation, held.content_version)) {
-            // Edited (or closed) since: the next save is the one to forward.
-            return true;
-        }
-        let Some((_, Some(injections))) = self.bridge_injections(uri) else {
-            self.bridge
-                .hold_save(uri, held.incarnation, held.content_version, held.region_ids);
-            return false;
-        };
-        let (sent, still_held): (Vec<_>, Vec<_>) = injections
-            .into_iter()
-            .filter(|injection| held.region_ids.contains(&injection.region_id))
-            .partition(|injection| !injection.held);
-        if !sent.is_empty() {
-            // Fire-and-forget like any didSave forward: the debt is the save
-            // the held regions missed, not its delivery.
-            self.bridge
-                .pool()
-                .sync_and_forward_did_save_to_virtual_docs(uri, held.incarnation, &sent)
-                .await;
-        }
-        if !still_held.is_empty() {
-            held.region_ids = still_held
-                .into_iter()
-                .map(|injection| injection.region_id)
-                .collect();
-            self.bridge
-                .hold_save(uri, held.incarnation, held.content_version, held.region_ids);
-        }
-        true
-    }
-
     /// Process injected languages: resolve injection data, optionally forward didChange,
     /// auto-install missing parsers, and eagerly open virtual documents.
     ///
@@ -518,11 +483,11 @@ impl InjectionCoordinator {
             .await;
     }
 
-    /// [`Self::process_injections`] forwarding didChange, reporting whether
-    /// every send it made could be queued (`false` also when the document
-    /// is gone).
-    pub(crate) async fn process_injections_synchronized(&self, uri: &Url) -> bool {
-        self.process_injections_after_lifecycle_lock(uri, true, None, std::future::ready(()))
+    /// [`Self::process_injections`] forwarding didChange, for a resync after
+    /// prepare answers: it also forwards a save the host's held regions
+    /// missed to those it now sends (see [`InjectionPass`]).
+    pub(crate) async fn process_injections_for_resync(&self, uri: &Url) -> InjectionPass {
+        self.run_injection_pass(uri, true, None, std::future::ready(()), true)
             .await
     }
 
@@ -565,6 +530,33 @@ impl InjectionCoordinator {
     where
         F: std::future::Future<Output = ()>,
     {
+        self.run_injection_pass(
+            uri,
+            forward_did_change,
+            required,
+            after_lifecycle_lock,
+            false,
+        )
+        .await
+        .synchronized
+    }
+
+    /// [`Self::process_injections_after_lifecycle_lock`], reporting what the
+    /// pass did. With `replay_held_save`, a save the host's held regions
+    /// missed is forwarded, under the pass's lock and from its own
+    /// resolution, to those the pass sends — while the host is still at the
+    /// saved version; regions still held keep waiting.
+    async fn run_injection_pass<F>(
+        &self,
+        uri: &Url,
+        forward_did_change: bool,
+        required: Option<InjectionTarget>,
+        after_lifecycle_lock: F,
+        replay_held_save: bool,
+    ) -> InjectionPass
+    where
+        F: std::future::Future<Output = ()>,
+    {
         // Serialize the complete tree-derived downstream pass with didClose and
         // didOpen. The pass uses the document state observed after it acquires
         // this guard; holding the same lifecycle lock through
@@ -578,12 +570,13 @@ impl InjectionCoordinator {
                 self.bridge.cancel_eager_open(uri);
             }
             self.documents.remove_edit_lock_if_unshared(uri, &edit_lock);
-            return false;
+            return InjectionPass::default();
         };
         if required.is_some_and(|target| !target.matches(&document)) {
-            return false;
+            return InjectionPass::default();
         }
         let incarnation = document.incarnation();
+        let content_version = document.content_version();
         drop(document);
 
         // Stored language first (see `document_language`): parser-aware
@@ -593,7 +586,7 @@ impl InjectionCoordinator {
         // look" and leave existing state alone.
         let Some(host_language) = self.document_language(uri) else {
             self.bridge.cancel_eager_open(uri);
-            return false;
+            return InjectionPass::default();
         };
         // `None`: the document could not be looked at (its language is still
         // publishing, or it has no tree yet). Leave whatever is open alone —
@@ -622,7 +615,10 @@ impl InjectionCoordinator {
                 );
             }
             self.documents.remove_edit_lock_if_unshared(uri, &edit_lock);
-            return true;
+            return InjectionPass {
+                synchronized: true,
+                looked: false,
+            };
         };
         // Stop the previous pass before closing a replaced language-bearing URI;
         // otherwise an old eager task can enqueue didOpen after the close and
@@ -634,7 +630,14 @@ impl InjectionCoordinator {
         // injections query), which no edit-driven close would catch.
         self.retract_deselected_docs(uri, &host_language).await;
         if injections.is_empty() {
-            return true;
+            if replay_held_save {
+                // No region left to forward it to.
+                let _ = self.bridge.take_held_save(uri);
+            }
+            return InjectionPass {
+                synchronized: true,
+                looked: true,
+            };
         }
         let replaced_regions = self.bridge.close_replaced_docs(uri, &injections).await;
         for region_id in replaced_regions {
@@ -687,6 +690,15 @@ impl InjectionCoordinator {
                     .evict_source(uri, &DiagnosticSource::Region(region_id));
             }
         }
+        let still_held: HashSet<String> = if replay_held_save {
+            injections
+                .iter()
+                .filter(|injection| injection.held)
+                .map(|injection| injection.region_id.clone())
+                .collect()
+        } else {
+            HashSet::new()
+        };
         let injections = sendable_injections(injections);
 
         let synchronized = if forward_did_change {
@@ -696,6 +708,32 @@ impl InjectionCoordinator {
         } else {
             true
         };
+        if replay_held_save
+            && let Some(mut held) = self.bridge.take_held_save(uri)
+            // Edited since: the next save is the one to forward.
+            && (held.incarnation, held.content_version) == (incarnation, content_version)
+        {
+            let sent: Vec<BridgeInjection> = injections
+                .iter()
+                .filter(|injection| held.region_ids.contains(&injection.region_id))
+                .cloned()
+                .collect();
+            if !sent.is_empty() {
+                // After the didChange above, which sent their text. Fire and
+                // forget like any didSave forward: the debt is the save the
+                // held regions missed, not its delivery.
+                self.bridge
+                    .pool()
+                    .sync_and_forward_did_save_to_virtual_docs(uri, incarnation, &sent)
+                    .await;
+            }
+            held.region_ids
+                .retain(|region_id| still_held.contains(region_id));
+            if !held.region_ids.is_empty() {
+                self.bridge
+                    .hold_save(uri, held.incarnation, held.content_version, held.region_ids);
+            }
+        }
 
         // Re-home the injected-language parser install OFF this task (#480 liveness;
         // the parse-actor ADR's "PR-3"). When a region's injected language has no
@@ -751,7 +789,10 @@ impl InjectionCoordinator {
                     .await;
             },
         );
-        synchronized
+        InjectionPass {
+            synchronized,
+            looked: true,
+        }
     }
 
     /// Check injected languages and handle missing parsers: auto-install when enabled,
