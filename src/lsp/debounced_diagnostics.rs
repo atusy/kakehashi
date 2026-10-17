@@ -84,7 +84,7 @@ pub(crate) struct DebounceExecutionGate {
 pub(crate) struct DebouncedDiagnosticsManager {
     /// Active debounce timers per document.
     /// The AbortHandle allows cancelling the timer when a new change arrives.
-    active_timers: DashMap<Url, AbortHandle>,
+    active_timers: DashMap<Url, Timer>,
 
     /// Milliseconds to wait after the last change before triggering diagnostics.
     /// Atomic so a `diagnostics_debounce_ms` config change applies to subsequent
@@ -93,6 +93,36 @@ pub(crate) struct DebouncedDiagnosticsManager {
     debounce_millis: AtomicU64,
     #[cfg(test)]
     execution_gate: std::sync::Mutex<Option<Arc<DebounceExecutionGate>>>,
+}
+
+/// A document's pending debounce timer, and the collection it was
+/// scheduled as.
+struct Timer {
+    handle: AbortHandle,
+    /// `(incarnation, content_version, settings_generation)`.
+    lineage: (u64, u64, u64),
+    trigger: SyntheticDiagnosticTrigger,
+}
+
+impl Timer {
+    /// Whether a schedule of `lineage` as `trigger` leaves this timer be: it
+    /// ranks above it for the same text and settings, as one scheduled after
+    /// held regions were sent ranks above an edit's whose snapshot was
+    /// captured before (and so left those regions out).
+    fn outranks(&self, lineage: (u64, u64, u64), trigger: SyntheticDiagnosticTrigger) -> bool {
+        !self.handle.is_finished() && self.lineage == lineage && self.trigger > trigger
+    }
+}
+
+#[cfg(test)]
+impl From<AbortHandle> for Timer {
+    fn from(handle: AbortHandle) -> Self {
+        Self {
+            handle,
+            lineage: (0, 0, 0),
+            trigger: SyntheticDiagnosticTrigger::Change,
+        }
+    }
 }
 
 impl Default for DebouncedDiagnosticsManager {
@@ -141,9 +171,10 @@ impl DebouncedDiagnosticsManager {
 
     /// Schedule a debounced diagnostic for a document.
     ///
-    /// Any existing timer for this document is cancelled and replaced; on expiry
-    /// the new timer publishes diagnostics from the pre-captured `snapshot_data`,
-    /// ranked as `trigger` among the version's collections.
+    /// Any existing timer for this document is cancelled and replaced, unless
+    /// it outranks this one for the same version; on expiry the new timer
+    /// publishes diagnostics from the pre-captured `snapshot_data`, ranked as
+    /// `trigger` among the version's collections.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn schedule(
         &self,
@@ -161,18 +192,10 @@ impl DebouncedDiagnosticsManager {
         // stale entries for documents that completed their debounce cycle.
         const CLEANUP_THRESHOLD: usize = 32;
         if self.active_timers.len() > CLEANUP_THRESHOLD {
-            self.active_timers.retain(|_, handle| !handle.is_finished());
+            self.active_timers
+                .retain(|_, timer| !timer.handle.is_finished());
         }
 
-        // Cancel existing timer if any
-        if let Some((_, prev_handle)) = self.active_timers.remove(&uri) {
-            prev_handle.abort();
-            log::trace!(
-                target: LOG_TARGET,
-                "Cancelled previous debounce timer for {}",
-                uri
-            );
-        }
         let Some((incarnation, content_version, settings_generation)) = snapshot_data
             .as_ref()
             .map(|snapshot| {
@@ -188,8 +211,31 @@ impl DebouncedDiagnosticsManager {
                     .map(|doc| (doc.incarnation(), doc.content_version(), 0))
             })
         else {
+            if let Some((_, previous)) = self.active_timers.remove(&uri) {
+                previous.handle.abort();
+            }
             return;
         };
+        let lineage = (incarnation, content_version, settings_generation);
+        // The check and the replacement under the entry's lock: a schedule
+        // racing this one either sees the timer this one leaves or replaces it.
+        let entry = self.active_timers.entry(uri.clone());
+        if let dashmap::mapref::entry::Entry::Occupied(previous) = &entry {
+            if previous.get().outranks(lineage, trigger) {
+                log::trace!(
+                    target: LOG_TARGET,
+                    "Kept the outranking debounce timer for {}",
+                    uri
+                );
+                return;
+            }
+            previous.get().handle.abort();
+            log::trace!(
+                target: LOG_TARGET,
+                "Cancelled previous debounce timer for {}",
+                uri
+            );
+        }
 
         let data = DebouncedDiagnosticData {
             uri: uri.clone(),
@@ -225,15 +271,19 @@ impl DebouncedDiagnosticsManager {
         });
 
         // Register the timer
-        self.active_timers.insert(uri, task.abort_handle());
+        entry.insert(Timer {
+            handle: task.abort_handle(),
+            lineage,
+            trigger,
+        });
     }
 
     /// Cancel the debounce timer for a document.
     ///
     /// Called when a document is closed - no need for debounced diagnostics.
     pub(crate) fn cancel(&self, uri: &Url) {
-        if let Some((_, handle)) = self.active_timers.remove(uri) {
-            handle.abort();
+        if let Some((_, timer)) = self.active_timers.remove(uri) {
+            timer.handle.abort();
             log::trace!(
                 target: LOG_TARGET,
                 "Cancelled debounce timer for closed document {}",
@@ -247,7 +297,7 @@ impl DebouncedDiagnosticsManager {
     /// Called during server shutdown.
     pub(crate) fn cancel_all(&self) {
         for entry in self.active_timers.iter() {
-            entry.value().abort();
+            entry.value().handle.abort();
         }
         self.active_timers.clear();
         log::debug!(
@@ -276,7 +326,7 @@ impl DebouncedDiagnosticsManager {
     pub(crate) fn timer_abort_handle(&self, uri: &Url) -> Option<AbortHandle> {
         self.active_timers
             .get(uri)
-            .map(|entry| entry.value().clone())
+            .map(|entry| entry.value().handle.clone())
     }
 }
 
@@ -486,7 +536,7 @@ mod tests {
         });
         manager
             .active_timers
-            .insert(uri.clone(), task.abort_handle());
+            .insert(uri.clone(), task.abort_handle().into());
 
         assert!(manager.has_active_timer(&uri));
 
@@ -511,8 +561,12 @@ mod tests {
         let handle1 = task1.abort_handle();
         let handle2 = task2.abort_handle();
 
-        manager.active_timers.insert(uri1.clone(), handle1.clone());
-        manager.active_timers.insert(uri2.clone(), handle2.clone());
+        manager
+            .active_timers
+            .insert(uri1.clone(), handle1.clone().into());
+        manager
+            .active_timers
+            .insert(uri2.clone(), handle2.clone().into());
 
         assert_eq!(manager.active_timer_count(), 2);
 
@@ -536,7 +590,9 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(10)).await;
         });
         let handle1 = task1.abort_handle();
-        manager.active_timers.insert(uri.clone(), handle1.clone());
+        manager
+            .active_timers
+            .insert(uri.clone(), handle1.clone().into());
 
         // Insert another timer for the same URI (simulating what schedule does)
         let task2 = tokio::spawn(async {
@@ -546,9 +602,11 @@ mod tests {
 
         // Remove and abort previous
         if let Some((_, prev_handle)) = manager.active_timers.remove(&uri) {
-            prev_handle.abort();
+            prev_handle.handle.abort();
         }
-        manager.active_timers.insert(uri.clone(), handle2.clone());
+        manager
+            .active_timers
+            .insert(uri.clone(), handle2.clone().into());
 
         // Yield to let abort propagate
         tokio::task::yield_now().await;

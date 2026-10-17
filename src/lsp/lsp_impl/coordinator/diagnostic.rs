@@ -831,6 +831,43 @@ mod tests {
         assert!(superseded.unwrap_err().is_cancelled());
     }
 
+    /// An edit's debounce whose snapshot was captured before held regions
+    /// were sent does not replace the timer scheduled after they were, for
+    /// the same version: nothing else would collect those regions.
+    #[tokio::test]
+    async fn an_edits_debounce_keeps_the_timer_scheduled_after_prepare() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///test/prepared-then-edit-timer.md").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "# typed\n".to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let scheduler = DiagnosticScheduler::new(server);
+        let timers = &server.debounced_diagnostics;
+        scheduler.schedule_debounced_diagnostic_after_prepare(uri.clone());
+        let prepared = timers.timer_abort_handle(&uri).unwrap();
+        scheduler.schedule_debounced_diagnostic(uri.clone());
+        assert_eq!(timers.timer_abort_handle(&uri).unwrap().id(), prepared.id());
+        assert!(!prepared.is_finished());
+        // A newer version's edit replaces it.
+        server.documents.insert(
+            uri.clone(),
+            "# typed more\n".to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        scheduler.schedule_debounced_diagnostic(uri.clone());
+        assert_ne!(timers.timer_abort_handle(&uri).unwrap().id(), prepared.id());
+        // And one scheduled after prepare replaces an edit's.
+        let edited = timers.timer_abort_handle(&uri).unwrap();
+        scheduler.schedule_debounced_diagnostic_after_prepare(uri.clone());
+        assert_ne!(timers.timer_abort_handle(&uri).unwrap().id(), edited.id());
+        timers.cancel_all();
+    }
+
     #[tokio::test]
     async fn saved_diagnostic_snapshot_input_rejects_a_later_edit() {
         let (service, _socket) = LspService::new(Kakehashi::new);
