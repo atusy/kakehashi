@@ -181,6 +181,82 @@ mod tests {
     use super::*;
     use tower_lsp_server::LspService;
 
+    /// A save resolves its regions holding them on the saved text, as the
+    /// lifecycle pass does: that text's answer then syncs the host and
+    /// replays the save, even when it lands before the edit's own pass.
+    #[tokio::test]
+    async fn a_save_holds_its_held_regions_on_the_saved_text() {
+        use std::sync::Arc;
+        let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
+        let (service, _socket) = LspService::new(|client| {
+            Kakehashi::with_cancel_forwarder(
+                client,
+                Arc::clone(&pool),
+                crate::lsp::CancelForwarder::new(Arc::clone(&pool)),
+            )
+        });
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), language.clone());
+        server.language.query_store().insert_injection_query(
+            "rust".into(),
+            Arc::new(
+                tree_sitter::Query::new(
+                    &language,
+                    r#"((string_literal) @injection.content (#set! injection.language "rust"))"#,
+                )
+                .unwrap(),
+            ),
+        );
+        server
+            .bridge
+            .prepare_settings_changed(&Arc::new(crate::config::WorkspaceSettings {
+                auto_install: false,
+                language_servers: [(
+                    "peer".to_string(),
+                    crate::lsp::bridge::test_helpers::devnull_config_for_language("rust"),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            }));
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let uri = url::Url::parse("file:///saved.rs").unwrap();
+        let text = r#"fn main() { let x = "a"; }"#;
+        server.documents.insert(
+            uri.clone(),
+            text.into(),
+            Some("rust".into()),
+            parser.parse(text, None),
+        );
+        let (incarnation, content_version) = {
+            let document = server.documents.get(&uri).unwrap();
+            (document.incarnation(), document.content_version())
+        };
+
+        server
+            .forward_virtual_did_save_for_saved_version(&pool, &uri, incarnation, content_version)
+            .await;
+
+        let held = server
+            .bridge
+            .take_held_save(&uri)
+            .expect("the held region misses the save");
+        assert_eq!(held.region_ids.len(), 1);
+        let region_id = held.region_ids.iter().next().unwrap();
+        assert!(
+            server
+                .bridge
+                .prepare_region(&uri, "rust", region_id)
+                .prepared,
+            "the save holds the region on the saved text"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn virtual_save_settle_obeys_the_real_time_budget_when_unparsed() {
         let (service, _socket) = LspService::new(Kakehashi::new);
