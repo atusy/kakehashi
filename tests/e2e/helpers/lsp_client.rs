@@ -939,7 +939,7 @@ impl LspClient {
     /// hanging on a quiet pipe. A disconnect (reader thread ended at EOF) also
     /// returns None — no further messages can arrive. A framing/parse error
     /// panics with its diagnostic.
-    fn try_receive_message(&mut self, timeout: Duration) -> Option<Value> {
+    pub(crate) fn try_receive_message(&mut self, timeout: Duration) -> Option<Value> {
         match self.rx.recv_timeout(timeout) {
             Ok(ReaderEvent::Message(value)) => Some(value),
             Ok(ReaderEvent::Error(e)) => panic!("{e}"),
