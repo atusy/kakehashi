@@ -20,7 +20,8 @@
 //! - `echo-document` — advertises `hoverProvider` +
 //!   `documentFormattingProvider`; hover answers the full text this server
 //!   holds for the document, ranged over the hovered line in its own
-//!   coordinates; formatting uppercases; a pull diagnostic spans the first
+//!   coordinates; formatting and range formatting uppercase; rename replaces the first line; a
+//!   pull diagnostic spans the first
 //!   line and carries the full text. Proves what a prepared virtual
 //!   document looks like downstream and how its coordinates map back. On a
 //!   save of a text holding `SHOW` it asks the editor to show the document
@@ -352,6 +353,8 @@ fn main() {
                     "echo-document" => json!({
                         "hoverProvider": true,
                         "documentFormattingProvider": true,
+                        "documentRangeFormattingProvider": true,
+                        "renameProvider": true,
                         "textDocumentSync": { "openClose": true, "change": 1, "save": true },
                         "diagnosticProvider": {
                             "interFileDependencies": false,
@@ -1042,13 +1045,14 @@ fn main() {
                         }),
                     );
                 }
-                let echoed = (mode == "echo-document").then(|| {
-                    message
-                        .pointer("/params/textDocument/uri")
-                        .and_then(Value::as_str)
-                        .and_then(|uri| documents.get(uri))
-                        .cloned()
-                });
+                let echoed =
+                    matches!(mode.as_str(), "echo-document" | "echo-document-push").then(|| {
+                        message
+                            .pointer("/params/textDocument/uri")
+                            .and_then(Value::as_str)
+                            .and_then(|uri| documents.get(uri))
+                            .cloned()
+                    });
                 let result = if let Some(text) = echoed {
                     // The text this server holds, and the hovered line's
                     // extent in ITS coordinates: a test can then prove both
@@ -2698,6 +2702,29 @@ fn main() {
                     "params": message.get("params"),
                 }),
             ),
+            "textDocument/rename" if mode == "echo-document" => {
+                // Renames the document's first line.
+                let uri = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let width = documents
+                    .get(&uri)
+                    .and_then(|text| text.lines().next())
+                    .map_or(0, |line| line.encode_utf16().count());
+                respond(
+                    &mut writer,
+                    id,
+                    json!({ "changes": { uri: [{
+                        "range": {
+                            "start": { "line": 0, "character": 0 },
+                            "end": { "line": 0, "character": width }
+                        },
+                        "newText": "renamed"
+                    }] } }),
+                );
+            }
             "kakehashi/virtualDocument/prepare" if mode == "prepare-peer" => {
                 let segments = message
                     .pointer("/params/segments")
