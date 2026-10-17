@@ -2974,21 +2974,31 @@ impl LanguageServerPool {
         if host.incarnation != incarnation {
             return;
         }
+        // When it was recorded is read only against a prepared text's
+        // answer: nothing to order without experimental features.
+        let stamped = self.prepare_advertisements.is_some();
+        let stamp = || {
+            if stamped {
+                super::protocol::next_presentation()
+            } else {
+                0
+            }
+        };
         let latest = || {
             Arc::new(LatestText {
                 text: content.text.to_string(),
                 map: content.map.cloned(),
-                recorded: std::sync::atomic::AtomicU64::new(super::protocol::next_presentation()),
+                recorded: std::sync::atomic::AtomicU64::new(stamp()),
             })
         };
         match host.contents.get(language) {
             Some(regions) => match regions.get(region_id).filter(|cached| {
                 cached.text == content.text && cached.map.as_deref() == content.map.map(Arc::as_ref)
             }) {
-                Some(cached) => cached.recorded.store(
-                    super::protocol::next_presentation(),
-                    std::sync::atomic::Ordering::Relaxed,
-                ),
+                Some(_) if !stamped => return,
+                Some(cached) => cached
+                    .recorded
+                    .store(stamp(), std::sync::atomic::Ordering::Relaxed),
                 None => {
                     regions.insert(region_id.to_string(), latest());
                 }
