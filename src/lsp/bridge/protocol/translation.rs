@@ -61,10 +61,6 @@ impl RegionOffset {
     }
 
     /// Attach the prepared ↔ virtual map of the text downstream servers hold.
-    #[allow(
-        dead_code,
-        reason = "the prepare layer that presents documents through it comes next"
-    )]
     pub(crate) fn with_prepared(mut self, prepared: Arc<PreparedMap>) -> Self {
         self.prepared = Some(prepared);
         self
@@ -74,6 +70,11 @@ impl RegionOffset {
     /// document.
     pub(crate) fn prepared(&self) -> Option<&PreparedMap> {
         self.prepared.as_deref()
+    }
+
+    /// [`Self::prepared`], shared: sent along with the prepared text.
+    pub(crate) fn prepared_map(&self) -> Option<&Arc<PreparedMap>> {
+        self.prepared.as_ref()
     }
 
     /// Get the starting line of the injection region.
@@ -198,10 +199,6 @@ pub(crate) fn host_position_within_region(host_position: Position, offset: &Regi
 /// on blank lines the peer deleted from the document's edges. A request
 /// there would be answered for another place — the gap's start, the next or
 /// previous line — so it is not made at all.
-#[allow(
-    dead_code,
-    reason = "the prepare layer that presents documents through it comes next"
-)]
 pub(crate) fn host_position_hidden_by_prepare(
     host_position: Position,
     offset: &RegionOffset,

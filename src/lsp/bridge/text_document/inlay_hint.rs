@@ -831,6 +831,11 @@ fn transform_inlay_hint_to_host(
 ) -> Vec<usize> {
     translate_virtual_position_to_host(&mut hint.position, offset);
 
+    // No edit is mapped back through a prepared document: the hint is
+    // shown, its edits are not offered.
+    if offset.prepared().is_some() {
+        hint.text_edits = None;
+    }
     if let Some(text_edits) = &mut hint.text_edits {
         for edit in text_edits.iter_mut() {
             translate_virtual_range_to_host(&mut edit.range, offset);
@@ -1587,6 +1592,7 @@ mod tests {
                 line: 4,
                 column: 2,
                 line_column_offsets: Some(vec![2, 3, 0]),
+                prepared: false,
             },
             inner: None,
             host_layer: false,
@@ -1663,6 +1669,7 @@ mod tests {
                 line: 4,
                 column: 0,
                 line_column_offsets: None,
+                prepared: false,
             },
             inner: None,
             host_layer: false,
@@ -1718,6 +1725,7 @@ mod tests {
                 line: 4,
                 column: 0,
                 line_column_offsets: None,
+                prepared: false,
             },
             inner: None,
             host_layer: false,

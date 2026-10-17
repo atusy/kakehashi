@@ -98,7 +98,6 @@ pub(crate) enum PrepareLookup {
 }
 
 /// Why waiting gave no document to send.
-#[allow(dead_code, reason = "requests wait for their answers through it, next")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PrepareMiss {
     /// No answer is in (yet): the attempt got none, a retry is backing off,
@@ -406,6 +405,10 @@ impl PrepareRegistry {
 
     /// Whether any of `host_uri`'s documents the lifecycle pass holds back
     /// still waits for its answer as it stands at `epoch`.
+    #[allow(
+        dead_code,
+        reason = "pushes and inbound requests read coordinates through it, next"
+    )]
     pub(crate) fn host_has_pending(&self, host_uri: &Url, epoch: u64) -> bool {
         self.regions.iter().any(|region| {
             region.host_uri == host_uri.as_str()

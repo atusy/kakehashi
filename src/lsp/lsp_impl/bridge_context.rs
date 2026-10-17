@@ -72,6 +72,53 @@ fn method_requires_contiguous_injection(method: &str) -> bool {
     )
 }
 
+/// Whether `method` is closed to a region: one that is not contiguous, or
+/// whose document is prepared (`prepared`), cannot take the edits the method
+/// answers with — no edit is mapped back through a prepared document. Inlay
+/// hints stay open to a contiguous prepared document (they are display; their
+/// edits are dropped instead).
+pub(crate) fn method_closed_to(resolved: &ResolvedInjection, method: &str, prepared: bool) -> bool {
+    method_requires_contiguous_injection(method)
+        && (!resolved.contiguous || (prepared && method != "textDocument/inlayHint"))
+}
+
+/// Present `ctx`'s virtual document as downstream servers see it, waiting for
+/// the prepare peer when the (host, injection) pair has one: the context's
+/// virtual content becomes the prepared text and its fan-out translates
+/// through the prepared map. A miss when the document could not be prepared:
+/// the region is then not bridged at all, never bridged unprepared.
+pub(crate) async fn prepare_request_context(
+    bridge: &crate::lsp::bridge::BridgeCoordinator,
+    host_language: &str,
+    mut ctx: DocumentRequestContext,
+) -> Result<DocumentRequestContext, crate::lsp::bridge::PrepareMiss> {
+    let Some(target) = bridge.prepare_target(host_language, &ctx.resolved.injection_language)
+    else {
+        return Ok(ctx);
+    };
+    let input = crate::lsp::bridge::PrepareInput {
+        host_uri: &ctx.uri,
+        host_language,
+        injection_language: &ctx.resolved.injection_language,
+        region_id: &ctx.resolved.region.region_id,
+        virtual_text: &ctx.resolved.virtual_content,
+        gaps: &ctx.resolved.gaps,
+    };
+    match bridge.prepared_document(&target, input).await? {
+        crate::lsp::bridge::PrepareAnswer::AsIs => {}
+        crate::lsp::bridge::PrepareAnswer::Prepared(prepared) => {
+            ctx.resolved.virtual_content = prepared.text.clone();
+            ctx.prepared = Some(std::sync::Arc::clone(&prepared.map));
+        }
+        // Not given out as an answer: `prepared_document` reports it as a
+        // miss.
+        crate::lsp::bridge::PrepareAnswer::Unusable => {
+            return Err(crate::lsp::bridge::PrepareMiss::Failed);
+        }
+    }
+    Ok(ctx)
+}
+
 /// The region-boundary rule a method's position resolves under.
 ///
 /// Caret-shaped methods — whose request position is the insert-mode caret,
@@ -196,6 +243,10 @@ pub(crate) struct DocumentRequestContext {
     /// aggregates the fanned-out downstreams' `$/progress` onto it
     /// (ls-bridge-client-progress); `None` disables client-progress aggregation.
     pub(crate) client_progress_token: Option<tower_lsp_server::ls_types::NumberOrString>,
+    /// Prepared ↔ virtual coordinates when `resolved.virtual_content` holds
+    /// the prepared document downstream servers see (see
+    /// [`prepare_request_context`]).
+    pub(crate) prepared: Option<std::sync::Arc<crate::lsp::bridge::PreparedMap>>,
 }
 
 /// All resolved context needed to send a **host** bridge request
@@ -1086,7 +1137,11 @@ impl Kakehashi {
             return None;
         };
 
-        if !resolved.contiguous && method_requires_contiguous_injection(method_name) {
+        if method_closed_to(
+            &resolved,
+            method_name,
+            self.region_prepared(&uri, &resolved),
+        ) {
             return None;
         }
 
@@ -1310,7 +1365,8 @@ impl Kakehashi {
             method_name,
         );
 
-        Some(DocumentRequestContext {
+        let ctx = DocumentRequestContext {
+            prepared: None,
             uri: preamble.uri,
             resolved: preamble.resolved,
             region_end: Some(preamble.region_end),
@@ -1320,7 +1376,28 @@ impl Kakehashi {
             strategy: agg.strategy,
             max_fan_out: agg.max_fan_out,
             client_progress_token: None,
-        })
+        };
+        let ctx = prepare_request_context(&self.bridge, &preamble.language_name, ctx)
+            .await
+            .ok()?;
+        // Checked again with the answer in: the lifecycle pass may not have
+        // looked the region up yet.
+        if method_closed_to(&ctx.resolved, method_name, ctx.prepared.is_some()) {
+            return None;
+        }
+        Some(ctx)
+    }
+
+    /// Whether the lifecycle pass prepares a region's current document (or
+    /// holds it back for its peer): see [`method_closed_to`].
+    pub(crate) fn region_prepared(&self, uri: &Url, resolved: &ResolvedInjection) -> bool {
+        self.bridge
+            .prepare_region(
+                uri,
+                &resolved.injection_language,
+                &resolved.region.region_id,
+            )
+            .prepared
     }
 
     /// Resolve all aggregation settings (strategy, priorities, max_fan_out) for a
@@ -1886,7 +1963,11 @@ impl Kakehashi {
         };
         let mut contexts = Vec::new();
         for resolved in regions {
-            if !resolved.contiguous && method_requires_contiguous_injection(method_name) {
+            if method_closed_to(
+                &resolved,
+                method_name,
+                self.region_prepared(&uri, &resolved),
+            ) {
                 continue;
             }
             // Clamp to the region so the translated range is in-region; skip a
@@ -1972,6 +2053,38 @@ mod tests {
     use crate::config::settings::{
         AggregationConfig, AggregationStrategy, BridgeLanguageConfig, LanguageSettings,
     };
+
+    #[test]
+    fn a_prepared_document_is_closed_to_edit_methods_but_not_inlay_hints() {
+        let mut resolved = crate::language::injection::ResolvedInjection {
+            region: crate::language::injection::CacheableInjectionRegion {
+                language: "lua".to_string(),
+                byte_range: 0..1,
+                line_range: 0..1,
+                start_column: 0,
+                region_id: String::new(),
+                content_hash: 0,
+            },
+            injection_language: "lua".to_string(),
+            virtual_content: String::new(),
+            line_column_offsets: vec![],
+            contiguous: true,
+            gaps: Default::default(),
+        };
+        for method in [
+            "textDocument/rename",
+            "textDocument/completion",
+            "textDocument/codeAction",
+            "textDocument/prepareRename",
+        ] {
+            assert!(!method_closed_to(&resolved, method, false), "{method}");
+            assert!(method_closed_to(&resolved, method, true), "{method}");
+        }
+        assert!(!method_closed_to(&resolved, "textDocument/inlayHint", true));
+        assert!(!method_closed_to(&resolved, "textDocument/hover", true));
+        resolved.contiguous = false;
+        assert!(method_closed_to(&resolved, "textDocument/inlayHint", false));
+    }
 
     #[tokio::test]
     async fn host_resolve_snapshot_keeps_language_and_text_together_during_edits() {

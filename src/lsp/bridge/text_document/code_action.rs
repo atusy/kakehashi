@@ -165,6 +165,7 @@ fn envelope_host_action(
             line: 0,
             column: 0,
             line_column_offsets: None,
+            prepared: false,
         },
         original_title: action.title.clone(),
         inner: None,

@@ -17,8 +17,24 @@ use super::{
 };
 use crate::lsp::bridge::actor::RouterCleanupGuard;
 use crate::lsp::bridge::protocol::{
-    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, host_position_within_region_bounds,
+    JsonRpcRequest, PREPARE_TIMEOUT, RegionOffset, RequestId, VirtualDocumentUri,
+    host_position_hidden_by_prepare, host_position_within_region_bounds,
 };
+
+/// How long a request waits for the lifecycle pass to send the text it was
+/// built for (see [`LanguageServerPool::wait_for_request_text`]). Its answer
+/// is in by then, and the send follows it within a lifecycle pass; a request
+/// whose text a newer edit superseded never sees it sent, and fails here (the
+/// editor usually cancels such a request first).
+const REQUEST_TEXT_WAIT: std::time::Duration = PREPARE_TIMEOUT;
+const REQUEST_TEXT_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+fn request_text_not_held(connection_key: &super::ConnectionKey) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::WouldBlock,
+        format!("{connection_key} does not hold the text this request was built for"),
+    )
+}
 
 /// Context provided to response transformers during bridge request execution.
 ///
@@ -171,6 +187,12 @@ impl LanguageServerPool {
 
         // Build virtual document URI
         let virtual_uri = VirtualDocumentUri::new(&host_uri_lsp, injection_language, region_id);
+        let uri_string = virtual_uri.to_uri_string();
+
+        // Before the host lifecycle guard: the wait can last the whole
+        // budget, and a didClose or reopen must not queue behind it.
+        self.wait_for_request_text(&uri_string, connection_key, offset)
+            .await?;
 
         let host_lifecycle = match expected_incarnation {
             Some(expected) => {
@@ -179,7 +201,7 @@ impl LanguageServerPool {
             }
             None => self.request_host_lifecycle(host_uri).await?,
         };
-        let routing_uri = url::Url::parse(&virtual_uri.to_uri_string())
+        let routing_uri = url::Url::parse(&uri_string)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         if self
             .host_routing_by_server(&routing_uri, connection_key.server())
@@ -262,7 +284,10 @@ impl LanguageServerPool {
                     &mut ConnectionHandleSender(&handle),
                     host_uri,
                     &virtual_uri,
-                    virtual_content,
+                    super::SentText {
+                        text: virtual_content,
+                        map: offset.prepared_map(),
+                    },
                     connection_key,
                 )
                 .await
@@ -273,6 +298,33 @@ impl LanguageServerPool {
                     self.unregister_upstream_request(id, connection_key);
                 }
                 return Err(e);
+            }
+
+            // The open above may have sent another text (a newer forwarded
+            // one), or a text may have been sent since the wait. Checked
+            // through the enqueue under the document's transition, which a
+            // didChange records and queues under (after the open, which
+            // takes it itself; the connections → transition order of
+            // didChange).
+            let region = super::RegionPrepare {
+                prepared: offset.prepared().is_some(),
+                failed: false,
+            };
+            let transition = self
+                .document_tracker
+                .held_texts_matter(region)
+                .then(|| self.open_transition_lock(&virtual_uri, connection_key));
+            let _transition_guard = match &transition {
+                Some(transition) => Some(transition.lock().await),
+                None => None,
+            };
+            if transition.is_some() && !self.holds_request_text(&uri_string, connection_key, offset)
+            {
+                drop(connections);
+                if let Some(ref id) = upstream_request_id {
+                    self.unregister_upstream_request(id, connection_key);
+                }
+                return Err(request_text_not_held(connection_key));
             }
 
             // Queue the request via single-writer loop (ls-bridge-message-ordering)
@@ -306,6 +358,68 @@ impl LanguageServerPool {
         };
 
         Ok(transform_response(response?, &context))
+    }
+
+    /// Whether `connection_key` holds exactly the text a request built on
+    /// `offset` describes: the prepared text under the request's map, or —
+    /// for a request built as is — a text held as is, as on every unprepared
+    /// path (an edit's didChange is ordered ahead of the request), but not a
+    /// prepared one, which stays until the lifecycle pass replaces it.
+    fn holds_request_text(
+        &self,
+        uri_string: &str,
+        connection_key: &super::ConnectionKey,
+        offset: &RegionOffset,
+    ) -> bool {
+        let request_map = offset.prepared();
+        let presentation = self.document_tracker.presentation(
+            uri_string,
+            connection_key,
+            super::Observed::Now,
+            super::RegionPrepare {
+                prepared: request_map.is_some(),
+                failed: false,
+            },
+            request_map.map_or("", |map| map.virtual_text()),
+        );
+        match presentation {
+            super::Presentation::Prepared(held) => request_map.is_some_and(|map| *map == *held),
+            super::Presentation::AsIs => request_map.is_none(),
+            super::Presentation::Unavailable => false,
+        }
+    }
+
+    /// Wait (briefly) until a connection that has the document open holds
+    /// the text a request built on `offset` describes.
+    ///
+    /// A request is prepared for the newest virtual text, while the lifecycle
+    /// pass sends that text only once its prepare answer is in — so right
+    /// after an edit, an open document can still hold the previous prepared
+    /// text, whose answer the request's map would misread. Likewise right
+    /// after a pair gains or loses its peer. The lifecycle pass is the only
+    /// sender (a request sending here could overtake a newer text), so the
+    /// request waits for it, and fails if it does not come. A document not
+    /// open there is opened by the request with its own text.
+    async fn wait_for_request_text(
+        &self,
+        uri_string: &str,
+        connection_key: &super::ConnectionKey,
+        offset: &RegionOffset,
+    ) -> io::Result<()> {
+        let deadline = tokio::time::Instant::now() + REQUEST_TEXT_WAIT;
+        loop {
+            if !self
+                .document_tracker
+                .is_virtual_doc_open_on_connection(uri_string, connection_key)
+                || self.holds_request_text(uri_string, connection_key, offset)
+            {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(request_text_not_held(connection_key));
+            }
+            tokio::time::sleep(REQUEST_TEXT_POLL).await;
+        }
     }
 
     /// Like [`execute_bridge_request_with_handle`](Self::execute_bridge_request_with_handle)
@@ -432,8 +546,20 @@ impl LanguageServerPool {
         // the content actually opened — the same in-flight staleness every
         // LSP position request has, which downstream servers clamp. Closing
         // it needs generation-bound opens (issue #996).
-        if !host_position_within_region_bounds(host_position, offset, region_end) {
-            if host_position.line < offset.line() {
+        let hidden = host_position_hidden_by_prepare(host_position, offset);
+        if hidden || !host_position_within_region_bounds(host_position, offset, region_end) {
+            if hidden {
+                // Strictly inside a gap, or on a blank line the prepare peer
+                // deleted: the prepared document has no such position, and
+                // would answer for another.
+                log::debug!(
+                    target: "kakehashi::bridge",
+                    "{method}: host position (line {}, char {}) has no place in the prepared \
+                     document; aborting request",
+                    host_position.line,
+                    host_position.character,
+                );
+            } else if host_position.line < offset.line() {
                 // Line above the region → almost certainly stale region data
                 // (a concurrent host edit shifted the region). Unexpected.
                 warn!(
@@ -506,6 +632,7 @@ mod tests {
     use super::*;
     use crate::lsp::bridge::pool::ConnectionKey;
     use crate::lsp::bridge::pool::ConnectionState;
+    use crate::lsp::bridge::pool::SentText;
     use crate::lsp::bridge::pool::test_helpers::*;
     use crate::lsp::bridge::protocol::region_host_end;
     use std::sync::Arc;
@@ -609,6 +736,135 @@ mod tests {
                 "downstream id mirrored upstream"
             );
         }
+    }
+
+    fn dedent_answer() -> crate::lsp::bridge::protocol::PrepareResult {
+        serde_json::from_value(serde_json::json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_request_reads_only_the_text_its_coordinates_describe() {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let pool = LanguageServerPool::preparing();
+        let host_uri = Url::parse("file:///test/held.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap(),
+            "lua",
+            TEST_ULID_LUA_0,
+        );
+        let uri = virtual_uri.to_uri_string();
+        let key = ConnectionKey::for_server("lua");
+        let prepared =
+            apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(dedent_answer()))
+                .unwrap();
+        let prepared_offset = RegionOffset::new(0, 0).with_prepared(Arc::clone(&prepared.map));
+        let as_is = RegionOffset::new(0, 0);
+        // As is on record: an unprepared request reads it (any text as is,
+        // as on every unprepared path); a prepared one does not.
+        pool.record_sent_for_test(&virtual_uri, &key, "  a".into());
+        assert!(pool.holds_request_text(&uri, &key, &as_is));
+        assert!(!pool.holds_request_text(&uri, &key, &prepared_offset));
+        // The prepared text under its map: the prepared request reads it,
+        // with an equal map in another allocation too; an unprepared one
+        // does not (its pair just lost its peer).
+        pool.record_sent_for_test(
+            &virtual_uri,
+            &key,
+            SentText {
+                text: &prepared.text,
+                map: Some(&prepared.map),
+            },
+        );
+        assert!(pool.holds_request_text(&uri, &key, &prepared_offset));
+        let again =
+            apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(dedent_answer()))
+                .unwrap();
+        assert!(pool.holds_request_text(
+            &uri,
+            &key,
+            &RegionOffset::new(0, 0).with_prepared(again.map)
+        ));
+        assert!(!pool.holds_request_text(&uri, &key, &as_is));
+        // Prepared from another text.
+        let other =
+            apply_prepare_result("  b", &VirtualLayout::single("  b"), Some(dedent_answer()))
+                .unwrap();
+        assert!(!pool.holds_request_text(
+            &uri,
+            &key,
+            &RegionOffset::new(0, 0).with_prepared(other.map)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_waits_for_its_text_until_the_budget_runs_out() {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let pool = Arc::new(LanguageServerPool::preparing());
+        let host_uri = Url::parse("file:///test/wait.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap(),
+            "lua",
+            TEST_ULID_LUA_0,
+        );
+        let uri = virtual_uri.to_uri_string();
+        let key = ConnectionKey::for_server("lua");
+        pool.register_opened_document(&host_uri, &virtual_uri, &key)
+            .await;
+        pool.record_sent_for_test(&virtual_uri, &key, "  a".into());
+        let prepared =
+            apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(dedent_answer()))
+                .unwrap();
+        let offset = RegionOffset::new(0, 0).with_prepared(Arc::clone(&prepared.map));
+
+        // Never sent: the request fails once the budget runs out.
+        let started = tokio::time::Instant::now();
+        assert!(
+            pool.wait_for_request_text(&uri, &key, &offset)
+                .await
+                .is_err()
+        );
+        assert!(started.elapsed() >= REQUEST_TEXT_WAIT);
+
+        // Sent while it waits: the request goes on.
+        let sender = {
+            let pool = Arc::clone(&pool);
+            let virtual_uri = virtual_uri.clone();
+            let key = key.clone();
+            let prepared = prepared.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(REQUEST_TEXT_WAIT / 2).await;
+                pool.record_sent_for_test(
+                    &virtual_uri,
+                    &key,
+                    SentText {
+                        text: &prepared.text,
+                        map: Some(&prepared.map),
+                    },
+                );
+            })
+        };
+        let started = tokio::time::Instant::now();
+        assert!(
+            pool.wait_for_request_text(&uri, &key, &offset)
+                .await
+                .is_ok()
+        );
+        assert!(started.elapsed() < REQUEST_TEXT_WAIT);
+        sender.await.unwrap();
+
+        // Not open on that connection: nothing to wait for (the request
+        // opens it with its own text).
+        let started = tokio::time::Instant::now();
+        let other = ConnectionKey::for_server("other");
+        assert!(
+            pool.wait_for_request_text(&uri, &other, &offset)
+                .await
+                .is_ok()
+        );
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
     }
 
     #[tokio::test]

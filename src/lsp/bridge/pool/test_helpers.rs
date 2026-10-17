@@ -26,10 +26,6 @@ pub(crate) fn mark_ready_for_test(handle: &ConnectionHandle) -> bool {
 
 /// Make `handle` advertise `kakehashi/virtualDocument/prepare` (or not), as
 /// its handshake would have.
-#[allow(
-    dead_code,
-    reason = "the prepare registry asks candidates through these, next"
-)]
 pub(crate) fn advertise_prepare_for_test(handle: &ConnectionHandle, advertised: bool) {
     handle.set_virtual_document_prepare(advertised);
 }
