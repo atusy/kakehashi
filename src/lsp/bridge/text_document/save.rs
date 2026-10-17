@@ -17,7 +17,7 @@ use tower_lsp_server::ls_types::TextDocumentSaveReason;
 use url::Url;
 
 use super::super::pool::{
-    ConnectionHandle, ConnectionState, LanguageServerPool, NotificationSendResult,
+    ConnectionHandle, ConnectionState, LanguageServerPool, NotificationSendResult, SentText,
 };
 use super::super::protocol::{JsonRpcNotification, VirtualDocumentUri};
 
@@ -108,30 +108,24 @@ impl LanguageServerPool {
                     continue;
                 }
 
+                let content = SentText::from(&injection.content);
                 let did_change = if let Some(version) = self
                     .increment_version_if_content_changed(
                         &virtual_uri,
                         &connection_key,
-                        &injection.content,
+                        content.text,
                     )
                     .await
                 {
-                    let outcome = Self::send_didchange_for_virtual_doc(
+                    Some(self.send_didchange_recorded(
                         &handle,
-                        &virtual_uri.to_uri_string(),
-                        &injection.content,
+                        &virtual_uri,
+                        &connection_key,
+                        content,
                         version,
-                    );
-                    if matches!(outcome, NotificationSendResult::Queued) {
-                        self.record_sent_content_fingerprint(
-                            &virtual_uri,
-                            &connection_key,
-                            &injection.content,
-                        )
-                        .await;
-                    }
-                    Some(outcome)
+                    ))
                 } else {
+                    self.rehold_unchanged_content(&virtual_uri, &connection_key, content);
                     None
                 };
 
@@ -261,8 +255,7 @@ mod tests {
             VirtualDocumentUri::new(&host_uri_lsp, &injection.language, &injection.region_id);
         pool.register_opened_document(&host_uri, &virtual_uri, &key)
             .await;
-        pool.record_sent_content_fingerprint(&virtual_uri, &key, &injection.content)
-            .await;
+        pool.record_sent_for_test(&virtual_uri, &key, (&injection.content).into());
 
         let transition = pool.open_transition_lock(&virtual_uri, &key);
         let transition_guard = transition.lock().await;
