@@ -1451,6 +1451,7 @@ print("hello")
             std::sync::Arc::new(DiagnosticPublisher::new(server)),
             std::sync::Arc::clone(&server.documents),
             crate::lsp::synthetic_diagnostics::SyntheticDiagnosticTrigger::Change,
+            None,
         );
         wait_version(1)
             .await
@@ -1478,6 +1479,7 @@ print("hello")
             std::sync::Arc::new(DiagnosticPublisher::new(server)),
             std::sync::Arc::clone(&server.documents),
             crate::lsp::synthetic_diagnostics::SyntheticDiagnosticTrigger::Change,
+            None,
         );
         wait_version(2).await.expect(
             "second debounce fire must re-read the updated store text and advance to version 2 \
@@ -1549,6 +1551,7 @@ print("hello")
             Arc::new(DiagnosticPublisher::new(server)),
             Arc::clone(&server.documents),
             crate::lsp::synthetic_diagnostics::SyntheticDiagnosticTrigger::Change,
+            None,
         );
         gate.entered.notified().await;
         let timer = manager.timer_abort_handle(&uri).unwrap();
@@ -2415,6 +2418,49 @@ print("hello")
                 .is_some(),
             "the completion exercised the two-stage regions handoff"
         );
+    }
+
+    /// A collection scheduled after prepare takes its snapshot when it fires:
+    /// a region still held when it was scheduled may be sent and collected at
+    /// once before then, and a snapshot from scheduling would leave it out of
+    /// a collection that replaces that one.
+    #[tokio::test]
+    async fn a_debounced_collection_after_prepare_snapshots_when_it_fires() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+        let uri = Url::parse("file:///test/prepared_snapshot_at_fire.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let scheduler = server.diagnostic_scheduler();
+        // Nothing to snapshot yet: no tree.
+        assert!(scheduler.prepare_diagnostic_snapshot(&uri).is_none());
+        let gate = server.debounced_diagnostics.install_execution_gate();
+        scheduler.schedule_debounced_diagnostic_after_prepare(uri.clone());
+        gate.entered.notified().await;
+        // By the time it fires, there is.
+        server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("rust"), None, None)
+            .await;
+        assert!(scheduler.prepare_diagnostic_snapshot(&uri).is_some());
+        gate.release.notify_one();
+        let collected = timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(collected) = *gate.collected_with_snapshot.lock().unwrap() {
+                    break collected;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the timer ran");
+        assert!(collected, "collected with the snapshot taken when it fired");
+        server.debounced_diagnostics.cancel_all();
     }
 
     /// Regression (parse-actor flip): the debounced diagnostic — which drives the

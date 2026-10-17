@@ -220,6 +220,20 @@ impl DiagnosticScheduler {
 
     fn schedule_debounced_diagnostic_as(&self, uri: Url, trigger: SyntheticDiagnosticTrigger) {
         let snapshot_data = self.prepare_diagnostic_snapshot(&uri);
+        // After prepare, the snapshot is taken again when the timer fires: a
+        // region still held now may be sent and collected at once before
+        // then, and a collection leaving it out would replace that one.
+        let resnapshot = (trigger == SyntheticDiagnosticTrigger::Prepared).then(|| {
+            let preparer = self.snapshot_preparer.clone();
+            let uri = uri.clone();
+            Box::new(move |incarnation, content_version| {
+                preparer.prepare_diagnostic_snapshot_when_current(
+                    &uri,
+                    incarnation,
+                    content_version,
+                )
+            }) as crate::lsp::debounced_diagnostics::Resnapshot
+        });
 
         // Apply the current `diagnostics_debounce_ms` setting (#533). The snapshot
         // is a cheap arc-swap clone, so reading it per schedule keeps the debounce
@@ -239,6 +253,7 @@ impl DiagnosticScheduler {
             std::sync::Arc::clone(&self.publisher),
             std::sync::Arc::clone(&self.documents),
             trigger,
+            resnapshot,
         );
     }
 

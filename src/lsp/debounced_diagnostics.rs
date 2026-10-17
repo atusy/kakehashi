@@ -61,6 +61,9 @@ struct DebouncedDiagnosticData {
     settings_generation: u64,
     /// What the collection supersedes among this version's others.
     trigger: SyntheticDiagnosticTrigger,
+    /// Takes the snapshot again when the timer fires, in place of
+    /// `snapshot_data`, for the version it was scheduled for.
+    resnapshot: Option<Resnapshot>,
     /// Reference to synthetic diagnostics manager for task registration
     synthetic_diagnostics: Arc<SyntheticDiagnosticsManager>,
     /// The single proactive publisher: feeds the pull result into the cache and
@@ -70,10 +73,17 @@ struct DebouncedDiagnosticData {
     execution_gate: Option<Arc<DebounceExecutionGate>>,
 }
 
+/// The document's diagnostic snapshot as of when a timer fires, given the
+/// `(incarnation, content_version)` it was scheduled for: `None` once the
+/// document moved past it.
+pub(crate) type Resnapshot = Box<dyn FnOnce(u64, u64) -> Option<DiagnosticSnapshot> + Send>;
+
 #[cfg(test)]
 pub(crate) struct DebounceExecutionGate {
     pub(crate) entered: tokio::sync::Notify,
     pub(crate) release: tokio::sync::Notify,
+    /// Whether the collection that ran had a snapshot.
+    pub(crate) collected_with_snapshot: std::sync::Mutex<Option<bool>>,
 }
 
 /// Manager for debounced diagnostic triggers.
@@ -164,6 +174,7 @@ impl DebouncedDiagnosticsManager {
         let gate = Arc::new(DebounceExecutionGate {
             entered: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
+            collected_with_snapshot: std::sync::Mutex::new(None),
         });
         *self.execution_gate.lock().unwrap() = Some(Arc::clone(&gate));
         gate
@@ -173,8 +184,9 @@ impl DebouncedDiagnosticsManager {
     ///
     /// Any existing timer for this document is cancelled and replaced, unless
     /// it outranks this one for the same version; on expiry the new timer
-    /// publishes diagnostics from the pre-captured `snapshot_data`, ranked as
-    /// `trigger` among the version's collections.
+    /// publishes diagnostics from the pre-captured `snapshot_data` (or, with
+    /// `resnapshot`, from the snapshot it takes then), ranked as `trigger`
+    /// among the version's collections.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn schedule(
         &self,
@@ -186,6 +198,7 @@ impl DebouncedDiagnosticsManager {
         publisher: Arc<DiagnosticPublisher>,
         documents: Arc<crate::document::DocumentStore>,
         trigger: SyntheticDiagnosticTrigger,
+        resnapshot: Option<Resnapshot>,
     ) {
         // Opportunistic cleanup: remove finished timers to prevent unbounded growth.
         // This is O(n) but runs infrequently and keeps the map from accumulating
@@ -249,6 +262,7 @@ impl DebouncedDiagnosticsManager {
             content_version,
             settings_generation,
             trigger,
+            resnapshot,
             #[cfg(test)]
             execution_gate: self.execution_gate.lock().unwrap().clone(),
         };
@@ -338,7 +352,7 @@ impl DebouncedDiagnosticsManager {
 async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
     let DebouncedDiagnosticData {
         uri,
-        snapshot_data,
+        mut snapshot_data,
         bridge_pool,
         bridge,
         synthetic_diagnostics,
@@ -348,12 +362,13 @@ async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
         content_version,
         settings_generation,
         trigger,
+        resnapshot,
         #[cfg(test)]
         execution_gate,
     } = data;
 
     #[cfg(test)]
-    if let Some(gate) = execution_gate {
+    if let Some(gate) = &execution_gate {
         gate.entered.notify_one();
         gate.release.notified().await;
     }
@@ -373,6 +388,17 @@ async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
         }
         drop(edit_guard);
         return;
+    }
+    // At the version it was scheduled for, under the edit lock: what the
+    // document's regions are now, not when the timer was scheduled. A region
+    // held then may have been sent since, and collected at once; a snapshot
+    // still leaving it out would replace that collection.
+    if let Some(resnapshot) = resnapshot {
+        snapshot_data = resnapshot(incarnation, content_version);
+    }
+    #[cfg(test)]
+    if let Some(gate) = &execution_gate {
+        *gate.collected_with_snapshot.lock().unwrap() = Some(snapshot_data.is_some());
     }
 
     // #431: re-sync the host document to its `_self` host servers at this debounced
