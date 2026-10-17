@@ -155,7 +155,10 @@ lines that stay, and blank lines ending or opening a segment beside a gap
 answer whose prepared text would join a lone CR and a LF the virtual
 document keeps apart into one line break (a dedent down to the line break
 after a lone CR, or a placeholder completing a CRLF): P would have a line
-fewer than V there.
+fewer than V there. A change's position follows LSP: a `character` past
+its line's length defaults back to that length (so none falls between a
+CRLF's CR and LF), while a `line` past the segment's last refuses the
+answer.
 
 ### Coordinates
 
