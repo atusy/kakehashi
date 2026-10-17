@@ -2646,13 +2646,18 @@ impl LanguageServerPool {
                 text: content.text.to_owned(),
             }],
         };
-        let notification = JsonRpcNotification::new("textDocument/didChange", params);
+        // Serialized before the record's lock is taken: only the enqueue
+        // happens under it.
+        let payload = message_sender::serialize_notification(JsonRpcNotification::new(
+            "textDocument/didChange",
+            params,
+        ))?;
         self.document_tracker.record_and_queue(
             virtual_uri,
             connection_key,
             content,
             version,
-            || sender.send_now(notification),
+            || sender.send_serialized(payload),
             io::Result::is_ok,
         )
     }
@@ -3059,19 +3064,19 @@ impl LanguageServerPool {
         content: SentText<'_>,
         version: i32,
     ) -> NotificationSendResult {
+        // Serialized before the record's lock is taken: only the enqueue
+        // happens under it.
+        let Some(payload) =
+            Self::didchange_payload(&virtual_uri.to_uri_string(), content.text, version)
+        else {
+            return NotificationSendResult::SerializationFailed;
+        };
         self.document_tracker.record_and_queue(
             virtual_uri,
             connection_key,
             content,
             version,
-            || {
-                Self::send_didchange_for_virtual_doc(
-                    handle,
-                    &virtual_uri.to_uri_string(),
-                    content.text,
-                    version,
-                )
-            },
+            || handle.send_serialized_notification(payload),
             |result| matches!(result, NotificationSendResult::Queued),
         )
     }
@@ -9257,10 +9262,7 @@ mod tests {
         }
 
         impl message_sender::MessageSender for BlockingSender {
-            fn send_now<P: serde::Serialize + Send>(
-                &mut self,
-                _notification: JsonRpcNotification<P>,
-            ) -> io::Result<()> {
+            fn send_serialized(&mut self, _payload: serde_json::Value) -> io::Result<()> {
                 unreachable!("only didOpen goes through this sender")
             }
 
@@ -9350,10 +9352,7 @@ mod tests {
         }
 
         impl message_sender::MessageSender for BlockingSender {
-            fn send_now<P: serde::Serialize + Send>(
-                &mut self,
-                _notification: JsonRpcNotification<P>,
-            ) -> io::Result<()> {
+            fn send_serialized(&mut self, _payload: serde_json::Value) -> io::Result<()> {
                 unreachable!("only didOpen goes through this sender")
             }
 
@@ -9420,10 +9419,7 @@ mod tests {
         }
 
         impl message_sender::MessageSender for GatedSender {
-            fn send_now<P: serde::Serialize + Send>(
-                &mut self,
-                _notification: JsonRpcNotification<P>,
-            ) -> io::Result<()> {
+            fn send_serialized(&mut self, _payload: serde_json::Value) -> io::Result<()> {
                 unreachable!("only didOpen goes through this sender")
             }
 
@@ -9545,10 +9541,7 @@ mod tests {
         }
 
         impl message_sender::MessageSender for GatedSender {
-            fn send_now<P: serde::Serialize + Send>(
-                &mut self,
-                _notification: JsonRpcNotification<P>,
-            ) -> io::Result<()> {
+            fn send_serialized(&mut self, _payload: serde_json::Value) -> io::Result<()> {
                 unreachable!("only didOpen goes through this sender")
             }
 

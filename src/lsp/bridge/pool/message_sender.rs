@@ -39,13 +39,17 @@ pub(crate) trait MessageSender: Send {
         notification: JsonRpcNotification<P>,
     ) -> impl std::future::Future<Output = io::Result<()>> + Send;
 
-    /// [`Self::send_notification`] queued at once, without awaiting: for a
-    /// send whose record must be taken back, under a lock, unless it was
-    /// queued (see `DocumentTracker::record_and_queue`).
-    fn send_now<P: serde::Serialize + Send>(
-        &mut self,
-        notification: JsonRpcNotification<P>,
-    ) -> io::Result<()>;
+    /// Queue a notification serialized beforehand, at once, without
+    /// awaiting: for a send whose record must be taken back, under a lock,
+    /// unless it was queued (see `DocumentTracker::record_and_queue`).
+    fn send_serialized(&mut self, payload: serde_json::Value) -> io::Result<()>;
+}
+
+/// The wire form of `notification`, for [`MessageSender::send_serialized`].
+pub(crate) fn serialize_notification<P: serde::Serialize>(
+    notification: JsonRpcNotification<P>,
+) -> io::Result<serde_json::Value> {
+    serde_json::to_value(notification).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 // Implementation for channel-based sends
@@ -54,15 +58,10 @@ impl MessageSender for mpsc::Sender<OutboundMessage> {
         &mut self,
         notification: JsonRpcNotification<P>,
     ) -> io::Result<()> {
-        self.send_now(notification)
+        self.send_serialized(serialize_notification(notification)?)
     }
 
-    fn send_now<P: serde::Serialize + Send>(
-        &mut self,
-        notification: JsonRpcNotification<P>,
-    ) -> io::Result<()> {
-        let payload = serde_json::to_value(notification)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    fn send_serialized(&mut self, payload: serde_json::Value) -> io::Result<()> {
         // Use try_send for non-blocking backpressure per ls-bridge-message-ordering
         self.try_send(OutboundMessage::Untracked(payload))
             .map_err(|e| match e {
@@ -94,14 +93,11 @@ impl MessageSender for ConnectionHandleSender<'_> {
         &mut self,
         notification: JsonRpcNotification<P>,
     ) -> io::Result<()> {
-        self.send_now(notification)
+        self.send_serialized(serialize_notification(notification)?)
     }
 
-    fn send_now<P: serde::Serialize + Send>(
-        &mut self,
-        notification: JsonRpcNotification<P>,
-    ) -> io::Result<()> {
-        match self.0.send_notification(notification) {
+    fn send_serialized(&mut self, payload: serde_json::Value) -> io::Result<()> {
+        match self.0.send_serialized_notification(payload) {
             NotificationSendResult::Queued => Ok(()),
             NotificationSendResult::QueueFull => Err(io::Error::new(
                 io::ErrorKind::WouldBlock,

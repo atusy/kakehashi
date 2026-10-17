@@ -10,7 +10,6 @@
 //! pattern that could violate FIFO ordering.
 
 use std::str::FromStr;
-use std::sync::Arc;
 
 use tower_lsp_server::ls_types::{
     DidChangeTextDocumentParams, TextDocumentContentChangeEvent, Uri,
@@ -18,9 +17,7 @@ use tower_lsp_server::ls_types::{
 };
 use url::Url;
 
-use super::super::pool::{
-    ConnectionHandle, ConnectionState, LanguageServerPool, NotificationSendResult, SentText,
-};
+use super::super::pool::{ConnectionState, LanguageServerPool, NotificationSendResult, SentText};
 use super::super::protocol::{JsonRpcNotification, VirtualDocumentUri};
 
 impl LanguageServerPool {
@@ -138,19 +135,16 @@ impl LanguageServerPool {
         synchronized
     }
 
-    /// Send a didChange notification for a virtual document, returning the
-    /// enqueue outcome.
-    ///
-    /// Uses the channel-based single-writer loop (ls-bridge-message-ordering): non-blocking, and
-    /// if the queue is full the notification is dropped with a warning log. The
-    /// returned [`NotificationSendResult`] lets the caller record the content
-    /// fingerprint only on a confirmed `Queued` enqueue (#422).
-    pub(in crate::lsp::bridge) fn send_didchange_for_virtual_doc(
-        handle: &Arc<ConnectionHandle>,
+    /// The serialized didChange notification for a virtual document, sent
+    /// through the channel-based single-writer loop (ls-bridge-message-ordering):
+    /// non-blocking, and if the queue is full the notification is dropped with
+    /// a warning log. `None` when it cannot be built: nothing is sent, nor
+    /// recorded as sent (#422).
+    pub(in crate::lsp::bridge) fn didchange_payload(
         virtual_uri: &str,
         content: &str,
         version: i32,
-    ) -> NotificationSendResult {
+    ) -> Option<serde_json::Value> {
         let uri = match Uri::from_str(virtual_uri) {
             Ok(u) => u,
             Err(e) => {
@@ -158,9 +152,7 @@ impl LanguageServerPool {
                     target: "kakehashi::bridge",
                     "Skipping didChange for invalid URI '{}': {}", virtual_uri, e
                 );
-                // Nothing was enqueued; treat as a non-`Queued` outcome so the caller
-                // does not record a fingerprint for content the server never received.
-                return NotificationSendResult::SerializationFailed;
+                return None;
             }
         };
 
@@ -174,8 +166,13 @@ impl LanguageServerPool {
         };
 
         let notification = JsonRpcNotification::new("textDocument/didChange", params);
-
-        // Send via the single-writer loop (non-blocking, fire-and-forget).
-        handle.send_notification(notification)
+        serde_json::to_value(notification)
+            .inspect_err(|e| {
+                log::error!(
+                    target: "kakehashi::bridge",
+                    "Failed to serialize didChange for '{}': {}", virtual_uri, e
+                );
+            })
+            .ok()
     }
 }

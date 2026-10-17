@@ -737,7 +737,10 @@ impl DocumentTracker {
         queue: impl FnOnce() -> R,
         queued: impl FnOnce(&R) -> bool,
     ) -> R {
+        // Hashed before the lock: only the record and the enqueue happen
+        // under it.
         let uri_string = virtual_uri.to_uri_string();
+        let fingerprint = content_fingerprint(content.text);
         let mut fingerprints = self
             .document_fingerprints
             .lock()
@@ -746,7 +749,8 @@ impl DocumentTracker {
             &mut fingerprints,
             &uri_string,
             connection_key,
-            content,
+            fingerprint,
+            content.map,
             version,
         );
         let result = queue();
@@ -772,30 +776,34 @@ impl DocumentTracker {
         connection_key: &ConnectionKey,
         content: SentText<'_>,
     ) {
+        let uri_string = virtual_uri.to_uri_string();
+        let fingerprint = content_fingerprint(content.text);
         let mut fingerprints = self
             .document_fingerprints
             .lock()
             .recover_poison("DocumentTracker::document_fingerprints");
         self.record_locked(
             &mut fingerprints,
-            &virtual_uri.to_uri_string(),
+            &uri_string,
             connection_key,
-            content,
+            fingerprint,
+            content.map,
             crate::lsp::bridge::protocol::DIDOPEN_VERSION,
         );
     }
 
-    /// Record `content` in `fingerprints`, returning the record it replaced.
+    /// Record the text of `fingerprint`, sent with `map`, in `fingerprints`,
+    /// returning the record it replaced.
     fn record_locked(
         &self,
         fingerprints: &mut HashMap<ConnectionKey, HashMap<String, HeldText>>,
         uri_string: &str,
         connection_key: &ConnectionKey,
-        content: SentText<'_>,
+        fingerprint: u64,
+        map: Option<&Arc<PreparedMap>>,
         version: i32,
     ) -> Option<HeldText> {
-        let fingerprint = content_fingerprint(content.text);
-        let map = content.map.cloned();
+        let map = map.cloned();
         if map.is_some() {
             self.ever_held_prepared.store(true, Ordering::Release);
         }

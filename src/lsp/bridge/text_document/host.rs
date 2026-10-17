@@ -1391,10 +1391,7 @@ mod tests {
     struct FailingSender;
 
     impl MessageSender for FailingSender {
-        fn send_now<P: serde::Serialize + Send>(
-            &mut self,
-            _notification: JsonRpcNotification<P>,
-        ) -> io::Result<()> {
+        fn send_serialized(&mut self, _payload: serde_json::Value) -> io::Result<()> {
             Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "test backpressure",

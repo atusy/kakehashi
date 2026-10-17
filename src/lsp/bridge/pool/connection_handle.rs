@@ -443,6 +443,15 @@ impl ConnectionHandle {
                 return NotificationSendResult::SerializationFailed;
             }
         };
+        self.send_serialized_notification(payload)
+    }
+
+    /// [`Self::send_notification`] of a payload serialized beforehand: only
+    /// the non-blocking enqueue, for a caller queueing under a lock.
+    pub(crate) fn send_serialized_notification(
+        &self,
+        payload: serde_json::Value,
+    ) -> NotificationSendResult {
         match self.tx.try_send(OutboundMessage::Untracked(payload)) {
             Ok(()) => NotificationSendResult::Queued,
             Err(mpsc::error::TrySendError::Full(_)) => {
