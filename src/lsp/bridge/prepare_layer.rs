@@ -16,13 +16,16 @@ use super::prepare_registry::{PrepareInput, PrepareLookup, PrepareMiss, PrepareR
 use crate::config::WorkspaceSettings;
 use crate::text::terminal::escape_terminal_controls;
 
+/// A pair's candidates, `None` for a pair with none.
+type Candidates = Option<Arc<[ResolvedServerConfig]>>;
+
 /// The settings prepare targets are resolved from, with the targets resolved
 /// so far (this runs per bridged region in every lifecycle pass and request).
 struct Targets {
     settings: Arc<WorkspaceSettings>,
-    /// `(host language, injection language)` → the pair's candidates, `None`
-    /// for a pair with none.
-    resolved: DashMap<(String, String), Option<Arc<[ResolvedServerConfig]>>>,
+    /// Host language → injection language → the pair's candidates: nested,
+    /// so a hit borrows both names instead of allocating a key.
+    resolved: DashMap<String, DashMap<String, Candidates>>,
 }
 
 pub(crate) struct PrepareLayer {
@@ -109,15 +112,20 @@ impl super::BridgeCoordinator {
         // epoch, so a target never pairs older candidates with a newer epoch.
         let epoch = self.pool.prepare_epoch();
         let targets = layer.targets.load();
-        let key = (host_language.to_string(), injection_language.to_string());
         // The first resolution wins for every caller: answers are keyed by
         // the candidates' launch configs by identity, which two resolutions
         // racing each other would not share.
-        let candidates = match targets.resolved.get(&key) {
-            Some(hit) => hit.clone(),
+        let hit = targets
+            .resolved
+            .get(host_language)
+            .and_then(|pairs| pairs.get(injection_language).map(|hit| hit.clone()));
+        let candidates = match hit {
+            Some(hit) => hit,
             None => targets
                 .resolved
-                .entry(key)
+                .entry(host_language.to_string())
+                .or_default()
+                .entry(injection_language.to_string())
                 .or_insert_with(|| {
                     self.resolve_prepare_candidates(
                         layer,
