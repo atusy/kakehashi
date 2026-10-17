@@ -384,9 +384,6 @@ impl PrepareRegistry {
         region_id: &str,
         epoch: u64,
     ) -> RegionPrepare {
-        if self.unused() {
-            return RegionPrepare::default();
-        }
         let host_uri = host_uri.as_str();
         self.regions
             .get(&region_hash(host_uri, injection_language, region_id))
@@ -410,9 +407,6 @@ impl PrepareRegistry {
     /// Whether any of `host_uri`'s documents the lifecycle pass holds back
     /// still waits for its answer as it stands at `epoch`.
     pub(crate) fn host_has_pending(&self, host_uri: &Url, epoch: u64) -> bool {
-        if self.unused() {
-            return false;
-        }
         self.regions.iter().any(|region| {
             region.host_uri == host_uri.as_str()
                 && region
@@ -429,9 +423,6 @@ impl PrepareRegistry {
         injection_language: Option<&str>,
         region_id: &str,
     ) {
-        if self.unused() {
-            return;
-        }
         let host_uri = host_uri.as_str();
         match injection_language {
             Some(language) => {
@@ -451,9 +442,6 @@ impl PrepareRegistry {
     /// keeps its id, and its document under the new language may be being
     /// prepared already.
     pub(crate) fn forget_region_except(&self, host_uri: &Url, region_id: &str, keep: Option<&str>) {
-        if self.unused() {
-            return;
-        }
         let host_uri = host_uri.as_str();
         self.regions.retain(|_, region| {
             !(region.host_uri == host_uri
@@ -464,9 +452,6 @@ impl PrepareRegistry {
 
     /// Forget a closed host's documents.
     pub(crate) fn forget_host(&self, host_uri: &Url) {
-        if self.unused() {
-            return;
-        }
         self.regions
             .retain(|_, region| region.host_uri != host_uri.as_str());
     }
@@ -679,13 +664,17 @@ fn region_hash(host_uri: &str, injection_language: &str, region_id: &str) -> u64
 }
 
 /// The input's identity: its text and gaps, the host language and the
-/// candidates by name — under the epoch the target was resolved in, which
-/// covers the candidates' launch configs (settings move it).
+/// candidates (by name and launch config), under the epoch the target was
+/// resolved in.
 fn input_key(target: &PrepareTarget, input: PrepareInput<'_>) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     target.epoch.hash(&mut hasher);
     for candidate in target.candidates.iter() {
         candidate.server_name.hash(&mut hasher);
+        // The launch config by identity: one settings snapshot shares its
+        // `Arc`s, so a target resolved from other settings — whatever its
+        // epoch reads — never shares a cell (or its answer) with this one.
+        std::ptr::hash(Arc::as_ptr(&candidate.config), &mut hasher);
     }
     input.host_language.hash(&mut hasher);
     input.virtual_text.hash(&mut hasher);
@@ -1480,6 +1469,25 @@ mod tests {
         .clone();
         assert_eq!(versions.len(), 1, "{versions:?}");
         assert!(versions[0] > 1, "a newer version than the first request's");
+    }
+
+    #[test]
+    fn another_launch_config_never_shares_an_answer() {
+        let registry = PrepareRegistry::default();
+        let pool = LanguageServerPool::preparing();
+        let host = Url::parse("file:///host.md").unwrap();
+        let current = target_of(&pool, &[("peer", &["peer", "--new"])]);
+        // The same name and epoch, resolved from other settings.
+        let other = target_of(&pool, &[("peer", &["peer", "--old"])]);
+        let a = cell(
+            &registry,
+            &pool,
+            &current,
+            input(&host, "a"),
+            Holder::Request,
+        );
+        let b = cell(&registry, &pool, &other, input(&host, "a"), Holder::Request);
+        assert!(!Arc::ptr_eq(&a, &b));
     }
 
     #[test]
