@@ -826,6 +826,13 @@ mod tests {
             coordinator.place_held(&host, "lua", TEST_ULID_LUA_0, "a", None),
             Presentation::AsIs
         ));
+        // The lifecycle pass holds the region on that answer, as it holds
+        // every region with no peer.
+        assert!(matches!(
+            coordinator.prepared_document_now(&target, input(TEST_ULID_LUA_0, "a")),
+            super::PrepareLookup::Answered(super::super::prepare_registry::Answer::AsIs)
+        ));
+        assert!(coordinator.places_pushes_as_is());
 
         // The lifecycle pass holds a region on an answer it waits for.
         let _ = coordinator.prepared_document_now(&target, input(TEST_ULID_LUA_0, "b"));

@@ -32,7 +32,7 @@
 
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -263,6 +263,13 @@ pub(crate) struct PrepareRegistry {
     /// Some region was ever looked up: until then every query answers "no
     /// region" without touching the map.
     used: AtomicBool,
+    /// Moved whenever what the lifecycle pass holds a document on, or the
+    /// answer it holds it on, may have changed: keys
+    /// [`Self::any_region_prepared`]'s cached scan.
+    held_changes: Arc<AtomicU64>,
+    /// The last scan of [`Self::any_region_prepared`]: `(epoch, held
+    /// changes, result)`.
+    prepared_scan: std::sync::Mutex<Option<(u64, u64, bool)>>,
     /// Source of `textDocument.version`: shared by all documents, so a
     /// document forgotten and prepared again (a reopen) never repeats a
     /// version the peer saw.
@@ -285,6 +292,8 @@ impl Default for PrepareRegistry {
         Self {
             regions: Arc::default(),
             used: AtomicBool::new(false),
+            held_changes: Arc::default(),
+            prepared_scan: std::sync::Mutex::new(None),
             next_revision: Arc::new(AtomicI32::new(1)),
             resync_tx,
             resync_rx: std::sync::Mutex::new(Some(resync_rx)),
@@ -427,12 +436,30 @@ impl PrepareRegistry {
     /// Whether the lifecycle pass prepares any region (holds it on an answer
     /// other than as is, or one it waits for) as it stands at `epoch`: see
     /// [`Self::region`].
+    /// Scanned once per epoch and change of what is held, not per call.
     pub(crate) fn any_region_prepared(&self, epoch: u64) -> bool {
-        self.regions.iter().any(|region| {
+        let changes = self.held_changes.load(Ordering::Acquire);
+        let cached = *self
+            .prepared_scan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((scanned_epoch, scanned_changes, prepared)) = cached
+            && (scanned_epoch, scanned_changes) == (epoch, changes)
+        {
+            return prepared;
+        }
+        let prepared = self.regions.iter().any(|region| {
             region
                 .held_cell()
                 .is_some_and(|cell| !matches!(cell.standing(epoch), Ok(Some(Answer::AsIs))))
-        })
+        });
+        // Keyed by the changes read before the scan: one made during it
+        // makes the next call scan again.
+        *self
+            .prepared_scan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((epoch, changes, prepared));
+        prepared
     }
 
     /// Whether any of `host_uri`'s documents the lifecycle pass holds back
@@ -466,6 +493,7 @@ impl PrepareRegistry {
                 !(region.host_uri == host_uri && region.region_id == region_id)
             }),
         }
+        self.held_changes.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Forget a replaced region under every language but the one it resolves
@@ -479,12 +507,14 @@ impl PrepareRegistry {
                 && region.region_id == region_id
                 && Some(region.injection_language.as_str()) != keep)
         });
+        self.held_changes.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Forget a closed host's documents.
     pub(crate) fn forget_host(&self, host_uri: &Url) {
         self.regions
             .retain(|_, region| region.host_uri != host_uri.as_str());
+        self.held_changes.fetch_add(1, Ordering::AcqRel);
     }
 
     /// The slot answering `input` under `epoch`, created when missing.
@@ -510,6 +540,7 @@ impl PrepareRegistry {
             .slot(target, input, holder, target.epoch)
             .expect("an input under the current epoch");
         assert!(slot.cell.outcome.set(answer).is_ok(), "answered already");
+        self.held_changes.fetch_add(1, Ordering::AcqRel);
     }
 
     fn slot(
@@ -543,8 +574,9 @@ impl PrepareRegistry {
                 held: None,
             };
         }
-        if holder == Holder::LifecyclePass {
+        if holder == Holder::LifecyclePass && region.held != Some(key) {
             region.held = Some(key);
+            self.held_changes.fetch_add(1, Ordering::AcqRel);
         }
         let slot = match region.slots.iter().position(|slot| slot.key == key) {
             Some(index) => region.slots.remove(index),
@@ -618,6 +650,7 @@ impl PrepareRegistry {
         let candidates = Arc::clone(&target.candidates);
         let job = PrepareJob::new(input, cell.taken);
         let resync_tx = self.resync_tx.clone();
+        let held_changes = Arc::clone(&self.held_changes);
         tokio::spawn(async move {
             let cell = Arc::clone(&end.0);
             // Its cell still stands: kept by its region, under the current
@@ -646,6 +679,7 @@ impl PrepareRegistry {
                 Ok(answer) => {
                     let ready = !matches!(answer, Answer::Unusable);
                     let _ = cell.outcome.set(answer);
+                    held_changes.fetch_add(1, Ordering::AcqRel);
                     // The answer the lifecycle pass holds the document on
                     // re-syncs the host, whoever asked. An unusable one
                     // does too, unready: nothing more is coming for this
