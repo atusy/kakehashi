@@ -172,12 +172,17 @@ fn collect_after_resync(resync: &crate::lsp::bridge::Resync) -> Option<CollectAf
 }
 
 /// Collect `uri`'s diagnostics as [`collect_after_resync`] has it, after a
-/// resync pass synced it.
+/// resync pass synced it. Not in a one-shot CLI run: no editor reads them,
+/// as `did_open_impl` schedules no synthetic collection there (#489).
 fn collect_diagnostics_after_resync(
     diagnostics: &super::coordinator::DiagnosticScheduler,
+    cli_mode: bool,
     uri: Url,
     resync: &crate::lsp::bridge::Resync,
 ) {
+    if cli_mode {
+        return;
+    }
     match collect_after_resync(resync) {
         Some(CollectAfterResync::AtOnce) => diagnostics.spawn_diagnostic_task_after_prepare(uri),
         Some(CollectAfterResync::Debounced) => {
@@ -925,6 +930,8 @@ impl Kakehashi {
         let diagnostics = self.diagnostic_scheduler();
         let bridge = Arc::clone(&self.bridge);
         let token = self.shutdown_token.clone();
+        // Marked before `initialize`, which spawns this loop.
+        let cli_mode = self.is_cli_mode();
         tokio::spawn(async move {
             // Consecutive passes per host that did not sync (sends failed, or
             // regions not looked at).
@@ -964,7 +971,7 @@ impl Kakehashi {
                             // The servers now hold the texts the answers
                             // gave; what they diagnosed before was for other
                             // texts.
-                            collect_diagnostics_after_resync(&diagnostics, uri, &resync);
+                            collect_diagnostics_after_resync(&diagnostics, cli_mode, uri, &resync);
                         }
                         AfterResyncPass::Retry { failed } => {
                             bridge.requeue_prepare_resync(
@@ -3273,11 +3280,52 @@ mod tests {
             recollect: false,
             edited,
         };
-        super::collect_diagnostics_after_resync(&diagnostics, uri.clone(), &resync(false));
+        super::collect_diagnostics_after_resync(&diagnostics, false, uri.clone(), &resync(false));
         assert!(!server.debounced_diagnostics.has_active_timer(&uri));
-        super::collect_diagnostics_after_resync(&diagnostics, uri.clone(), &resync(true));
+        super::collect_diagnostics_after_resync(&diagnostics, false, uri.clone(), &resync(true));
         assert!(server.debounced_diagnostics.has_active_timer(&uri));
         server.debounced_diagnostics.cancel_all();
+    }
+
+    /// A one-shot CLI run collects nothing after a resync pass, as its
+    /// didOpen schedules nothing (#489): no editor reads it.
+    #[tokio::test]
+    async fn a_cli_run_collects_nothing_after_a_resync_pass() {
+        use crate::lsp::bridge::Resync;
+        for cli_mode in [true, false] {
+            let (service, _socket) =
+                tower_lsp_server::LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+            let server = service.inner();
+            let uri = url::Url::parse("file:///test/cli-resync.md").unwrap();
+            server.documents.insert(
+                uri.clone(),
+                "# cli\n".to_string(),
+                Some("markdown".to_string()),
+                None,
+            );
+            let diagnostics = server.diagnostic_scheduler();
+            for edited in [false, true] {
+                let resync = Resync {
+                    host_uri: uri.clone(),
+                    ready: true,
+                    recollect: false,
+                    edited,
+                };
+                super::collect_diagnostics_after_resync(
+                    &diagnostics,
+                    cli_mode,
+                    uri.clone(),
+                    &resync,
+                );
+            }
+            assert_eq!(
+                server.debounced_diagnostics.has_active_timer(&uri)
+                    || server.synthetic_diagnostics.has_active_task(&uri),
+                !cli_mode,
+                "cli mode {cli_mode}"
+            );
+            server.debounced_diagnostics.cancel_all();
+        }
     }
 
     /// A keystroke's answer is collected by the edit's debounced collection,
