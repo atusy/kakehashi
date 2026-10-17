@@ -226,6 +226,12 @@ fn transform_document_symbol_nested_response(
 fn transform_document_symbol_ranges(symbol: &mut DocumentSymbol, offset: &RegionOffset) {
     translate_virtual_range_to_host(&mut symbol.range, offset);
     translate_virtual_range_to_host(&mut symbol.selection_range, offset);
+    if offset.prepared().is_some() {
+        // Mapped on its own, a selection at a dedented line's start or an
+        // emptied gap can land outside its symbol's range, which LSP
+        // requires to contain it.
+        clamp_into(&mut symbol.selection_range, symbol.range);
+    }
 
     if let Some(children) = &mut symbol.children {
         for child in children {
@@ -234,10 +240,40 @@ fn transform_document_symbol_ranges(symbol: &mut DocumentSymbol, offset: &Region
     }
 }
 
+/// Clamp `inner` into `outer`.
+fn clamp_into(
+    inner: &mut tower_lsp_server::ls_types::Range,
+    outer: tower_lsp_server::ls_types::Range,
+) {
+    inner.start = inner.start.clamp(outer.start, outer.end);
+    inner.end = inner.end.clamp(inner.start, outer.end);
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::*;
     use super::*;
+
+    #[test]
+    fn a_selection_is_clamped_into_its_range() {
+        use tower_lsp_server::ls_types::{Position, Range};
+        let range = |a: (u32, u32), b: (u32, u32)| {
+            Range::new(Position::new(a.0, a.1), Position::new(b.0, b.1))
+        };
+        let outer = range((3, 2), (5, 0));
+        let mut before = range((3, 0), (3, 4));
+        clamp_into(&mut before, outer);
+        assert_eq!(before, range((3, 2), (3, 4)));
+        let mut after = range((4, 0), (6, 1));
+        clamp_into(&mut after, outer);
+        assert_eq!(after, range((4, 0), (5, 0)));
+        let mut outside = range((6, 0), (6, 1));
+        clamp_into(&mut outside, outer);
+        assert_eq!(outside, range((5, 0), (5, 0)));
+        let mut inside = range((4, 1), (4, 2));
+        clamp_into(&mut inside, outer);
+        assert_eq!(inside, range((4, 1), (4, 2)));
+    }
     use rstest::rstest;
     use serde_json::json;
 
