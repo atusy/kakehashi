@@ -610,6 +610,53 @@ mod tests {
         assert!(!prepared(&off));
     }
 
+    /// A pair's candidates resolve once per settings: every caller gets the
+    /// same launch configs (answers are keyed by their identity), and only
+    /// other settings resolve them again.
+    #[test]
+    fn a_pairs_candidates_resolve_once_per_settings() {
+        let pool = Arc::new(LanguageServerPool::preparing());
+        let coordinator = BridgeCoordinator::with_cancel_forwarder(
+            Arc::clone(&pool),
+            CancelForwarder::new(Arc::clone(&pool)),
+        );
+        let settings_with = |servers: &[&str]| {
+            Arc::new(crate::config::WorkspaceSettings {
+                auto_install: false,
+                language_servers: servers
+                    .iter()
+                    .map(|name| {
+                        (
+                            name.to_string(),
+                            super::super::pool::test_helpers::devnull_config_for_language("lua"),
+                        )
+                    })
+                    .collect(),
+                ..Default::default()
+            })
+        };
+        coordinator.prepare_settings_changed(&settings_with(&["peer"]));
+        let first = coordinator.prepare_target("markdown", "lua").unwrap();
+        let again = coordinator.prepare_target("markdown", "lua").unwrap();
+        assert!(Arc::ptr_eq(&first.candidates, &again.candidates));
+        assert!(Arc::ptr_eq(
+            &first.candidates[0].config,
+            &again.candidates[0].config
+        ));
+
+        // Equal settings: nothing resolves again, the epoch stays.
+        coordinator.prepare_settings_changed(&settings_with(&["peer"]));
+        let same = coordinator.prepare_target("markdown", "lua").unwrap();
+        assert!(Arc::ptr_eq(&first.candidates, &same.candidates));
+        assert_eq!(same.epoch, first.epoch);
+
+        // Other settings: resolved again, under a new epoch.
+        coordinator.prepare_settings_changed(&settings_with(&["peer", "other"]));
+        let other = coordinator.prepare_target("markdown", "lua").unwrap();
+        assert!(!Arc::ptr_eq(&first.candidates, &other.candidates));
+        assert!(other.epoch > first.epoch);
+    }
+
     #[test]
     fn an_unrecorded_text_places_as_is_only_outside_prepared_regions() {
         let pool = LanguageServerPool::preparing();
