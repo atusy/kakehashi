@@ -19,7 +19,7 @@
 use std::ops::Range;
 use std::time::Duration;
 
-use line_index::{LineIndex, WideEncoding, WideLineCol};
+use line_index::{LineIndex, TextRange, WideEncoding, WideLineCol};
 
 use crate::language::injection::VirtualGap;
 use crate::text::position::normalize_lone_carriage_returns;
@@ -898,15 +898,15 @@ impl LineMap {
         }
     }
 
-    /// Byte offset of `position`, or `None` unless it names a real location.
+    /// Byte offset of `position`, or `None` unless its line exists and its
+    /// column falls between characters. A column past the line's content
+    /// defaults back to the line's length, as LSP has it.
     fn offset_strict(&self, position: Position) -> Option<usize> {
-        // A line has no more UTF-16 units than bytes: a column past its byte
-        // length names nothing, and is refused before the index adds it to
-        // the line's start (which a column near `u32::MAX` would overflow).
         let line = self.index.0.line(position.line)?;
-        if position.character > u32::from(line.len()) {
-            return None;
-        }
+        // Also keeps the column from overflowing once the index adds it to
+        // the line's start.
+        let length = self.position(self.content_end(line)).character;
+        let position = Position::new(position.line, position.character.min(length));
         let line_col = self.index.0.to_utf8(
             WideEncoding::Utf16,
             WideLineCol {
@@ -928,13 +928,8 @@ impl LineMap {
             return self.text.len();
         };
         let line_start: usize = line_range.start().into();
-        let line_end: usize = line_range.end().into();
-        let line = &self.text[line_start..line_end];
-        let content = line
-            .strip_suffix('\n')
-            .map(|line| line.strip_suffix('\r').unwrap_or(line))
-            .unwrap_or_else(|| line.strip_suffix('\r').unwrap_or(line));
-        let content_end = line_start + content.len();
+        let content_end = self.content_end(line_range);
+        let content = &self.text[line_start..content_end];
         // Through the index's per-line table of non-ASCII characters rather
         // than a scan of the line. A line has no more UTF-16 units than
         // bytes, so capping the column at the byte length keeps every column
@@ -958,6 +953,18 @@ impl LineMap {
             .map_or(content_end, usize::from)
             .min(content_end);
         self.text.ceil_char_boundary(byte)
+    }
+
+    /// Where `line`'s content ends: before its line break.
+    fn content_end(&self, line: TextRange) -> usize {
+        let line_start: usize = line.start().into();
+        let line_end: usize = line.end().into();
+        let line = &self.text[line_start..line_end];
+        let content = line
+            .strip_suffix('\n')
+            .map(|line| line.strip_suffix('\r').unwrap_or(line))
+            .unwrap_or_else(|| line.strip_suffix('\r').unwrap_or(line));
+        line_start + content.len()
     }
 
     fn position(&self, offset: usize) -> Position {
@@ -1087,11 +1094,18 @@ mod tests {
     }
 
     #[test]
-    fn a_column_past_any_line_names_no_location() {
-        let lines = LineMap::new("\n ".to_string());
-        assert_eq!(lines.offset_strict(Position::new(1, u32::MAX)), None);
-        assert_eq!(lines.offset_strict(Position::new(1, 2)), None);
+    fn a_column_past_a_line_defaults_back_to_its_length() {
+        let lines = LineMap::new("\n \r\nb".to_string());
+        assert_eq!(lines.offset_strict(Position::new(1, u32::MAX)), Some(2));
+        assert_eq!(lines.offset_strict(Position::new(1, 2)), Some(2));
         assert_eq!(lines.offset_strict(Position::new(1, 1)), Some(2));
+        assert_eq!(lines.offset_strict(Position::new(0, 5)), Some(0));
+        assert_eq!(lines.offset_strict(Position::new(2, 9)), Some(5));
+        assert_eq!(
+            lines.offset_strict(Position::new(3, 0)),
+            None,
+            "no such line"
+        );
         assert_eq!(lines.offset_clamped(Position::new(1, u32::MAX)), 2);
     }
 
@@ -1566,30 +1580,30 @@ mod tests {
     }
 
     #[test]
-    fn a_deletion_splitting_a_crlf_is_refused() {
-        // LSP treats CRLF as one line break, but a position between its CR
-        // and LF still names an offset: deleting up to or from there would
-        // leave a lone CR or LF the map does not count.
-        for (virtual_text, start, end) in [
-            ("\r\nfoo", (0, 0), (0, 1)),
-            ("  \r\nfoo", (0, 0), (0, 3)),
-            ("foo\r\n\r\n", (0, 4), (2, 0)),
-            ("a\r\n\r\n  ", (1, 1), (2, 0)),
+    fn no_deletion_splits_a_crlf() {
+        // LSP treats CRLF as one line break: a column between its CR and LF
+        // is past the line's content, and defaults back to before the CR.
+        // No change leaves a lone CR or LF the map does not count.
+        for (virtual_text, start, end, clamped) in [
+            ("\r\nfoo", (0, 0), (0, 1), ((0, 0), (0, 0))),
+            ("  \r\nfoo", (0, 0), (0, 3), ((0, 0), (0, 2))),
+            ("foo\r\n\r\n", (0, 4), (2, 0), ((0, 3), (2, 0))),
+            ("a\r\n\r\n  ", (1, 1), (2, 0), ((1, 0), (2, 0))),
         ] {
-            let change = json!({"range": {
-                "start": {"line": start.0, "character": start.1},
-                "end": {"line": end.0, "character": end.1}
-            }, "newText": ""});
-            assert_eq!(
+            let apply = |start: (u32, u32), end: (u32, u32)| {
+                let change = json!({"range": {
+                    "start": {"line": start.0, "character": start.1},
+                    "end": {"line": end.0, "character": end.1}
+                }, "newText": ""});
                 apply_prepare_result(
                     virtual_text,
                     &VirtualLayout::single(virtual_text),
                     result(json!({"segments": [{"type": "content", "changes": [change]}]})),
-                ),
-                Err(PrepareError::InvalidChange {
-                    index: 0,
-                    reason: "content changes may only delete whole blank lines"
-                }),
+                )
+            };
+            assert_eq!(
+                apply(start, end),
+                apply(clamped.0, clamped.1),
                 "{virtual_text:?} {start:?}-{end:?}"
             );
         }
@@ -1742,6 +1756,22 @@ mod tests {
     }
 
     #[test]
+    fn a_dedent_past_its_line_deletes_up_to_the_line_end() {
+        // LSP: a character past the line defaults back to its length.
+        let virtual_text = "a\n   \nb\n".to_string();
+        let layout = VirtualLayout::single(&virtual_text);
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &layout,
+            result(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 99}}, "newText": ""}
+            ]}]})),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "a\n\nb\n");
+    }
+
+    #[test]
     fn content_change_must_delete_leading_whitespace_or_whole_lines() {
         let virtual_text = "  a b\n".to_string();
         let layout = VirtualLayout::single(&virtual_text);
@@ -1759,7 +1789,12 @@ mod tests {
                 "content changes may only delete whitespace",
             ),
             (
+                // Past the line: up to its end, then.
                 json!({"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 99}}, "newText": ""}),
+                "content changes may only delete whitespace",
+            ),
+            (
+                json!({"range": {"start": {"line": 0, "character": 0}, "end": {"line": 9, "character": 0}}, "newText": ""}),
                 "change ends outside the segment",
             ),
         ] {
