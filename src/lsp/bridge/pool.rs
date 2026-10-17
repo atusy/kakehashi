@@ -2727,18 +2727,19 @@ impl LanguageServerPool {
         // under too: a region it holds for its prepare peer is not opened
         // with text as is (a request resolved before its pair gained the
         // peer), whether its own or the last forwarded.
+        let region_held = self
+            .latest_virtual_contents
+            .get(host_uri)
+            .is_some_and(|host| {
+                !host.held.is_empty()
+                    && host.held.contains(&(
+                        virtual_uri.language().to_string(),
+                        virtual_uri.region_id().to_string(),
+                    ))
+            });
         if let VirtualOpenContent::LatestKnown(provided) = &content
             && provided.map.is_none()
-            && self
-                .latest_virtual_contents
-                .get(host_uri)
-                .is_some_and(|host| {
-                    !host.held.is_empty()
-                        && host.held.contains(&(
-                            virtual_uri.language().to_string(),
-                            virtual_uri.region_id().to_string(),
-                        ))
-                })
+            && region_held
         {
             drop(transition_guard);
             self.remove_open_transition_lock_if_unshared(virtual_uri, connection_key, &transition);
@@ -2865,12 +2866,13 @@ impl LanguageServerPool {
         // the cache — most likely the lifecycle pass's newer text, which the
         // server should hold even though this request then fails its own
         // check.
+        // Never a cached text as is for a held region, however new.
         let virtual_content = current_content
             .as_deref()
             .filter(|cached| {
                 provided.map.is_none_or(|request| {
                     cached.recorded.load(std::sync::atomic::Ordering::Relaxed) > request.built()
-                })
+                }) && (cached.map.is_some() || !region_held)
             })
             .map_or(provided, LatestText::as_sent);
         // What the connection holds is recorded as the didOpen is queued,
@@ -9322,7 +9324,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_lazy_open_sends_the_newer_of_its_text_and_the_forwarded_one() {
-        let pool = LanguageServerPool::new();
+        let pool = LanguageServerPool::preparing();
         let host_uri = Url::parse("file:///test/lazy-open-order.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
         let key = ConnectionKey::for_server("lua");
@@ -9361,7 +9363,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_prepared_open_takes_a_text_forwarded_after_its_answer_was_taken() {
-        let pool = LanguageServerPool::new();
+        let pool = LanguageServerPool::preparing();
         let host_uri = Url::parse("file:///test/lazy-open-newer.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
         let key = ConnectionKey::for_server("lua");
@@ -9393,8 +9395,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_held_region_opens_with_a_prepared_request_text_over_a_newer_one_as_is() {
+        let pool = LanguageServerPool::preparing();
+        let host_uri = Url::parse("file:///test/lazy-open-held-newer.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        // A request's answer taken; the pair then lost its peer (the text
+        // forwarded as is) and regained one (the region held again).
+        let map = dedent_map("  x = 1");
+        pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  x = 1");
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
+        pool.ensure_document_opened(
+            &mut sender,
+            &host_uri,
+            &virtual_uri,
+            SentText {
+                text: "x = 1",
+                map: Some(&map),
+            },
+            &key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened_text(&mut rx), "x = 1");
+    }
+
+    #[tokio::test]
     async fn a_region_held_for_its_peer_is_not_opened_as_is() {
-        let pool = LanguageServerPool::new();
+        let pool = LanguageServerPool::preparing();
         let host_uri = Url::parse("file:///test/lazy-open-held.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
         let key = ConnectionKey::for_server("lua");
