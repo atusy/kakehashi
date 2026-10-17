@@ -265,6 +265,10 @@ pub(crate) struct DocumentTracker {
     /// Source of [`HeldText::generation`]: the newest generation given out,
     /// published once its record is in (see [`Self::held_through`]).
     held_generations: Arc<AtomicU64>,
+    /// Woken once a record is in, or a document closes on a connection: what
+    /// a request waiting for its text checks changed (see
+    /// [`Self::held_changed`]).
+    held_changed: tokio::sync::Notify,
     /// Some connection was ever sent a prepared text: until then every held
     /// text is a virtual text as is, which lets paths skip looking up what a
     /// connection holds.
@@ -315,6 +319,7 @@ impl DocumentTracker {
             document_versions: Mutex::new(HashMap::new()),
             document_fingerprints: std::sync::Mutex::new(HashMap::new()),
             held_generations: Arc::new(AtomicU64::new(0)),
+            held_changed: tokio::sync::Notify::new(),
             ever_held_prepared: AtomicBool::new(false),
             prepared_history: std::sync::Mutex::new(HashMap::new()),
             host_to_virtual: Mutex::new(HashMap::new()),
@@ -945,6 +950,7 @@ impl DocumentTracker {
             let previous = held.clone();
             held.map = map;
             held.version = change.version;
+            self.held_changed.notify_waiters();
             return Some(previous);
         }
         // Given out only under this lock, and published once the record is
@@ -961,7 +967,15 @@ impl DocumentTracker {
             },
         );
         self.held_generations.store(generation, Ordering::Release);
+        self.held_changed.notify_waiters();
         previous
+    }
+
+    /// Completes once a record is in, or a document closes on a connection,
+    /// after this was enabled: check what changed after enabling it, then
+    /// await it.
+    pub(super) fn held_changed(&self) -> tokio::sync::futures::Notified<'_> {
+        self.held_changed.notified()
     }
 
     /// Whether any connection was ever sent a prepared text.
@@ -1392,6 +1406,7 @@ impl DocumentTracker {
                 keys.retain(|k| k != connection_key);
                 keys.is_empty()
             });
+        self.held_changed.notify_waiters();
     }
 
     /// Find ALL connections that have opened a given virtual document URI.

@@ -27,7 +27,6 @@ use crate::lsp::bridge::protocol::{
 /// whose text a newer edit superseded never sees it sent, and fails here (the
 /// editor usually cancels such a request first).
 const REQUEST_TEXT_WAIT: std::time::Duration = PREPARE_TIMEOUT;
-const REQUEST_TEXT_POLL: std::time::Duration = std::time::Duration::from_millis(10);
 
 fn request_text_not_held(connection_key: &super::ConnectionKey) -> io::Error {
     io::Error::new(
@@ -419,6 +418,11 @@ impl LanguageServerPool {
         }
         let deadline = tokio::time::Instant::now() + REQUEST_TEXT_WAIT;
         loop {
+            // Enabled before the check: a record made after it wakes the
+            // wait.
+            let changed = self.document_tracker.held_changed();
+            let mut changed = std::pin::pin!(changed);
+            changed.as_mut().enable();
             if !self
                 .document_tracker
                 .is_virtual_doc_open_on_connection(uri_string, connection_key)
@@ -426,10 +430,9 @@ impl LanguageServerPool {
             {
                 return Ok(());
             }
-            if tokio::time::Instant::now() >= deadline {
+            if tokio::time::timeout_at(deadline, changed).await.is_err() {
                 return Err(request_text_not_held(connection_key));
             }
-            tokio::time::sleep(REQUEST_TEXT_POLL).await;
         }
     }
 
@@ -876,6 +879,80 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_waiting_request_goes_on_as_soon_as_its_text_is_sent_or_closed() {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let pool = Arc::new(LanguageServerPool::preparing());
+        let host_uri = Url::parse("file:///test/wake.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap(),
+            "lua",
+            TEST_ULID_LUA_0,
+        );
+        let uri = virtual_uri.to_uri_string();
+        let key = ConnectionKey::for_server("lua");
+        pool.register_opened_document(&host_uri, &virtual_uri, &key)
+            .await;
+        pool.record_sent_for_test(&virtual_uri, &key, "  a".into());
+        let prepared =
+            apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(dedent_answer()))
+                .unwrap();
+        let offset = RegionOffset::new(0, 0).with_prepared(Arc::clone(&prepared.map));
+        // Off any polling tick.
+        let delay = std::time::Duration::from_millis(2_503);
+
+        // Sent: the request goes on at that instant, not at a later tick.
+        let sender = {
+            let pool = Arc::clone(&pool);
+            let virtual_uri = virtual_uri.clone();
+            let key = key.clone();
+            let prepared = prepared.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                pool.record_sent_for_test(
+                    &virtual_uri,
+                    &key,
+                    SentText {
+                        text: &prepared.text,
+                        map: Some(&prepared.map),
+                    },
+                );
+            })
+        };
+        let started = tokio::time::Instant::now();
+        assert!(
+            pool.wait_for_request_text(&uri, &key, &offset)
+                .await
+                .is_ok()
+        );
+        assert_eq!(started.elapsed(), delay);
+        sender.await.unwrap();
+
+        // Closed on the connection: nothing is waited for any more (the
+        // request opens it with its own text).
+        let other =
+            apply_prepare_result("  b", &VirtualLayout::single("  b"), Some(dedent_answer()))
+                .unwrap();
+        let other_offset = RegionOffset::new(0, 0).with_prepared(Arc::clone(&other.map));
+        let closer = {
+            let pool = Arc::clone(&pool);
+            let virtual_uri = virtual_uri.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                pool.untrack_document(&virtual_uri, &key).await;
+            })
+        };
+        let started = tokio::time::Instant::now();
+        assert!(
+            pool.wait_for_request_text(&uri, &key, &other_offset)
+                .await
+                .is_ok()
+        );
+        assert_eq!(started.elapsed(), delay);
+        closer.await.unwrap();
     }
 
     #[tokio::test]
