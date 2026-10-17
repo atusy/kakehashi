@@ -955,7 +955,8 @@ pub(crate) struct ResolvedInjection {
     /// masked spans and host-only lines' line breaks (a non-empty
     /// `virtual_range`), and stripped text such as line prefixes (an empty
     /// one). Empty for an isolated region, presented as all content: the
-    /// host text it strips (line prefixes) is not part of its segments.
+    /// host text it strips (line prefixes) is not part of its segments. Empty
+    /// too with experimental features off, where nothing presents them.
     pub gaps: std::sync::Arc<[VirtualGap]>,
 }
 
@@ -1633,18 +1634,7 @@ fn push_stripped_gap(output: &str, gaps: &mut GapLog, host_text: &str) {
     gaps.push(output.len()..output.len(), host_text);
 }
 
-/// Build a line-preserving combined document while stripping excluded prefixes.
-///
-/// Host-only gaps stay as empty or whitespace-only lines so virtual and host
-/// line numbers remain aligned. On lines containing injected content, bytes
-/// before the first included range are removed and recorded as a UTF-16 column
-/// offset, matching the isolated-region `extract_clean_content` contract. Any
-/// later gaps on the same line remain coordinate-preserving whitespace because
-/// the bridge offset model supports one translation offset per line.
-///
-/// Every host byte the virtual document does not carry verbatim is also
-/// returned as a [`VirtualGap`], in order, so the bridge can present the
-/// document as content and gap segments (`kakehashi/virtualDocument/prepare`).
+/// [`build_combined_virtual_content_recording`], recording the gaps.
 #[cfg(test)]
 fn build_combined_virtual_content(
     text: &str,
@@ -1654,8 +1644,19 @@ fn build_combined_virtual_content(
     build_combined_virtual_content_recording(text, span, included, true)
 }
 
-/// [`build_combined_virtual_content`], recording its gaps only when
-/// `record_gaps`.
+/// Build a line-preserving combined document while stripping excluded prefixes.
+///
+/// Host-only gaps stay as empty or whitespace-only lines so virtual and host
+/// line numbers remain aligned. On lines containing injected content, bytes
+/// before the first included range are removed and recorded as a UTF-16 column
+/// offset, matching the isolated-region `extract_clean_content` contract. Any
+/// later gaps on the same line remain coordinate-preserving whitespace because
+/// the bridge offset model supports one translation offset per line.
+///
+/// With `record_gaps`, every host byte the virtual document does not carry
+/// verbatim is also returned as a [`VirtualGap`], in order, so the bridge can
+/// present the document as content and gap segments
+/// (`kakehashi/virtualDocument/prepare`); otherwise none is.
 fn build_combined_virtual_content_recording(
     text: &str,
     span: Range<usize>,

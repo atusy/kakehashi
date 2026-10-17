@@ -8,7 +8,7 @@
 //! shared by all of them.
 //!
 //! An answer stands only under the epoch it was asked in (see
-//! [`PrepareEpoch`]): whatever can change which candidate answers, or how —
+//! [`LanguageServerPool::prepare_epoch`]): whatever can change which candidate answers, or how —
 //! an advertisement, a start failure cleared, settings — moves the epoch, and
 //! every lookup after that is a new input. No answer is forgotten to get
 //! there; outdated answers age out of their region's slots, and an attempt
@@ -21,9 +21,11 @@
 //! The lifecycle pass must not wait for the peer under the document's edit
 //! lock, so it only looks up: on a miss it starts the attempt and holds the
 //! document back, and the attempt's end asks for the host to be synced again
-//! ([`Resync`]). Requests that can wait for the answer do; those that cannot
-//! (a diagnostic snapshot, a pull folding pushes) look up without waiting,
-//! never moving what the pass holds the document on.
+//! ([`Resync`]). A save, under the same lock at the saved version, holds its
+//! documents the same way. Requests that can wait for the answer do; those
+//! that cannot (a diagnostic snapshot, a pull folding pushes), and the
+//! re-open sweep and recovery probes, look up without waiting, never moving
+//! what the pass holds the document on.
 //!
 //! Every attempt runs on its own task, so a cancelled request cannot strand
 //! one half-done, and all waiters share it. An attempt that gets no answer
@@ -259,8 +261,9 @@ enum Holder {
     /// The lifecycle pass, which holds the document until the answer
     /// re-syncs it.
     LifecyclePass,
-    /// A request, which waits for the answer itself: it never moves what
-    /// the lifecycle pass holds the document on.
+    /// Anything else — a request (which may wait for the answer itself), a
+    /// re-open sweep, a recovery probe: it never moves what the lifecycle
+    /// pass holds the document on.
     Request,
 }
 
@@ -325,8 +328,9 @@ impl PrepareRegistry {
         !self.used.load(Ordering::Acquire)
     }
 
-    /// Queue `resync` again after `delay` — for a pass whose sends failed,
-    /// which nothing else would repeat. A shutdown drops it.
+    /// Queue `resync` again after `delay` — for a pass that did not sync,
+    /// which nothing else would repeat, or for a pull owed a refresh whose
+    /// documents no longer wait. A shutdown drops it.
     pub(crate) fn requeue_resync(&self, resync: Resync, delay: Duration) {
         let resync_tx = self.resync_tx.clone();
         tokio::spawn(async move {
@@ -337,9 +341,9 @@ impl PrepareRegistry {
 
     /// Hosts to sync again: a held-back virtual document became ready, its
     /// answer came back unusable, an attempt that got no answer finished its
-    /// retry backoff, a pass whose sends failed is retried
-    /// ([`Self::requeue_resync`]), or a lifecycle lookup found its target
-    /// resolved under a moved epoch. Taken once by the server loop.
+    /// retry backoff, a pass that did not sync or a pull owed a refresh is
+    /// synced again ([`Self::requeue_resync`]), or a lifecycle lookup found
+    /// its target resolved under a moved epoch. Taken once by the server loop.
     pub(crate) fn take_resync_rx(&self) -> Option<UnboundedReceiver<Resync>> {
         self.resync_rx
             .lock()
@@ -359,7 +363,8 @@ impl PrepareRegistry {
         let epoch = pool.prepare_epoch();
         let Some(slot) = self.slot(target, input, Holder::LifecyclePass, epoch) else {
             // A pass from before the epoch moved holds the document with no
-            // answer coming: sync the host again, under the current one.
+            // answer coming: sync the host again, under the current one. (A
+            // closed host is synced to nothing: its document is gone.)
             let _ = self.resync_tx.send(Resync {
                 host_uri: input.host_uri.clone(),
                 ready: false,
@@ -374,9 +379,10 @@ impl PrepareRegistry {
         PrepareLookup::Pending
     }
 
-    /// Look up for a request that cannot wait (a diagnostic snapshot, an
-    /// editor's pull on a push-only region): on a miss, start an attempt in
-    /// the background. It never moves what the lifecycle pass holds the
+    /// Look up without waiting for anything other than the lifecycle pass (a
+    /// diagnostic snapshot, an editor's pull on a push-only region, a
+    /// re-open sweep or recovery probe): on a miss, start an attempt in the
+    /// background. It never moves what the lifecycle pass holds the
     /// document on.
     pub(crate) fn lookup_for_request(
         &self,

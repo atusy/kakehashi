@@ -314,10 +314,6 @@ pub(crate) struct PreparedDocument {
     pub(crate) map: std::sync::Arc<PreparedMap>,
 }
 
-/// Apply a peer answer to the virtual document it was asked about.
-///
-/// `result` of `None` is the wire `null`: every gap keeps its
-/// coordinate-preserving whitespace and no content changes.
 /// [`apply_prepare_result_at`] taking its place in the presentation order
 /// now, as a test applying an answer directly does.
 #[cfg(test)]
@@ -329,10 +325,14 @@ pub(crate) fn apply_prepare_result(
     apply_prepare_result_at(virtual_text, layout, result, next_presentation())
 }
 
-/// [`apply_prepare_result`] for an answer to an input taken at `taken` in
-/// the presentation order (see [`next_presentation`]): what orders it
-/// against other texts is when its virtual text was read, not when the
-/// answer came — two attempts in flight can answer in either order.
+/// Apply a peer answer to the virtual document it was asked about, for an
+/// input taken at `taken` in the presentation order (see
+/// [`next_presentation`]): what orders it against other texts is when its
+/// virtual text was read, not when the answer came — two attempts in flight
+/// can answer in either order.
+///
+/// `result` of `None` is the wire `null`: every gap keeps its
+/// coordinate-preserving whitespace and no content changes.
 pub(crate) fn apply_prepare_result_at(
     virtual_text: &str,
     layout: &VirtualLayout,
