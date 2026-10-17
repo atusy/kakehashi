@@ -19,6 +19,11 @@ use crate::lsp::bridge::protocol::RequestId;
 
 // Test ULID constants - valid 26-char alphanumeric strings matching ULID format.
 // Using realistic ULIDs ensures tests reflect actual runtime behavior.
+/// Finish `handle`'s start, as its handshake would.
+pub(crate) fn mark_ready_for_test(handle: &ConnectionHandle) -> bool {
+    handle.transition_initializing_to_ready()
+}
+
 /// Make `handle` advertise `kakehashi/virtualDocument/prepare` (or not), as
 /// its handshake would have.
 #[allow(

@@ -1565,12 +1565,31 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn an_attempt_forgotten_while_its_candidate_is_ready_asks_nothing() {
+    async fn an_attempt_forgotten_while_its_candidate_starts_asks_nothing() {
+        use crate::lsp::bridge::pool::ConnectionState;
+        use crate::lsp::bridge::pool::test_helpers::{
+            advertise_prepare_for_test, create_handle_with_command, mark_ready_for_test,
+        };
         let registry = PrepareRegistry::default();
         let pool = Arc::new(LanguageServerPool::preparing());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("peer");
-        recording_candidate(&pool, "peer", true, &path).await;
+        // Starting: the attempt is admitted to acquire it, then waits for it.
+        let (handle, _) = create_handle_with_command(
+            ConnectionState::Initializing,
+            ConnectionKey::for_server("peer"),
+            vec![
+                "sh".into(),
+                "-c".into(),
+                "cat > \"$1\"".into(),
+                "record".into(),
+                path.to_str().unwrap().into(),
+            ],
+            None,
+        )
+        .await;
+        advertise_prepare_for_test(&handle, true);
+        pool.insert_connection(Arc::clone(&handle)).await;
         let host = Url::parse("file:///host.md").unwrap();
         let target = target_of(&pool, &[("peer", &["peer"])]);
         let slot = registry
@@ -1581,10 +1600,12 @@ mod tests {
                 target.epoch,
             )
             .unwrap();
-        // The host closes as the attempt starts.
-        registry.forget_host(&host);
         let mut attempts = slot.cell.attempts.subscribe();
         assert!(registry.start(&slot, &pool, &target, input(&host, "a")));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The host closes while the candidate starts.
+        registry.forget_host(&host);
+        assert!(mark_ready_for_test(&handle));
         let _ = attempts.changed().await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         let sent = std::fs::read_to_string(&path).unwrap_or_default();
