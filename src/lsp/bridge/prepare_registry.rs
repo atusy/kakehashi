@@ -1420,11 +1420,17 @@ mod tests {
         };
         let refusal =
             format!(r#"{{"jsonrpc":"2.0","id":2,"error":{{"code":{code},"message":"no"}}}}"#);
+        // A negative delay: answer once `<path>.release` exists.
+        let pause = if delay < 0.0 {
+            "while [ ! -e \"$1.release\" ]; do sleep 0.01; done".to_string()
+        } else {
+            format!("sleep {delay}")
+        };
         let script = format!(
             // An asynchronous list reads /dev/null unless given stdin.
             "exec 3<&0; (cat <&3 > \"$1\") & \
              while ! grep -q virtualDocument \"$1\" 2>/dev/null; do sleep 0.05; done; \
-             sleep {delay}; printf 'Content-Length: {}\\r\\n\\r\\n%s' '{refusal}'; wait",
+             {pause}; printf 'Content-Length: {}\\r\\n\\r\\n%s' '{refusal}'; wait",
             refusal.len()
         );
         let (handle, _) = create_handle_with_command(
@@ -1580,9 +1586,9 @@ mod tests {
         let first = dir.path().join("first");
         let second = dir.path().join("second");
         let sent = |path: &std::path::Path| std::fs::read_to_string(path).unwrap_or_default();
-        // `first` answers a while after the request arrived, having
-        // withdrawn its advertisement meanwhile.
-        refusing_candidate(&pool, "first", &first, 0.5, -32603).await;
+        // `first` answers once released, after the request arrived and its
+        // advertisement was withdrawn meanwhile.
+        refusing_candidate(&pool, "first", &first, -1.0, -32603).await;
         pool.record_prepare_advertisement(&ConnectionKey::for_server("first"), true);
         // A retryable cancellation: no answer, at once.
         refusing_candidate(&pool, "second", &second, 0.0, -32800).await;
@@ -1601,6 +1607,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             pool.record_prepare_advertisement(&ConnectionKey::for_server("first"), false);
+            std::fs::write(first.with_extension("release"), "").unwrap();
         };
         let (miss, ()) = tokio::join!(
             registry.prepare(&pool, &target, input(&host, "a")),
