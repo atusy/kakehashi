@@ -94,6 +94,15 @@ impl Kakehashi {
                             &host_url,
                             &envelope.region_id,
                         )?;
+                        // Its text as is describes nothing a prepared
+                        // region's servers hold (see `resolve_region_offset`).
+                        if self.bridge.region_coordinates_may_be_prepared(
+                            &host_url,
+                            &region.injection_language,
+                            &envelope.region_id,
+                        ) {
+                            return None;
+                        }
                         let text = std::sync::Arc::from(region.virtual_content.as_str());
                         let (offset, end, contiguous, language) = resolved_region_geometry(region);
                         if !completion_geometry_matches(envelope, &offset, contiguous, &language) {

@@ -2717,6 +2717,31 @@ impl LanguageServerPool {
         )
     }
 
+    /// Whether a text sent as is, from outside the lifecycle pass, must not
+    /// reach `virtual_uri` on this connection: the connection holds a
+    /// prepared text of it, or the lifecycle pass holds the region for its
+    /// prepare peer. Taken under the document's transition lock, which the
+    /// lifecycle pass sends and holds under too.
+    pub(in crate::lsp::bridge) fn refuses_text_as_is(
+        &self,
+        host_uri: &Url,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+    ) -> bool {
+        // Nothing is ever prepared or held without the prepare layer.
+        self.prepares()
+            && (self
+                .document_tracker
+                .held_text(&virtual_uri.to_uri_string(), connection_key)
+                .is_some_and(|held| held.map.is_some())
+                || self
+                    .latest_virtual_contents
+                    .get(host_uri)
+                    .is_some_and(|host| {
+                        host.holds(virtual_uri.language(), virtual_uri.region_id())
+                    }))
+    }
+
     async fn ensure_document_opened_with_content<S: message_sender::MessageSender>(
         &self,
         sender: &mut S,
@@ -9548,6 +9573,46 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(opened_text(&mut rx), "x = 1");
+    }
+
+    #[tokio::test]
+    async fn a_text_as_is_is_refused_over_a_prepared_or_held_region() {
+        let pool = LanguageServerPool::preparing();
+        let host_uri = Url::parse("file:///test/refuse-as-is.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        pool.register_opened_document(&host_uri, &virtual_uri, &key)
+            .await;
+        assert!(!pool.refuses_text_as_is(&host_uri, &virtual_uri, &key));
+        pool.record_sent_for_test(&virtual_uri, &key, SentText::from("  x = 1"));
+        assert!(
+            !pool.refuses_text_as_is(&host_uri, &virtual_uri, &key),
+            "held as is"
+        );
+        // Held for its peer.
+        pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  x = 1");
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
+        assert!(pool.refuses_text_as_is(&host_uri, &virtual_uri, &key));
+        // Holding a prepared text of it.
+        pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  x = 1");
+        assert!(
+            !pool.refuses_text_as_is(&host_uri, &virtual_uri, &key),
+            "released"
+        );
+        let map = dedent_map("  x = 1");
+        pool.record_sent_for_test(
+            &virtual_uri,
+            &key,
+            SentText {
+                text: "x = 1",
+                map: Some(&map),
+            },
+        );
+        assert!(pool.refuses_text_as_is(&host_uri, &virtual_uri, &key));
+        // Without the prepare layer, nothing is.
+        let plain = LanguageServerPool::new();
+        assert!(!plain.refuses_text_as_is(&host_uri, &virtual_uri, &key));
     }
 
     #[tokio::test]

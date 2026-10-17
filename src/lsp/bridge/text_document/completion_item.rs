@@ -463,6 +463,13 @@ impl LanguageServerPool {
                 if !self.is_document_opened_on_connection(&virtual_uri, connection_key) {
                     return Err(io::Error::other("completion document is no longer open"));
                 }
+                // The text is the region's as is: it never replaces a
+                // prepared one, nor reaches a region held for its peer.
+                if self.refuses_text_as_is(&document.host_uri, &virtual_uri, connection_key) {
+                    return Err(io::Error::other(
+                        "completion document is prepared for its peer",
+                    ));
+                }
                 if let Some(change) = self
                     .increment_version_if_content_changed(
                         &virtual_uri,
@@ -866,6 +873,99 @@ mod tests {
             assert_eq!(handle.router().route(json!({"jsonrpc": "2.0", "id": ids[0].as_i64(), "result": {"label": "x", "detail": "resolved"}})), crate::lsp::bridge::RouteResult::Delivered);
             assert_eq!(reply.await.unwrap().detail.as_deref(), Some("resolved"));
         }).await.expect("sync and enqueue must not wait for the reply");
+    }
+
+    /// An item minted from a region's text as is resolves nothing once its
+    /// connection holds a prepared text of the region: syncing the text as
+    /// is would replace it, and the server's coordinates would then map
+    /// through nothing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolve_sends_no_text_as_is_over_a_prepared_one() {
+        use crate::lsp::bridge::pool::test_helpers::create_handle_with_command;
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        use crate::lsp::bridge::{ConnectionKey, ConnectionState};
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let key = ConnectionKey::for_server("lua-ls");
+        let (handle, _) = create_handle_with_command(
+            ConnectionState::Ready,
+            key.clone(),
+            vec![
+                "sh".into(),
+                "-c".into(),
+                "cat > \"$1\"".into(),
+                "sh".into(),
+                output.path().to_str().unwrap().into(),
+            ],
+            None,
+        )
+        .await;
+        let pool = LanguageServerPool::preparing();
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let envelope = test_envelope();
+        let uri = Url::parse(&envelope.host_uri).unwrap();
+        pool.open_host_incarnation(&uri, 1).await;
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&uri).unwrap(),
+            &envelope.injection_language,
+            &envelope.region_id,
+        );
+        let virtual_text = "  a";
+        let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(answer),
+        )
+        .unwrap();
+        let sent = SentText {
+            text: &prepared.text,
+            map: Some(&prepared.map),
+        };
+        pool.ensure_document_opened(
+            &mut ConnectionHandleSender(&handle),
+            &uri,
+            &virtual_uri,
+            sent,
+            &key,
+        )
+        .await
+        .unwrap();
+        let edit_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let document = CompletionResolveDocument {
+            host_uri: uri,
+            language_id: envelope.injection_language.clone(),
+            text: Arc::from(virtual_text),
+            geometry: None,
+            revision: HostRevision {
+                incarnation: 1,
+                content_version: 2,
+            },
+            edit_guard: Arc::clone(&edit_lock).lock_owned().await,
+        };
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            pool.send_completion_resolve_on_handle(
+                &handle,
+                CompletionItem::default(),
+                None,
+                &envelope,
+                document,
+            ),
+        )
+        .await
+        .expect("refused without waiting for a reply");
+        assert!(reply.is_none(), "left unresolved");
+        let held = pool
+            .held_text(&virtual_uri.to_uri_string(), &key)
+            .expect("still held");
+        assert!(held.map.is_some(), "the prepared text stays what it holds");
+        let wire = std::fs::read_to_string(output.path()).unwrap();
+        assert!(!wire.contains("textDocument/didChange"), "{wire}");
+        assert!(!wire.contains("completionItem/resolve"), "{wire}");
     }
 
     // ==========================================================================
