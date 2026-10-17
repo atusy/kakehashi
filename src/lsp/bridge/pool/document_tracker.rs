@@ -132,11 +132,18 @@ impl<'a> From<&'a String> for SentText<'a> {
 /// and its fingerprint (hashed once, by the guard that decided to send it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ContentChange {
-    pub(crate) version: i32,
-    pub(crate) fingerprint: u64,
+    version: i32,
+    /// [`content_fingerprint`] of the text: built only here, from the text
+    /// it is recorded with, so the #422 guard compares like with like.
+    fingerprint: u64,
 }
 
 impl ContentChange {
+    /// The version the text goes out under.
+    pub(crate) fn version(self) -> i32 {
+        self.version
+    }
+
     /// The didOpen of `text`.
     pub(crate) fn opening(text: &str) -> Self {
         Self {
@@ -1883,7 +1890,7 @@ mod tests {
             tracker
                 .increment_version_if_content_changed(&virtual_uri, &conn, "local x = 1")
                 .await
-                .map(|change| change.version),
+                .map(ContentChange::version),
             Some(2),
             "first didChange sends and bumps the version"
         );
@@ -1893,7 +1900,7 @@ mod tests {
             tracker
                 .increment_version_if_content_changed(&virtual_uri, &conn, "local x = 1")
                 .await
-                .map(|change| change.version),
+                .map(ContentChange::version),
             None,
             "unchanged content must skip the re-send once recorded as sent"
         );
@@ -1902,7 +1909,7 @@ mod tests {
             tracker
                 .increment_version_if_content_changed(&virtual_uri, &conn, "local x = 2")
                 .await
-                .map(|change| change.version),
+                .map(ContentChange::version),
             Some(3),
             "changed content sends and bumps"
         );
@@ -1973,7 +1980,7 @@ mod tests {
             tracker
                 .increment_version_if_content_changed(&virtual_uri, &conn, sent)
                 .await
-                .map(|change| change.version),
+                .map(ContentChange::version),
             None
         );
         let remapped = tracker.held_text(&uri, &conn).unwrap();
@@ -1986,7 +1993,7 @@ mod tests {
             tracker
                 .increment_version_if_content_changed(&virtual_uri, &conn, "a")
                 .await
-                .map(|change| change.version),
+                .map(ContentChange::version),
             None
         );
         assert!(tracker.held_text(&uri, &conn).unwrap().map.is_none());
@@ -2069,7 +2076,7 @@ mod tests {
             tracker
                 .increment_version_if_content_changed(&virtual_uri, &conn, "local x = 1")
                 .await
-                .map(|change| change.version),
+                .map(ContentChange::version),
             Some(2),
         );
         // Same content re-sends (bumps again) because no fingerprint was recorded.
@@ -2077,7 +2084,7 @@ mod tests {
             tracker
                 .increment_version_if_content_changed(&virtual_uri, &conn, "local x = 1")
                 .await
-                .map(|change| change.version),
+                .map(ContentChange::version),
             Some(3),
             "a dropped send must self-heal: identical content re-sends, not skips"
         );
@@ -2098,7 +2105,7 @@ mod tests {
                     "local x = 1",
                 )
                 .await
-                .map(|change| change.version),
+                .map(ContentChange::version),
             None,
         );
         tracker
@@ -2112,7 +2119,7 @@ mod tests {
                     "local x = 1",
                 )
                 .await
-                .map(|change| change.version),
+                .map(ContentChange::version),
             Some(2),
             "after registration the first send goes through even with the same content"
         );

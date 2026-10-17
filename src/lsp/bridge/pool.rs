@@ -2639,7 +2639,7 @@ impl LanguageServerPool {
             return Ok(());
         };
         let params = DidChangeTextDocumentParams {
-            text_document: VersionedTextDocumentIdentifier::new(uri, change.version),
+            text_document: VersionedTextDocumentIdentifier::new(uri, change.version()),
             content_changes: vec![TextDocumentContentChangeEvent {
                 range: None,
                 range_length: None,
@@ -3083,7 +3083,7 @@ impl LanguageServerPool {
         // Serialized before the record's lock is taken: only the enqueue
         // happens under it.
         let Some(payload) =
-            Self::didchange_payload(&virtual_uri.to_uri_string(), content.text, change.version)
+            Self::didchange_payload(&virtual_uri.to_uri_string(), content.text, change.version())
         else {
             return NotificationSendResult::SerializationFailed;
         };
