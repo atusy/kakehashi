@@ -64,10 +64,12 @@ fn method_requires_contiguous_injection(method: &str) -> bool {
         "textDocument/codeAction"
             | "textDocument/colorPresentation"
             | "textDocument/completion"
+            | "textDocument/formatting"
             | "textDocument/inlayHint"
             | "textDocument/linkedEditingRange"
             | "textDocument/onTypeFormatting"
             | "textDocument/prepareRename"
+            | "textDocument/rangeFormatting"
             | "textDocument/rename"
     )
 }
@@ -1186,7 +1188,7 @@ impl Kakehashi {
         if method_closed_to(
             &resolved,
             method_name,
-            self.region_prepared(&uri, &resolved),
+            self.lifecycle_prepares(&uri, &resolved),
         ) {
             return None;
         }
@@ -1435,8 +1437,10 @@ impl Kakehashi {
     }
 
     /// Whether the lifecycle pass prepares a region's current document (or
-    /// holds it back for its peer): see [`method_closed_to`].
-    pub(crate) fn region_prepared(&self, uri: &Url, resolved: &ResolvedInjection) -> bool {
+    /// holds it back for its peer): what [`method_closed_to`] closes edit
+    /// methods by. Not whether a server still holds a prepared text of it
+    /// (see `BridgeCoordinator::region_coordinates_may_be_prepared`).
+    pub(crate) fn lifecycle_prepares(&self, uri: &Url, resolved: &ResolvedInjection) -> bool {
         self.bridge
             .prepare_region(
                 uri,
@@ -2012,7 +2016,7 @@ impl Kakehashi {
             if method_closed_to(
                 &resolved,
                 method_name,
-                self.region_prepared(&uri, &resolved),
+                self.lifecycle_prepares(&uri, &resolved),
             ) {
                 continue;
             }
@@ -2122,6 +2126,8 @@ mod tests {
             "textDocument/completion",
             "textDocument/codeAction",
             "textDocument/prepareRename",
+            "textDocument/formatting",
+            "textDocument/rangeFormatting",
         ] {
             assert!(!method_closed_to(&resolved, method, false), "{method}");
             assert!(method_closed_to(&resolved, method, true), "{method}");

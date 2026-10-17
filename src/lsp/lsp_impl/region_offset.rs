@@ -167,7 +167,8 @@ pub(super) fn resolve_region_offset(
     region_id: &str,
 ) -> Option<(RegionOffset, Position, bool, String)> {
     let resolved = resolve_region(documents, language, bridge, host_url, region_id)?;
-    if bridge.region_is_prepared(host_url, &resolved.injection_language, region_id) {
+    if bridge.region_coordinates_may_be_prepared(host_url, &resolved.injection_language, region_id)
+    {
         return None;
     }
     Some(resolved_region_geometry(resolved))

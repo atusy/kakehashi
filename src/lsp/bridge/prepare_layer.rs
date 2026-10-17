@@ -325,10 +325,13 @@ impl super::BridgeCoordinator {
         self.prepare_unused() && !self.pool.held_texts_matter(RegionPrepare::default())
     }
 
-    /// Whether a region is prepared: the lifecycle pass prepares its document
-    /// (or holds it back for its peer), or a server still holds a prepared
-    /// text of it (right after its pair lost its peer).
-    pub(crate) fn region_is_prepared(
+    /// Whether coordinates a server computed for a region may be a prepared
+    /// text's: the lifecycle pass prepares its document (or holds it back
+    /// for its peer), or a server still holds a prepared text of it (right
+    /// after its pair lost its peer). What resolving through the region's
+    /// offset alone is refused by; edit methods close by the lifecycle pass
+    /// alone (see `method_closed_to`).
+    pub(crate) fn region_coordinates_may_be_prepared(
         &self,
         host_uri: &Url,
         injection_language: &str,
@@ -580,7 +583,7 @@ mod tests {
         pool.register_opened_document(&host, &virtual_uri, &key)
             .await;
         let prepared = |coordinator: &BridgeCoordinator| {
-            coordinator.region_is_prepared(&host, "lua", TEST_ULID_LUA_0)
+            coordinator.region_coordinates_may_be_prepared(&host, "lua", TEST_ULID_LUA_0)
         };
 
         pool.record_sent_for_test(&virtual_uri, &key, "  a".into());
