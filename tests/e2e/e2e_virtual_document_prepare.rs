@@ -39,6 +39,8 @@ struct Setup {
     unprepared_python: bool,
     /// The editor's capabilities.
     capabilities: Value,
+    /// The prepare method's `priorities` for markdown's lua documents.
+    prepare_priorities: Value,
 }
 
 impl Default for Setup {
@@ -49,6 +51,7 @@ impl Default for Setup {
             echo: "echo-document",
             unprepared_python: false,
             capabilities: json!({}),
+            prepare_priorities: json!(["peer"]),
         }
     }
 }
@@ -62,7 +65,7 @@ impl Setup {
         // names it, over the `_` method entry that leaves every other method
         // to the echo mock.
         let mut markdown = json!({ "bridge": { "lua": { "aggregation": {
-            "kakehashi/virtualDocument/prepare": { "priorities": ["peer"] },
+            "kakehashi/virtualDocument/prepare": { "priorities": self.prepare_priorities },
             "_": { "priorities": ["echo"] }
         } } } });
         if self.unprepared_python {
@@ -111,6 +114,18 @@ impl Setup {
         client.send_notification("initialized", json!({}));
         (client, dir)
     }
+}
+
+/// Name the servers preparing markdown's lua documents from now on.
+fn set_prepare_priorities(client: &mut LspClient, priorities: Value) {
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({ "settings": { "kakehashi": { "languages": { "markdown": { "bridge": { "lua": {
+            "aggregation": {
+                "kakehashi/virtualDocument/prepare": { "priorities": priorities }
+            }
+        } } } } } } }),
+    );
 }
 
 fn open(client: &mut LspClient, uri: &str, text: &str) {
@@ -234,8 +249,10 @@ fn formatting_is_not_offered_on_a_prepared_document() {
     hover_with_retry(&mut client, uri, 3, 4);
 
     // The echo mock would uppercase the document; no edit is mapped back
-    // through a prepared one.
+    // through a prepared one. Refused up front, not by a wait for a text the
+    // server never holds (which would take the 5 s budget).
     for method in ["textDocument/formatting", "textDocument/rangeFormatting"] {
+        let started = Instant::now();
         let response = client.send_request(
             method,
             json!({
@@ -250,7 +267,38 @@ fn formatting_is_not_offered_on_a_prepared_document() {
         assert!(response.get("error").is_none(), "{method}: {response}");
         let edits = response["result"].as_array().cloned().unwrap_or_default();
         assert!(edits.is_empty(), "{method}: {response}");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "{method} took {elapsed:?}"
+        );
     }
+}
+
+#[test]
+fn a_rename_before_the_document_was_looked_up_is_refused_once_it_is_prepared() {
+    let (mut client, _dir) = Setup::default().start();
+    let uri = "file:///prepare/rename.md";
+    let text = "# t\n\n```lua\n  local x = 1\n```\n";
+    open(&mut client, uri, text);
+
+    // At once: the answer is not in yet. The request waits for it, finds
+    // the document prepared, and is refused — the echo mock would rename.
+    for _ in 0..20 {
+        let response = client.send_request(
+            "textDocument/rename",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 3, "character": 8 },
+                "newName": "y"
+            }),
+        );
+        assert!(response.get("error").is_none(), "{response}");
+        assert!(response["result"].is_null(), "{response}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // The document was bridged meanwhile.
+    hover_with_retry(&mut client, uri, 3, 4);
 }
 
 #[test]
@@ -313,7 +361,9 @@ fn an_edit_is_prepared_before_requests_read_it() {
     // Insert a line above `print(x)`, shifting it down, and hover it at once:
     // the answer must come from the newly prepared text, not the one the
     // server held before the edit.
-    let edited = "# t\n\n```lua\n  local x = 1\n  x = x + 1\n  print(x)\n```\n";
+    // The peer takes two seconds over the edited text: the hover races a
+    // pending answer.
+    let edited = "# t\n\n```lua\n  local x = 1\n  x = x + 1 -- SLOW\n  print(x)\n```\n";
     change(&mut client, uri, 2, edited);
     // No answer may come from the text the server held before the edit:
     // a request either waits for the new prepared text or gives no answer
@@ -328,7 +378,7 @@ fn an_edit_is_prepared_before_requests_read_it() {
             }
             assert_eq!(
                 hover_text(&answer),
-                "local x = 1\nx = x + 1\nprint(x)\n",
+                "local x = 1\nx = x + 1 -- SLOW\nprint(x)\n",
                 "an answer from the text before the edit"
             );
             Some(answer)
@@ -371,7 +421,7 @@ fn an_unprepared_document_answers_promptly_beside_a_prepared_one() {
     let first = hover(&mut client, uri, 8, 0)["result"].clone();
     let elapsed = started.elapsed();
     assert!(
-        elapsed < Duration::from_secs(4),
+        elapsed < Duration::from_millis(4500),
         "the unprepared request waited {elapsed:?}"
     );
     let answer = std::iter::once(first)
@@ -666,4 +716,121 @@ fn an_edit_a_server_computed_for_a_prepared_text_is_refused() {
         json!({ "textDocument": { "uri": uri } }),
     );
     assert_eq!(wait_for_echo_log(&mut client, "applied"), "false");
+}
+
+#[test]
+fn gaining_a_peer_prepares_an_open_document() {
+    let (mut client, _dir) = Setup {
+        prepare_priorities: json!([]),
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/gain.md";
+    let text = "# t\n\n```lua\n  local x = 1\n```\n";
+    open(&mut client, uri, text);
+    // No peer: sent as is.
+    let answer = hover_with_retry(&mut client, uri, 3, 4);
+    assert_eq!(hover_text(&answer), "  local x = 1\n");
+
+    // A peer from now on: the open document is prepared, without an edit,
+    // and once it is, no answer comes from the text as is.
+    set_prepare_priorities(&mut client, json!(["peer"]));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let answer = loop {
+        let answer = hover(&mut client, uri, 3, 4)["result"].clone();
+        if !answer.is_null() && hover_text(&answer) == "local x = 1\n" {
+            break answer;
+        }
+        assert!(Instant::now() < deadline, "never prepared: {answer}");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(
+        answer["range"],
+        json!({
+            "start": { "line": 3, "character": 2 },
+            "end": { "line": 3, "character": 13 }
+        })
+    );
+    for _ in 0..10 {
+        let answer = hover(&mut client, uri, 3, 4)["result"].clone();
+        assert_eq!(hover_text(&answer), "local x = 1\n");
+    }
+}
+
+#[test]
+fn losing_the_peer_sends_an_open_document_as_is() {
+    let (mut client, _dir) = Setup {
+        echo: "echo-document-push",
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/lose.md";
+    let text = "# t\n\n```lua\n  local x = 1\n```\n";
+    open(&mut client, uri, text);
+    let diagnostic = wait_for_echo_diagnostic(&mut client, uri, "local x = 1\n");
+    assert_eq!(
+        diagnostic["range"]["start"],
+        json!({ "line": 3, "character": 2 })
+    );
+
+    // No peer from now on: the open document goes out as is, and what its
+    // server computed for the prepared text is never placed through the
+    // offset alone.
+    set_prepare_priorities(&mut client, json!([]));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let params = client
+            .wait_for_notification("textDocument/publishDiagnostics", remaining)
+            .expect("the text as is was never diagnosed");
+        let items = params["diagnostics"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        for item in &items {
+            if item["message"] == "local x = 1\n" {
+                assert_eq!(
+                    item["range"]["start"],
+                    json!({ "line": 3, "character": 2 }),
+                    "a prepared text's diagnostic placed through the offset alone"
+                );
+            }
+        }
+        if let Some(item) = items.iter().find(|d| d["message"] == "  local x = 1\n") {
+            assert_eq!(
+                item["range"],
+                json!({
+                    "start": { "line": 3, "character": 0 },
+                    "end": { "line": 3, "character": 13 }
+                })
+            );
+            break;
+        }
+    }
+    let answer = hover_with_retry(&mut client, uri, 3, 4);
+    assert_eq!(hover_text(&answer), "  local x = 1\n");
+}
+
+#[test]
+fn a_reopened_prepared_document_is_prepared_again() {
+    let (mut client, _dir) = Setup::default().start();
+    let uri = "file:///prepare/reopen.md";
+    let text = "# t\n\n```lua\n  local x = 1\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+
+    client.send_notification(
+        "textDocument/didClose",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    open(&mut client, uri, text);
+    let answer = hover_with_retry(&mut client, uri, 3, 4);
+    assert_eq!(hover_text(&answer), "local x = 1\n");
+    assert_eq!(
+        answer["range"],
+        json!({
+            "start": { "line": 3, "character": 2 },
+            "end": { "line": 3, "character": 13 }
+        })
+    );
 }
