@@ -883,6 +883,34 @@ impl DocumentTracker {
         self.held_generations.load(Ordering::Acquire)
     }
 
+    /// How coordinates `connection_key` computed for `virtual_uri` translate
+    /// to the host while its region's virtual text is `virtual_text` (see
+    /// [`super::presentation::presentation`]). Until any connection was sent
+    /// a prepared text, and while the lifecycle pass prepares nothing of the
+    /// region, every connection holds its text as is: no record is read.
+    #[allow(
+        dead_code,
+        reason = "the prepare layer reads coordinates through it, next"
+    )]
+    pub(super) fn presentation(
+        &self,
+        virtual_uri: &str,
+        connection_key: &ConnectionKey,
+        observed: super::Observed,
+        region: super::RegionPrepare,
+        virtual_text: &str,
+    ) -> super::Presentation {
+        if region == super::RegionPrepare::default() && !self.ever_held_prepared() {
+            return super::Presentation::AsIs;
+        }
+        super::presentation::presentation(
+            self.held_text(virtual_uri, connection_key).as_ref(),
+            observed,
+            region,
+            virtual_text,
+        )
+    }
+
     /// What this connection was last sent for the document, if anything.
     #[allow(
         dead_code,
