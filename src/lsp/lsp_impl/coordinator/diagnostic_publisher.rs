@@ -2681,6 +2681,42 @@ mod tests {
         scheduler.settle_pull_debt_after_prepare(&host, true);
         assert_eq!(requested(), 0);
 
+        // Owed while a document of the host still waits for its answer: a
+        // pass without that answer asks nothing and keeps the debt.
+        let target = crate::lsp::bridge::PrepareTarget {
+            candidates: vec![crate::lsp::bridge::ResolvedServerConfig {
+                server_name: "peer".to_string(),
+                config: std::sync::Arc::new(crate::config::settings::BridgeServerConfig {
+                    cmd: Some(vec!["/nonexistent/kakehashi-prepare-peer".to_string()]),
+                    ..Default::default()
+                }),
+            }]
+            .into(),
+            epoch: pool.prepare_epoch(),
+        };
+        let pending = server.bridge.prepared_document_now(
+            &target,
+            crate::lsp::bridge::PrepareInput {
+                host_uri: &host,
+                host_language: "markdown",
+                injection_language: "lua",
+                region_id: "01J0000000000000000000000A",
+                virtual_text: "a",
+                gaps: &[],
+            },
+        );
+        assert!(matches!(
+            pending,
+            crate::lsp::bridge::PrepareLookup::Pending
+        ));
+        server.bridge.owe_pull_after_prepare(&host);
+        scheduler.settle_pull_debt_after_prepare(&host, false);
+        assert_eq!(requested(), 0);
+        scheduler.settle_pull_debt_after_prepare(&host, true);
+        assert_eq!(requested(), 1);
+        server.bridge.forget_prepared_host(&host);
+        let requested = || server.diagnostics.metrics_snapshot().refreshes_requested - 1;
+
         server.bridge.owe_pull_after_prepare(&host);
         scheduler.settle_pull_debt_after_prepare(&host, true);
         assert_eq!(requested(), 1);
