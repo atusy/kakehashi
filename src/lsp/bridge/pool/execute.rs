@@ -306,13 +306,8 @@ impl LanguageServerPool {
             // didChange records and queues under (after the open, which
             // takes it itself; the connections → transition order of
             // didChange).
-            let region = super::RegionPrepare {
-                prepared: offset.prepared().is_some(),
-                failed: false,
-            };
             let transition = self
-                .document_tracker
-                .held_texts_matter(region)
+                .request_text_matters(offset)
                 .then(|| self.open_transition_lock(&virtual_uri, connection_key));
             let _transition_guard = match &transition {
                 Some(transition) => Some(transition.lock().await),
@@ -389,6 +384,16 @@ impl LanguageServerPool {
         }
     }
 
+    /// Whether [`Self::holds_request_text`] can be false for a request built
+    /// on `offset`: the rule's shortcut (see `DocumentTracker::held_texts_matter`).
+    fn request_text_matters(&self, offset: &RegionOffset) -> bool {
+        self.document_tracker
+            .held_texts_matter(super::RegionPrepare {
+                prepared: offset.prepared().is_some(),
+                failed: false,
+            })
+    }
+
     /// Wait (briefly) until a connection that has the document open holds
     /// the text a request built on `offset` describes.
     ///
@@ -406,6 +411,12 @@ impl LanguageServerPool {
         connection_key: &super::ConnectionKey,
         offset: &RegionOffset,
     ) -> io::Result<()> {
+        // Without any prepared text sent, nor a map on the request (always
+        // so with experimental features off), every connection holds the
+        // request's text: no document is looked up.
+        if !self.request_text_matters(offset) {
+            return Ok(());
+        }
         let deadline = tokio::time::Instant::now() + REQUEST_TEXT_WAIT;
         loop {
             if !self
