@@ -330,8 +330,10 @@ pub(crate) struct ServerRequestDeps {
     pub(crate) progress_connection_id: crate::lsp::bridge::ProgressConnectionId,
     /// What each connection holds for each virtual document: a region push,
     /// and a showDocument selection, are stamped with what this connection
-    /// held as they were read.
-    pub(crate) document_tracker: Arc<crate::lsp::bridge::pool::DocumentTracker>,
+    /// held as they were read. `None` when the pool prepares nothing (with
+    /// experimental features off): every connection holds its texts as is,
+    /// and nothing is stamped.
+    pub(crate) document_tracker: Option<Arc<crate::lsp::bridge::pool::DocumentTracker>>,
     /// This server's current workspace settings, shared with the pool, used to
     /// answer downstream `workspace/configuration` pulls (downstream-settings-propagation).
     /// `None` slot = no settings configured for this server. The pool seeds it at
@@ -628,7 +630,7 @@ where
             progress_registry,
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
-            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
+            document_tracker: None,
         },
     )
 }
@@ -726,7 +728,7 @@ async fn reader_loop(
         progress_registry,
         client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
         progress_connection_id,
-        document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
+        document_tracker: None,
     };
     reader_loop_with_liveness(reader, router, cancel_token, liveness, server_request_deps).await
 }
@@ -1357,7 +1359,7 @@ mod tests {
             progress_registry,
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
-            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
+            document_tracker: None,
         };
         (deps, window_rx, (rx, upstream_rx))
     }
@@ -1497,7 +1499,7 @@ mod tests {
             progress_registry,
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
-            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
+            document_tracker: None,
         };
 
         let notification = |text: &str| {
@@ -1580,7 +1582,7 @@ mod tests {
                     crate::lsp::bridge::ClientProgressRegistry::new(),
                 ),
                 progress_connection_id: conn,
-                document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
+                document_tracker: None,
             },
         );
 
@@ -2036,7 +2038,7 @@ mod tests {
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
-            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
+            document_tracker: None,
         };
 
         let message = json!({
@@ -2614,7 +2616,7 @@ mod tests {
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
-            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
+            document_tracker: None,
         };
 
         // Then unregister it
@@ -2680,7 +2682,7 @@ mod tests {
             progress_registry: Arc::clone(&progress_registry),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
-            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
+            document_tracker: None,
         };
 
         let message = json!({
@@ -2773,7 +2775,7 @@ mod tests {
             progress_registry: Arc::clone(&progress_registry),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
-            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
+            document_tracker: None,
         };
 
         let create = json!({
@@ -2837,7 +2839,7 @@ mod tests {
             progress_registry: Arc::clone(&progress_registry),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
-            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
+            document_tracker: None,
         };
 
         let create = json!({
@@ -2899,7 +2901,7 @@ mod tests {
             progress_registry: Arc::clone(&progress_registry),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
-            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
+            document_tracker: None,
         };
 
         let create = json!({
@@ -2962,7 +2964,7 @@ mod tests {
             progress_registry: Arc::clone(&progress_registry),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
-            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
+            document_tracker: None,
         };
 
         let create = json!({
@@ -3034,7 +3036,7 @@ mod tests {
             progress_registry,
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
-            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
+            document_tracker: None,
         };
 
         let make = || {
@@ -3124,7 +3126,7 @@ mod tests {
             progress_registry,
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
-            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
+            document_tracker: None,
         };
 
         let message = json!({
@@ -3185,7 +3187,7 @@ mod tests {
             progress_registry: Arc::clone(&progress_registry),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
-            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
+            document_tracker: None,
         };
 
         // A renderable "begin" announces the token (create first) and is forwarded
@@ -3274,7 +3276,7 @@ mod tests {
             progress_registry,
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
-            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
+            document_tracker: None,
         };
 
         let progress = json!({
@@ -3318,7 +3320,7 @@ mod tests {
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
-            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
+            document_tracker: None,
         };
 
         let message = json!({
@@ -3378,7 +3380,7 @@ mod tests {
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
-            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
+            document_tracker: None,
         };
 
         let message = json!({
@@ -3427,7 +3429,7 @@ mod tests {
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
-            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
+            document_tracker: None,
         };
 
         let message = json!({
@@ -3476,7 +3478,7 @@ mod tests {
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
-            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
+            document_tracker: None,
         };
 
         let message = json!({
@@ -3531,7 +3533,7 @@ mod tests {
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
-            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
+            document_tracker: None,
         };
 
         let message = json!({
@@ -3569,6 +3571,95 @@ mod tests {
         }
     }
 
+    /// A region push is stamped with what its connection held as it was read
+    /// — only when the pool prepares (it then shares its records with the
+    /// reader); otherwise every text is held as is and nothing is stamped.
+    #[tokio::test]
+    async fn a_region_push_is_stamped_only_when_the_pool_prepares() {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let host =
+            crate::lsp::lsp_impl::url_to_uri(&url::Url::parse("file:///project/stamp.md").unwrap())
+                .unwrap();
+        let virtual_uri =
+            crate::lsp::bridge::VirtualDocumentUri::new(&host, "lua", "01JPMQ8ZYYQA1W3AVPW4JDRZFR");
+        let key = ConnectionKey::for_server("test");
+        let tracker = Arc::new(crate::lsp::bridge::pool::DocumentTracker::new());
+        let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared =
+            apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(answer)).unwrap();
+        tracker.record_sent_for_test(
+            &virtual_uri,
+            &key,
+            crate::lsp::bridge::pool::SentText {
+                text: &prepared.text,
+                map: Some(&prepared.map),
+            },
+            3,
+        );
+
+        let push = |version: i32| {
+            json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/publishDiagnostics",
+                "params": {
+                    "uri": virtual_uri.to_uri_string(),
+                    "version": version,
+                    "diagnostics": []
+                }
+            })
+        };
+        let held_of = |tracker: Option<Arc<crate::lsp::bridge::pool::DocumentTracker>>,
+                       version: i32| {
+            let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
+            let deps = ServerRequestDeps {
+                experimental_enabled: true,
+                settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+                server_name: Some("luals".to_string()),
+                connection_key: key.clone(),
+                peer_directory: Arc::new(peer::PeerDirectory::default()),
+                response_tx: mpsc::channel(16).0,
+                dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
+                upstream_tx,
+                workspace_folders: WorkspaceFolderSet::new(None),
+                window_tx: mpsc::channel(16).0,
+                upstream_request_tx: mpsc::unbounded_channel().0,
+                inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
+                progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+                client_progress_registry: Arc::new(
+                    crate::lsp::bridge::ClientProgressRegistry::new(),
+                ),
+                progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+                document_tracker: tracker,
+            };
+            crate::lsp::bridge::text_document::publish_diagnostics::forward_push(
+                push(version),
+                &deps,
+            );
+            match upstream_rx.try_recv().expect("the push is routed upstream") {
+                UpstreamNotification::PublishDiagnostics { held, .. } => held,
+                _ => panic!("expected PublishDiagnostics"),
+            }
+        };
+
+        // The pool prepares nothing: not stamped.
+        assert_eq!(held_of(None, 3), None);
+        // It prepares: stamped with the prepared text this connection holds,
+        // and whether the push names another version than the one sent.
+        let stamp = |stale_version| crate::lsp::diagnostic_cache::HeldStamp {
+            connection: key.clone(),
+            observed: crate::lsp::bridge::Observed::Read {
+                generation: Some(1),
+                prepared: true,
+                stale_version,
+            },
+        };
+        assert_eq!(held_of(Some(Arc::clone(&tracker)), 3), Some(stamp(false)));
+        assert_eq!(held_of(Some(Arc::clone(&tracker)), 2), Some(stamp(true)));
+    }
+
     /// A non-virtual (real host URI) push is now routed up too — the publisher
     /// classifies it as a candidate `_self` host-layer push and decides (using
     /// document/config state the reader lacks) whether it names an open
@@ -3595,7 +3686,7 @@ mod tests {
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
-            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
+            document_tracker: None,
         };
 
         let message = json!({
@@ -3653,7 +3744,7 @@ mod tests {
                     crate::lsp::bridge::ClientProgressRegistry::new(),
                 ),
                 progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
-                document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
+                document_tracker: None,
             };
             (deps, upstream_rx)
         };
@@ -3737,7 +3828,7 @@ mod tests {
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
-            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
+            document_tracker: None,
         };
 
         let message = json!({
@@ -3782,7 +3873,7 @@ mod tests {
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
-            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
+            document_tracker: None,
         };
 
         // client/registerCapability with no params field at all
@@ -3842,7 +3933,7 @@ mod tests {
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
-            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
+            document_tracker: None,
         };
 
         // client/unregisterCapability with no params field at all
@@ -3913,7 +4004,7 @@ mod tests {
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
-            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
+            document_tracker: None,
         };
         let handle = tokio::spawn(async move {
             let message = json!({
@@ -3979,7 +4070,7 @@ mod tests {
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
-            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
+            document_tracker: None,
         };
 
         let message = json!({
@@ -4503,7 +4594,7 @@ mod tests {
             progress_registry,
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
-            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
+            document_tracker: None,
         };
         (deps, response_rx, upstream_request_rx)
     }
@@ -4958,7 +5049,7 @@ mod tests {
             progress_registry,
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
-            document_tracker: Arc::new(crate::lsp::bridge::pool::DocumentTracker::new()),
+            document_tracker: None,
         };
         (deps, (rx, upstream_rx, window_rx))
     }

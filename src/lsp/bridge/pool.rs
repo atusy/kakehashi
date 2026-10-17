@@ -4601,7 +4601,7 @@ impl LanguageServerPool {
                 client_progress_registry: Arc::clone(&self.client_progress_registry),
                 progress_connection_id,
                 settings: Arc::clone(&settings_cell),
-                document_tracker: Arc::clone(&self.document_tracker),
+                document_tracker: self.prepares().then(|| Arc::clone(&self.document_tracker)),
             },
         );
 

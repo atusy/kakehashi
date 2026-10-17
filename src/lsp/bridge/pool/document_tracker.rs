@@ -1030,7 +1030,7 @@ impl DocumentTracker {
 
     /// Record `content` as sent under `version`, as a queued send would.
     #[cfg(test)]
-    pub(super) fn record_sent_for_test(
+    pub(in crate::lsp::bridge) fn record_sent_for_test(
         &self,
         virtual_uri: &VirtualDocumentUri,
         connection_key: &ConnectionKey,
