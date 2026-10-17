@@ -271,6 +271,17 @@ mod tests {
             presentation(Some(&as_is), true, read(4, true), AS_IS, "v"),
             Presentation::Unavailable
         ));
+        // Read about several documents, while the connection holds as is a
+        // document it was once sent a prepared text of: that history alone
+        // involves preparation.
+        assert!(matches!(
+            presentation(Some(&as_is), true, Observed::Through(4), AS_IS, "v"),
+            Presentation::Unavailable
+        ));
+        assert!(matches!(
+            presentation(Some(&as_is), false, Observed::Through(4), AS_IS, "v"),
+            Presentation::AsIs
+        ));
         // Closed since: nothing on record now.
         assert!(matches!(
             presentation(None, true, read(4, true), AS_IS, "v"),
