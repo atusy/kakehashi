@@ -681,6 +681,11 @@ impl PreparedMap {
         self.built
     }
 
+    /// The virtual text this map's answer was given for.
+    pub(crate) fn virtual_text(&self) -> &str {
+        &self.virtual_lines.text
+    }
+
     /// Translate a position in P to V.
     pub(crate) fn to_virtual(&self, position: Position, bias: Bias) -> Position {
         let offset = self.prepared_lines.offset_clamped(position);

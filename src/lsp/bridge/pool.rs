@@ -22,6 +22,11 @@ mod handshake;
 mod liveness_timeout;
 mod message_sender;
 mod pending_reopen;
+#[allow(
+    dead_code,
+    reason = "the prepare layer reads coordinates through it, next"
+)]
+mod presentation;
 mod shutdown;
 mod shutdown_timeout;
 #[cfg(test)]
@@ -56,6 +61,11 @@ use pending_reopen::PendingReopenRegistry;
 /// Re-exported so the server-side re-open handler bounds its work by the same
 /// budget requests wait on — the two must not drift apart.
 pub(crate) use pending_reopen::REOPEN_WAIT;
+#[allow(
+    unused_imports,
+    reason = "the prepare layer reads coordinates through it, next"
+)]
+pub(crate) use presentation::{Observed, Presentation, RegionPrepare};
 pub(crate) use shutdown_timeout::GlobalShutdownTimeout;
 
 #[derive(Clone)]
