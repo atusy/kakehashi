@@ -794,7 +794,26 @@ fn an_edit_a_server_computed_for_a_prepared_text_is_refused() {
         "textDocument/didSave",
         json!({ "textDocument": { "uri": uri } }),
     );
-    assert_eq!(wait_for_echo_log(&mut client, "applied"), "false");
+    let marker = "echo-document applied: ";
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let applied = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let message = client
+            .try_receive_message(remaining)
+            .unwrap_or_else(|| panic!("no `{marker}` log"));
+        assert_ne!(
+            message["method"], "workspace/applyEdit",
+            "the editor was asked to apply an edit: {message}"
+        );
+        if message["method"] == "window/logMessage"
+            && let Some((_, applied)) = message["params"]["message"]
+                .as_str()
+                .and_then(|text| text.split_once(marker))
+        {
+            break applied.to_string();
+        }
+    };
+    assert_eq!(applied, "false");
 }
 
 #[test]
