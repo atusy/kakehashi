@@ -912,7 +912,7 @@ impl DocumentTracker {
         connection_key: &ConnectionKey,
         version: Option<i32>,
     ) -> super::Observed {
-        if !self.ever_held_prepared() {
+        if !self.held_texts_matter(super::RegionPrepare::default()) {
             return super::Observed::AsIsThen;
         }
         let (held, history) = self.held_now(virtual_uri, connection_key);

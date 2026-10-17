@@ -301,11 +301,7 @@ impl super::BridgeCoordinator {
     ) -> super::Presentation {
         let region = self.prepare_region(host_uri, injection_language, region_id);
         let Some(stamp) = held else {
-            return if region == RegionPrepare::default() {
-                super::Presentation::AsIs
-            } else {
-                super::Presentation::Unavailable
-            };
+            return self.pool.unrecorded_presentation(region);
         };
         let Ok(host) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
             return super::Presentation::Unavailable;
@@ -321,10 +317,12 @@ impl super::BridgeCoordinator {
         )
     }
 
-    /// Whether every cached push places as is (see [`Self::place_push`]):
-    /// nothing was ever prepared, so the per-slot placement can be skipped.
+    /// Whether every cached push places as is (see [`Self::place_push`]),
+    /// so the per-slot placement can be skipped: the rule's shortcut (see
+    /// `DocumentTracker::held_texts_matter`) for every region at once — the
+    /// lifecycle pass prepares none.
     pub(crate) fn places_pushes_as_is(&self) -> bool {
-        self.prepare_unused() && !self.pool.prepares_anything()
+        self.prepare_unused() && !self.pool.held_texts_matter(RegionPrepare::default())
     }
 
     /// Whether a region is prepared: the lifecycle pass prepares its document
@@ -439,5 +437,118 @@ impl super::BridgeCoordinator {
         if let Some(layer) = &self.prepare {
             layer.registry.requeue_resync(resync, delay);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use url::Url;
+
+    use super::super::pool::test_helpers::TEST_ULID_LUA_0;
+    use super::super::pool::{ConnectionKey, LanguageServerPool, SentText};
+    use super::super::protocol::{VirtualDocumentUri, VirtualLayout, apply_prepare_result};
+    use super::super::{BridgeCoordinator, Observed, Presentation};
+    use crate::lsp::CancelForwarder;
+    use crate::lsp::diagnostic_cache::HeldStamp;
+
+    fn dedented(virtual_text: &str) -> super::super::protocol::PreparedDocument {
+        let answer = serde_json::from_value(serde_json::json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(answer),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_cached_push_places_through_the_text_its_connection_held() {
+        let pool = Arc::new(LanguageServerPool::preparing());
+        let coordinator = BridgeCoordinator::with_cancel_forwarder(
+            Arc::clone(&pool),
+            CancelForwarder::new(Arc::clone(&pool)),
+        );
+        let host = Url::parse("file:///test/place.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host).unwrap(),
+            "lua",
+            TEST_ULID_LUA_0,
+        );
+        let key = ConnectionKey::for_server("lua");
+        let place = |virtual_text: &str, held: Option<&HeldStamp>| {
+            coordinator.place_push(&host, "lua", TEST_ULID_LUA_0, virtual_text, held)
+        };
+        let stamp = |generation| HeldStamp {
+            connection: key.clone(),
+            observed: Observed::Read {
+                generation: Some(generation),
+                prepared: true,
+                stale_version: false,
+            },
+        };
+
+        // Not stamped, in a region the lifecycle pass does not prepare.
+        assert!(matches!(place("  a", None), Presentation::AsIs));
+
+        // Stamped with the prepared text the connection holds: through its
+        // map, while the region's virtual text is the one it was built from.
+        let first = dedented("  a");
+        pool.record_sent_for_test(
+            &virtual_uri,
+            &key,
+            SentText {
+                text: &first.text,
+                map: Some(&first.map),
+            },
+        );
+        match place("  a", Some(&stamp(1))) {
+            Presentation::Prepared(map) => assert!(Arc::ptr_eq(&map, &first.map)),
+            other => panic!("expected the held map, got {other:?}"),
+        }
+        assert!(matches!(
+            place("  b", Some(&stamp(1))),
+            Presentation::Unavailable
+        ));
+
+        // A newer text sent since the push was read: it places nowhere.
+        let second = dedented("  b");
+        pool.record_sent_for_test(
+            &virtual_uri,
+            &key,
+            SentText {
+                text: &second.text,
+                map: Some(&second.map),
+            },
+        );
+        assert!(matches!(
+            place("  b", Some(&stamp(1))),
+            Presentation::Unavailable
+        ));
+        assert!(matches!(
+            place("  b", Some(&stamp(2))),
+            Presentation::Prepared(_)
+        ));
+    }
+
+    #[test]
+    fn an_unrecorded_text_places_as_is_only_outside_prepared_regions() {
+        let pool = LanguageServerPool::preparing();
+        let prepared = super::RegionPrepare {
+            prepared: true,
+            failed: false,
+        };
+        assert!(matches!(
+            pool.unrecorded_presentation(super::RegionPrepare::default()),
+            Presentation::AsIs
+        ));
+        assert!(matches!(
+            pool.unrecorded_presentation(prepared),
+            Presentation::Unavailable
+        ));
     }
 }

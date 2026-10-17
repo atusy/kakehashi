@@ -3254,9 +3254,19 @@ impl LanguageServerPool {
         )
     }
 
-    /// Whether any connection was ever sent a prepared text.
-    pub(crate) fn prepares_anything(&self) -> bool {
-        self.document_tracker.ever_held_prepared()
+    /// How coordinates of a connection whose text is not on record — read
+    /// while the pool stamped nothing — translate, by the one rule (see
+    /// `DocumentTracker::presentation`): as is, unless `region` is bridged
+    /// only through a prepared text.
+    pub(crate) fn unrecorded_presentation(&self, region: RegionPrepare) -> Presentation {
+        presentation::presentation(None, false, Observed::AsIsThen, region, "")
+    }
+
+    /// Whether what connections hold can make [`Self::presentation`] other
+    /// than as is for a region the lifecycle pass knows `region` of (see
+    /// `DocumentTracker::held_texts_matter`).
+    pub(crate) fn held_texts_matter(&self, region: RegionPrepare) -> bool {
+        self.document_tracker.held_texts_matter(region)
     }
 
     /// What `connection_key` was last sent for `virtual_uri` (see
