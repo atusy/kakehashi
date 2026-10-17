@@ -613,7 +613,8 @@ pub struct Kakehashi {
     cli_mode: std::sync::atomic::AtomicBool,
     /// Runtime opt-in for experimental features (`KAKEHASHI_EXPERIMENTAL=true`,
     /// see [`crate::experimental`]) — currently the native lexical-resolution
-    /// layer. Copied from the environment once at construction; atomic
+    /// layer and virtual document preparation (`kakehashi/virtualDocument/prepare`).
+    /// Copied from the environment once at construction; atomic
     /// only so tests can toggle it per instance.
     experimental: std::sync::atomic::AtomicBool,
     /// Per-document coalescing scheduler for the off-ingress parse

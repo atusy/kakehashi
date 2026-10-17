@@ -269,7 +269,10 @@ latest the lifecycle pass recorded.
   enqueue cannot be separated by a recorded send. The request must not send
   a text to a document its server already has open — it could overtake a
   newer text the lifecycle pass already sent; it only opens one not open
-  there (see Lifecycle).
+  there (see Lifecycle). `completionItem/resolve` is the one exception: it
+  syncs its document's text before resolving, under the host's edit lock
+  so no newer text can be sent meanwhile, and only for an unprepared
+  document: never over a prepared text or a document held for its peer.
 - **A push follows the text its connection held when kakehashi read it.**
   The push is stamped as it is read, before it waits to be published.
   Where preparation is involved (by the rule above), it is placed only while
@@ -288,8 +291,11 @@ latest the lifecycle pass recorded.
   but never move what the lifecycle pass holds the document on.
 - **The peer is not awaited under a document's edit lock.** A slow or
   starting peer would otherwise stall the host's edit processing.
-- **Without experimental features nothing of this runs.** No record is
-  stamped, no region text is copied for placement, and no request waits.
+- **Without experimental features none of the preparing runs.** No peer is
+  asked, no record is stamped, no region text is copied for placement, and
+  no request waits. What runs regardless is small: each send's text is
+  recorded as what its connection holds, and the advertisement in a
+  server's `initialize` result is read.
 
 ## Considered Options
 
