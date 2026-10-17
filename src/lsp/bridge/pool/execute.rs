@@ -978,6 +978,80 @@ mod tests {
         closer.await.unwrap();
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_waiting_request_goes_on_as_soon_as_its_text_is_held_under_its_map() {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        // Two virtual texts the peer prepares into the same text (a gap
+        // replaced by a fixed placeholder, say): only the map differs.
+        let strip = |virtual_text: &str, columns: u32| {
+            let answer = serde_json::from_value(serde_json::json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": columns}}, "newText": ""}
+            ]}]}))
+            .unwrap();
+            apply_prepare_result(
+                virtual_text,
+                &VirtualLayout::single(virtual_text),
+                Some(answer),
+            )
+            .unwrap()
+        };
+        let before = strip("  a", 2);
+        let after = strip("   a", 3);
+        assert_eq!(before.text, after.text);
+        let pool = Arc::new(LanguageServerPool::preparing());
+        let host_uri = Url::parse("file:///test/remap.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap(),
+            "lua",
+            TEST_ULID_LUA_0,
+        );
+        let uri = virtual_uri.to_uri_string();
+        let key = ConnectionKey::for_server("lua");
+        pool.register_opened_document(&host_uri, &virtual_uri, &key)
+            .await;
+        pool.record_sent_for_test(
+            &virtual_uri,
+            &key,
+            SentText {
+                text: &before.text,
+                map: Some(&before.map),
+            },
+        );
+        let offset = RegionOffset::new(0, 0).with_prepared(Arc::clone(&after.map));
+        // Off any polling tick.
+        let delay = std::time::Duration::from_millis(2_503);
+        let remap = {
+            let pool = Arc::clone(&pool);
+            let virtual_uri = virtual_uri.clone();
+            let key = key.clone();
+            let after = after.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                // The lifecycle pass sends nothing for the same text: it
+                // holds it under the new map.
+                let sent = pool
+                    .increment_version_if_content_changed(
+                        &virtual_uri,
+                        &key,
+                        SentText {
+                            text: &after.text,
+                            map: Some(&after.map),
+                        },
+                    )
+                    .await;
+                assert!(sent.is_none());
+            })
+        };
+        let started = tokio::time::Instant::now();
+        assert!(
+            pool.wait_for_request_text(&uri, &key, &offset)
+                .await
+                .is_ok()
+        );
+        assert_eq!(started.elapsed(), delay);
+        remap.await.unwrap();
+    }
+
     #[tokio::test]
     async fn the_first_prepared_text_cannot_slip_ahead_of_an_as_is_request() {
         use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
