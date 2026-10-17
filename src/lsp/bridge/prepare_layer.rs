@@ -294,7 +294,7 @@ impl super::BridgeCoordinator {
         let layer = self.prepare.as_ref()?;
         Some((
             layer.registry.take_resync_rx()?,
-            self.pool.subscribe_prepare_epoch(),
+            self.pool.subscribe_prepare_epoch()?,
         ))
     }
 

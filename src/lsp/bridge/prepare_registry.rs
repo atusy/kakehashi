@@ -966,7 +966,7 @@ mod tests {
     #[test]
     fn a_slot_returned_to_a_lookup_is_not_evicted_before_it_starts() {
         let registry = PrepareRegistry::default();
-        let pool = LanguageServerPool::new();
+        let pool = LanguageServerPool::preparing();
         let target = unstartable_target(&pool);
         let host = Url::parse("file:///host.md").unwrap();
         // Looked up, its attempt not yet started.
@@ -993,7 +993,7 @@ mod tests {
     #[test]
     fn an_input_whose_attempt_is_in_flight_is_not_evicted() {
         let registry = PrepareRegistry::default();
-        let pool = LanguageServerPool::new();
+        let pool = LanguageServerPool::preparing();
         let target = unstartable_target(&pool);
         let host = Url::parse("file:///host.md").unwrap();
         let running = cell(
@@ -1044,7 +1044,7 @@ mod tests {
         // document goes out unprepared, and that is final for the input.
         let registry = PrepareRegistry::default();
         let mut resync = registry.take_resync_rx().unwrap();
-        let pool = Arc::new(LanguageServerPool::new());
+        let pool = Arc::new(LanguageServerPool::preparing());
         let host = Url::parse("file:///host.md").unwrap();
         let target = unstartable_target(&pool);
         assert!(matches!(
@@ -1090,7 +1090,7 @@ mod tests {
     async fn the_held_input_resyncs_whoever_started_its_attempt() {
         let registry = PrepareRegistry::default();
         let mut resync = registry.take_resync_rx().unwrap();
-        let pool = Arc::new(LanguageServerPool::new());
+        let pool = Arc::new(LanguageServerPool::preparing());
         let host = Url::parse("file:///host.md").unwrap();
         let target = unstartable_target(&pool);
         // A request sees the edited text first and starts the attempt; the
@@ -1135,7 +1135,7 @@ mod tests {
     async fn a_target_from_before_the_epoch_moved_asks_nothing() {
         let registry = PrepareRegistry::default();
         let mut resync = registry.take_resync_rx().unwrap();
-        let pool = Arc::new(LanguageServerPool::new());
+        let pool = Arc::new(LanguageServerPool::preparing());
         let host = Url::parse("file:///host.md").unwrap();
         let target = unstartable_target(&pool);
         // Settings changed, say: the candidates resolved before may name a
@@ -1168,7 +1168,7 @@ mod tests {
     #[tokio::test]
     async fn an_answer_stands_only_under_the_epoch_it_was_asked_in() {
         let registry = PrepareRegistry::default();
-        let pool = Arc::new(LanguageServerPool::new());
+        let pool = Arc::new(LanguageServerPool::preparing());
         let host = Url::parse("file:///host.md").unwrap();
         let target = unstartable_target(&pool);
         assert!(
@@ -1205,7 +1205,7 @@ mod tests {
     #[tokio::test]
     async fn a_forgotten_attempt_does_not_start_its_peer() {
         let registry = PrepareRegistry::default();
-        let pool = Arc::new(LanguageServerPool::new());
+        let pool = Arc::new(LanguageServerPool::preparing());
         let dir = tempfile::tempdir().unwrap();
         let started = dir.path().join("started");
         let host = Url::parse("file:///host.md").unwrap();
@@ -1306,7 +1306,7 @@ mod tests {
     async fn the_first_advertising_candidate_alone_is_asked_and_retried() {
         let registry = PrepareRegistry::default();
         let mut resync = registry.take_resync_rx().unwrap();
-        let pool = Arc::new(LanguageServerPool::new());
+        let pool = Arc::new(LanguageServerPool::preparing());
         let dir = tempfile::tempdir().unwrap();
         let sent = |name: &str| std::fs::read_to_string(dir.path().join(name)).unwrap_or_default();
         recording_candidate(&pool, "quiet", false, &dir.path().join("quiet")).await;
@@ -1383,7 +1383,7 @@ mod tests {
     async fn an_unusable_answer_resyncs_its_host_as_failed() {
         let registry = PrepareRegistry::default();
         let mut resync = registry.take_resync_rx().unwrap();
-        let pool = Arc::new(LanguageServerPool::new());
+        let pool = Arc::new(LanguageServerPool::preparing());
         let dir = tempfile::tempdir().unwrap();
         refusing_candidate(&pool, "peer", &dir.path().join("peer"), 0.0).await;
         let host = Url::parse("file:///host.md").unwrap();
@@ -1424,7 +1424,7 @@ mod tests {
     #[tokio::test]
     async fn a_withdrawn_advertisement_outdates_the_answer_and_passes_its_server_over() {
         let registry = PrepareRegistry::default();
-        let pool = Arc::new(LanguageServerPool::new());
+        let pool = Arc::new(LanguageServerPool::preparing());
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("first");
         let second = dir.path().join("second");
@@ -1494,7 +1494,7 @@ mod tests {
     #[test]
     fn regions_are_forgotten_by_language_and_host() {
         let registry = PrepareRegistry::default();
-        let pool = LanguageServerPool::new();
+        let pool = LanguageServerPool::preparing();
         let target = unstartable_target(&pool);
         let host = Url::parse("file:///host.md").unwrap();
         let other = Url::parse("file:///other.md").unwrap();
