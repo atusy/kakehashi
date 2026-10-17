@@ -715,7 +715,8 @@ impl PrepareRegistry {
                     .push(version);
                 version
             };
-            match run(&pool, &candidates, &job, &next_version, &admitted).await {
+            let retrying = cell.misses.load(Ordering::Acquire) > 0;
+            match run(&pool, &candidates, &job, &next_version, &admitted, retrying).await {
                 Ok(answer) => {
                     let ready = !matches!(answer, Answer::Unusable);
                     let _ = cell.outcome.set(answer);
@@ -844,6 +845,7 @@ async fn run(
     job: &PrepareJob,
     next_version: &(dyn Fn() -> i32 + Sync),
     admitted: &(dyn Fn() -> bool + Sync),
+    retrying: bool,
 ) -> Result<Answer, ()> {
     // The error carries the peer's own text (its error object, the variant
     // names of a malformed answer): escaped, as is the language name.
@@ -865,16 +867,25 @@ async fn run(
         }
         Err(unanswered) => {
             // A revoked attempt (its host closed, its region replaced, the
-            // epoch moved) is no failure worth a warning.
-            if admitted() {
-                log_failure(&unanswered);
-            } else {
+            // epoch moved) is no failure worth a warning, nor is a retry's
+            // miss once the first was warned about.
+            if !admitted() {
                 log::debug!(
                     target: "kakehashi::bridge::prepare",
                     "Dropped an outdated prepare attempt for {}: {}",
                     job.host_uri,
                     escape_terminal_controls(&unanswered.to_string())
                 );
+            } else if retrying {
+                log::debug!(
+                    target: "kakehashi::bridge::prepare",
+                    "Still no answer for the {} virtual document of {}: {}",
+                    escape_terminal_controls(&job.injection_language),
+                    job.host_uri,
+                    escape_terminal_controls(&unanswered.to_string())
+                );
+            } else {
+                log_failure(&unanswered);
             }
             Err(())
         }
@@ -985,7 +996,16 @@ async fn try_run(
             // withdraws the advertisement, which moves the epoch): this
             // attempt is outdated, and the next one passes it over.
             Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
-                pool.record_prepare_advertisement_from(&handle, false);
+                // Once, as the withdrawal lands: a misconfigured peer whose
+                // documents now go out as is.
+                if pool.record_prepare_advertisement_from(&handle, false) {
+                    log::warn!(
+                        target: "kakehashi::bridge::prepare",
+                        "{} advertised {} but does not implement it; no longer asking it",
+                        escape_terminal_controls(name),
+                        super::protocol::PREPARE_METHOD,
+                    );
+                }
                 return Err(error);
             }
             // Final for this input: an unusable answer (an error response or
@@ -996,7 +1016,14 @@ async fn try_run(
                     format!("{name} could not prepare it: {error}"),
                 )));
             }
-            // No answer: timed out, cancelled by the peer, connection gone.
+            // Cancelled by the peer with a code LSP lets a client retry.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!("{name} cancelled the request; asking again: {error}"),
+                ));
+            }
+            // No answer: timed out, connection gone.
             Err(error) => {
                 return Err(std::io::Error::new(
                     error.kind(),
