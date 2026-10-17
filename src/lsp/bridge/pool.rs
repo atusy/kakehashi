@@ -2787,23 +2787,29 @@ impl LanguageServerPool {
             .as_deref()
             .filter(|_| provided.map.is_none())
             .map_or(provided, SentText::from);
-        let did_open = build_didopen_notification(virtual_uri, virtual_content.text);
-        // What the connection holds is recorded before the didOpen can reach
-        // it: a server pushing diagnostics the moment it opens the document
-        // finds its text on record. (The fingerprint also keeps the first
+        // What the connection holds is recorded as the didOpen is queued,
+        // taken back unless it is (see `DocumentTracker::record_and_queue`):
+        // a server pushing diagnostics the moment it opens the document finds
+        // its text on record. (The fingerprint also keeps the first
         // position-only host edit, which leaves this region's content
         // unchanged, from re-sending a didChange — and flickering a server
-        // that clears on didChange, #422.) A didOpen that is not queued
-        // takes the record back at once, before its claim is rolled back;
-        // the production senders queue without suspending, so only a test
-        // sender can be cancelled in between, which the claim guard's
-        // rollback covers.
-        let previous =
-            self.document_tracker
-                .record_opening(virtual_uri, connection_key, virtual_content);
-        if let Err(e) = sender.send_notification(did_open).await {
-            self.document_tracker
-                .take_back(virtual_uri, connection_key, previous);
+        // that clears on didChange, #422.) Serialized first: only the
+        // enqueue happens under the record's lock.
+        let queued = message_sender::serialize_notification(build_didopen_notification(
+            virtual_uri,
+            virtual_content.text,
+        ))
+        .and_then(|payload| {
+            self.document_tracker.record_and_queue(
+                virtual_uri,
+                connection_key,
+                virtual_content,
+                crate::lsp::bridge::protocol::DIDOPEN_VERSION,
+                || sender.send_serialized(payload),
+                io::Result::is_ok,
+            )
+        });
+        if let Err(e) = queued {
             self.document_tracker
                 .rollback_open_claim_if(host_uri, virtual_uri, connection_key, &claim)
                 .await;
@@ -9267,37 +9273,20 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_document_opened_unclaims_when_task_is_aborted_before_enqueue() {
-        struct BlockingSender {
-            entered: Arc<tokio::sync::Notify>,
-        }
-
-        impl message_sender::MessageSender for BlockingSender {
-            fn send_serialized(&mut self, _payload: serde_json::Value) -> io::Result<()> {
-                unreachable!("only didOpen goes through this sender")
-            }
-
-            async fn send_notification<P: serde::Serialize + Send>(
-                &mut self,
-                _notification: JsonRpcNotification<P>,
-            ) -> io::Result<()> {
-                self.entered.notify_one();
-                std::future::pending().await
-            }
-        }
-
         let pool = Arc::new(LanguageServerPool::new());
         let host_uri = Url::parse("file:///test/abort.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
         let connection_key = ConnectionKey::for_server("lua");
-        let entered = Arc::new(tokio::sync::Notify::new());
+        // Stalled after its claim, before its didOpen is queued.
+        let registrations = pool.document_tracker.lock_host_to_virtual_for_test().await;
+        let (sender, mut first_rx) = tokio::sync::mpsc::channel::<OutboundMessage>(1);
         let task = {
             let pool = Arc::clone(&pool);
             let host_uri = host_uri.clone();
             let virtual_uri = virtual_uri.clone();
             let connection_key = connection_key.clone();
-            let entered = Arc::clone(&entered);
             tokio::spawn(async move {
-                let mut sender = BlockingSender { entered };
+                let mut sender = sender;
                 pool.ensure_document_opened(
                     &mut sender,
                     &host_uri,
@@ -9308,14 +9297,18 @@ mod tests {
                 .await
             })
         };
-
-        entered.notified().await;
-        assert!(!pool.is_document_opened(&virtual_uri));
-        assert!(
-            pool.document_tracker
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool
+                .document_tracker
                 .open_claim_waiter(&virtual_uri, &connection_key)
-                .is_some()
-        );
+                .is_none()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the open claims the document");
+        assert!(!pool.is_document_opened(&virtual_uri));
         let (sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(1);
         let retry = {
             let pool = Arc::clone(&pool);
@@ -9341,12 +9334,17 @@ mod tests {
         );
         task.abort();
         let _ = task.await;
+        drop(registrations);
         tokio::time::timeout(Duration::from_secs(1), retry)
             .await
             .expect("waiting retry should resume after abort rollback")
             .expect("retry task should not panic")
             .expect("retry should enqueue didOpen");
         assert!(rx.try_recv().is_ok(), "a later didOpen must be retryable");
+        assert!(
+            first_rx.try_recv().is_err(),
+            "the aborted open queued nothing"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert!(
             pool.document_tracker
@@ -9357,21 +9355,24 @@ mod tests {
 
     #[tokio::test]
     async fn a_didopen_finds_its_text_on_record_as_it_goes_out_and_takes_it_back_if_not() {
-        struct BlockingSender {
-            entered: Arc<tokio::sync::Notify>,
+        /// Queues under the record's lock, or refuses to.
+        struct ObservedSender {
+            tracker: Arc<DocumentTracker>,
+            queue: bool,
+            locked: Arc<std::sync::atomic::AtomicBool>,
         }
 
-        impl message_sender::MessageSender for BlockingSender {
+        impl message_sender::MessageSender for ObservedSender {
             fn send_serialized(&mut self, _payload: serde_json::Value) -> io::Result<()> {
-                unreachable!("only didOpen goes through this sender")
-            }
-
-            async fn send_notification<P: serde::Serialize + Send>(
-                &mut self,
-                _notification: JsonRpcNotification<P>,
-            ) -> io::Result<()> {
-                self.entered.notify_one();
-                std::future::pending().await
+                self.locked.store(
+                    self.tracker.held_texts_locked_for_test(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                if self.queue {
+                    Ok(())
+                } else {
+                    Err(io::Error::new(io::ErrorKind::WouldBlock, "full"))
+                }
             }
         }
 
@@ -9380,91 +9381,69 @@ mod tests {
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
         let uri = virtual_uri.to_uri_string();
         let connection_key = ConnectionKey::for_server("lua");
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let task = {
-            let pool = Arc::clone(&pool);
-            let host_uri = host_uri.clone();
-            let virtual_uri = virtual_uri.clone();
-            let connection_key = connection_key.clone();
-            let entered = Arc::clone(&entered);
-            tokio::spawn(async move {
-                let mut sender = BlockingSender { entered };
-                pool.ensure_document_opened(
-                    &mut sender,
-                    &host_uri,
-                    &virtual_uri,
-                    "print('old')",
-                    &connection_key,
-                )
-                .await
-            })
+        let locked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut refusing = ObservedSender {
+            tracker: Arc::clone(&pool.document_tracker),
+            queue: false,
+            locked: Arc::clone(&locked),
         };
-        entered.notified().await;
+        assert!(
+            pool.ensure_document_opened(
+                &mut refusing,
+                &host_uri,
+                &virtual_uri,
+                "print('old')",
+                &connection_key,
+            )
+            .await
+            .is_err()
+        );
+        assert!(locked.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            pool.document_tracker
+                .held_text(&uri, &connection_key)
+                .is_none(),
+            "a didOpen that never went out leaves nothing on record"
+        );
+
+        let mut queueing = ObservedSender {
+            tracker: Arc::clone(&pool.document_tracker),
+            queue: true,
+            locked: Arc::clone(&locked),
+        };
+        pool.ensure_document_opened(
+            &mut queueing,
+            &host_uri,
+            &virtual_uri,
+            "print('old')",
+            &connection_key,
+        )
+        .await
+        .expect("the retry opens the document");
         let held = pool
             .document_tracker
             .held_text(&uri, &connection_key)
-            .expect("a didOpen is on record before it can reach the server");
+            .expect("a queued didOpen is on record");
         assert_eq!(held.version, crate::lsp::bridge::protocol::DIDOPEN_VERSION);
-        task.abort();
-        let _ = task.await;
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while pool
-                .document_tracker
-                .held_text(&uri, &connection_key)
-                .is_some()
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("a didOpen that never went out leaves nothing on record");
     }
 
     #[tokio::test]
     async fn ensure_document_opened_finishes_promotion_after_enqueue_when_caller_is_aborted() {
-        struct GatedSender {
-            entered: Arc<tokio::sync::Notify>,
-            release: Arc<tokio::sync::Notify>,
-            sent: Arc<tokio::sync::Notify>,
-        }
-
-        impl message_sender::MessageSender for GatedSender {
-            fn send_serialized(&mut self, _payload: serde_json::Value) -> io::Result<()> {
-                unreachable!("only didOpen goes through this sender")
-            }
-
-            async fn send_notification<P: serde::Serialize + Send>(
-                &mut self,
-                _notification: JsonRpcNotification<P>,
-            ) -> io::Result<()> {
-                self.entered.notify_one();
-                self.release.notified().await;
-                self.sent.notify_one();
-                Ok(())
-            }
-        }
-
         let pool = Arc::new(LanguageServerPool::new());
         let host_uri = Url::parse("file:///test/abort-after-enqueue.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
         let connection_key = ConnectionKey::for_server("lua");
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        let sent = Arc::new(tokio::sync::Notify::new());
+        // Stalled after its claim, so the version map can be taken before
+        // its promotion needs it.
+        let registrations = pool.document_tracker.lock_host_to_virtual_for_test().await;
+        let (sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(1);
         let task = {
             let pool = Arc::clone(&pool);
             let host_uri = host_uri.clone();
             let virtual_uri = virtual_uri.clone();
             let connection_key = connection_key.clone();
-            let entered = Arc::clone(&entered);
-            let release = Arc::clone(&release);
-            let sent = Arc::clone(&sent);
             tokio::spawn(async move {
-                let mut sender = GatedSender {
-                    entered,
-                    release,
-                    sent,
-                };
+                let mut sender = sender;
                 pool.ensure_document_opened(
                     &mut sender,
                     &host_uri,
@@ -9475,14 +9454,29 @@ mod tests {
                 .await
             })
         };
-
-        entered.notified().await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool
+                .document_tracker
+                .open_claim_waiter(&virtual_uri, &connection_key)
+                .is_none()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the open claims the document");
         let versions = pool
             .document_tracker
             .lock_document_versions_for_test()
             .await;
-        release.notify_one();
-        sent.notified().await;
+        drop(registrations);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while rx.try_recv().is_err() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the didOpen is queued");
         tokio::task::yield_now().await;
         let provenance = pool.observe_virtual_uris_for_connection(
             &connection_key,
@@ -9545,41 +9539,20 @@ mod tests {
 
     #[tokio::test]
     async fn did_close_waits_for_open_enqueue_then_removes_sent_state() {
-        struct GatedSender {
-            entered: Arc<tokio::sync::Notify>,
-            release: Arc<tokio::sync::Notify>,
-        }
-
-        impl message_sender::MessageSender for GatedSender {
-            fn send_serialized(&mut self, _payload: serde_json::Value) -> io::Result<()> {
-                unreachable!("only didOpen goes through this sender")
-            }
-
-            async fn send_notification<P: serde::Serialize + Send>(
-                &mut self,
-                _notification: JsonRpcNotification<P>,
-            ) -> io::Result<()> {
-                self.entered.notify_one();
-                self.release.notified().await;
-                Ok(())
-            }
-        }
-
         let pool = Arc::new(LanguageServerPool::new());
         let host_uri = Url::parse("file:///test/open-close.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
         let connection_key = ConnectionKey::for_server("lua");
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
+        // Stalled after its claim, before its didOpen is queued.
+        let registrations = pool.document_tracker.lock_host_to_virtual_for_test().await;
+        let (sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(1);
         let opening = {
             let pool = Arc::clone(&pool);
             let host_uri = host_uri.clone();
             let virtual_uri = virtual_uri.clone();
             let connection_key = connection_key.clone();
-            let entered = Arc::clone(&entered);
-            let release = Arc::clone(&release);
             tokio::spawn(async move {
-                let mut sender = GatedSender { entered, release };
+                let mut sender = sender;
                 pool.ensure_document_opened(
                     &mut sender,
                     &host_uri,
@@ -9590,7 +9563,17 @@ mod tests {
                 .await
             })
         };
-        entered.notified().await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool
+                .document_tracker
+                .open_claim_waiter(&virtual_uri, &connection_key)
+                .is_none()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the open claims the document");
         let closing = {
             let pool = Arc::clone(&pool);
             let host_uri = host_uri.clone();
@@ -9602,8 +9585,9 @@ mod tests {
             "close must serialize behind didOpen"
         );
 
-        release.notify_one();
+        drop(registrations);
         opening.await.unwrap().unwrap();
+        assert!(rx.try_recv().is_ok(), "the didOpen went out");
         let closed = closing.await.unwrap();
         assert_eq!(closed.len(), 1);
         assert!(!pool.is_document_opened(&virtual_uri));

@@ -341,6 +341,19 @@ impl DocumentTracker {
     }
 
     #[cfg(test)]
+    pub(super) async fn lock_host_to_virtual_for_test(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, HashMap<Url, Vec<OpenedVirtualDoc>>> {
+        self.host_to_virtual.lock().await
+    }
+
+    /// Whether what connections hold is being changed right now.
+    #[cfg(test)]
+    pub(super) fn held_texts_locked_for_test(&self) -> bool {
+        self.document_fingerprints.try_lock().is_err()
+    }
+
+    #[cfg(test)]
     pub(super) async fn lock_document_versions_for_test(
         &self,
     ) -> tokio::sync::MutexGuard<'_, HashMap<ConnectionKey, HashMap<String, i32>>> {
@@ -775,54 +788,6 @@ impl DocumentTracker {
             take_back_locked(&mut fingerprints, uri_string, connection_key, previous);
         }
         result
-    }
-
-    /// Record the content a `didOpen` hands this connection, before the
-    /// didOpen is queued: a server pushing diagnostics the moment it opens
-    /// the document finds its text on record. A didOpen goes through a
-    /// sender that may await, so it cannot be queued under the lock: the
-    /// record it replaced is returned for [`Self::take_back`], and its open
-    /// claim's rollback (`rollback_open_claim_if`) drops it too.
-    pub(super) fn record_opening(
-        &self,
-        virtual_uri: &VirtualDocumentUri,
-        connection_key: &ConnectionKey,
-        content: SentText<'_>,
-    ) -> Option<HeldText> {
-        let uri_string = virtual_uri.to_uri_string();
-        let fingerprint = content_fingerprint(content.text);
-        let mut fingerprints = self
-            .document_fingerprints
-            .lock()
-            .recover_poison("DocumentTracker::document_fingerprints");
-        self.record_locked(
-            &mut fingerprints,
-            &uri_string,
-            connection_key,
-            fingerprint,
-            content.map,
-            crate::lsp::bridge::protocol::DIDOPEN_VERSION,
-        )
-    }
-
-    /// Put back `previous`, the record [`Self::record_opening`] replaced,
-    /// for a send that was not queued.
-    pub(super) fn take_back(
-        &self,
-        virtual_uri: &VirtualDocumentUri,
-        connection_key: &ConnectionKey,
-        previous: Option<HeldText>,
-    ) {
-        let mut fingerprints = self
-            .document_fingerprints
-            .lock()
-            .recover_poison("DocumentTracker::document_fingerprints");
-        take_back_locked(
-            &mut fingerprints,
-            virtual_uri.to_uri_string(),
-            connection_key,
-            previous,
-        );
     }
 
     /// Record the text of `fingerprint`, sent with `map`, in `fingerprints`,
