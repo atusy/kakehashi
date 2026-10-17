@@ -546,7 +546,7 @@ fn content_deletions(
     }
     // The closing line's indentation is no part of the value either, and
     // with it gone P ends where the deleted lines were: no kept text starts
-    // there in P that positions or edits at P's end could belong to.
+    // there in P that a position at P's end could belong to.
     let has_trailing = deletions
         .iter()
         .any(|(_, kind)| *kind == RunKind::TrailingLines);
