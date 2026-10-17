@@ -3419,6 +3419,97 @@ mod tests {
         assert_eq!(merged[0].range.start, Position::new(5, 6));
     }
 
+    /// Region slots placed by their presentation: through the prepared map
+    /// of the text their connection held, or not at all — in the proactive
+    /// merge and in a pull's fold alike.
+    #[test]
+    fn region_slots_place_through_their_presentation() {
+        use crate::lsp::bridge::Presentation;
+        use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
+        // The peer strips the first two columns of "  a": prepared column 0
+        // is virtual column 2.
+        let answer = serde_json::from_value(serde_json::json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let map = apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(answer))
+            .unwrap()
+            .map;
+        let agg = DiagnosticAggregator::new();
+        for (region, server) in [("prepared", "a"), ("unplaced", "b"), ("as-is", "c")] {
+            agg.record(
+                &host(),
+                DiagnosticSource::Region(region.into()),
+                server.into(),
+                Some(ProgressConnectionId::for_test(1)),
+                vec![diag_at(region, 0, 0)],
+            );
+        }
+        let offsets: HashMap<String, RegionOffset> = ["prepared", "unplaced", "as-is"]
+            .into_iter()
+            .map(|region| (region.to_string(), RegionOffset::new(5, 4)))
+            .collect();
+        let place = |region_id: &str, _: &SlotEntry| match region_id {
+            "prepared" => Presentation::Prepared(Arc::clone(&map)),
+            "unplaced" => Presentation::Unavailable,
+            _ => Presentation::AsIs,
+        };
+        let placed = |mut diagnostics: Vec<Diagnostic>| {
+            diagnostics.sort_by(|a, b| a.message.cmp(&b.message));
+            diagnostics
+                .into_iter()
+                .map(|d| (d.message, d.range.start))
+                .collect::<Vec<_>>()
+        };
+        let expected = vec![
+            ("as-is".to_string(), Position::new(5, 4)),
+            ("prepared".to_string(), Position::new(5, 6)),
+        ];
+        assert_eq!(
+            placed(merge_cached_diagnostics(
+                &host(),
+                agg.snapshot(&host()),
+                &offsets,
+                place
+            )),
+            expected
+        );
+        let (region_items, _) =
+            cached_push_diagnostics(&host(), agg.snapshot(&host()), &offsets, place, |_, _| true);
+        assert_eq!(placed(region_items), expected);
+    }
+
+    /// The same diagnostics under another stamp place differently: the
+    /// republish must not skip them.
+    #[test]
+    fn a_new_stamp_on_the_same_diagnostics_is_a_change() {
+        use crate::lsp::bridge::{ConnectionKey, Observed};
+        let agg = DiagnosticAggregator::new();
+        let stamp = |generation| {
+            Some(HeldStamp {
+                connection: ConnectionKey::for_server("luals"),
+                observed: Observed::Read {
+                    generation: Some(generation),
+                    prepared: true,
+                    stale_version: false,
+                },
+            })
+        };
+        let record = |held| {
+            agg.record_held(
+                &host(),
+                DiagnosticSource::Region("r1".into()),
+                "luals".into(),
+                Some(ProgressConnectionId::for_test(1)),
+                held,
+                vec![diag("same")],
+            )
+        };
+        assert!(record(stamp(1)));
+        assert!(!record(stamp(1)));
+        assert!(record(stamp(2)));
+    }
+
     #[test]
     fn merge_drops_virtual_related_information_and_translates_host() {
         use std::str::FromStr;

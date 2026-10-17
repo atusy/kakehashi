@@ -95,6 +95,10 @@ pub(crate) use protocol::translate_virtual_range_to_host;
 pub(crate) use protocol::workspace_edit_has_effect;
 pub(crate) use protocol::workspace_edit_preserves_line_prefixes;
 pub(crate) use protocol::workspace_edit_within_region;
+/// Re-exported for tests outside the bridge that place coordinates through a
+/// prepared map.
+#[cfg(test)]
+pub(crate) use protocol::{VirtualLayout, apply_prepare_result};
 pub(crate) use text_document::completion_item::CompletionResolveDocument;
 pub(crate) use text_document::host::HostResolveSnapshot;
 pub(crate) use text_document::host::{HostDocument, HostTextReader, normalize_host_goto_result};
