@@ -952,7 +952,9 @@ original document: hovers, definitions, diagnostics, folding ranges and the
 like work as on any document. Edits are not mapped back: completion, code
 actions, rename, formatting and the other edit-producing methods are not
 available on a prepared document, and inlay hints are shown without their
-edits. A document the server fails to prepare is not sent downstream at
+edits. Items listed from a prepared document are not resolved further:
+`*/resolve`, and call and type hierarchy follow-ups (incoming and outgoing
+calls, supertypes and subtypes), return nothing more. A document the server fails to prepare is not sent downstream at
 all; answer `null` to keep a document unchanged.
 
 ### Configuration Files

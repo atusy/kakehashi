@@ -179,8 +179,11 @@ prepareRename, rangeFormatting, rename — are closed to a prepared one too,
 as is an inbound `workspace/applyEdit` computed for a prepared text, but
 for inlay hints: they stay available on a contiguous prepared document
 (they are display), with each hint's `textEdits` dropped.
-A `*/resolve` envelope minted from a prepared document never resolves:
-the map it was minted through is not carried.
+A `*/resolve` envelope minted from a prepared document never resolves,
+nor does a call or type hierarchy item minted from one answer its
+follow-ups (`callHierarchy/incomingCalls`, `outgoingCalls`,
+`typeHierarchy/supertypes`, `subtypes`): the map it was minted through is
+not carried.
 
 ### Failure
 
@@ -374,7 +377,8 @@ move: an answer from before it is simply not read.
   can under the default `priorities`, and declining with `null` still
   makes a document prepared; restricting it takes `priorities = []` where
   it should not apply.
-- `*/resolve` for items from prepared documents is refused (stale).
+- `*/resolve` for items from prepared documents is refused (stale), as are
+  call and type hierarchy follow-ups for their items.
 - Host text the injection query includes in content cannot be protected as
   a gap; only text outside the captured content is.
 - A request issued right after an edit waits for the new prepared text to
