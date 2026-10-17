@@ -182,7 +182,7 @@ candidate advertising the request, or able to start — is a different case:
 there is nothing to prepare the document, and it is sent as is.) Requests on
 such a document get no answer from the virt layer, its pushed diagnostics
 are dropped, and the one-shot CLI (`format`, `diagnose`) counts it as a
-failed request. A peer that prefers a fallback answers `null` (or catches
+failed request (`format` exits 2). A peer that prefers a fallback answers `null` (or catches
 its own errors and does so); kakehashi does not choose one on its behalf.
 
 An unusable answer (an error response, a malformed or refused result) is
@@ -249,17 +249,21 @@ own text and the latest the lifecycle pass recorded.
   unprepared document waits only while its server still holds a prepared
   text, right after its pair lost its peer. The check and the request's
   enqueue cannot be separated by a recorded send. The request must not send
-  the text itself — it could overtake a newer text the lifecycle pass
-  already sent.
+  a text to a document its server already has open — it could overtake a
+  newer text the lifecycle pass already sent; it only opens one not open
+  there (see Lifecycle).
 - **A push follows the text its connection held when kakehashi read it.**
-  The push is stamped as it is read, before it waits to be published, and is
-  placed only while the connection still holds that very text. A push naming
-  another document version than the one its connection was last sent was
-  computed for an earlier text and places nowhere.
+  The push is stamped as it is read, before it waits to be published.
+  Where preparation is involved (by the rule above), it is placed only while
+  the connection still holds that very text, and one naming another
+  document version than the one its connection was last sent was computed
+  for an earlier text and places nowhere. Elsewhere it places as on any
+  unprepared path.
 - **Cached answers follow the configuration.** An answer is the peer's for
   one launch configuration and its runtime settings, read only under the
-  epoch it was asked in; a lookup resolved before a settings change neither
-  reads answers nor starts the old peer.
+  epoch it was asked in. The epoch moves once the new settings are in, so
+  no answer given for a lookup resolved from the old ones is read after the
+  change.
 - **The answer that unblocks a held document always re-syncs its host**,
   whoever started the attempt that got it; requests may read older answers
   but never move what the lifecycle pass holds the document on.
