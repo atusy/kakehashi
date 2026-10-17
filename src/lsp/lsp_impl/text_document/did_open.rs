@@ -1450,6 +1450,7 @@ print("hello")
             std::sync::Arc::new(SyntheticDiagnosticsManager::new()),
             std::sync::Arc::new(DiagnosticPublisher::new(server)),
             std::sync::Arc::clone(&server.documents),
+            crate::lsp::synthetic_diagnostics::SyntheticDiagnosticTrigger::Change,
         );
         wait_version(1)
             .await
@@ -1476,6 +1477,7 @@ print("hello")
             std::sync::Arc::new(SyntheticDiagnosticsManager::new()),
             std::sync::Arc::new(DiagnosticPublisher::new(server)),
             std::sync::Arc::clone(&server.documents),
+            crate::lsp::synthetic_diagnostics::SyntheticDiagnosticTrigger::Change,
         );
         wait_version(2).await.expect(
             "second debounce fire must re-read the updated store text and advance to version 2 \
@@ -1546,6 +1548,7 @@ print("hello")
             Arc::new(SyntheticDiagnosticsManager::new()),
             Arc::new(DiagnosticPublisher::new(server)),
             Arc::clone(&server.documents),
+            crate::lsp::synthetic_diagnostics::SyntheticDiagnosticTrigger::Change,
         );
         gate.entered.notified().await;
         let timer = manager.timer_abort_handle(&uri).unwrap();

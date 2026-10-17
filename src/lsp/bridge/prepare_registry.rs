@@ -129,6 +129,10 @@ pub(crate) struct Resync {
     /// placed from a document's earlier text: one held back got an unusable
     /// answer, so it is no longer bridged.
     pub(crate) recollect: bool,
+    /// The ready document's answer follows one for its earlier text under
+    /// the same epoch: an edit's, whose diagnostics the edit's debounced
+    /// collection gathers, rather than a collection of its own at once.
+    pub(crate) edited: bool,
 }
 
 /// The answer for one input under one epoch, and the attempts to get it.
@@ -150,6 +154,9 @@ struct Cell {
     retry_at: std::sync::Mutex<Option<Instant>>,
     /// Bumped after every attempt, answered or not.
     attempts: tokio::sync::watch::Sender<u32>,
+    /// The lifecycle pass moved its document onto this input from an
+    /// answered one under the same epoch: the text was edited.
+    after_edit: AtomicBool,
     /// The `textDocument.version` of each attempt, in order.
     #[cfg(test)]
     versions: std::sync::Mutex<Vec<i32>>,
@@ -165,6 +172,7 @@ impl Cell {
             misses: AtomicU32::new(0),
             retry_at: std::sync::Mutex::new(None),
             attempts: tokio::sync::watch::channel(0).0,
+            after_edit: AtomicBool::new(false),
             #[cfg(test)]
             versions: std::sync::Mutex::new(Vec::new()),
         }
@@ -369,6 +377,7 @@ impl PrepareRegistry {
                 host_uri: input.host_uri.clone(),
                 ready: false,
                 recollect: false,
+                edited: false,
             });
             return PrepareLookup::Pending;
         };
@@ -657,7 +666,13 @@ impl PrepareRegistry {
                 held: None,
             };
         }
-        if holder == Holder::LifecyclePass && region.held != Some(key) {
+        // Moved off an answered input of the same epoch: an edit.
+        let moved = holder == Holder::LifecyclePass && region.held != Some(key);
+        let edited = moved
+            && region
+                .held_cell()
+                .is_some_and(|cell| cell.epoch == target.epoch && cell.outcome.get().is_some());
+        if moved {
             region.held = Some(key);
             self.held_changes.fetch_add(1, Ordering::AcqRel);
         }
@@ -668,6 +683,9 @@ impl PrepareRegistry {
                 cell: Arc::new(Cell::new(target.epoch)),
             },
         };
+        if moved {
+            slot.cell.after_edit.store(edited, Ordering::Release);
+        }
         region.slots.insert(0, slot.clone());
         // Evict the least recently used beyond the bound, never the one the
         // lifecycle pass holds on, nor one in use: returned to a lookup that
@@ -778,6 +796,7 @@ impl PrepareRegistry {
                             host_uri: job.host_uri.clone(),
                             ready,
                             recollect: !ready,
+                            edited: ready && cell.after_edit.load(Ordering::Acquire),
                         });
                     }
                 }
@@ -805,6 +824,7 @@ impl PrepareRegistry {
                                 host_uri,
                                 ready: false,
                                 recollect: false,
+                                edited: false,
                             });
                         }
                     });
@@ -1268,9 +1288,56 @@ mod tests {
             Some(Resync {
                 host_uri: host,
                 ready: true,
-                recollect: false
+                recollect: false,
+                edited: false,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn an_answer_for_an_edit_resyncs_as_edited() {
+        // The lifecycle pass moves from an answered text to the edited one
+        // under the same epoch: that answer's resync is an edit's, which the
+        // edit's debounced collection covers. The first answer's is not.
+        let registry = PrepareRegistry::default();
+        let mut resync = registry.take_resync_rx().unwrap();
+        let pool = Arc::new(LanguageServerPool::preparing());
+        let host = Url::parse("file:///host.md").unwrap();
+        let target = unstartable_target(&pool);
+        let ready = |edited| Resync {
+            host_uri: host.clone(),
+            ready: true,
+            recollect: false,
+            edited,
+        };
+        registry.lookup_or_start(&pool, &target, input(&host, "a"));
+        assert!(
+            registry
+                .prepare(&pool, &target, input(&host, "a"))
+                .await
+                .is_ok()
+        );
+        assert_eq!(resync.try_recv().ok(), Some(ready(false)));
+        registry.lookup_or_start(&pool, &target, input(&host, "b"));
+        assert!(
+            registry
+                .prepare(&pool, &target, input(&host, "b"))
+                .await
+                .is_ok()
+        );
+        assert_eq!(resync.try_recv().ok(), Some(ready(true)));
+        // Under a new epoch the held answer is for other settings: not an
+        // edit's.
+        pool.advance_prepare_epoch();
+        let target = unstartable_target(&pool);
+        registry.lookup_or_start(&pool, &target, input(&host, "c"));
+        assert!(
+            registry
+                .prepare(&pool, &target, input(&host, "c"))
+                .await
+                .is_ok()
+        );
+        assert_eq!(resync.try_recv().ok(), Some(ready(false)));
     }
 
     #[tokio::test]
@@ -1303,7 +1370,8 @@ mod tests {
             Some(Resync {
                 host_uri: host.clone(),
                 ready: true,
-                recollect: false
+                recollect: false,
+                edited: false,
             })
         );
         // An answer for text the lifecycle pass no longer holds on re-syncs
@@ -1347,7 +1415,8 @@ mod tests {
             Some(Resync {
                 host_uri: host,
                 ready: false,
-                recollect: false
+                recollect: false,
+                edited: false,
             })
         );
     }
@@ -1576,7 +1645,8 @@ mod tests {
             Some(Resync {
                 host_uri: host.clone(),
                 ready: false,
-                recollect: false
+                recollect: false,
+                edited: false,
             })
         );
     }
@@ -1618,7 +1688,8 @@ mod tests {
             Some(Resync {
                 host_uri: host,
                 ready: false,
-                recollect: true
+                recollect: true,
+                edited: false,
             })
         );
     }

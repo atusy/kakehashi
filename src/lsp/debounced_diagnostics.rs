@@ -59,6 +59,8 @@ struct DebouncedDiagnosticData {
     incarnation: u64,
     content_version: u64,
     settings_generation: u64,
+    /// What the collection supersedes among this version's others.
+    trigger: SyntheticDiagnosticTrigger,
     /// Reference to synthetic diagnostics manager for task registration
     synthetic_diagnostics: Arc<SyntheticDiagnosticsManager>,
     /// The single proactive publisher: feeds the pull result into the cache and
@@ -140,7 +142,8 @@ impl DebouncedDiagnosticsManager {
     /// Schedule a debounced diagnostic for a document.
     ///
     /// Any existing timer for this document is cancelled and replaced; on expiry
-    /// the new timer publishes diagnostics from the pre-captured `snapshot_data`.
+    /// the new timer publishes diagnostics from the pre-captured `snapshot_data`,
+    /// ranked as `trigger` among the version's collections.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn schedule(
         &self,
@@ -151,6 +154,7 @@ impl DebouncedDiagnosticsManager {
         synthetic_diagnostics: Arc<SyntheticDiagnosticsManager>,
         publisher: Arc<DiagnosticPublisher>,
         documents: Arc<crate::document::DocumentStore>,
+        trigger: SyntheticDiagnosticTrigger,
     ) {
         // Opportunistic cleanup: remove finished timers to prevent unbounded growth.
         // This is O(n) but runs infrequently and keeps the map from accumulating
@@ -198,6 +202,7 @@ impl DebouncedDiagnosticsManager {
             incarnation,
             content_version,
             settings_generation,
+            trigger,
             #[cfg(test)]
             execution_gate: self.execution_gate.lock().unwrap().clone(),
         };
@@ -292,6 +297,7 @@ async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
         incarnation,
         content_version,
         settings_generation,
+        trigger,
         #[cfg(test)]
         execution_gate,
     } = data;
@@ -428,7 +434,7 @@ async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
         incarnation,
         content_version,
         settings_generation,
-        SyntheticDiagnosticTrigger::Change,
+        trigger,
         future,
     );
     drop(edit_guard);

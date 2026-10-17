@@ -206,6 +206,19 @@ impl DiagnosticScheduler {
     /// captured now, at schedule time, so diagnostics stay consistent with the
     /// document state that triggered the change.
     pub(crate) fn schedule_debounced_diagnostic(&self, uri: Url) {
+        self.schedule_debounced_diagnostic_as(uri, SyntheticDiagnosticTrigger::Change);
+    }
+
+    /// Collect `uri`'s diagnostics again after a resync pass sent its
+    /// servers the texts an edit's prepare answers gave, through the edit's
+    /// debounce: a burst of keystrokes still collects once. Ranked as a
+    /// collection after held regions are sent, since an earlier one of this
+    /// version (a save's, say) left them out.
+    pub(crate) fn schedule_debounced_diagnostic_after_prepare(&self, uri: Url) {
+        self.schedule_debounced_diagnostic_as(uri, SyntheticDiagnosticTrigger::Prepared);
+    }
+
+    fn schedule_debounced_diagnostic_as(&self, uri: Url, trigger: SyntheticDiagnosticTrigger) {
         let snapshot_data = self.prepare_diagnostic_snapshot(&uri);
 
         // Apply the current `diagnostics_debounce_ms` setting (#533). The snapshot
@@ -225,6 +238,7 @@ impl DiagnosticScheduler {
             std::sync::Arc::clone(&self.synthetic_diagnostics),
             std::sync::Arc::clone(&self.publisher),
             std::sync::Arc::clone(&self.documents),
+            trigger,
         );
     }
 
@@ -779,6 +793,42 @@ mod tests {
                 .await
                 .expect("tree publication must release the diagnostic waiter")
         );
+    }
+
+    /// An edit's prepare answer is collected through the debounce, yet ranks
+    /// as a collection after held regions are sent: a save of the same
+    /// version collected without those regions, and a change-ranked one
+    /// would yield to it.
+    #[tokio::test]
+    async fn a_debounced_collection_after_prepare_supersedes_the_versions_save() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///test/prepared-after-save.md").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "# saved\n".to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let content_version = server.documents.get(&uri).unwrap().content_version();
+        let scheduler = DiagnosticScheduler::new(server);
+        let settings_generation = scheduler
+            .prepare_diagnostic_snapshot(&uri)
+            .map_or(0, |snapshot| snapshot.lineage.settings_generation);
+        let save = tokio::spawn(std::future::pending::<()>());
+        assert!(server.synthetic_diagnostics.register_task_for_lineage(
+            uri.clone(),
+            incarnation,
+            content_version,
+            settings_generation,
+            SyntheticDiagnosticTrigger::Save,
+            save.abort_handle(),
+        ));
+        scheduler.schedule_debounced_diagnostic_after_prepare(uri);
+        let superseded = tokio::time::timeout(std::time::Duration::from_secs(5), save)
+            .await
+            .expect("the save's collection is superseded");
+        assert!(superseded.unwrap_err().is_cancelled());
     }
 
     #[tokio::test]

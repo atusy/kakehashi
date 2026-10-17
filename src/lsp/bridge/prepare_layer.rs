@@ -267,6 +267,7 @@ impl super::BridgeCoordinator {
                     host_uri: host.clone(),
                     ready: false,
                     recollect: false,
+                    edited: false,
                 },
                 std::time::Duration::ZERO,
             );
