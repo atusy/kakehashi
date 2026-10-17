@@ -484,6 +484,13 @@ impl super::BridgeCoordinator {
             .map(|(_, held)| held)
     }
 
+    /// A host opened (again): its documents are prepared as any.
+    pub(crate) fn prepare_host_opened(&self, host_uri: &Url) {
+        if let Some(layer) = &self.prepare {
+            layer.registry.host_opened(host_uri);
+        }
+    }
+
     /// Drop a closed host's answers and the start failures recorded for it.
     pub(crate) fn forget_prepared_host(&self, host_uri: &Url) {
         if let Some(layer) = &self.prepare {
@@ -641,7 +648,32 @@ mod tests {
         assert!(coordinator.take_pull_debt_after_prepare(&host));
         assert!(!coordinator.take_pull_debt_after_prepare(&host));
 
-        // A closed host owes nothing.
+        // A closed host owes nothing. (One of its documents was looked up,
+        // as any owing a pull.)
+        coordinator.prepare_settings_changed(&Arc::new(crate::config::WorkspaceSettings {
+            auto_install: false,
+            language_servers: [(
+                "peer".to_string(),
+                super::super::pool::test_helpers::devnull_config_for_language("lua"),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        }));
+        let target = coordinator.prepare_target("markdown", "lua").unwrap();
+        coordinator.answer_prepare_for_test(
+            &target,
+            super::PrepareInput {
+                host_uri: &host,
+                host_language: "markdown",
+                injection_language: "lua",
+                region_id: TEST_ULID_LUA_0,
+                virtual_text: "a",
+                gaps: &[],
+            },
+            super::super::prepare_registry::Answer::AsIs,
+            true,
+        );
         coordinator.owe_pull_after_prepare(&host);
         coordinator.forget_prepared_host(&host);
         assert!(!coordinator.take_pull_debt_after_prepare(&host));

@@ -1499,6 +1499,7 @@ impl BridgeCoordinator {
     }
 
     pub(crate) async fn open_host_incarnation(&self, uri: &Url, incarnation: u64) {
+        self.prepare_host_opened(uri);
         self.pool.open_host_incarnation(uri, incarnation).await;
     }
 
