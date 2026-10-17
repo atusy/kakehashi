@@ -256,11 +256,14 @@ impl super::BridgeCoordinator {
         let Some(layer) = &self.prepare else {
             return;
         };
-        // Closed meanwhile: no editor shows it.
+        // Closed meanwhile: no editor shows it. Checked after recording the
+        // debt, as a close marks the host closed before it drops the debts:
+        // a close either drops this one or is seen here.
+        layer.pull_debts.insert(host.clone());
         if layer.registry.host_closed(host) {
+            layer.pull_debts.remove(host);
             return;
         }
-        layer.pull_debts.insert(host.clone());
         if !self.prepare_host_has_pending(host) {
             layer.registry.requeue_resync(
                 Resync {
@@ -515,9 +518,10 @@ impl super::BridgeCoordinator {
     /// Drop a closed host's answers and the start failures recorded for it.
     pub(crate) fn forget_prepared_host(&self, host_uri: &Url) {
         if let Some(layer) = &self.prepare {
+            // Closed first: a debt owed meanwhile sees it and is undone.
+            layer.registry.forget_host(host_uri);
             layer.pull_debts.remove(host_uri);
             layer.held_saves.remove(host_uri);
-            layer.registry.forget_host(host_uri);
             self.pool.forget_prepare_start_failures(Some(host_uri));
         }
     }
