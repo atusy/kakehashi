@@ -1451,7 +1451,8 @@ impl Kakehashi {
         if method_closed_to(resolved, method, self.lifecycle_prepares(uri, resolved)) {
             return true;
         }
-        if !method_requires_contiguous_injection(method) {
+        // Open even were the region prepared: no answer to wait for.
+        if !method_closed_to(resolved, method, true) {
             return false;
         }
         let Some(target) = self
