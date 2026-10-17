@@ -295,6 +295,8 @@ pub(crate) enum PrepareError {
     SegmentKind { index: usize, expected: SegmentKind },
     #[error("segment {index}: {reason}")]
     InvalidChange { index: usize, reason: &'static str },
+    #[error("the answer joins a CR and a LF the document keeps apart into one line break")]
+    FusedLineBreak,
 }
 
 // =============================================================================
@@ -414,6 +416,10 @@ pub(crate) fn apply_prepare_result_at(
             }
             (expected, _) => return Err(PrepareError::SegmentKind { index, expected }),
         }
+    }
+
+    if fuses_a_line_break(&text, &runs, virtual_text) {
+        return Err(PrepareError::FusedLineBreak);
     }
 
     // Even an answer that changed nothing yields a map: the map is how every
@@ -983,6 +989,39 @@ impl PartialEq for LineIndexEq {
 
 impl Eq for LineIndexEq {}
 
+/// Whether the prepared text holds a CRLF whose CR and LF are not one CRLF
+/// of the virtual text: a lone CR meeting a LF once whitespace or a gap
+/// between them is gone, or a placeholder completing one. P would have a
+/// line fewer than V where they meet, and a position between them would map
+/// to another line.
+fn fuses_a_line_break(prepared: &str, runs: &[Run], virtual_text: &str) -> bool {
+    // The run a prepared byte at `offset` comes from (runs tile P in order).
+    let run_of = |offset: usize| {
+        let index = runs.partition_point(|run| run.prepared.end <= offset);
+        runs.get(index)
+            .filter(|run| run.prepared.contains(&offset))
+            .map(|_| index)
+    };
+    // The V offset of the prepared byte at `offset`, when it is one V holds
+    // verbatim.
+    let virtual_offset = |offset: usize| {
+        run_of(offset).and_then(|index| {
+            let run = &runs[index];
+            (run.kind == RunKind::Identity)
+                .then(|| run.virtual_.start + (offset - run.prepared.start))
+        })
+    };
+    prepared.match_indices("\r\n").any(|(cr, _)| {
+        match (virtual_offset(cr), virtual_offset(cr + 1)) {
+            (Some(virtual_cr), Some(virtual_lf)) => {
+                virtual_lf != virtual_cr + 1 || !splits_crlf(virtual_text, virtual_lf)
+            }
+            // Both from one placeholder: its own line break.
+            _ => run_of(cr) != run_of(cr + 1),
+        }
+    })
+}
+
 /// Whether `offset` sits between the CR and LF of a CRLF: past its line's
 /// content, where LSP clamps a position, yet a distinct byte offset.
 fn splits_crlf(text: &str, offset: usize) -> bool {
@@ -998,6 +1037,53 @@ fn is_line_start(text: &str, offset: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An answer whose prepared text would join a lone CR and a following
+    /// LF into one CRLF — one line fewer than the virtual document keeps,
+    /// with a position between them that maps to the wrong line — is
+    /// refused. A CRLF the virtual document has stays.
+    #[test]
+    fn an_answer_fusing_a_cr_and_a_lf_is_refused() {
+        let dedent_line_1 = |virtual_text: &str, columns: u32| {
+            let answer: PrepareResult = serde_json::from_value(serde_json::json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": columns}}, "newText": ""}
+            ]}]}))
+            .unwrap();
+            apply_prepare_result(
+                virtual_text,
+                &VirtualLayout::single(virtual_text),
+                Some(answer),
+            )
+        };
+        // V: "a" ends at a lone CR; line 1 is two spaces and its LF.
+        assert!(dedent_line_1("a\r  \nb", 2).is_err());
+        // V keeps a CRLF: dedenting the next line joins nothing.
+        let kept = dedent_line_1("a\r\n  b", 2).unwrap();
+        assert_eq!(kept.text, "a\r\nb");
+    }
+
+    /// A gap placeholder that would complete a CRLF with the content beside
+    /// it is refused the same way.
+    #[test]
+    fn a_placeholder_fusing_a_cr_and_a_lf_is_refused() {
+        let gaps = [VirtualGap {
+            virtual_range: 2..3,
+            host_text: "x".to_string(),
+        }];
+        let virtual_text = "a\r \nb";
+        let layout = VirtualLayout::from_gaps(virtual_text, &gaps);
+        let answer = |placeholder: &str| -> PrepareResult {
+            serde_json::from_value(serde_json::json!({"segments": [
+                {"type": "content"},
+                {"type": "gap", "content": placeholder},
+                {"type": "content"}
+            ]}))
+            .unwrap()
+        };
+        assert!(apply_prepare_result(virtual_text, &layout, Some(answer(""))).is_err());
+        assert!(apply_prepare_result(virtual_text, &layout, Some(answer("\n"))).is_err());
+        assert!(apply_prepare_result(virtual_text, &layout, Some(answer("-"))).is_ok());
+    }
 
     #[test]
     fn a_column_past_any_line_names_no_location() {
