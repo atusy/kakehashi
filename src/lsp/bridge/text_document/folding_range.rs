@@ -184,6 +184,42 @@ mod tests {
         );
     }
 
+    /// A gap emptied by its placeholder joins two virtual lines into one
+    /// prepared line: a fold to that line's end, given without a character,
+    /// ends on the virtual line the joined line ends on.
+    #[test]
+    fn a_fold_without_an_end_character_ends_where_its_prepared_line_does() {
+        use crate::language::injection::VirtualGap;
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let virtual_text = "ab\n--\ncd";
+        let gaps = [VirtualGap {
+            virtual_range: 2..6,
+            host_text: "\n--\n".to_string(),
+        }];
+        let answer = serde_json::from_value(serde_json::json!({"segments": [
+            {"type": "content"},
+            {"type": "gap", "content": ""},
+            {"type": "content"}
+        ]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::from_gaps(virtual_text, &gaps),
+            Some(answer),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "abcd");
+        let response = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": [
+            {"startLine": 0, "endLine": 0}
+        ]});
+        let ranges = transform_folding_range_response_to_host(
+            response,
+            &RegionOffset::new(10, 0).with_prepared(prepared.map),
+        )
+        .unwrap();
+        assert_eq!((ranges[0].start_line, ranges[0].end_line), (10, 12));
+    }
+
     #[test]
     fn folding_range_request_uses_virtual_uri() {
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
