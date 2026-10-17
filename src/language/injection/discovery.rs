@@ -955,6 +955,10 @@ pub(crate) struct ResolvedInjection {
     /// masked spans and host-only lines' line breaks (a non-empty
     /// `virtual_range`), and stripped text such as line prefixes (an empty
     /// one). Empty for an isolated region, which is all content.
+    #[allow(
+        dead_code,
+        reason = "the prepare layer that presents documents through it comes next"
+    )]
     pub gaps: std::sync::Arc<[VirtualGap]>,
 }
 
@@ -3045,7 +3049,8 @@ mod tests {
     fn combined_content_skips_empty_ranges_before_later_content() {
         let text = "abcdef";
 
-        let (content, offsets, _) = build_combined_virtual_content(text, 0..text.len(), &[2..2, 4..5]);
+        let (content, offsets, _) =
+            build_combined_virtual_content(text, 0..text.len(), &[2..2, 4..5]);
 
         assert_eq!(content, "e ");
         assert_eq!(offsets, vec![4]);

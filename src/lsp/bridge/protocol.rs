@@ -9,6 +9,7 @@
 //! - `command_routing` - Encode/decode the origin server in a bridged command name
 //! - `jsonrpc` - JSON-RPC message types and error inspection
 //! - `lifecycle` - Initialize/shutdown message builders
+//! - `prepare` - `kakehashi/virtualDocument/prepare`: present a virtual document through a peer
 //! - `request_id` - RequestId type for type-safe request ID handling
 //! - `virtual_uri` - VirtualDocumentUri type for encoding injection region references
 //! - `request` - Request builders for downstream language servers
@@ -20,6 +21,11 @@ mod client_capabilities;
 mod command_routing;
 mod jsonrpc;
 mod lifecycle;
+#[allow(
+    dead_code,
+    reason = "the prepare layer that presents documents through it comes next"
+)]
+mod prepare;
 mod request;
 mod request_id;
 mod response;

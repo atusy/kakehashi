@@ -3,7 +3,11 @@
 //! All translation functions use in-place `&mut` mutation and saturating arithmetic
 //! for race-condition safety (stale region data after document edits).
 
+use std::sync::Arc;
+
 use tower_lsp_server::ls_types::{Position, Range};
+
+use super::prepare::{Bias, PreparedMap};
 
 /// The starting offset of an injection region in the host document.
 ///
@@ -20,6 +24,11 @@ use tower_lsp_server::ls_types::{Position, Range};
 /// row where the included ranges end (the closing-fence line). That row's
 /// real prefix is unrecorded; `workspace_edit_preserves_line_prefixes`
 /// derives its boundary semantics from the region end instead.
+///
+/// When downstream servers hold a prepared document
+/// (`kakehashi/virtualDocument/prepare`), `prepared` maps between it and the
+/// virtual document. `line`/`columns` always describe the virtual document,
+/// so the translation functions below compose prepared ↔ virtual ↔ host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RegionOffset {
     /// The starting line of the injection region in the host document.
@@ -27,6 +36,9 @@ pub(crate) struct RegionOffset {
     /// Per-virtual-line column offsets (UTF-16 code units).
     /// Index = virtual line number, value = column offset for that line.
     columns: Vec<u32>,
+    /// Prepared ↔ virtual coordinates, when downstream servers hold a
+    /// prepared document.
+    prepared: Option<Arc<PreparedMap>>,
 }
 
 impl RegionOffset {
@@ -35,12 +47,46 @@ impl RegionOffset {
         Self {
             line,
             columns: vec![column],
+            prepared: None,
         }
     }
 
     /// Construct a `RegionOffset` with per-line column offsets (blockquote case).
     pub(crate) fn with_per_line_offsets(line: u32, columns: Vec<u32>) -> Self {
-        Self { line, columns }
+        Self {
+            line,
+            columns,
+            prepared: None,
+        }
+    }
+
+    /// Attach the prepared ↔ virtual map of the text downstream servers hold.
+    #[allow(
+        dead_code,
+        reason = "the prepare layer that presents documents through it comes next"
+    )]
+    pub(crate) fn with_prepared(mut self, prepared: Arc<PreparedMap>) -> Self {
+        self.prepared = Some(prepared);
+        self
+    }
+
+    /// The prepared ↔ virtual map, when downstream servers hold a prepared
+    /// document.
+    pub(crate) fn prepared(&self) -> Option<&PreparedMap> {
+        self.prepared.as_deref()
+    }
+
+    /// This offset without its prepared map: virtual ↔ host only.
+    #[allow(
+        dead_code,
+        reason = "the prepare layer that presents documents through it comes next"
+    )]
+    fn unprepared(&self) -> Self {
+        Self {
+            line: self.line,
+            columns: self.columns.clone(),
+            prepared: None,
+        }
     }
 
     /// Get the starting line of the injection region.
@@ -86,6 +132,17 @@ impl RegionOffset {
 /// only line 0 gets a column adjustment (line 1+ falls back to 0).
 /// Uses saturating arithmetic for race-condition safety.
 pub(crate) fn translate_virtual_position_to_host(pos: &mut Position, offset: &RegionOffset) {
+    translate_virtual_position_to_host_biased(pos, offset, Bias::Start);
+}
+
+fn translate_virtual_position_to_host_biased(
+    pos: &mut Position,
+    offset: &RegionOffset,
+    bias: Bias,
+) {
+    if let Some(prepared) = offset.prepared() {
+        *pos = prepared.to_virtual(*pos, bias);
+    }
     let virtual_line = pos.line;
     pos.line = pos.line.saturating_add(offset.line());
     pos.character = pos
@@ -95,10 +152,24 @@ pub(crate) fn translate_virtual_position_to_host(pos: &mut Position, offset: &Re
 
 /// Translate a virtual range to host coordinates.
 ///
-/// Applies position translation to both start and end.
+/// Applies position translation to both start and end. Through a prepared
+/// map, a range end strictly inside a replaced gap maps to the gap's end, so
+/// the range covers the host text the gap stands for.
 pub(crate) fn translate_virtual_range_to_host(range: &mut Range, offset: &RegionOffset) {
-    translate_virtual_position_to_host(&mut range.start, offset);
-    translate_virtual_position_to_host(&mut range.end, offset);
+    // Empty as the prepared document reads it: endpoints past a line's end
+    // clamp onto one offset, which opposite biases would map apart.
+    let empty = range.start == range.end
+        || offset
+            .prepared()
+            .is_some_and(|prepared| prepared.same_prepared_offset(range.start, range.end));
+    translate_virtual_position_to_host_biased(&mut range.start, offset, Bias::Start);
+    // An empty range stays empty: biasing its end differently from its start
+    // could turn it inside out at a prepared gap.
+    if empty {
+        range.end = range.start;
+    } else {
+        translate_virtual_position_to_host_biased(&mut range.end, offset, Bias::End);
+    }
 }
 
 // =============================================================================
@@ -134,6 +205,29 @@ pub(crate) fn host_position_within_region(host_position: Position, offset: &Regi
     host_position.character >= offset.column_for_line(virtual_line)
 }
 
+/// Whether `host_position` lies where the prepared document downstream
+/// servers hold has no position of its own: strictly inside a gap (host text
+/// such as an interpolation, which the prepared document shows replaced), or
+/// on blank lines the peer deleted from the document's edges. A request
+/// there would be answered for another place — the gap's start, the next or
+/// previous line — so it is not made at all.
+#[allow(
+    dead_code,
+    reason = "the prepare layer that presents documents through it comes next"
+)]
+pub(crate) fn host_position_hidden_by_prepare(
+    host_position: Position,
+    offset: &RegionOffset,
+) -> bool {
+    let Some(prepared) = offset.prepared() else {
+        return false;
+    };
+    let mut position = host_position;
+    translate_host_position_to_virtual(&mut position, &offset.unprepared());
+    prepared.virtual_position_in_gap(position)
+        || prepared.virtual_position_in_removed_lines(position)
+}
+
 /// [`host_position_within_region`] plus the trailing bound: the position must
 /// also not lie past `region_end` — the region's end-of-content mapped to host
 /// coordinates (`region_host_end(virtual_content, offset)`).
@@ -160,12 +254,23 @@ pub(crate) fn host_position_within_region_bounds(
 /// condition), column offset is NOT applied to avoid compounding the error.
 /// Uses saturating arithmetic for race-condition safety.
 pub(crate) fn translate_host_position_to_virtual(pos: &mut Position, offset: &RegionOffset) {
+    translate_host_position_to_virtual_biased(pos, offset, Bias::Start);
+}
+
+fn translate_host_position_to_virtual_biased(
+    pos: &mut Position,
+    offset: &RegionOffset,
+    bias: Bias,
+) {
     let underflowed = pos.line < offset.line();
     pos.line = pos.line.saturating_sub(offset.line());
     if !underflowed {
         pos.character = pos
             .character
             .saturating_sub(offset.column_for_line(pos.line));
+    }
+    if let Some(prepared) = offset.prepared() {
+        *pos = prepared.to_prepared(*pos, bias);
     }
 }
 
@@ -177,8 +282,13 @@ pub(crate) fn translate_host_position_to_virtual(pos: &mut Position, offset: &Re
 /// will skip column adjustment. This is intentional — each endpoint should
 /// degrade independently rather than coupling their error behavior.
 pub(crate) fn translate_host_range_to_virtual(range: &mut Range, offset: &RegionOffset) {
-    translate_host_position_to_virtual(&mut range.start, offset);
-    translate_host_position_to_virtual(&mut range.end, offset);
+    let empty = range.start == range.end;
+    translate_host_position_to_virtual_biased(&mut range.start, offset, Bias::Start);
+    if empty {
+        range.end = range.start;
+    } else {
+        translate_host_position_to_virtual_biased(&mut range.end, offset, Bias::End);
+    }
 }
 
 #[cfg(test)]
@@ -194,6 +304,177 @@ mod tests {
         // Blockquoted and list-item fences: a prefix column per line.
         assert!(!RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]).opens_mid_line());
         assert!(!RegionOffset::with_per_line_offsets(3, vec![2, 0]).opens_mid_line());
+    }
+
+    fn prepared(
+        virtual_text: &str,
+        layout: &super::super::prepare::VirtualLayout,
+        answer: serde_json::Value,
+    ) -> Arc<PreparedMap> {
+        let result = serde_json::from_value(answer).unwrap();
+        super::super::prepare::apply_prepare_result(virtual_text, layout, Some(result))
+            .unwrap()
+            .map
+            .unwrap()
+    }
+
+    /// A region at host line 10, column 4, whose two virtual lines lost a
+    /// two-space indent to the prepare peer.
+    fn prepared_offset() -> RegionOffset {
+        let virtual_text = "  if x:\n    y\n";
+        let layout = super::super::prepare::VirtualLayout::single(virtual_text);
+        let map = prepared(
+            virtual_text,
+            &layout,
+            serde_json::json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+            ]}]}),
+        );
+        RegionOffset::new(10, 4).with_prepared(map)
+    }
+
+    #[test]
+    fn prepared_positions_compose_with_the_region_offset() {
+        let offset = prepared_offset();
+        // P (1, 2) is `y`: V (1, 4), host (11, 4).
+        let mut pos = Position::new(1, 2);
+        translate_virtual_position_to_host(&mut pos, &offset);
+        assert_eq!(pos, Position::new(11, 4));
+        translate_host_position_to_virtual(&mut pos, &offset);
+        assert_eq!(pos, Position::new(1, 2));
+    }
+
+    #[test]
+    fn offsets_compare_unequal_once_a_prepared_map_differs() {
+        assert_ne!(prepared_offset(), RegionOffset::new(10, 4));
+        assert_eq!(prepared_offset(), prepared_offset());
+    }
+
+    #[test]
+    fn a_host_position_inside_a_prepared_gap_is_hidden() {
+        use super::super::prepare::{SegmentKind, VirtualLayout};
+        // `x = ${a}` at host line 10, the interpolation a gap.
+        let virtual_text = "x =     \n";
+        let layout = VirtualLayout::from_pieces(
+            virtual_text,
+            [
+                (SegmentKind::Content, 0..4, String::new()),
+                (SegmentKind::Gap, 4..8, "${a}".to_string()),
+                (SegmentKind::Content, 8..9, String::new()),
+            ],
+        );
+        let map = prepared(
+            virtual_text,
+            &layout,
+            serde_json::json!({"segments": [
+                {"type": "content"}, {"type": "gap", "content": "None"}, {"type": "content"}
+            ]}),
+        );
+        let offset = RegionOffset::new(10, 0).with_prepared(map);
+        assert!(host_position_hidden_by_prepare(
+            Position::new(10, 6),
+            &offset
+        ));
+        // Its edges are not inside it.
+        for character in [2, 4, 8] {
+            assert!(
+                !host_position_hidden_by_prepare(Position::new(10, character), &offset),
+                "{character}"
+            );
+        }
+        // An unprepared offset hides nothing.
+        assert!(!host_position_hidden_by_prepare(
+            Position::new(10, 6),
+            &RegionOffset::new(10, 0)
+        ));
+    }
+
+    #[test]
+    fn a_host_position_on_removed_edge_lines_is_hidden() {
+        use super::super::prepare::VirtualLayout;
+        // `''\n  foo\n''` at host line 10: the opening line goes, and the
+        // indent of `foo`.
+        let virtual_text = "\n  foo\n";
+        let map = prepared(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            serde_json::json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""},
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+            ]}]}),
+        );
+        let offset = RegionOffset::new(10, 0).with_prepared(map);
+        assert!(host_position_hidden_by_prepare(
+            Position::new(10, 0),
+            &offset
+        ));
+        // A removed indent is no removed line: a request there stands for
+        // the line's content.
+        assert!(!host_position_hidden_by_prepare(
+            Position::new(11, 0),
+            &offset
+        ));
+        assert!(!host_position_hidden_by_prepare(
+            Position::new(11, 3),
+            &offset
+        ));
+    }
+
+    #[test]
+    fn a_range_clamping_to_one_prepared_offset_stays_empty() {
+        use super::super::prepare::{SegmentKind, VirtualLayout};
+        // `ab${x}` on host line 10, the interpolation prepared as nothing.
+        let virtual_text = "ab    \ncd";
+        let layout = VirtualLayout::from_pieces(
+            virtual_text,
+            [
+                (SegmentKind::Content, 0..2, String::new()),
+                (SegmentKind::Gap, 2..6, "${x}".to_string()),
+                (SegmentKind::Content, 6..9, String::new()),
+            ],
+        );
+        let map = prepared(
+            virtual_text,
+            &layout,
+            serde_json::json!({"segments": [
+                {"type": "content"}, {"type": "gap", "content": ""}, {"type": "content"}
+            ]}),
+        );
+        let offset = RegionOffset::new(10, 0).with_prepared(map);
+        let mut range = Range::new(Position::new(0, 2), Position::new(0, 100));
+        translate_virtual_range_to_host(&mut range, &offset);
+        assert_eq!(range.start, range.end, "{range:?}");
+    }
+
+    #[test]
+    fn a_range_ending_inside_a_replaced_gap_covers_its_host_text() {
+        use super::super::prepare::{SegmentKind, VirtualLayout};
+        // `x = ${a}` at host line 10, the interpolation shown as `None`.
+        let virtual_text = "x =     \n";
+        let layout = VirtualLayout::from_pieces(
+            virtual_text,
+            [
+                (SegmentKind::Content, 0..4, String::new()),
+                (SegmentKind::Gap, 4..8, "${a}".to_string()),
+                (SegmentKind::Content, 8..9, String::new()),
+            ],
+        );
+        let map = prepared(
+            virtual_text,
+            &layout,
+            serde_json::json!({"segments": [
+                {"type": "content"}, {"type": "gap", "content": "None"}, {"type": "content"}
+            ]}),
+        );
+        let offset = RegionOffset::new(10, 0).with_prepared(map);
+        // A diagnostic on `No` of `None`: the gap's start through its end.
+        let mut range = Range::new(Position::new(0, 4), Position::new(0, 6));
+        translate_virtual_range_to_host(&mut range, &offset);
+        assert_eq!(
+            range,
+            Range::new(Position::new(10, 4), Position::new(10, 8))
+        );
     }
 
     // ======================================================================
