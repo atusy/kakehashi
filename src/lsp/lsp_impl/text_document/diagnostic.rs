@@ -78,6 +78,16 @@ pub(crate) async fn collect_region_diagnostics(
 // Pull diagnostics implementation (textDocument/diagnostic)
 // ============================================================================
 
+/// Whether a region its prepare answer left undiagnosed fails the pull. For
+/// the CLI (`counting`) always: the region goes undiagnosed, which it must
+/// not report as success. For an editor only while the answer may still
+/// come (a retry, a resync): one the peer answered unusably stays so until
+/// the text or the epoch changes, and counting it would keep every pull of
+/// the host from ever being clean.
+fn prepare_miss_fails_pull(miss: crate::lsp::bridge::PrepareMiss, counting: bool) -> bool {
+    counting || miss != crate::lsp::bridge::PrepareMiss::Failed
+}
+
 /// `(region_id, injection_language, current offset, virtual text)` of a
 /// region, for the pushFallback fold. The virtual text only when the pool
 /// prepares (see `fold_push_fallback_diagnostics`).
@@ -359,9 +369,9 @@ impl Kakehashi {
                     {
                         Ok(region_ctx) => region_ctx,
                         Err(miss) => {
-                            // The region goes undiagnosed, which the CLI must not
-                            // report as success.
-                            count_request_errors(&request_error_sink, 1);
+                            if prepare_miss_fails_pull(miss, external_error_sink.is_some()) {
+                                count_request_errors(&request_error_sink, 1);
+                            }
                             if miss == crate::lsp::bridge::PrepareMiss::Unanswered {
                                 prepare_skipped.store(true, std::sync::atomic::Ordering::Relaxed);
                             }
@@ -1091,6 +1101,21 @@ fn empty_diagnostic_report() -> DocumentDiagnosticReportResult {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_unusable_prepare_answer_fails_only_the_cli_pull() {
+        use crate::lsp::bridge::PrepareMiss;
+        assert!(super::prepare_miss_fails_pull(PrepareMiss::Failed, true));
+        assert!(super::prepare_miss_fails_pull(
+            PrepareMiss::Unanswered,
+            true
+        ));
+        assert!(!super::prepare_miss_fails_pull(PrepareMiss::Failed, false));
+        assert!(super::prepare_miss_fails_pull(
+            PrepareMiss::Unanswered,
+            false
+        ));
+    }
     use super::*;
     use tower_lsp_server::ls_types::{Position, Range};
 
