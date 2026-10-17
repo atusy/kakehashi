@@ -879,7 +879,7 @@ Embedded code is not always valid as written: a Nix indented string's
 content is indented by the host, and its `${…}` interpolations leave holes.
 A language server can rewrite each virtual document before the downstream
 servers see it, via `kakehashi/virtualDocument/prepare`
-(see virtual-document-prepare-protocol), when it advertises
+(see [virtual-document-prepare-protocol](architecture-decisions/virtual-document-prepare-protocol.md)), when it advertises
 `experimental.kakehashi.virtualDocumentPrepare`. The feature requires
 `KAKEHASHI_EXPERIMENTAL=true`.
 
@@ -889,7 +889,9 @@ server must list the languages it prepares, or `"*"`). The strategy is
 always `preferred`: the first server in priority order that advertises the
 request prepares the document; when none does, the document is sent as is.
 The default `priorities = ["*"]` uses any server that offers it; `[]` opts
-a language out.
+a language out. Like any method, it inherits the `aggregation._` entry's
+`priorities` when it has no entry of its own: an allowlist of language
+servers written there must name the peer too, or nothing prepares.
 
 A server that advertises the request is asked wherever it is bridged, and
 answering `null` still makes a document prepared, so a peer meant for some
