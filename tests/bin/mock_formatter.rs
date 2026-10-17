@@ -17,18 +17,21 @@
 //!   uppercases the text. Exercises the pipeline's capability-based
 //!   whole-region rangeFormatting fallback (concatenated-formatting-pipeline
 //!   Decision point 3.2).
-//! - `echo-document` — advertises `hoverProvider` +
-//!   `documentFormattingProvider`; hover answers the full text this server
-//!   holds for the document, ranged over the hovered line in its own
-//!   coordinates; formatting and range formatting uppercase; rename replaces the first line; a
-//!   pull diagnostic spans the first
-//!   line and carries the full text. Proves what a prepared virtual
+//! - `echo-document` — advertises `hoverProvider`,
+//!   `documentFormattingProvider`, `documentRangeFormattingProvider`,
+//!   `renameProvider`, `diagnosticProvider`, and full sync with save; hover
+//!   answers the full text this server holds for the document, ranged over
+//!   the hovered line in its own coordinates; formatting and range
+//!   formatting uppercase; rename replaces the first line; a pull diagnostic
+//!   spans the first line and carries the full text. Proves what a prepared virtual
 //!   document looks like downstream and how its coordinates map back. On a
 //!   save of a text holding `SHOW` it asks the editor to show the document
 //!   with its first line selected; holding `EDIT`, it asks to apply an edit
 //!   there and logs `echo-document applied: <bool>` with the answer.
-//! - `echo-document-push` — `echo-document` without pull diagnostics: it
-//!   pushes the first-line diagnostic on every didOpen/didChange instead.
+//! - `echo-document-push` — advertises only `hoverProvider` and full sync
+//!   with save: hover and the save hooks as `echo-document`, and instead of
+//!   pull diagnostics it pushes the first-line diagnostic on every
+//!   didOpen/didChange.
 //! - `prepare-peer` — advertises
 //!   `experimental.kakehashi.virtualDocumentPrepare` and answers
 //!   `kakehashi/virtualDocument/prepare`: content dedented by its common

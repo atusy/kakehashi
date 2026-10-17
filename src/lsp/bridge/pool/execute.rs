@@ -365,14 +365,15 @@ impl LanguageServerPool {
         super::document_tracker::holds_request_text(presentation, request_map)
     }
 
-    /// Queue `request` while `connection_key` holds the text it was built on
-    /// `offset` for: the lazy open may have sent another text (a newer
-    /// forwarded one), or the lifecycle pass one since the wait. Checked and
-    /// queued under the lock every send records under, so the first prepared
-    /// text cannot slip between the check and the enqueue (see
-    /// `DocumentTracker::queue_if_holding`); serialized before it. `None`,
-    /// with nothing queued, when the text is not held. A pool that prepares
-    /// nothing queues at once.
+    /// Queue `request` only while `connection_key` holds the text the
+    /// request was built for on `offset`: the lazy open may have sent another
+    /// text (a newer forwarded one), and the lifecycle pass may have sent one
+    /// since the wait. The check and the enqueue happen under the lock every
+    /// send records under, so no recorded text — the first prepared one
+    /// included — slips between them (see
+    /// `DocumentTracker::queue_if_holding`); the request is serialized
+    /// before. `None`, with nothing queued, when the text is not held. A pool
+    /// that prepares nothing queues at once.
     fn queue_request_if_holding<P: serde::Serialize>(
         &self,
         handle: &ConnectionHandle,

@@ -256,8 +256,9 @@ impl DiagnosticScheduler {
     }
 
     /// Settle `uri`'s debt of an editor pull answered without documents then
-    /// waiting for their prepare answers, once a pass synced the host and
-    /// none is pending any more: the editor is asked to pull again.
+    /// waiting for their prepare answers, once a pass synced the host with
+    /// an answer in (`ready`), or with none pending any more: the editor is
+    /// asked to pull again. A debt is settled once.
     pub(crate) fn settle_pull_debt_after_prepare(&self, uri: &Url, ready: bool) {
         if (ready || !self.bridge.prepare_host_has_pending(uri))
             && self.bridge.take_pull_debt_after_prepare(uri)

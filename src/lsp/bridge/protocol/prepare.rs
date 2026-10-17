@@ -253,7 +253,8 @@ pub(crate) struct PrepareResult {
 
 /// Parse the response to [`PREPARE_METHOD`]. An error response or a
 /// malformed result is an `InvalidData` error — a failed prepare, never
-/// "unchanged".
+/// "unchanged" — but for the cancellation codes LSP lets a client retry,
+/// which are `Interrupted`: no answer at all.
 pub(crate) fn parse_prepare_response(
     response: &serde_json::Value,
 ) -> std::io::Result<Option<PrepareResult>> {

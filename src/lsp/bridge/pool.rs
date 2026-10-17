@@ -5834,9 +5834,6 @@ mod tests {
     // and OpenedVirtualDoc live in their respective submodules.
     // This file contains integration tests that exercise cross-module behavior.
 
-    /// A client `window/workDoneProgress/cancel` for a bridge-minted token is
-    /// routed to the owning downstream with its ORIGINAL token restored.
-
     #[test]
     fn a_prepare_start_failure_holds_for_its_host_until_a_handshake_settings_or_close() {
         let pool = LanguageServerPool::preparing();
@@ -6110,6 +6107,8 @@ mod tests {
         assert_eq!(*epochs.borrow_and_update(), pool.prepare_epoch());
     }
 
+    /// A client `window/workDoneProgress/cancel` for a bridge-minted token is
+    /// routed to the owning downstream with its ORIGINAL token restored.
     #[tokio::test]
     async fn forward_work_done_cancel_routes_to_owning_downstream() {
         use tower_lsp_server::ls_types::NumberOrString;
@@ -9426,7 +9425,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_lazy_open_sends_the_newer_of_its_text_and_the_forwarded_one() {
+    async fn a_lazy_open_sends_a_newer_prepared_text_and_otherwise_the_forwarded_one() {
         let pool = LanguageServerPool::preparing();
         let host_uri = Url::parse("file:///test/lazy-open-order.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);

@@ -179,8 +179,10 @@ pub(crate) enum UpstreamRequest {
     /// virtual-document URIs); the editor's success flag is relayed back.
     ShowDocument {
         params: tower_lsp_server::ls_types::ShowDocumentParams,
-        /// What the originating connection held as the request was read:
-        /// how its selection translates (see `HeldStamp`).
+        /// The watermark of texts held as the request was read (an
+        /// `Observed::Through` stamp of the originating connection): how its
+        /// selection translates, by what that connection's record says at
+        /// placement (see `HeldStamp`).
         held: Option<crate::lsp::diagnostic_cache::HeldStamp>,
         reply: oneshot::Sender<bool>,
         cancel: ForwardedRequestCancel,
@@ -200,8 +202,10 @@ pub(crate) enum UpstreamRequest {
         /// (each connection's didOpen starts its own counter), so the
         /// translation must know which connection's version space applies.
         connection: ConnectionKey,
-        /// What the connection held as the request was read: an edit
-        /// computed for a prepared text is refused (see `HeldStamp`).
+        /// The watermark of texts held as the request was read (an
+        /// `Observed::Through` stamp of `connection`): an edit computed for a
+        /// prepared text, or one replaced since, is refused (see
+        /// `HeldStamp`).
         held: Option<crate::lsp::diagnostic_cache::HeldStamp>,
         reply: oneshot::Sender<tower_lsp_server::ls_types::ApplyWorkspaceEditResponse>,
         cancel: ForwardedRequestCancel,
@@ -334,9 +338,10 @@ pub(crate) struct ServerRequestDeps {
     pub(crate) progress_registry: Arc<crate::lsp::bridge::ProgressRegistry>,
     /// This connection's id, used to scope forward token translation.
     pub(crate) progress_connection_id: crate::lsp::bridge::ProgressConnectionId,
-    /// What each connection holds for each virtual document: a region push,
-    /// and a showDocument selection, are stamped with what this connection
-    /// held as they were read. `None` when the pool prepares nothing (with
+    /// What each connection holds for each virtual document: a region push
+    /// is stamped with what this connection held for its document as it was
+    /// read, a showDocument or an applyEdit with the watermark of texts held
+    /// so far. `None` when the pool prepares nothing (with
     /// experimental features off): every connection holds its texts as is,
     /// and nothing is stamped.
     pub(crate) document_tracker: Option<Arc<crate::lsp::bridge::pool::DocumentTracker>>,
@@ -353,8 +358,9 @@ pub(crate) struct ServerRequestDeps {
 }
 
 impl ServerRequestDeps {
-    /// What this connection held as a request about several documents (or
-    /// one, read later) was read: `None` when the pool prepares nothing.
+    /// The watermark of texts held as a request about several documents (or
+    /// one, read later) was read, stamped for this connection: `None` when
+    /// the pool prepares nothing.
     pub(crate) fn held_through(&self) -> Option<crate::lsp::diagnostic_cache::HeldStamp> {
         self.document_tracker
             .as_ref()

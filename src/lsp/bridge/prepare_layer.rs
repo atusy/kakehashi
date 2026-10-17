@@ -87,7 +87,7 @@ impl PrepareLayer {
         }));
         self.warned_strategy.clear();
         // After the settings are in: a target resolved under the epoch read
-        // before this move asks nothing (see `target`).
+        // before this move asks nothing (see `BridgeCoordinator::prepare_target`).
         pool.forget_prepare_start_failures(None);
         pool.advance_prepare_epoch();
     }

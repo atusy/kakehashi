@@ -300,7 +300,9 @@ impl LanguageServerPool {
     }
 
     /// Close the host's virtual documents whose connection's server is no
-    /// longer selected for them, returning what was closed.
+    /// longer selected for them, returning what was closed. Also what closes
+    /// held documents a server holds unprepared (`is_selected` then names the
+    /// copies to keep: see `BridgeCoordinator::close_unprepared_held_docs`).
     ///
     /// Selection is a settings question, so nothing about the region itself
     /// changes: the region stays live and its latest contents stay recorded,

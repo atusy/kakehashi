@@ -954,7 +954,8 @@ pub(crate) struct ResolvedInjection {
     /// Host text the virtual document does not carry verbatim, in order:
     /// masked spans and host-only lines' line breaks (a non-empty
     /// `virtual_range`), and stripped text such as line prefixes (an empty
-    /// one). Empty for an isolated region, which is all content.
+    /// one). Empty for an isolated region, presented as all content: the
+    /// host text it strips (line prefixes) is not part of its segments.
     pub gaps: std::sync::Arc<[VirtualGap]>,
 }
 
