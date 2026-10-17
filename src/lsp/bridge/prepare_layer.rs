@@ -92,18 +92,23 @@ impl super::BridgeCoordinator {
         let epoch = self.pool.prepare_epoch();
         let targets = layer.targets.load();
         let key = (host_language.to_string(), injection_language.to_string());
+        // The first resolution wins for every caller: answers are keyed by
+        // the candidates' launch configs by identity, which two resolutions
+        // racing each other would not share.
         let candidates = match targets.resolved.get(&key) {
             Some(hit) => hit.clone(),
-            None => {
-                let resolved = self.resolve_prepare_candidates(
-                    layer,
-                    &targets.settings,
-                    host_language,
-                    injection_language,
-                );
-                targets.resolved.insert(key, resolved.clone());
-                resolved
-            }
+            None => targets
+                .resolved
+                .entry(key)
+                .or_insert_with(|| {
+                    self.resolve_prepare_candidates(
+                        layer,
+                        &targets.settings,
+                        host_language,
+                        injection_language,
+                    )
+                })
+                .clone(),
         }?;
         candidates
             .iter()
