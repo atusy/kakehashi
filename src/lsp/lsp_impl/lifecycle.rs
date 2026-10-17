@@ -123,8 +123,8 @@ fn resyncs_on_epoch_move(
 
 /// Hosts to sync again, each once: several documents of one host usually
 /// finish together. Ready, or recollecting, when any of a host's resyncs
-/// is; edited only when every ready one is (one ready otherwise collects at
-/// once).
+/// is; edited only when every ready or recollecting one is (any other
+/// collects at once).
 fn merge_resyncs(
     resyncs: impl IntoIterator<Item = crate::lsp::bridge::Resync>,
 ) -> std::collections::HashMap<Url, crate::lsp::bridge::Resync> {
@@ -141,12 +141,12 @@ fn merge_resyncs(
             });
         merged.ready |= resync.ready;
         merged.recollect |= resync.recollect;
-        if resync.ready {
+        if resync.ready || resync.recollect {
             merged.edited &= resync.edited;
         }
     }
     for merged in hosts.values_mut() {
-        merged.edited &= merged.ready;
+        merged.edited &= merged.ready || merged.recollect;
     }
     hosts
 }
@@ -155,21 +155,19 @@ fn merge_resyncs(
 #[derive(Debug, PartialEq, Eq)]
 enum CollectAfterResync {
     /// At once: its servers hold texts other than those they diagnosed (an
-    /// open's first answer, an epoch move, an unusable answer).
+    /// open's first answer, an epoch move, an open's unusable answer).
     AtOnce,
-    /// Through the edit's debounced collection: the answer is an edit's,
-    /// and the 500 ms debounce that keeps a burst of keystrokes to one
-    /// collection holds for it too.
+    /// Through the edit's debounced collection: the answer, ready or
+    /// unusable, is an edit's, and the 500 ms debounce that keeps a burst of
+    /// keystrokes to one collection holds for it too.
     Debounced,
 }
 
 fn collect_after_resync(resync: &crate::lsp::bridge::Resync) -> Option<CollectAfterResync> {
-    if resync.recollect || resync.ready && !resync.edited {
-        Some(CollectAfterResync::AtOnce)
-    } else if resync.ready {
-        Some(CollectAfterResync::Debounced)
-    } else {
-        None
+    match (resync.ready || resync.recollect, resync.edited) {
+        (false, _) => None,
+        (true, false) => Some(CollectAfterResync::AtOnce),
+        (true, true) => Some(CollectAfterResync::Debounced),
     }
 }
 
@@ -3277,6 +3275,21 @@ mod tests {
         assert_eq!(
             collect(vec![resync(true, false, true), resync(true, false, false)]),
             Some(CollectAfterResync::AtOnce)
+        );
+        // An edit's unusable answer waits too; beside an epoch move's
+        // recollection, at once.
+        assert_eq!(
+            collect(vec![resync(false, true, true)]),
+            Some(CollectAfterResync::Debounced)
+        );
+        assert_eq!(
+            collect(vec![resync(false, true, true), resync(false, true, false)]),
+            Some(CollectAfterResync::AtOnce)
+        );
+        // A retry's resync collects nothing, nor makes another's wait.
+        assert_eq!(
+            collect(vec![resync(true, false, true), resync(false, false, false)]),
+            Some(CollectAfterResync::Debounced)
         );
         // A retry's resync collects nothing.
         assert_eq!(collect(vec![resync(false, false, false)]), None);

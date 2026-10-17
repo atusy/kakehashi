@@ -129,9 +129,10 @@ pub(crate) struct Resync {
     /// placed from a document's earlier text: one held back got an unusable
     /// answer, so it is no longer bridged.
     pub(crate) recollect: bool,
-    /// The ready document's answer follows one for its earlier text under
-    /// the same epoch: an edit's, whose diagnostics the edit's debounced
-    /// collection gathers, rather than a collection of its own at once.
+    /// The document's answer, ready or unusable, follows one for its earlier
+    /// text under the same epoch: an edit's, whose diagnostics the edit's
+    /// debounced collection gathers, rather than a collection of its own at
+    /// once.
     pub(crate) edited: bool,
 }
 
@@ -798,7 +799,7 @@ impl PrepareRegistry {
                             host_uri: job.host_uri.clone(),
                             ready,
                             recollect: !ready,
-                            edited: ready && cell.after_edit.load(Ordering::Acquire),
+                            edited: cell.after_edit.load(Ordering::Acquire),
                         });
                     }
                 }
@@ -1699,10 +1700,48 @@ mod tests {
         assert_eq!(
             resync.try_recv().ok(),
             Some(Resync {
-                host_uri: host,
+                host_uri: host.clone(),
                 ready: false,
                 recollect: true,
                 edited: false,
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_edits_unusable_answer_resyncs_as_edited() {
+        // An unusable answer for an edited text is an edit's like any other:
+        // its collection waits for the edit's debounce.
+        let registry = PrepareRegistry::default();
+        let mut resync = registry.take_resync_rx().unwrap();
+        let pool = Arc::new(LanguageServerPool::preparing());
+        let dir = tempfile::tempdir().unwrap();
+        refusing_candidate(&pool, "peer", &dir.path().join("peer"), 0.0, -32603).await;
+        let host = Url::parse("file:///host.md").unwrap();
+        let target = target_of(&pool, &[("peer", &["peer"])]);
+        for text in ["before the edit", "a"] {
+            registry.slot(
+                &target,
+                input(&host, text),
+                Holder::LifecyclePass,
+                target.epoch,
+            );
+        }
+        assert_eq!(
+            registry
+                .prepare(&pool, &target, input(&host, "a"))
+                .await
+                .err(),
+            Some(PrepareMiss::Failed)
+        );
+        assert_eq!(
+            resync.try_recv().ok(),
+            Some(Resync {
+                host_uri: host,
+                ready: false,
+                recollect: true,
+                edited: true,
             })
         );
     }

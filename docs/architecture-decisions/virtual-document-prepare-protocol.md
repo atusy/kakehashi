@@ -199,7 +199,8 @@ An unusable answer (an error response, a malformed or refused result) is
 final for that input under the current epoch. When it is the input the
 lifecycle pass holds the document on, and the epoch has not moved, it
 re-syncs its host as it arrives, and the host's diagnostics are collected
-again. A missing answer from the chosen peer (crashing, timing out, or
+again (through the edit's debounce when the answer is an edit's, as for a
+usable one). A missing answer from the chosen peer (crashing, timing out, or
 answering with one of LSP's retryable cancellation codes) is retried with
 backoff — one second, doubling to a minute — without waiting for an edit,
 and requests do not pile further attempts onto a backing-off one.
