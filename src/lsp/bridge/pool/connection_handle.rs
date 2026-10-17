@@ -714,6 +714,13 @@ impl ConnectionHandle {
         }
     }
 
+    /// How many are subscribed to this connection's state, a wait for it to
+    /// be ready included.
+    #[cfg(test)]
+    pub(crate) fn state_subscribers_for_test(&self) -> usize {
+        self.state_watch.receiver_count()
+    }
+
     /// Await `Ready` (up to `timeout`) instead of failing fast — used by
     /// diagnostic requests that prefer to wait through initialization.
     /// `TimedOut` on expiry; `Other` if the connection fails or shuts down.
