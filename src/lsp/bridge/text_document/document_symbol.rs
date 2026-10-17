@@ -240,11 +240,15 @@ fn transform_document_symbol_ranges(symbol: &mut DocumentSymbol, offset: &Region
     }
 }
 
-/// Clamp `inner` into `outer`.
+/// Clamp `inner` into `outer`; an inverted `outer` (a malformed answer)
+/// leaves it as is.
 fn clamp_into(
     inner: &mut tower_lsp_server::ls_types::Range,
     outer: tower_lsp_server::ls_types::Range,
 ) {
+    if outer.start > outer.end {
+        return;
+    }
     inner.start = inner.start.clamp(outer.start, outer.end);
     inner.end = inner.end.clamp(inner.start, outer.end);
 }
@@ -273,6 +277,10 @@ mod tests {
         let mut inside = range((4, 1), (4, 2));
         clamp_into(&mut inside, outer);
         assert_eq!(inside, range((4, 1), (4, 2)));
+        // A malformed, inverted range: no panic, nothing clamped.
+        let mut any = range((1, 0), (9, 0));
+        clamp_into(&mut any, range((5, 0), (3, 2)));
+        assert_eq!(any, range((1, 0), (9, 0)));
     }
     use rstest::rstest;
     use serde_json::json;
