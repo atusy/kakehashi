@@ -804,6 +804,7 @@ impl Kakehashi {
             return;
         };
         let injection = self.injection_coordinator();
+        let diagnostics = self.diagnostic_scheduler();
         let bridge = Arc::clone(&self.bridge);
         let token = self.shutdown_token.clone();
         tokio::spawn(async move {
@@ -860,6 +861,12 @@ impl Kakehashi {
                     let looked = matches!(injection.bridge_injections(&uri), Some((_, Some(_))));
                     if synchronized && looked {
                         failures.remove(&uri);
+                        diagnostics.settle_pull_debt_after_prepare(&uri, ready);
+                        // The servers now hold the texts the answers gave;
+                        // what they diagnosed before was for other texts.
+                        if ready || recollect {
+                            diagnostics.spawn_diagnostic_task_after_prepare(uri);
+                        }
                     } else if injection.document_incarnation(&uri).is_some() {
                         let failed = failures.entry(uri.clone()).or_default();
                         *failed += 1;
@@ -1229,11 +1236,13 @@ async fn deliver_upstream_batch(
                 uri,
                 server,
                 connection_id,
+                held,
                 diagnostics,
             } => pushes.push(DiagnosticPush {
                 uri,
                 server,
                 connection_id,
+                held,
                 diagnostics,
             }),
             barrier => {
@@ -1332,6 +1341,7 @@ fn coalesce_upstream_batch(
                 uri,
                 server,
                 connection_id,
+                held,
                 diagnostics,
             } => {
                 let idx = output.len();
@@ -1348,6 +1358,7 @@ fn coalesce_upstream_batch(
                     uri,
                     server,
                     connection_id,
+                    held,
                     diagnostics,
                 }));
             }
@@ -2276,6 +2287,7 @@ async fn deliver_upstream_notification(
             uri,
             server,
             connection_id,
+            held,
             diagnostics,
         } => {
             // Cache the downstream push and republish the merged host set
@@ -2288,7 +2300,7 @@ async fn deliver_upstream_notification(
                 delivery_context.map(|context| context.diagnostic_publisher.as_ref())
             {
                 publisher
-                    .publish_push(uri, server, connection_id, diagnostics)
+                    .publish_push(uri, server, connection_id, held, diagnostics)
                     .await;
             }
         }
@@ -3449,6 +3461,7 @@ mod tests {
                 uri: uri.to_string(),
                 server: "srv".to_string(),
                 connection_id: ProgressConnectionId::for_test(conn),
+                held: None,
                 diagnostics: vec![Diagnostic {
                     message: msg.to_string(),
                     ..Default::default()
@@ -3462,6 +3475,7 @@ mod tests {
                 uri: uri.to_string(),
                 server: "srv".to_string(),
                 connection_id: ProgressConnectionId::for_test(conn),
+                held: None,
                 diagnostics: vec![],
             }
         }

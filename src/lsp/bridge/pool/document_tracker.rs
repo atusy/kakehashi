@@ -898,11 +898,7 @@ impl DocumentTracker {
     /// showDocument selection — to decide their [`super::Presentation`] by,
     /// later. Read as they arrive; while no connection was ever sent a
     /// prepared text, without reading any record.
-    #[allow(
-        dead_code,
-        reason = "pushes and inbound requests read coordinates through it, next"
-    )]
-    pub(super) fn observe(
+    pub(in crate::lsp::bridge) fn observe(
         &self,
         virtual_uri: &str,
         connection_key: &ConnectionKey,
@@ -978,7 +974,7 @@ impl DocumentTracker {
     /// reader to take as each message arrives.
     #[allow(
         dead_code,
-        reason = "pushes and inbound requests read coordinates through it, next"
+        reason = "a showDocument request reads its selection through it, next"
     )]
     pub(super) fn held_through(&self) -> u64 {
         self.held_generations.load(Ordering::Acquire)

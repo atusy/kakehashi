@@ -9,6 +9,7 @@
 //! coordinates were read ([`Observed`]), and what the lifecycle pass knows of
 //! the region ([`RegionPrepare`]).
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use super::document_tracker::HeldText;
@@ -28,16 +29,12 @@ pub(crate) enum Presentation {
 }
 
 impl Presentation {
-    #[allow(
-        dead_code,
-        reason = "pushes and inbound requests read coordinates through it, next"
-    )]
-    /// `offset` as coordinates under this presentation follow it, `None`
-    /// when unavailable.
-    pub(crate) fn offset(self, offset: RegionOffset) -> Option<RegionOffset> {
+    /// `offset` as coordinates under this presentation follow it: borrowed
+    /// unless a prepared map goes in front of it, `None` when unavailable.
+    pub(crate) fn offset(self, offset: &RegionOffset) -> Option<Cow<'_, RegionOffset>> {
         match self {
-            Self::AsIs => Some(offset),
-            Self::Prepared(map) => Some(offset.with_prepared(map)),
+            Self::AsIs => Some(Cow::Borrowed(offset)),
+            Self::Prepared(map) => Some(Cow::Owned(offset.clone().with_prepared(map))),
             Self::Unavailable => None,
         }
     }
@@ -45,10 +42,6 @@ impl Presentation {
 
 /// What a connection held when kakehashi read coordinates it sent (or is
 /// about to send it a request on).
-#[allow(
-    dead_code,
-    reason = "pushes and inbound requests read coordinates through it, next"
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Observed {
     /// Read while no connection had ever been sent a prepared text: the
@@ -67,6 +60,10 @@ pub(crate) enum Observed {
     /// Read when no text newer than this generation was held by any
     /// connection (see `DocumentTracker::held_through`): for coordinates
     /// about several documents, whose records are read later.
+    #[allow(
+        dead_code,
+        reason = "a showDocument request reads its selection through it, next"
+    )]
     Through(u64),
     /// A request about to be sent: the coordinates it will get are computed
     /// for whatever the connection holds now.

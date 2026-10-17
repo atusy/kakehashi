@@ -236,7 +236,34 @@ impl DiagnosticScheduler {
     /// `textDocument/publishDiagnostics`.
     pub(crate) fn spawn_synthetic_diagnostic_task(&self, uri: Url) {
         let snapshot_data = self.prepare_diagnostic_snapshot(&uri);
-        self.spawn_prepared_synthetic_diagnostic_task(uri, snapshot_data);
+        self.spawn_prepared_synthetic_diagnostic_task(
+            uri,
+            snapshot_data,
+            SyntheticDiagnosticTrigger::Open,
+        );
+    }
+
+    /// Pull `uri`'s diagnostics again after a resync pass sent its servers
+    /// the texts their prepare answers gave: what they computed before was
+    /// for other texts, and a push-only collection never asks again.
+    pub(crate) fn spawn_diagnostic_task_after_prepare(&self, uri: Url) {
+        let snapshot_data = self.prepare_diagnostic_snapshot(&uri);
+        self.spawn_prepared_synthetic_diagnostic_task(
+            uri,
+            snapshot_data,
+            SyntheticDiagnosticTrigger::Prepared,
+        );
+    }
+
+    /// Settle `uri`'s debt of an editor pull answered without documents then
+    /// waiting for their prepare answers, once a pass synced the host and
+    /// none is pending any more: the editor is asked to pull again.
+    pub(crate) fn settle_pull_debt_after_prepare(&self, uri: &Url, ready: bool) {
+        if (ready || !self.bridge.prepare_host_has_pending(uri))
+            && self.bridge.take_pull_debt_after_prepare(uri)
+        {
+            self.publisher.request_pull_diagnostic_refresh(true);
+        }
     }
 
     pub(crate) fn spawn_synthetic_diagnostic_task_for_parse(
@@ -251,13 +278,18 @@ impl DiagnosticScheduler {
                 parsed.incarnation,
                 parsed.content_version,
             );
-        self.spawn_prepared_synthetic_diagnostic_task(uri, snapshot_data);
+        self.spawn_prepared_synthetic_diagnostic_task(
+            uri,
+            snapshot_data,
+            SyntheticDiagnosticTrigger::Open,
+        );
     }
 
     fn spawn_prepared_synthetic_diagnostic_task(
         &self,
         uri: Url,
         snapshot_data: Option<DiagnosticSnapshot>,
+        trigger: SyntheticDiagnosticTrigger,
     ) {
         let Some(lineage) = snapshot_data.as_ref().map(|snapshot| snapshot.lineage) else {
             return;
@@ -286,7 +318,7 @@ impl DiagnosticScheduler {
             lineage.incarnation,
             lineage.content_version,
             lineage.settings_generation,
-            SyntheticDiagnosticTrigger::Open,
+            trigger,
             future,
         );
     }
@@ -427,6 +459,7 @@ impl DiagnosticSnapshotPreparer {
                 &language_name,
                 "textDocument/diagnostic",
             );
+        let mut prepare_pending = false;
         let mut narrower_than_editor_pull = layer_cfg.priorities != editor_layer_cfg.priorities
             || layer_cfg.strategy != editor_layer_cfg.strategy;
 
@@ -558,7 +591,7 @@ impl DiagnosticSnapshotPreparer {
                             continue;
                         };
 
-                        contexts.push(DocumentRequestContext {
+                        let ctx = DocumentRequestContext {
                             prepared: None,
                             uri: uri.clone(),
                             resolved: resolved.clone(),
@@ -569,7 +602,23 @@ impl DiagnosticSnapshotPreparer {
                             strategy: agg.strategy,
                             max_fan_out: agg.max_fan_out,
                             client_progress_token: None,
-                        });
+                        };
+                        // The snapshot is built without waiting: a document
+                        // still waiting for its prepare peer skips this cycle
+                        // (its host is collected again when the answer
+                        // arrives), and one its peer could not prepare is not
+                        // bridged.
+                        match crate::lsp::lsp_impl::bridge_context::prepare_request_context_now(
+                            &self.bridge,
+                            &language_name,
+                            ctx,
+                        ) {
+                            Ok(ctx) => contexts.push(ctx),
+                            Err(crate::lsp::lsp_impl::bridge_context::PrepareSkip::Failed) => {}
+                            Err(crate::lsp::lsp_impl::bridge_context::PrepareSkip::Pending) => {
+                                prepare_pending = true;
+                            }
+                        }
                     }
                     contexts
                 })
@@ -660,6 +709,7 @@ impl DiagnosticSnapshotPreparer {
             virt_contexts,
             host_pull_enabled,
             narrower_than_editor_pull,
+            prepare_pending,
             host,
             layer_cfg,
         })
