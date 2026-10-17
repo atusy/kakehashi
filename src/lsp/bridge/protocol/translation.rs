@@ -426,6 +426,32 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_host_range_inside_a_replaced_gap_stays_empty() {
+        use super::super::prepare::{SegmentKind, VirtualLayout};
+        // `x = ${a}` at host line 10, the interpolation shown as `None`.
+        let virtual_text = "x =     \n";
+        let layout = VirtualLayout::from_pieces(
+            virtual_text,
+            [
+                (SegmentKind::Content, 0..4, String::new()),
+                (SegmentKind::Gap, 4..8, "${a}".to_string()),
+                (SegmentKind::Content, 8..9, String::new()),
+            ],
+        );
+        let map = prepared(
+            virtual_text,
+            &layout,
+            serde_json::json!({"segments": [
+                {"type": "content"}, {"type": "gap", "content": "None"}, {"type": "content"}
+            ]}),
+        );
+        let offset = RegionOffset::new(10, 0).with_prepared(map);
+        let mut range = Range::new(Position::new(10, 6), Position::new(10, 6));
+        translate_host_range_to_virtual(&mut range, &offset);
+        assert_eq!(range.start, range.end, "{range:?}");
+    }
+
+    #[test]
     fn a_range_clamping_to_one_prepared_offset_stays_empty() {
         use super::super::prepare::{SegmentKind, VirtualLayout};
         // `ab${x}` on host line 10, the interpolation prepared as nothing.
