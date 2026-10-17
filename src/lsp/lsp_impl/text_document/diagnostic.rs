@@ -79,8 +79,9 @@ pub(crate) async fn collect_region_diagnostics(
 // ============================================================================
 
 /// `(region_id, injection_language, current offset, virtual text)` of a
-/// region, for the pushFallback fold.
-type RegionPushMeta = (String, String, RegionOffset, String);
+/// region, for the pushFallback fold. The virtual text only when the pool
+/// prepares (see `fold_push_fallback_diagnostics`).
+type RegionPushMeta = (String, String, RegionOffset, Option<String>);
 
 impl Kakehashi {
     pub(crate) async fn diagnostic_impl(
@@ -237,7 +238,9 @@ impl Kakehashi {
         // pull below moves the regions themselves. The virtual text goes
         // along: a cached push follows the text its connection held, checked
         // against it when the fold snapshots the pushes, after the awaits
-        // below (see `BridgeCoordinator::place_push`).
+        // below (see `BridgeCoordinator::place_push`). Not copied when the
+        // pool prepares nothing: every push then places as is.
+        let prepares = self.bridge.pool().prepares();
         let region_meta: Vec<RegionPushMeta> = virt_regions
             .iter()
             .map(|r| {
@@ -248,7 +251,7 @@ impl Kakehashi {
                         r.region.line_range.start,
                         r.line_column_offsets.clone(),
                     ),
-                    r.virtual_content.clone(),
+                    prepares.then(|| r.virtual_content.clone()),
                 )
             })
             .collect();
@@ -696,7 +699,7 @@ impl Kakehashi {
                 }
             };
             if push_fallback {
-                if !places_as_is {
+                if !places_as_is && let Some(virtual_text) = virtual_text {
                     region_texts.insert(region_id.clone(), (injection_language, virtual_text));
                 }
                 region_offsets.insert(region_id, offset);
