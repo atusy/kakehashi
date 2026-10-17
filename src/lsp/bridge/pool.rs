@@ -5962,6 +5962,27 @@ mod tests {
         assert!(pool.prepare_epoch() > epoch);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_replacement_whose_handshake_times_out_forgets_what_its_key_advertised() {
+        let pool = LanguageServerPool::preparing();
+        pool.record_prepare_advertisement(&ConnectionKey::for_server("peer"), true);
+        let epoch = pool.prepare_epoch();
+        // Reads the initialize request and never answers it.
+        let config = BridgeServerConfig {
+            cmd: Some(vec!["sh".into(), "-c".into(), "cat > /dev/null".into()]),
+            ..Default::default()
+        };
+        let error = pool
+            .get_or_create_connection_wait_ready("peer", &config, None, Duration::from_millis(300))
+            .await
+            .err()
+            .expect("the handshake never completes");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        assert_eq!(pool.prepare_advertisement("peer"), None);
+        assert!(pool.prepare_epoch() > epoch);
+    }
+
     #[tokio::test]
     async fn retiring_one_root_changes_its_hosts_answers() {
         let pool = LanguageServerPool::preparing();
