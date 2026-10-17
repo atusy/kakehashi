@@ -50,10 +50,10 @@ use crate::language::injection::VirtualGap;
 use crate::lsp::bridge::pool::RegionPrepare;
 use crate::text::terminal::escape_terminal_controls;
 
-/// How long a closed host is remembered as closed: longer than any request
-/// resolved before the close keeps looking its documents up (it waits at
-/// most for an answer, then for its text).
-const CLOSED_HOST_TTL: Duration = Duration::from_secs(60);
+/// How many closed hosts are remembered as closed at most, the oldest close
+/// going first. No time bound: a request resolved before a close may look
+/// region after region up, each after a peer's start and answer.
+const CLOSED_HOSTS_KEPT: usize = 512;
 
 /// Answers kept per region besides the one the lifecycle pass holds its
 /// document on: enough for an undo, or a request on text an edit or two
@@ -278,9 +278,11 @@ pub(crate) struct PrepareRegistry {
     /// Hosts closed with documents looked up, until reopened: a request
     /// still running past the close looks nothing up for them, and an
     /// attempt for one asks no peer. Shared with the attempts. Each entry
-    /// goes on a reopen, or once [`CLOSED_HOST_TTL`] passed — by then no
-    /// request from before the close is still looking up.
-    closed_hosts: Arc<DashMap<String, Instant>>,
+    /// goes on a reopen, or once [`CLOSED_HOSTS_KEPT`] later closes were
+    /// recorded (keyed by the order of closes).
+    closed_hosts: Arc<DashMap<String, u64>>,
+    /// Source of `closed_hosts`' order.
+    closes: AtomicU64,
     /// Source of `textDocument.version`: shared by all documents, so a
     /// document forgotten and prepared again (a reopen) never repeats a
     /// version the peer saw.
@@ -306,6 +308,7 @@ impl Default for PrepareRegistry {
             held_changes: Arc::default(),
             prepared_scan: std::sync::Mutex::new(None),
             closed_hosts: Arc::default(),
+            closes: AtomicU64::new(0),
             next_revision: Arc::new(AtomicI32::new(1)),
             resync_tx,
             resync_rx: std::sync::Mutex::new(Some(resync_rx)),
@@ -535,15 +538,22 @@ impl PrepareRegistry {
     /// Forget a closed host's documents: until it opens again, nothing is
     /// looked up for it.
     pub(crate) fn forget_host(&self, host_uri: &Url) {
-        let now = Instant::now();
-        self.closed_hosts
-            .retain(|_, closed| now.duration_since(*closed) < CLOSED_HOST_TTL);
         let looked_up = self
             .regions
             .iter()
             .any(|region| region.host_uri == host_uri.as_str());
         if looked_up {
-            self.closed_hosts.insert(host_uri.to_string(), now);
+            let order = self.closes.fetch_add(1, Ordering::AcqRel);
+            self.closed_hosts.insert(host_uri.to_string(), order);
+            if self.closed_hosts.len() > CLOSED_HOSTS_KEPT
+                && let Some(oldest) = self
+                    .closed_hosts
+                    .iter()
+                    .min_by_key(|entry| *entry.value())
+                    .map(|entry| entry.key().clone())
+            {
+                self.closed_hosts.remove(&oldest);
+            }
         }
         self.regions
             .retain(|_, region| region.host_uri != host_uri.as_str());
@@ -1829,6 +1839,31 @@ mod tests {
         let other = Url::parse("file:///untouched.md").unwrap();
         registry.forget_host(&other);
         assert!(!registry.host_closed(&other));
+    }
+
+    /// Closed hosts are remembered up to a bound, the oldest close going
+    /// first.
+    #[test]
+    fn the_oldest_closed_host_goes_past_the_bound() {
+        let registry = PrepareRegistry::default();
+        let pool = Arc::new(LanguageServerPool::preparing());
+        let target = unstartable_target(&pool);
+        let closed = |index: usize| {
+            let host = Url::parse(&format!("file:///closed-{index}.md")).unwrap();
+            registry.slot(
+                &target,
+                input(&host, "a"),
+                Holder::LifecyclePass,
+                target.epoch,
+            );
+            registry.forget_host(&host);
+            host
+        };
+        let hosts: Vec<Url> = (0..=CLOSED_HOSTS_KEPT).map(closed).collect();
+        assert_eq!(registry.closed_hosts.len(), CLOSED_HOSTS_KEPT);
+        assert!(!registry.host_closed(&hosts[0]));
+        assert!(registry.host_closed(&hosts[1]));
+        assert!(registry.host_closed(hosts.last().unwrap()));
     }
 
     #[test]
