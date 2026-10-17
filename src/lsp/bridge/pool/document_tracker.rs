@@ -951,6 +951,17 @@ impl DocumentTracker {
         }
     }
 
+    /// What any connection held as coordinates it sent about several
+    /// documents arrive — an applyEdit's, a showDocument's — whose records
+    /// are read later: the watermark of texts held so far. While no
+    /// connection was ever sent a prepared text, without reading it.
+    pub(in crate::lsp::bridge) fn observe_through(&self) -> super::Observed {
+        if !self.held_texts_matter(super::RegionPrepare::default()) {
+            return super::Observed::AsIsThen;
+        }
+        super::Observed::Through(self.held_through())
+    }
+
     /// Record the text of `fingerprint`, sent with `map`, in `fingerprints`,
     /// returning the record it replaced.
     fn record_locked(
@@ -1016,10 +1027,6 @@ impl DocumentTracker {
     /// The newest [`HeldText::generation`] published so far: a text held
     /// with a newer one was recorded after this was read. Lock-free, for a
     /// reader to take as each message arrives.
-    #[allow(
-        dead_code,
-        reason = "a showDocument request reads its selection through it, next"
-    )]
     pub(super) fn held_through(&self) -> u64 {
         self.held_generations.load(Ordering::Acquire)
     }

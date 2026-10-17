@@ -61,6 +61,9 @@ pub(in crate::lsp::bridge) fn handle(
 
     // Register the in-flight request BEFORE enqueueing it so a racing downstream
     // `$/cancelRequest` can't miss it (#404). See `show_message_request`.
+    // Stamped as it is read: what the connection held then is what its
+    // coordinates were computed for.
+    let held = deps.held_through();
     let connection_id = deps.progress_connection_id;
     let (token, generation) = deps
         .inbound_request_registry
@@ -93,6 +96,7 @@ pub(in crate::lsp::bridge) fn handle(
         .upstream_request_tx
         .send(UpstreamRequest::ShowDocument {
             params,
+            held,
             reply: reply_tx,
             cancel,
         })

@@ -2115,6 +2115,7 @@ fn spawn_upstream_request(
             }
             UpstreamRequest::ShowDocument {
                 params,
+                held,
                 reply,
                 cancel,
             } => {
@@ -2125,7 +2126,12 @@ fn spawn_upstream_request(
                 // rebuilt); only a non-virtual/unresolvable URI is forwarded
                 // unchanged. See `ShowDocumentTranslator::translate`.
                 let params = match &translators {
-                    Some(translators) => translators.show_document.translate(params).await,
+                    Some(translators) => {
+                        translators
+                            .show_document
+                            .translate(params, held.as_ref())
+                            .await
+                    }
                     None => params,
                 };
                 let id = client.next_request_id();
@@ -2146,6 +2152,7 @@ fn spawn_upstream_request(
             UpstreamRequest::ApplyEdit {
                 params,
                 connection,
+                held,
                 reply,
                 cancel,
             } => {
@@ -2191,7 +2198,10 @@ fn spawn_upstream_request(
                     super::apply_edit_translation::document_change_count(&params);
                 let params = match &translators {
                     Some(translators) => {
-                        translators.apply_edit.translate(params, &connection).await
+                        translators
+                            .apply_edit
+                            .translate(params, &connection, held.as_ref())
+                            .await
                     }
                     None => Ok(params),
                 };
@@ -4920,6 +4930,7 @@ mod tests {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         request_tx
             .send(UpstreamRequest::ShowDocument {
+                held: None,
                 params: serde_json::from_value(serde_json::json!({ "uri": "file:///x.rs" }))
                     .unwrap(),
                 reply: reply_tx,
@@ -4982,6 +4993,7 @@ mod tests {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         request_tx
             .send(UpstreamRequest::ApplyEdit {
+                held: None,
                 params: serde_json::from_value(serde_json::json!({
                     "edit": { "changes": { "file:///x.rs": [] } }
                 }))
@@ -5063,6 +5075,7 @@ mod tests {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         request_tx
             .send(UpstreamRequest::ApplyEdit {
+                held: None,
                 connection: crate::lsp::bridge::ConnectionKey::for_server("test"),
                 params: serde_json::from_value(serde_json::json!({
                     "edit": { "changes": { "file:///x.rs": [] } }
@@ -5154,6 +5167,7 @@ mod tests {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         request_tx
             .send(UpstreamRequest::ApplyEdit {
+                held: None,
                 connection: crate::lsp::bridge::ConnectionKey::for_server("test"),
                 params: serde_json::from_value(serde_json::json!({
                     "edit": { "documentChanges": [
@@ -5189,6 +5203,7 @@ mod tests {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         request_tx
             .send(UpstreamRequest::ApplyEdit {
+                held: None,
                 connection: crate::lsp::bridge::ConnectionKey::for_server("test"),
                 params: serde_json::from_value(serde_json::json!({
                     "edit": { "documentChanges": [real_edit] }
@@ -5265,6 +5280,7 @@ mod tests {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         request_tx
             .send(UpstreamRequest::ApplyEdit {
+                held: None,
                 connection: crate::lsp::bridge::ConnectionKey::for_server("test"),
                 // A NON-empty edit against a virtual URI that resolves to no open
                 // document: the translator can't map it, so the loop must reject

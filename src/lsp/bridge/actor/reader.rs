@@ -179,6 +179,9 @@ pub(crate) enum UpstreamRequest {
     /// virtual-document URIs); the editor's success flag is relayed back.
     ShowDocument {
         params: tower_lsp_server::ls_types::ShowDocumentParams,
+        /// What the originating connection held as the request was read:
+        /// how its selection translates (see `HeldStamp`).
+        held: Option<crate::lsp::diagnostic_cache::HeldStamp>,
         reply: oneshot::Sender<bool>,
         cancel: ForwardedRequestCancel,
     },
@@ -197,6 +200,9 @@ pub(crate) enum UpstreamRequest {
         /// (each connection's didOpen starts its own counter), so the
         /// translation must know which connection's version space applies.
         connection: ConnectionKey,
+        /// What the connection held as the request was read: an edit
+        /// computed for a prepared text is refused (see `HeldStamp`).
+        held: Option<crate::lsp::diagnostic_cache::HeldStamp>,
         reply: oneshot::Sender<tower_lsp_server::ls_types::ApplyWorkspaceEditResponse>,
         cancel: ForwardedRequestCancel,
     },
@@ -344,6 +350,19 @@ pub(crate) struct ServerRequestDeps {
     /// Routes bridge-minted client-progress tokens (`kakehashi/bridge/cprog/*`)
     /// to their aggregator (ls-bridge-client-progress).
     pub(crate) client_progress_registry: Arc<crate::lsp::bridge::ClientProgressRegistry>,
+}
+
+impl ServerRequestDeps {
+    /// What this connection held as a request about several documents (or
+    /// one, read later) was read: `None` when the pool prepares nothing.
+    pub(crate) fn held_through(&self) -> Option<crate::lsp::diagnostic_cache::HeldStamp> {
+        self.document_tracker
+            .as_ref()
+            .map(|tracker| crate::lsp::diagnostic_cache::HeldStamp {
+                connection: self.connection_key.clone(),
+                observed: tracker.observe_through(),
+            })
+    }
 }
 
 /// RAII guard that purges this connection's progress-token mappings when the
@@ -3658,6 +3677,65 @@ mod tests {
         };
         assert_eq!(held_of(Some(Arc::clone(&tracker)), 3), Some(stamp(false)));
         assert_eq!(held_of(Some(Arc::clone(&tracker)), 2), Some(stamp(true)));
+    }
+
+    /// A showDocument or applyEdit is stamped as it is read with the
+    /// watermark of texts held so far — only when the pool prepares, and
+    /// without reading it until a prepared text was ever sent.
+    #[tokio::test]
+    async fn a_request_about_documents_is_stamped_with_the_texts_held_so_far() {
+        use crate::lsp::bridge::Observed;
+        let key = ConnectionKey::for_server("test");
+        let deps_with = |tracker| ServerRequestDeps {
+            experimental_enabled: true,
+            settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+            server_name: Some("luals".to_string()),
+            connection_key: key.clone(),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
+            response_tx: mpsc::channel(16).0,
+            dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
+            upstream_tx: mpsc::unbounded_channel().0,
+            workspace_folders: WorkspaceFolderSet::new(None),
+            window_tx: mpsc::channel(16).0,
+            upstream_request_tx: mpsc::unbounded_channel().0,
+            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
+            progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+            document_tracker: tracker,
+        };
+        assert_eq!(deps_with(None).held_through(), None);
+
+        let tracker = Arc::new(crate::lsp::bridge::pool::DocumentTracker::new());
+        let deps = deps_with(Some(Arc::clone(&tracker)));
+        let observed = || deps.held_through().map(|stamp| stamp.observed);
+        assert_eq!(observed(), Some(Observed::AsIsThen));
+
+        let host = crate::lsp::lsp_impl::url_to_uri(
+            &url::Url::parse("file:///project/through.md").unwrap(),
+        )
+        .unwrap();
+        let virtual_uri =
+            crate::lsp::bridge::VirtualDocumentUri::new(&host, "lua", "01JPMQ8ZYYQA1W3AVPW4JDRZFR");
+        let map = crate::lsp::bridge::apply_prepare_result(
+            "a",
+            &crate::lsp::bridge::VirtualLayout::single("a"),
+            None,
+        )
+        .unwrap()
+        .map;
+        for text in ["a", "b"] {
+            tracker.record_sent_for_test(
+                &virtual_uri,
+                &key,
+                crate::lsp::bridge::pool::SentText {
+                    text,
+                    map: Some(&map),
+                },
+                1,
+            );
+        }
+        assert_eq!(observed(), Some(Observed::Through(2)));
     }
 
     /// A non-virtual (real host URI) push is now routed up too — the publisher

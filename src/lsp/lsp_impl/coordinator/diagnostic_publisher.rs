@@ -1036,7 +1036,7 @@ impl DiagnosticPublisher {
         }
         // The stamp places the push through the text its connection held
         // when it was read, while the rule allows (see
-        // `BridgeCoordinator::place_push`).
+        // `BridgeCoordinator::place_held`).
         let slot = (DiagnosticSource::Region(region_id.clone()), server.clone());
         let changed = self.aggregator.record_held(
             &host,
@@ -1361,7 +1361,7 @@ impl DiagnosticPublisher {
         };
         let (region_offsets, regions) = region_offsets;
         // A slot's coordinates follow the text its connection held when it
-        // pushed (see `BridgeCoordinator::place_push`) — through the region's
+        // pushed (see `BridgeCoordinator::place_held`) — through the region's
         // offset alone while nothing was ever prepared.
         let diagnostics = if self.bridge.places_pushes_as_is() {
             merge_cached_diagnostics(host, snapshot, &region_offsets, |_, _| {
@@ -1375,7 +1375,7 @@ impl DiagnosticPublisher {
                 .collect();
             merge_cached_diagnostics(host, snapshot, &region_offsets, |region_id, slot| {
                 match regions.get(region_id) {
-                    Some(region) => self.bridge.place_push(
+                    Some(region) => self.bridge.place_held(
                         host,
                         &region.injection_language,
                         region_id,

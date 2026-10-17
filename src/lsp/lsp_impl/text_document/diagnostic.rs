@@ -238,7 +238,7 @@ impl Kakehashi {
         // pull below moves the regions themselves. The virtual text goes
         // along: a cached push follows the text its connection held, checked
         // against it when the fold snapshots the pushes, after the awaits
-        // below (see `BridgeCoordinator::place_push`). Not copied when the
+        // below (see `BridgeCoordinator::place_held`). Not copied when the
         // pool prepares nothing: every push then places as is.
         let prepares = self.bridge.pool().prepares();
         let region_meta: Vec<RegionPushMeta> = virt_regions
@@ -675,7 +675,7 @@ impl Kakehashi {
 
         let mut region_offsets = HashMap::new();
         // The language and virtual text place a slot through the text its
-        // connection held (see `BridgeCoordinator::place_push`), needed only
+        // connection held (see `BridgeCoordinator::place_held`), needed only
         // once anything was prepared.
         let places_as_is = self.bridge.places_pushes_as_is();
         let mut region_texts: HashMap<String, (String, String)> = HashMap::new();
@@ -749,7 +749,7 @@ impl Kakehashi {
                 return crate::lsp::bridge::Presentation::AsIs;
             }
             match region_texts.get(region_id) {
-                Some((language, virtual_text)) => self.bridge.place_push(
+                Some((language, virtual_text)) => self.bridge.place_held(
                     host,
                     language,
                     region_id,

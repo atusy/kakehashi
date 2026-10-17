@@ -174,6 +174,31 @@ pub(super) fn resolve_region_offset(
     Some(resolved_region_geometry(resolved))
 }
 
+/// Rebuild the region's current host offset (see [`resolve_region_offset`])
+/// for coordinates a connection sent: through the text it held when they
+/// were read (`held`; see `BridgeCoordinator::place_held`). `None` also when
+/// they describe no current host position.
+pub(super) fn resolve_region_offset_for_held(
+    documents: &DocumentStore,
+    language: &Arc<LanguageCoordinator>,
+    bridge: &BridgeCoordinator,
+    host_url: &Url,
+    region_id: &str,
+    held: Option<&crate::lsp::diagnostic_cache::HeldStamp>,
+) -> Option<(RegionOffset, Position, bool, String)> {
+    let resolved = resolve_region(documents, language, bridge, host_url, region_id)?;
+    let presentation = bridge.place_held(
+        host_url,
+        &resolved.injection_language,
+        region_id,
+        &resolved.virtual_content,
+        held,
+    );
+    let (offset, region_end, contiguous, language) = resolved_region_geometry(resolved);
+    let offset = presentation.offset(&offset)?.into_owned();
+    Some((offset, region_end, contiguous, language))
+}
+
 /// Resolve geometry and content from the same current snapshot.
 pub(super) fn resolve_region(
     documents: &DocumentStore,

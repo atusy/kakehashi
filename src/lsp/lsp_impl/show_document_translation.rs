@@ -38,7 +38,7 @@ use crate::document::DocumentStore;
 use crate::language::LanguageCoordinator;
 use crate::lsp::bridge::{BridgeCoordinator, RegionOffset, translate_virtual_range_to_host};
 
-use super::region_offset::resolve_region_offset;
+use super::region_offset::resolve_region_offset_for_held;
 
 /// Translates `window/showDocument` params whose URI is a virtual document back
 /// to the host document + host coordinates. Holds shared (cheaply cloneable)
@@ -67,7 +67,11 @@ impl ShowDocumentTranslator {
     /// coordinates when the offset resolves); forward `params` unchanged only when
     /// the URI isn't a resolvable virtual document. See the module docs for the
     /// exact behavior.
-    pub(super) async fn translate(&self, mut params: ShowDocumentParams) -> ShowDocumentParams {
+    pub(super) async fn translate(
+        &self,
+        mut params: ShowDocumentParams,
+        held: Option<&crate::lsp::diagnostic_cache::HeldStamp>,
+    ) -> ShowDocumentParams {
         // `external: true` is a browser/OS resource, never a virtual document.
         if params.external == Some(true) {
             return params;
@@ -87,7 +91,7 @@ impl ShowDocumentTranslator {
         // Only a selection needs the (live-parse) region offset, so skip
         // resolving it when there's nothing to translate.
         if params.selection.is_some() {
-            match self.region_offset(&host_url, &region_id) {
+            match self.region_offset(&host_url, &region_id, held) {
                 Some(offset) => return Self::apply_host_translation(params, host_uri, &offset),
                 // Offset unavailable (region invalidated by edits, or otherwise
                 // unresolvable): drop the selection we can't translate — a
@@ -115,18 +119,26 @@ impl ShowDocumentTranslator {
         params
     }
 
-    /// Rebuild the region's current host offset from the live parse via the
-    /// shared [`resolve_region_offset`]. On `None` the caller opens the host
-    /// document without a selection rather than risk a wrong one. showDocument
-    /// only needs the offset (it translates a single selection position, not an
-    /// edit), so the region-end bound and contiguity marker are discarded.
-    fn region_offset(&self, host_url: &Url, region_id: &str) -> Option<RegionOffset> {
-        resolve_region_offset(
+    /// Rebuild the region's current host offset from the live parse, through
+    /// the text the connection held as the request was read (`held`), via the
+    /// shared [`resolve_region_offset_for_held`]. On `None` the caller opens
+    /// the host document without a selection rather than risk a wrong one.
+    /// showDocument only needs the offset (it translates a single selection
+    /// position, not an edit), so the region-end bound and contiguity marker
+    /// are discarded.
+    fn region_offset(
+        &self,
+        host_url: &Url,
+        region_id: &str,
+        held: Option<&crate::lsp::diagnostic_cache::HeldStamp>,
+    ) -> Option<RegionOffset> {
+        resolve_region_offset_for_held(
             &self.documents,
             &self.language,
             &self.bridge,
             host_url,
             region_id,
+            held,
         )
         .map(|(offset, _region_end, _contiguous, _language)| offset)
     }
@@ -159,7 +171,7 @@ mod tests {
     #[tokio::test]
     async fn passes_through_non_virtual_uri_unchanged() {
         let original = params("file:///project/main.rs");
-        let out = translator().translate(original.clone()).await;
+        let out = translator().translate(original.clone(), None).await;
         assert_eq!(out, original);
     }
 
@@ -167,7 +179,7 @@ mod tests {
     async fn passes_through_external_resource_unchanged() {
         let mut original = params("https://example.com/");
         original.external = Some(true);
-        let out = translator().translate(original.clone()).await;
+        let out = translator().translate(original.clone(), None).await;
         assert_eq!(out, original);
     }
 
@@ -181,7 +193,7 @@ mod tests {
         assert!(VirtualDocumentUri::is_virtual_uri(&virtual_uri));
 
         let original = params(&virtual_uri);
-        let out = translator().translate(original.clone()).await;
+        let out = translator().translate(original.clone(), None).await;
         assert_eq!(out, original);
     }
 
