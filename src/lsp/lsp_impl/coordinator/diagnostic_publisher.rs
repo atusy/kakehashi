@@ -2714,7 +2714,8 @@ mod tests {
         assert_eq!(requested(), 0);
         scheduler.settle_pull_debt_after_prepare(&host, true);
         assert_eq!(requested(), 1);
-        server.bridge.forget_prepared_host(&host);
+        // The rest on a host nothing is pending for.
+        let host = Url::parse("file:///test/owed_pull_other.md").unwrap();
         let requested = || server.diagnostics.metrics_snapshot().refreshes_requested - 1;
 
         server.bridge.owe_pull_after_prepare(&host);

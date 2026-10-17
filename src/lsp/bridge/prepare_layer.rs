@@ -247,6 +247,10 @@ impl super::BridgeCoordinator {
         let Some(layer) = &self.prepare else {
             return;
         };
+        // Closed meanwhile: no editor shows it.
+        if layer.registry.host_closed(host) {
+            return;
+        }
         layer.pull_debts.insert(host.clone());
         if !self.prepare_host_has_pending(host) {
             layer.registry.requeue_resync(
@@ -640,6 +644,9 @@ mod tests {
         // A closed host owes nothing.
         coordinator.owe_pull_after_prepare(&host);
         coordinator.forget_prepared_host(&host);
+        assert!(!coordinator.take_pull_debt_after_prepare(&host));
+        // Nor does a pull still running past the close.
+        coordinator.owe_pull_after_prepare(&host);
         assert!(!coordinator.take_pull_debt_after_prepare(&host));
     }
 
