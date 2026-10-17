@@ -788,10 +788,11 @@ impl Side {
 /// opaque run (a deleted indent, deleted edge lines or a gap) it lands on
 /// the run's start, or — strictly inside, with [`Bias::End`] — its end. On a
 /// boundary the run that *starts* there wins, so a P line start maps after
-/// the indent V deleted there: the host keeps its indentation and the edit
-/// lands on the content. Likewise P's start maps after the lines deleted
-/// from the document's start, and P's end, whatever the bias, before those
-/// deleted from its end.
+/// the indent V deleted there: a position there names the line's content.
+/// A range end there ([`Bias::End`]) stops before that indent instead: it
+/// covers nothing of the line, as it does in P. Likewise P's start maps
+/// after the lines deleted from the document's start, and P's end, whatever
+/// the bias, before those deleted from its end.
 fn map_offset(runs: &[Run], offset: usize, bias: Bias, from: Side) -> usize {
     // P's end, where the document's deleted closing lines were: the
     // content ends there in V too, before them.
@@ -800,13 +801,15 @@ fn map_offset(runs: &[Run], offset: usize, bias: Bias, from: Side) -> usize {
     {
         return lines.virtual_.start;
     }
-    // The end of a P range that reaches a gap the peer replaced with nothing
-    // stops before that gap: the range covers none of its host text.
+    // The end of a P range that reaches a gap the peer replaced with nothing,
+    // or a line start whose indent the peer deleted, stops before it: the
+    // range covers none of that host text.
     if bias == Bias::End
         && matches!(from, Side::Prepared)
-        && let Some(gap) = empty_run(runs, offset, RunKind::Gap)
+        && let Some(run) = empty_run(runs, offset, RunKind::Gap)
+            .or_else(|| empty_run(runs, offset, RunKind::Deleted))
     {
-        return gap.virtual_.start;
+        return run.virtual_.start;
     }
     // Runs tile both texts in order, so the run holding `offset` is the
     // first that ends after it (runs empty on this side never hold one).
@@ -1815,6 +1818,8 @@ mod tests {
         assert_eq!(map.to_virtual(pos(1, 0), Bias::Start), pos(1, 2));
         // P's end too.
         assert_eq!(map.to_virtual(pos(1, 1), Bias::End), pos(1, 3));
+        // A range ending at that line start covers nothing of the line.
+        assert_eq!(map.to_virtual(pos(1, 0), Bias::End), pos(1, 0));
         // A V position inside the removed indent maps to its line's start.
         assert_eq!(map.to_prepared(pos(1, 1), Bias::Start), pos(1, 0));
         assert!(!map.virtual_position_in_removed_lines(pos(1, 1)));

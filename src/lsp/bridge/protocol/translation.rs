@@ -338,6 +338,18 @@ mod tests {
     }
 
     #[test]
+    fn a_range_ending_at_a_dedented_line_start_covers_none_of_its_indent() {
+        let offset = prepared_offset();
+        // P (0,0)-(1,0): the whole first line, line break included.
+        let mut range = Range::new(Position::new(0, 0), Position::new(1, 0));
+        translate_virtual_range_to_host(&mut range, &offset);
+        assert_eq!(
+            range,
+            Range::new(Position::new(10, 6), Position::new(11, 0))
+        );
+    }
+
+    #[test]
     fn offsets_compare_unequal_once_a_prepared_map_differs() {
         assert_ne!(prepared_offset(), RegionOffset::new(10, 4));
         assert_eq!(prepared_offset(), prepared_offset());
