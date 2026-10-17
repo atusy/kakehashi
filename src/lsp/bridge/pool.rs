@@ -2633,11 +2633,9 @@ impl LanguageServerPool {
             .parse()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let Some(version) = self
-            .increment_version_if_content_changed(virtual_uri, connection_key, content.text)
+            .increment_version_if_content_changed(virtual_uri, connection_key, content)
             .await
         else {
-            self.document_tracker
-                .rehold_unchanged(virtual_uri, connection_key, content);
             return Ok(());
         };
         let params = DidChangeTextDocumentParams {
@@ -3038,11 +3036,11 @@ impl LanguageServerPool {
     /// (content unchanged, or the doc isn't registered for this connection). The
     /// content guard keeps a position-only host edit from re-analyzing every region
     /// (#422). Delegates to [`DocumentTracker::increment_version_if_content_changed`].
-    pub(super) async fn increment_version_if_content_changed(
+    pub(super) async fn increment_version_if_content_changed<'a>(
         &self,
         virtual_uri: &VirtualDocumentUri,
         connection_key: &ConnectionKey,
-        content: &str,
+        content: impl Into<SentText<'a>>,
     ) -> Option<i32> {
         self.document_tracker
             .increment_version_if_content_changed(virtual_uri, connection_key, content)
@@ -3076,18 +3074,6 @@ impl LanguageServerPool {
             },
             |result| matches!(result, NotificationSendResult::Queued),
         )
-    }
-
-    /// Hold `content` again under its map where it is unchanged (see
-    /// [`DocumentTracker::rehold_unchanged`]).
-    pub(super) fn rehold_unchanged_content(
-        &self,
-        virtual_uri: &VirtualDocumentUri,
-        connection_key: &ConnectionKey,
-        content: SentText<'_>,
-    ) {
-        self.document_tracker
-            .rehold_unchanged(virtual_uri, connection_key, content);
     }
 
     /// Record `content` as sent to this connection, as a queued send would.

@@ -673,14 +673,19 @@ impl DocumentTracker {
     /// queued, keeping "fingerprint set ⟺ content sent". `None` is also
     /// returned when the document isn't registered for this connection (as for
     /// `increment`).
-    pub(super) async fn increment_version_if_content_changed(
+    ///
+    /// Unchanged content is held again under `content`'s map: only the gaps
+    /// may have changed, which the prepared text hides, and the server's
+    /// coordinates now map back through the new map.
+    pub(super) async fn increment_version_if_content_changed<'a>(
         &self,
         virtual_uri: &VirtualDocumentUri,
         connection_key: &ConnectionKey,
-        content: &str,
+        content: impl Into<SentText<'a>>,
     ) -> Option<i32> {
+        let content = content.into();
         let uri_string = virtual_uri.to_uri_string();
-        let fp = content_fingerprint(content);
+        let fp = content_fingerprint(content.text);
 
         // Unchanged content (vs the last fingerprint **recorded as sent**) → skip the
         // re-send and the version bump. The fingerprint is NOT updated here (see the
@@ -688,15 +693,21 @@ impl DocumentTracker {
         // (self-healing). Held briefly and released before the version lock (the two
         // maps are never locked together).
         {
-            let fingerprints = self
+            let mut fingerprints = self
                 .document_fingerprints
                 .lock()
                 .recover_poison("DocumentTracker::document_fingerprints");
-            if fingerprints
-                .get(connection_key)
-                .and_then(|docs| docs.get(&uri_string))
-                .is_some_and(|held| held.fingerprint == fp)
+            if let Some(held) = fingerprints
+                .get_mut(connection_key)
+                .and_then(|docs| docs.get_mut(&uri_string))
+                .filter(|held| held.fingerprint == fp)
             {
+                if let Some(map) = content.map {
+                    self.ever_held_prepared.store(true, Ordering::Release);
+                    held.map = Some(Arc::clone(map));
+                } else {
+                    held.map = None;
+                }
                 return None;
             }
         }
@@ -821,39 +832,11 @@ impl DocumentTracker {
         previous
     }
 
-    /// Record that this connection holds `content` under `content`'s map
-    /// when it already holds that exact text — a send skipped because the
-    /// text is unchanged, whose map may not be (only its gaps changed, which
-    /// the prepared text hides). A no-op otherwise: only a send records a
-    /// new text.
-    pub(super) fn rehold_unchanged(
-        &self,
-        virtual_uri: &VirtualDocumentUri,
-        connection_key: &ConnectionKey,
-        content: SentText<'_>,
-    ) {
-        match content.map {
-            // Every unchanged region takes this path per edit: with nothing
-            // ever held prepared, every held map is already `None`.
-            None if !self.ever_held_prepared() => return,
-            None => {}
-            Some(_) => self.ever_held_prepared.store(true, Ordering::Release),
-        }
-        let fingerprint = content_fingerprint(content.text);
-        let mut fingerprints = self
-            .document_fingerprints
-            .lock()
-            .recover_poison("DocumentTracker::document_fingerprints");
-        if let Some(held) = fingerprints
-            .get_mut(connection_key)
-            .and_then(|docs| docs.get_mut(&virtual_uri.to_uri_string()))
-            .filter(|held| held.fingerprint == fingerprint)
-        {
-            held.map = content.map.cloned();
-        }
-    }
-
     /// Whether any connection was ever sent a prepared text.
+    #[allow(
+        dead_code,
+        reason = "read by the presentation of what a connection holds, next"
+    )]
     pub(super) fn ever_held_prepared(&self) -> bool {
         self.ever_held_prepared.load(Ordering::Acquire)
     }
@@ -1930,6 +1913,62 @@ mod tests {
         assert!(changed.generation > first.generation);
         assert!(changed.generation <= tracker.held_through());
         assert!(changed.map.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_text_is_held_again_under_its_new_map() {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let uri = virtual_uri.to_uri_string();
+        let conn = ConnectionKey::for_server("lua");
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, &conn)
+            .await;
+        tracker.record_sent_for_test(&virtual_uri, &conn, "a".into(), 1);
+        let first = tracker.held_text(&uri, &conn).unwrap();
+        let mapped = apply_prepare_result("a", &VirtualLayout::single("a"), None)
+            .unwrap()
+            .map;
+        let sent = SentText {
+            text: "a",
+            map: Some(&mapped),
+        };
+
+        // The same text under a map: no send, the record takes the map and
+        // keeps its generation and version.
+        assert_eq!(
+            tracker
+                .increment_version_if_content_changed(&virtual_uri, &conn, sent)
+                .await,
+            None
+        );
+        let remapped = tracker.held_text(&uri, &conn).unwrap();
+        assert!(Arc::ptr_eq(remapped.map.as_ref().unwrap(), &mapped));
+        assert_eq!(remapped.generation, first.generation);
+        assert_eq!(remapped.version, first.version);
+
+        // And back as is.
+        assert_eq!(
+            tracker
+                .increment_version_if_content_changed(&virtual_uri, &conn, "a")
+                .await,
+            None
+        );
+        assert!(tracker.held_text(&uri, &conn).unwrap().map.is_none());
+
+        // Another text is a send, which alone records it.
+        assert!(
+            tracker
+                .increment_version_if_content_changed(&virtual_uri, &conn, "b")
+                .await
+                .is_some()
+        );
+        assert_eq!(
+            tracker.held_text(&uri, &conn).unwrap().fingerprint,
+            first.fingerprint
+        );
     }
 
     #[test]

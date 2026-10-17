@@ -109,25 +109,18 @@ impl LanguageServerPool {
                 }
 
                 let content = SentText::from(&injection.content);
-                let did_change = if let Some(version) = self
-                    .increment_version_if_content_changed(
-                        &virtual_uri,
-                        &connection_key,
-                        content.text,
-                    )
+                let did_change = self
+                    .increment_version_if_content_changed(&virtual_uri, &connection_key, content)
                     .await
-                {
-                    Some(self.send_didchange_recorded(
-                        &handle,
-                        &virtual_uri,
-                        &connection_key,
-                        content,
-                        version,
-                    ))
-                } else {
-                    self.rehold_unchanged_content(&virtual_uri, &connection_key, content);
-                    None
-                };
+                    .map(|version| {
+                        self.send_didchange_recorded(
+                            &handle,
+                            &virtual_uri,
+                            &connection_key,
+                            content,
+                            version,
+                        )
+                    });
 
                 let virtual_uri = virtual_uri.to_uri_string();
                 let params = if include_text {
