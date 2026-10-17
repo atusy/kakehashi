@@ -206,6 +206,15 @@ pub(super) fn holds_request_text(
     }
 }
 
+/// A request counted as waiting on `DocumentTracker::held_changed`.
+pub(super) struct HeldWaiter<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for HeldWaiter<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Hash of a virtual document's extracted content, used to skip re-sending an
 /// unchanged `didChange` (#422). Mirrors the host path's fingerprint
 /// (`text_document/host.rs`).
@@ -286,6 +295,9 @@ pub(crate) struct DocumentTracker {
     /// a request waiting for its text checks changed (see
     /// [`Self::held_changed`]).
     held_changed: tokio::sync::Notify,
+    /// Requests waiting on [`Self::held_changed`]: with none (always with
+    /// experimental features off), a change wakes nobody.
+    held_waiters: std::sync::atomic::AtomicUsize,
     /// Some connection was ever sent a prepared text: until then every held
     /// text is a virtual text as is, which lets paths skip looking up what a
     /// connection holds.
@@ -337,6 +349,7 @@ impl DocumentTracker {
             document_fingerprints: std::sync::Mutex::new(HashMap::new()),
             held_generations: Arc::new(AtomicU64::new(0)),
             held_changed: tokio::sync::Notify::new(),
+            held_waiters: std::sync::atomic::AtomicUsize::new(0),
             ever_held_prepared: AtomicBool::new(false),
             prepared_history: std::sync::Mutex::new(HashMap::new()),
             host_to_virtual: Mutex::new(HashMap::new()),
@@ -791,7 +804,7 @@ impl DocumentTracker {
                 }
                 // The same text under another map is what a request built
                 // on that map waits for.
-                self.held_changed.notify_waiters();
+                self.notify_held_changed();
                 return None;
             }
         }
@@ -991,7 +1004,7 @@ impl DocumentTracker {
             let previous = held.clone();
             held.map = map;
             held.version = change.version;
-            self.held_changed.notify_waiters();
+            self.notify_held_changed();
             return Some(previous);
         }
         // Given out only under this lock, and published once the record is
@@ -1008,7 +1021,7 @@ impl DocumentTracker {
             },
         );
         self.held_generations.store(generation, Ordering::Release);
-        self.held_changed.notify_waiters();
+        self.notify_held_changed();
         previous
     }
 
@@ -1017,6 +1030,22 @@ impl DocumentTracker {
     /// await it.
     pub(super) fn held_changed(&self) -> tokio::sync::futures::Notified<'_> {
         self.held_changed.notified()
+    }
+
+    /// Count a request as waiting on [`Self::held_changed`] while the
+    /// guard lives: take it before the first check. A change made under the
+    /// lock the check reads under either precedes that check or sees the
+    /// count.
+    pub(super) fn wait_for_held_changes(&self) -> HeldWaiter<'_> {
+        self.held_waiters.fetch_add(1, Ordering::SeqCst);
+        HeldWaiter(&self.held_waiters)
+    }
+
+    /// Wake the requests waiting on [`Self::held_changed`], if any.
+    fn notify_held_changed(&self) {
+        if self.held_waiters.load(Ordering::SeqCst) > 0 {
+            self.held_changed.notify_waiters();
+        }
     }
 
     /// Whether any connection was ever sent a prepared text.
@@ -1482,7 +1511,7 @@ impl DocumentTracker {
                 keys.retain(|k| k != connection_key);
                 keys.is_empty()
             });
-        self.held_changed.notify_waiters();
+        self.notify_held_changed();
     }
 
     /// Find ALL connections that have opened a given virtual document URI.

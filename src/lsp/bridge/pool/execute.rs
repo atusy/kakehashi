@@ -432,6 +432,7 @@ impl LanguageServerPool {
             return Ok(());
         }
         let deadline = tokio::time::Instant::now() + REQUEST_TEXT_WAIT;
+        let _waiting = self.document_tracker.wait_for_held_changes();
         loop {
             // Enabled before the check: a record made after it wakes the
             // wait.
