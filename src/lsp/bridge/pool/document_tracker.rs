@@ -151,6 +151,23 @@ pub(crate) struct HeldText {
     pub(crate) version: i32,
 }
 
+/// Put `previous` back as what `connection_key` holds for `uri_string`
+/// (`None`: nothing).
+fn take_back_locked(
+    fingerprints: &mut HashMap<ConnectionKey, HashMap<String, HeldText>>,
+    uri_string: String,
+    connection_key: &ConnectionKey,
+    previous: Option<HeldText>,
+) {
+    let Some(docs) = fingerprints.get_mut(connection_key) else {
+        return;
+    };
+    match previous {
+        Some(previous) => docs.insert(uri_string, previous),
+        None => docs.remove(&uri_string),
+    };
+}
+
 /// Hash of a virtual document's extracted content, used to skip re-sending an
 /// unchanged `didChange` (#422). Mirrors the host path's fingerprint
 /// (`text_document/host.rs`).
@@ -754,28 +771,24 @@ impl DocumentTracker {
             version,
         );
         let result = queue();
-        if !queued(&result)
-            && let Some(docs) = fingerprints.get_mut(connection_key)
-        {
-            match previous {
-                Some(previous) => docs.insert(uri_string, previous),
-                None => docs.remove(&uri_string),
-            };
+        if !queued(&result) {
+            take_back_locked(&mut fingerprints, uri_string, connection_key, previous);
         }
         result
     }
 
     /// Record the content a `didOpen` hands this connection, before the
     /// didOpen is queued: a server pushing diagnostics the moment it opens
-    /// the document finds its text on record. Unlike a `didChange`, a didOpen
-    /// is queued across an await, so its record is taken back with its open
-    /// claim (`rollback_open_claim_if`) when it does not go out.
+    /// the document finds its text on record. A didOpen goes through a
+    /// sender that may await, so it cannot be queued under the lock: the
+    /// record it replaced is returned for [`Self::take_back`], and its open
+    /// claim's rollback (`rollback_open_claim_if`) drops it too.
     pub(super) fn record_opening(
         &self,
         virtual_uri: &VirtualDocumentUri,
         connection_key: &ConnectionKey,
         content: SentText<'_>,
-    ) {
+    ) -> Option<HeldText> {
         let uri_string = virtual_uri.to_uri_string();
         let fingerprint = content_fingerprint(content.text);
         let mut fingerprints = self
@@ -789,6 +802,26 @@ impl DocumentTracker {
             fingerprint,
             content.map,
             crate::lsp::bridge::protocol::DIDOPEN_VERSION,
+        )
+    }
+
+    /// Put back `previous`, the record [`Self::record_opening`] replaced,
+    /// for a send that was not queued.
+    pub(super) fn take_back(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+        previous: Option<HeldText>,
+    ) {
+        let mut fingerprints = self
+            .document_fingerprints
+            .lock()
+            .recover_poison("DocumentTracker::document_fingerprints");
+        take_back_locked(
+            &mut fingerprints,
+            virtual_uri.to_uri_string(),
+            connection_key,
+            previous,
         );
     }
 
