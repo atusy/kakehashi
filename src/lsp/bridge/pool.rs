@@ -5551,13 +5551,13 @@ impl PrepareAdvertisements {
             return;
         }
         *current = std::sync::Weak::new();
-        let server = handle.key().server();
-        let before = self.get(server);
-        self.forget(handle.key());
-        let after = self.get(server);
+        let removed = self.forget(handle.key());
         drop(current);
-        // Only a change of what the server advertises changes an answer.
-        if before != after {
+        // As in `record`: an attempt asks a candidate through the host's own
+        // connection, so one root's record going changes its hosts' answers
+        // even while the server still advertises it through another — and
+        // the next first record for that root compares against nothing.
+        if removed {
             self.advance();
         }
     }
@@ -5928,7 +5928,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retiring_one_of_several_advertising_connections_moves_no_epoch() {
+    async fn retiring_one_root_changes_its_hosts_answers() {
         let pool = LanguageServerPool::preparing();
         let advertisements = pool.prepare_advertisements.as_ref().unwrap();
         let a = test_helpers::create_handle_with_key(
@@ -5947,9 +5947,10 @@ mod tests {
         }
         let epoch = pool.prepare_epoch();
         advertisements.retire(&a);
-        // The server still advertises it through the other root.
+        // The server still advertises it through the other root, but the
+        // retired root's hosts asked through its own connection.
         assert_eq!(pool.prepare_advertisement("peer"), Some(true));
-        assert_eq!(pool.prepare_epoch(), epoch);
+        assert!(pool.prepare_epoch() > epoch);
     }
 
     #[tokio::test]
