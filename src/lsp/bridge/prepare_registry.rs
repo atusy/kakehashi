@@ -345,6 +345,27 @@ impl PrepareRegistry {
         PrepareLookup::Pending
     }
 
+    /// Look up for a request that cannot wait (a diagnostic snapshot, an
+    /// editor's pull on a push-only region): on a miss, start an attempt in
+    /// the background. It never moves what the lifecycle pass holds the
+    /// document on.
+    pub(crate) fn lookup_for_request(
+        &self,
+        pool: &Arc<LanguageServerPool>,
+        target: &PrepareTarget,
+        input: PrepareInput<'_>,
+    ) -> PrepareLookup {
+        let epoch = pool.prepare_epoch();
+        let Some(slot) = self.slot(target, input, Holder::Request, epoch) else {
+            return PrepareLookup::Pending;
+        };
+        if let Ok(Some(answer)) = slot.cell.standing(epoch) {
+            return PrepareLookup::Answered(answer.clone());
+        }
+        self.start(&slot, pool, target, input);
+        PrepareLookup::Pending
+    }
+
     /// Wait for the answer, sharing an attempt already running. A request
     /// never moves what the lifecycle pass holds the document on.
     pub(crate) async fn prepare(
@@ -405,10 +426,6 @@ impl PrepareRegistry {
 
     /// Whether any of `host_uri`'s documents the lifecycle pass holds back
     /// still waits for its answer as it stands at `epoch`.
-    #[allow(
-        dead_code,
-        reason = "pushes and inbound requests read coordinates through it, next"
-    )]
     pub(crate) fn host_has_pending(&self, host_uri: &Url, epoch: u64) -> bool {
         self.regions.iter().any(|region| {
             region.host_uri == host_uri.as_str()

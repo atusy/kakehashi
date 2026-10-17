@@ -119,6 +119,52 @@ pub(crate) async fn prepare_request_context(
     Ok(ctx)
 }
 
+/// [`prepare_request_context`] without waiting, for paths that cannot: a
+/// document whose answer is not in yet is skipped like a failed one (its
+/// host is synced again when the answer arrives).
+pub(crate) fn prepare_request_context_now(
+    bridge: &crate::lsp::bridge::BridgeCoordinator,
+    host_language: &str,
+    mut ctx: DocumentRequestContext,
+) -> Result<DocumentRequestContext, PrepareSkip> {
+    let Some(target) = bridge.prepare_target(host_language, &ctx.resolved.injection_language)
+    else {
+        return Ok(ctx);
+    };
+    let input = crate::lsp::bridge::PrepareInput {
+        host_uri: &ctx.uri,
+        host_language,
+        injection_language: &ctx.resolved.injection_language,
+        region_id: &ctx.resolved.region.region_id,
+        virtual_text: &ctx.resolved.virtual_content,
+        gaps: &ctx.resolved.gaps,
+    };
+    match bridge.prepared_document_now_for_request(&target, input) {
+        crate::lsp::bridge::PrepareLookup::Answered(crate::lsp::bridge::PrepareAnswer::AsIs) => {}
+        crate::lsp::bridge::PrepareLookup::Answered(
+            crate::lsp::bridge::PrepareAnswer::Prepared(prepared),
+        ) => {
+            ctx.resolved.virtual_content = prepared.text.clone();
+            ctx.prepared = Some(std::sync::Arc::clone(&prepared.map));
+        }
+        crate::lsp::bridge::PrepareLookup::Answered(
+            crate::lsp::bridge::PrepareAnswer::Unusable,
+        ) => return Err(PrepareSkip::Failed),
+        crate::lsp::bridge::PrepareLookup::Pending => return Err(PrepareSkip::Pending),
+    }
+    Ok(ctx)
+}
+
+/// Why [`prepare_request_context_now`] gave no context to send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrepareSkip {
+    /// The peer could not prepare the region.
+    Failed,
+    /// No answer yet. A collection runs again once it arrives, and covers
+    /// the region.
+    Pending,
+}
+
 /// The region-boundary rule a method's position resolves under.
 ///
 /// Caret-shaped methods — whose request position is the insert-mode caret,

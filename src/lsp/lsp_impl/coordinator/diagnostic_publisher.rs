@@ -25,7 +25,7 @@ use crate::lsp::bridge::{
     BridgeCoordinator, ProgressConnectionId, RegionOffset, VirtualDocumentUri,
 };
 use crate::lsp::diagnostic_cache::{
-    DiagnosticAggregator, DiagnosticSource, merge_cached_diagnostics,
+    DiagnosticAggregator, DiagnosticSource, HeldStamp, merge_cached_diagnostics,
 };
 use crate::lsp::lsp_impl::Kakehashi;
 use crate::lsp::lsp_impl::coordinator::diagnostic::DiagnosticSnapshotPreparer;
@@ -43,6 +43,9 @@ pub(crate) struct DiagnosticPush {
     pub(crate) uri: String,
     pub(crate) server: String,
     pub(crate) connection_id: ProgressConnectionId,
+    /// What the originating connection held for a region push's document
+    /// as the reader read it (see [`HeldStamp`]).
+    pub(crate) held: Option<HeldStamp>,
     pub(crate) diagnostics: Vec<Diagnostic>,
 }
 
@@ -468,6 +471,10 @@ impl DiagnosticPublisher {
         let mut tasks = tokio::task::JoinSet::new();
         let mut summary = ForwardedPrefetchSummary::default();
         for uri in self.documents.open_uris() {
+            // Read before the snapshot: a move of the prepare epoch after it
+            // re-sends what the prepared regions hold (see
+            // `commit_refresh_prefetch`).
+            let prepare_epoch = self.bridge.pool().prepare_epoch();
             let Some(snapshot) = self.snapshot_preparer.prepare_diagnostic_snapshot(&uri) else {
                 // No snapshot conflates two very different states. A document
                 // that is gone or has no detectable language is covered: the
@@ -486,6 +493,15 @@ impl DiagnosticPublisher {
                 }
                 continue;
             };
+            if snapshot.prepare_pending {
+                // A region waits for its prepare answer. The collection that
+                // runs when it arrives covers the region; this pull leaves
+                // it out and, committed after that collection, would drop
+                // its diagnostics. Skip the document and let the editor
+                // re-pull.
+                summary.coverage_incomplete = true;
+                continue;
+            }
             let lineage = snapshot.lineage;
             let narrower_than_editor_pull = snapshot.narrower_than_editor_pull;
             let pool = self.bridge.pool_arc();
@@ -518,7 +534,7 @@ impl DiagnosticPublisher {
                 }
                 summary.absorb(
                     publisher
-                        .commit_refresh_prefetch(&uri, lineage, outcome)
+                        .commit_refresh_prefetch(&uri, lineage, prepare_epoch, outcome)
                         .await,
                 );
                 summary
@@ -561,6 +577,7 @@ impl DiagnosticPublisher {
         &self,
         uri: &Url,
         lineage: DiagnosticSnapshotLineage,
+        prepare_epoch: u64,
         outcome: PullLayerOutcome,
     ) -> ForwardedPrefetchSummary {
         let edit_lock = self.documents.edit_lock(uri);
@@ -587,6 +604,20 @@ impl DiagnosticPublisher {
             log::debug!(
                 target: LOG_TARGET,
                 "Discarding refresh prefetch resolved under stale settings for {uri}"
+            );
+            drop(edit_guard);
+            return ForwardedPrefetchSummary {
+                coverage_incomplete: true,
+                ..Default::default()
+            };
+        }
+        // The prepare epoch moving mid-prefetch re-sends what the prepared
+        // regions hold, and the collection that follows it may already have
+        // committed: this result was pulled against the text before.
+        if prepare_epoch != self.bridge.pool().prepare_epoch() {
+            log::debug!(
+                target: LOG_TARGET,
+                "Discarding refresh prefetch resolved under a replaced prepare epoch for {uri}"
             );
             drop(edit_guard);
             return ForwardedPrefetchSummary {
@@ -649,12 +680,14 @@ impl DiagnosticPublisher {
         uri: String,
         server: String,
         connection_id: ProgressConnectionId,
+        held: Option<HeldStamp>,
         diagnostics: Vec<Diagnostic>,
     ) {
         self.publish_push_batch(vec![DiagnosticPush {
             uri,
             server,
             connection_id,
+            held,
             diagnostics,
         }])
         .await;
@@ -673,6 +706,7 @@ impl DiagnosticPublisher {
                     &push.uri,
                     push.server,
                     push.connection_id,
+                    push.held,
                     push.diagnostics,
                 )
                 .await
@@ -959,7 +993,7 @@ impl DiagnosticPublisher {
         diagnostics: Vec<Diagnostic>,
     ) {
         if let Some(RecordedPush { host, changed }) = self
-            .record_region_push(virtual_uri, server, connection_id, diagnostics)
+            .record_region_push(virtual_uri, server, connection_id, None, diagnostics)
             .await
         {
             self.publish_recorded_hosts(vec![(host, changed.into_iter().collect())])
@@ -972,6 +1006,7 @@ impl DiagnosticPublisher {
         virtual_uri: &str,
         server: String,
         connection_id: ProgressConnectionId,
+        held: Option<HeldStamp>,
         diagnostics: Vec<Diagnostic>,
     ) -> Option<RecordedPush> {
         let Some((host, region_id)) = self.bridge.resolve_virtual_uri(virtual_uri).await else {
@@ -999,13 +1034,22 @@ impl DiagnosticPublisher {
             );
             return None;
         }
-        Some(self.record_push(
-            host,
+        // The stamp places the push through the text its connection held
+        // when it was read, while the rule allows (see
+        // `BridgeCoordinator::place_push`).
+        let slot = (DiagnosticSource::Region(region_id.clone()), server.clone());
+        let changed = self.aggregator.record_held(
+            &host,
             DiagnosticSource::Region(region_id),
             server,
-            connection_id,
+            Some(connection_id),
+            held,
             diagnostics,
-        ))
+        );
+        Some(RecordedPush {
+            host,
+            changed: changed.then_some(slot),
+        })
     }
 
     /// Feed a proactive pull's combined result into the cache and republish.
@@ -1256,7 +1300,7 @@ impl DiagnosticPublisher {
                     // Only now is each region's injection language known: gate
                     // the region pushes on the allowlist before the merge.
                     self.filter_excluded_region_slots(&settings, &mut snapshot, &geometry, pushed);
-                    geometry.offsets
+                    (geometry.offsets, geometry.regions)
                 }
                 // The document is open but has no parse snapshot: `did_change`
                 // cleared the tree and the off-ingress reparse hasn't landed yet,
@@ -1313,9 +1357,35 @@ impl DiagnosticPublisher {
             }) {
                 pushed.pull_only_change = true;
             }
-            HashMap::new()
+            (HashMap::new(), None)
         };
-        let diagnostics = merge_cached_diagnostics(host, snapshot, &region_offsets);
+        let (region_offsets, regions) = region_offsets;
+        // A slot's coordinates follow the text its connection held when it
+        // pushed (see `BridgeCoordinator::place_push`) — through the region's
+        // offset alone while nothing was ever prepared.
+        let diagnostics = if self.bridge.places_pushes_as_is() {
+            merge_cached_diagnostics(host, snapshot, &region_offsets, |_, _| {
+                crate::lsp::bridge::Presentation::AsIs
+            })
+        } else {
+            let regions: HashMap<&str, &crate::language::injection::ResolvedInjection> = regions
+                .iter()
+                .flat_map(|regions| regions.iter())
+                .map(|region| (region.region.region_id.as_str(), region))
+                .collect();
+            merge_cached_diagnostics(host, snapshot, &region_offsets, |region_id, slot| {
+                match regions.get(region_id) {
+                    Some(region) => self.bridge.place_push(
+                        host,
+                        &region.injection_language,
+                        region_id,
+                        &region.virtual_content,
+                        slot.held.as_ref(),
+                    ),
+                    None => crate::lsp::bridge::Presentation::Unavailable,
+                }
+            })
+        };
 
         let lsp_uri = match crate::lsp::lsp_impl::url_to_uri(host) {
             Ok(uri) => uri,
@@ -2559,6 +2629,7 @@ mod tests {
             .commit_refresh_prefetch(
                 &uri,
                 lineage,
+                server.bridge.pool().prepare_epoch(),
                 PullLayerOutcome::Publish(vec![diag("old-surface")]),
             )
             .await;
@@ -3386,12 +3457,14 @@ mod tests {
                     uri: uri.to_string(),
                     server: "rust_ls".to_string(),
                     connection_id: ProgressConnectionId::for_test(1),
+                    held: None,
                     diagnostics: vec![diag("superseded")],
                 },
                 DiagnosticPush {
                     uri: uri.to_string(),
                     server: "rust_ls".to_string(),
                     connection_id: ProgressConnectionId::for_test(1),
+                    held: None,
                     diagnostics: vec![diag("latest")],
                 },
             ])

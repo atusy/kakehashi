@@ -3235,6 +3235,30 @@ impl LanguageServerPool {
         }
     }
 
+    /// How coordinates `connection_key` computed for `virtual_uri` translate
+    /// (see `DocumentTracker::presentation`).
+    pub(crate) fn presentation(
+        &self,
+        virtual_uri: &str,
+        connection_key: &ConnectionKey,
+        observed: Observed,
+        region: RegionPrepare,
+        virtual_text: &str,
+    ) -> Presentation {
+        self.document_tracker.presentation(
+            virtual_uri,
+            connection_key,
+            observed,
+            region,
+            virtual_text,
+        )
+    }
+
+    /// Whether any connection was ever sent a prepared text.
+    pub(crate) fn prepares_anything(&self) -> bool {
+        self.document_tracker.ever_held_prepared()
+    }
+
     /// What `connection_key` was last sent for `virtual_uri` (see
     /// [`HeldText`]).
     pub(crate) fn held_text(
@@ -4577,6 +4601,7 @@ impl LanguageServerPool {
                 client_progress_registry: Arc::clone(&self.client_progress_registry),
                 progress_connection_id,
                 settings: Arc::clone(&settings_cell),
+                document_tracker: Arc::clone(&self.document_tracker),
             },
         );
 

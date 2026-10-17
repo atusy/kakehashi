@@ -64,6 +64,11 @@ pub(crate) struct DiagnosticSnapshot {
     /// re-pull would — the forwarded-refresh prefetch must then keep its
     /// forced editor nudge instead of standing in for it.
     pub(crate) narrower_than_editor_pull: bool,
+    /// Whether a region was left out because its prepare answer was not in
+    /// yet. The collection that runs once the answer arrives covers it, so a
+    /// refresh prefetch built from this snapshot must not commit: landing
+    /// after that collection, it would drop the region's diagnostics.
+    pub(crate) prepare_pending: bool,
     /// Cross-layer combine config for `textDocument/publishDiagnostics`.
     pub(crate) layer_cfg: ResolvedLayerConfig,
 }
@@ -146,6 +151,7 @@ pub(crate) async fn collect_push_diagnostics_with_error_sink(
         host,
         host_pull_enabled,
         narrower_than_editor_pull: _,
+        prepare_pending: _,
         layer_cfg,
     } = snapshot;
 
@@ -323,6 +329,7 @@ mod tests {
             },
             virt_contexts: vec![virt_ctx_for_server("test")],
             narrower_than_editor_pull: false,
+            prepare_pending: false,
             host: None,
             host_pull_enabled: false,
             layer_cfg: ResolvedLayerConfig::with_defaults("textDocument/publishDiagnostics"),

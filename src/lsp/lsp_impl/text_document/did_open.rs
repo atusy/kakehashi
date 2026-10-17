@@ -1386,6 +1386,7 @@ print("hello")
             virt_contexts: vec![],
             host_pull_enabled: true,
             narrower_than_editor_pull: false,
+            prepare_pending: false,
             host: Some(HostRequestContext {
                 uri: uri.clone(),
                 language_id: "rust".to_string(),
@@ -1517,6 +1518,7 @@ print("hello")
             virt_contexts: vec![],
             host_pull_enabled: true,
             narrower_than_editor_pull: false,
+            prepare_pending: false,
             host: Some(HostRequestContext {
                 uri: uri.clone(),
                 language_id: "rust".to_string(),

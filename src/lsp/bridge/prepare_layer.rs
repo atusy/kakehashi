@@ -31,6 +31,10 @@ pub(crate) struct PrepareLayer {
     /// Pairs already warned about a configured strategy other than
     /// `preferred`, per settings.
     warned_strategy: DashSet<(String, String)>,
+    /// Hosts an editor's pull answered without documents then waiting for
+    /// their prepare answers: owed a refresh once they are sent. One per
+    /// host: each refresh's re-pull records it again while anything waits.
+    pull_debts: DashSet<Url>,
 }
 
 impl PrepareLayer {
@@ -42,6 +46,7 @@ impl PrepareLayer {
                 resolved: DashMap::new(),
             })),
             warned_strategy: DashSet::new(),
+            pull_debts: DashSet::new(),
         }
     }
 }
@@ -206,6 +211,50 @@ impl super::BridgeCoordinator {
         }
     }
 
+    /// [`Self::prepared_document_now`] for a request that cannot wait (see
+    /// `PrepareRegistry::lookup_for_request`).
+    pub(crate) fn prepared_document_now_for_request(
+        &self,
+        target: &super::PrepareTarget,
+        input: PrepareInput<'_>,
+    ) -> PrepareLookup {
+        match &self.prepare {
+            Some(layer) => layer.registry.lookup_for_request(&self.pool, target, input),
+            None => PrepareLookup::Pending,
+        }
+    }
+
+    /// Note that an editor's pull for `host` was answered without documents
+    /// still waiting for their prepare answers: it is owed a
+    /// `workspace/diagnostic/refresh` once a resync pass sends them. When
+    /// none is pending any more — the answer came while the pull ran, and
+    /// its resync may already have looked for the debt — the host is synced
+    /// again, so a pass that reaches every server settles it.
+    pub(crate) fn owe_pull_after_prepare(&self, host: &Url) {
+        let Some(layer) = &self.prepare else {
+            return;
+        };
+        layer.pull_debts.insert(host.clone());
+        if !self.prepare_host_has_pending(host) {
+            layer.registry.requeue_resync(
+                Resync {
+                    host_uri: host.clone(),
+                    ready: false,
+                    recollect: false,
+                },
+                std::time::Duration::ZERO,
+            );
+        }
+    }
+
+    /// Take `host`'s debt of a pull answered without documents then waiting
+    /// for their prepare answers (see [`Self::owe_pull_after_prepare`]).
+    pub(crate) fn take_pull_debt_after_prepare(&self, host: &Url) -> bool {
+        self.prepare
+            .as_ref()
+            .is_some_and(|layer| layer.pull_debts.remove(host).is_some())
+    }
+
     /// A request's wait for a virtual document's answer.
     pub(crate) async fn prepared_document(
         &self,
@@ -235,6 +284,47 @@ impl super::BridgeCoordinator {
             ),
             None => RegionPrepare::default(),
         }
+    }
+
+    /// How a region's cached push places while the region's virtual text is
+    /// `virtual_text`: through the text its connection held when it pushed
+    /// (`held`), by the one rule (see `Presentation`). A slot not stamped
+    /// with a connection places as is — unless the region is prepared, whose
+    /// servers are bridged only through a prepared text.
+    pub(crate) fn place_push(
+        &self,
+        host_uri: &Url,
+        injection_language: &str,
+        region_id: &str,
+        virtual_text: &str,
+        held: Option<&crate::lsp::diagnostic_cache::HeldStamp>,
+    ) -> super::Presentation {
+        let region = self.prepare_region(host_uri, injection_language, region_id);
+        let Some(stamp) = held else {
+            return if region == RegionPrepare::default() {
+                super::Presentation::AsIs
+            } else {
+                super::Presentation::Unavailable
+            };
+        };
+        let Ok(host) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
+            return super::Presentation::Unavailable;
+        };
+        let virtual_uri =
+            super::protocol::VirtualDocumentUri::new(&host, injection_language, region_id);
+        self.pool.presentation(
+            &virtual_uri.to_uri_string(),
+            &stamp.connection,
+            stamp.observed,
+            region,
+            virtual_text,
+        )
+    }
+
+    /// Whether every cached push places as is (see [`Self::place_push`]):
+    /// nothing was ever prepared, so the per-slot placement can be skipped.
+    pub(crate) fn places_pushes_as_is(&self) -> bool {
+        self.prepare_unused() && !self.pool.prepares_anything()
     }
 
     /// Whether a region is prepared: the lifecycle pass prepares its document
@@ -272,10 +362,6 @@ impl super::BridgeCoordinator {
     }
 
     /// Whether any of `host_uri`'s documents still waits for its answer.
-    #[allow(
-        dead_code,
-        reason = "pushes and inbound requests read coordinates through it, next"
-    )]
     pub(crate) fn prepare_host_has_pending(&self, host_uri: &Url) -> bool {
         self.prepare.as_ref().is_some_and(|layer| {
             layer
@@ -316,6 +402,7 @@ impl super::BridgeCoordinator {
     /// Drop a closed host's answers and the start failures recorded for it.
     pub(crate) fn forget_prepared_host(&self, host_uri: &Url) {
         if let Some(layer) = &self.prepare {
+            layer.pull_debts.remove(host_uri);
             layer.registry.forget_host(host_uri);
             self.pool.forget_prepare_start_failures(Some(host_uri));
         }

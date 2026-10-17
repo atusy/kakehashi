@@ -78,6 +78,10 @@ pub(crate) async fn collect_region_diagnostics(
 // Pull diagnostics implementation (textDocument/diagnostic)
 // ============================================================================
 
+/// `(region_id, injection_language, current offset, virtual text)` of a
+/// region, for the pushFallback fold.
+type RegionPushMeta = (String, String, RegionOffset, String);
+
 impl Kakehashi {
     pub(crate) async fn diagnostic_impl(
         &self,
@@ -229,9 +233,12 @@ impl Kakehashi {
         let regions_unavailable = resolved_regions.is_none();
         let virt_regions = resolved_regions.unwrap_or_default();
         // Lightweight per-region metadata `(region_id, injection_language,
-        // current offset)` for the pushFallback fold; the live pull below moves
-        // the regions themselves.
-        let region_meta: Vec<(String, String, RegionOffset)> = virt_regions
+        // current offset, virtual text)` for the pushFallback fold; the live
+        // pull below moves the regions themselves. The virtual text goes
+        // along: a cached push follows the text its connection held, checked
+        // against it when the fold snapshots the pushes, after the awaits
+        // below (see `BridgeCoordinator::place_push`).
+        let region_meta: Vec<RegionPushMeta> = virt_regions
             .iter()
             .map(|r| {
                 (
@@ -241,6 +248,7 @@ impl Kakehashi {
                         r.region.line_range.start,
                         r.line_column_offsets.clone(),
                     ),
+                    r.virtual_content.clone(),
                 )
             })
             .collect();
@@ -263,6 +271,10 @@ impl Kakehashi {
         // Virt layer: 2-level aggregation —
         //   Inner: dispatch per region (fans out to all servers for that region)
         //   Outer: collect across regions
+        // A region left out because its peer's answer is not in (yet): the
+        // answer is incomplete until that document is sent. (One the peer
+        // answered unusably is not bridged at all, by design.)
+        let prepare_skipped = std::sync::atomic::AtomicBool::new(false);
         let virt_fut = async {
             let mut outer_join_set: JoinSet<Vec<Diagnostic>> = JoinSet::new();
             for resolved in virt_regions.iter() {
@@ -276,6 +288,38 @@ impl Kakehashi {
                     configs.retain(|c| !incapable_servers.contains(&c.server_name));
                 }
                 if configs.is_empty() {
+                    // Only push-driven servers: nothing to pull, but a region
+                    // the peer could not prepare never reached them either,
+                    // and its pushes are dropped — not a clean result. Only a
+                    // caller counting failures (CLI diagnose) waits for the
+                    // answer to find out; an editor's pull does not, but while
+                    // the answer for the current text is pending, the
+                    // region's pushes are left out of this result: it owes a
+                    // refresh once it is sent.
+                    if let Some(target) = self
+                        .bridge
+                        .prepare_target(language_name, &resolved.injection_language)
+                    {
+                        let input = crate::lsp::bridge::PrepareInput {
+                            host_uri: &uri,
+                            host_language: language_name,
+                            injection_language: &resolved.injection_language,
+                            region_id: &resolved.region.region_id,
+                            virtual_text: &resolved.virtual_content,
+                            gaps: &resolved.gaps,
+                        };
+                        if external_error_sink.is_none() {
+                            if matches!(
+                                self.bridge
+                                    .prepared_document_now_for_request(&target, input),
+                                crate::lsp::bridge::PrepareLookup::Pending
+                            ) {
+                                prepare_skipped.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        } else if self.bridge.prepared_document(&target, input).await.is_err() {
+                            count_request_errors(&request_error_sink, 1);
+                        }
+                    }
                     continue;
                 }
 
@@ -299,6 +343,27 @@ impl Kakehashi {
                     max_fan_out: agg.max_fan_out,
                     client_progress_token: None,
                 };
+                // The lifecycle pass has started every region's attempt
+                // already: waiting for each in turn costs the slowest one.
+                let region_ctx =
+                    match crate::lsp::lsp_impl::bridge_context::prepare_request_context(
+                        &self.bridge,
+                        language_name,
+                        region_ctx,
+                    )
+                    .await
+                    {
+                        Ok(region_ctx) => region_ctx,
+                        Err(miss) => {
+                            // The region goes undiagnosed, which the CLI must not
+                            // report as success.
+                            count_request_errors(&request_error_sink, 1);
+                            if miss == crate::lsp::bridge::PrepareMiss::Unanswered {
+                                prepare_skipped.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            continue;
+                        }
+                    };
                 let pool = Arc::clone(&pool);
                 let task_sink = request_error_sink.clone();
 
@@ -421,6 +486,11 @@ impl Kakehashi {
             // `DiagnosticAggregator::degraded_pulls`).
             self.diagnostics.record_degraded_pull(&uri, coverage_stamp);
             self.recover_degraded_pull(&uri);
+        } else if prepare_skipped.load(std::sync::atomic::Ordering::Relaxed) {
+            // Owed a refresh once the region's prepared text is sent (the
+            // prepare resync settles the debt), not right away: a re-pull now
+            // would find the region still waiting on its peer.
+            self.bridge.owe_pull_after_prepare(&uri);
         } else {
             // A failed/partial fan-out (`!pull_clean`) still advances the
             // coverage version but clears neither the pull-view lag nor the
@@ -547,7 +617,7 @@ impl Kakehashi {
         &self,
         host: &Url,
         language_name: &str,
-        region_meta: Vec<(String, String, RegionOffset)>,
+        region_meta: Vec<RegionPushMeta>,
         host_ctx: Option<&HostRequestContext>,
         virt_items: &mut Vec<Diagnostic>,
         host_items: &mut Vec<Diagnostic>,
@@ -585,7 +655,7 @@ impl Kakehashi {
         if crate::lsp::diagnostic_cache::has_region_sources(&snapshot) {
             let injection_languages: HashMap<&str, &str> = region_meta
                 .iter()
-                .map(|(region_id, language, _)| (region_id.as_str(), language.as_str()))
+                .map(|(region_id, language, _, _)| (region_id.as_str(), language.as_str()))
                 .collect();
             let mut allowlist = crate::lsp::lsp_impl::bridge_context::RegionPushAllowlist::new(
                 &self.bridge,
@@ -601,8 +671,13 @@ impl Kakehashi {
         }
 
         let mut region_offsets = HashMap::new();
+        // The language and virtual text place a slot through the text its
+        // connection held (see `BridgeCoordinator::place_push`), needed only
+        // once anything was prepared.
+        let places_as_is = self.bridge.places_pushes_as_is();
+        let mut region_texts: HashMap<String, (String, String)> = HashMap::new();
         let mut push_fallback_by_lang: HashMap<String, bool> = HashMap::new();
-        for (region_id, injection_language, offset) in region_meta {
+        for (region_id, injection_language, offset, virtual_text) in region_meta {
             // `get` on the common (cache-hit) path is a single lookup; only the
             // resolving miss touches the map again, moving the owned language key
             // in (no clone).
@@ -616,11 +691,14 @@ impl Kakehashi {
                         "textDocument/diagnostic",
                     )
                     .push_fallback;
-                    push_fallback_by_lang.insert(injection_language, fallback);
+                    push_fallback_by_lang.insert(injection_language.clone(), fallback);
                     fallback
                 }
             };
             if push_fallback {
+                if !places_as_is {
+                    region_texts.insert(region_id.clone(), (injection_language, virtual_text));
+                }
                 region_offsets.insert(region_id, offset);
             }
         }
@@ -663,8 +741,23 @@ impl Kakehashi {
                 DiagnosticSource::PullLayer => false,
             }
         };
+        let place = |region_id: &str, slot: &crate::lsp::diagnostic_cache::SlotEntry| {
+            if places_as_is {
+                return crate::lsp::bridge::Presentation::AsIs;
+            }
+            match region_texts.get(region_id) {
+                Some((language, virtual_text)) => self.bridge.place_push(
+                    host,
+                    language,
+                    region_id,
+                    virtual_text,
+                    slot.held.as_ref(),
+                ),
+                None => crate::lsp::bridge::Presentation::Unavailable,
+            }
+        };
         let (region_push, host_push) =
-            cached_push_diagnostics(host, snapshot, &region_offsets, include);
+            cached_push_diagnostics(host, snapshot, &region_offsets, place, include);
         virt_items.extend(region_push);
         host_items.extend(host_push);
     }
