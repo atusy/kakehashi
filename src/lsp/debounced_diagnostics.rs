@@ -1,12 +1,17 @@
-//! Debounced synthetic-diagnostic triggers for `didChange` (pull-first-diagnostic-forwarding Phase 3).
+//! Debounced synthetic-diagnostic triggers for `didChange` (pull-first-diagnostic-forwarding Phase 3),
+//! and for the prepare answers an edit's held virtual documents wait for.
 //!
 //! Each document has its own timer that resets on every change; firing after the
-//! debounce delay (default 500ms) collects and publishes diagnostics.
+//! debounce delay (default 500ms) collects and publishes diagnostics. A schedule
+//! replaces the pending timer unless that one outranks it for the same version
+//! (one scheduled after prepare answers over an edit's).
 //!
-//! Snapshot data is captured at *schedule* time, not when the timer fires, so the
-//! published diagnostics match the document state that triggered them and the
-//! timer callback needs no `self` reference. Newer schedules supersede older
-//! in-flight publishes via `SyntheticDiagnosticsManager`'s `AbortHandle`.
+//! An edit's snapshot data is captured at *schedule* time, not when the timer
+//! fires, so the published diagnostics match the document state that triggered
+//! them and the timer callback needs no `self` reference. One scheduled after
+//! prepare answers snapshots again when it fires, for the same version: a region
+//! held when it was scheduled may have been sent since. Newer schedules supersede
+//! older in-flight publishes via `SyntheticDiagnosticsManager`'s `AbortHandle`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -92,8 +97,9 @@ pub(crate) struct DebounceExecutionGate {
 /// collection on expiry. Uses `DashMap` for concurrent access from multiple
 /// tokio tasks via sharded locks (no single global lock).
 pub(crate) struct DebouncedDiagnosticsManager {
-    /// Active debounce timers per document.
-    /// The AbortHandle allows cancelling the timer when a new change arrives.
+    /// Active debounce timers per document, with the version and rank each
+    /// was scheduled for: a new schedule cancels the timer unless it
+    /// outranks the schedule for the same version.
     active_timers: DashMap<Url, Timer>,
 
     /// Milliseconds to wait after the last change before triggering diagnostics.
