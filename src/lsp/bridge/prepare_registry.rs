@@ -1351,12 +1351,14 @@ mod tests {
         assert!(!sent("quiet").contains(method));
         assert!(sent("first").contains(method));
         assert!(!sent("second").contains(method));
-        // Timed out, the request is cancelled.
-        assert!(
-            sent("first").contains(r#""method":"$/cancelRequest","params":{"id":2}"#),
-            "{}",
-            sent("first")
-        );
+        // Timed out, the request is cancelled: queued as the attempt ends,
+        // written by the candidate when its turn comes.
+        let cancel = r#""method":"$/cancelRequest","params":{"id":2}"#;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !sent("first").contains(cancel) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(sent("first").contains(cancel), "{}", sent("first"));
         let cell = cell(
             &registry,
             &pool,
