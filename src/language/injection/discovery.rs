@@ -1290,8 +1290,12 @@ impl InjectionResolver {
             covered_until = covered_until.max(range.end);
             true
         }) && covered_until >= group_end;
-        let (virtual_content, line_column_offsets, gaps) =
-            build_combined_virtual_content(text, group_start..group_end, &included);
+        let (virtual_content, line_column_offsets, gaps) = build_combined_virtual_content_recording(
+            text,
+            group_start..group_end,
+            &included,
+            cfg!(test) || crate::experimental::enabled(),
+        );
 
         let mut combined_region = first_cacheable.clone();
         combined_region.byte_range.end = group_end;
@@ -1558,7 +1562,7 @@ fn mask_outside_ranges(
     span: Range<usize>,
     included: &[Range<usize>],
     output: &mut String,
-    gaps: &mut Vec<VirtualGap>,
+    gaps: &mut GapLog,
 ) {
     // The output is the span verbatim with excluded bytes turned to spaces
     // (multi-byte chars can shrink it, never grow it).
@@ -1580,29 +1584,52 @@ fn mask_outside_ranges(
     push_masked_gap(output, gaps, clamped_slice(text, cursor..span.end));
 }
 
+/// The gaps of a combined virtual document, recorded only for a consumer
+/// that presents them (`kakehashi/virtualDocument/prepare`, with
+/// experimental features on): otherwise each would copy host text on every
+/// resolution for nothing.
+struct GapLog(Option<Vec<VirtualGap>>);
+
+impl GapLog {
+    fn push(&mut self, virtual_range: Range<usize>, host_text: &str) {
+        if let Some(gaps) = &mut self.0 {
+            gaps.push(VirtualGap {
+                virtual_range,
+                host_text: host_text.to_string(),
+            });
+        }
+    }
+
+    /// Whether the last gap recorded ends at `end` (always, when nothing is
+    /// recorded: there is no gap to add to).
+    fn last_ends_at(&self, end: usize) -> bool {
+        self.0
+            .as_ref()
+            .is_none_or(|gaps| gaps.last().is_some_and(|gap| gap.virtual_range.end == end))
+    }
+
+    fn into_vec(self) -> Vec<VirtualGap> {
+        self.0.unwrap_or_default()
+    }
+}
+
 /// Mask host-only text with coordinate-preserving whitespace, recording it
 /// as a gap.
-fn push_masked_gap(output: &mut String, gaps: &mut Vec<VirtualGap>, host_text: &str) {
+fn push_masked_gap(output: &mut String, gaps: &mut GapLog, host_text: &str) {
     if host_text.is_empty() {
         return;
     }
     let start = output.len();
     push_coordinate_whitespace(output, host_text);
-    gaps.push(VirtualGap {
-        virtual_range: start..output.len(),
-        host_text: host_text.to_string(),
-    });
+    gaps.push(start..output.len(), host_text);
 }
 
 /// Record host text the virtual document strips (empty in it) as a gap.
-fn push_stripped_gap(output: &str, gaps: &mut Vec<VirtualGap>, host_text: &str) {
+fn push_stripped_gap(output: &str, gaps: &mut GapLog, host_text: &str) {
     if host_text.is_empty() {
         return;
     }
-    gaps.push(VirtualGap {
-        virtual_range: output.len()..output.len(),
-        host_text: host_text.to_string(),
-    });
+    gaps.push(output.len()..output.len(), host_text);
 }
 
 /// Build a line-preserving combined document while stripping excluded prefixes.
@@ -1617,10 +1644,22 @@ fn push_stripped_gap(output: &str, gaps: &mut Vec<VirtualGap>, host_text: &str) 
 /// Every host byte the virtual document does not carry verbatim is also
 /// returned as a [`VirtualGap`], in order, so the bridge can present the
 /// document as content and gap segments (`kakehashi/virtualDocument/prepare`).
+#[cfg(test)]
 fn build_combined_virtual_content(
     text: &str,
     span: Range<usize>,
     included: &[Range<usize>],
+) -> (String, Vec<u32>, Vec<VirtualGap>) {
+    build_combined_virtual_content_recording(text, span, included, true)
+}
+
+/// [`build_combined_virtual_content`], recording its gaps only when
+/// `record_gaps`.
+fn build_combined_virtual_content_recording(
+    text: &str,
+    span: Range<usize>,
+    included: &[Range<usize>],
+    record_gaps: bool,
 ) -> (String, Vec<u32>, Vec<VirtualGap>) {
     // Tree-sitter byte ranges are only valid for the exact parsed text. A
     // stale tree must not turn a combined-document rebuild into an invalid
@@ -1631,7 +1670,7 @@ fn build_combined_virtual_content(
     }
     let mut output = String::with_capacity(span.len());
     let mut offsets = Vec::new();
-    let mut gaps = Vec::new();
+    let mut gaps = GapLog(record_gaps.then(Vec::new));
     let mut line_start = span.start;
     let mut range_index = 0;
     // Lines are LSP lines, as the virtual document is read: LF, CRLF, and a
@@ -1706,10 +1745,7 @@ fn build_combined_virtual_content(
             let start = output.len();
             output.push_str(line_break);
             if !line_break.is_empty() {
-                gaps.push(VirtualGap {
-                    virtual_range: start..output.len(),
-                    host_text: line_break.to_string(),
-                });
+                gaps.push(start..output.len(), line_break);
             }
         }
 
@@ -1718,13 +1754,9 @@ fn build_combined_virtual_content(
             // its one column as whitespace instead, standing for host text.
             output.pop();
             output.push(' ');
-            match gaps.last_mut() {
-                // Masked already, as the end of a gap: it stays that gap's.
-                Some(gap) if gap.virtual_range.end == output.len() => {}
-                _ => gaps.push(VirtualGap {
-                    virtual_range: output.len() - 1..output.len(),
-                    host_text: "\r".to_string(),
-                }),
+            // Masked already, as the end of a gap: it stays that gap's.
+            if !gaps.last_ends_at(output.len()) {
+                gaps.push(output.len() - 1..output.len(), "\r");
             }
         }
 
@@ -1735,7 +1767,7 @@ fn build_combined_virtual_content(
     if output.ends_with(['\n', '\r']) {
         offsets.push(0);
     }
-    (output, offsets, gaps)
+    (output, offsets, gaps.into_vec())
 }
 
 fn push_coordinate_whitespace(output: &mut String, text: &str) {
@@ -3057,6 +3089,21 @@ mod tests {
             virtual_range,
             host_text: host_text.to_string(),
         }
+    }
+
+    /// Without a consumer of gaps nothing is recorded, and the document is
+    /// the same.
+    #[test]
+    fn combined_content_records_no_gaps_unless_asked() {
+        let text = "> ab\n> cd\r\nef";
+        let included = [2..4, 7..9, 11..13];
+        let recorded =
+            build_combined_virtual_content_recording(text, 0..text.len(), &included, true);
+        let unrecorded =
+            build_combined_virtual_content_recording(text, 0..text.len(), &included, false);
+        assert!(!recorded.2.is_empty());
+        assert!(unrecorded.2.is_empty());
+        assert_eq!((recorded.0, recorded.1), (unrecorded.0, unrecorded.1));
     }
 
     #[test]
