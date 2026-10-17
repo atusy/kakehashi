@@ -39,19 +39,30 @@ impl Presentation {
     }
 }
 
-/// What a connection held when kakehashi read coordinates it sent.
+/// What a connection held when kakehashi read coordinates it sent (or is
+/// about to send it a request on).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Observed {
     /// Read while no connection had ever been sent a prepared text: the
-    /// connection held its text as is.
-    BeforeAnyPrepared,
-    /// Read when the connection held no text newer than this generation
-    /// (see [`HeldText::generation`]): a text it holds with a newer one was
-    /// sent after the coordinates were computed.
+    /// connection held a text as is (or nothing).
+    AsIsThen,
+    /// Read when the connection held the text of this generation (`None`:
+    /// nothing on record), prepared or not — or, had it ever, a prepared
+    /// text of the document before (`prepared`). `stale_version`: the
+    /// coordinates name another document version than that text's (a push
+    /// computed for an earlier text).
+    Read {
+        generation: Option<u64>,
+        prepared: bool,
+        stale_version: bool,
+    },
+    /// Read when no text newer than this generation was held by any
+    /// connection (see `DocumentTracker::held_through`): for coordinates
+    /// about several documents, whose records are read later.
     Through(u64),
-    /// Computed for another text than the connection was last sent (a push
-    /// naming an older document version).
-    Stale,
+    /// A request about to be sent: the coordinates it will get are computed
+    /// for whatever the connection holds now.
+    Now,
 }
 
 /// What the lifecycle pass knows of a region's current virtual document.
@@ -67,9 +78,18 @@ pub(crate) struct RegionPrepare {
 
 /// The one rule deciding how a connection's coordinates translate.
 ///
+/// `held` is what the connection holds for the document now, `history`
+/// whether it was ever sent a prepared text of it (kept past the record
+/// itself).
+///
 /// - A region whose current input the peer answered unusably is not bridged.
-/// - A text the connection was sent after the coordinates were read is not
-///   the one they were computed for.
+/// - Where preparation is involved — the region is prepared, or the
+///   connection holds (or ever held, or held when the coordinates were read)
+///   a prepared text of the document — coordinates are those of the text the
+///   connection held when they were read, and that text only: a text sent
+///   since, a document closed since, or an earlier version named, places
+///   nowhere. Elsewhere coordinates translate as on any unprepared path,
+///   whatever was sent meanwhile.
 /// - A text held as is (or nothing on record) translates through the offset
 ///   alone — unless the lifecycle pass prepares the region, whose servers
 ///   are bridged only through a prepared text.
@@ -78,6 +98,7 @@ pub(crate) struct RegionPrepare {
 ///   text describes no current host position.
 pub(super) fn presentation(
     held: Option<&HeldText>,
+    history: bool,
     observed: Observed,
     region: RegionPrepare,
     virtual_text: &str,
@@ -85,13 +106,29 @@ pub(super) fn presentation(
     if region.failed {
         return Presentation::Unavailable;
     }
-    let newer = match observed {
-        Observed::Stale => true,
-        Observed::BeforeAnyPrepared => held.is_some_and(|held| held.map.is_some()),
-        Observed::Through(generation) => held.is_some_and(|held| held.generation > generation),
-    };
-    if newer {
-        return Presentation::Unavailable;
+    let involved = region.prepared
+        || history
+        || held.is_some_and(|held| held.map.is_some())
+        || matches!(observed, Observed::Read { prepared: true, .. });
+    if involved {
+        // Nothing on record: the document was closed since (every send is
+        // recorded before it is queued).
+        let newer = held.is_none() && observed != Observed::Now
+            || match observed {
+                Observed::AsIsThen => held.is_none_or(|held| held.map.is_some()),
+                Observed::Read {
+                    generation,
+                    stale_version,
+                    ..
+                } => stale_version || generation != held.map(|held| held.generation),
+                Observed::Through(generation) => {
+                    held.is_none_or(|held| held.generation > generation)
+                }
+                Observed::Now => false,
+            };
+        if newer {
+            return Presentation::Unavailable;
+        }
     }
     match held.and_then(|held| held.map.as_ref()) {
         None if region.prepared => Presentation::Unavailable,
@@ -126,96 +163,123 @@ mod tests {
         failed: false,
     };
 
+    fn read(generation: u64, prepared: bool) -> Observed {
+        Observed::Read {
+            generation: Some(generation),
+            prepared,
+            stale_version: false,
+        }
+    }
+
+    const AS_IS: RegionPrepare = RegionPrepare {
+        prepared: false,
+        failed: false,
+    };
+
     #[test]
     fn a_text_held_as_is_translates_through_the_offset_unless_the_region_is_prepared() {
         let as_is = held(3, None);
-        assert!(matches!(
-            presentation(
-                Some(&as_is),
-                Observed::Through(3),
-                RegionPrepare::default(),
-                "v"
-            ),
-            Presentation::AsIs
-        ));
-        assert!(matches!(
-            presentation(None, Observed::Through(3), RegionPrepare::default(), "v"),
-            Presentation::AsIs
-        ));
-        // A region the lifecycle pass prepares is bridged only through a
-        // prepared text: one held as is was sent before its pair gained its
-        // peer, and nothing on record says no map.
-        assert!(matches!(
-            presentation(Some(&as_is), Observed::Through(3), PREPARED, "v"),
-            Presentation::Unavailable
-        ));
-        assert!(matches!(
-            presentation(None, Observed::Through(3), PREPARED, "v"),
-            Presentation::Unavailable
-        ));
+        for held in [Some(&as_is), None] {
+            assert!(matches!(
+                presentation(held, false, read(3, false), AS_IS, "v"),
+                Presentation::AsIs
+            ));
+            // A region the lifecycle pass prepares is bridged only through a
+            // prepared text: one held as is was sent before its pair gained
+            // its peer, and nothing on record says no map.
+            assert!(matches!(
+                presentation(held, false, Observed::Now, PREPARED, "v"),
+                Presentation::Unavailable
+            ));
+        }
     }
 
     #[test]
     fn a_prepared_text_translates_through_its_map_only_for_the_current_virtual_text() {
         let prepared = held(3, Some(map("v")));
         assert!(matches!(
-            presentation(Some(&prepared), Observed::Through(3), PREPARED, "v"),
+            presentation(Some(&prepared), true, read(3, true), PREPARED, "v"),
             Presentation::Prepared(_)
         ));
         // Prepared from another virtual text: no current host position.
         assert!(matches!(
-            presentation(Some(&prepared), Observed::Through(3), PREPARED, "w"),
+            presentation(Some(&prepared), true, read(3, true), PREPARED, "w"),
             Presentation::Unavailable
         ));
         // Right after its pair lost its peer, the server still holds it.
         assert!(matches!(
-            presentation(
-                Some(&prepared),
-                Observed::Through(3),
-                RegionPrepare::default(),
-                "v"
-            ),
+            presentation(Some(&prepared), true, Observed::Now, AS_IS, "v"),
             Presentation::Prepared(_)
         ));
     }
 
     #[test]
-    fn a_text_sent_after_the_coordinates_were_read_is_not_theirs() {
-        let prepared = held(4, Some(map("v")));
-        assert!(matches!(
-            presentation(Some(&prepared), Observed::Through(3), PREPARED, "v"),
-            Presentation::Unavailable
-        ));
+    fn where_nothing_is_prepared_coordinates_translate_whatever_was_sent_since() {
+        // As on any unprepared path: a push racing an edit, or naming an
+        // earlier version, is placed through the current offset.
         let as_is = held(4, None);
+        for observed in [
+            read(3, false),
+            Observed::Read {
+                generation: Some(4),
+                prepared: false,
+                stale_version: true,
+            },
+            Observed::Through(3),
+            Observed::AsIsThen,
+        ] {
+            assert!(
+                matches!(
+                    presentation(Some(&as_is), false, observed, AS_IS, "v"),
+                    Presentation::AsIs
+                ),
+                "{observed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn where_preparation_is_involved_coordinates_are_the_held_texts_only() {
+        let prepared = held(4, Some(map("v")));
+        // A text sent after the coordinates were read.
         assert!(matches!(
-            presentation(
-                Some(&as_is),
-                Observed::Through(3),
-                RegionPrepare::default(),
-                "v"
-            ),
+            presentation(Some(&prepared), true, read(3, true), PREPARED, "v"),
             Presentation::Unavailable
         ));
-        // Read before anything was prepared: only a prepared text is newer
-        // than what the connection held then.
         assert!(matches!(
-            presentation(
-                Some(&as_is),
-                Observed::BeforeAnyPrepared,
-                RegionPrepare::default(),
-                "v"
-            ),
-            Presentation::AsIs
-        ));
-        let prepared = held(1, Some(map("v")));
-        assert!(matches!(
-            presentation(Some(&prepared), Observed::BeforeAnyPrepared, PREPARED, "v"),
+            presentation(Some(&prepared), true, Observed::Through(3), PREPARED, "v"),
             Presentation::Unavailable
         ));
-        // Computed for an earlier version of the text.
         assert!(matches!(
-            presentation(Some(&prepared), Observed::Stale, PREPARED, "v"),
+            presentation(Some(&prepared), true, Observed::AsIsThen, PREPARED, "v"),
             Presentation::Unavailable
+        ));
+        // An earlier version named.
+        let stale = Observed::Read {
+            generation: Some(4),
+            prepared: true,
+            stale_version: true,
+        };
+        assert!(matches!(
+            presentation(Some(&prepared), true, stale, PREPARED, "v"),
+            Presentation::Unavailable
+        ));
+        // The pair lost its peer: the text held as is now was sent after the
+        // prepared one the coordinates were computed for.
+        let as_is = held(5, None);
+        assert!(matches!(
+            presentation(Some(&as_is), true, read(4, true), AS_IS, "v"),
+            Presentation::Unavailable
+        ));
+        // Closed since: nothing on record now.
+        assert!(matches!(
+            presentation(None, true, read(4, true), AS_IS, "v"),
+            Presentation::Unavailable
+        ));
+        // Read while it was held, and still held: placed through its map.
+        assert!(matches!(
+            presentation(Some(&prepared), true, read(4, true), PREPARED, "v"),
+            Presentation::Prepared(_)
         ));
     }
 
@@ -227,7 +291,7 @@ mod tests {
             failed: true,
         };
         assert!(matches!(
-            presentation(Some(&prepared), Observed::Through(3), failed, "v"),
+            presentation(Some(&prepared), true, read(3, true), failed, "v"),
             Presentation::Unavailable
         ));
     }

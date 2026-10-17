@@ -3218,6 +3218,12 @@ impl LanguageServerPool {
         )
     }
 
+    /// Forget which of `documents` a connection was ever sent a prepared text
+    /// of (see `DocumentTracker::forget_prepared_history`).
+    pub(super) fn forget_prepared_history(&self, documents: &[OpenedVirtualDoc]) {
+        self.document_tracker.forget_prepared_history(documents);
+    }
+
     /// What `connection_key` was last sent for `virtual_uri` (see
     /// [`HeldText`]).
     pub(crate) fn held_text(
