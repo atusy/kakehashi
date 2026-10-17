@@ -34,8 +34,28 @@ pub(crate) struct BridgeInjection {
     pub(crate) language: String,
     /// Stable ULID-based region ID (lazy-node-identity-tracking)
     pub(crate) region_id: String,
-    /// The text content of the bridge virtual document
+    /// The text content of the bridge virtual document: what downstream
+    /// servers are sent, the prepared text for a prepared one.
     pub(crate) content: String,
+    /// Not to be sent: its prepared form is not available
+    /// (`kakehashi/virtualDocument/prepare` pending or failed). A held
+    /// injection still exists — its open document stays open — but neither
+    /// opens nor changes downstream.
+    pub(crate) held: bool,
+    /// The map from `content` back to the virtual document, for a prepared
+    /// one: sent along with it, so each connection's record of what it holds
+    /// says how its coordinates translate.
+    pub(crate) prepared: Option<Arc<super::protocol::PreparedMap>>,
+}
+
+impl BridgeInjection {
+    /// The text to send, with its map.
+    pub(crate) fn sent(&self) -> super::pool::SentText<'_> {
+        super::pool::SentText {
+            text: &self.content,
+            map: self.prepared.as_ref(),
+        }
+    }
 }
 
 /// One server's share of an eager-open batch: its spawn config plus the
@@ -159,7 +179,7 @@ pub(crate) struct ForceStartTestControl {
 /// here when the operation has 3+ callers, combines pool with node_tracker, or
 /// genuinely benefits from a semantic name (e.g., document lifecycle, shutdown).
 pub(crate) struct BridgeCoordinator {
-    pool: Arc<LanguageServerPool>,
+    pub(super) pool: Arc<LanguageServerPool>,
     node_tracker: Arc<NodeTracker>,
     /// Cancel forwarder for upstream cancel notification and downstream forwarding.
     ///
@@ -232,6 +252,9 @@ pub(crate) struct BridgeCoordinator {
     /// one `Arc` bump per configured server — the settings blobs themselves
     /// stay behind their `Arc`s).
     config_memo: ArcSwap<ConfigMemo>,
+    /// `kakehashi/virtualDocument/prepare`, with experimental features on
+    /// (`KAKEHASHI_EXPERIMENTAL=true`, read once): `None` prepares nothing.
+    pub(super) prepare: Option<super::prepare_layer::PrepareLayer>,
 }
 
 /// One settings snapshot's worth of resolved-config lookups (see
@@ -307,6 +330,7 @@ impl BridgeCoordinator {
             host_eager_open_generation: std::sync::atomic::AtomicU64::new(0),
             host_eager_open_tasks: DashMap::new(),
             config_memo: ArcSwap::new(Arc::new(ConfigMemo::empty(None))),
+            prepare: crate::experimental::enabled().then(super::prepare_layer::PrepareLayer::new),
         }
     }
 
@@ -333,6 +357,7 @@ impl BridgeCoordinator {
             host_eager_open_generation: std::sync::atomic::AtomicU64::new(0),
             host_eager_open_tasks: DashMap::new(),
             config_memo: ArcSwap::new(Arc::new(ConfigMemo::empty(None))),
+            prepare: crate::experimental::enabled().then(super::prepare_layer::PrepareLayer::new),
         }
     }
 
@@ -1341,6 +1366,34 @@ impl BridgeCoordinator {
         injections: &[BridgeInjection],
     ) -> std::collections::HashSet<String> {
         self.pool.close_replaced_docs(uri, injections).await
+    }
+
+    /// Close the host's held virtual documents (`(injection language, region
+    /// id)`) on the connections that hold them unprepared — sent before their
+    /// pair gained a prepare peer, or never recorded: until the peer answers
+    /// (or if it fails) that text would stay bridged, which a prepared pair
+    /// never is. Returns the regions closed.
+    pub(crate) async fn close_unprepared_held_docs(
+        &self,
+        uri: &Url,
+        held: &[(&str, &str)],
+    ) -> Vec<String> {
+        let held: std::collections::HashSet<(&str, &str)> = held.iter().copied().collect();
+        if held.is_empty() {
+            return Vec::new();
+        }
+        self.pool
+            .close_deselected_docs(uri, |doc| {
+                !held.contains(&(doc.virtual_uri.language(), doc.virtual_uri.region_id()))
+                    || self
+                        .pool
+                        .held_text(&doc.virtual_uri.to_uri_string(), &doc.connection_key)
+                        .is_some_and(|held| held.map.is_some())
+            })
+            .await
+            .into_iter()
+            .map(|doc| doc.virtual_uri.region_id().to_string())
+            .collect()
     }
 
     /// Close the host's virtual documents whose server current settings no
@@ -2809,6 +2862,8 @@ mod tests {
                 language: "lua".to_string(),
                 region_id: "region-0".to_string(),
                 content: "print(1)\n".to_string(),
+                held: false,
+                prepared: None,
             }]
         };
         // Decide routing up front, so no candidate server is asked (the
@@ -2873,6 +2928,8 @@ mod tests {
                 language: "lua".to_string(),
                 region_id: "region-0".to_string(),
                 content: "print(1)\n".to_string(),
+                held: false,
+                prepared: None,
             }]
         };
         let key = ConnectionKey::new("test-server", None);
@@ -3431,6 +3488,8 @@ mod tests {
             language: "python".to_string(),
             region_id: "region-0".to_string(),
             content: "import os\n".to_string(),
+            held: false,
+            prepared: None,
         }];
 
         for (name, cmd) in [("ruff", "ruff"), ("pyright", "pyright")] {
@@ -3495,6 +3554,8 @@ mod tests {
             language: "python".to_string(),
             region_id: "region-0".to_string(),
             content: "import os\n".to_string(),
+            held: false,
+            prepared: None,
         }];
 
         // `python` bridges to "ruff", not "other-server" → no match → no-op.
@@ -3533,6 +3594,8 @@ mod tests {
             language: "lua".to_string(),
             region_id: "region-0".to_string(),
             content: "print('hello')".to_string(),
+            held: false,
+            prepared: None,
         };
         let virtual_uri = crate::lsp::bridge::protocol::VirtualDocumentUri::new(
             &host_uri_lsp,
@@ -3916,6 +3979,8 @@ mod tests {
             language: language.to_string(),
             region_id: region_id.to_string(),
             content: String::new(),
+            held: false,
+            prepared: None,
         }
     }
 

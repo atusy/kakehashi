@@ -60,6 +60,7 @@ impl Kakehashi {
         self.debounced_diagnostics.cancel(uri);
         self.bridge.cancel_eager_open(uri);
         self.bridge.cancel_host_eager_open(uri);
+        self.bridge.forget_prepared_host(uri);
 
         let closed_docs = self.bridge.close_host_document(uri).await;
         if !closed_docs.is_empty() {

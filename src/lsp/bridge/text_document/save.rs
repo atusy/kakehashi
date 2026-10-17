@@ -17,7 +17,7 @@ use tower_lsp_server::ls_types::TextDocumentSaveReason;
 use url::Url;
 
 use super::super::pool::{
-    ConnectionHandle, ConnectionState, LanguageServerPool, NotificationSendResult, SentText,
+    ConnectionHandle, ConnectionState, LanguageServerPool, NotificationSendResult,
 };
 use super::super::protocol::{JsonRpcNotification, VirtualDocumentUri};
 
@@ -73,7 +73,7 @@ impl LanguageServerPool {
                 incarnation,
                 &injection.language,
                 &injection.region_id,
-                &injection.content,
+                injection.sent(),
             );
             let virtual_uri =
                 VirtualDocumentUri::new(&host_uri_lsp, &injection.language, &injection.region_id);
@@ -108,7 +108,7 @@ impl LanguageServerPool {
                     continue;
                 }
 
-                let content = SentText::from(&injection.content);
+                let content = injection.sent();
                 let did_change = self
                     .increment_version_if_content_changed(&virtual_uri, &connection_key, content)
                     .await
@@ -242,6 +242,8 @@ mod tests {
             language: "lua".to_string(),
             region_id: ulid::Ulid::generate().to_string(),
             content: "print(1)".to_string(),
+            held: false,
+            prepared: None,
         };
         let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap();
         let virtual_uri =

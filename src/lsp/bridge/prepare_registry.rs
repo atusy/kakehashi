@@ -98,6 +98,7 @@ pub(crate) enum PrepareLookup {
 }
 
 /// Why waiting gave no document to send.
+#[allow(dead_code, reason = "requests wait for their answers through it, next")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PrepareMiss {
     /// No answer is in (yet): the attempt got none, a retry is backing off,

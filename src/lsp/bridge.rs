@@ -36,11 +36,12 @@ mod inbound_request_registry;
 mod peer;
 mod pool;
 pub(crate) use pool::{HostLanguageAdmission, INIT_TIMEOUT_SECS};
-#[allow(
-    dead_code,
-    reason = "the prepare layer looks documents up through it, next"
-)]
+mod prepare_layer;
 mod prepare_registry;
+pub(crate) use prepare_registry::{
+    Answer as PrepareAnswer, PrepareInput, PrepareLookup, PrepareTarget, Resync,
+    retry_delay as prepare_retry_delay,
+};
 mod progress_registry;
 mod protocol;
 mod root_markers;

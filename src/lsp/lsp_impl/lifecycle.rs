@@ -96,6 +96,10 @@ enum ClientRoot<'a> {
     LegacyPath(&'a str),
 }
 
+/// Times a prepare resync pass whose sends failed is retried (with the
+/// prepare backoff: one second, doubling) before waiting for the next edit.
+const MAX_RESYNC_RETRIES: u32 = 6;
+
 impl ClientRoot<'_> {
     /// How this root's origin reads in the startup log.
     fn source(&self) -> &'static str {
@@ -774,6 +778,8 @@ impl Kakehashi {
             ));
         }
 
+        self.spawn_prepare_resync_loop();
+
         // Ask a pull-capable client for its configuration now that the
         // handshake is complete. Editors that send `didChangeConfiguration`
         // with no usable `settings` have no other way to configure kakehashi
@@ -784,6 +790,104 @@ impl Kakehashi {
         // forwarding loops above. Nothing follows it, so the only thing such a
         // client delays is its own configuration.
         self.pull_client_configuration().await;
+    }
+
+    /// Sync hosts again whose virtual documents a prepare peer answered for
+    /// (`kakehashi/virtualDocument/prepare`): the finished attempt names the
+    /// host, and the injection pass re-run for it now finds the answer. An
+    /// unusable answer names it at once; an attempt that got no answer names
+    /// it again after its retry backoff. A move of the prepare epoch names
+    /// every open host: what each holds was prepared (or sent as is) under
+    /// the epoch before. Without the prepare layer, nothing is spawned.
+    fn spawn_prepare_resync_loop(&self) {
+        let Some((mut resync_rx, mut epochs)) = self.bridge.take_prepare_resyncs() else {
+            return;
+        };
+        let injection = self.injection_coordinator();
+        let bridge = Arc::clone(&self.bridge);
+        let token = self.shutdown_token.clone();
+        tokio::spawn(async move {
+            // Consecutive passes per host whose sends failed.
+            let mut failures: std::collections::HashMap<Url, u32> =
+                std::collections::HashMap::new();
+            loop {
+                let first = tokio::select! {
+                    _ = token.cancelled() => return,
+                    resync = resync_rx.recv() => match resync {
+                        Some(resync) => vec![resync],
+                        None => return,
+                    },
+                    changed = epochs.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        // Nothing was prepared, nor is any document held:
+                        // what every server holds stands.
+                        if bridge.prepare_unused() {
+                            continue;
+                        }
+                        injection
+                            .open_host_uris()
+                            .into_iter()
+                            .map(|host_uri| crate::lsp::bridge::Resync {
+                                host_uri,
+                                ready: false,
+                                recollect: true,
+                            })
+                            .collect()
+                    },
+                };
+                // Several documents of one host usually finish together.
+                let mut hosts: std::collections::HashMap<Url, (bool, bool)> =
+                    std::collections::HashMap::new();
+                for resync in first
+                    .into_iter()
+                    .chain(std::iter::from_fn(|| resync_rx.try_recv().ok()))
+                {
+                    let (ready, recollect) = hosts.entry(resync.host_uri).or_default();
+                    *ready |= resync.ready;
+                    *recollect |= resync.recollect;
+                }
+                for (uri, (ready, recollect)) in hosts {
+                    // A send the pass could not queue leaves its server on
+                    // the text before, and the answer is cached, so no
+                    // resync would come again: retry with backoff, a bounded
+                    // number of times, while the host is open. So is a pass
+                    // the host's regions could not be looked at for (a
+                    // reload in progress), which deferred its work to a
+                    // retry that only syncs documents.
+                    let synchronized = injection.process_injections_synchronized(&uri).await;
+                    let looked = matches!(injection.bridge_injections(&uri), Some((_, Some(_))));
+                    if synchronized && looked {
+                        failures.remove(&uri);
+                    } else if injection.document_incarnation(&uri).is_some() {
+                        let failed = failures.entry(uri.clone()).or_default();
+                        *failed += 1;
+                        if *failed <= MAX_RESYNC_RETRIES {
+                            bridge.requeue_prepare_resync(
+                                crate::lsp::bridge::Resync {
+                                    host_uri: uri.clone(),
+                                    ready,
+                                    recollect,
+                                },
+                                crate::lsp::bridge::prepare_retry_delay(*failed),
+                            );
+                        } else {
+                            // Servers may still hold the text before, and
+                            // requests on it fail their wait, until the next
+                            // edit or save syncs the host.
+                            log::warn!(
+                                target: "kakehashi::bridge::prepare",
+                                "Gave up syncing the prepared virtual documents of {uri} after {MAX_RESYNC_RETRIES} retries; the next edit syncs them"
+                            );
+                            failures.remove(&uri);
+                        }
+                    } else {
+                        failures.remove(&uri);
+                    }
+                }
+            }
+        });
     }
 
     /// Arm a Unix-signal watcher that reaps the downstream server pool when
