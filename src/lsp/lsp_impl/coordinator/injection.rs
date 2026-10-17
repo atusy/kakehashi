@@ -88,12 +88,13 @@ pub(crate) struct InjectionCoordinator {
 /// Who looks a document's prepare answer up while resolving injections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PrepareHolder {
-    /// The lifecycle pass, under the document's edit lock: the document is
-    /// held on this input until its answer lands, which syncs the host.
+    /// The lifecycle pass, or a save at the saved version, under the
+    /// document's edit lock: the document is held on this input until its
+    /// answer lands, which syncs the host.
     LifecyclePass,
-    /// Anything else (a re-open sweep, a recovery probe, a save): it reads
-    /// the answer, or starts the attempt, without moving what the document
-    /// is held on.
+    /// Anything else (a re-open sweep, a recovery probe): it reads the
+    /// answer, or starts the attempt, without moving what the document is
+    /// held on.
     Probe,
 }
 
@@ -281,8 +282,9 @@ impl InjectionCoordinator {
     }
 
     /// [`Self::resolve_injection_data`] as `holder` looks the documents'
-    /// prepare answers up: only the lifecycle pass, under the document's edit
-    /// lock, holds each document on the input it resolves. A probe off that
+    /// prepare answers up: only the lifecycle pass, or a save at the saved
+    /// version, under the document's edit lock, holds each document on the
+    /// input it resolves. A probe off that
     /// lock reading an older snapshot would otherwise move what a document
     /// is held on back to an older input, whose answer then resyncs nothing.
     fn resolve_injection_data_as(
