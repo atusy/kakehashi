@@ -867,11 +867,9 @@ impl Kakehashi {
                         if changed.is_err() {
                             return;
                         }
-                        // Nothing was prepared, nor is any document held:
-                        // what every server holds stands.
-                        if bridge.prepare_unused() {
-                            continue;
-                        }
+                        // Even with nothing looked up yet: a pair with no
+                        // candidate advertising the request was never
+                        // looked up, and the move may give it one.
                         injection
                             .open_host_uris()
                             .into_iter()

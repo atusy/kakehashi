@@ -491,8 +491,8 @@ impl super::BridgeCoordinator {
         ))
     }
 
-    /// Whether nothing was ever looked up for a prepare peer: an epoch move
-    /// then changes nothing any document holds.
+    /// Whether nothing was ever looked up for a prepare peer: no answer was
+    /// given, and no region is prepared.
     pub(crate) fn prepare_unused(&self) -> bool {
         self.prepare
             .as_ref()
