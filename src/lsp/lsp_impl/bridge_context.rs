@@ -80,8 +80,18 @@ fn method_requires_contiguous_injection(method: &str) -> bool {
 /// hints stay open to a contiguous prepared document (they are display; their
 /// edits are dropped instead).
 pub(crate) fn method_closed_to(resolved: &ResolvedInjection, method: &str, prepared: bool) -> bool {
+    method_closed_to_with(resolved, method, || prepared)
+}
+
+/// [`method_closed_to`], asking whether the document is prepared only for
+/// a method that depends on it.
+fn method_closed_to_with(
+    resolved: &ResolvedInjection,
+    method: &str,
+    prepared: impl FnOnce() -> bool,
+) -> bool {
     method_requires_contiguous_injection(method)
-        && (!resolved.contiguous || (prepared && method != "textDocument/inlayHint"))
+        && (!resolved.contiguous || (method != "textDocument/inlayHint" && prepared()))
 }
 
 /// [`prepare_request_context`] for a `method` request: `None` when the
@@ -1217,11 +1227,9 @@ impl Kakehashi {
         // included (most likely prepared); checked again with the answer in
         // (see `prepare_request_context_for`). Formatting waits instead (see
         // `method_gate`).
-        if method_closed_to(
-            &resolved,
-            method_name,
-            self.lifecycle_prepares(&uri, &resolved),
-        ) {
+        if method_closed_to_with(&resolved, method_name, || {
+            self.lifecycle_prepares(&uri, &resolved)
+        }) {
             return None;
         }
 
@@ -2096,11 +2104,9 @@ impl Kakehashi {
         };
         let mut contexts = Vec::new();
         for resolved in regions {
-            if method_closed_to(
-                &resolved,
-                method_name,
-                self.lifecycle_prepares(&uri, &resolved),
-            ) {
+            if method_closed_to_with(&resolved, method_name, || {
+                self.lifecycle_prepares(&uri, &resolved)
+            }) {
                 continue;
             }
             // Clamp to the region so the translated range is in-region; skip a
