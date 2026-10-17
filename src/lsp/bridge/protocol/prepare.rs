@@ -26,6 +26,10 @@ use crate::text::position::normalize_lone_carriage_returns;
 use serde::{Deserialize, Serialize};
 use tower_lsp_server::ls_types::{Position, TextEdit};
 
+mod edits;
+
+pub(crate) use edits::EditMode;
+
 /// The request kakehashi sends to the configured prepare peer.
 pub(crate) const PREPARE_METHOD: &str = "kakehashi/virtualDocument/prepare";
 
@@ -371,6 +375,7 @@ fn build_prepared(
 
     let mut text = String::with_capacity(virtual_text.len());
     let mut runs: Vec<Run> = Vec::new();
+    let mut indents: Vec<SegmentIndent> = Vec::new();
     let last_index = layout.segments.len().saturating_sub(1);
     for (index, (segment, answer)) in layout.segments.iter().zip(result.segments).enumerate() {
         let virtual_segment = &virtual_text[segment.virtual_range.clone()];
@@ -388,6 +393,10 @@ fn build_prepared(
                 )
                 .map_err(|reason| PrepareError::InvalidChange { index, reason })?;
                 let mut cursor = segment.virtual_range.start;
+                let mut deleted: Vec<&str> = Vec::new();
+                let deletes_closing_lines = deletions
+                    .iter()
+                    .any(|(_, kind)| *kind == RunKind::TrailingLines);
                 for (deletion, kind) in deletions {
                     push_run(
                         &mut runs,
@@ -405,6 +414,18 @@ fn build_prepared(
                         virtual_text,
                         "",
                     );
+                    // The closing indent deleted with the document's closing
+                    // lines (the indent before a closing `''`, which must go
+                    // with them) indents no content line, so it says nothing
+                    // of the indent new lines regain. Without closing lines
+                    // deleted, an indentation-only last line may be content
+                    // of its own, and counts as any line does.
+                    let closing_indent = deletes_closing_lines
+                        && index == last_index
+                        && deletion.end == segment.virtual_range.end;
+                    if kind == RunKind::Deleted && !closing_indent {
+                        deleted.push(&virtual_text[deletion.clone()]);
+                    }
                     cursor = deletion.end;
                 }
                 push_run(
@@ -415,6 +436,10 @@ fn build_prepared(
                     virtual_text,
                     "",
                 );
+                indents.push(SegmentIndent::from_deletions(
+                    segment.virtual_range.clone(),
+                    &deleted,
+                ));
             }
             (SegmentKind::Gap, WireSegmentResult::Gap { content }) => {
                 let replacement = content.as_deref().unwrap_or(virtual_segment);
@@ -450,6 +475,7 @@ fn build_prepared(
         virtual_lines: LineMap::new(virtual_text.to_string()),
         prepared_lines: LineMap::new(text.clone()),
         runs,
+        indents,
         fingerprint,
         built: taken,
         #[cfg(test)]
@@ -680,6 +706,33 @@ struct Run {
     virtual_: Range<usize>,
 }
 
+/// The indentation a content segment lost, which lines an edit to P creates
+/// there regain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SegmentIndent {
+    virtual_range: Range<usize>,
+    /// `Some(indent)` when every deletion in the segment removed the same
+    /// text (a dedent); `None` when they differ, so a new line has no single
+    /// right indentation.
+    uniform: Option<String>,
+}
+
+impl SegmentIndent {
+    fn from_deletions(virtual_range: Range<usize>, deleted: &[&str]) -> Self {
+        let uniform = match deleted.split_first() {
+            None => Some(String::new()),
+            Some((first, rest)) => rest
+                .iter()
+                .all(|other| other == first)
+                .then(|| (*first).to_string()),
+        };
+        Self {
+            virtual_range,
+            uniform,
+        }
+    }
+}
+
 /// Coordinates between a prepared document (P) and its virtual document (V).
 ///
 /// Equality compares a fingerprint of both texts and the runs between them:
@@ -690,6 +743,9 @@ pub(crate) struct PreparedMap {
     virtual_lines: LineMap,
     prepared_lines: LineMap,
     runs: Vec<Run>,
+    /// One per content segment, in order; derived from the runs, so not
+    /// part of the fingerprint.
+    indents: Vec<SegmentIndent>,
     fingerprint: u64,
     /// Where the input its answer came from was taken in the presentation
     /// order (see [`apply_prepare_result_at`]); not part of its equality.
@@ -965,6 +1021,21 @@ impl Side {
 /// after the lines deleted from the document's start, and P's end, whatever
 /// the bias, before those deleted from its end.
 fn map_offset(runs: &[Run], offset: usize, bias: Bias, from: Side) -> usize {
+    map_offset_stopping(runs, offset, bias, from, |kind| {
+        matches!(kind, RunKind::Gap | RunKind::Deleted)
+    })
+}
+
+/// [`map_offset`], with a [`Bias::End`] offset from P stopping before the
+/// empty runs of the kinds `stops_before` accepts that sit there (and before
+/// the document's deleted closing lines, whatever it accepts).
+fn map_offset_stopping(
+    runs: &[Run],
+    offset: usize,
+    bias: Bias,
+    from: Side,
+    stops_before: impl Fn(RunKind) -> bool,
+) -> usize {
     // P's end, where the document's deleted closing lines were: the
     // content ends there in V too, before them.
     if matches!(from, Side::Prepared)
@@ -977,9 +1048,7 @@ fn map_offset(runs: &[Run], offset: usize, bias: Bias, from: Side) -> usize {
     // range covers none of that host text.
     if bias == Bias::End
         && matches!(from, Side::Prepared)
-        && let Some(run) = empty_run(runs, offset, |kind| {
-            matches!(kind, RunKind::Gap | RunKind::Deleted)
-        })
+        && let Some(run) = empty_run(runs, offset, stops_before)
     {
         return run.virtual_.start;
     }

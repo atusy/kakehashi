@@ -32,8 +32,9 @@ coordinate bookkeeping itself. The peer is any language server that
 advertises the request; tsudoi-language-server is the intended one, since
 its handlers are user code.
 
-Edits are not mapped back through a prepared document: methods whose
-answers are edits are not available on one (see Coordinates).
+Edits a downstream server makes to a prepared document are mapped back
+through the same map (see Edits); methods whose edits are not mapped that
+way are not available on one (see Coordinates).
 
 ### Configuration and Discovery
 
@@ -188,18 +189,46 @@ request is not made at all at a host position with no corresponding
 position in P, such as one strictly inside a gap or on a deleted edge line,
 since the server would answer it for another place.
 
-No edit is mapped back through a prepared document. The methods closed to
-a non-contiguous combined document — codeAction, colorPresentation,
-completion, formatting, inlayHint, linkedEditingRange, onTypeFormatting,
-prepareRename, rangeFormatting, rename — are closed to a prepared one too,
-as is an inbound `workspace/applyEdit` computed for a prepared text, but
-for inlay hints: they stay available on a contiguous prepared document
-(they are display), with each hint's `textEdits` dropped.
+The methods closed to a non-contiguous combined document — codeAction,
+colorPresentation, completion, formatting, inlayHint, linkedEditingRange,
+onTypeFormatting, prepareRename, rangeFormatting, rename — are closed to a
+prepared one too, as is an inbound `workspace/applyEdit` computed for a
+prepared text, but for inlay hints: they stay available on a contiguous
+prepared document, each hint's `textEdits` mapped as Edits describes.
 A `*/resolve` envelope minted from a prepared document never resolves,
 nor does a call or type hierarchy item minted from one answer its
 follow-ups (`callHierarchy/incomingCalls`, `outgoingCalls`,
 `typeHierarchy/supertypes`, `subtypes`): the map it was minted through is
 not carried.
+
+### Edits
+
+An edit a server makes to P maps onto V keeping its extent: its range maps
+as positions do, except that a change starting at a line start that
+replaces, clears or deletes whole lines, or opens with a line break, also
+covers the indentation the peer removed from that line, and a change ending
+at a line start keeps that line's own removed indentation (the change takes
+it along and gives it back). Every line the edit's text begins regains the
+indentation the peer removed from the segment it lands in, provided the
+peer removed the same indentation from every line of that segment;
+otherwise an edit creating a line there is refused, since no single
+indentation is right.
+
+A set of edits the client applies together (a hint's `textEdits`) is mapped
+one by one and checked as a whole on the edited V. It is refused, and
+dropped like any unsafe set, when:
+
+- an edit is reversed, or edits overlap in P or once mapped;
+- an edit reaches into a gap's text (or, for a gap the peer emptied,
+  spans its position);
+- host text starting a line in V — a gap such as the fences between two
+  combined blocks, or the document's deleted closing lines — would no
+  longer start one;
+- a line break P hides — a deleted edge line's, or a replaced gap's — would
+  fuse with one beside it into a single CRLF.
+
+No edit in P reaches into the deleted edge lines or the closing indent
+deleted with them: P has no position inside them.
 
 ### Failure
 
@@ -408,7 +437,7 @@ a hook per kind of change.
   does.
 - Edit-producing methods (completion, code actions, rename, formatting and
   the others listed in Coordinates) and inbound `workspace/applyEdit` are
-  not available on prepared documents; inlay hints lose their edits.
+  not available on prepared documents.
 - A peer must be bridged for the languages it prepares, so it receives
   their documents too; keeping it out of other methods takes `priorities`.
 - A peer that cannot start leaves its documents unprepared rather than

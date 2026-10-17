@@ -5,9 +5,9 @@
 
 use std::sync::Arc;
 
-use tower_lsp_server::ls_types::{Position, Range};
+use tower_lsp_server::ls_types::{Position, Range, TextEdit};
 
-use super::prepare::{Bias, PreparedMap};
+use super::prepare::{Bias, EditMode, PreparedMap};
 
 /// The starting offset of an injection region in the host document.
 ///
@@ -131,6 +131,12 @@ fn translate_virtual_position_to_host_biased(
     if let Some(prepared) = offset.prepared() {
         *pos = prepared.to_virtual(*pos, bias);
     }
+    translate_unprepared_virtual_position_to_host(pos, offset);
+}
+
+/// V → host only, ignoring `offset`'s prepared map: for coordinates already
+/// mapped out of the prepared document.
+fn translate_unprepared_virtual_position_to_host(pos: &mut Position, offset: &RegionOffset) {
     let virtual_line = pos.line;
     pos.line = pos.line.saturating_add(offset.line());
     pos.character = pos
@@ -185,6 +191,38 @@ pub(crate) fn translate_virtual_range_to_host(range: &mut Range, offset: &Region
     } else {
         translate_virtual_position_to_host_biased(&mut range.end, offset, Bias::End);
     }
+}
+
+/// Translate, in place, a set of edits a downstream server made to one
+/// virtual document into host coordinates, as `mode` reads them; `false` —
+/// the caller drops the set or its carrier — when the set is refused, with
+/// `edits` left as they came.
+///
+/// An edit to a prepared document must also restore the indentation its new
+/// lines lost and keep off the host text the peer hid (gaps, deleted edge
+/// lines), so the set goes through [`PreparedMap::map_edits`]. An
+/// unprepared document's edits translate one by one, as ranges, allocating
+/// nothing.
+pub(crate) fn translate_virtual_text_edits_to_host(
+    edits: &mut [TextEdit],
+    offset: &RegionOffset,
+    mode: EditMode,
+) -> bool {
+    let Some(prepared) = offset.prepared() else {
+        for edit in edits.iter_mut() {
+            translate_virtual_range_to_host(&mut edit.range, offset);
+        }
+        return true;
+    };
+    let Some(mapped) = prepared.map_edits(edits, mode) else {
+        return false;
+    };
+    for (edit, mut mapped) in edits.iter_mut().zip(mapped) {
+        translate_unprepared_virtual_position_to_host(&mut mapped.range.start, offset);
+        translate_unprepared_virtual_position_to_host(&mut mapped.range.end, offset);
+        *edit = mapped;
+    }
+    true
 }
 
 // =============================================================================
@@ -371,6 +409,56 @@ mod tests {
             range,
             Range::new(Position::new(10, 6), Position::new(11, 0))
         );
+    }
+
+    #[test]
+    fn prepared_text_edits_restore_the_indent_in_host_coordinates() {
+        let offset = prepared_offset();
+        // A line inserted after `y` (P (1, 2)) regains the removed indent.
+        let mut edits = [TextEdit {
+            range: Range::new(Position::new(1, 3), Position::new(1, 3)),
+            new_text: "\n  z".to_string(),
+        }];
+        assert!(translate_virtual_text_edits_to_host(
+            &mut edits,
+            &offset,
+            EditMode::Extent
+        ));
+        assert_eq!(
+            edits[0].range,
+            Range::new(Position::new(11, 5), Position::new(11, 5))
+        );
+        assert_eq!(edits[0].new_text, "\n    z");
+        // A refused set is left as it came.
+        let reversed = TextEdit {
+            range: Range::new(Position::new(1, 3), Position::new(0, 0)),
+            new_text: "x".to_string(),
+        };
+        let mut edits = [reversed.clone()];
+        assert!(!translate_virtual_text_edits_to_host(
+            &mut edits,
+            &offset,
+            EditMode::Extent
+        ));
+        assert_eq!(edits, [reversed]);
+    }
+
+    #[test]
+    fn unprepared_text_edits_translate_as_ranges() {
+        let mut edits = [TextEdit {
+            range: Range::new(Position::new(0, 1), Position::new(1, 0)),
+            new_text: "\nz".to_string(),
+        }];
+        assert!(translate_virtual_text_edits_to_host(
+            &mut edits,
+            &RegionOffset::new(10, 4),
+            EditMode::Extent
+        ));
+        assert_eq!(
+            edits[0].range,
+            Range::new(Position::new(10, 5), Position::new(11, 0))
+        );
+        assert_eq!(edits[0].new_text, "\nz");
     }
 
     #[test]

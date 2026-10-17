@@ -74,11 +74,17 @@ fn method_requires_contiguous_injection(method: &str) -> bool {
     )
 }
 
+/// Whether an edit method stays open to a contiguous prepared document: its
+/// edits are mapped back through the prepared map
+/// (`translate_virtual_text_edits_to_host`).
+fn method_maps_prepared_edits(method: &str) -> bool {
+    matches!(method, "textDocument/inlayHint")
+}
+
 /// Whether `method` is closed to a region: one that is not contiguous, or
 /// whose document is prepared (`prepared`), cannot take the edits the method
-/// answers with — no edit is mapped back through a prepared document. Inlay
-/// hints stay open to a contiguous prepared document (they are display; their
-/// edits are dropped instead).
+/// answers with — but for the methods whose edits are mapped back through a
+/// prepared document ([`method_maps_prepared_edits`]).
 pub(crate) fn method_closed_to(resolved: &ResolvedInjection, method: &str, prepared: bool) -> bool {
     method_closed_to_with(resolved, method, || prepared)
 }
@@ -91,7 +97,7 @@ fn method_closed_to_with(
     prepared: impl FnOnce() -> bool,
 ) -> bool {
     method_requires_contiguous_injection(method)
-        && (!resolved.contiguous || (method != "textDocument/inlayHint" && prepared()))
+        && (!resolved.contiguous || (!method_maps_prepared_edits(method) && prepared()))
 }
 
 /// [`prepare_request_context`] for a `method` request: `None` when the
@@ -2323,7 +2329,7 @@ mod tests {
 
     /// An edit method on a region the lifecycle pass has not looked up yet
     /// is closed once its answer is in, unless the document goes as is;
-    /// inlay hints stay open (their edits are dropped instead).
+    /// inlay hints stay open (their edits are mapped back).
     #[tokio::test]
     async fn an_answer_closes_edit_methods_before_the_lifecycle_pass_looks() {
         let (service, resolved, uri) = kakehashi_with_an_unlooked_region();
