@@ -513,11 +513,10 @@ impl PrepareRegistry {
         // the slots in use.)
         while region.slots.len() > SLOTS_PER_REGION + 1 {
             let held = region.held;
-            let Some(index) = region.slots[1..].iter().rposition(|slot| {
-                Some(slot.key) != held
-                    && !slot.cell.in_flight.load(Ordering::Acquire)
-                    && Arc::strong_count(&slot.cell) == 1
-            }) else {
+            let Some(index) = region.slots[1..]
+                .iter()
+                .rposition(|slot| Some(slot.key) != held && Arc::strong_count(&slot.cell) == 1)
+            else {
                 break;
             };
             region.slots.remove(index + 1);
@@ -980,7 +979,7 @@ mod tests {
     }
 
     #[test]
-    fn an_input_whose_attempt_is_in_flight_is_not_evicted() {
+    fn an_input_still_in_use_is_not_evicted() {
         let registry = PrepareRegistry::default();
         let pool = LanguageServerPool::preparing();
         let target = unstartable_target(&pool);
@@ -992,7 +991,7 @@ mod tests {
             input(&host, "a"),
             Holder::Request,
         );
-        running.in_flight.store(true, Ordering::Release);
+        // `running` stands for a waiter, or a running attempt's end guard.
         // Looked up and released: idle.
         cell(
             &registry,
@@ -1251,21 +1250,23 @@ mod tests {
         pool.insert_connection(handle).await;
     }
 
-    /// A candidate advertising the request that refuses it (its first
-    /// request, id 2) `delay` seconds after it arrived, recording what it
-    /// was sent at `path`.
+    /// A candidate advertising the request that answers it (its first
+    /// request, id 2) with error `code` `delay` seconds after it arrived,
+    /// recording what it was sent at `path`.
     #[cfg(unix)]
     async fn refusing_candidate(
         pool: &LanguageServerPool,
         name: &str,
         path: &std::path::Path,
         delay: f64,
+        code: i64,
     ) {
         use crate::lsp::bridge::pool::ConnectionState;
         use crate::lsp::bridge::pool::test_helpers::{
             advertise_prepare_for_test, create_handle_with_command,
         };
-        let refusal = r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32603,"message":"no"}}"#;
+        let refusal =
+            format!(r#"{{"jsonrpc":"2.0","id":2,"error":{{"code":{code},"message":"no"}}}}"#);
         let script = format!(
             // An asynchronous list reads /dev/null unless given stdin.
             "exec 3<&0; (cat <&3 > \"$1\") & \
@@ -1330,6 +1331,12 @@ mod tests {
         assert!(!sent("quiet").contains(method));
         assert!(sent("first").contains(method));
         assert!(!sent("second").contains(method));
+        // Timed out, the request is cancelled.
+        assert!(
+            sent("first").contains(r#""method":"$/cancelRequest","params":{"id":2}"#),
+            "{}",
+            sent("first")
+        );
         let cell = cell(
             &registry,
             &pool,
@@ -1374,7 +1381,7 @@ mod tests {
         let mut resync = registry.take_resync_rx().unwrap();
         let pool = Arc::new(LanguageServerPool::preparing());
         let dir = tempfile::tempdir().unwrap();
-        refusing_candidate(&pool, "peer", &dir.path().join("peer"), 0.0).await;
+        refusing_candidate(&pool, "peer", &dir.path().join("peer"), 0.0, -32603).await;
         let host = Url::parse("file:///host.md").unwrap();
         let target = target_of(&pool, &[("peer", &["peer"])]);
         registry.slot(
@@ -1420,9 +1427,10 @@ mod tests {
         let sent = |path: &std::path::Path| std::fs::read_to_string(path).unwrap_or_default();
         // `first` answers a while after the request arrived, having
         // withdrawn its advertisement meanwhile.
-        refusing_candidate(&pool, "first", &first, 0.5).await;
+        refusing_candidate(&pool, "first", &first, 0.5, -32603).await;
         pool.record_prepare_advertisement(&ConnectionKey::for_server("first"), true);
-        recording_candidate(&pool, "second", true, &second).await;
+        // A retryable cancellation: no answer, at once.
+        refusing_candidate(&pool, "second", &second, 0.0, -32800).await;
         let host = Url::parse("file:///host.md").unwrap();
         let candidates: &[(&str, &[&str])] = &[("first", &["first"]), ("second", &["second"])];
         let target = target_of(&pool, candidates);
@@ -1488,6 +1496,102 @@ mod tests {
         );
         let b = cell(&registry, &pool, &other, input(&host, "a"), Holder::Request);
         assert!(!Arc::ptr_eq(&a, &b));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_lookups_share_one_attempt() {
+        let registry = PrepareRegistry::default();
+        let pool = Arc::new(LanguageServerPool::preparing());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peer");
+        refusing_candidate(&pool, "peer", &path, 0.5, -32603).await;
+        let host = Url::parse("file:///host.md").unwrap();
+        let target = target_of(&pool, &[("peer", &["peer"])]);
+        let (a, b, ()) = tokio::join!(
+            registry.prepare(&pool, &target, input(&host, "a")),
+            registry.prepare(&pool, &target, input(&host, "a")),
+            async {
+                registry.lookup_or_start(&pool, &target, input(&host, "a"));
+            }
+        );
+        assert_eq!(a.err(), Some(PrepareMiss::Failed));
+        assert_eq!(b.err(), Some(PrepareMiss::Failed));
+        let sent = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            sent.matches(crate::lsp::bridge::protocol::PREPARE_METHOD)
+                .count(),
+            1,
+            "{sent}"
+        );
+        let cell = cell(
+            &registry,
+            &pool,
+            &target,
+            input(&host, "a"),
+            Holder::Request,
+        );
+        assert_eq!(cell.versions.lock().unwrap().len(), 1);
+        assert_eq!(*cell.attempts.borrow(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_method_not_found_answer_withdraws_the_advertisement() {
+        let registry = PrepareRegistry::default();
+        let pool = Arc::new(LanguageServerPool::preparing());
+        let dir = tempfile::tempdir().unwrap();
+        refusing_candidate(&pool, "peer", &dir.path().join("peer"), 0.0, -32601).await;
+        pool.record_prepare_advertisement(&ConnectionKey::for_server("peer"), true);
+        let epoch = pool.prepare_epoch();
+        let host = Url::parse("file:///host.md").unwrap();
+        let target = target_of(&pool, &[("peer", &["peer"])]);
+        assert_eq!(
+            registry
+                .prepare(&pool, &target, input(&host, "a"))
+                .await
+                .err(),
+            Some(PrepareMiss::Unanswered)
+        );
+        assert_eq!(pool.prepare_advertisement("peer"), Some(false));
+        assert!(pool.prepare_epoch() > epoch);
+        // Asked again under the new epoch, it is passed over: sent as is.
+        let renewed = target_of(&pool, &[("peer", &["peer"])]);
+        assert!(matches!(
+            registry.prepare(&pool, &renewed, input(&host, "a")).await,
+            Ok(Answer::AsIs)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_attempt_forgotten_while_its_candidate_is_ready_asks_nothing() {
+        let registry = PrepareRegistry::default();
+        let pool = Arc::new(LanguageServerPool::preparing());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peer");
+        recording_candidate(&pool, "peer", true, &path).await;
+        let host = Url::parse("file:///host.md").unwrap();
+        let target = target_of(&pool, &[("peer", &["peer"])]);
+        let slot = registry
+            .slot(
+                &target,
+                input(&host, "a"),
+                Holder::LifecyclePass,
+                target.epoch,
+            )
+            .unwrap();
+        // The host closes as the attempt starts.
+        registry.forget_host(&host);
+        let mut attempts = slot.cell.attempts.subscribe();
+        assert!(registry.start(&slot, &pool, &target, input(&host, "a")));
+        let _ = attempts.changed().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let sent = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            !sent.contains(crate::lsp::bridge::protocol::PREPARE_METHOD),
+            "{sent}"
+        );
     }
 
     #[test]
