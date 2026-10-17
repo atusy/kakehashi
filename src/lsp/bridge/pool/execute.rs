@@ -299,27 +299,21 @@ impl LanguageServerPool {
                 return Err(e);
             }
 
-            // The open above may have sent another text (a newer forwarded
-            // one), or a text may have been sent since the wait. Checked
-            // through the enqueue under the document's transition, which a
-            // didChange records and queues under (after the open, which
-            // takes it itself; the connections → transition order of
-            // didChange).
-            let transition = self
-                .request_text_matters(offset)
-                .then(|| self.open_transition_lock(&virtual_uri, connection_key));
-            let _transition_guard = match &transition {
-                Some(transition) => Some(transition.lock().await),
-                None => None,
-            };
-            if transition.is_some() && !self.holds_request_text(&uri_string, connection_key, offset)
+            // After the open above (which takes the transition itself; the
+            // connections → transition order of didChange).
+            let _transition_guard = match self
+                .hold_request_text(&virtual_uri, connection_key, offset)
+                .await
             {
-                drop(connections);
-                if let Some(ref id) = upstream_request_id {
-                    self.unregister_upstream_request(id, connection_key);
+                Ok(guard) => guard,
+                Err(e) => {
+                    drop(connections);
+                    if let Some(ref id) = upstream_request_id {
+                        self.unregister_upstream_request(id, connection_key);
+                    }
+                    return Err(e);
                 }
-                return Err(request_text_not_held(connection_key));
-            }
+            };
 
             // Queue the request via single-writer loop (ls-bridge-message-ordering)
             if let Err(e) = handle.send_request(request, request_id) {
@@ -381,6 +375,35 @@ impl LanguageServerPool {
             super::Presentation::AsIs => request_map.is_none(),
             super::Presentation::Unavailable => false,
         }
+    }
+
+    /// Hold the document's transition through a request's enqueue, while
+    /// `connection_key` holds the text the request built on `offset`
+    /// describes: the lazy open may have sent another text (a newer
+    /// forwarded one), or the lifecycle pass one since the wait. A didChange
+    /// records and queues under the transition, so whether any prepared
+    /// text matters is read under it too: the first prepared text sent
+    /// cannot slip between that read and the enqueue. Nothing is held when
+    /// the pool prepares nothing.
+    async fn hold_request_text(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &super::ConnectionKey,
+        offset: &RegionOffset,
+    ) -> io::Result<Option<tokio::sync::OwnedMutexGuard<()>>> {
+        if !self.prepares() {
+            return Ok(None);
+        }
+        let guard = self
+            .open_transition_lock(virtual_uri, connection_key)
+            .lock_owned()
+            .await;
+        if self.request_text_matters(offset)
+            && !self.holds_request_text(&virtual_uri.to_uri_string(), connection_key, offset)
+        {
+            return Err(request_text_not_held(connection_key));
+        }
+        Ok(Some(guard))
     }
 
     /// Whether [`Self::holds_request_text`] can be false for a request built
@@ -953,6 +976,63 @@ mod tests {
         );
         assert_eq!(started.elapsed(), delay);
         closer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_first_prepared_text_cannot_slip_ahead_of_an_as_is_request() {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let pool = Arc::new(LanguageServerPool::preparing());
+        let host_uri = Url::parse("file:///test/first.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap(),
+            "lua",
+            TEST_ULID_LUA_0,
+        );
+        let key = ConnectionKey::for_server("lua");
+        pool.record_sent_for_test(&virtual_uri, &key, "  a".into());
+        // The lifecycle pass is about to send the first prepared text ever:
+        // it holds the transition it records and queues under.
+        let transition = pool
+            .open_transition_lock(&virtual_uri, &key)
+            .lock_owned()
+            .await;
+        let request = {
+            let pool = Arc::clone(&pool);
+            let virtual_uri = virtual_uri.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                pool.hold_request_text(&virtual_uri, &key, &RegionOffset::new(0, 0))
+                    .await
+                    .map(|guard| guard.is_some())
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !request.is_finished(),
+            "an as-is request must not read that no prepared text matters before the send"
+        );
+        let prepared =
+            apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(dedent_answer()))
+                .unwrap();
+        pool.record_sent_for_test(
+            &virtual_uri,
+            &key,
+            SentText {
+                text: &prepared.text,
+                map: Some(&prepared.map),
+            },
+        );
+        drop(transition);
+        assert!(request.await.unwrap().is_err());
+
+        // A pool preparing nothing holds nothing.
+        let off = LanguageServerPool::new();
+        assert!(
+            off.hold_request_text(&virtual_uri, &key, &RegionOffset::new(0, 0))
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
