@@ -54,7 +54,7 @@ pub(crate) struct CrashedConnection {
 }
 pub(crate) use crash_recovery::{RecoveryDecision, Reservation};
 pub(in crate::lsp::bridge) use document_tracker::DocumentTracker;
-pub(crate) use document_tracker::{OpenedVirtualDoc, SentText, VirtualUriObserver};
+pub(crate) use document_tracker::{HeldText, OpenedVirtualDoc, SentText, VirtualUriObserver};
 pub(crate) use dynamic_capability_registry::DynamicCapabilityRegistry;
 pub(crate) use message_sender::{ConnectionHandleSender, MessageSender};
 use pending_reopen::PendingReopenRegistry;
@@ -185,7 +185,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use tokio::sync::Mutex;
 use url::Url;
 
@@ -370,7 +370,34 @@ pub(crate) struct HostVirtualContents {
     /// Only accepted parse-label promotions establish this admission fence.
     /// Explicit aliases keep their existing canonical request behavior.
     promoted_language: Option<HostLanguageAdmission>,
-    contents: DashMap<String, DashMap<String, Arc<str>>>,
+    contents: DashMap<String, DashMap<String, Arc<LatestText>>>,
+    /// (language, region id) of the regions the lifecycle pass holds for a
+    /// prepare peer known to prepare them (see
+    /// [`LanguageServerPool::hold_latest_virtual_content`]): no request opens
+    /// one with text as is.
+    held: DashSet<(String, String)>,
+}
+
+/// The latest text forwarded for a virtual document, which a deferred
+/// didOpen substitutes: what downstream servers are sent, with the prepared
+/// map when a peer prepared it.
+#[derive(Debug)]
+pub(crate) struct LatestText {
+    text: String,
+    map: Option<Arc<super::protocol::PreparedMap>>,
+    /// When it was last recorded (see [`super::protocol::next_presentation`]),
+    /// the same text recorded again included: the pass recording it decided
+    /// on it then.
+    recorded: std::sync::atomic::AtomicU64,
+}
+
+impl LatestText {
+    fn as_sent(&self) -> SentText<'_> {
+        SentText {
+            text: &self.text,
+            map: self.map.as_ref(),
+        }
+    }
 }
 
 pub(crate) struct HostLanguageAdmission {
@@ -2691,6 +2718,30 @@ impl LanguageServerPool {
         let connection_generation = self.document_tracker.connection_generation(connection_key);
         let transition = self.open_transition_lock(virtual_uri, connection_key);
         let transition_guard = Arc::clone(&transition).lock_owned().await;
+        // Under the transition the lifecycle pass closes held documents
+        // under too: a region it holds for its prepare peer is not opened
+        // with text as is (a request resolved before its pair gained the
+        // peer), whether its own or the last forwarded.
+        if let VirtualOpenContent::LatestKnown(provided) = &content
+            && provided.map.is_none()
+            && self
+                .latest_virtual_contents
+                .get(host_uri)
+                .is_some_and(|host| {
+                    !host.held.is_empty()
+                        && host.held.contains(&(
+                            virtual_uri.language().to_string(),
+                            virtual_uri.region_id().to_string(),
+                        ))
+                })
+        {
+            drop(transition_guard);
+            self.remove_open_transition_lock_if_unshared(virtual_uri, connection_key, &transition);
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "bridge: the region is held for its prepare peer",
+            ));
+        }
         if !self
             .document_tracker
             .is_document_opened_on_connection(virtual_uri, connection_key)
@@ -2799,12 +2850,24 @@ impl LanguageServerPool {
             ),
             VirtualOpenContent::Snapshot(provided) => (provided, None),
         };
-        // The cache holds virtual text as is: it never stands in for a
-        // prepared text, whose map it would drop.
+        // A prepared request opens with the newer of its own text and the
+        // cached one, by when its answer's input was taken and when the cache
+        // was recorded: a cache from before (sent as is before the pair
+        // gained its peer, or prepared from an earlier text) would hold back
+        // a request whose answer is already in, and a newer one (the
+        // lifecycle pass's, as is since the pair lost its peer, say) must not
+        // be replaced by the stale request. A request built as is opens with
+        // the cache — most likely the lifecycle pass's newer text, which the
+        // server should hold even though this request then fails its own
+        // check.
         let virtual_content = current_content
             .as_deref()
-            .filter(|_| provided.map.is_none())
-            .map_or(provided, SentText::from);
+            .filter(|cached| {
+                provided.map.is_none_or(|request| {
+                    cached.recorded.load(std::sync::atomic::Ordering::Relaxed) > request.built()
+                })
+            })
+            .map_or(provided, LatestText::as_sent);
         // What the connection holds is recorded as the didOpen is queued,
         // taken back unless it is (see `DocumentTracker::record_and_queue`):
         // a server pushing diagnostics the moment it opens the document finds
@@ -2889,34 +2952,73 @@ impl LanguageServerPool {
         Ok(())
     }
 
-    pub(crate) fn record_latest_virtual_content(
+    pub(crate) fn record_latest_virtual_content<'a>(
         &self,
         host_uri: &Url,
         incarnation: u64,
         language: &str,
         region_id: &str,
-        content: &str,
+        content: impl Into<SentText<'a>>,
     ) {
+        let content = content.into();
         let Some(host) = self.latest_virtual_contents.get(host_uri) else {
             return;
         };
         if host.incarnation != incarnation {
             return;
         }
-        if let Some(regions) = host.contents.get(language) {
-            if regions
-                .get(region_id)
-                .is_some_and(|cached| cached.as_ref() == content)
-            {
-                return;
+        let latest = || {
+            Arc::new(LatestText {
+                text: content.text.to_string(),
+                map: content.map.cloned(),
+                recorded: std::sync::atomic::AtomicU64::new(super::protocol::next_presentation()),
+            })
+        };
+        match host.contents.get(language) {
+            Some(regions) => match regions.get(region_id).filter(|cached| {
+                cached.text == content.text && cached.map.as_deref() == content.map.map(Arc::as_ref)
+            }) {
+                Some(cached) => cached.recorded.store(
+                    super::protocol::next_presentation(),
+                    std::sync::atomic::Ordering::Relaxed,
+                ),
+                None => {
+                    regions.insert(region_id.to_string(), latest());
+                }
+            },
+            None => {
+                host.contents
+                    .entry(language.to_string())
+                    .or_default()
+                    .insert(region_id.to_string(), latest());
             }
-            regions.insert(region_id.to_string(), Arc::<str>::from(content));
-            return;
         }
-        host.contents
-            .entry(language.to_string())
-            .or_default()
-            .insert(region_id.to_string(), Arc::<str>::from(content));
+        // Only once the text to open with is in: a request checking the hold
+        // in between would open the text it replaces.
+        if !host.held.is_empty() {
+            host.held
+                .remove(&(language.to_string(), region_id.to_string()));
+        }
+    }
+
+    /// Note that the lifecycle pass holds `region_id` (under `language`)
+    /// for a prepare peer known to prepare it: what was last forwarded for
+    /// it was sent as is, and a request opening it lazily must not send
+    /// that (or its own text as is) while it waits — or after its peer
+    /// failed. Cleared once text is recorded for it again.
+    pub(crate) fn hold_latest_virtual_content(
+        &self,
+        host_uri: &Url,
+        incarnation: u64,
+        language: &str,
+        region_id: &str,
+    ) {
+        if let Some(host) = self.latest_virtual_contents.get(host_uri)
+            && host.incarnation == incarnation
+        {
+            host.held
+                .insert((language.to_string(), region_id.to_string()));
+        }
     }
 
     /// The document's lifecycle lock, created on first use. Transitions lock it
@@ -2998,6 +3100,7 @@ impl LanguageServerPool {
                 incarnation,
                 promoted_language: None,
                 contents: DashMap::new(),
+                held: DashSet::new(),
             },
         );
     }
@@ -3113,6 +3216,16 @@ impl LanguageServerPool {
             || handle.send_serialized_notification(payload),
             |result| matches!(result, NotificationSendResult::Queued),
         )
+    }
+
+    /// What `connection_key` was last sent for `virtual_uri` (see
+    /// [`HeldText`]).
+    pub(crate) fn held_text(
+        &self,
+        virtual_uri: &str,
+        connection_key: &ConnectionKey,
+    ) -> Option<HeldText> {
+        self.document_tracker.held_text(virtual_uri, connection_key)
     }
 
     /// Record `content` as sent to this connection, as a queued send would.
@@ -8837,6 +8950,8 @@ mod tests {
             language: "lua".to_string(),
             region_id: TEST_ULID_LUA_0.to_string(),
             content: "local x = 42".to_string(),
+            held: false,
+            prepared: None,
         }];
 
         let start = Instant::now();
@@ -8930,6 +9045,8 @@ mod tests {
                 language: "lua".to_string(),
                 region_id: TEST_ULID_LUA_0.to_string(),
                 content: "print('current')".to_string(),
+                held: false,
+                prepared: None,
             }],
         )
         .await;
@@ -8968,6 +9085,8 @@ mod tests {
                 language: "lua".into(),
                 region_id: TEST_ULID_LUA_0.into(),
                 content: "print('previous')".into(),
+                held: false,
+                prepared: None,
             }],
         )
         .await;
@@ -9078,6 +9197,156 @@ mod tests {
         assert_eq!(change["params"]["contentChanges"][0]["text"], "current");
     }
 
+    /// The text a didOpen sent, from what `rx` received.
+    fn opened_text(rx: &mut tokio::sync::mpsc::Receiver<OutboundMessage>) -> String {
+        let Some(OutboundMessage::Untracked(payload)) = rx.try_recv().ok() else {
+            panic!("a didOpen was queued");
+        };
+        payload["params"]["textDocument"]["text"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// A map dedenting `virtual_text`'s first line by two columns.
+    fn dedent_map(virtual_text: &str) -> Arc<crate::lsp::bridge::protocol::PreparedMap> {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let answer = serde_json::from_value(serde_json::json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(answer),
+        )
+        .unwrap()
+        .map
+    }
+
+    #[tokio::test]
+    async fn a_lazy_open_sends_the_newer_of_its_text_and_the_forwarded_one() {
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///test/lazy-open-order.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        pool.open_host_incarnation(&host_uri, 1).await;
+
+        // Forwarded as is before the request's answer was taken: the
+        // prepared request opens with its own text, under its map.
+        pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  x = 1");
+        let map = dedent_map("  x = 1");
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
+        pool.ensure_document_opened(
+            &mut sender,
+            &host_uri,
+            &virtual_uri,
+            SentText {
+                text: "x = 1",
+                map: Some(&map),
+            },
+            &key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened_text(&mut rx), "x = 1");
+        let held = pool.held_text(&virtual_uri.to_uri_string(), &key).unwrap();
+        assert!(Arc::ptr_eq(held.map.as_ref().unwrap(), &map));
+
+        // A request built as is opens with the forwarded text, as on any
+        // unprepared path.
+        let other = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_1);
+        pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_1, "print('new')");
+        pool.ensure_document_opened(&mut sender, &host_uri, &other, "print('old')", &key)
+            .await
+            .unwrap();
+        assert_eq!(opened_text(&mut rx), "print('new')");
+    }
+
+    #[tokio::test]
+    async fn a_prepared_open_takes_a_text_forwarded_after_its_answer_was_taken() {
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///test/lazy-open-newer.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        // The request's answer was taken, then the lifecycle pass forwarded
+        // the text as is (its pair lost its peer since, say).
+        let map = dedent_map("  x = 1");
+        pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  x = 2");
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
+        pool.ensure_document_opened(
+            &mut sender,
+            &host_uri,
+            &virtual_uri,
+            SentText {
+                text: "x = 1",
+                map: Some(&map),
+            },
+            &key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened_text(&mut rx), "  x = 2");
+        assert!(
+            pool.held_text(&virtual_uri.to_uri_string(), &key)
+                .unwrap()
+                .map
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_region_held_for_its_peer_is_not_opened_as_is() {
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///test/lazy-open-held.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  x = 1");
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
+        assert!(
+            pool.ensure_document_opened(&mut sender, &host_uri, &virtual_uri, "  x = 1", &key)
+                .await
+                .is_err()
+        );
+        assert!(rx.try_recv().is_err(), "nothing was sent as is");
+        // A prepared text opens it.
+        let map = dedent_map("  x = 1");
+        pool.ensure_document_opened(
+            &mut sender,
+            &host_uri,
+            &virtual_uri,
+            SentText {
+                text: "x = 1",
+                map: Some(&map),
+            },
+            &key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened_text(&mut rx), "x = 1");
+        // Recording the prepared text releases the hold.
+        pool.record_latest_virtual_content(
+            &host_uri,
+            1,
+            "lua",
+            TEST_ULID_LUA_0,
+            SentText {
+                text: "x = 1",
+                map: Some(&map),
+            },
+        );
+        assert!(
+            pool.latest_virtual_contents
+                .get(&host_uri)
+                .unwrap()
+                .held
+                .is_empty()
+        );
+    }
+
     #[tokio::test]
     async fn stale_incarnation_cannot_repopulate_latest_virtual_content_after_fast_reopen() {
         let pool = LanguageServerPool::new();
@@ -9118,6 +9387,8 @@ mod tests {
                     language: "lua".to_string(),
                     region_id: TEST_ULID_LUA_0.to_string(),
                     content: "print('old lifetime')".to_string(),
+                    held: false,
+                    prepared: None,
                 }],
             )
             .await;
@@ -9165,6 +9436,8 @@ mod tests {
                     language: "lua".to_string(),
                     region_id: TEST_ULID_LUA_0.to_string(),
                     content: "print('old lifetime')".to_string(),
+                    held: false,
+                    prepared: None,
                 }],
             )
             .await;
@@ -9188,6 +9461,8 @@ mod tests {
                 language: "lua".to_string(),
                 region_id: TEST_ULID_LUA_0.to_string(),
                 content: "print('cached')".to_string(),
+                held: false,
+                prepared: None,
             }],
         )
         .await;
@@ -11974,6 +12249,8 @@ mod tests {
                         language: "lua".to_string(),
                         region_id: TEST_ULID_LUA_0.to_string(),
                         content: "print('new')".to_string(),
+                        held: false,
+                        prepared: None,
                     }],
                 )
                 .await;
@@ -12047,6 +12324,8 @@ mod tests {
             language: "lua".to_string(),
             region_id: TEST_ULID_LUA_0.to_string(),
             content: "print('hello')".to_string(),
+            held: false,
+            prepared: None,
         }];
         pool.open_host_incarnation(&host_uri, 1).await;
         pool.forward_didchange_to_opened_docs(&host_uri, 1, &injections)
@@ -12119,6 +12398,8 @@ mod tests {
             language: "lua".to_string(),
             region_id: TEST_ULID_LUA_0.to_string(),
             content: "print('hello')".to_string(),
+            held: false,
+            prepared: None,
         }];
         pool.open_host_incarnation(&host_uri, 1).await;
         pool.forward_didchange_to_opened_docs(&host_uri, 1, &injections)

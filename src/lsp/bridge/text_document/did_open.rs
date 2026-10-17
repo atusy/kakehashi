@@ -477,7 +477,7 @@ impl LanguageServerPool {
                     &mut sender,
                     host_uri,
                     &virtual_uri,
-                    &injection.content,
+                    injection.sent(),
                     &connection_key,
                 )
                 .await
@@ -486,7 +486,7 @@ impl LanguageServerPool {
                     &mut sender,
                     host_uri,
                     &virtual_uri,
-                    &injection.content,
+                    injection.sent(),
                     &connection_key,
                 )
                 .await
@@ -1036,6 +1036,8 @@ mod tests {
                     language: "lua".into(),
                     region_id: TEST_ULID_LUA_0.into(),
                     content: "print('old')".into(),
+                    held: false,
+                    prepared: None,
                 }],
             )
             .await;
@@ -1081,11 +1083,15 @@ mod tests {
                 language: "lua".to_string(),
                 region_id: TEST_ULID_LUA_0.to_string(),
                 content: "print('hello')".to_string(),
+                held: false,
+                prepared: None,
             },
             BridgeInjection {
                 language: "lua".to_string(),
                 region_id: TEST_ULID_LUA_1.to_string(),
                 content: "print('world')".to_string(),
+                held: false,
+                prepared: None,
             },
         ];
 
@@ -1169,6 +1175,8 @@ mod tests {
                     language: "lua".to_string(),
                     region_id: TEST_ULID_LUA_0.to_string(),
                     content: "print('hello')".to_string(),
+                    held: false,
+                    prepared: None,
                 }],
             )
             .await;
@@ -1227,6 +1235,8 @@ mod tests {
                     language: "lua".to_string(),
                     region_id: TEST_ULID_LUA_0.to_string(),
                     content: "print('hello')".to_string(),
+                    held: false,
+                    prepared: None,
                 }],
             )
             .await;
@@ -1262,6 +1272,8 @@ mod tests {
             language: "lua".to_string(),
             region_id: TEST_ULID_LUA_0.to_string(),
             content: "print('hello')".to_string(),
+            held: false,
+            prepared: None,
         }];
 
         // The key this host routes to (client-root fallback, no marker above
@@ -1341,6 +1353,8 @@ mod tests {
                     language: "lua".to_string(),
                     region_id: TEST_ULID_LUA_0.to_string(),
                     content: "print('hello')".to_string(),
+                    held: false,
+                    prepared: None,
                 }],
             )
             .await;
@@ -1389,6 +1403,8 @@ mod tests {
                     language: "lua".to_string(),
                     region_id: TEST_ULID_LUA_0.to_string(),
                     content: "print('hello')".to_string(),
+                    held: false,
+                    prepared: None,
                 }],
             )
             .await;
@@ -1428,6 +1444,8 @@ mod tests {
             language: "lua".to_string(),
             region_id: TEST_ULID_LUA_0.to_string(),
             content: "print('hello')".to_string(),
+            held: false,
+            prepared: None,
         }];
 
         // First call - should open the document

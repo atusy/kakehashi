@@ -17,7 +17,7 @@ use tower_lsp_server::ls_types::{
 };
 use url::Url;
 
-use super::super::pool::{ConnectionState, LanguageServerPool, NotificationSendResult, SentText};
+use super::super::pool::{ConnectionState, LanguageServerPool, NotificationSendResult};
 use super::super::protocol::{JsonRpcNotification, VirtualDocumentUri};
 
 impl LanguageServerPool {
@@ -63,7 +63,7 @@ impl LanguageServerPool {
                 incarnation,
                 &injection.language,
                 &injection.region_id,
-                &injection.content,
+                injection.sent(),
             );
             let virtual_uri =
                 VirtualDocumentUri::new(&host_uri_lsp, &injection.language, &injection.region_id);
@@ -107,7 +107,7 @@ impl LanguageServerPool {
                 // region's extracted content is unchanged since the last didChange to
                 // this connection, so a position-only host edit doesn't re-analyze
                 // every region (#422). Mirrors the host path's fingerprint guard.
-                let content = SentText::from(&injection.content);
+                let content = injection.sent();
                 let Some(change) = self
                     .increment_version_if_content_changed(&virtual_uri, &connection_key, content)
                     .await
