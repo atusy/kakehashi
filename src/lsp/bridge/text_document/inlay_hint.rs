@@ -47,10 +47,11 @@ use tower_lsp_server::ls_types::{
 };
 
 use super::super::protocol::{
-    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, decode_command, encode_command,
-    response_has_jsonrpc_error, text_edit_safe_in_region, translate_host_position_to_virtual,
-    translate_host_range_to_virtual, translate_virtual_position_to_host,
-    translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
+    EditMode, JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, decode_command,
+    encode_command, response_has_jsonrpc_error, text_edit_safe_in_region,
+    translate_host_position_to_virtual, translate_host_range_to_virtual,
+    translate_virtual_position_to_host, translate_virtual_range_to_host,
+    translate_virtual_text_edits_to_host, virtual_uri_to_lsp_uri,
 };
 use super::completion::EnvelopeOffset;
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
@@ -841,22 +842,16 @@ fn transform_inlay_hint_to_host(
 ) -> Vec<usize> {
     translate_virtual_position_to_host(&mut hint.position, offset);
 
-    // No edit is mapped back through a prepared document: the hint is
-    // shown, its edits are not offered.
-    if offset.prepared().is_some() {
-        hint.text_edits = None;
-    }
     if let Some(text_edits) = &mut hint.text_edits {
-        for edit in text_edits.iter_mut() {
-            translate_virtual_range_to_host(&mut edit.range, offset);
-        }
-        if !text_edits
-            .iter()
-            .all(|edit| text_edit_safe_in_region(edit, offset, region_end))
+        // One set: the client applies them together.
+        if !translate_virtual_text_edits_to_host(text_edits, offset, EditMode::Extent)
+            || !text_edits
+                .iter()
+                .all(|edit| text_edit_safe_in_region(edit, offset, region_end))
         {
             log::warn!(
                 target: "kakehashi::bridge",
-                "{method}: dropped a hint's textEdits ({}): an edit is unsafe for the injection region (escapes it, breaks line prefixes, or merges content into the closing fence)",
+                "{method}: dropped a hint's textEdits ({}): an edit is unsafe for the injection region (escapes it, breaks line prefixes, merges content into the closing fence, or reaches host text its prepared document hides)",
                 text_edits.len()
             );
             hint.text_edits = None;
@@ -1095,31 +1090,46 @@ mod tests {
     // ==========================================================================
 
     /// A hint from a prepared document is placed through its map, and its
-    /// edits are dropped: none is mapped back through a prepared document.
-    /// From an unprepared one, its edits are kept and translated.
+    /// edits are mapped through it as one set: kept when they keep off the
+    /// host text the document hides, dropped when they would not. From an
+    /// unprepared one, its edits are translated as ranges.
     #[test]
-    fn a_prepared_hint_is_shown_without_its_edits() {
-        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+    fn a_prepared_hints_edits_map_through_its_document() {
+        use crate::lsp::bridge::protocol::{SegmentKind, VirtualLayout, apply_prepare_result};
         let host_uri: Uri = "file:///test.md".parse().unwrap();
-        // The peer strips the first two columns of "  a".
-        let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
-            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
-        ]}]}))
+        // `  a${x}b`, dedented by two, the interpolation shown as `1`.
+        let virtual_text = "  a    b";
+        let layout = VirtualLayout::from_pieces(
+            virtual_text,
+            [
+                (SegmentKind::Content, 0..3, String::new()),
+                (SegmentKind::Gap, 3..7, "${x}".to_string()),
+                (SegmentKind::Content, 7..8, String::new()),
+            ],
+        );
+        let answer = serde_json::from_value(json!({"segments": [
+            {"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+            ]},
+            {"type": "gap", "content": "1"},
+            {"type": "content"}
+        ]}))
         .unwrap();
-        let map = apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(answer))
+        let map = apply_prepare_result(virtual_text, &layout, Some(answer))
             .unwrap()
             .map;
-        let hint = || -> InlayHint {
+        let hint = |edits: serde_json::Value| -> InlayHint {
             serde_json::from_value(json!({
                 "position": {"line": 0, "character": 1},
                 "label": ": x",
-                "textEdits": [{
-                    "range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 1}},
-                    "newText": ": x"
-                }]
+                "textEdits": edits
             }))
             .unwrap()
         };
+        let insertion = json!([{
+            "range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 1}},
+            "newText": ": x"
+        }]);
         let transform = |hint: &mut InlayHint, offset: &RegionOffset| {
             transform_inlay_hint_to_host(
                 hint,
@@ -1131,13 +1141,32 @@ mod tests {
                 "textDocument/inlayHint",
             );
         };
+        let prepared_offset = || RegionOffset::new(3, 2).with_prepared(map.clone());
 
-        let mut prepared = hint();
-        transform(&mut prepared, &RegionOffset::new(3, 2).with_prepared(map));
+        let mut prepared = hint(insertion.clone());
+        transform(&mut prepared, &prepared_offset());
         assert_eq!(prepared.position, Position::new(3, 5));
-        assert!(prepared.text_edits.is_none());
+        let edits = prepared.text_edits.expect("edits keeping off the gap stay");
+        assert_eq!(
+            edits[0].range,
+            tower_lsp_server::ls_types::Range::new(Position::new(3, 5), Position::new(3, 5))
+        );
 
-        let mut as_is = hint();
+        // One edit of the set rewriting the placeholder drops the set.
+        let mut into_gap = hint(json!([
+            {
+                "range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 1}},
+                "newText": ": x"
+            },
+            {
+                "range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 2}},
+                "newText": "2"
+            }
+        ]));
+        transform(&mut into_gap, &prepared_offset());
+        assert!(into_gap.text_edits.is_none());
+
+        let mut as_is = hint(insertion);
         transform(&mut as_is, &RegionOffset::new(3, 2));
         assert_eq!(as_is.position, Position::new(3, 3));
         let edits = as_is.text_edits.expect("edits of an unprepared hint stay");
