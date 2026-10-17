@@ -184,7 +184,11 @@ impl Kakehashi {
                 // whose single replacement would overwrite those real gaps.
                 // A prepared document's edits are not mapped back through its
                 // map: closed as a non-contiguous one is.
-                if !resolved.contiguous || self.region_prepared(&uri, resolved) {
+                if crate::lsp::lsp_impl::bridge_context::method_closed_to(
+                    resolved,
+                    "textDocument/rangeFormatting",
+                    self.lifecycle_prepares(&uri, resolved),
+                ) {
                     continue;
                 }
                 // A covering request (its byte span encloses the whole region)
