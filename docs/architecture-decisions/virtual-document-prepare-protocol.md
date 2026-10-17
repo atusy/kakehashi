@@ -294,12 +294,11 @@ answers state the correspondence instead.
 
 ### Deleting any blank line, or inserting text into content
 
-Deleting a blank line between lines that stay leaves a join in P where a
-formatter may add a blank line back, which the host would then hold twice
-once formatting edits are mapped back;
-no host string drops interior blank lines anyway, and in some embedded
-languages (HTTP, Markdown) they carry meaning. Inserting text adds P-only
-text that a formatter's diff can attribute either way.
+Deleting a blank line between lines that stay would leave P a line break
+the host has with no P position of its own between them; no host string
+drops interior blank lines anyway, and in some embedded languages (HTTP,
+Markdown) they carry meaning. Inserting text would add P text no V
+position stands for.
 
 ### Gap replacements of the original width
 
