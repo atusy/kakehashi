@@ -5944,6 +5944,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retiring_one_of_several_advertising_connections_moves_no_epoch() {
+        let pool = LanguageServerPool::preparing();
+        let advertisements = pool.prepare_advertisements.as_ref().unwrap();
+        let a = test_helpers::create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::new("peer", Some("file:///a".to_string())),
+        )
+        .await;
+        let b = test_helpers::create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::new("peer", Some("file:///b".to_string())),
+        )
+        .await;
+        for handle in [&a, &b] {
+            advertisements.adopt(handle);
+            pool.record_prepare_advertisement_from(handle, true);
+        }
+        let epoch = pool.prepare_epoch();
+        advertisements.retire(&a);
+        // The server still advertises it through the other root.
+        assert_eq!(pool.prepare_advertisement("peer"), Some(true));
+        assert_eq!(pool.prepare_epoch(), epoch);
+    }
+
+    #[tokio::test]
     async fn a_restarted_non_peer_moves_no_epoch() {
         let pool = LanguageServerPool::preparing();
         let key = ConnectionKey::for_server("lua_ls");
