@@ -100,6 +100,18 @@ pub(crate) async fn prepare_request_context_for(
     (!method_closed_to(&ctx.resolved, method, ctx.prepared.is_some())).then_some(ctx)
 }
 
+/// Whether a method is open to a region (see
+/// `Kakehashi::method_gate`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MethodGate {
+    Open,
+    /// Closed by the region's shape or its prepared document.
+    Closed,
+    /// Its peer could not prepare it: not bridged, a failed request for a
+    /// caller counting them.
+    Unprepared,
+}
+
 /// Present `ctx`'s virtual document as downstream servers see it, waiting for
 /// the prepare peer when the (host, injection) pair has one: the context's
 /// virtual content becomes the prepared text and its fan-out translates
@@ -1444,30 +1456,45 @@ impl Kakehashi {
         prepare_request_context_for(&self.bridge, &preamble.language_name, ctx, method_name).await
     }
 
-    /// Whether `method` is closed to a region of a `host_language` host: by
-    /// [`method_closed_to`] under what the lifecycle pass knows, or — for an
-    /// edit method on a region the pass has not looked up yet — once the
+    /// Whether `method` is open to a region of a `host_language` host: not
+    /// by [`method_closed_to`] under what the lifecycle pass knows, nor — for
+    /// an edit method on a region the pass has not looked up yet — once the
     /// prepare answer for its current text is in (waited for, as a request
-    /// is): only a document sent as is takes edits.
-    pub(crate) async fn method_closed_to_region(
+    /// is): only a document sent as is takes edits. One its peer could not
+    /// prepare is told apart: it is not bridged at all.
+    pub(crate) async fn method_gate(
         &self,
         uri: &Url,
         host_language: &str,
         resolved: &ResolvedInjection,
         method: &str,
-    ) -> bool {
-        if method_closed_to(resolved, method, self.lifecycle_prepares(uri, resolved)) {
-            return true;
+    ) -> MethodGate {
+        if method_closed_to(resolved, method, false) {
+            return MethodGate::Closed;
+        }
+        let region = self.bridge.prepare_region(
+            uri,
+            &resolved.injection_language,
+            &resolved.region.region_id,
+        );
+        if region.failed {
+            return MethodGate::Unprepared;
         }
         // Open even were the region prepared: no answer to wait for.
         if !method_closed_to(resolved, method, true) {
-            return false;
+            return MethodGate::Open;
         }
+        // The answer, waited for even while the lifecycle pass holds the
+        // document on it: one the peer cannot give is told apart.
         let Some(target) = self
             .bridge
             .prepare_target(host_language, &resolved.injection_language)
         else {
-            return false;
+            return if region.prepared {
+                MethodGate::Closed
+            } else {
+                MethodGate::Open
+            };
         };
         let input = crate::lsp::bridge::PrepareInput {
             host_uri: uri,
@@ -1477,10 +1504,11 @@ impl Kakehashi {
             virtual_text: &resolved.virtual_content,
             gaps: &resolved.gaps,
         };
-        !matches!(
-            self.bridge.prepared_document(&target, input).await,
-            Ok(crate::lsp::bridge::PrepareAnswer::AsIs)
-        )
+        match self.bridge.prepared_document(&target, input).await {
+            Ok(crate::lsp::bridge::PrepareAnswer::AsIs) => MethodGate::Open,
+            Ok(_) => MethodGate::Closed,
+            Err(_) => MethodGate::Unprepared,
+        }
     }
 
     /// Whether the lifecycle pass prepares a region's current document (or
@@ -2246,10 +2274,13 @@ mod tests {
         let (service, resolved, uri) = kakehashi_with_an_unlooked_region();
         let server = service.inner();
         answer(server, &uri, &resolved, dedented());
-        let closed = |method| server.method_closed_to_region(&uri, "markdown", &resolved, method);
-        assert!(closed("textDocument/formatting").await);
-        assert!(closed("textDocument/rangeFormatting").await);
-        assert!(!closed("textDocument/inlayHint").await);
+        let gate = |method| server.method_gate(&uri, "markdown", &resolved, method);
+        assert_eq!(gate("textDocument/formatting").await, MethodGate::Closed);
+        assert_eq!(
+            gate("textDocument/rangeFormatting").await,
+            MethodGate::Closed
+        );
+        assert_eq!(gate("textDocument/inlayHint").await, MethodGate::Open);
 
         let ctx = || DocumentRequestContext {
             prepared: None,
@@ -2284,10 +2315,11 @@ mod tests {
             &resolved,
             crate::lsp::bridge::PrepareAnswer::AsIs,
         );
-        assert!(
-            !server
-                .method_closed_to_region(&uri, "markdown", &resolved, "textDocument/formatting")
-                .await
+        assert_eq!(
+            server
+                .method_gate(&uri, "markdown", &resolved, "textDocument/formatting")
+                .await,
+            MethodGate::Open
         );
         let ctx = DocumentRequestContext {
             prepared: None,
