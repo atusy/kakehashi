@@ -1462,9 +1462,9 @@ impl Kakehashi {
 
     /// Whether `method` is open to a region of a `host_language` host, for
     /// formatting. Closed by the region's shape ([`method_closed_to`]);
-    /// unprepared when the lifecycle pass holds it on an unusable answer;
     /// otherwise, for a method the rule closes on a prepared document, by
-    /// the prepare answer for its current text, waited for: only a document
+    /// the prepare answer for the text being formatted, waited for (not the
+    /// one the lifecycle pass holds the document on, which can be older): only a document
     /// sent as is takes edits, and one its peer could not prepare is told
     /// apart (not bridged at all).
     ///
@@ -1488,9 +1488,6 @@ impl Kakehashi {
             &resolved.injection_language,
             &resolved.region.region_id,
         );
-        if region.failed {
-            return MethodGate::Unprepared;
-        }
         // Open even were the region prepared: no answer to wait for.
         if !method_closed_to(resolved, method, true) {
             return MethodGate::Open;
@@ -2347,6 +2344,37 @@ mod tests {
                 .method_gate(&uri, "markdown", &resolved, "textDocument/formatting")
                 .await,
             MethodGate::Unprepared
+        );
+    }
+
+    /// The gate answers for the text being formatted: an unusable answer the
+    /// lifecycle pass holds the document on, for an older text, does not
+    /// make a text answered as is unprepared.
+    #[tokio::test]
+    async fn the_gate_answers_for_the_text_being_formatted() {
+        let (service, older, uri) = kakehashi_with_an_unlooked_region();
+        let server = service.inner();
+        answer_held(
+            server,
+            &uri,
+            &older,
+            crate::lsp::bridge::PrepareAnswer::Unusable,
+            true,
+        );
+        let mut current = older.clone();
+        current.virtual_content = "b".to_string();
+        answer_held(
+            server,
+            &uri,
+            &current,
+            crate::lsp::bridge::PrepareAnswer::AsIs,
+            false,
+        );
+        assert_eq!(
+            server
+                .method_gate(&uri, "markdown", &current, "textDocument/formatting")
+                .await,
+            MethodGate::Open
         );
     }
 
