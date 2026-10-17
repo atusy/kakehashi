@@ -1090,6 +1090,21 @@ mod tests {
         );
         assert!(!queue(None));
         assert!(queue(Some(&prepared.map)));
+        // The same virtual text prepared another way (the peer's answer
+        // changed with its settings, say): not queued behind the text held.
+        let other = apply_prepare_result(
+            "  a",
+            &VirtualLayout::single("  a"),
+            Some(
+                serde_json::from_value(serde_json::json!({"segments": [{"type": "content", "changes": [
+                    {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "newText": ""}
+                ]}]}))
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        assert_ne!(other.text, prepared.text);
+        assert!(!queue(Some(&other.map)));
     }
 
     #[tokio::test]
