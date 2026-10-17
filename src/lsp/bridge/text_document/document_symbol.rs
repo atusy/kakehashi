@@ -258,6 +258,47 @@ mod tests {
     use super::super::test_helpers::*;
     use super::*;
 
+    /// Through a prepared document whose lines are dedented, a range ending
+    /// at a line's start maps before the line's indentation while an empty
+    /// selection there maps after it: the selection is clamped back into its
+    /// symbol's range, as LSP requires.
+    #[test]
+    fn a_prepared_symbols_selection_stays_inside_its_range() {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        use tower_lsp_server::ls_types::Position;
+        let virtual_text = "  a\n  b\n";
+        let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let map = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(answer),
+        )
+        .unwrap()
+        .map;
+        let result = json!([{
+            "name": "a",
+            "kind": 12,
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 0 } },
+            "selectionRange": { "start": { "line": 1, "character": 0 }, "end": { "line": 1, "character": 0 } }
+        }]);
+        let symbols = transform_document_symbol_nested_response(
+            result,
+            &RegionOffset::new(0, 0).with_prepared(map),
+        )
+        .unwrap();
+        let symbol = &symbols[0];
+        assert!(
+            symbol.selection_range.start >= symbol.range.start,
+            "{symbol:?}"
+        );
+        assert!(symbol.selection_range.end <= symbol.range.end, "{symbol:?}");
+        assert_eq!(symbol.range.end, Position::new(1, 0));
+    }
+
     #[test]
     fn a_selection_is_clamped_into_its_range() {
         use tower_lsp_server::ls_types::{Position, Range};
