@@ -1886,6 +1886,51 @@ mod tests {
         );
     }
 
+    /// The README's prepare opt-out at `languages._.bridge._` lands in every
+    /// host's bridge map, beside the shipped `bridge._.enabled = true`: which
+    /// languages a host bridges is the same with it as without it.
+    #[test]
+    fn a_prepare_opt_out_for_every_host_bridges_what_the_defaults_do() {
+        use crate::config::defaults::default_settings;
+
+        let bridgeable = |user: &str| {
+            let user: RawWorkspaceSettings = toml::from_str(user).unwrap();
+            let merged = merge_workspace_settings(Some(default_settings()), Some(user)).unwrap();
+            let markdown =
+                resolve_with_wildcard(&merged.languages, "markdown", merge_language_settings)
+                    .unwrap();
+            ["python", "rust"].map(|language| markdown.is_language_bridgeable(language))
+        };
+        let host = r#"
+            [languages.markdown.bridge.python]
+        "#;
+        let opted_out = format!(
+            r#"
+            [languages._.bridge._.aggregation."kakehashi/virtualDocument/prepare"]
+            priorities = []
+            {host}"#
+        );
+        assert_eq!(bridgeable(&opted_out), bridgeable(host));
+        // A host that bridges only some languages says so for `_`, which the
+        // opt-out leaves as it is.
+        let restricted = r#"
+            [languages.markdown.bridge._]
+            enabled = false
+            [languages.markdown.bridge.python]
+            enabled = true
+        "#;
+        assert_eq!(bridgeable(restricted), [true, false]);
+        assert_eq!(
+            bridgeable(&format!(
+                r#"
+            [languages._.bridge._.aggregation."kakehashi/virtualDocument/prepare"]
+            priorities = []
+            {restricted}"#
+            )),
+            [true, false]
+        );
+    }
+
     /// Verifies that when looking up a language server config by name,
     /// the wildcard server settings (languageServers._) are merged with
     /// specific server settings.
