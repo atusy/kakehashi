@@ -273,6 +273,12 @@ pub(crate) struct DocumentTracker {
     /// text is a virtual text as is, which lets paths skip looking up what a
     /// connection holds.
     ever_held_prepared: AtomicBool,
+    /// The documents each connection was ever sent a prepared text of, kept
+    /// past their records (a document closed since): coordinates such a
+    /// connection computed may be in a prepared text's, which no record says
+    /// any more. Written under `document_fingerprints`'s lock, read under it
+    /// too (that lock first). Dropped with the connection, and with its host.
+    prepared_history: std::sync::Mutex<HashMap<ConnectionKey, HashSet<String>>>,
     /// Tracks which virtual documents were opened for each host document.
     ///
     /// Each OpenedVirtualDoc stores its connection key for reverse lookup during didClose.
@@ -313,6 +319,7 @@ impl DocumentTracker {
             document_fingerprints: std::sync::Mutex::new(HashMap::new()),
             held_generations: Arc::new(AtomicU64::new(0)),
             ever_held_prepared: AtomicBool::new(false),
+            prepared_history: std::sync::Mutex::new(HashMap::new()),
             host_to_virtual: Mutex::new(HashMap::new()),
             opened_documents: DashMap::new(),
             virtual_to_servers: DashMap::new(),
@@ -758,7 +765,7 @@ impl DocumentTracker {
                 .filter(|held| held.fingerprint == fp)
             {
                 if let Some(map) = content.map {
-                    self.ever_held_prepared.store(true, Ordering::Release);
+                    self.note_prepared(connection_key, &uri_string);
                     held.map = Some(Arc::clone(map));
                 } else {
                     held.map = None;
@@ -815,6 +822,93 @@ impl DocumentTracker {
         result
     }
 
+    /// Note that `connection_key` holds a prepared text of `uri_string`, under
+    /// the records' lock.
+    fn note_prepared(&self, connection_key: &ConnectionKey, uri_string: &str) {
+        self.ever_held_prepared.store(true, Ordering::Release);
+        let mut history = self
+            .prepared_history
+            .lock()
+            .recover_poison("DocumentTracker::prepared_history");
+        if !history
+            .get(connection_key)
+            .is_some_and(|uris| uris.contains(uri_string))
+        {
+            history
+                .entry(connection_key.clone())
+                .or_default()
+                .insert(uri_string.to_owned());
+        }
+    }
+
+    /// Forget which of `documents` a connection was ever sent a prepared
+    /// text of: their host closed.
+    pub(super) fn forget_prepared_history(&self, documents: &[OpenedVirtualDoc]) {
+        if !self.ever_held_prepared() {
+            return;
+        }
+        let mut history = self
+            .prepared_history
+            .lock()
+            .recover_poison("DocumentTracker::prepared_history");
+        for document in documents {
+            if let Some(uris) = history.get_mut(&document.connection_key) {
+                uris.remove(&document.virtual_uri.to_uri_string());
+            }
+        }
+    }
+
+    /// What `connection_key` holds for `virtual_uri` now, and whether it was
+    /// ever sent a prepared text of it, from one read.
+    fn held_now(
+        &self,
+        virtual_uri: &str,
+        connection_key: &ConnectionKey,
+    ) -> (Option<HeldText>, bool) {
+        let fingerprints = self
+            .document_fingerprints
+            .lock()
+            .recover_poison("DocumentTracker::document_fingerprints");
+        let held = fingerprints
+            .get(connection_key)
+            .and_then(|docs| docs.get(virtual_uri))
+            .cloned();
+        let history = self
+            .prepared_history
+            .lock()
+            .recover_poison("DocumentTracker::prepared_history")
+            .get(connection_key)
+            .is_some_and(|uris| uris.contains(virtual_uri));
+        (held, history)
+    }
+
+    /// What `connection_key` held for `virtual_uri` as coordinates it sent
+    /// about the document arrive — a push naming document `version`, a
+    /// showDocument selection — to decide their [`super::Presentation`] by,
+    /// later. Read as they arrive; while no connection was ever sent a
+    /// prepared text, without reading any record.
+    #[allow(
+        dead_code,
+        reason = "the prepare layer reads coordinates through it, next"
+    )]
+    pub(super) fn observe(
+        &self,
+        virtual_uri: &str,
+        connection_key: &ConnectionKey,
+        version: Option<i32>,
+    ) -> super::Observed {
+        if !self.ever_held_prepared() {
+            return super::Observed::AsIsThen;
+        }
+        let (held, history) = self.held_now(virtual_uri, connection_key);
+        super::Observed::Read {
+            generation: held.as_ref().map(|held| held.generation),
+            prepared: history || held.as_ref().is_some_and(|held| held.map.is_some()),
+            stale_version: version
+                .is_some_and(|version| held.as_ref().is_none_or(|held| held.version != version)),
+        }
+    }
+
     /// Record the text of `fingerprint`, sent with `map`, in `fingerprints`,
     /// returning the record it replaced.
     fn record_locked(
@@ -828,7 +922,7 @@ impl DocumentTracker {
     ) -> Option<HeldText> {
         let map = map.cloned();
         if map.is_some() {
-            self.ever_held_prepared.store(true, Ordering::Release);
+            self.note_prepared(connection_key, uri_string);
         }
         // Clone the connection key only when first inserting it (common path: the
         // connection is already present, so look up by borrow).
@@ -900,15 +994,14 @@ impl DocumentTracker {
         region: super::RegionPrepare,
         virtual_text: &str,
     ) -> super::Presentation {
+        // A shortcut of the rule, not another: with no prepared text ever
+        // sent, no record holds a map, none has a history, and no read saw
+        // either.
         if region == super::RegionPrepare::default() && !self.ever_held_prepared() {
             return super::Presentation::AsIs;
         }
-        super::presentation::presentation(
-            self.held_text(virtual_uri, connection_key).as_ref(),
-            observed,
-            region,
-            virtual_text,
-        )
+        let (held, history) = self.held_now(virtual_uri, connection_key);
+        super::presentation::presentation(held.as_ref(), history, observed, region, virtual_text)
     }
 
     /// What this connection was last sent for the document, if anything.
@@ -1023,6 +1116,11 @@ impl DocumentTracker {
         self.document_fingerprints
             .lock()
             .recover_poison("DocumentTracker::document_fingerprints")
+            .remove(connection_key);
+        // A replacement process was never sent anything.
+        self.prepared_history
+            .lock()
+            .recover_poison("DocumentTracker::prepared_history")
             .remove(connection_key);
         for uri in &uris {
             self.decrement_opened(uri);
@@ -1417,6 +1515,7 @@ impl DocumentTracker {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{Observed, Presentation, RegionPrepare};
     use super::*;
     use crate::lsp::bridge::pool::test_helpers::*;
 
@@ -2037,6 +2136,126 @@ mod tests {
             tracker.held_text(&uri, &conn).unwrap().fingerprint,
             first.fingerprint
         );
+    }
+
+    fn prepared_text(text: &str) -> Arc<PreparedMap> {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        apply_prepare_result(text, &VirtualLayout::single(text), None)
+            .unwrap()
+            .map
+    }
+
+    #[test]
+    fn preparing_one_document_changes_nothing_for_another() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let plain = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let uri = plain.to_uri_string();
+        let conn = ConnectionKey::for_server("lua");
+        tracker.record_sent_for_test(&plain, &conn, "a".into(), 1);
+        // A push naming the version before, read as an edit's didChange went
+        // out.
+        let stale = tracker.observe(&uri, &conn, Some(0));
+        tracker.record_sent_for_test(&plain, &conn, "b".into(), 2);
+        let ask =
+            |observed| tracker.presentation(&uri, &conn, observed, RegionPrepare::default(), "b");
+        let before = (ask(stale), ask(Observed::Through(0)));
+        assert!(matches!(before, (Presentation::AsIs, Presentation::AsIs)));
+
+        // Another document is prepared.
+        let other = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_1);
+        let map = prepared_text("c");
+        tracker.record_sent_for_test(
+            &other,
+            &conn,
+            SentText {
+                text: "c",
+                map: Some(&map),
+            },
+            1,
+        );
+        assert!(tracker.ever_held_prepared());
+        let stale = tracker.observe(&uri, &conn, Some(0));
+        assert!(matches!(
+            (ask(stale), ask(Observed::Through(0))),
+            (Presentation::AsIs, Presentation::AsIs)
+        ));
+    }
+
+    #[test]
+    fn coordinates_from_a_prepared_text_place_nowhere_once_it_is_replaced() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let uri = virtual_uri.to_uri_string();
+        let conn = ConnectionKey::for_server("lua");
+        let map = prepared_text("  a");
+        tracker.record_sent_for_test(
+            &virtual_uri,
+            &conn,
+            SentText {
+                text: "  a",
+                map: Some(&map),
+            },
+            1,
+        );
+        let pushed = tracker.observe(&uri, &conn, Some(1));
+        assert!(matches!(
+            tracker.presentation(&uri, &conn, pushed, RegionPrepare::default(), "  a"),
+            Presentation::Prepared(_)
+        ));
+        // The pair lost its peer: the virtual text goes out as is.
+        tracker.record_sent_for_test(&virtual_uri, &conn, "  a\n".into(), 2);
+        assert!(matches!(
+            tracker.presentation(&uri, &conn, pushed, RegionPrepare::default(), "  a\n"),
+            Presentation::Unavailable
+        ));
+        // A push naming the prepared text's version, read after it was
+        // replaced.
+        let late = tracker.observe(&uri, &conn, Some(1));
+        assert!(matches!(
+            tracker.presentation(&uri, &conn, late, RegionPrepare::default(), "  a\n"),
+            Presentation::Unavailable
+        ));
+        // One for the text it holds places as is.
+        let current = tracker.observe(&uri, &conn, Some(2));
+        assert!(matches!(
+            tracker.presentation(&uri, &conn, current, RegionPrepare::default(), "  a\n"),
+            Presentation::AsIs
+        ));
+    }
+
+    #[tokio::test]
+    async fn coordinates_from_a_prepared_text_place_nowhere_once_its_document_closed() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let uri = virtual_uri.to_uri_string();
+        let conn = ConnectionKey::for_server("lua");
+        let map = prepared_text("a");
+        tracker.record_sent_for_test(
+            &virtual_uri,
+            &conn,
+            SentText {
+                text: "a",
+                map: Some(&map),
+            },
+            1,
+        );
+        let pushed = tracker.observe(&uri, &conn, None);
+        tracker.untrack_document(&virtual_uri, &conn).await;
+        assert!(tracker.held_text(&uri, &conn).is_none());
+        assert!(matches!(
+            tracker.presentation(&uri, &conn, pushed, RegionPrepare::default(), "a"),
+            Presentation::Unavailable
+        ));
+        // Nor does one read once the record went: the connection held a
+        // prepared text of it.
+        let late = tracker.observe(&uri, &conn, None);
+        assert!(matches!(
+            tracker.presentation(&uri, &conn, late, RegionPrepare::default(), "a"),
+            Presentation::Unavailable
+        ));
     }
 
     #[test]

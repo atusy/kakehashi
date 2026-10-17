@@ -244,6 +244,7 @@ impl LanguageServerPool {
         for doc in &virtual_docs {
             self.close_single_virtual_doc(doc).await;
         }
+        self.forget_prepared_history(&virtual_docs);
 
         virtual_docs
     }
