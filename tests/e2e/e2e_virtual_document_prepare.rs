@@ -276,6 +276,38 @@ fn formatting_is_not_offered_on_a_prepared_document() {
 }
 
 #[test]
+fn formatting_before_the_document_was_looked_up_is_refused_once_it_is_prepared() {
+    let (mut client, _dir) = Setup::default().start();
+    let uri = "file:///prepare/format-early.md";
+    let text = "# t\n\n```lua\n  local x = 1\n```\n";
+    open(&mut client, uri, text);
+
+    // At once, and again while a hover may be sending the prepared text
+    // before the lifecycle pass looked the region up: each waits for the
+    // answer, and is refused up front rather than by waiting out the
+    // budget for a text its server never holds.
+    for _ in 0..10 {
+        let started = Instant::now();
+        let response = client.send_request(
+            "textDocument/formatting",
+            json!({
+                "textDocument": { "uri": uri },
+                "options": { "tabSize": 2, "insertSpaces": true }
+            }),
+        );
+        assert!(response.get("error").is_none(), "{response}");
+        let edits = response["result"].as_array().cloned().unwrap_or_default();
+        assert!(edits.is_empty(), "{response}");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(2500),
+            "formatting took {elapsed:?}"
+        );
+        let _ = hover(&mut client, uri, 3, 4);
+    }
+}
+
+#[test]
 fn a_rename_before_the_document_was_looked_up_is_refused_once_it_is_prepared() {
     let (mut client, _dir) = Setup::default().start();
     let uri = "file:///prepare/rename.md";
