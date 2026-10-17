@@ -189,6 +189,23 @@ fn take_back_locked(
     };
 }
 
+/// Whether a connection whose coordinates present as `presentation` holds
+/// exactly the text a request built on `request_map` describes: the prepared
+/// text under that map, or — for a request built as is — a text held as is,
+/// as on every unprepared path (an edit's didChange is ordered ahead of the
+/// request), but not a prepared one, which stays until the lifecycle pass
+/// replaces it.
+pub(super) fn holds_request_text(
+    presentation: super::Presentation,
+    request_map: Option<&PreparedMap>,
+) -> bool {
+    match presentation {
+        super::Presentation::Prepared(held) => request_map.is_some_and(|map| *map == *held),
+        super::Presentation::AsIs => request_map.is_none(),
+        super::Presentation::Unavailable => false,
+    }
+}
+
 /// Hash of a virtual document's extracted content, used to skip re-sending an
 /// unchanged `didChange` (#422). Mirrors the host path's fingerprint
 /// (`text_document/host.rs`).
@@ -888,6 +905,16 @@ impl DocumentTracker {
             .document_fingerprints
             .lock()
             .recover_poison("DocumentTracker::document_fingerprints");
+        self.held_locked(&fingerprints, virtual_uri, connection_key)
+    }
+
+    /// [`Self::held_now`] under the records' lock, taken by the caller.
+    fn held_locked(
+        &self,
+        fingerprints: &HashMap<ConnectionKey, HashMap<String, HeldText>>,
+        virtual_uri: &str,
+        connection_key: &ConnectionKey,
+    ) -> (Option<HeldText>, bool) {
         let held = fingerprints
             .get(connection_key)
             .and_then(|docs| docs.get(virtual_uri))
@@ -1015,6 +1042,45 @@ impl DocumentTracker {
         }
         let (held, history) = self.held_now(virtual_uri, connection_key);
         super::presentation::presentation(held.as_ref(), history, observed, region, virtual_text)
+    }
+
+    /// Queue a request about `virtual_uri` to `connection_key` only while the
+    /// connection holds the text the request was built for — the prepared
+    /// text under `request_map`, or a text held as is for a request without
+    /// one (see [`holds_request_text`]). Checked and queued under the lock
+    /// every send records and queues under (see [`Self::record_and_queue`]):
+    /// no text can be recorded and queued between the check and the
+    /// enqueue, so the request follows exactly the text it was checked
+    /// against. `None`, with nothing queued, when the text is not held.
+    pub(super) fn queue_if_holding<R>(
+        &self,
+        virtual_uri: &str,
+        connection_key: &ConnectionKey,
+        request_map: Option<&PreparedMap>,
+        queue: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let fingerprints = self
+            .document_fingerprints
+            .lock()
+            .recover_poison("DocumentTracker::document_fingerprints");
+        let region = super::RegionPrepare {
+            prepared: request_map.is_some(),
+            failed: false,
+        };
+        if self.held_texts_matter(region) {
+            let (held, history) = self.held_locked(&fingerprints, virtual_uri, connection_key);
+            let presentation = super::presentation::presentation(
+                held.as_ref(),
+                history,
+                super::Observed::Now,
+                region,
+                request_map.map_or("", |map| map.virtual_text()),
+            );
+            if !holds_request_text(presentation, request_map) {
+                return None;
+            }
+        }
+        Some(queue())
     }
 
     /// What this connection was last sent for the document, if anything.
