@@ -424,6 +424,17 @@ impl PrepareRegistry {
             .unwrap_or_default()
     }
 
+    /// Whether the lifecycle pass prepares any region (holds it on an answer
+    /// other than as is, or one it waits for) as it stands at `epoch`: see
+    /// [`Self::region`].
+    pub(crate) fn any_region_prepared(&self, epoch: u64) -> bool {
+        self.regions.iter().any(|region| {
+            region
+                .held_cell()
+                .is_some_and(|cell| !matches!(cell.standing(epoch), Ok(Some(Answer::AsIs))))
+        })
+    }
+
     /// Whether any of `host_uri`'s documents the lifecycle pass holds back
     /// still waits for its answer as it stands at `epoch`.
     pub(crate) fn host_has_pending(&self, host_uri: &Url, epoch: u64) -> bool {

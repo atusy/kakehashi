@@ -331,6 +331,11 @@ impl super::BridgeCoordinator {
         held: Option<&crate::lsp::diagnostic_cache::HeldStamp>,
     ) -> super::Presentation {
         let region = self.prepare_region(host_uri, injection_language, region_id);
+        // The rule's shortcut, before any URI is built: nothing involves a
+        // prepared text.
+        if !self.pool.held_texts_matter(region) {
+            return super::Presentation::AsIs;
+        }
         let Some(stamp) = held else {
             return self.pool.unrecorded_presentation(region);
         };
@@ -350,10 +355,16 @@ impl super::BridgeCoordinator {
 
     /// Whether every cached push places as is (see [`Self::place_held`]),
     /// so the per-slot placement can be skipped: the rule's shortcut (see
-    /// `DocumentTracker::held_texts_matter`) for every region at once — the
-    /// lifecycle pass prepares none.
+    /// `DocumentTracker::held_texts_matter`) for every region at once — no
+    /// prepared text was ever sent, and the lifecycle pass prepares no
+    /// region now (answers given as is, as with no peer, involve nothing).
     pub(crate) fn places_pushes_as_is(&self) -> bool {
-        self.prepare_unused() && !self.pool.held_texts_matter(RegionPrepare::default())
+        !self.pool.held_texts_matter(RegionPrepare::default())
+            && self.prepare.as_ref().is_none_or(|layer| {
+                !layer
+                    .registry
+                    .any_region_prepared(self.pool.prepare_epoch())
+            })
     }
 
     /// Whether coordinates a server computed for a region may be a prepared
@@ -376,6 +387,10 @@ impl super::BridgeCoordinator {
             .prepared
         {
             return true;
+        }
+        // No prepared text was ever sent: none is held.
+        if !self.pool.held_texts_matter(RegionPrepare::default()) {
+            return false;
         }
         let Ok(host) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
             return false;
@@ -763,6 +778,56 @@ mod tests {
         );
         off.hold_save(&host, 1, 2, ids(&["a"]));
         assert_eq!(off.take_held_save(&host), None);
+    }
+
+    /// With a peer configured but nothing prepared — every answer given as
+    /// is, as before a handshake or with no peer — pushes place as is
+    /// without per-slot work, however many lookups were made.
+    #[tokio::test]
+    async fn pushes_place_as_is_until_a_region_is_prepared() {
+        let pool = Arc::new(LanguageServerPool::preparing());
+        let coordinator = BridgeCoordinator::with_cancel_forwarder(
+            Arc::clone(&pool),
+            CancelForwarder::new(Arc::clone(&pool)),
+        );
+        coordinator.prepare_settings_changed(&Arc::new(crate::config::WorkspaceSettings {
+            auto_install: false,
+            language_servers: [(
+                "peer".to_string(),
+                super::super::pool::test_helpers::devnull_config_for_language("lua"),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        }));
+        let host = Url::parse("file:///test/as-is.md").unwrap();
+        let target = coordinator.prepare_target("markdown", "lua").unwrap();
+        let input = |region_id, virtual_text| super::PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id,
+            virtual_text,
+            gaps: &[],
+        };
+        assert!(coordinator.places_pushes_as_is());
+
+        // Looked up, answered as is.
+        coordinator.answer_prepare_for_test(
+            &target,
+            input(TEST_ULID_LUA_0, "a"),
+            super::super::prepare_registry::Answer::AsIs,
+        );
+        assert!(coordinator.places_pushes_as_is());
+        assert!(!coordinator.region_coordinates_may_be_prepared(&host, "lua", TEST_ULID_LUA_0));
+        assert!(matches!(
+            coordinator.place_held(&host, "lua", TEST_ULID_LUA_0, "a", None),
+            Presentation::AsIs
+        ));
+
+        // The lifecycle pass holds a region on an answer it waits for.
+        let _ = coordinator.prepared_document_now(&target, input(TEST_ULID_LUA_0, "b"));
+        assert!(!coordinator.places_pushes_as_is());
     }
 
     #[test]
