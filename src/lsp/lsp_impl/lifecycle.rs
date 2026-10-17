@@ -100,6 +100,51 @@ enum ClientRoot<'a> {
 /// prepare backoff: one second, doubling) before waiting for the next edit.
 const MAX_RESYNC_RETRIES: u32 = 6;
 
+/// Hosts to sync again, each once: several documents of one host usually
+/// finish together. `(ready, recollect)` of any of a host's resyncs.
+fn merge_resyncs(
+    resyncs: impl IntoIterator<Item = crate::lsp::bridge::Resync>,
+) -> std::collections::HashMap<Url, (bool, bool)> {
+    let mut hosts: std::collections::HashMap<Url, (bool, bool)> = std::collections::HashMap::new();
+    for resync in resyncs {
+        let (ready, recollect) = hosts.entry(resync.host_uri).or_default();
+        *ready |= resync.ready;
+        *recollect |= resync.recollect;
+    }
+    hosts
+}
+
+/// What a resync pass over a host leads to.
+#[derive(Debug, PartialEq, Eq)]
+enum AfterResyncPass {
+    /// Every send queued, every region looked at: its diagnostics follow.
+    Synced,
+    /// Sync it again after a backoff, the `failed`th consecutive time.
+    Retry { failed: u32 },
+    /// Retried enough: left to the next edit or save.
+    GiveUp,
+    /// Closed meanwhile: nothing to sync.
+    Closed,
+}
+
+/// A pass over a host that could not queue a send leaves its server on the
+/// text before, and the answer is cached, so no resync would come again:
+/// retried with backoff, a bounded number of times, while the host is open.
+/// So is a pass whose regions could not be looked at (a reload in
+/// progress), which deferred its work to a retry that only syncs
+/// documents. `failed` passes before this one failed in a row.
+fn after_resync_pass(synced: bool, open: bool, failed: u32) -> AfterResyncPass {
+    if synced {
+        AfterResyncPass::Synced
+    } else if !open {
+        AfterResyncPass::Closed
+    } else if failed < MAX_RESYNC_RETRIES {
+        AfterResyncPass::Retry { failed: failed + 1 }
+    } else {
+        AfterResyncPass::GiveUp
+    }
+}
+
 impl ClientRoot<'_> {
     /// How this root's origin reads in the startup log.
     fn source(&self) -> &'static str {
@@ -838,48 +883,39 @@ impl Kakehashi {
                             .collect()
                     },
                 };
-                // Several documents of one host usually finish together.
-                let mut hosts: std::collections::HashMap<Url, (bool, bool)> =
-                    std::collections::HashMap::new();
-                for resync in first
-                    .into_iter()
-                    .chain(std::iter::from_fn(|| resync_rx.try_recv().ok()))
-                {
-                    let (ready, recollect) = hosts.entry(resync.host_uri).or_default();
-                    *ready |= resync.ready;
-                    *recollect |= resync.recollect;
-                }
+                let hosts = merge_resyncs(
+                    first
+                        .into_iter()
+                        .chain(std::iter::from_fn(|| resync_rx.try_recv().ok())),
+                );
                 for (uri, (ready, recollect)) in hosts {
-                    // A send the pass could not queue leaves its server on
-                    // the text before, and the answer is cached, so no
-                    // resync would come again: retry with backoff, a bounded
-                    // number of times, while the host is open. So is a pass
-                    // the host's regions could not be looked at for (a
-                    // reload in progress), which deferred its work to a
-                    // retry that only syncs documents.
                     let synchronized = injection.process_injections_synchronized(&uri).await;
                     let looked = matches!(injection.bridge_injections(&uri), Some((_, Some(_))));
-                    if synchronized && looked {
-                        failures.remove(&uri);
-                        diagnostics.settle_pull_debt_after_prepare(&uri, ready);
-                        // The servers now hold the texts the answers gave;
-                        // what they diagnosed before was for other texts.
-                        if ready || recollect {
-                            diagnostics.spawn_diagnostic_task_after_prepare(uri);
+                    let synced = synchronized && looked;
+                    let open = injection.document_incarnation(&uri).is_some();
+                    let failed = failures.remove(&uri).unwrap_or_default();
+                    match after_resync_pass(synced, open, failed) {
+                        AfterResyncPass::Synced => {
+                            diagnostics.settle_pull_debt_after_prepare(&uri, ready);
+                            // The servers now hold the texts the answers
+                            // gave; what they diagnosed before was for other
+                            // texts.
+                            if ready || recollect {
+                                diagnostics.spawn_diagnostic_task_after_prepare(uri);
+                            }
                         }
-                    } else if injection.document_incarnation(&uri).is_some() {
-                        let failed = failures.entry(uri.clone()).or_default();
-                        *failed += 1;
-                        if *failed <= MAX_RESYNC_RETRIES {
+                        AfterResyncPass::Retry { failed } => {
                             bridge.requeue_prepare_resync(
                                 crate::lsp::bridge::Resync {
                                     host_uri: uri.clone(),
                                     ready,
                                     recollect,
                                 },
-                                crate::lsp::bridge::prepare_retry_delay(*failed),
+                                crate::lsp::bridge::prepare_retry_delay(failed),
                             );
-                        } else {
+                            failures.insert(uri, failed);
+                        }
+                        AfterResyncPass::GiveUp => {
                             // Servers may still hold the text before, and
                             // requests on it fail their wait, until the next
                             // edit or save syncs the host.
@@ -887,10 +923,8 @@ impl Kakehashi {
                                 target: "kakehashi::bridge::prepare",
                                 "Gave up syncing the prepared virtual documents of {uri} after {MAX_RESYNC_RETRIES} retries; the next edit syncs them"
                             );
-                            failures.remove(&uri);
                         }
-                    } else {
-                        failures.remove(&uri);
+                        AfterResyncPass::Closed => {}
                     }
                 }
             }
@@ -3097,6 +3131,53 @@ async fn upstream_forwarding_loop_with_cancel(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_host_is_synced_again_once_per_batch_of_resyncs() {
+        use crate::lsp::bridge::Resync;
+        let host = |name: &str| url::Url::parse(&format!("file:///{name}.md")).unwrap();
+        let hosts = super::merge_resyncs([
+            Resync {
+                host_uri: host("a"),
+                ready: true,
+                recollect: false,
+            },
+            Resync {
+                host_uri: host("b"),
+                ready: false,
+                recollect: false,
+            },
+            Resync {
+                host_uri: host("a"),
+                ready: false,
+                recollect: true,
+            },
+        ]);
+        assert_eq!(hosts.len(), 2);
+        assert_eq!(hosts[&host("a")], (true, true));
+        assert_eq!(hosts[&host("b")], (false, false));
+    }
+
+    #[test]
+    fn a_failed_resync_pass_is_retried_a_bounded_number_of_times_while_open() {
+        use super::{AfterResyncPass, MAX_RESYNC_RETRIES, after_resync_pass};
+        assert_eq!(after_resync_pass(true, true, 3), AfterResyncPass::Synced);
+        assert_eq!(after_resync_pass(false, false, 0), AfterResyncPass::Closed);
+        assert_eq!(
+            after_resync_pass(false, true, 0),
+            AfterResyncPass::Retry { failed: 1 }
+        );
+        assert_eq!(
+            after_resync_pass(false, true, MAX_RESYNC_RETRIES - 1),
+            AfterResyncPass::Retry {
+                failed: MAX_RESYNC_RETRIES
+            }
+        );
+        assert_eq!(
+            after_resync_pass(false, true, MAX_RESYNC_RETRIES),
+            AfterResyncPass::GiveUp
+        );
+    }
+
     use super::*;
 
     #[test]
