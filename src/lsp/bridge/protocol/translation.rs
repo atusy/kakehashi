@@ -315,7 +315,6 @@ mod tests {
         super::super::prepare::apply_prepare_result(virtual_text, layout, Some(result))
             .unwrap()
             .map
-            .unwrap()
     }
 
     /// A region at host line 10, column 4, whose two virtual lines lost a

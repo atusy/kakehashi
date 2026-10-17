@@ -305,10 +305,9 @@ pub(crate) enum PrepareError {
 pub(crate) struct PreparedDocument {
     /// The text sent downstream.
     pub(crate) text: String,
-    /// `Some` for every document that went through a peer, even when its
-    /// answer changed nothing; `None` when no candidate advertises the
-    /// request, and the virtual text is sent as is.
-    pub(crate) map: Option<std::sync::Arc<PreparedMap>>,
+    /// The map back to the virtual document, even for an answer that changed
+    /// nothing: it is what records that the document went through the peer.
+    pub(crate) map: std::sync::Arc<PreparedMap>,
 }
 
 /// Apply a peer answer to the virtual document it was asked about.
@@ -436,7 +435,7 @@ pub(crate) fn apply_prepare_result_at(
     };
     Ok(PreparedDocument {
         text,
-        map: Some(std::sync::Arc::new(map)),
+        map: std::sync::Arc::new(map),
     })
 }
 
@@ -1190,9 +1189,7 @@ mod tests {
         let layout = VirtualLayout::single("a\n");
         let prepared = apply_prepare_result("a\n", &layout, None).unwrap();
         assert_eq!(prepared.text, "a\n");
-        let map = prepared
-            .map
-            .expect("a prepared document always carries a map");
+        let map = prepared.map;
         assert_eq!(map.to_virtual(pos(0, 1), Bias::Start), pos(0, 1));
     }
 
@@ -1220,7 +1217,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(prepared.text, "x = None\nprint(x)\n");
-        let map = prepared.map.unwrap();
+        let map = prepared.map;
         // Content after the gap moves with the gap's new length…
         assert_eq!(map.to_virtual(pos(1, 6), Bias::Start), pos(1, 6));
         assert_eq!(map.to_prepared(pos(0, 2), Bias::Start), pos(0, 2));
@@ -1247,7 +1244,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(prepared.text, "f(1, b)");
-        let map = prepared.map.unwrap();
+        let map = prepared.map;
         // `b` sits at column 5 in P and column 8 in V.
         assert_eq!(map.to_virtual(pos(0, 5), Bias::Start), pos(0, 8));
         assert_eq!(map.to_prepared(pos(0, 8), Bias::Start), pos(0, 5));
@@ -1271,7 +1268,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(prepared.text, "a\nb");
-        let map = prepared.map.unwrap();
+        let map = prepared.map;
         assert_eq!(map.to_virtual(pos(1, 0), Bias::Start), pos(3, 0));
         assert_eq!(map.to_prepared(pos(3, 0), Bias::Start), pos(1, 0));
     }
@@ -1280,7 +1277,7 @@ mod tests {
     fn dedent_shifts_columns_by_the_deleted_indent() {
         let (_, prepared) = dedented();
         assert_eq!(prepared.text, "if x:\n  y\n");
-        let map = prepared.map.unwrap();
+        let map = prepared.map;
         assert_eq!(map.to_virtual(pos(1, 2), Bias::Start), pos(1, 4));
         assert_eq!(map.to_prepared(pos(1, 4), Bias::Start), pos(1, 2));
         // A V position inside the deleted indent lands on the P line start.
@@ -1311,7 +1308,7 @@ mod tests {
     fn leading_blank_lines_are_deleted() {
         let (_, prepared) = leading_blank_dedented();
         assert_eq!(prepared.text, "a\nb\n");
-        let map = prepared.map.unwrap();
+        let map = prepared.map;
         // P's first line is V's second, after its removed indent.
         assert_eq!(map.to_virtual(pos(0, 0), Bias::Start), pos(1, 2));
         assert_eq!(map.to_virtual(pos(1, 1), Bias::Start), pos(2, 3));
@@ -1341,7 +1338,7 @@ mod tests {
     fn trailing_blank_lines_are_deleted() {
         let (_, prepared) = trailing_blank_dedented();
         assert_eq!(prepared.text, "a\n");
-        let map = prepared.map.unwrap();
+        let map = prepared.map;
         assert_eq!(map.to_virtual(pos(0, 1), Bias::Start), pos(0, 3));
         // P's end is the content's end, before the deleted lines.
         assert_eq!(map.to_virtual(pos(1, 0), Bias::Start), pos(1, 0));
@@ -1755,7 +1752,7 @@ mod tests {
         assert_eq!(prepared.text, "abcd");
         (
             virtual_text,
-            std::sync::Arc::try_unwrap(prepared.map.unwrap()).unwrap(),
+            std::sync::Arc::try_unwrap(prepared.map).unwrap(),
         )
     }
 
@@ -1776,7 +1773,7 @@ mod tests {
             result(json!({"segments": [{"type": "content", "changes": changes}]})),
         )
         .unwrap();
-        std::sync::Arc::try_unwrap(prepared.map.unwrap()).unwrap()
+        std::sync::Arc::try_unwrap(prepared.map).unwrap()
     }
 
     #[test]
@@ -1789,7 +1786,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(prepared.text, "foo()\nbar()\n");
-        let map = prepared.map.unwrap();
+        let map = prepared.map;
         // `bar()` starts P line 1 and V line 4, past the gap's lines.
         assert_eq!(map.to_virtual(pos(1, 0), Bias::Start), pos(4, 0));
         assert_eq!(map.to_prepared(pos(4, 0), Bias::Start), pos(1, 0));
@@ -1839,7 +1836,7 @@ mod tests {
             result(json!({"segments": [{"type": "content"}, {"type": "gap", "content": ""}]})),
         )
         .unwrap();
-        let map = prepared.map.unwrap();
+        let map = prepared.map;
         assert_eq!(map.to_virtual(pos(0, 2), Bias::Start), pos(0, 2));
         assert_eq!(map.to_virtual(pos(0, 1), Bias::Start), pos(0, 1));
         assert_eq!(map.to_prepared(pos(0, 4), Bias::Start), pos(0, 2));
@@ -1858,10 +1855,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(prepared.text, "  a\rb");
-        assert_eq!(
-            prepared.map.unwrap().to_virtual(pos(1, 0), Bias::Start),
-            pos(1, 2)
-        );
+        assert_eq!(prepared.map.to_virtual(pos(1, 0), Bias::Start), pos(1, 2));
     }
 
     #[test]
@@ -1884,7 +1878,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(prepared.text, "f(1, 𝄞é)");
-        let map = prepared.map.unwrap();
+        let map = prepared.map;
         // `é` is P column 7 (f ( 1 , space 𝄞=2) and V column 10.
         assert_eq!(map.to_virtual(pos(0, 7), Bias::Start), pos(0, 10));
         assert_eq!(map.to_prepared(pos(0, 10), Bias::Start), pos(0, 7));

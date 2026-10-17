@@ -1913,8 +1913,7 @@ mod tests {
         // The same text held with a map: same coordinates, another mapping.
         let mapped = apply_prepare_result("a", &VirtualLayout::single("a"), None)
             .unwrap()
-            .map
-            .unwrap();
+            .map;
         let sent = SentText {
             text: "a",
             map: Some(&mapped),
