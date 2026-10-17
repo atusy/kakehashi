@@ -2788,12 +2788,17 @@ impl LanguageServerPool {
         // finds its text on record. (The fingerprint also keeps the first
         // position-only host edit, which leaves this region's content
         // unchanged, from re-sending a didChange — and flickering a server
-        // that clears on didChange, #422.) A didOpen that never goes out
-        // takes the record back with its claim: the rollback below, or the
-        // claim guard's on cancellation.
-        self.document_tracker
-            .record_opening(virtual_uri, connection_key, virtual_content);
+        // that clears on didChange, #422.) A didOpen that is not queued
+        // takes the record back at once, before its claim is rolled back;
+        // the production senders queue without suspending, so only a test
+        // sender can be cancelled in between, which the claim guard's
+        // rollback covers.
+        let previous =
+            self.document_tracker
+                .record_opening(virtual_uri, connection_key, virtual_content);
         if let Err(e) = sender.send_notification(did_open).await {
+            self.document_tracker
+                .take_back(virtual_uri, connection_key, previous);
             self.document_tracker
                 .rollback_open_claim_if(host_uri, virtual_uri, connection_key, &claim)
                 .await;
