@@ -79,7 +79,7 @@ pub(in crate::lsp::bridge) fn devnull_config() -> BridgeServerConfig {
 }
 
 /// Create a BridgeServerConfig for a mock server with a specific language.
-pub(in crate::lsp::bridge) fn devnull_config_for_language(language: &str) -> BridgeServerConfig {
+pub(crate) fn devnull_config_for_language(language: &str) -> BridgeServerConfig {
     BridgeServerConfig {
         cmd: Some(vec![
             "sh".to_string(),
