@@ -2235,6 +2235,19 @@ mod tests {
         resolved: &crate::language::injection::ResolvedInjection,
         answer: crate::lsp::bridge::PrepareAnswer,
     ) {
+        answer_held(server, uri, resolved, answer, false);
+        assert!(!server.lifecycle_prepares(uri, resolved));
+    }
+
+    /// [`answer`], the lifecycle pass holding the document on it when
+    /// `held`.
+    fn answer_held(
+        server: &crate::lsp::lsp_impl::Kakehashi,
+        uri: &Url,
+        resolved: &crate::language::injection::ResolvedInjection,
+        answer: crate::lsp::bridge::PrepareAnswer,
+        held: bool,
+    ) {
         let target = server.bridge.prepare_target("markdown", "lua").unwrap();
         server.bridge.answer_prepare_for_test(
             &target,
@@ -2247,8 +2260,8 @@ mod tests {
                 gaps: &resolved.gaps,
             },
             answer,
+            held,
         );
-        assert!(!server.lifecycle_prepares(uri, resolved));
     }
 
     fn dedented() -> crate::lsp::bridge::PrepareAnswer {
@@ -2303,6 +2316,27 @@ mod tests {
             .expect("hints stay open");
         assert!(hint.prepared.is_some());
         assert_eq!(hint.resolved.virtual_content, "a");
+    }
+
+    /// A region the lifecycle pass holds on an unusable answer is not
+    /// bridged: formatting tells it apart from a closed one, as a failure.
+    #[tokio::test]
+    async fn a_region_its_peer_failed_is_unprepared_for_edit_methods() {
+        let (service, resolved, uri) = kakehashi_with_an_unlooked_region();
+        let server = service.inner();
+        answer_held(
+            server,
+            &uri,
+            &resolved,
+            crate::lsp::bridge::PrepareAnswer::Unusable,
+            true,
+        );
+        assert_eq!(
+            server
+                .method_gate(&uri, "markdown", &resolved, "textDocument/formatting")
+                .await,
+            MethodGate::Unprepared
+        );
     }
 
     #[tokio::test]
