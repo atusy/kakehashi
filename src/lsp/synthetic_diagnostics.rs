@@ -47,7 +47,7 @@ pub(crate) enum SyntheticDiagnosticTrigger {
 impl SyntheticDiagnosticTrigger {
     /// Precedence among one version's collections; equal ranks supersede
     /// each other in arrival order.
-    fn rank(self) -> u8 {
+    pub(crate) fn rank(self) -> u8 {
         match self {
             Self::Open => 0,
             Self::Change => 1,

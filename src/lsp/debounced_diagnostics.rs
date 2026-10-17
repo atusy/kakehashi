@@ -120,7 +120,9 @@ impl Timer {
     /// held regions were sent ranks above an edit's whose snapshot was
     /// captured before (and so left those regions out).
     fn outranks(&self, lineage: (u64, u64, u64), trigger: SyntheticDiagnosticTrigger) -> bool {
-        !self.handle.is_finished() && self.lineage == lineage && self.trigger > trigger
+        !self.handle.is_finished()
+            && self.lineage == lineage
+            && self.trigger.rank() > trigger.rank()
     }
 }
 
