@@ -311,11 +311,10 @@ impl Kakehashi {
             // would replace those real host gaps as well and corrupt the document.
             // A prepared document's edits are not mapped back through its map:
             // closed as a non-contiguous one is.
-            if crate::lsp::lsp_impl::bridge_context::method_closed_to(
-                resolved,
-                "textDocument/formatting",
-                self.lifecycle_prepares(uri, resolved),
-            ) {
+            if self
+                .method_closed_to_region(uri, language_name, resolved, "textDocument/formatting")
+                .await
+            {
                 continue;
             }
             let configs = self

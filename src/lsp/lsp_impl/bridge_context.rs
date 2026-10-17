@@ -1436,6 +1436,44 @@ impl Kakehashi {
         Some(ctx)
     }
 
+    /// Whether `method` is closed to a region of a `host_language` host: by
+    /// [`method_closed_to`] under what the lifecycle pass knows, or — for an
+    /// edit method on a region the pass has not looked up yet — once the
+    /// prepare answer for its current text is in (waited for, as a request
+    /// is): only a document sent as is takes edits.
+    pub(crate) async fn method_closed_to_region(
+        &self,
+        uri: &Url,
+        host_language: &str,
+        resolved: &ResolvedInjection,
+        method: &str,
+    ) -> bool {
+        if method_closed_to(resolved, method, self.lifecycle_prepares(uri, resolved)) {
+            return true;
+        }
+        if !method_requires_contiguous_injection(method) {
+            return false;
+        }
+        let Some(target) = self
+            .bridge
+            .prepare_target(host_language, &resolved.injection_language)
+        else {
+            return false;
+        };
+        let input = crate::lsp::bridge::PrepareInput {
+            host_uri: uri,
+            host_language,
+            injection_language: &resolved.injection_language,
+            region_id: &resolved.region.region_id,
+            virtual_text: &resolved.virtual_content,
+            gaps: &resolved.gaps,
+        };
+        !matches!(
+            self.bridge.prepared_document(&target, input).await,
+            Ok(crate::lsp::bridge::PrepareAnswer::AsIs)
+        )
+    }
+
     /// Whether the lifecycle pass prepares a region's current document (or
     /// holds it back for its peer): what [`method_closed_to`] closes edit
     /// methods by. Not whether a server still holds a prepared text of it
