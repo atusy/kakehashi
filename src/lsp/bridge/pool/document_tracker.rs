@@ -804,6 +804,7 @@ impl DocumentTracker {
                 .and_then(|docs| docs.get_mut(&uri_string))
                 .filter(|held| held.fingerprint == fp)
             {
+                let changed = held.map.as_deref() != content.map.map(Arc::as_ref);
                 if let Some(map) = content.map {
                     self.note_prepared(connection_key, virtual_uri, &uri_string);
                     held.map = Some(Arc::clone(map));
@@ -812,7 +813,9 @@ impl DocumentTracker {
                 }
                 // The same text under another map is what a request built
                 // on that map waits for.
-                self.notify_held_changed();
+                if changed {
+                    self.notify_held_changed();
+                }
                 return None;
             }
         }
