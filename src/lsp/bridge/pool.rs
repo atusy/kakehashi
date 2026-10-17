@@ -3252,6 +3252,10 @@ impl LanguageServerPool {
     /// Forget which of `host_uri`'s documents a connection was ever sent a
     /// prepared text of (see `DocumentTracker::forget_prepared_history`).
     pub(super) fn forget_prepared_history(&self, host_uri: &Url) {
+        // Nothing to forget before any prepared text was sent.
+        if !self.document_tracker.ever_held_prepared() {
+            return;
+        }
         if let Ok(host_uri) = crate::lsp::lsp_impl::url_to_uri(host_uri) {
             self.document_tracker.forget_prepared_history(&host_uri);
         }

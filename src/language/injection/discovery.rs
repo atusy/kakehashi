@@ -1315,7 +1315,12 @@ impl InjectionResolver {
             virtual_content,
             line_column_offsets,
             contiguous,
-            gaps: gaps.into(),
+            // An empty one shares the static empty slice: nothing allocated.
+            gaps: if gaps.is_empty() {
+                Default::default()
+            } else {
+                gaps.into()
+            },
         })
     }
 

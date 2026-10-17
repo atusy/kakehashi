@@ -195,7 +195,7 @@ pub(super) fn resolve_region_offset_for_held(
         held,
     );
     let (offset, region_end, contiguous, language) = resolved_region_geometry(resolved);
-    let offset = presentation.offset(&offset)?.into_owned();
+    let offset = presentation.into_offset(offset)?;
     Some((offset, region_end, contiguous, language))
 }
 
