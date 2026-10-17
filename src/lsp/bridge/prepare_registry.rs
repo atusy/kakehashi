@@ -278,7 +278,7 @@ pub(crate) struct PrepareRegistry {
     /// The last scan of [`Self::any_region_prepared`]: `(epoch, held
     /// changes, result)`.
     prepared_scan: std::sync::Mutex<Option<(u64, u64, bool)>>,
-    /// Hosts closed with documents looked up, until reopened: a request
+    /// Hosts closed, until reopened: a request
     /// still running past the close looks nothing up for them, and an
     /// attempt for one asks no peer. Shared with the attempts. Each entry
     /// goes on a reopen, or once [`CLOSED_HOSTS_KEPT`] later closes were
@@ -556,22 +556,18 @@ impl PrepareRegistry {
     /// Forget a closed host's documents: until it opens again, nothing is
     /// looked up for it.
     pub(crate) fn forget_host(&self, host_uri: &Url) {
-        let looked_up = self
-            .regions
-            .iter()
-            .any(|region| region.host_uri == host_uri.as_str());
-        if looked_up {
-            let order = self.closes.fetch_add(1, Ordering::AcqRel);
-            self.closed_hosts.insert(host_uri.to_string(), order);
-            if self.closed_hosts.len() > CLOSED_HOSTS_KEPT
-                && let Some(oldest) = self
-                    .closed_hosts
-                    .iter()
-                    .min_by_key(|entry| *entry.value())
-                    .map(|entry| entry.key().clone())
-            {
-                self.closed_hosts.remove(&oldest);
-            }
+        // Every close, whether anything was looked up yet or not: a request
+        // resolved before the close may still be about to look up.
+        let order = self.closes.fetch_add(1, Ordering::AcqRel);
+        self.closed_hosts.insert(host_uri.to_string(), order);
+        if self.closed_hosts.len() > CLOSED_HOSTS_KEPT
+            && let Some(oldest) = self
+                .closed_hosts
+                .iter()
+                .min_by_key(|entry| *entry.value())
+                .map(|entry| entry.key().clone())
+        {
+            self.closed_hosts.remove(&oldest);
         }
         self.regions
             .retain(|_, region| region.host_uri != host_uri.as_str());
@@ -1855,10 +1851,21 @@ mod tests {
         registry.lookup_or_start(&pool, &target, input(&host, "a"));
         assert_eq!(registry.regions.len(), 1);
 
-        // A host closed with nothing looked up is not remembered.
+        // A host closed before anything was looked up is remembered too: a
+        // request resolved before the close may look up after it.
         let other = Url::parse("file:///untouched.md").unwrap();
         registry.forget_host(&other);
-        assert!(!registry.host_closed(&other));
+        assert!(registry.host_closed(&other));
+        assert!(matches!(
+            registry.lookup_for_request(&pool, &target, input(&other, "a")),
+            PrepareLookup::Pending
+        ));
+        assert!(
+            !registry
+                .regions
+                .iter()
+                .any(|region| region.host_uri == other.as_str())
+        );
     }
 
     /// Closed hosts are remembered up to a bound, the oldest close going
