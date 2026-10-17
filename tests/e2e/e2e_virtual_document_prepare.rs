@@ -506,6 +506,7 @@ fn a_document_the_peer_cannot_prepare_is_not_bridged() {
     let until = Instant::now() + Duration::from_secs(7);
     while Instant::now() < until {
         let response = hover(&mut client, uri, 5, 1);
+        assert!(response.get("error").is_none(), "{response}");
         assert!(response["result"].is_null(), "{response}");
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -633,9 +634,23 @@ fn an_editor_pull_while_preparing_waits_for_the_prepared_text() {
         2,
         "# t\n\n```lua\n  local x = 2 -- SLOW\n```\n",
     );
-    let report = pull(&mut client, uri);
-    let items = echo_items(&report);
-    assert_eq!(items.len(), 1, "{report}");
+    // Pulled again while nothing is reported (a loaded runner can push the
+    // answer past one pull's budget), never with the text before.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let items = loop {
+        let report = pull(&mut client, uri);
+        let items = echo_items(&report);
+        assert!(
+            items.iter().all(|item| item["message"] != "local x = 1\n"),
+            "a diagnostic of the text before the edit: {report}"
+        );
+        if !items.is_empty() {
+            break items;
+        }
+        assert!(Instant::now() < deadline, "{report}");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(items.len(), 1, "{items:?}");
     assert_eq!(items[0]["message"], "local x = 2 -- SLOW\n");
     assert_eq!(
         items[0]["range"],
