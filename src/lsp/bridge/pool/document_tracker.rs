@@ -1027,15 +1027,17 @@ impl DocumentTracker {
         // in: a watermark read without the lock never covers a record made
         // after it.
         let generation = self.held_generations.load(Ordering::Relaxed) + 1;
-        let previous = docs.insert(
-            uri_string.to_owned(),
-            HeldText {
-                fingerprint: change.fingerprint,
-                map,
-                generation,
-                version: change.version,
-            },
-        );
+        let record = HeldText {
+            fingerprint: change.fingerprint,
+            map,
+            generation,
+            version: change.version,
+        };
+        // The key is copied only for a document not on record yet.
+        let previous = match docs.get_mut(uri_string) {
+            Some(held) => Some(std::mem::replace(held, record)),
+            None => docs.insert(uri_string.to_owned(), record),
+        };
         self.held_generations.store(generation, Ordering::Release);
         self.notify_held_changed();
         previous

@@ -232,7 +232,8 @@ impl super::BridgeCoordinator {
         }
     }
 
-    /// [`Self::prepared_document_now`] for a request that cannot wait (see
+    /// [`Self::prepared_document_now`] for anything but the lifecycle pass
+    /// that cannot wait — a request, a re-open sweep, a recovery probe (see
     /// `PrepareRegistry::lookup_for_request`).
     pub(crate) fn prepared_document_now_for_request(
         &self,
