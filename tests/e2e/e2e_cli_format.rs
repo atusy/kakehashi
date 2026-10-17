@@ -599,7 +599,7 @@ languages = ["lua"]
     );
     assert!(
         String::from_utf8_lossy(&output.stderr)
-            .contains("1 downstream formatting operation(s) failed"),
+            .contains("doc.md: 1 downstream formatting operation(s) failed"),
         "stderr should report the failed region; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );

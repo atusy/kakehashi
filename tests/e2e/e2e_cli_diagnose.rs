@@ -750,7 +750,7 @@ languages = ["lua"]
         stderr_of(&output)
     );
     assert!(
-        stderr_of(&output).contains("1 downstream diagnostic operation(s) failed"),
+        stderr_of(&output).contains("doc.md: 1 downstream diagnostic operation(s) failed"),
         "stderr should report the failed region; stderr: {}",
         stderr_of(&output)
     );
@@ -760,7 +760,7 @@ languages = ["lua"]
 fn e2e_diagnose_does_not_count_a_region_its_prepare_peer_prepared() {
     // The same region, prepared by its peer, is no failure: the run
     // exits 0.
-    let markdown = "# Test\n\n```lua\nprint('ok')\n```\n";
+    let markdown = "# Test\n\n```lua\n  print('ok')\n```\n";
     let config = format!(
         r#"autoInstall = false
 
@@ -797,9 +797,10 @@ languages = ["lua"]
         "a region its prepare peer prepared must exit 0; stderr: {}",
         stderr_of(&output)
     );
-    // Diagnosed through the prepared document.
+    // Diagnosed through the prepared document: the server's diagnostic at
+    // its line's start lands after the indent the peer dedented.
     assert!(
-        String::from_utf8_lossy(&output.stdout).starts_with("doc.md:4:"),
+        String::from_utf8_lossy(&output.stdout).starts_with("doc.md:4:3: "),
         "stdout: {}",
         String::from_utf8_lossy(&output.stdout)
     );
