@@ -10,10 +10,11 @@
 //! coordinates between P and V. V keeps its existing host translation
 //! ([`super::RegionOffset`]), so host ↔ P is the composition of the two.
 //!
-//! Content may only lose leading whitespace and edge blank lines so that
-//! every edit a downstream server makes in P can be mapped back
-//! unambiguously; gaps are opaque, so an edit touching one is refused rather
-//! than guessed.
+//! Content may only lose leading whitespace and blank lines at the
+//! document's edges, so the map is fixed by the answer itself: every P
+//! position has one V position, and every V position outside those deleted
+//! runs and the gaps one P position. Gaps are opaque: a position inside one
+//! stands for no P position of its own.
 
 use std::ops::Range;
 use std::time::Duration;
@@ -710,11 +711,10 @@ impl PreparedMap {
     fn offset_in_removed_lines(&self, offset: usize) -> bool {
         // From where the document's deleted closing lines start, V holds only
         // what P dropped (those lines and the closing indent after them), up
-        // to its very end. P's end maps to that start, but what a client
-        // inserts at a caret there (a completion without a text edit) joins
-        // the first of those lines, which P does not have. Those are the runs
-        // empty in P at its end; the closing lines may be several runs,
-        // deleted one by one.
+        // to its very end. P's end maps to that start, yet a position there
+        // is on the first of those lines, which P does not have. Those are
+        // the runs empty in P at its end; the closing lines may be several
+        // runs, deleted one by one.
         if let Some(lines) = self
             .runs
             .iter()
