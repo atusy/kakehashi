@@ -511,6 +511,19 @@ impl PrepareRegistry {
         self.held_changes.fetch_add(1, Ordering::AcqRel);
     }
 
+    /// Forget `host_uri`'s regions of `region_ids` under every language, in
+    /// one sweep: they were invalidated together.
+    pub(crate) fn forget_regions(&self, host_uri: &Url, region_ids: &[String]) {
+        if region_ids.is_empty() || self.unused() {
+            return;
+        }
+        let host_uri = host_uri.as_str();
+        self.regions.retain(|_, region| {
+            !(region.host_uri == host_uri && region_ids.contains(&region.region_id))
+        });
+        self.held_changes.fetch_add(1, Ordering::AcqRel);
+    }
+
     /// Forget a replaced region under every language but the one it resolves
     /// to now (`None`: every one): a region re-routed to another language
     /// keeps its id, and its document under the new language may be being
@@ -1894,5 +1907,51 @@ mod tests {
         assert_eq!(registry.regions.len(), 1);
         registry.forget_region(&host, None, REGION);
         assert!(registry.regions.is_empty());
+    }
+
+    #[test]
+    fn invalidated_regions_are_forgotten_together_under_every_language() {
+        let registry = PrepareRegistry::default();
+        let pool = LanguageServerPool::preparing();
+        let target = unstartable_target(&pool);
+        let host = Url::parse("file:///host.md").unwrap();
+        let other = Url::parse("file:///other.md").unwrap();
+        let region = |host, region_id, language| {
+            let mut input = input(host, "a");
+            input.region_id = region_id;
+            input.injection_language = language;
+            registry.slot(&target, input, Holder::LifecyclePass, target.epoch);
+        };
+        region(&host, "01J0000000000000000000000A", "lua");
+        region(&host, "01J0000000000000000000000A", "ruby");
+        region(&host, "01J0000000000000000000000B", "lua");
+        region(&host, "01J0000000000000000000000C", "lua");
+        region(&other, "01J0000000000000000000000A", "lua");
+        registry.forget_regions(
+            &host,
+            &[
+                "01J0000000000000000000000A".to_string(),
+                "01J0000000000000000000000B".to_string(),
+            ],
+        );
+        let mut left: Vec<_> = registry
+            .regions
+            .iter()
+            .map(|region| (region.host_uri.clone(), region.region_id.clone()))
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                (
+                    "file:///host.md".to_string(),
+                    "01J0000000000000000000000C".to_string()
+                ),
+                (
+                    "file:///other.md".to_string(),
+                    "01J0000000000000000000000A".to_string()
+                ),
+            ]
+        );
     }
 }

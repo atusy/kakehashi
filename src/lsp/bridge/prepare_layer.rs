@@ -444,6 +444,14 @@ impl super::BridgeCoordinator {
         }
     }
 
+    /// Drop invalidated regions' answers under every language (see
+    /// `PrepareRegistry::forget_regions`).
+    pub(crate) fn forget_prepared_regions(&self, host_uri: &Url, region_ids: &[String]) {
+        if let Some(layer) = &self.prepare {
+            layer.registry.forget_regions(host_uri, region_ids);
+        }
+    }
+
     /// Drop a replaced region's answers except under the language it
     /// resolves to now (see `PrepareRegistry::forget_region_except`).
     pub(crate) fn forget_replaced_prepared_region(
