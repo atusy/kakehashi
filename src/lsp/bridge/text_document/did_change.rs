@@ -112,14 +112,9 @@ impl LanguageServerPool {
                 // every region (#422). Mirrors the host path's fingerprint guard.
                 let content = SentText::from(&injection.content);
                 let Some(version) = self
-                    .increment_version_if_content_changed(
-                        &virtual_uri,
-                        &connection_key,
-                        content.text,
-                    )
+                    .increment_version_if_content_changed(&virtual_uri, &connection_key, content)
                     .await
                 else {
-                    self.rehold_unchanged_content(&virtual_uri, &connection_key, content);
                     continue;
                 };
 
