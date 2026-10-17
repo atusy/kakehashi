@@ -880,6 +880,11 @@ mod tests {
         let edited = timers.timer_abort_handle(&uri).unwrap();
         scheduler.schedule_debounced_diagnostic_after_prepare(uri.clone());
         assert_ne!(timers.timer_abort_handle(&uri).unwrap().id(), edited.id());
+        // As does a later one after prepare, for the same version: it
+        // snapshots when it fires, so nothing the first had is lost.
+        let first = timers.timer_abort_handle(&uri).unwrap();
+        scheduler.schedule_debounced_diagnostic_after_prepare(uri.clone());
+        assert_ne!(timers.timer_abort_handle(&uri).unwrap().id(), first.id());
         timers.cancel_all();
     }
 
