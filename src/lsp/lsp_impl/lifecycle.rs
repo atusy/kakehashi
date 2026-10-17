@@ -116,22 +116,61 @@ fn resyncs_on_epoch_move(
             host_uri,
             ready: false,
             recollect: !nothing_looked_up,
+            edited: false,
         })
         .collect()
 }
 
 /// Hosts to sync again, each once: several documents of one host usually
-/// finish together. `(ready, recollect)` of any of a host's resyncs.
+/// finish together. Ready, or recollecting, when any of a host's resyncs
+/// is; edited only when every ready one is (one ready otherwise collects at
+/// once).
 fn merge_resyncs(
     resyncs: impl IntoIterator<Item = crate::lsp::bridge::Resync>,
-) -> std::collections::HashMap<Url, (bool, bool)> {
-    let mut hosts: std::collections::HashMap<Url, (bool, bool)> = std::collections::HashMap::new();
+) -> std::collections::HashMap<Url, crate::lsp::bridge::Resync> {
+    let mut hosts: std::collections::HashMap<Url, crate::lsp::bridge::Resync> =
+        std::collections::HashMap::new();
     for resync in resyncs {
-        let (ready, recollect) = hosts.entry(resync.host_uri).or_default();
-        *ready |= resync.ready;
-        *recollect |= resync.recollect;
+        let merged = hosts
+            .entry(resync.host_uri.clone())
+            .or_insert(crate::lsp::bridge::Resync {
+                host_uri: resync.host_uri,
+                ready: false,
+                recollect: false,
+                edited: true,
+            });
+        merged.ready |= resync.ready;
+        merged.recollect |= resync.recollect;
+        if resync.ready {
+            merged.edited &= resync.edited;
+        }
+    }
+    for merged in hosts.values_mut() {
+        merged.edited &= merged.ready;
     }
     hosts
+}
+
+/// How a host's diagnostics are collected after a resync pass synced it.
+#[derive(Debug, PartialEq, Eq)]
+enum CollectAfterResync {
+    /// At once: its servers hold texts other than those they diagnosed (an
+    /// open's first answer, an epoch move, an unusable answer).
+    AtOnce,
+    /// Through the edit's debounced collection: the answer is an edit's,
+    /// and the 500 ms debounce that keeps a burst of keystrokes to one
+    /// collection holds for it too.
+    Debounced,
+}
+
+fn collect_after_resync(resync: &crate::lsp::bridge::Resync) -> Option<CollectAfterResync> {
+    if resync.recollect || resync.ready && !resync.edited {
+        Some(CollectAfterResync::AtOnce)
+    } else if resync.ready {
+        Some(CollectAfterResync::Debounced)
+    } else {
+        None
+    }
 }
 
 /// What a resync pass over a host leads to.
@@ -896,7 +935,8 @@ impl Kakehashi {
                         .into_iter()
                         .chain(std::iter::from_fn(|| resync_rx.try_recv().ok())),
                 );
-                for (uri, (ready, recollect)) in hosts {
+                for (uri, resync) in hosts {
+                    let ready = resync.ready;
                     // A save the held regions missed is replayed by the
                     // pass too; one it could not look at the regions for
                     // keeps it, and is retried.
@@ -910,17 +950,19 @@ impl Kakehashi {
                             // The servers now hold the texts the answers
                             // gave; what they diagnosed before was for other
                             // texts.
-                            if ready || recollect {
-                                diagnostics.spawn_diagnostic_task_after_prepare(uri);
+                            match collect_after_resync(&resync) {
+                                Some(CollectAfterResync::AtOnce) => {
+                                    diagnostics.spawn_diagnostic_task_after_prepare(uri);
+                                }
+                                Some(CollectAfterResync::Debounced) => {
+                                    diagnostics.schedule_debounced_diagnostic_after_prepare(uri);
+                                }
+                                None => {}
                             }
                         }
                         AfterResyncPass::Retry { failed } => {
                             bridge.requeue_prepare_resync(
-                                crate::lsp::bridge::Resync {
-                                    host_uri: uri.clone(),
-                                    ready,
-                                    recollect,
-                                },
+                                resync,
                                 crate::lsp::bridge::prepare_retry_delay(failed),
                             );
                             failures.insert(uri, failed);
@@ -3160,6 +3202,7 @@ mod tests {
             host_uri: host,
             ready: false,
             recollect,
+            edited: false,
         };
         let [a, b] = hosts();
         assert_eq!(
@@ -3181,21 +3224,62 @@ mod tests {
                 host_uri: host("a"),
                 ready: true,
                 recollect: false,
+                edited: false,
             },
             Resync {
                 host_uri: host("b"),
                 ready: false,
                 recollect: false,
+                edited: false,
             },
             Resync {
                 host_uri: host("a"),
                 ready: false,
                 recollect: true,
+                edited: false,
             },
         ]);
         assert_eq!(hosts.len(), 2);
-        assert_eq!(hosts[&host("a")], (true, true));
-        assert_eq!(hosts[&host("b")], (false, false));
+        let flags = |resync: &Resync| (resync.ready, resync.recollect, resync.edited);
+        assert_eq!(flags(&hosts[&host("a")]), (true, true, false));
+        assert_eq!(flags(&hosts[&host("b")]), (false, false, false));
+    }
+
+    /// A keystroke's answer is collected by the edit's debounced collection,
+    /// not at once: an immediate collection per keystroke would bypass the
+    /// debounce. An open's first answer, an epoch move and an unusable
+    /// answer collect at once.
+    #[test]
+    fn an_edits_answer_waits_for_the_debounced_collection() {
+        use super::{CollectAfterResync, collect_after_resync, merge_resyncs};
+        use crate::lsp::bridge::Resync;
+        let host = url::Url::parse("file:///edited.md").unwrap();
+        let resync = |ready, recollect, edited| Resync {
+            host_uri: host.clone(),
+            ready,
+            recollect,
+            edited,
+        };
+        let collect = |resyncs: Vec<Resync>| collect_after_resync(&merge_resyncs(resyncs)[&host]);
+        assert_eq!(
+            collect(vec![resync(true, false, true)]),
+            Some(CollectAfterResync::Debounced)
+        );
+        assert_eq!(
+            collect(vec![resync(true, false, false)]),
+            Some(CollectAfterResync::AtOnce)
+        );
+        assert_eq!(
+            collect(vec![resync(false, true, false)]),
+            Some(CollectAfterResync::AtOnce)
+        );
+        // An edit's answer beside an open's: at once.
+        assert_eq!(
+            collect(vec![resync(true, false, true), resync(true, false, false)]),
+            Some(CollectAfterResync::AtOnce)
+        );
+        // A retry's resync collects nothing.
+        assert_eq!(collect(vec![resync(false, false, false)]), None);
     }
 
     #[test]
