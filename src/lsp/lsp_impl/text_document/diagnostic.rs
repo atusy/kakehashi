@@ -238,9 +238,10 @@ impl Kakehashi {
         // pull below moves the regions themselves. The virtual text goes
         // along: a cached push follows the text its connection held, checked
         // against it when the fold snapshots the pushes, after the awaits
-        // below (see `BridgeCoordinator::place_held`). Not copied when the
-        // pool prepares nothing: every push then places as is.
-        let prepares = self.bridge.pool().prepares();
+        // below (see `BridgeCoordinator::place_held`). Not copied while
+        // every push places as is (with no peer, or none involved): a region
+        // prepared during the awaits misses one pull's pushes at most.
+        let prepares = !self.bridge.places_pushes_as_is();
         let region_meta: Vec<RegionPushMeta> = virt_regions
             .iter()
             .map(|r| {
