@@ -368,6 +368,19 @@ pub(crate) struct HostVirtualContents {
     /// [`LanguageServerPool::hold_latest_virtual_content`]): no request opens
     /// one with text as is.
     held: DashSet<(String, String)>,
+    /// How many entries `held` has: read in place of `held`'s emptiness,
+    /// which locks every shard, on every lazy open and every recorded text.
+    held_count: std::sync::atomic::AtomicUsize,
+}
+
+impl HostVirtualContents {
+    /// Whether the lifecycle pass holds `(language, region_id)` (see `held`).
+    fn holds(&self, language: &str, region_id: &str) -> bool {
+        self.held_count.load(Ordering::Acquire) > 0
+            && self
+                .held
+                .contains(&(language.to_string(), region_id.to_string()))
+    }
 }
 
 /// The latest text forwarded for a virtual document, which a deferred
@@ -2719,16 +2732,12 @@ impl LanguageServerPool {
         // under too: a region it holds for its prepare peer is not opened
         // with text as is (a request resolved before its pair gained the
         // peer), whether its own or the last forwarded.
-        let region_held = self
-            .latest_virtual_contents
-            .get(host_uri)
-            .is_some_and(|host| {
-                !host.held.is_empty()
-                    && host.held.contains(&(
-                        virtual_uri.language().to_string(),
-                        virtual_uri.region_id().to_string(),
-                    ))
-            });
+        // Nothing is ever held without the prepare layer.
+        let region_held = self.prepares()
+            && self
+                .latest_virtual_contents
+                .get(host_uri)
+                .is_some_and(|host| host.holds(virtual_uri.language(), virtual_uri.region_id()));
         if let VirtualOpenContent::LatestKnown(provided) = &content
             && provided.map.is_none()
             && region_held
@@ -3004,9 +3013,13 @@ impl LanguageServerPool {
         }
         // Only once the text to open with is in: a request checking the hold
         // in between would open the text it replaces.
-        if !host.held.is_empty() {
-            host.held
-                .remove(&(language.to_string(), region_id.to_string()));
+        if host.held_count.load(Ordering::Acquire) > 0
+            && host
+                .held
+                .remove(&(language.to_string(), region_id.to_string()))
+                .is_some()
+        {
+            host.held_count.fetch_sub(1, Ordering::AcqRel);
         }
     }
 
@@ -3024,9 +3037,11 @@ impl LanguageServerPool {
     ) {
         if let Some(host) = self.latest_virtual_contents.get(host_uri)
             && host.incarnation == incarnation
+            && host
+                .held
+                .insert((language.to_string(), region_id.to_string()))
         {
-            host.held
-                .insert((language.to_string(), region_id.to_string()));
+            host.held_count.fetch_add(1, Ordering::AcqRel);
         }
     }
 
@@ -3110,6 +3125,7 @@ impl LanguageServerPool {
                 promoted_language: None,
                 contents: DashMap::new(),
                 held: DashSet::new(),
+                held_count: std::sync::atomic::AtomicUsize::new(0),
             },
         );
     }
