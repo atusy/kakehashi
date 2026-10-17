@@ -151,7 +151,11 @@ The answer has the same length and the same `type` order:
 kakehashi validates the whole answer; a wrong length or order, or a content
 change of any other shape, refuses it. That includes a blank line between
 lines that stay, and blank lines ending or opening a segment beside a gap
-(the line break opening the second of two joined strings, say).
+(the line break opening the second of two joined strings, say). So is an
+answer whose prepared text would join a lone CR and a LF the virtual
+document keeps apart into one line break (a dedent down to the line break
+after a lone CR, or a placeholder completing a CRLF): P would have a line
+fewer than V there.
 
 ### Coordinates
 
@@ -184,18 +188,18 @@ candidate advertising the request, or able to start — is a different case:
 there is nothing to prepare the document, and it is sent as is.) Requests on
 such a document get no answer from the virt layer, its pushed diagnostics
 are dropped, and the one-shot CLI (`format`, `diagnose`) counts it as a
-failed request (`format` exits 2). A peer that prefers a fallback answers `null` (or catches
-its own errors and does so); kakehashi does not choose one on its behalf.
+failed request, exiting 2. A peer that prefers a fallback answers `null`
+(or catches its own errors and does so); kakehashi does not choose one on
+its behalf.
 
 An unusable answer (an error response, a malformed or refused result) is
 final for that input under the current epoch. When it is the input the
 lifecycle pass holds the document on, and the epoch has not moved, it
 re-syncs its host as it arrives, and the host's diagnostics are collected
-again. A missing answer
-from the chosen peer (crashing, timing out, or answering with one of LSP's
-retryable cancellation codes) is retried with backoff — one second, doubling
-to a minute — without waiting for an edit, and requests do not pile further
-attempts onto a backing-off one.
+again. A missing answer from the chosen peer (crashing, timing out, or
+answering with one of LSP's retryable cancellation codes) is retried with
+backoff — one second, doubling to a minute — without waiting for an edit,
+and requests do not pile further attempts onto a backing-off one.
 
 ### Lifecycle
 
@@ -216,8 +220,9 @@ synced again: the prepared text is sent, the host's diagnostics are
 collected again, an editor pull answered without the document while it
 waited is owed a `workspace/diagnostic/refresh`, and a save the held
 document missed is forwarded, if the host is still at the saved version. A
-pass whose sends could not all be queued is retried with backoff, a bounded
-number of times. A request opening a document lazily opens the newer of its
+pass whose sends could not all be queued, or whose regions could not be
+looked at (a reload in progress), is retried with backoff, a bounded number
+of times. A request opening a document lazily opens the newer of its
 own text and the latest the lifecycle pass recorded.
 
 ## Invariants
