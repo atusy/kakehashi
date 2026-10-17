@@ -1527,6 +1527,25 @@ impl InjectionCoordinator {
         &self,
         uri: &Url,
     ) -> Option<(String, Option<Vec<BridgeInjection>>)> {
+        self.bridge_injections_as(uri, PrepareHolder::Probe)
+    }
+
+    /// [`Self::bridge_injections`] for a caller holding `uri`'s edit lock at
+    /// its current version (a save): it holds each document on the input it
+    /// resolves, as the lifecycle pass does, so the answer for that input
+    /// syncs the host again — and replays the save its held documents miss.
+    pub(crate) fn bridge_injections_holding(
+        &self,
+        uri: &Url,
+    ) -> Option<(String, Option<Vec<BridgeInjection>>)> {
+        self.bridge_injections_as(uri, PrepareHolder::LifecyclePass)
+    }
+
+    fn bridge_injections_as(
+        &self,
+        uri: &Url,
+        holder: PrepareHolder,
+    ) -> Option<(String, Option<Vec<BridgeInjection>>)> {
         let (host_language, settled) = self.screen_language(uri)?;
         if !settled {
             // The language did not come from a settled parse: between a
@@ -1536,7 +1555,7 @@ impl InjectionCoordinator {
             // against the other's tree. Nothing was looked at.
             return Some((host_language, None));
         }
-        let injections = self.resolve_injection_data(uri, &host_language);
+        let injections = self.resolve_injection_data_as(uri, &host_language, holder);
         Some((host_language, injections))
     }
 
@@ -2349,10 +2368,22 @@ mod tests {
         assert_eq!(probed.len(), 1);
         assert!(probed[0].held, "no answer yet: not sent");
         assert!(!held(&probed), "a probe holds nothing");
+        // The lifecycle pass holds the document on its input.
         let passed = injection
             .resolve_injection_data_as(&uri, "rust", super::PrepareHolder::LifecyclePass)
             .unwrap();
         assert!(held(&passed), "the pass holds the document on its input");
+        server.bridge.forget_prepared_host(&uri);
+        server.bridge.prepare_host_opened(&uri);
+        assert!(!held(&passed));
+        // A save resolves under the edit lock at the saved version, as the
+        // pass does: it holds the document, so the answer for its input syncs
+        // the host (and replays the save) even when it lands before the
+        // parse's pass.
+        let (_, Some(saved)) = injection.bridge_injections_holding(&uri).unwrap() else {
+            panic!("the document could be looked at");
+        };
+        assert!(held(&saved), "a save holds the document on its input");
     }
 
     /// Publish `tree` as `uri`'s current parse snapshot under `language`,

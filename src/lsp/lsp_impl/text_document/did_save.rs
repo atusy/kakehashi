@@ -147,7 +147,8 @@ impl Kakehashi {
             .get(uri)
             .map(|document| (document.incarnation(), document.content_version()));
         if current_lineage == Some((saved_incarnation, saved_content_version))
-            && let Some((_, Some(injections))) = self.injection_coordinator().bridge_injections(uri)
+            && let Some((_, Some(injections))) =
+                self.injection_coordinator().bridge_injections_holding(uri)
         {
             // Held documents (waiting for their prepare answers, or answered
             // unusably) are not sent, their save included: it is forwarded
