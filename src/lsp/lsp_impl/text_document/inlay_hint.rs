@@ -300,7 +300,7 @@ impl Kakehashi {
         // the region invalidates every parse, which advances the version as
         // well (`Document::invalidate_parse`), so the two stamps cover every
         // way the geometry can move.
-        if !self.inlay_hint_envelope_is_fresh(&host_url, &envelope, &pool) {
+        if !self.inlay_hint_response_is_current(&host_url, &envelope, &pool) {
             log::debug!(
                 target: "kakehashi::bridge",
                 "inlayHint/resolve: {} was revised or reopened while resolving; returning hint unresolved",
@@ -309,6 +309,25 @@ impl Kakehashi {
             return Ok(unresolved);
         }
         Ok(resolved)
+    }
+
+    /// Whether a resolved hint still belongs where its envelope was minted:
+    /// the document is neither revised nor reopened, nor its region prepared
+    /// meanwhile (an epoch move gaining its pair a peer), whose response is
+    /// in a prepared text's coordinates the envelope's offset does not map.
+    fn inlay_hint_response_is_current(
+        &self,
+        host_url: &url::Url,
+        envelope: &InlayHintEnvelope,
+        pool: &crate::lsp::bridge::LanguageServerPool,
+    ) -> bool {
+        self.inlay_hint_envelope_is_fresh(host_url, envelope, pool)
+            && (envelope.is_host_layer()
+                || !self.bridge.region_coordinates_may_be_prepared(
+                    host_url,
+                    &envelope.injection_language,
+                    &envelope.region_id,
+                ))
     }
 
     fn inlay_hint_envelope_is_fresh(
@@ -481,8 +500,20 @@ mod tests {
         envelope.region_id = region.region_id.clone();
         envelope.injection_language = "rust".to_string();
 
-        // As is: the region is rebuilt for the resolve.
+        let (incarnation, content_version) = server
+            .documents
+            .get(&uri)
+            .map(|document| (document.incarnation(), document.content_version()))
+            .unwrap();
+        envelope.incarnation = Some(incarnation);
+        envelope.content_version = Some(content_version);
+        let pool = server.bridge.pool_arc();
+        pool.open_host_incarnation(&uri, incarnation).await;
+
+        // As is: the region is rebuilt for the resolve, and its response
+        // surfaces.
         assert!(server.inlay_hint_region_geometry(&uri, &envelope).is_some());
+        assert!(server.inlay_hint_response_is_current(&uri, &envelope, &pool));
 
         // Prepared since (the pair gained its peer): not rebuilt.
         let target = server.bridge.prepare_target("rust", "rust").unwrap();
@@ -509,6 +540,8 @@ mod tests {
             true,
         );
         assert!(server.inlay_hint_region_geometry(&uri, &envelope).is_none());
+        // Nor does a response for it that was asked before.
+        assert!(!server.inlay_hint_response_is_current(&uri, &envelope, &pool));
     }
 
     #[test]

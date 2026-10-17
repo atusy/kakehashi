@@ -279,9 +279,7 @@ impl Kakehashi {
         // was enqueued. Revalidate after the response so an edit computed
         // against the content this resolve observed is not surfaced into a
         // revised or reopened document.
-        if !self.document_revision_is_current(&host_url, envelope.content_version)
-            || !self.host_incarnation_is_current(&host_url, envelope.incarnation)
-        {
+        if !self.code_action_response_is_current(&host_url, &envelope) {
             log::debug!(
                 target: "kakehashi::bridge",
                 "codeAction/resolve: {} was revised or reopened while resolving; refusing resolve",
@@ -298,6 +296,25 @@ impl Kakehashi {
             return Err(code_action_resolve_failed());
         }
         Ok(resolved)
+    }
+
+    /// Whether a resolved action still belongs where its envelope was
+    /// minted: the document is neither revised nor reopened, nor its region
+    /// prepared meanwhile (an epoch move gaining its pair a peer), whose edit
+    /// is in a prepared text's coordinates the envelope's offset does not map.
+    fn code_action_response_is_current(
+        &self,
+        host_url: &Url,
+        envelope: &CodeActionEnvelope,
+    ) -> bool {
+        self.document_revision_is_current(host_url, envelope.content_version)
+            && self.host_incarnation_is_current(host_url, envelope.incarnation)
+            && (envelope.is_host_layer()
+                || !self.bridge.region_coordinates_may_be_prepared(
+                    host_url,
+                    &envelope.injection_language,
+                    &envelope.region_id,
+                ))
     }
 
     /// The region's current content-precise host-document END position if the
@@ -684,6 +701,120 @@ fn code_action_resolve_failed() -> tower_lsp_server::jsonrpc::Error {
 mod tests {
     use super::*;
     use tower_lsp_server::ls_types::Command;
+
+    /// An action resolved while its region went from as is to prepared (an
+    /// epoch move gaining its pair a peer) is refused: its edit was computed
+    /// for the prepared text, which the envelope's offset does not map.
+    #[tokio::test]
+    async fn an_action_resolved_as_is_is_refused_once_its_region_is_prepared() {
+        use std::sync::Arc;
+        let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
+        let (service, _socket) = tower_lsp_server::LspService::new(|client| {
+            crate::lsp::lsp_impl::Kakehashi::with_cancel_forwarder(
+                client,
+                Arc::clone(&pool),
+                crate::lsp::CancelForwarder::new(Arc::clone(&pool)),
+            )
+        });
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), language.clone());
+        server.language.query_store().insert_injection_query(
+            "rust".into(),
+            Arc::new(
+                tree_sitter::Query::new(
+                    &language,
+                    r#"((string_literal) @injection.content (#set! injection.language "rust"))"#,
+                )
+                .unwrap(),
+            ),
+        );
+        server
+            .bridge
+            .prepare_settings_changed(&Arc::new(crate::config::WorkspaceSettings {
+                auto_install: false,
+                language_servers: [(
+                    "peer".to_string(),
+                    crate::lsp::bridge::test_helpers::devnull_config_for_language("rust"),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            }));
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let uri = url::Url::parse("file:///hinted.rs").unwrap();
+        let text = r#"fn main() { let x = "a"; }"#;
+        server.documents.insert(
+            uri.clone(),
+            text.into(),
+            Some("rust".into()),
+            parser.parse(text, None),
+        );
+        let region = server
+            .injection_coordinator()
+            .resolve_injection_data(&uri, "rust")
+            .unwrap()
+            .remove(0);
+        let mut envelope: crate::lsp::bridge::CodeActionEnvelope =
+            serde_json::from_value(serde_json::json!({
+                "origin": "rust-ls",
+                "host_uri": uri.to_string(),
+                "region_id": region.region_id,
+                "injection_language": "rust",
+                "offset": { "line": 0, "column": 0 },
+                "original_title": "fix",
+                "inner": null
+            }))
+            .unwrap();
+
+        let (incarnation, content_version) = server
+            .documents
+            .get(&uri)
+            .map(|document| (document.incarnation(), document.content_version()))
+            .unwrap();
+        envelope.incarnation = Some(incarnation);
+        envelope.content_version = Some(content_version);
+        server
+            .bridge
+            .pool_arc()
+            .open_host_incarnation(&uri, incarnation)
+            .await;
+
+        // As is: its resolved edit surfaces.
+        assert!(server.code_action_response_is_current(&uri, &envelope));
+
+        // Prepared since (the pair gained its peer): not rebuilt.
+        let target = server.bridge.prepare_target("rust", "rust").unwrap();
+        let answer =
+            serde_json::from_value(serde_json::json!({"segments": [{"type": "content"}]})).unwrap();
+        server.bridge.answer_prepare_for_test(
+            &target,
+            crate::lsp::bridge::PrepareInput {
+                host_uri: &uri,
+                host_language: "rust",
+                injection_language: "rust",
+                region_id: &region.region_id,
+                virtual_text: &region.content,
+                gaps: &[],
+            },
+            crate::lsp::bridge::PrepareAnswer::Prepared(Arc::new(
+                crate::lsp::bridge::apply_prepare_result(
+                    &region.content,
+                    &crate::lsp::bridge::VirtualLayout::single(&region.content),
+                    Some(answer),
+                )
+                .unwrap(),
+            )),
+            true,
+        );
+        // Prepared while resolving: the edit is in the prepared text's
+        // coordinates, which the envelope's offset does not map.
+        assert!(!server.code_action_response_is_current(&uri, &envelope));
+    }
 
     #[rstest::rstest]
     #[case::removed_server("server")]
