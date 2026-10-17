@@ -154,8 +154,8 @@ struct Cell {
     retry_at: std::sync::Mutex<Option<Instant>>,
     /// Bumped after every attempt, answered or not.
     attempts: tokio::sync::watch::Sender<u32>,
-    /// The lifecycle pass moved its document onto this input from an
-    /// answered one under the same epoch: the text was edited.
+    /// The lifecycle pass moved its document onto this input from another
+    /// under the same epoch, answered or still pending: the text was edited.
     after_edit: AtomicBool,
     /// The `textDocument.version` of each attempt, in order.
     #[cfg(test)]
@@ -666,12 +666,14 @@ impl PrepareRegistry {
                 held: None,
             };
         }
-        // Moved off an answered input of the same epoch: an edit.
+        // Moved off an input of the same epoch, answered or not: an edit.
+        // Typing ahead of a slow peer moves off pending inputs, and those
+        // answers belong to the burst the edit's debounce collects once.
         let moved = holder == Holder::LifecyclePass && region.held != Some(key);
         let edited = moved
             && region
                 .held_cell()
-                .is_some_and(|cell| cell.epoch == target.epoch && cell.outcome.get().is_some());
+                .is_some_and(|cell| cell.epoch == target.epoch);
         if moved {
             region.held = Some(key);
             self.held_changes.fetch_add(1, Ordering::AcqRel);
@@ -1296,9 +1298,9 @@ mod tests {
 
     #[tokio::test]
     async fn an_answer_for_an_edit_resyncs_as_edited() {
-        // The lifecycle pass moves from an answered text to the edited one
-        // under the same epoch: that answer's resync is an edit's, which the
-        // edit's debounced collection covers. The first answer's is not.
+        // The lifecycle pass moves from one text to the edited one under the
+        // same epoch: that answer's resync is an edit's, which the edit's
+        // debounced collection covers. The first answer's is not.
         let registry = PrepareRegistry::default();
         let mut resync = registry.take_resync_rx().unwrap();
         let pool = Arc::new(LanguageServerPool::preparing());
@@ -1322,6 +1324,17 @@ mod tests {
         assert!(
             registry
                 .prepare(&pool, &target, input(&host, "b"))
+                .await
+                .is_ok()
+        );
+        assert_eq!(resync.try_recv().ok(), Some(ready(true)));
+        // Typed on before an answer: moving off the still-pending input is
+        // an edit too.
+        registry.lookup_or_start(&pool, &target, input(&host, "x"));
+        registry.lookup_or_start(&pool, &target, input(&host, "y"));
+        assert!(
+            registry
+                .prepare(&pool, &target, input(&host, "y"))
                 .await
                 .is_ok()
         );
