@@ -3843,10 +3843,12 @@ mod tests {
             "textDocument/codeAction",
             "textDocument/colorPresentation",
             "textDocument/completion",
+            "textDocument/formatting",
             "textDocument/inlayHint",
             "textDocument/linkedEditingRange",
             "textDocument/onTypeFormatting",
             "textDocument/prepareRename",
+            "textDocument/rangeFormatting",
             "textDocument/rename",
         ] {
             assert!(method_requires_contiguous_injection(method), "{method}");
