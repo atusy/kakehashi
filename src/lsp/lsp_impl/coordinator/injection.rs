@@ -166,11 +166,16 @@ pub(crate) enum ReopenSnapshotState {
 }
 
 /// Inputs whose identity must survive from injection discovery to repair.
-/// Query reloads can change regions without editing the document.
+/// Query reloads can change regions without editing the document, and a
+/// prepare epoch move can change what its regions are sent as.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ReopenRevision {
     document: crate::lsp::bridge::HostRevision,
     query_generation: u64,
+    /// The prepare epoch the regions' answers were looked up under: after
+    /// it moves, the resync pass sends what the new one gives, and an open
+    /// with an answer from before would overwrite it.
+    prepare_epoch: u64,
 }
 
 impl InjectionCoordinator {
@@ -1332,9 +1337,11 @@ impl InjectionCoordinator {
 
     pub(crate) fn reopen_revision(&self, uri: &Url) -> Option<ReopenRevision> {
         let query_generation = self.cache.semantic_token_generation();
+        let prepare_epoch = self.bridge.pool().prepare_epoch();
         self.document_revision(uri).map(|document| ReopenRevision {
             document,
             query_generation,
+            prepare_epoch,
         })
     }
 
@@ -1356,6 +1363,7 @@ impl InjectionCoordinator {
             .recover_poison("InjectionCoordinator::reopen_queries_are_current");
         !pool.reload_in_progress()
             && self.cache.semantic_token_generation() == expected.query_generation
+            && self.bridge.pool().prepare_epoch() == expected.prepare_epoch
     }
 
     pub(crate) fn reopen_snapshot_state(
@@ -2784,6 +2792,49 @@ mod tests {
         assert!(
             received.try_recv().is_err(),
             "reconciliation must synchronize already-opened content too"
+        );
+    }
+
+    /// A reopen looks its regions' answers up off the edit lock and opens
+    /// later: after the prepare epoch moved, the resync pass sends what the
+    /// new epoch gives, and an open with an answer from before would
+    /// overwrite it. It is refused, and the retry looks again.
+    #[tokio::test]
+    async fn reopen_rejects_answers_from_before_the_prepare_epoch_moved() {
+        use std::sync::Arc;
+        let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
+        let (service, _socket) = LspService::new(|client| {
+            crate::lsp::lsp_impl::Kakehashi::with_cancel_forwarder(
+                client,
+                Arc::clone(&pool),
+                crate::lsp::CancelForwarder::new(Arc::clone(&pool)),
+            )
+        });
+        let server = service.inner();
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let uri = Url::parse("file:///reopen-prepare-epoch.rs").unwrap();
+        let text = "fn main() {}";
+        server.documents.insert(
+            uri.clone(),
+            text.into(),
+            Some("rust".into()),
+            parser.parse(text, None),
+        );
+        let injection = server.injection_coordinator();
+        let revision = injection.reopen_revision(&uri).unwrap();
+        assert_eq!(
+            injection.reopen_document_revision(&uri, revision),
+            Some(revision.document)
+        );
+        pool.advance_prepare_epoch();
+        assert_eq!(injection.reopen_document_revision(&uri, revision), None);
+        assert_ne!(
+            injection.reopen_snapshot_state(&uri, revision),
+            super::ReopenSnapshotState::Current,
+            "the retry looks again"
         );
     }
 
