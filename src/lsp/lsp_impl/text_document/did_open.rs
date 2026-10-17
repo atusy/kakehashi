@@ -2420,6 +2420,50 @@ print("hello")
         );
     }
 
+    /// A collection after a resync pass is for the revision the pass synced:
+    /// a later edit's text may hold regions its own pass has yet to send, and
+    /// a collection of it ranked as one after they were sent would leave them
+    /// out for good.
+    #[tokio::test]
+    async fn a_collection_after_prepare_is_for_the_revision_its_pass_synced() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+        let uri = Url::parse("file:///test/collect_synced_revision.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let parse = || async {
+            server
+                .parse_coordinator()
+                .parse_document(uri.clone(), Some("rust"), None, None)
+                .await
+        };
+        parse().await;
+        let scheduler = server.diagnostic_scheduler();
+        let synced = scheduler.current_revision(&uri);
+        // Edited and parsed since the pass.
+        server
+            .documents
+            .update_document(uri.clone(), "fn edited() {}".to_string(), None);
+        parse().await;
+        assert!(scheduler.prepare_diagnostic_snapshot(&uri).is_some());
+        scheduler.spawn_diagnostic_task_after_prepare(uri.clone(), synced);
+        scheduler.schedule_debounced_diagnostic_after_prepare(uri.clone(), synced);
+        assert!(!server.synthetic_diagnostics.has_active_task(&uri));
+        assert!(!server.debounced_diagnostics.has_active_timer(&uri));
+        // For the revision it is at, both collect.
+        let current = scheduler.current_revision(&uri);
+        scheduler.schedule_debounced_diagnostic_after_prepare(uri.clone(), current);
+        assert!(server.debounced_diagnostics.has_active_timer(&uri));
+        scheduler.spawn_diagnostic_task_after_prepare(uri.clone(), current);
+        assert!(server.synthetic_diagnostics.has_active_task(&uri));
+        server.debounced_diagnostics.cancel_all();
+    }
+
     /// A collection scheduled after prepare takes its snapshot when it fires:
     /// a region still held when it was scheduled may be sent and collected at
     /// once before then, and a snapshot from scheduling would leave it out of
@@ -2440,7 +2484,10 @@ print("hello")
         // Nothing to snapshot yet: no tree.
         assert!(scheduler.prepare_diagnostic_snapshot(&uri).is_none());
         let gate = server.debounced_diagnostics.install_execution_gate();
-        scheduler.schedule_debounced_diagnostic_after_prepare(uri.clone());
+        scheduler.schedule_debounced_diagnostic_after_prepare(
+            uri.clone(),
+            scheduler.current_revision(&uri),
+        );
         gate.entered.notified().await;
         // By the time it fires, there is.
         server

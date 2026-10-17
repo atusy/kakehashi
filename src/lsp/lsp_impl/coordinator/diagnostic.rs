@@ -206,20 +206,65 @@ impl DiagnosticScheduler {
     /// captured now, at schedule time, so diagnostics stay consistent with the
     /// document state that triggered the change.
     pub(crate) fn schedule_debounced_diagnostic(&self, uri: Url) {
-        self.schedule_debounced_diagnostic_as(uri, SyntheticDiagnosticTrigger::Change);
+        let snapshot_data = self.prepare_diagnostic_snapshot(&uri);
+        self.schedule_debounced_diagnostic_as(
+            uri,
+            snapshot_data,
+            SyntheticDiagnosticTrigger::Change,
+        );
     }
 
     /// Collect `uri`'s diagnostics again after a resync pass sent its
     /// servers the texts an edit's prepare answers gave, through the edit's
     /// debounce: a burst of keystrokes still collects once. Ranked as a
     /// collection after held regions are sent, since an earlier one of this
-    /// version (a save's, say) left them out.
-    pub(crate) fn schedule_debounced_diagnostic_after_prepare(&self, uri: Url) {
-        self.schedule_debounced_diagnostic_as(uri, SyntheticDiagnosticTrigger::Prepared);
+    /// version (a save's, say) left them out. For `revision`, the one the
+    /// pass synced: a later edit's own pass and debounce collect that one.
+    pub(crate) fn schedule_debounced_diagnostic_after_prepare(
+        &self,
+        uri: Url,
+        revision: crate::lsp::bridge::HostRevision,
+    ) {
+        let current = self
+            .documents
+            .get(&uri)
+            .map(|document| crate::lsp::bridge::HostRevision {
+                incarnation: document.incarnation(),
+                content_version: document.content_version(),
+            });
+        if current != Some(revision) {
+            return;
+        }
+        let snapshot_data = self
+            .snapshot_preparer
+            .prepare_diagnostic_snapshot_when_current(
+                &uri,
+                revision.incarnation,
+                revision.content_version,
+            );
+        self.schedule_debounced_diagnostic_as(
+            uri,
+            snapshot_data,
+            SyntheticDiagnosticTrigger::Prepared,
+        );
     }
 
-    fn schedule_debounced_diagnostic_as(&self, uri: Url, trigger: SyntheticDiagnosticTrigger) {
-        let snapshot_data = self.prepare_diagnostic_snapshot(&uri);
+    /// `uri`'s current revision, as a pass that synced it now has it.
+    #[cfg(test)]
+    pub(crate) fn current_revision(&self, uri: &Url) -> crate::lsp::bridge::HostRevision {
+        let document = self.documents.get(uri).expect("open");
+        crate::lsp::bridge::HostRevision {
+            incarnation: document.incarnation(),
+            content_version: document.content_version(),
+        }
+    }
+
+    fn schedule_debounced_diagnostic_as(
+        &self,
+        uri: Url,
+        snapshot_data: Option<DiagnosticSnapshot>,
+        trigger: SyntheticDiagnosticTrigger,
+    ) {
         // After prepare, the snapshot is taken again when the timer fires: a
         // region still held now may be sent and collected at once before
         // then, and a collection leaving it out would replace that one.
@@ -274,9 +319,22 @@ impl DiagnosticScheduler {
 
     /// Pull `uri`'s diagnostics again after a resync pass sent its servers
     /// the texts their prepare answers gave: what they computed before was
-    /// for other texts, and a push-only collection never asks again.
-    pub(crate) fn spawn_diagnostic_task_after_prepare(&self, uri: Url) {
-        let snapshot_data = self.prepare_diagnostic_snapshot(&uri);
+    /// for other texts, and a push-only collection never asks again. For
+    /// `revision`, the one the pass synced: a later edit's text may have
+    /// regions its own pass has yet to send, and a collection of it ranked
+    /// as one after they were sent would leave them out for good.
+    pub(crate) fn spawn_diagnostic_task_after_prepare(
+        &self,
+        uri: Url,
+        revision: crate::lsp::bridge::HostRevision,
+    ) {
+        let snapshot_data = self
+            .snapshot_preparer
+            .prepare_diagnostic_snapshot_when_current(
+                &uri,
+                revision.incarnation,
+                revision.content_version,
+            );
         self.spawn_prepared_synthetic_diagnostic_task(
             uri,
             snapshot_data,
@@ -839,7 +897,10 @@ mod tests {
             SyntheticDiagnosticTrigger::Save,
             save.abort_handle(),
         ));
-        scheduler.schedule_debounced_diagnostic_after_prepare(uri);
+        scheduler.schedule_debounced_diagnostic_after_prepare(
+            uri.clone(),
+            scheduler.current_revision(&uri),
+        );
         let superseded = tokio::time::timeout(std::time::Duration::from_secs(5), save)
             .await
             .expect("the save's collection is superseded");
@@ -862,7 +923,10 @@ mod tests {
         );
         let scheduler = DiagnosticScheduler::new(server);
         let timers = &server.debounced_diagnostics;
-        scheduler.schedule_debounced_diagnostic_after_prepare(uri.clone());
+        scheduler.schedule_debounced_diagnostic_after_prepare(
+            uri.clone(),
+            scheduler.current_revision(&uri),
+        );
         let prepared = timers.timer_abort_handle(&uri).unwrap();
         scheduler.schedule_debounced_diagnostic(uri.clone());
         assert_eq!(timers.timer_abort_handle(&uri).unwrap().id(), prepared.id());
@@ -878,12 +942,18 @@ mod tests {
         assert_ne!(timers.timer_abort_handle(&uri).unwrap().id(), prepared.id());
         // And one scheduled after prepare replaces an edit's.
         let edited = timers.timer_abort_handle(&uri).unwrap();
-        scheduler.schedule_debounced_diagnostic_after_prepare(uri.clone());
+        scheduler.schedule_debounced_diagnostic_after_prepare(
+            uri.clone(),
+            scheduler.current_revision(&uri),
+        );
         assert_ne!(timers.timer_abort_handle(&uri).unwrap().id(), edited.id());
         // As does a later one after prepare, for the same version: it
         // snapshots when it fires, so nothing the first had is lost.
         let first = timers.timer_abort_handle(&uri).unwrap();
-        scheduler.schedule_debounced_diagnostic_after_prepare(uri.clone());
+        scheduler.schedule_debounced_diagnostic_after_prepare(
+            uri.clone(),
+            scheduler.current_revision(&uri),
+        );
         assert_ne!(timers.timer_abort_handle(&uri).unwrap().id(), first.id());
         timers.cancel_all();
     }

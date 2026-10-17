@@ -179,14 +179,17 @@ fn collect_diagnostics_after_resync(
     cli_mode: bool,
     uri: Url,
     resync: &crate::lsp::bridge::Resync,
+    synced: crate::lsp::bridge::HostRevision,
 ) {
     if cli_mode {
         return;
     }
     match collect_after_resync(resync) {
-        Some(CollectAfterResync::AtOnce) => diagnostics.spawn_diagnostic_task_after_prepare(uri),
+        Some(CollectAfterResync::AtOnce) => {
+            diagnostics.spawn_diagnostic_task_after_prepare(uri, synced);
+        }
         Some(CollectAfterResync::Debounced) => {
-            diagnostics.schedule_debounced_diagnostic_after_prepare(uri);
+            diagnostics.schedule_debounced_diagnostic_after_prepare(uri, synced);
         }
         None => {}
     }
@@ -971,7 +974,15 @@ impl Kakehashi {
                             // The servers now hold the texts the answers
                             // gave; what they diagnosed before was for other
                             // texts.
-                            collect_diagnostics_after_resync(&diagnostics, cli_mode, uri, &resync);
+                            if let Some(revision) = pass.revision {
+                                collect_diagnostics_after_resync(
+                                    &diagnostics,
+                                    cli_mode,
+                                    uri,
+                                    &resync,
+                                    revision,
+                                );
+                            }
                         }
                         AfterResyncPass::Retry { failed } => {
                             bridge.requeue_prepare_resync(
@@ -3280,9 +3291,21 @@ mod tests {
             recollect: false,
             edited,
         };
-        super::collect_diagnostics_after_resync(&diagnostics, false, uri.clone(), &resync(false));
+        super::collect_diagnostics_after_resync(
+            &diagnostics,
+            false,
+            uri.clone(),
+            &resync(false),
+            diagnostics.current_revision(&uri),
+        );
         assert!(!server.debounced_diagnostics.has_active_timer(&uri));
-        super::collect_diagnostics_after_resync(&diagnostics, false, uri.clone(), &resync(true));
+        super::collect_diagnostics_after_resync(
+            &diagnostics,
+            false,
+            uri.clone(),
+            &resync(true),
+            diagnostics.current_revision(&uri),
+        );
         assert!(server.debounced_diagnostics.has_active_timer(&uri));
         server.debounced_diagnostics.cancel_all();
     }
@@ -3316,6 +3339,7 @@ mod tests {
                     cli_mode,
                     uri.clone(),
                     &resync,
+                    diagnostics.current_revision(&uri),
                 );
             }
             assert_eq!(
