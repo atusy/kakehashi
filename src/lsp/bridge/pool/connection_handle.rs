@@ -497,6 +497,16 @@ impl ConnectionHandle {
                 return Err(BridgeError::SerializationFailed);
             }
         };
+        self.send_serialized_request(payload, request_id)
+    }
+
+    /// [`Self::send_request`] of a payload serialized beforehand: only the
+    /// non-blocking enqueue, for a caller queueing under a lock.
+    pub(crate) fn send_serialized_request(
+        &self,
+        payload: serde_json::Value,
+        request_id: RequestId,
+    ) -> Result<(), BridgeError> {
         match self.tx.try_send(OutboundMessage::Tracked {
             payload,
             request_id,
