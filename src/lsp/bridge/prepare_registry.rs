@@ -1623,8 +1623,17 @@ mod tests {
             )
             .unwrap();
         let mut attempts = slot.cell.attempts.subscribe();
+        let subscribers = handle.state_subscribers_for_test();
         assert!(registry.start(&slot, &pool, &target, input(&host, "a")));
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Admitted, the attempt waits for the candidate to be ready.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while handle.state_subscribers_for_test() == subscribers {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the attempt never waited"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
         // The host closes while the candidate starts.
         registry.forget_host(&host);
         assert!(mark_ready_for_test(&handle));
