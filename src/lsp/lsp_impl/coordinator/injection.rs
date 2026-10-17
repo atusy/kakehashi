@@ -94,6 +94,31 @@ pub(crate) fn sendable_injections(injections: Vec<BridgeInjection>) -> Vec<Bridg
         .collect()
 }
 
+/// `injection` as the lifecycle pass presents it under its prepare
+/// `lookup`: as is, the prepared text with its map, or held.
+fn presented_injection(
+    mut injection: BridgeInjection,
+    lookup: crate::lsp::bridge::PrepareLookup,
+) -> BridgeInjection {
+    match lookup {
+        crate::lsp::bridge::PrepareLookup::Answered(crate::lsp::bridge::PrepareAnswer::AsIs) => {}
+        crate::lsp::bridge::PrepareLookup::Answered(
+            crate::lsp::bridge::PrepareAnswer::Prepared(prepared),
+        ) => {
+            injection.content = prepared.text.clone();
+            injection.prepared = Some(std::sync::Arc::clone(&prepared.map));
+        }
+        crate::lsp::bridge::PrepareLookup::Answered(
+            crate::lsp::bridge::PrepareAnswer::Unusable,
+        )
+        | crate::lsp::bridge::PrepareLookup::Pending => {
+            injection.content = String::new();
+            injection.held = true;
+        }
+    }
+    injection
+}
+
 /// What a bounded wait for a current tree actually found.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ParseWait {
@@ -402,7 +427,7 @@ impl InjectionCoordinator {
         &self,
         uri: &Url,
         host_language: &str,
-        mut injection: BridgeInjection,
+        injection: BridgeInjection,
         gaps: &[crate::language::injection::VirtualGap],
     ) -> BridgeInjection {
         let Some(target) = self
@@ -426,25 +451,8 @@ impl InjectionCoordinator {
             virtual_text: &injection.content,
             gaps,
         };
-        match self.bridge.prepared_document_now(&target, input) {
-            crate::lsp::bridge::PrepareLookup::Answered(
-                crate::lsp::bridge::PrepareAnswer::AsIs,
-            ) => {}
-            crate::lsp::bridge::PrepareLookup::Answered(
-                crate::lsp::bridge::PrepareAnswer::Prepared(prepared),
-            ) => {
-                injection.content = prepared.text.clone();
-                injection.prepared = Some(std::sync::Arc::clone(&prepared.map));
-            }
-            crate::lsp::bridge::PrepareLookup::Answered(
-                crate::lsp::bridge::PrepareAnswer::Unusable,
-            )
-            | crate::lsp::bridge::PrepareLookup::Pending => {
-                injection.content = String::new();
-                injection.held = true;
-            }
-        }
-        injection
+        let lookup = self.bridge.prepared_document_now(&target, input);
+        presented_injection(injection, lookup)
     }
 
     /// Process injected languages: resolve injection data, optionally forward didChange,
@@ -1538,6 +1546,63 @@ fn parser_enabled_injection_language(language: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{InjectionTarget, parser_enabled_injection_language};
+
+    /// The lifecycle pass sends a region as is, as its prepared text with
+    /// the map, or — answer pending or unusable — not at all: a held
+    /// injection is left out of every send.
+    #[test]
+    fn a_region_is_sent_as_its_answer_presents_it() {
+        use super::BridgeInjection;
+        use crate::lsp::bridge::{PrepareAnswer, PrepareLookup};
+        use std::sync::Arc;
+        let injection = || BridgeInjection {
+            language: "lua".to_string(),
+            region_id: "r".to_string(),
+            content: "  a".to_string(),
+            held: false,
+            prepared: None,
+        };
+        let as_is =
+            super::presented_injection(injection(), PrepareLookup::Answered(PrepareAnswer::AsIs));
+        assert_eq!((as_is.content.as_str(), as_is.held), ("  a", false));
+        assert!(as_is.prepared.is_none());
+
+        let document = crate::lsp::bridge::apply_prepare_result(
+            "  a",
+            &crate::lsp::bridge::VirtualLayout::single("  a"),
+            Some(
+                serde_json::from_value(serde_json::json!({"segments": [{"type": "content", "changes": [
+                    {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+                ]}]}))
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        let prepared = super::presented_injection(
+            injection(),
+            PrepareLookup::Answered(PrepareAnswer::Prepared(Arc::new(document.clone()))),
+        );
+        assert_eq!((prepared.content.as_str(), prepared.held), ("a", false));
+        assert!(Arc::ptr_eq(
+            prepared.prepared.as_ref().unwrap(),
+            &document.map
+        ));
+
+        let pending = super::presented_injection(injection(), PrepareLookup::Pending);
+        let unusable = super::presented_injection(
+            injection(),
+            PrepareLookup::Answered(PrepareAnswer::Unusable),
+        );
+        for held in [&pending, &unusable] {
+            assert!(held.held);
+            assert!(held.content.is_empty());
+        }
+        let sent: Vec<_> = super::sendable_injections(vec![as_is, pending, prepared, unusable])
+            .into_iter()
+            .map(|injection| injection.content)
+            .collect();
+        assert_eq!(sent, ["  a", "a"]);
+    }
 
     #[rstest::rstest]
     #[case::timeout(false)]
