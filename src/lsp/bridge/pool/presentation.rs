@@ -60,10 +60,6 @@ pub(crate) enum Observed {
     /// Read when no text newer than this generation was held by any
     /// connection (see `DocumentTracker::held_through`): for coordinates
     /// about several documents, whose records are read later.
-    #[allow(
-        dead_code,
-        reason = "a showDocument request reads its selection through it, next"
-    )]
     Through(u64),
     /// A request about to be sent: the coordinates it will get are computed
     /// for whatever the connection holds now.

@@ -299,12 +299,14 @@ impl super::BridgeCoordinator {
         }
     }
 
-    /// How a region's cached push places while the region's virtual text is
-    /// `virtual_text`: through the text its connection held when it pushed
-    /// (`held`), by the one rule (see `Presentation`). A slot not stamped
-    /// with a connection places as is — unless the region is prepared, whose
-    /// servers are bridged only through a prepared text.
-    pub(crate) fn place_push(
+    /// How coordinates a connection sent about a region — a cached push, a
+    /// showDocument selection, an applyEdit's edits — place while the
+    /// region's virtual text is `virtual_text`: through the text the
+    /// connection held when they were read (`held`), by the one rule (see
+    /// `Presentation`). Unstamped coordinates place as is — unless the
+    /// region is prepared, whose servers are bridged only through a
+    /// prepared text.
+    pub(crate) fn place_held(
         &self,
         host_uri: &Url,
         injection_language: &str,
@@ -330,7 +332,7 @@ impl super::BridgeCoordinator {
         )
     }
 
-    /// Whether every cached push places as is (see [`Self::place_push`]),
+    /// Whether every cached push places as is (see [`Self::place_held`]),
     /// so the per-slot placement can be skipped: the rule's shortcut (see
     /// `DocumentTracker::held_texts_matter`) for every region at once — the
     /// lifecycle pass prepares none.
@@ -531,7 +533,7 @@ mod tests {
         );
         let key = ConnectionKey::for_server("lua");
         let place = |virtual_text: &str, held: Option<&HeldStamp>| {
-            coordinator.place_push(&host, "lua", TEST_ULID_LUA_0, virtual_text, held)
+            coordinator.place_held(&host, "lua", TEST_ULID_LUA_0, virtual_text, held)
         };
         let stamp = |generation| HeldStamp {
             connection: key.clone(),
