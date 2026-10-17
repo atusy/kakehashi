@@ -892,6 +892,10 @@ mod tests {
             super::PrepareLookup::Answered(super::super::prepare_registry::Answer::AsIs)
         ));
         assert!(coordinator.places_pushes_as_is());
+        // The epoch moves: the as-is answer the region is held on no longer
+        // stands, and the region reads prepared until the pass looks again.
+        pool.advance_prepare_epoch();
+        assert!(!coordinator.places_pushes_as_is());
 
         // The lifecycle pass holds a region on an answer it waits for.
         let _ = coordinator.prepared_document_now(&target, input(TEST_ULID_LUA_0, "b"));
