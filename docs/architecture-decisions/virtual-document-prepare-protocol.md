@@ -303,9 +303,10 @@ position stands for.
 ### Gap replacements of the original width
 
 Preserving each gap's line count and width would let the existing
-per-line column offsets translate P directly, but it makes placeholders pad
-with spaces that formatters then rewrite, and it cannot express removing a
-Nix escape or collapsing a fence.
+per-line column offsets translate P directly, but it pads placeholders with
+spaces the downstream server then sees (trailing whitespace after a token,
+columns shifted in what it reports), and it cannot express removing a Nix
+escape or collapsing a fence.
 
 ### The downstream server prepares its own documents
 
