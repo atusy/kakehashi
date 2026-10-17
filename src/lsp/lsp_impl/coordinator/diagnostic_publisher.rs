@@ -2648,6 +2648,52 @@ mod tests {
         );
     }
 
+    /// A pull answered without documents still waiting for their prepare
+    /// answers owes the editor one refresh, asked once a pass synced the host
+    /// with its answer in (or with none pending any more).
+    #[tokio::test(start_paused = true)]
+    async fn a_pull_owed_after_prepare_asks_one_refresh() {
+        let pool = std::sync::Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
+        let (service, _socket) = LspService::new(|client| {
+            Kakehashi::with_cancel_forwarder(
+                client,
+                std::sync::Arc::clone(&pool),
+                crate::lsp::CancelForwarder::new(std::sync::Arc::clone(&pool)),
+            )
+        });
+        let server = service.inner();
+        server
+            .settings_manager
+            .set_capabilities(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        let scheduler = server.diagnostic_scheduler();
+        let host = Url::parse("file:///test/owed_pull.md").unwrap();
+        let requested = || server.diagnostics.metrics_snapshot().refreshes_requested;
+
+        // Nothing owed: nothing asked.
+        scheduler.settle_pull_debt_after_prepare(&host, true);
+        assert_eq!(requested(), 0);
+
+        server.bridge.owe_pull_after_prepare(&host);
+        scheduler.settle_pull_debt_after_prepare(&host, true);
+        assert_eq!(requested(), 1);
+        // Settled: a later pass asks nothing more.
+        scheduler.settle_pull_debt_after_prepare(&host, true);
+        assert_eq!(requested(), 1);
+
+        // A pass with no answer in, while none is pending any more.
+        server.bridge.owe_pull_after_prepare(&host);
+        scheduler.settle_pull_debt_after_prepare(&host, false);
+        assert_eq!(requested(), 2);
+    }
+
     /// A prefetch pulled under a prepare epoch that moved since was pulled
     /// against the texts before: the resync after the move re-sends what the
     /// prepared regions hold, and its collection may already have committed.
