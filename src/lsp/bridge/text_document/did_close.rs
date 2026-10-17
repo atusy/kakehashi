@@ -330,6 +330,49 @@ mod tests {
     use super::*;
     use crate::lsp::bridge::pool::test_helpers::{create_handle_with_key, url_to_uri};
 
+    /// Closing a host forgets which of its documents any connection was ever
+    /// sent a prepared text of — a region closed before it included — under
+    /// the host URI as the tracker spells it (percent-encoded here).
+    #[tokio::test]
+    async fn closing_a_host_forgets_its_prepared_history() {
+        use crate::lsp::bridge::pool::{Observed, Presentation, RegionPrepare, SentText};
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let pool = LanguageServerPool::preparing();
+        let host = Url::parse("file:///test/a b.md").unwrap();
+        let virtual_uri =
+            VirtualDocumentUri::new(&url_to_uri(&host), "lua", "01J0000000000000000000000A");
+        let uri = virtual_uri.to_uri_string();
+        let key = ConnectionKey::for_server("lua");
+        let map = apply_prepare_result("a", &VirtualLayout::single("a"), None)
+            .unwrap()
+            .map;
+        pool.record_sent_for_test(
+            &virtual_uri,
+            &key,
+            SentText {
+                text: "a",
+                map: Some(&map),
+            },
+        );
+        // The region closed: its record goes, the history stays.
+        pool.untrack_document(&virtual_uri, &key).await;
+        // Coordinates read while it held as is, placed now: the history says
+        // they may be a prepared text's.
+        let placed = || {
+            pool.presentation(
+                &uri,
+                &key,
+                Observed::AsIsThen,
+                RegionPrepare::default(),
+                "a",
+            )
+        };
+        assert!(matches!(placed(), Presentation::Unavailable));
+
+        pool.close_host_document(&host).await;
+        assert!(matches!(placed(), Presentation::AsIs));
+    }
+
     /// `close_scratch_document` untracks a directly-addressed scratch virtual
     /// document.
     ///
