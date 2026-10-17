@@ -80,8 +80,9 @@ priorities = ["tsudoi"]
 
 Every answer stands under one **prepare epoch**. The epoch moves when a
 connection's advertisement record changes or goes, or its server's does,
-when start failures are cleared, when settings change, and when runtime
-settings are pushed to servers. A first record moves nothing (a candidate
+when start failures are cleared (but for one host's, on its close), when
+settings change, and when runtime settings are pushed to servers once
+anything was looked up. A first record moves nothing (a candidate
 not yet recorded is waited for, so no answer was given without it), nor
 does a replaced connection's handshake answering what its key already
 advertised. Answers are keyed by
@@ -166,10 +167,11 @@ for another place.
 
 No edit is mapped back through a prepared document. The methods closed to
 a non-contiguous combined document — codeAction, colorPresentation,
-completion, linkedEditingRange, onTypeFormatting, prepareRename, rename —
-and formatting and range formatting are closed to a prepared one too, as
-is an inbound `workspace/applyEdit` computed for a prepared text. Inlay
-hints stay available (they are display); a hint's `textEdits` are dropped.
+completion, formatting, inlayHint, linkedEditingRange, onTypeFormatting,
+prepareRename, rangeFormatting, rename — are closed to a prepared one too,
+as is an inbound `workspace/applyEdit` computed for a prepared text, but
+for inlay hints: they stay available on a contiguous prepared document
+(they are display), with each hint's `textEdits` dropped.
 A `*/resolve` envelope minted from a prepared document never resolves:
 the map it was minted through is not carried.
 
@@ -186,8 +188,10 @@ failed request (`format` exits 2). A peer that prefers a fallback answers `null`
 its own errors and does so); kakehashi does not choose one on its behalf.
 
 An unusable answer (an error response, a malformed or refused result) is
-final for that input under the current epoch. It re-syncs its host as it
-arrives, and the host's diagnostics are collected again. A missing answer
+final for that input under the current epoch. When it is the input the
+lifecycle pass holds the document on, and the epoch has not moved, it
+re-syncs its host as it arrives, and the host's diagnostics are collected
+again. A missing answer
 from the chosen peer (crashing, timing out, or answering with one of LSP's
 retryable cancellation codes) is retried with backoff — one second, doubling
 to a minute — without waiting for an edit, and requests do not pile further
@@ -257,8 +261,9 @@ own text and the latest the lifecycle pass recorded.
   Where preparation is involved (by the rule above), it is placed only while
   the connection still holds that very text, and one naming another
   document version than the one its connection was last sent was computed
-  for an earlier text and places nowhere. Elsewhere it places as on any
-  unprepared path.
+  for an earlier text and places nowhere. Elsewhere — and for a push read
+  while its connection had never held a prepared text of the document — it
+  places as on any unprepared path.
 - **Cached answers follow the configuration.** An answer is the peer's for
   one launch configuration and its runtime settings, read only under the
   epoch it was asked in. The epoch moves once the new settings are in, so
@@ -290,7 +295,8 @@ answers state the correspondence instead.
 ### Deleting any blank line, or inserting text into content
 
 Deleting a blank line between lines that stay leaves a join in P where a
-formatter may add a blank line back, which the host would then hold twice;
+formatter may add a blank line back, which the host would then hold twice
+once formatting edits are mapped back;
 no host string drops interior blank lines anyway, and in some embedded
 languages (HTTP, Markdown) they carry meaning. Inserting text adds P-only
 text that a formatter's diff can attribute either way.
@@ -366,6 +372,9 @@ move: an answer from before it is simply not read.
   a prepared text (right after its pair lost its peer).
 - A save made while a document's answer is pending reaches no server that
   has not started opening the document by the time the answer arrives.
+- A push without a document version, computed for one prepared text but
+  read after the next was recorded under another map, is placed through
+  the newer map: without a version nothing tells the two apart.
 
 ### Neutral
 
