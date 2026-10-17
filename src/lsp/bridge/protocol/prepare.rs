@@ -797,7 +797,7 @@ fn map_offset(runs: &[Run], offset: usize, bias: Bias, from: Side) -> usize {
     // P's end, where the document's deleted closing lines were: the
     // content ends there in V too, before them.
     if matches!(from, Side::Prepared)
-        && let Some(lines) = empty_run(runs, offset, RunKind::TrailingLines)
+        && let Some(lines) = empty_run(runs, offset, |kind| kind == RunKind::TrailingLines)
     {
         return lines.virtual_.start;
     }
@@ -806,8 +806,9 @@ fn map_offset(runs: &[Run], offset: usize, bias: Bias, from: Side) -> usize {
     // range covers none of that host text.
     if bias == Bias::End
         && matches!(from, Side::Prepared)
-        && let Some(run) = empty_run(runs, offset, RunKind::Gap)
-            .or_else(|| empty_run(runs, offset, RunKind::Deleted))
+        && let Some(run) = empty_run(runs, offset, |kind| {
+            matches!(kind, RunKind::Gap | RunKind::Deleted)
+        })
     {
         return run.virtual_.start;
     }
@@ -854,13 +855,14 @@ fn map_offset(runs: &[Run], offset: usize, bias: Bias, from: Side) -> usize {
     runs.last().map_or(0, |run| from.ranges(run).1.end)
 }
 
-/// The `kind` run that is empty in P and sits at P `offset`.
-fn empty_run(runs: &[Run], offset: usize, kind: RunKind) -> Option<&Run> {
+/// The first run, in V order, that is empty in P, sits at P `offset` and is
+/// of a kind `kind` accepts.
+fn empty_run(runs: &[Run], offset: usize, kind: impl Fn(RunKind) -> bool) -> Option<&Run> {
     let first = runs.partition_point(|run| run.prepared.start < offset);
     runs[first..]
         .iter()
         .take_while(|run| run.prepared.start == offset)
-        .find(|run| run.kind == kind && run.prepared.is_empty())
+        .find(|run| kind(run.kind) && run.prepared.is_empty())
 }
 
 // =============================================================================
@@ -1903,6 +1905,37 @@ mod tests {
         );
         assert_eq!(prepared.text, "");
         assert_eq!(prepared.map.to_virtual(pos(0, 0), Bias::Start), pos(0, 2));
+    }
+
+    #[test]
+    fn a_range_end_before_a_removed_indent_and_an_emptied_gap_stops_before_both() {
+        // `a` then `  ${x}foo`: the second line's indent removed, the
+        // interpolation emptied.
+        let virtual_text = "a\n      foo\n".to_string();
+        let layout = VirtualLayout::from_pieces(
+            &virtual_text,
+            [
+                (SegmentKind::Content, 0..4, String::new()),
+                (SegmentKind::Gap, 4..8, "${x}".to_string()),
+                (SegmentKind::Content, 8..12, String::new()),
+            ],
+        );
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &layout,
+            result(json!({"segments": [
+                {"type": "content", "changes": [
+                    {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+                ]},
+                {"type": "gap", "content": ""},
+                {"type": "content"}
+            ]})),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "a\nfoo\n");
+        // The first line taken whole ends where the second starts in V.
+        assert_eq!(prepared.map.to_virtual(pos(1, 0), Bias::End), pos(1, 0));
+        assert_eq!(prepared.map.to_virtual(pos(1, 0), Bias::Start), pos(1, 6));
     }
 
     #[test]
