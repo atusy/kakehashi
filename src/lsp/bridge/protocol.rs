@@ -40,12 +40,13 @@ pub(crate) use jsonrpc::{
     JsonRpcNotification, JsonRpcRequest, jsonrpc_error_summary, response_has_jsonrpc_error,
 };
 pub(crate) use lifecycle::*;
-pub(crate) use prepare::{
-    PREPARE_METHOD, PREPARE_TIMEOUT, PrepareParams, PrepareResult, PreparedMap,
-    parse_prepare_response,
-};
 #[cfg(test)]
-pub(crate) use prepare::{VirtualLayout, apply_prepare_result};
+pub(crate) use prepare::apply_prepare_result;
+pub(crate) use prepare::{
+    PREPARE_METHOD, PREPARE_TIMEOUT, PrepareHostTextDocument, PrepareParams, PrepareResult,
+    PrepareTextDocument, PreparedDocument, PreparedMap, VirtualLayout, apply_prepare_result_at,
+    next_presentation, parse_prepare_response,
+};
 pub(crate) use request::*;
 pub(crate) use request_id::RequestId;
 pub(crate) use response::*;
