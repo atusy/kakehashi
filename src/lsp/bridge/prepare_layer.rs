@@ -280,7 +280,7 @@ impl super::BridgeCoordinator {
         }
     }
 
-    /// Settle `input`'s answer as a request's attempt would (see
+    /// Settle `input`'s answer as an attempt would (see
     /// `PrepareRegistry::answer_for_test`).
     #[cfg(test)]
     pub(crate) fn answer_prepare_for_test(
@@ -288,12 +288,13 @@ impl super::BridgeCoordinator {
         target: &super::PrepareTarget,
         input: PrepareInput<'_>,
         answer: super::prepare_registry::Answer,
+        held: bool,
     ) {
         self.prepare
             .as_ref()
             .expect("the prepare layer")
             .registry
-            .answer_for_test(target, input, answer);
+            .answer_for_test(target, input, answer, held);
     }
 
     /// What the lifecycle pass knows of a region's current document (see
@@ -817,6 +818,7 @@ mod tests {
             &target,
             input(TEST_ULID_LUA_0, "a"),
             super::super::prepare_registry::Answer::AsIs,
+            false,
         );
         assert!(coordinator.places_pushes_as_is());
         assert!(!coordinator.region_coordinates_may_be_prepared(&host, "lua", TEST_ULID_LUA_0));
