@@ -63,6 +63,7 @@ jobs:
           cargo test --features e2e --test e2e --
           e2e_virtual_document_prepare::
           e2e_cli_format::e2e_format_counts_a_region_its_prepare_peer_failed_as_a_failure
+          e2e_cli_diagnose::e2e_diagnose_counts_a_region_its_prepare_peer_failed_as_a_failure
           --test-threads=2
 
   fmt:

@@ -706,3 +706,47 @@ fn e2e_diagnose_symlink_alias_is_diagnosed_once() {
         "the first-named spelling is reported; got: {stdout:?}"
     );
 }
+
+#[test]
+fn e2e_diagnose_counts_a_region_its_prepare_peer_failed_as_a_failure() {
+    // With experimental features on, a prepare peer that answers with an
+    // error leaves its region unsent, so undiagnosed: something the run
+    // could not do, which exits 2 like any failed request.
+    let markdown = "# Test\n\n```lua\nprint('FAIL')\n```\n";
+    let config = format!(
+        r#"autoInstall = false
+
+[languages.markdown.bridge.lua.aggregation."kakehashi/virtualDocument/prepare"]
+priorities = ["peer"]
+
+[languages.markdown.bridge.lua.aggregation._]
+priorities = ["mock-diag"]
+
+[languageServers.peer]
+cmd = ['{bin}', 'prepare-peer']
+languages = ["lua"]
+
+[languageServers.mock-diag]
+cmd = ['{bin}', 'diagnostics']
+languages = ["lua"]
+"#,
+        bin = env!("CARGO_BIN_EXE_mock-lsp-formatter")
+    );
+    let ws = workspace_with(&config, &[("doc.md", markdown)]);
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .arg("diagnose")
+        .arg("--config-file")
+        .arg("kakehashi.toml")
+        .arg("doc.md")
+        .current_dir(ws.path())
+        .env("KAKEHASHI_DATA_DIR", data_dir())
+        .env("KAKEHASHI_EXPERIMENTAL", "true")
+        .output()
+        .expect("spawn kakehashi diagnose");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a region its prepare peer failed must exit 2; stderr: {}",
+        stderr_of(&output)
+    );
+}
