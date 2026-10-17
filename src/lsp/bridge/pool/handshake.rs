@@ -40,7 +40,7 @@ pub(super) async fn perform_lsp_handshake(
     workspace_folders: Option<Vec<WorkspaceFolder>>,
     client_capabilities: Option<ClientCapabilities>,
     advertise_configuration: bool,
-) -> io::Result<(ServerCapabilities, bool, bool)> {
+) -> io::Result<(ServerCapabilities, KakehashiExtensions, bool)> {
     // 1. Build and send initialize request via the single-writer loop
     let init_request = build_initialize_request(
         init_request_id,
@@ -70,7 +70,10 @@ pub(super) async fn perform_lsp_handshake(
             dropped.error,
         );
     }
-    let bridge_routing = parsed.bridge_routing;
+    let extensions = KakehashiExtensions {
+        bridge_routing: parsed.bridge_routing,
+        virtual_document_prepare: parsed.virtual_document_prepare,
+    };
     let type_hierarchy_provider = parsed.type_hierarchy_provider;
     let capabilities = parsed.capabilities;
     // A `changeNotifications` id is a registration the server may withdraw
@@ -106,7 +109,16 @@ pub(super) async fn perform_lsp_handshake(
         }
     }
 
-    Ok((capabilities, bridge_routing, type_hierarchy_provider))
+    Ok((capabilities, extensions, type_hierarchy_provider))
+}
+
+/// The `experimental.kakehashi` protocol extensions a server advertised.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct KakehashiExtensions {
+    /// Answers `kakehashi/bridge/routing`.
+    pub(crate) bridge_routing: bool,
+    /// Answers `kakehashi/virtualDocument/prepare`.
+    pub(crate) virtual_document_prepare: bool,
 }
 
 #[cfg(all(test, unix))]
@@ -149,7 +161,7 @@ mod tests {
             }))
             .unwrap();
 
-        let (capabilities, bridge_routing, type_hierarchy_provider) = perform_lsp_handshake(
+        let (capabilities, extensions, type_hierarchy_provider) = perform_lsp_handshake(
             &handle,
             RequestId::new(1),
             response_rx,
@@ -164,7 +176,7 @@ mod tests {
 
         assert!(capabilities.hover_provider.is_none());
         assert!(capabilities.completion_provider.is_some());
-        assert!(!bridge_routing);
+        assert_eq!(extensions, KakehashiExtensions::default());
         assert!(!type_hierarchy_provider);
         let mut messages = String::new();
         for _ in 0..200 {
