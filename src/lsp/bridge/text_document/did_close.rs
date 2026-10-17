@@ -233,6 +233,9 @@ impl LanguageServerPool {
         // Fence even a first pull that snapshotted before its downstream
         // didOpen became visible in the tracker.
         self.invalidate_diagnostic_host(host_uri);
+        // Whatever prepared texts its documents' connections held, the
+        // host's regions closed before it included, describe nothing now.
+        self.forget_prepared_history(host_uri);
         // 1. Remove and get all virtual docs for this host
         let virtual_docs = self.remove_host_virtual_docs(host_uri).await;
 
@@ -244,7 +247,6 @@ impl LanguageServerPool {
         for doc in &virtual_docs {
             self.close_single_virtual_doc(doc).await;
         }
-        self.forget_prepared_history(&virtual_docs);
 
         virtual_docs
     }

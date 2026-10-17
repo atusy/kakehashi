@@ -278,7 +278,8 @@ pub(crate) struct DocumentTracker {
     /// connection computed may be in a prepared text's, which no record says
     /// any more. Written under `document_fingerprints`'s lock, read under it
     /// too (that lock first). Dropped with the connection, and with its host.
-    prepared_history: std::sync::Mutex<HashMap<ConnectionKey, HashSet<String>>>,
+    /// Keyed by virtual URI, with the host URI each belongs to.
+    prepared_history: std::sync::Mutex<HashMap<ConnectionKey, HashMap<String, String>>>,
     /// Tracks which virtual documents were opened for each host document.
     ///
     /// Each OpenedVirtualDoc stores its connection key for reverse lookup during didClose.
@@ -765,7 +766,7 @@ impl DocumentTracker {
                 .filter(|held| held.fingerprint == fp)
             {
                 if let Some(map) = content.map {
-                    self.note_prepared(connection_key, &uri_string);
+                    self.note_prepared(connection_key, virtual_uri, &uri_string);
                     held.map = Some(Arc::clone(map));
                 } else {
                     held.map = None;
@@ -809,11 +810,11 @@ impl DocumentTracker {
             .recover_poison("DocumentTracker::document_fingerprints");
         let previous = self.record_locked(
             &mut fingerprints,
+            virtual_uri,
             &uri_string,
             connection_key,
-            change.fingerprint,
+            change,
             content.map,
-            change.version,
         );
         let result = queue();
         if !queued(&result) {
@@ -822,9 +823,14 @@ impl DocumentTracker {
         result
     }
 
-    /// Note that `connection_key` holds a prepared text of `uri_string`, under
-    /// the records' lock.
-    fn note_prepared(&self, connection_key: &ConnectionKey, uri_string: &str) {
+    /// Note that `connection_key` holds a prepared text of `virtual_uri`
+    /// (rendered as `uri_string`), under the records' lock.
+    fn note_prepared(
+        &self,
+        connection_key: &ConnectionKey,
+        virtual_uri: &VirtualDocumentUri,
+        uri_string: &str,
+    ) {
         self.ever_held_prepared.store(true, Ordering::Release);
         let mut history = self
             .prepared_history
@@ -832,29 +838,30 @@ impl DocumentTracker {
             .recover_poison("DocumentTracker::prepared_history");
         if !history
             .get(connection_key)
-            .is_some_and(|uris| uris.contains(uri_string))
+            .is_some_and(|uris| uris.contains_key(uri_string))
         {
-            history
-                .entry(connection_key.clone())
-                .or_default()
-                .insert(uri_string.to_owned());
+            history.entry(connection_key.clone()).or_default().insert(
+                uri_string.to_owned(),
+                virtual_uri.host_uri().as_str().to_owned(),
+            );
         }
     }
 
-    /// Forget which of `documents` a connection was ever sent a prepared
-    /// text of: their host closed.
-    pub(super) fn forget_prepared_history(&self, documents: &[OpenedVirtualDoc]) {
+    /// Forget which documents of `host_uri` any connection was ever sent a
+    /// prepared text of — every one, its regions closed before it included:
+    /// the host closed.
+    pub(super) fn forget_prepared_history(&self, host_uri: &tower_lsp_server::ls_types::Uri) {
         if !self.ever_held_prepared() {
             return;
         }
-        let mut history = self
+        let host_uri = host_uri.as_str();
+        for uris in self
             .prepared_history
             .lock()
-            .recover_poison("DocumentTracker::prepared_history");
-        for document in documents {
-            if let Some(uris) = history.get_mut(&document.connection_key) {
-                uris.remove(&document.virtual_uri.to_uri_string());
-            }
+            .recover_poison("DocumentTracker::prepared_history")
+            .values_mut()
+        {
+            uris.retain(|_, host| host != host_uri);
         }
     }
 
@@ -878,7 +885,7 @@ impl DocumentTracker {
             .lock()
             .recover_poison("DocumentTracker::prepared_history")
             .get(connection_key)
-            .is_some_and(|uris| uris.contains(virtual_uri));
+            .is_some_and(|uris| uris.contains_key(virtual_uri));
         (held, history)
     }
 
@@ -914,15 +921,15 @@ impl DocumentTracker {
     fn record_locked(
         &self,
         fingerprints: &mut HashMap<ConnectionKey, HashMap<String, HeldText>>,
+        virtual_uri: &VirtualDocumentUri,
         uri_string: &str,
         connection_key: &ConnectionKey,
-        fingerprint: u64,
+        change: ContentChange,
         map: Option<&Arc<PreparedMap>>,
-        version: i32,
     ) -> Option<HeldText> {
         let map = map.cloned();
         if map.is_some() {
-            self.note_prepared(connection_key, uri_string);
+            self.note_prepared(connection_key, virtual_uri, uri_string);
         }
         // Clone the connection key only when first inserting it (common path: the
         // connection is already present, so look up by borrow).
@@ -931,13 +938,13 @@ impl DocumentTracker {
             None => fingerprints.entry(connection_key.clone()).or_default(),
         };
         if let Some(held) = docs.get_mut(uri_string)
-            && held.fingerprint == fingerprint
+            && held.fingerprint == change.fingerprint
         {
             // The same text: what the server computed stays in the same
             // coordinates, even when it maps back differently now.
             let previous = held.clone();
             held.map = map;
-            held.version = version;
+            held.version = change.version;
             return Some(previous);
         }
         // Given out only under this lock, and published once the record is
@@ -947,10 +954,10 @@ impl DocumentTracker {
         let previous = docs.insert(
             uri_string.to_owned(),
             HeldText {
-                fingerprint,
+                fingerprint: change.fingerprint,
                 map,
                 generation,
-                version,
+                version: change.version,
             },
         );
         self.held_generations.store(generation, Ordering::Release);
@@ -2256,6 +2263,38 @@ mod tests {
             tracker.presentation(&uri, &conn, late, RegionPrepare::default(), "a"),
             Presentation::Unavailable
         ));
+    }
+
+    #[tokio::test]
+    async fn a_closed_host_takes_its_documents_prepared_history_with_it() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let uri = virtual_uri.to_uri_string();
+        let conn = ConnectionKey::for_server("lua");
+        let map = prepared_text("a");
+        tracker.record_sent_for_test(
+            &virtual_uri,
+            &conn,
+            SentText {
+                text: "a",
+                map: Some(&map),
+            },
+            1,
+        );
+        // Its region closed before the host.
+        tracker.untrack_document(&virtual_uri, &conn).await;
+        tracker.forget_prepared_history(&url_to_uri(&host_uri));
+        // Reopened as is under the same region id: nothing prepared involved.
+        tracker.record_sent_for_test(&virtual_uri, &conn, "a".into(), 1);
+        assert_eq!(
+            tracker.observe(&uri, &conn, Some(1)),
+            Observed::Read {
+                generation: tracker.held_text(&uri, &conn).map(|held| held.generation),
+                prepared: false,
+                stale_version: false,
+            }
+        );
     }
 
     #[test]
