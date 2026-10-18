@@ -1118,6 +1118,50 @@ mod tests {
         assert!(apply_prepare_result(virtual_text, &layout, Some(answer)).is_err());
     }
 
+    /// The same split, as discovery itself makes it: combined Rust line
+    /// comments with their children included take each comment's CR, and
+    /// leave the LF between them a gap. A `null` answer is accepted.
+    #[test]
+    fn a_null_answer_keeps_the_crlf_combined_comments_split() {
+        use crate::language::injection::InjectionResolver;
+        let text = "// a\r\n// b\r\n";
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(text, None).unwrap();
+        let query = tree_sitter::Query::new(
+            &language,
+            r#"((line_comment) @injection.content
+                (#set! injection.language "markdown")
+                (#set! injection.include-children)
+                (#set! injection.combined))"#,
+        )
+        .unwrap();
+        let resolved = InjectionResolver::resolve_all(
+            &crate::language::LanguageCoordinator::new(),
+            &crate::language::NodeTracker::new(),
+            &url::Url::parse("file:///test/crlf-comments.rs").unwrap(),
+            &tree,
+            text,
+            &query,
+            0,
+        );
+        assert_eq!(resolved.len(), 1);
+        let injection = &resolved[0];
+        let virtual_text = &injection.virtual_content;
+        // Discovery still splits it so: the CR content, the LF a gap.
+        assert!(
+            injection.gaps.iter().any(|gap| {
+                virtual_text[gap.virtual_range.clone()].starts_with('\n')
+                    && virtual_text[..gap.virtual_range.start].ends_with('\r')
+            }),
+            "{virtual_text:?}"
+        );
+        let layout = VirtualLayout::from_gaps(virtual_text, &injection.gaps);
+        let prepared = apply_prepare_result(virtual_text, &layout, None).unwrap();
+        assert_eq!(&prepared.text, virtual_text);
+    }
+
     /// A gap placeholder that would complete a CRLF with the content beside
     /// it is refused the same way.
     #[test]
