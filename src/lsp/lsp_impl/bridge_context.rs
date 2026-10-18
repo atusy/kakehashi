@@ -386,6 +386,23 @@ impl<T> Sourced<T> {
         }
     }
 
+    /// The value apart from where it came from: for an answer combined with
+    /// others, the source checked for its part alone.
+    pub(crate) fn into_parts(self) -> (T, Sourced<()>) {
+        (
+            self.value,
+            Sourced {
+                value: (),
+                prepared: self.prepared,
+            },
+        )
+    }
+
+    /// Whether the answer was mapped through a prepared map.
+    pub(crate) fn is_prepared(&self) -> bool {
+        self.prepared.is_some()
+    }
+
     /// Whether the edits mapped into the answer still land where they were
     /// mapped: always so without a map, and otherwise as the executor read
     /// it as the reply arrived (`LanguageServerPool::host_text_still_current`),

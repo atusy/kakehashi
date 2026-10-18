@@ -19,21 +19,19 @@ impl Kakehashi {
     ) -> Result<Vec<ColorPresentation>> {
         let raw_params = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
         let lsp_uri = params.text_document.uri;
-        // Each layer's presentations kept apart, in order, so a stale
-        // prepared part can be dropped without the others.
         let virt = async {
             let presentations = self
                 .color_presentation_virt_layer(&lsp_uri, params.range, params.color)
                 .await?;
-            Ok(presentations.map(|presentations| vec![presentations]))
+            Ok(presentations.map(ColorAnswer::from_layer))
         };
         let host = async {
             let presentations = self
                 .color_presentation_host_layer(&lsp_uri, raw_params)
                 .await?;
-            Ok(presentations.map(|presentations| vec![Sourced::unprepared(presentations)]))
+            Ok(presentations.map(ColorAnswer::unprepared))
         };
-        let parts = self
+        let answer = self
             .walk_layers_by_strategy(
                 &lsp_uri,
                 METHOD,
@@ -41,22 +39,16 @@ impl Kakehashi {
                 virt,
                 host,
                 std::future::ready(Ok(None)),
-                |parts: &Vec<Sourced<Vec<ColorPresentation>>>| {
-                    parts.iter().any(|part| !part.value.is_empty())
-                },
-                |mut acc, mut next| {
-                    acc.append(&mut next);
-                    acc
-                },
+                |answer: &ColorAnswer| !answer.items.is_empty(),
+                ColorAnswer::combine,
             )
             .await?;
-        // The final answer chosen: each part's edits checked once more
-        // against the host text, which may have moved while it was held.
+        // The final answer chosen: a prepared part's edits checked once
+        // more against the host text, which may have moved while it was held.
         let pool = self.bridge.pool();
-        Ok(color_presentations_still_current(
-            parts.unwrap_or_default(),
-            |part| part.still_current(pool),
-        ))
+        Ok(answer.map_or_else(Vec::new, |answer| {
+            answer.still_current(|source| source.still_current(pool))
+        }))
     }
 
     async fn color_presentation_virt_layer(
@@ -163,18 +155,55 @@ impl Kakehashi {
     }
 }
 
-/// The chosen presentations, each layer's part kept only while its edits
-/// still land where they were mapped (`current`): a stale part answers
-/// nothing, the others stay.
-fn color_presentations_still_current(
-    parts: Vec<Sourced<Vec<ColorPresentation>>>,
-    current: impl Fn(&Sourced<Vec<ColorPresentation>>) -> bool,
-) -> Vec<ColorPresentation> {
-    parts
-        .into_iter()
-        .filter(|part| current(part))
-        .flat_map(|part| part.value)
-        .collect()
+/// The presentations as the layers gave them, in order, with the range of
+/// those mapped through a prepared map, if any (the virt layer's, at most
+/// one): what a stale check drops alone. Without a prepared part it is the
+/// plain vector, combined by appending as ever.
+struct ColorAnswer {
+    items: Vec<ColorPresentation>,
+    prepared: Option<(Sourced<()>, std::ops::Range<usize>)>,
+}
+
+impl ColorAnswer {
+    fn unprepared(items: Vec<ColorPresentation>) -> Self {
+        Self {
+            items,
+            prepared: None,
+        }
+    }
+
+    fn from_layer(sourced: Sourced<Vec<ColorPresentation>>) -> Self {
+        if !sourced.is_prepared() {
+            return Self::unprepared(sourced.value);
+        }
+        let (items, source) = sourced.into_parts();
+        let range = 0..items.len();
+        Self {
+            items,
+            prepared: Some((source, range)),
+        }
+    }
+
+    fn combine(mut self, mut next: Self) -> Self {
+        let shift = self.items.len();
+        self.items.append(&mut next.items);
+        self.prepared = self.prepared.or(next
+            .prepared
+            .map(|(source, range)| (source, range.start + shift..range.end + shift)));
+        self
+    }
+
+    /// The presentations, the prepared part kept only while its edits still
+    /// land where they were mapped (`current`): a stale part answers
+    /// nothing, the others stay.
+    fn still_current(mut self, current: impl Fn(&Sourced<()>) -> bool) -> Vec<ColorPresentation> {
+        if let Some((source, range)) = self.prepared
+            && !current(&source)
+        {
+            self.items.drain(range);
+        }
+        self.items
+    }
 }
 
 #[cfg(test)]
@@ -188,11 +217,24 @@ mod tests {
             text_edit: None,
             additional_text_edits: None,
         };
-        let parts = || {
-            vec![
-                Sourced::unprepared(vec![presentation("host")]),
-                Sourced::unprepared(vec![presentation("virt")]),
-            ]
+        let host = url::Url::parse("file:///test/color.md").unwrap();
+        let map = crate::lsp::bridge::apply_prepare_result(
+            "red",
+            &crate::lsp::bridge::VirtualLayout::single("red"),
+            None,
+        )
+        .unwrap()
+        .map;
+        let answer = || {
+            ColorAnswer::unprepared(vec![presentation("host")]).combine(ColorAnswer::from_layer(
+                Sourced::prepared_for_test(
+                    vec![presentation("virt"), presentation("virt2")],
+                    &host,
+                    "css",
+                    "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    &map,
+                ),
+            ))
         };
         let labels = |presentations: Vec<ColorPresentation>| {
             presentations
@@ -201,13 +243,16 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(
-            labels(color_presentations_still_current(parts(), |_| true)),
-            ["host", "virt"]
+            labels(answer().still_current(|_| true)),
+            ["host", "virt", "virt2"]
         );
+        assert_eq!(labels(answer().still_current(|_| false)), ["host"]);
+        // Without a prepared part nothing is read.
         assert_eq!(
-            labels(color_presentations_still_current(parts(), |part| {
-                part.value[0].label != "virt"
-            })),
+            labels(
+                ColorAnswer::unprepared(vec![presentation("host")])
+                    .still_current(|_| unreachable!())
+            ),
             ["host"]
         );
     }
