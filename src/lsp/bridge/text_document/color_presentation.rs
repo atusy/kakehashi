@@ -157,7 +157,8 @@ fn transform_color_presentation_response_to_host(
     // the server keys to that range); over a gap of a prepared document that
     // range stands for host-owned text none may overwrite — the prepared
     // range may even be empty there, where an edit would only insert beside
-    // the host text it was asked to replace.
+    // the host text it was asked to replace. (The round trip below refuses
+    // these too; this says why, and spares the probe.)
     if host_range_in_prepared_gap(host_request_range, offset) {
         return vec![];
     }
