@@ -3142,6 +3142,24 @@ mod formatting {
     }
 
     #[test]
+    fn a_lone_cr_turned_crlf_and_back_maps_whole() {
+        let virtual_text = "  a\r  b\r";
+        let map = dedent_lines(virtual_text, &[2, 2]);
+        let answer = [edit((0, 0), (2, 0), "a\r\nb\r\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  a\r\n  b\r\n")
+        );
+        let virtual_text = "  a\r\n  b\r\n";
+        let map = dedent_lines(virtual_text, &[2, 2]);
+        let answer = [edit((0, 0), (2, 0), "a\rb\r")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  a\r  b\r")
+        );
+    }
+
+    #[test]
     fn lines_joined_keep_the_first_ones_indent() {
         // `0x` deleted and `1x` joined with `2x`: the joined line is `1x`.
         let virtual_text = "0if x:0\n    1if x:1\n    2if x:2\n";
@@ -3542,7 +3560,7 @@ mod formatting_reference {
         BlankAfter,
         Delete,
         JoinNext,
-        /// Its line break switched between LF and CRLF.
+        /// Its line break switched, LF to CRLF to a lone CR to LF.
         SwitchBreak,
         /// Text written on it, after this many spaces, if it is blank.
         Write(usize),
@@ -3695,7 +3713,8 @@ mod formatting_reference {
                 Rewrite::SwitchBreak => {
                     let switched = match line_break.as_str() {
                         "\n" => "\r\n",
-                        "\r\n" => "\n",
+                        "\r\n" => "\r",
+                        "\r" => "\n",
                         other => other,
                     };
                     output.push((text, switched.to_string(), origin));
@@ -3743,6 +3762,10 @@ mod formatting_reference {
             indented.push_str(document.last_line_indent);
         }
         if !document.closing.is_empty() && !indented.is_empty() && !at_line_start {
+            return None;
+        }
+        // A lone CR ending the text would fuse with the closing lines' LF.
+        if indented.ends_with('\r') && document.closing.starts_with('\n') {
             return None;
         }
         Some(format!(
@@ -3812,7 +3835,7 @@ mod formatting_reference {
         let strategy = (
             prop::collection::vec(line(), 1..6),
             prop::sample::select(vec!["  ", "\t", "    "]),
-            prop::sample::select(vec!["\n", "\r\n"]),
+            prop::sample::select(vec!["\n", "\r\n", "\r"]),
             (0..3usize, 0..3usize, any::<bool>()),
             prop::collection::vec(rewrite(), 1..6),
             (any::<bool>(), any::<u8>()),
@@ -3830,6 +3853,13 @@ mod formatting_reference {
                     );
                     let prepared = map.prepared_lines.text.clone();
                     let output = format(&prepared, &rewrites, flip);
+                    // A lone CR before an empty line's LF would fuse into
+                    // one line break: lines the formatter did not write.
+                    if output.windows(2).any(|pair| {
+                        pair[0].1 == "\r" && pair[1].0.is_empty() && pair[1].1.starts_with('\n')
+                    }) {
+                        return Ok(());
+                    }
                     let formatted: String = output
                         .iter()
                         .map(|(text, line_break, _)| format!("{text}{line_break}"))
