@@ -791,14 +791,26 @@ impl PreparedMap {
         }
     }
 
-    /// Whether `incoming` was taken before `held`: holding it in its place
-    /// would move an answer backwards, and once a failure taken between the
-    /// two revoked it alone, hold a revoked text where a standing one was.
+    /// Whether `incoming` is an answer for the same input as `held` (they
+    /// share what revokes them), taken before it: holding it in its place
+    /// would move that input's answer backwards, and once a failure taken
+    /// between the two revoked it alone, hold a revoked text where a
+    /// standing one was. Answers for other inputs (an undo back to a text
+    /// answered before the edit) are never taken before: whichever is
+    /// recorded last stands, however alike their coordinates.
     pub(crate) fn taken_before(
         incoming: Option<&std::sync::Arc<PreparedMap>>,
         held: Option<&std::sync::Arc<PreparedMap>>,
     ) -> bool {
-        matches!((incoming, held), (Some(incoming), Some(held)) if incoming.built < held.built)
+        matches!(
+            (incoming, held),
+            (Some(incoming), Some(held))
+                if incoming.built < held.built
+                    && matches!(
+                        (&incoming.revocation, &held.revocation),
+                        (Some(incoming), Some(held)) if std::sync::Arc::ptr_eq(incoming, held)
+                    )
+        )
     }
 
     /// Whether the peer failed this map's input since it was taken: an

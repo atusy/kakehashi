@@ -10043,6 +10043,60 @@ mod tests {
         assert_eq!(opened_text(&mut rx), "x = 1");
     }
 
+    /// The lazy-open cache takes an older answer for another input (an
+    /// undo back to a text answered before the edit): the rule against
+    /// moving backwards is per input.
+    #[tokio::test]
+    async fn the_cache_takes_an_older_answer_for_another_input() {
+        let pool = LanguageServerPool::preparing();
+        let host_uri = Url::parse("file:///test/lazy-open-undo.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        let undone = answered_map(&pool, &host_uri, 1);
+        let edited = answered_map(&pool, &host_uri, 2);
+        let record = |map| {
+            pool.record_latest_virtual_content(
+                &host_uri,
+                1,
+                "lua",
+                TEST_ULID_LUA_0,
+                SentText {
+                    text: "x = 1",
+                    map: Some(map),
+                },
+            )
+        };
+        record(&edited);
+        record(&undone);
+        // The edited input failing revokes nothing the undo holds.
+        pool.prepare_failures_for_test().hold_for_test(
+            &host_uri,
+            "lua",
+            TEST_ULID_LUA_0,
+            pool.prepare_epoch(),
+            Some(crate::lsp::bridge::protocol::AnswerOrigin {
+                taken: crate::lsp::bridge::protocol::next_presentation(),
+                input: 2,
+            }),
+        );
+        assert!(edited.revoked());
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
+        pool.ensure_document_opened(
+            &mut sender,
+            &host_uri,
+            &virtual_uri,
+            SentText {
+                text: "x = 1",
+                map: Some(&undone),
+            },
+            &key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened_text(&mut rx), "x = 1");
+    }
+
     /// The lazy-open cache never moves back to an older answer alike in
     /// coordinates (one a stale pass records): revoked alone later, it
     /// would refuse a request on the newer answer that stands.
