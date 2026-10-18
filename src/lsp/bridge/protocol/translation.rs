@@ -226,21 +226,20 @@ pub(crate) fn translate_virtual_text_edits_to_host(
     true
 }
 
-/// [`translate_virtual_text_edits_to_host`] for one edit that must stay one
-/// (a completion's main edit, an edit probed for where it lands); `false`,
-/// with `edit` left as it came, when refused or mapped to another number of
-/// edits.
+/// [`translate_virtual_text_edits_to_host`] for one edit keeping its
+/// extent (a completion's main edit, an edit probed for where it lands),
+/// which maps to one edit; `false`, with `edit` left as it came, when
+/// refused.
 pub(crate) fn translate_virtual_text_edit_to_host(
     edit: &mut TextEdit,
     offset: &RegionOffset,
-    mode: EditMode,
 ) -> bool {
     let Some(prepared) = offset.prepared() else {
         translate_virtual_range_to_host(&mut edit.range, offset);
         return true;
     };
     let Some(Ok([mut mapped])) = prepared
-        .map_edits(std::slice::from_ref(edit), mode)
+        .map_edits(std::slice::from_ref(edit), EditMode::Extent)
         .map(<[TextEdit; 1]>::try_from)
     else {
         return false;
@@ -252,7 +251,8 @@ pub(crate) fn translate_virtual_text_edit_to_host(
 }
 
 /// Translate, in place, a main edit and the additional edits a client
-/// applies together with it, as `mode` reads them. `mains` is the main edit
+/// applies together with it, each keeping its extent
+/// ([`EditMode::Extent`], one edit mapped for each). `mains` is the main edit
 /// once per range the client may apply it through (an insert/replace edit
 /// has two; none for an item with no main edit), each translated alone.
 /// `None` — the caller drops the carrier — when a main edit is refused;
@@ -272,7 +272,6 @@ pub(crate) fn translate_virtual_main_and_additional_edits_to_host(
     mains: &mut [TextEdit],
     additional: Option<&mut Vec<TextEdit>>,
     offset: &RegionOffset,
-    mode: EditMode,
 ) -> Option<bool> {
     // No additional edits is nothing to check or drop.
     let additional = additional.filter(|additional| !additional.is_empty());
@@ -287,7 +286,7 @@ pub(crate) fn translate_virtual_main_and_additional_edits_to_host(
         None => Vec::new(),
     };
     for main in mains.iter_mut() {
-        if !translate_virtual_text_edit_to_host(main, offset, mode) {
+        if !translate_virtual_text_edit_to_host(main, offset) {
             return None;
         }
     }
@@ -303,7 +302,11 @@ pub(crate) fn translate_virtual_main_and_additional_edits_to_host(
         // would bear on each other are refused), so the main edit maps in
         // the set as alone and the additional edits alike for every main:
         // these comparisons guard that the set sent is the set checked.
-        if !translate_virtual_text_edits_to_host(&mut set, offset, mode) || set[0] != *mapped {
+        // (The count is kept by extents; checked rather than assumed.)
+        if !translate_virtual_text_edits_to_host(&mut set, offset, EditMode::Extent)
+            || set.len() != additional.len() + 1
+            || set[0] != *mapped
+        {
             return Some(false);
         }
         let set = set.split_off(1);

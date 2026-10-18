@@ -24,10 +24,9 @@ use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::{
-    EditMode, JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
-    build_position_based_request, host_position_in_removed_indent, response_has_jsonrpc_error,
-    text_edit_safe_in_region, translate_virtual_main_and_additional_edits_to_host,
-    translate_virtual_range_to_host,
+    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request,
+    host_position_in_removed_indent, response_has_jsonrpc_error, text_edit_safe_in_region,
+    translate_virtual_main_and_additional_edits_to_host, translate_virtual_range_to_host,
 };
 use super::keep_additional_edits_if_safe;
 use tower_lsp_server::ls_types::TextDocumentPositionParams;
@@ -417,19 +416,13 @@ fn transform_prepared_completion_item(
     // primary with.
     let additional = item.additional_text_edits.as_mut();
     let mut additional_kept = match &mut item.text_edit {
-        None => translate_virtual_main_and_additional_edits_to_host(
-            &mut [],
-            additional,
-            offset,
-            EditMode::Extent,
-        )
-        .unwrap_or(false),
+        None => translate_virtual_main_and_additional_edits_to_host(&mut [], additional, offset)
+            .unwrap_or(false),
         Some(CompletionTextEdit::Edit(edit)) => {
             let Some(kept) = translate_virtual_main_and_additional_edits_to_host(
                 std::slice::from_mut(edit),
                 additional,
                 offset,
-                EditMode::Extent,
             ) else {
                 return false;
             };
@@ -538,7 +531,6 @@ fn transform_prepared_completion_item(
                     std::slice::from_mut(&mut probe),
                     item.additional_text_edits.as_mut(),
                     offset,
-                    EditMode::Extent,
                 )
             else {
                 return false;
@@ -610,12 +602,7 @@ fn translate_insert_replace_edit_to_host(
             new_text,
         },
     ];
-    let kept = translate_virtual_main_and_additional_edits_to_host(
-        &mut mains,
-        additional,
-        offset,
-        EditMode::Extent,
-    );
+    let kept = translate_virtual_main_and_additional_edits_to_host(&mut mains, additional, offset);
     let [insert, replace] = mains;
     edit.new_text = replace.new_text;
     let kept = kept?;
