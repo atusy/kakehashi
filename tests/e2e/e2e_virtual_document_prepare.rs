@@ -46,6 +46,11 @@ struct Setup {
     wire_log: bool,
     /// `KAKEHASHI_EXPERIMENTAL`, which the prepare layer requires.
     experimental: bool,
+    /// Bridge markdown itself to a `slow-empty` host server and give the
+    /// formatting methods' layers this strategy, the host layer ranked as
+    /// it says: `preferred` ranks host first, `concatenated` runs virt then
+    /// host.
+    slow_host: Option<&'static str>,
 }
 
 impl Default for Setup {
@@ -59,6 +64,7 @@ impl Default for Setup {
             prepare_priorities: json!(["peer"]),
             wire_log: false,
             experimental: true,
+            slow_host: None,
         }
     }
 }
@@ -77,6 +83,18 @@ impl Setup {
         } } } });
         if self.unprepared_python {
             markdown["bridge"]["python"] = json!({});
+        }
+        if let Some(strategy) = self.slow_host {
+            markdown["bridge"]["_self"] = json!({ "enabled": true });
+            let priorities = if strategy == "preferred" {
+                json!(["host", "virt"])
+            } else {
+                json!(["virt", "host"])
+            };
+            markdown["layers"] = json!({ "aggregation": {
+                "textDocument/formatting": { "strategy": strategy, "priorities": priorities },
+                "textDocument/onTypeFormatting": { "strategy": strategy, "priorities": priorities }
+            } });
         }
         if self.combined {
             let query_path = dir.path().join("combined-injections.scm");
@@ -104,6 +122,26 @@ impl Setup {
             );
         }
         let mut client = builder.build();
+        let mut servers = json!({
+            "peer": {
+                "cmd": [mock_bin(), "prepare-peer"],
+                "languages": ["lua"]
+            },
+            "echo": {
+                "cmd": [mock_bin(), self.echo],
+                "languages": if self.unprepared_python {
+                    json!(["lua", "python"])
+                } else {
+                    json!(["lua"])
+                }
+            }
+        });
+        if self.slow_host.is_some() {
+            servers["slowhost"] = json!({
+                "cmd": [mock_bin(), "slow-empty"],
+                "languages": ["markdown"]
+            });
+        }
         client.send_request(
             "initialize",
             json!({
@@ -112,20 +150,7 @@ impl Setup {
                 "capabilities": self.capabilities,
                 "workspaceFolders": null,
                 "initializationOptions": {
-                    "languageServers": {
-                        "peer": {
-                            "cmd": [mock_bin(), "prepare-peer"],
-                            "languages": ["lua"]
-                        },
-                        "echo": {
-                            "cmd": [mock_bin(), self.echo],
-                            "languages": if self.unprepared_python {
-                                json!(["lua", "python"])
-                            } else {
-                                json!(["lua"])
-                            }
-                        }
-                    },
+                    "languageServers": servers,
                     "languages": { "markdown": markdown }
                 }
             }),
@@ -485,6 +510,69 @@ fn on_type_formatting_on_a_prepared_document_maps_back_reindented() {
         "# t\n\n```lua\n  LOCAL X = 1\n  LOCAL Y = 2\n```\n",
         "{response}"
     );
+}
+
+/// The params of `method` over the whole of `uri`, typed at host (3, 14)
+/// for on-type formatting.
+fn formatting_params(method: &str, uri: &str) -> Value {
+    let mut params = json!({
+        "textDocument": { "uri": uri },
+        "options": { "tabSize": 2, "insertSpaces": true }
+    });
+    match method {
+        "textDocument/rangeFormatting" => {
+            params["range"] = json!({
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 5, "character": 0 }
+            });
+        }
+        "textDocument/onTypeFormatting" => {
+            params["position"] = json!({ "line": 3, "character": 14 });
+            params["ch"] = json!(";");
+        }
+        _ => {}
+    }
+    params
+}
+
+/// A formatting answer mapped through a prepared document is checked once
+/// more as the final answer is chosen: while the slow host layer still
+/// ran, the host was edited, and the virt edits the answer would carry are
+/// dropped. Without the edit, the same request answers with them.
+#[test]
+fn a_formatting_answer_the_host_moved_under_is_dropped_as_it_is_chosen() {
+    let text = "# t\n\n```lua\n  local x = 1; local y = 2\n```\n";
+    for (strategy, method) in [
+        ("preferred", "textDocument/formatting"),
+        ("preferred", "textDocument/rangeFormatting"),
+        ("preferred", "textDocument/onTypeFormatting"),
+        ("concatenated", "textDocument/formatting"),
+    ] {
+        let (mut client, _dir) = Setup {
+            slow_host: Some(strategy),
+            ..Setup::default()
+        }
+        .start();
+        let uri = "file:///prepare/stale.md";
+        open(&mut client, uri, text);
+        hover_with_retry(&mut client, uri, 3, 4);
+
+        let response = client.send_request(method, formatting_params(method, uri));
+        let edits = response["result"].as_array().cloned().unwrap_or_default();
+        assert!(
+            !edits.is_empty(),
+            "{strategy} {method}, unedited: {response}"
+        );
+
+        // The virt layer answers at once, the host layer after 1.5 s: edit
+        // the host (outside the region) while it runs.
+        let id = client.send_request_async(method, formatting_params(method, uri));
+        std::thread::sleep(Duration::from_millis(600));
+        change(&mut client, uri, 2, &format!("# u{}", &text[3..]));
+        let response = client.receive_response_for_id_public(id);
+        let edits = response["result"].as_array().cloned().unwrap_or_default();
+        assert!(edits.is_empty(), "{strategy} {method}, edited: {response}");
+    }
 }
 
 #[test]

@@ -984,6 +984,56 @@ languages = ["lua"]
 }
 
 #[test]
+fn e2e_format_fails_on_a_prepared_answer_the_host_cannot_take() {
+    // The formatter answers the prepared text with edits no document takes
+    // (overlapping): the map refuses them, the run exits 2 and writes
+    // nothing.
+    let markdown = "# Test\n\n```lua\n  print('OVERLAP')\n```\n";
+    let ws = workspace_with(&[("doc.md", markdown)]);
+    std::fs::write(
+        ws.path().join("kakehashi.toml"),
+        format!(
+            r#"autoInstall = false
+
+[languages.markdown.bridge.lua.aggregation."kakehashi/virtualDocument/prepare"]
+priorities = ["peer"]
+
+[languages.markdown.bridge.lua.aggregation._]
+priorities = ["mock-upper"]
+
+[languageServers.peer]
+cmd = ['{bin}', 'prepare-peer']
+languages = ["lua"]
+
+[languageServers.mock-upper]
+cmd = ['{bin}', 'upper']
+languages = ["lua"]
+"#,
+            bin = env!("CARGO_BIN_EXE_mock-lsp-formatter")
+        ),
+    )
+    .expect("write prepare config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .arg("format")
+        .arg("--config-file")
+        .arg("kakehashi.toml")
+        .arg("doc.md")
+        .current_dir(ws.path())
+        .env("KAKEHASHI_DATA_DIR", data_dir())
+        .env("KAKEHASHI_EXPERIMENTAL", "true")
+        .output()
+        .expect("spawn kakehashi format");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a refused prepared answer must exit 2; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(read(ws.path(), "doc.md"), markdown);
+}
+
+#[test]
 fn e2e_format_preferred_non_winning_failure_is_not_counted() {
     // Preferred fan-out (the bridge-level default for formatting): the
     // higher-priority server errors, the fallback formats and WINS. Under

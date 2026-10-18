@@ -10,6 +10,8 @@
 //! order end-to-end:
 //!
 //! - `upper` — advertises `documentFormattingProvider`; uppercases the text.
+//!   (In every mode, formatting a text holding `OVERLAP` is answered with two
+//!   overlapping edits: an answer no document takes.)
 //! - `append` — advertises `documentFormattingProvider`; appends a
 //!   `-- mock-marker` line (lowercase, so a later `upper` step would be
 //!   detectable).
@@ -45,6 +47,9 @@
 //!   replaced by `MOCK_PREPARE_PLACEHOLDER` (default `--`). A document whose
 //!   content holds `FAIL` gets an error; one holding `SLOW` is answered
 //!   after two seconds.
+//! - `slow-empty` — advertises formatting, range and on-type (`;`)
+//!   formatting, and answers each with no edits after a second and a half:
+//!   a slow host layer for a test to edit the host while it runs.
 //! - `definition` — advertises `definitionProvider` + `hoverProvider`;
 //!   answers definition with a fixed Location that **echoes the requested
 //!   URI** (and hover with the URI in the contents), but only for documents
@@ -344,6 +349,12 @@ fn main() {
                     }),
                     "range-upper" => json!({
                         "documentRangeFormattingProvider": true,
+                        "textDocumentSync": 1
+                    }),
+                    "slow-empty" => json!({
+                        "documentFormattingProvider": true,
+                        "documentRangeFormattingProvider": true,
+                        "documentOnTypeFormattingProvider": { "firstTriggerCharacter": ";" },
                         "textDocumentSync": 1
                     }),
                     "definition" => json!({
@@ -2714,6 +2725,14 @@ fn main() {
                     respond(&mut writer, id, result);
                 }
             }
+            "textDocument/formatting"
+            | "textDocument/rangeFormatting"
+            | "textDocument/onTypeFormatting"
+                if mode == "slow-empty" =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                respond(&mut writer, id, json!([]));
+            }
             "textDocument/onTypeFormatting" => {
                 // Answer with the whole-document transformation REGARDLESS of
                 // the typed character: the bridge is supposed to filter
@@ -2749,7 +2768,17 @@ fn main() {
                     .pointer("/params/textDocument/uri")
                     .and_then(Value::as_str)
                     .and_then(|uri| documents.get(uri))
-                    .map(|text| whole_document_edit(text, &mode, options.as_ref()))
+                    .map(|text| {
+                        // Two edits overlapping: an answer no document takes.
+                        if text.contains("OVERLAP") {
+                            json!([
+                                { "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 2 } }, "newText": "a" },
+                                { "range": { "start": { "line": 0, "character": 1 }, "end": { "line": 0, "character": 3 } }, "newText": "b" }
+                            ])
+                        } else {
+                            whole_document_edit(text, &mode, options.as_ref())
+                        }
+                    })
                     .unwrap_or(Value::Null);
                 respond(&mut writer, id, result);
             }
