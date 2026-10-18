@@ -138,24 +138,37 @@ impl PreparedMap {
         }) {
             return false;
         }
-        let mut edited = String::with_capacity(virtual_text.len());
-        let mut cursor = 0;
-        for (range, new_text) in &sorted {
-            edited.push_str(&virtual_text[cursor..range.start]);
-            edited.push_str(new_text);
-            cursor = range.end;
-        }
-        edited.push_str(&virtual_text[cursor..]);
-        // Where V offset `offset`, outside every change, lands in the edited
-        // V: after the changes ending at or before it (an insertion there
-        // included, which goes before what follows it).
-        let shifted = |offset: usize| -> usize {
-            sorted
-                .iter()
-                .take_while(|(range, _)| range.end <= offset)
-                .fold(offset, |at, (range, new_text)| {
-                    at + new_text.len() - range.len()
-                })
+        // The edited V is read only beside host runs, outside every change:
+        // the character before or after V offset `offset` there, looked up
+        // in the changes meeting it rather than in a copy of the whole text.
+        // Before it come the changes ending there (an insertion there
+        // included, which goes before what follows it), after it those
+        // starting there; one inserting nothing passes the lookup on.
+        let before = |mut offset: usize| {
+            let met = sorted.partition_point(|(range, _)| range.end <= offset);
+            for (range, new_text) in sorted[..met].iter().rev() {
+                if range.end != offset {
+                    break;
+                }
+                if let Some(last) = new_text.chars().next_back() {
+                    return Some(last);
+                }
+                offset = range.start;
+            }
+            virtual_text[..offset].chars().next_back()
+        };
+        let after = |mut offset: usize| {
+            let met = sorted.partition_point(|(range, _)| range.start < offset);
+            for (range, new_text) in &sorted[met..] {
+                if range.start != offset {
+                    break;
+                }
+                if let Some(first) = new_text.chars().next() {
+                    return Some(first);
+                }
+                offset = range.end;
+            }
+            virtual_text[offset..].chars().next()
         };
         // Changes never reach into a gap (see `hunk_touches_gap`) nor into
         // the deleted edge lines, which P has no position inside.
@@ -171,7 +184,7 @@ impl PreparedMap {
             })
             .chain(first_closing_line);
         for run in line_starts {
-            if !is_line_start(&edited, shifted(run.virtual_.start)) {
+            if before(run.virtual_.start).is_some_and(|c| c != '\n' && c != '\r') {
                 return false;
             }
         }
@@ -184,8 +197,6 @@ impl PreparedMap {
         });
         for run in host_owned {
             let text = &virtual_text[run.virtual_.clone()];
-            let start = shifted(run.virtual_.start);
-            let end = start + text.len();
             // A line break at the run's edge is hidden when P does not show
             // it there: one the peer's text shows too (a gap replaced by text
             // ending with the same CR) was the server's to join.
@@ -193,10 +204,10 @@ impl PreparedMap {
             let cr_hidden = text.ends_with('\r') && !shown.ends_with('\r');
             let lf_hidden = text.starts_with('\n') && !shown.starts_with('\n');
             let fused_after = cr_hidden
-                && edited[end..].starts_with('\n')
+                && after(run.virtual_.end) == Some('\n')
                 && !virtual_text[run.virtual_.end..].starts_with('\n');
             let fused_before = lf_hidden
-                && edited[..start].ends_with('\r')
+                && before(run.virtual_.start) == Some('\r')
                 && !virtual_text[..run.virtual_.start].ends_with('\r');
             if fused_after || fused_before {
                 return false;
