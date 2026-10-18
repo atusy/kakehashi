@@ -923,6 +923,17 @@ fn lone_cr_lines_regain_their_indent() {
     assert_eq!(apply_to(virtual_text, &[inserted]), "  a\r  b\r  c");
 }
 
+#[test]
+fn a_range_reaching_into_a_gap_is_in_it() {
+    let (_, map) = interpolated();
+    assert!(map.virtual_range_in_gap(LspRange::new(pos(0, 4), pos(0, 8))));
+    assert!(map.virtual_range_in_gap(LspRange::new(pos(0, 0), pos(0, 5))));
+    assert!(map.virtual_range_in_gap(LspRange::new(pos(0, 6), pos(0, 6))));
+    assert!(!map.virtual_range_in_gap(LspRange::new(pos(0, 0), pos(0, 4))));
+    assert!(!map.virtual_range_in_gap(LspRange::new(pos(0, 8), pos(1, 2))));
+    assert!(!map.virtual_range_in_gap(LspRange::new(pos(0, 4), pos(0, 4))));
+}
+
 // =============================================================================
 // Property: mapped edits keep the host's text and the server's content
 // =============================================================================

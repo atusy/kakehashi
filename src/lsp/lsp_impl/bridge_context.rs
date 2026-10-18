@@ -78,7 +78,10 @@ fn method_requires_contiguous_injection(method: &str) -> bool {
 /// edits are mapped back through the prepared map
 /// (`translate_virtual_text_edits_to_host`).
 fn method_maps_prepared_edits(method: &str) -> bool {
-    matches!(method, "textDocument/inlayHint")
+    matches!(
+        method,
+        "textDocument/colorPresentation" | "textDocument/inlayHint"
+    )
 }
 
 /// Whether `method` is closed to a region: one that is not contiguous, or
@@ -2454,7 +2457,7 @@ mod tests {
     }
 
     #[test]
-    fn a_prepared_document_is_closed_to_edit_methods_but_not_inlay_hints() {
+    fn a_prepared_document_is_closed_to_edit_methods_but_those_mapping_their_edits() {
         let mut resolved = crate::language::injection::ResolvedInjection {
             region: crate::language::injection::CacheableInjectionRegion {
                 language: "lua".to_string(),
@@ -2482,7 +2485,9 @@ mod tests {
             assert!(!method_closed_to(&resolved, method, false), "{method}");
             assert!(method_closed_to(&resolved, method, true), "{method}");
         }
-        assert!(!method_closed_to(&resolved, "textDocument/inlayHint", true));
+        for method in ["textDocument/inlayHint", "textDocument/colorPresentation"] {
+            assert!(!method_closed_to(&resolved, method, true), "{method}");
+        }
         assert!(!method_closed_to(&resolved, "textDocument/hover", true));
         resolved.contiguous = false;
         assert!(method_closed_to(&resolved, "textDocument/inlayHint", false));
