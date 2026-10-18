@@ -74,6 +74,10 @@ impl LanguageServerPool {
                 )
             },
             |response, ctx| {
+                // Edits for a text whose host coordinates moved since.
+                if !ctx.request_text_held {
+                    return Vec::new();
+                }
                 transform_color_presentation_response_to_host(
                     response, ctx.offset, region_end, host_range,
                 )

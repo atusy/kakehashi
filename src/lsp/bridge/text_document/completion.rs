@@ -92,6 +92,10 @@ impl LanguageServerPool {
                 build_completion_request(virtual_uri, host_position, &offset, request_id)
             },
             |response, ctx| {
+                // Edits for a text whose host coordinates moved since.
+                if !ctx.request_text_held {
+                    return None;
+                }
                 transform_completion_response_to_host(
                     response,
                     ctx.offset,
