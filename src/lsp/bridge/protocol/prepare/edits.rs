@@ -46,22 +46,37 @@ impl PreparedMap {
     /// indentation the peer removed from lines it creates or replaces. The
     /// mapped set is then checked as a whole against the host text V holds
     /// and P does not show (see [`Self::mapped_edits_keep_host_text`]).
-    /// `None` — refuse the set — when an edit is reversed, edits overlap or
-    /// touch in P (or overlap once mapped), an edit touches a gap, a line
-    /// created in content has no single indentation to regain, or the host
-    /// text would not survive.
+    /// `None` — refuse the set — when an edit is reversed, edits overlap in
+    /// P or once mapped (or touch where either's text bears on the other),
+    /// an edit touches a gap, a line created in content has no single
+    /// indentation to regain, or the host text would not survive.
     pub(crate) fn map_edits(&self, edits: &[TextEdit], mode: EditMode) -> Option<Vec<TextEdit>> {
         let EditMode::Extent = mode;
         let prepared = &self.prepared_lines.text;
         let (ranges, order) = sorted_extents(&self.prepared_lines, edits)?;
         // Edits that touch — one ending where another starts, two inserting
-        // at one place — are refused: how each regains a removed indent, and
-        // on which side of the other it lands, depends on the other's text,
-        // which mapped one by one neither sees.
-        if order
-            .windows(2)
-            .any(|pair| ranges[pair[0]].end == ranges[pair[1]].start)
-        {
+        // at one place — are refused where how each regains a removed indent,
+        // or how a CR and an LF meet, depends on the other's text, which
+        // mapped one by one neither sees: at a line start, or with a line
+        // break or no text at all on the side where they meet. Mid-line
+        // between text, neither decides anything there.
+        let breaks = |c: char| c == '\n' || c == '\r';
+        if order.windows(2).any(|pair| {
+            let (earlier, later) = (pair[0], pair[1]);
+            let meeting = ranges[later].start;
+            ranges[earlier].end == meeting
+                && (is_line_start(prepared, meeting)
+                    || !edits[earlier]
+                        .new_text
+                        .chars()
+                        .next_back()
+                        .is_some_and(|last| !breaks(last))
+                    || !edits[later]
+                        .new_text
+                        .chars()
+                        .next()
+                        .is_some_and(|first| !breaks(first)))
+        }) {
             return None;
         }
         let mut mapped = vec![None; edits.len()];
