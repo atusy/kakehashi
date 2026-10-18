@@ -396,9 +396,20 @@ impl super::BridgeCoordinator {
             return super::Presentation::Unavailable;
         };
         let virtual_uri =
-            super::protocol::VirtualDocumentUri::new(&host, injection_language, region_id);
+            super::protocol::VirtualDocumentUri::new(&host, injection_language, region_id)
+                .to_uri_string();
+        // A push about another document than the one the region resolves
+        // to now (re-routed under the same id) is in that document's
+        // coordinates, which this one's text and record do not describe.
+        if stamp
+            .origin
+            .as_ref()
+            .is_some_and(|origin| *origin != virtual_uri)
+        {
+            return super::Presentation::Unavailable;
+        }
         self.pool.presentation(
-            &virtual_uri.to_uri_string(),
+            &virtual_uri,
             &stamp.connection,
             stamp.observed,
             region,
@@ -642,6 +653,7 @@ mod tests {
                 prepared: true,
                 stale_version: false,
             },
+            origin: Some(virtual_uri.to_uri_string()),
         };
 
         // Not stamped, in a region the lifecycle pass does not prepare.
@@ -684,6 +696,24 @@ mod tests {
         assert!(matches!(
             place("  b", Some(&stamp(2))),
             Presentation::Prepared(_)
+        ));
+        // A push about the region's document under another language (it was
+        // re-routed under the same id since the push was read) places
+        // nowhere: its coordinates are that document's.
+        let other = HeldStamp {
+            origin: Some(
+                VirtualDocumentUri::new(
+                    &crate::lsp::lsp_impl::url_to_uri(&host).unwrap(),
+                    "python",
+                    TEST_ULID_LUA_0,
+                )
+                .to_uri_string(),
+            ),
+            ..stamp(2)
+        };
+        assert!(matches!(
+            place("  b", Some(&other)),
+            Presentation::Unavailable
         ));
     }
 
