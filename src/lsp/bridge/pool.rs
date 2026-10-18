@@ -3406,13 +3406,15 @@ impl LanguageServerPool {
     ///   yet — no.
     /// - Held (a newer input's answer pending, or failed): the host moved,
     ///   to a map not known yet — no.
-    /// - The latest map prepares the request's very text, yet differs: the
-    ///   host moved under a prepared text that stayed the same (indentation
-    ///   the peer removes was edited) — no.
-    /// - The latest text prepares to another text (typing), or went as is:
+    /// - The latest map lays V out otherwise (see
+    ///   `PreparedMap::same_geometry`): a line's removed indentation
+    ///   changed, whether P did (typing as the indent changed) or not (an
+    ///   edit to indentation the peer removes), or lines moved past one —
+    ///   no: positions read through the request's map land elsewhere.
+    /// - The same layout, its shared text typed on or not (the same map):
     ///   the answer is stale as any LSP answer is when the document changed
     ///   meanwhile, as on unprepared documents — yes.
-    /// - The same map, or nothing recorded — yes.
+    /// - The latest text went as is, or nothing recorded — yes.
     ///
     /// The hold is read first: [`Self::record_latest_virtual_content`]
     /// stores a text before it clears the hold, so with the hold read clear
@@ -3447,9 +3449,7 @@ impl LanguageServerPool {
                 .map(|latest| latest.value().map().cloned())
         });
         match latest {
-            Some(Some(latest)) => {
-                latest.prepared_text() != request_map.prepared_text() || *latest == *request_map
-            }
+            Some(Some(latest)) => super::protocol::PreparedMap::same_geometry(&latest, request_map),
             _ => true,
         }
     }

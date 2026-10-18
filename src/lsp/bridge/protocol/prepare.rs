@@ -494,12 +494,25 @@ fn build_prepared(
         runs.hash(&mut hasher);
         hasher.finish()
     };
+    let virtual_lines = LineMap::new(virtual_text.to_string());
+    let geometry = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for run in runs.iter().filter(|run| run.kind != RunKind::Identity) {
+            let at = virtual_lines.position(run.virtual_.start);
+            (run.kind, at.line, at.character).hash(&mut hasher);
+            virtual_text[run.virtual_.clone()].hash(&mut hasher);
+            text[run.prepared.clone()].hash(&mut hasher);
+        }
+        hasher.finish()
+    };
     let map = PreparedMap {
-        virtual_lines: LineMap::new(virtual_text.to_string()),
+        virtual_lines,
         prepared_lines: LineMap::new(text.clone()),
         runs,
         indents,
         fingerprint,
+        geometry,
         built: taken,
         #[cfg(test)]
         input: 0,
@@ -786,6 +799,10 @@ pub(crate) struct PreparedMap {
     /// part of the fingerprint.
     indents: Vec<SegmentIndent>,
     fingerprint: u64,
+    /// A fingerprint of what the peer removed or replaced, and where in V:
+    /// every run but the text both documents share (see
+    /// [`Self::same_geometry`]); not part of its equality.
+    geometry: u64,
     /// Where the input its answer came from was taken in the presentation
     /// order (see [`apply_prepare_result_at`]); not part of its equality.
     built: u64,
@@ -948,8 +965,15 @@ impl PreparedMap {
     }
 
     /// The prepared text this map's answer gave.
-    pub(crate) fn prepared_text(&self) -> &str {
-        &self.prepared_lines.text
+    /// Whether `a` and `b` lay V out alike: the same indentation removed
+    /// from the same lines, the same edge lines deleted, the same gaps at
+    /// the same places with the same text in P, whatever text both
+    /// documents share around them (typing within a line). A position
+    /// read through either then lands where the other would put it in the
+    /// text the other describes; with a line's removed indentation changed,
+    /// a line added before a removed indent, or a gap moved, it does not.
+    pub(crate) fn same_geometry(a: &PreparedMap, b: &PreparedMap) -> bool {
+        a.geometry == b.geometry
     }
 
     /// Translate a position in P to V.
