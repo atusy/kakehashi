@@ -1234,6 +1234,56 @@ mod tests {
         assert!(task.await.unwrap().is_err(), "its reply is dropped");
     }
 
+    /// A failure keeps revoking the answers it revokes once the lifecycle
+    /// pass holds the region on another input (an edit while a request
+    /// ran), or never held it there (a request's own lookup): a reply on
+    /// such an answer is not read. A text as is follows only the input the
+    /// region is held on.
+    #[tokio::test]
+    async fn a_failure_not_held_still_revokes_the_answers_it_revokes() {
+        use crate::lsp::bridge::protocol::{AnswerOrigin, VirtualLayout, apply_prepare_result};
+        let pool = LanguageServerPool::preparing();
+        let host_uri = Url::parse("file:///test/failure-not-held.md").unwrap();
+        let answer =
+            apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(dedent_answer()))
+                .unwrap()
+                .map
+                .origin();
+        let failures = pool.prepare_failures_for_test();
+        // Held on another input, still waiting for its answer.
+        failures.hold_for_test(
+            &host_uri,
+            "lua",
+            TEST_ULID_LUA_0,
+            pool.prepare_epoch(),
+            None,
+        );
+        let failure = AnswerOrigin {
+            taken: crate::lsp::bridge::protocol::next_presentation(),
+            input: answer.input,
+        };
+        failures.keep_failure_for_test(
+            &host_uri,
+            "lua",
+            TEST_ULID_LUA_0,
+            pool.prepare_epoch(),
+            failure,
+        );
+        assert!(pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0, Some(answer)));
+        assert!(!pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0, None));
+        // One taken after it is not revoked.
+        let newer =
+            apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(dedent_answer()))
+                .unwrap()
+                .map
+                .origin();
+        let newer = AnswerOrigin {
+            input: answer.input,
+            ..newer
+        };
+        assert!(!pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0, Some(newer)));
+    }
+
     /// A request on an answer the registry holds its region failed on is
     /// refused at once, before the lifecycle pass re-syncs the host: the
     /// failure is read where it is recorded.
