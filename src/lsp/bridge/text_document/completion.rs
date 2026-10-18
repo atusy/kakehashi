@@ -127,11 +127,15 @@ impl LanguageServerPool {
 }
 
 /// [`transform_completion_response_to_host`] for a response as the executor
-/// hands it over. When the request's map no longer describes the region's
-/// current host text (see `BridgeResponseContext`), no item is kept, its
-/// edits made for host coordinates that moved since — but an incomplete
-/// list still asks to re-query, as an empty incomplete list (its items not
-/// even read), as the final check answers too.
+/// hands it over. Whether the host moved under a prepared request's map is
+/// not read here: the virt layer reads it once, as the final answer is
+/// chosen (`Sourced::still_current`), dropping its items then (an empty
+/// incomplete list when the answer asked to re-query). Refused here, the
+/// reply would count as no answer, and a server ranked below it whose reply
+/// came once the host settled would win, against the configured order.
+/// Mapped through a map the host moved under, the items are only ever
+/// discarded by that check: the map is the one the server's text was
+/// prepared under.
 fn completion_response_to_host(
     response: serde_json::Value,
     ctx: &super::super::pool::BridgeResponseContext<'_>,
@@ -141,17 +145,6 @@ fn completion_response_to_host(
     envelope_ctx: &EnvelopeContext<'_>,
     insert_mode: ClientInsertMode,
 ) -> Option<CompletionList> {
-    if !ctx.request_map_current {
-        let incomplete = !response_has_jsonrpc_error(&response, "textDocument/completion")
-            && response.get("result").is_some_and(|result| {
-                result.get("isIncomplete").and_then(Value::as_bool) == Some(true)
-                    && result.get("items").is_some_and(Value::is_array)
-            });
-        return incomplete.then(|| CompletionList {
-            is_incomplete: true,
-            items: vec![],
-        });
-    }
     transform_completion_response_to_host(
         response,
         ctx.offset,
@@ -1789,33 +1782,44 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_answer_whose_map_is_no_longer_current_is_dropped() {
-        let offset = dedented_offset("  a\n");
-        let host_uri: tower_lsp_server::ls_types::Uri = "file:///test.md".parse().unwrap();
-        let response = json!({"jsonrpc": "2.0", "id": 1, "result": [{"label": "x", "textEdit": {
-            "range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 1}},
-            "newText": "x"
-        }}]});
-        let answer = |current: bool| {
-            let ctx = super::super::super::pool::BridgeResponseContext {
-                virtual_uri_string: "file:///test.md/v.lua".to_string(),
-                host_uri_lsp: &host_uri,
-                offset: &offset,
-                request_map_current: current,
-            };
+    /// The server ranked first keeps its place though its reply came while
+    /// the host had moved (an edit to another fence, its pass not settled
+    /// yet) and the next one's came once it settled with the content
+    /// unchanged: whether the host moved is read once, where the answer is
+    /// chosen, not per reply, where it would hand the region to the next.
+    #[tokio::test]
+    async fn the_server_ranked_first_wins_though_its_reply_came_before_the_host_settled() {
+        use crate::lsp::aggregation::server::priority::PriorityEntry;
+        use crate::lsp::aggregation::server::{FanInResult, TaggedResult, preferred};
+        let map = dedented_map("  a\n");
+        let offset = RegionOffset::new(10, 0).with_prepared(std::sync::Arc::clone(&map));
+        let pool = crate::lsp::bridge::LanguageServerPool::preparing();
+        let host = url::Url::parse("file:///test/two-fences.md").unwrap();
+        let host_lsp = crate::lsp::lsp_impl::url_to_uri(&host).unwrap();
+        let region = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        pool.open_host_incarnation(&host, 1).await;
+        let prepared = crate::lsp::bridge::protocol::PreparedDocument {
+            text: "a\n".to_string(),
+            map: std::sync::Arc::clone(&map),
+        };
+        pool.record_latest_prepared_for_test(&host, 1, "lua", region, &prepared);
+        let reply = |label: &str| {
+            let ctx = pool.response_context_for_test(&host_lsp, (&host, "lua", region), &offset);
             completion_response_to_host(
-                response.clone(),
+                json!({"jsonrpc": "2.0", "id": 1, "result": [{"label": label, "textEdit": {
+                    "range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 1}},
+                    "newText": label
+                }}]}),
                 &ctx,
                 Position::new(11, 0),
                 Position::new(10, 3),
                 false,
                 &EnvelopeContext {
-                    server_name: "lua-ls",
+                    server_name: label,
                     injection_language: "lua",
                     incarnation: Some(1),
-                    host_uri: "file:///test.md",
-                    region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    host_uri: "file:///test/two-fences.md",
+                    region_id: region,
                     offset: &offset,
                     region_end: Some(Position::new(11, 0)),
                     host_layer: false,
@@ -1823,57 +1827,38 @@ mod tests {
                 ClientInsertMode::default(),
             )
         };
-        assert_eq!(answer(true).map(|list| list.items.len()), Some(1));
-        assert_eq!(answer(false), None);
-    }
-
-    /// A stale incomplete list keeps its ask to re-query, its items (and
-    /// their edits) dropped; a stale complete one answers nothing.
-    #[test]
-    fn a_stale_incomplete_list_still_asks_to_requery() {
-        let offset = dedented_offset("  a\n");
-        let host_uri: tower_lsp_server::ls_types::Uri = "file:///test.md".parse().unwrap();
-        let ctx = super::super::super::pool::BridgeResponseContext {
-            virtual_uri_string: "file:///test.md/v.lua".to_string(),
-            host_uri_lsp: &host_uri,
-            offset: &offset,
-            request_map_current: false,
+        // Another fence edited, its pass not settled: the top server replies.
+        pool.note_host_edited(&host, 1, 1);
+        let top = reply("top");
+        // Settled, this region's text unchanged: the next server replies.
+        pool.note_host_settled(&host, 1, 1);
+        let next = reply("next");
+        assert!(next.is_some());
+        let mut tasks = tokio::task::JoinSet::new();
+        for (server_name, value) in [("next", next), ("top", top)] {
+            tasks.spawn(async move {
+                TaggedResult {
+                    server_name: server_name.to_string(),
+                    value: Ok(value),
+                }
+            });
+        }
+        let result = preferred(
+            &mut tasks,
+            |list: &Option<CompletionList>| {
+                list.as_ref().is_some_and(|list| !list.items.is_empty())
+            },
+            &[
+                PriorityEntry::Server("top".to_string()),
+                PriorityEntry::Server("next".to_string()),
+            ],
+            None,
+        )
+        .await;
+        let FanInResult::Done(Some(list)) = result else {
+            panic!("an answer");
         };
-        let answer = |is_incomplete: bool| {
-            completion_response_to_host(
-                json!({"jsonrpc": "2.0", "id": 1, "result": {
-                    "isIncomplete": is_incomplete,
-                    "items": [{"label": "abc", "textEdit": {
-                        "range": {"start": {"line": 0, "character": 0},
-                                  "end": {"line": 0, "character": 1}},
-                        "newText": "abc"
-                    }}]
-                }}),
-                &ctx,
-                Position::new(11, 0),
-                Position::new(10, 3),
-                false,
-                &EnvelopeContext {
-                    server_name: "lua-ls",
-                    injection_language: "lua",
-                    incarnation: Some(1),
-                    host_uri: "file:///test.md",
-                    region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
-                    offset: &offset,
-                    region_end: Some(Position::new(11, 0)),
-                    host_layer: false,
-                },
-                ClientInsertMode::default(),
-            )
-        };
-        assert_eq!(
-            answer(true),
-            Some(CompletionList {
-                is_incomplete: true,
-                items: vec![],
-            })
-        );
-        assert_eq!(answer(false), None);
+        assert_eq!(list.items[0].label, "top");
     }
 
     #[test]

@@ -449,10 +449,11 @@ impl<T> Sourced<T> {
     /// still tracked under the lifetime it was tracked under as the answer
     /// was made, which the host's store is open for (not deleted,
     /// invalidated, nor its host closed or reopened) — and its recorded text
-    /// what the executor read as the reply arrived
-    /// (`LanguageServerPool::host_text_still_current`). Read again here
-    /// because a fan-in or the layer race can hold a transformed answer
-    /// while the host moves; read once, where the final answer is chosen.
+    /// still the request's (`LanguageServerPool::host_text_still_current`).
+    /// Read once, where the final answer is chosen, after every fan-in and
+    /// layer await, and nowhere per reply: a reply refused as it arrived
+    /// would count as no answer, and a server ranked below it replying once
+    /// the host settled (the region's content unchanged) would win.
     pub(crate) fn still_current(
         &self,
         pool: &crate::lsp::bridge::LanguageServerPool,
