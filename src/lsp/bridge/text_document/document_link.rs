@@ -100,21 +100,14 @@ fn strip_document_link_envelope(link: &mut DocumentLink) -> Option<DocumentLinkE
 }
 
 fn re_envelope_link(link: &mut DocumentLink, envelope: &DocumentLinkEnvelope) {
-    let offset = RegionOffset::from(&envelope.offset);
-    envelope_link_data(
-        link,
-        &DocumentLinkEnvelopeContext {
-            server_name: &envelope.origin,
-            host_uri: &envelope.host_uri,
-            region_id: &envelope.region_id,
-            injection_language: &envelope.injection_language,
-            incarnation: envelope.incarnation,
-            connection_generation: envelope.connection_generation,
-            connection_key: envelope.connection_key.as_ref(),
-            offset: &offset,
-            host_layer: envelope.host_layer,
-        },
-    );
+    // Written as a fresh mint writes it, but keeping the mark of a link
+    // minted from a prepared document (see `EnvelopeOffset::rewritten`).
+    let rebuilt = DocumentLinkEnvelope {
+        offset: envelope.offset.rewritten(),
+        inner: None,
+        ..envelope.clone()
+    };
+    link.data = Some(wrap_envelope(&rebuilt, link.data.take()));
 }
 
 pub(crate) fn envelope_host_document_links(

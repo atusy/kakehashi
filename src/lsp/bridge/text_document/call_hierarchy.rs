@@ -99,25 +99,15 @@ fn re_envelope_item(
     envelope: &CallHierarchyEnvelope,
     projected_from_virtual: bool,
 ) {
-    let offset = RegionOffset::from(&envelope.offset);
-    envelope_item_data(
-        item,
-        &CallHierarchyEnvelopeContext {
-            server_name: &envelope.origin,
-            host_uri: &envelope.host_uri,
-            region_id: &envelope.region_id,
-            injection_language: &envelope.injection_language,
-            revision: CallHierarchyDocumentRevision {
-                incarnation: envelope.incarnation,
-                content_version: envelope.content_version,
-            },
-            connection_generation: envelope.connection_generation,
-            connection_key: &envelope.connection_key,
-            offset: &offset,
-            host_layer: envelope.host_layer,
-            projected_from_virtual,
-        },
-    );
+    // Written as a fresh mint writes it, but keeping the mark of an item
+    // minted from a prepared document (see `EnvelopeOffset::rewritten`).
+    let rebuilt = CallHierarchyEnvelope {
+        offset: envelope.offset.rewritten(),
+        inner: item.data.take(),
+        projected_from_virtual,
+        ..envelope.clone()
+    };
+    item.data = Some(serde_json::json!({ ENVELOPE_KEY: rebuilt }));
 }
 
 pub(crate) struct CallHierarchyDocumentRevision {

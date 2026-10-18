@@ -157,18 +157,14 @@ pub(crate) fn strip_code_lens_envelope(lens: &mut CodeLens) -> Option<CodeLensEn
 
 /// Restore the envelope into a lens's `data` field (fail-soft return path).
 fn re_envelope_lens(lens: &mut CodeLens, envelope: &CodeLensEnvelope) {
-    let ctx = CodeLensEnvelopeContext {
-        server_name: &envelope.origin,
-        host_uri: &envelope.host_uri,
-        region_id: &envelope.region_id,
-        injection_language: &envelope.injection_language,
-        incarnation: envelope.incarnation,
-        connection_generation: envelope.connection_generation,
-        connection_key: envelope.connection_key.as_ref(),
-        offset: &RegionOffset::from(&envelope.offset),
-        host_layer: envelope.host_layer,
+    // Written as a fresh mint writes it, but keeping the mark of a lens
+    // minted from a prepared document (see `EnvelopeOffset::rewritten`).
+    let rebuilt = CodeLensEnvelope {
+        offset: envelope.offset.rewritten(),
+        inner: None,
+        ..envelope.clone()
     };
-    envelope_lens_data(lens, &ctx);
+    lens.data = Some(wrap_envelope(&rebuilt, lens.data.take()));
 }
 
 pub(crate) fn envelope_host_code_lenses(
@@ -672,6 +668,67 @@ mod tests {
         server_resolves: bool,
     ) -> Option<Vec<CodeLens>> {
         transform_code_lens_response_to_host(response, offset, server_resolves, &ctx_with(offset))
+    }
+
+    /// A lens re-enveloped after a refused resolve keeps the mark of a mint
+    /// from a prepared document, and an as-is one is written as a fresh mint
+    /// writes it.
+    #[test]
+    fn a_re_enveloped_lens_keeps_the_prepared_mark() {
+        let envelope = |prepared| CodeLensEnvelope {
+            origin: "lua-ls".into(),
+            host_uri: "file:///test.md".to_string(),
+            region_id: "region".to_string(),
+            injection_language: "lua".to_string(),
+            incarnation: Some(1),
+            connection_generation: Some(2),
+            connection_key: None,
+            offset: EnvelopeOffset {
+                prepared,
+                ..EnvelopeOffset::from(&RegionOffset::new(3, 2))
+            },
+            inner: None,
+            host_layer: false,
+        };
+        for prepared in [false, true] {
+            let mut lens = CodeLens {
+                range: Default::default(),
+                command: None,
+                data: Some(json!({ "token": 1 })),
+            };
+            re_envelope_lens(&mut lens, &envelope(prepared));
+            let back = extract_code_lens_envelope(&lens).unwrap();
+            assert_eq!(back.offset.prepared, prepared);
+            assert_eq!(back.inner, Some(json!({ "token": 1 })));
+        }
+        // As is: what a fresh mint writes.
+        let mut minted = CodeLens {
+            range: Default::default(),
+            command: None,
+            data: Some(json!({ "token": 1 })),
+        };
+        let as_is = envelope(false);
+        envelope_lens_data(
+            &mut minted,
+            &CodeLensEnvelopeContext {
+                server_name: &as_is.origin,
+                host_uri: &as_is.host_uri,
+                region_id: &as_is.region_id,
+                injection_language: &as_is.injection_language,
+                incarnation: as_is.incarnation,
+                connection_generation: as_is.connection_generation,
+                connection_key: None,
+                offset: &RegionOffset::new(3, 2),
+                host_layer: false,
+            },
+        );
+        let mut rewritten = CodeLens {
+            range: Default::default(),
+            command: None,
+            data: Some(json!({ "token": 1 })),
+        };
+        re_envelope_lens(&mut rewritten, &as_is);
+        assert_eq!(rewritten.data, minted.data);
     }
 
     #[test]
