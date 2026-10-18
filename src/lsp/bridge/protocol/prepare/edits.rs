@@ -119,7 +119,8 @@ impl PreparedMap {
             return Some(Vec::new());
         }
         let deadline = Instant::now() + budget;
-        let hunks = diff_hunks(prepared, &edited, deadline);
+        // `None` past what pairing blank lines may hold in memory.
+        let hunks = diff_hunks(prepared, &edited, deadline)?;
         // The diff gives up only once it has seen the deadline pass: a diff
         // finishing past it may have, and is not trusted (see
         // `FORMATTING_DIFF_BUDGET`).
@@ -855,7 +856,7 @@ struct Hunk {
 /// over the unchanged character beside it. Stretches left touching merge,
 /// but at the start of a line one writes text over or the other's line
 /// break ends before.
-fn diff_hunks(old: &str, new: &str, deadline: Instant) -> Vec<Hunk> {
+fn diff_hunks(old: &str, new: &str, deadline: Instant) -> Option<Vec<Hunk>> {
     let old_lines = lines_with_breaks(old);
     let new_lines = lines_with_breaks(new);
     let line_start = |lines: &[(usize, &str)], text: &str, index: usize| {
@@ -873,7 +874,7 @@ fn diff_hunks(old: &str, new: &str, deadline: Instant) -> Vec<Hunk> {
     };
     let (old_keys, new_keys) = (line_keys(&old_lines), line_keys(&new_lines));
     let mut aligned = Vec::new();
-    align_lines(
+    if !align_lines(
         &old_keys,
         &new_keys,
         0,
@@ -881,7 +882,9 @@ fn diff_hunks(old: &str, new: &str, deadline: Instant) -> Vec<Hunk> {
         0..new_lines.len(),
         deadline,
         &mut aligned,
-    );
+    ) {
+        return None;
+    }
     let block = |lines: &[(usize, &str)], text: &str, range: Range<usize>| {
         line_start(lines, text, range.start)..line_start(lines, text, range.end)
     };
@@ -969,7 +972,7 @@ fn diff_hunks(old: &str, new: &str, deadline: Instant) -> Vec<Hunk> {
             }
         }
     }
-    hunks
+    Some(hunks)
 }
 
 /// One way [`align_lines`] pairs lines.
@@ -1008,18 +1011,24 @@ const ALIGNMENTS: [Alignment; 3] = [
     Alignment::Blanks,
 ];
 
+/// How many cells the table pairing blank lines may take (4 bytes each): a
+/// run of blank lines beyond that, its table quadratic in them, refuses
+/// the answer rather than hold the memory.
+const BLANK_PAIRING_CELLS: usize = 1 << 22;
+
 /// Pairs of the blank lines of `old_range` with those of `new_range`, in
 /// order: as many as an alignment of them can pair, and among those, as
 /// many pairs alike to the whitespace as can be. Lines of text take no
 /// part. Quadratic in the blank lines: past `deadline` it pairs nothing,
-/// for the answer to be refused.
+/// for the answer to be refused; `None`, to refuse it at once, when its
+/// table would outgrow `BLANK_PAIRING_CELLS`.
 fn blank_lines(
     old_keys: &[Vec<String>; 2],
     new_keys: &[Vec<String>; 2],
     old_range: &Range<usize>,
     new_range: &Range<usize>,
     deadline: Instant,
-) -> Vec<(usize, usize)> {
+) -> Option<Vec<(usize, usize)>> {
     let blanks = |keys: &[Vec<String>; 2], range: &Range<usize>| -> Vec<usize> {
         range
             .clone()
@@ -1027,6 +1036,9 @@ fn blank_lines(
             .collect()
     };
     let (old, new) = (blanks(old_keys, old_range), blanks(new_keys, new_range));
+    if (old.len() + 1).saturating_mul(new.len() + 1) > BLANK_PAIRING_CELLS {
+        return None;
+    }
     // Alike to the whitespace, holding some: empty lines are all alike, and
     // say nothing of which is which.
     let alike = |old_line: usize, new_line: usize| {
@@ -1038,7 +1050,7 @@ fn blank_lines(
     let mut score = vec![vec![0u32; new.len() + 1]; old.len() + 1];
     for i in (0..old.len()).rev() {
         if Instant::now() >= deadline {
-            return Vec::new();
+            return Some(Vec::new());
         }
         for j in (0..new.len()).rev() {
             let alike = alike(old[i], new[j]);
@@ -1059,7 +1071,7 @@ fn blank_lines(
             j += 1;
         }
     }
-    pairs
+    Some(pairs)
 }
 
 /// Pairs of an old line and the new line written as its text with more
@@ -1096,7 +1108,8 @@ fn joined_lines(
 /// Pair the lines of `old_range` with those of `new_range` at
 /// `ALIGNMENTS[level]`, and each looser one between the pairs it finds:
 /// `aligned` is given in order every pair (one line each) and every run
-/// left between pairs (to diff by character). `keys` are each line's text
+/// left between pairs (to diff by character); `false` when a stage refuses
+/// the answer (see [`blank_lines`]). `keys` are each line's text
 /// without its break, then trimmed of whitespace. A line joined onto
 /// another is left to a run, deleted whole: the text it gave is written on
 /// the line it joined.
@@ -1108,18 +1121,23 @@ fn align_lines(
     new_range: Range<usize>,
     deadline: Instant,
     aligned: &mut Vec<(Range<usize>, Range<usize>)>,
-) {
+) -> bool {
     if old_range.is_empty() || new_range.is_empty() {
         aligned.push((old_range, new_range));
-        return;
+        return true;
     }
     let Some(&alignment) = ALIGNMENTS.get(level) else {
         aligned.push((old_range, new_range));
-        return;
+        return true;
     };
     let pairs: Vec<(usize, usize)> = match alignment {
         Alignment::Joined => joined_lines(old_keys, new_keys, &old_range, &new_range, deadline),
-        Alignment::Blanks => blank_lines(old_keys, new_keys, &old_range, &new_range, deadline),
+        Alignment::Blanks => {
+            match blank_lines(old_keys, new_keys, &old_range, &new_range, deadline) {
+                Some(pairs) => pairs,
+                None => return false,
+            }
+        }
         Alignment::Diff(keys, algorithm, takes_part) => {
             let candidates = |all: &[String], range: &Range<usize>| -> Vec<usize> {
                 range
@@ -1150,7 +1168,7 @@ fn align_lines(
     };
     let (mut old_at, mut new_at) = (old_range.start, new_range.start);
     for (old_line, new_line) in pairs {
-        align_lines(
+        if !align_lines(
             old_keys,
             new_keys,
             level + 1,
@@ -1158,7 +1176,9 @@ fn align_lines(
             new_at..new_line,
             deadline,
             aligned,
-        );
+        ) {
+            return false;
+        }
         aligned.push((old_line..old_line + 1, new_line..new_line + 1));
         (old_at, new_at) = (old_line + 1, new_line + 1);
     }
@@ -1170,7 +1190,7 @@ fn align_lines(
         new_at..new_range.end,
         deadline,
         aligned,
-    );
+    )
 }
 
 /// `text`'s lines, each with its line break (LF, CRLF or a lone CR), and
