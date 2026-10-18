@@ -3173,6 +3173,33 @@ mod formatting {
     }
 
     #[test]
+    fn a_kept_whitespace_line_pairs_with_itself_before_an_empty_line() {
+        // Two kept ` ` lines and an empty one; an empty line written
+        // between the two: each ` ` is the line it was, the empty lines
+        // alike among themselves.
+        let virtual_text = "  a\n \n \n\n";
+        let map = dedent_lines(virtual_text, &[2, 0, 0, 0]);
+        let answer = [edit((0, 0), (4, 0), "a\n \n\n \n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  a\n \n\n \n")
+        );
+    }
+
+    #[test]
+    fn a_blank_line_given_other_whitespace_is_the_line_it_was() {
+        // The kept ` ` widened to two spaces, a line inserted above it:
+        // the inserted line is the content's, the blank line its own.
+        let virtual_text = "  a\n \n";
+        let map = dedent_lines(virtual_text, &[2, 0]);
+        let answer = [edit((0, 0), (2, 0), "a\nw\n  \n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  a\n  w\n  \n")
+        );
+    }
+
+    #[test]
     fn lines_joined_keep_the_first_ones_indent() {
         // `0x` deleted and `1x` joined with `2x`: the joined line is `1x`.
         let virtual_text = "0if x:0\n    1if x:1\n    2if x:2\n";

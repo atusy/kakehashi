@@ -988,12 +988,14 @@ enum Alignment {
 /// - Lines holding whitespace alike but for their line break (patience
 ///   again: such a line unlike the others is that line), before empty
 ///   lines, which are all alike, can draw it away.
-/// - Lines alike but for whitespace: blank lines given other whitespace.
-const ALIGNMENTS: [Alignment; 4] = [
+///
+/// What is left between pairs (lines rewritten past telling, blank lines
+/// given other whitespace, lines written or removed) is diffed by
+/// character as one run.
+const ALIGNMENTS: [Alignment; 3] = [
     Alignment::Diff(1, similar::Algorithm::Patience, |key| !key.is_empty()),
     Alignment::Joined,
     Alignment::Diff(0, similar::Algorithm::Patience, |key| !key.is_empty()),
-    Alignment::Diff(1, similar::Algorithm::Myers, |_| true),
 ];
 
 /// Pairs of an old line and the new line written as its text with more
