@@ -164,7 +164,9 @@ impl PreparedMap {
         // Changes never reach into a gap (see `hunk_touches_gap`) nor into
         // the deleted edge lines, which P has no position inside. Only a run
         // a change meets at one of its edges can read differently there than
-        // in V, where each held: those are the runs looked at.
+        // in V, where each held: those are the runs looked at. A CR and an LF
+        // already meeting across such an edge in V cannot be one a change
+        // meets: its edge would fall between them, refused above.
         let first_closing_line = self
             .runs
             .iter()
@@ -202,7 +204,6 @@ impl PreparedMap {
                     && virtual_text[run.virtual_.clone()].starts_with('\n')
                     && !shown.starts_with('\n')
                     && before == Some('\r')
-                    && !virtual_text[..run.virtual_.start].ends_with('\r')
                 {
                     return false;
                 }
@@ -220,7 +221,6 @@ impl PreparedMap {
                     && virtual_text[run.virtual_.clone()].ends_with('\r')
                     && !shown.ends_with('\r')
                     && after(run.virtual_.end) == Some('\n')
-                    && !virtual_text[run.virtual_.end..].starts_with('\n')
                 {
                     return false;
                 }
