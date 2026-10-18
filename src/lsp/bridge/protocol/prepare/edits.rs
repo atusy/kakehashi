@@ -8,6 +8,7 @@
 //! are fine one by one cannot combine into a corruption of it.
 
 use std::ops::Range;
+use std::time::{Duration, Instant};
 
 use tower_lsp_server::ls_types::{Range as LspRange, TextEdit};
 
@@ -23,7 +24,20 @@ pub(crate) enum EditMode {
     /// Edits keeping their extents (a completion's replace range, an inlay
     /// hint's text edits), mapped one by one.
     Extent,
+    /// A formatter's answer: what it changes counts, not how it says so. The
+    /// edits are applied to P and the result diffed against P; each changed
+    /// stretch maps as one edit would, so a whole-document replacement maps
+    /// as precisely as small edits. The set mapped is the diff's, not the
+    /// edits sent. A range may also end at the line just past P's last
+    /// (`(lineCount, 0)`), naming P's end, as whole-document answers do.
+    Formatting,
 }
+
+/// How long diffing a formatting answer may take (see
+/// [`EditMode::Formatting`]). A diff out of time gives coarser stretches:
+/// each still maps as an edit would, or is refused, so the budget bears on
+/// which answers are refused, never on what an accepted one does.
+const FORMATTING_DIFF_BUDGET: Duration = Duration::from_millis(200);
 
 /// The indentation a mapped edit's first line regains.
 #[derive(Clone, Copy)]
@@ -45,15 +59,18 @@ impl PreparedMap {
     /// Translate a set of edits a downstream server made to P into edits to
     /// V, as `mode` reads them (see [`EditMode`]), one for each in order.
     ///
-    /// Every edit is mapped on its own, keeping its extent and restoring the
-    /// indentation the peer removed from lines it creates or replaces. The
-    /// mapped set is then checked as a whole against the host text V holds
-    /// and P does not show (see [`Self::mapped_edits_keep_host_text`]).
-    /// `None` — refuse the set — when an edit is reversed, reaches a line
-    /// past P's last, edits overlap in P or once mapped (or touch where
-    /// either's text bears on the other), an edit reaches into a gap, a line
-    /// of text created in content has no single indentation to regain, or
-    /// the host text would not survive.
+    /// Every edit (with [`EditMode::Formatting`], every stretch the edited P
+    /// differs from P in) is mapped on its own, keeping its extent and
+    /// restoring the indentation the peer removed from lines it creates or
+    /// replaces. The mapped set is then checked as a whole against the host
+    /// text V holds and P does not show (see
+    /// [`Self::mapped_edits_keep_host_text`]). `None` — refuse the set — when
+    /// an edit is reversed, reaches a line past P's last (but for a
+    /// formatting answer's end at P's end), edits overlap in P or once mapped
+    /// (or, keeping their extents, touch where either's text bears on the
+    /// other), an edit reaches into a gap, a line of text created in content
+    /// has no single indentation to regain, or the host text would not
+    /// survive.
     ///
     /// The host's own text, gaps and edge lines, is always kept; but on a
     /// map with gaps the indentation lines regain is not yet exact in some
@@ -62,9 +79,52 @@ impl PreparedMap {
     /// contiguous regions only, which have none; one opening on a
     /// noncontiguous region needs those fixed first.
     pub(crate) fn map_edits(&self, edits: &[TextEdit], mode: EditMode) -> Option<Vec<TextEdit>> {
-        let EditMode::Extent = mode;
+        self.map_edits_within(edits, mode, FORMATTING_DIFF_BUDGET)
+    }
+
+    /// [`Self::map_edits`], diffing a formatting answer for at most
+    /// `budget`.
+    pub(super) fn map_edits_within(
+        &self,
+        edits: &[TextEdit],
+        mode: EditMode,
+        budget: Duration,
+    ) -> Option<Vec<TextEdit>> {
+        match mode {
+            EditMode::Extent => self.map_extents(edits),
+            EditMode::Formatting => self.map_formatting(edits, budget),
+        }
+    }
+
+    /// [`EditMode::Formatting`]: the edits applied to P, and each stretch
+    /// the result differs from P in mapped as one edit.
+    fn map_formatting(&self, edits: &[TextEdit], budget: Duration) -> Option<Vec<TextEdit>> {
         let prepared = &self.prepared_lines.text;
-        let (ranges, order) = sorted_extents(&self.prepared_lines, edits)?;
+        let (ranges, order) = sorted_extents(&self.prepared_lines, edits, true)?;
+        let mut edited = String::with_capacity(prepared.len());
+        let mut cursor = 0;
+        for &index in &order {
+            edited.push_str(&prepared[cursor..ranges[index].start]);
+            edited.push_str(&edits[index].new_text);
+            cursor = ranges[index].end;
+        }
+        edited.push_str(&prepared[cursor..]);
+        // Stretches the diff keeps apart are apart by unchanged text: none
+        // touches another, so each maps on its own as an edit does.
+        let mapped = diff_hunks(prepared, &edited, Instant::now() + budget)
+            .into_iter()
+            .map(|hunk| {
+                let following = prepared[hunk.old.end..].chars().next();
+                self.hunk_to_virtual(hunk.old, &edited[hunk.new], following)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        self.to_text_edits(mapped)
+    }
+
+    /// [`EditMode::Extent`]: each edit mapped on its own.
+    fn map_extents(&self, edits: &[TextEdit]) -> Option<Vec<TextEdit>> {
+        let prepared = &self.prepared_lines.text;
+        let (ranges, order) = sorted_extents(&self.prepared_lines, edits, false)?;
         // Edits that touch — one ending where another starts, two inserting
         // at one place — are refused where how each regains a removed indent,
         // or how a CR and an LF meet, depends on the other's text, which
@@ -133,6 +193,12 @@ impl PreparedMap {
         {
             return None;
         }
+        self.to_text_edits(mapped)
+    }
+
+    /// The mapped V edits as LSP edits, once checked as a set (see
+    /// [`Self::mapped_edits_keep_host_text`]).
+    fn to_text_edits(&self, mapped: Vec<(Range<usize>, String)>) -> Option<Vec<TextEdit>> {
         self.mapped_edits_keep_host_text(&mapped).then(|| {
             mapped
                 .into_iter()
@@ -699,8 +765,14 @@ fn line_breaks_agree(
 /// in the order they apply: by start, then end, so an insertion goes before
 /// a replacement starting where it is, in whichever order they came, and
 /// same-position insertions in the order they were sent. `None` when an
-/// edit is reversed, names a line past the text's last, or edits overlap.
-fn sorted_extents(lines: &LineMap, edits: &[TextEdit]) -> Option<(Vec<Range<usize>>, Vec<usize>)> {
+/// edit is reversed, names a line past the text's last, or edits overlap —
+/// but for an end at the start of the line just past the last, naming the
+/// text's end, when `end_past_last_line`.
+fn sorted_extents(
+    lines: &LineMap,
+    edits: &[TextEdit],
+    end_past_last_line: bool,
+) -> Option<(Vec<Range<usize>>, Vec<usize>)> {
     let ranges = edits
         .iter()
         .map(|edit| {
@@ -713,9 +785,22 @@ fn sorted_extents(lines: &LineMap, edits: &[TextEdit]) -> Option<(Vec<Range<usiz
             // column past its line as the line's end, but not a line past the
             // document as its end (an import "at line 7" of a 3-line P would
             // land after its content).
-            lines.index.0.line(edit.range.end.line)?;
+            let end = if lines.index.0.line(edit.range.end.line).is_some() {
+                lines.offset_clamped(edit.range.end)
+            } else if end_past_last_line
+                && edit.range.end.character == 0
+                && edit
+                    .range
+                    .end
+                    .line
+                    .checked_sub(1)
+                    .is_some_and(|last| lines.index.0.line(last).is_some())
+            {
+                lines.text.len()
+            } else {
+                return None;
+            };
             let start = lines.offset_clamped(edit.range.start);
-            let end = lines.offset_clamped(edit.range.end);
             (start <= end).then_some(start..end)
         })
         .collect::<Option<Vec<_>>>()?;
@@ -728,6 +813,84 @@ fn sorted_extents(lines: &LineMap, edits: &[TextEdit]) -> Option<(Vec<Range<usiz
         return None;
     }
     Some((ranges, order))
+}
+
+/// A stretch two texts differ in: `old` bytes of the one replaced by `new`
+/// bytes of the other.
+struct Hunk {
+    old: Range<usize>,
+    new: Range<usize>,
+}
+
+/// The stretches `new` differs from `old` in, by a character diff given
+/// until `deadline`; past it the diff gives coarser stretches, still exact.
+/// A stretch never starts or ends between a CR and its LF in either text
+/// (no LSP position names that place): it widens over the unchanged
+/// character beside it. Stretches left touching merge.
+fn diff_hunks(old: &str, new: &str, deadline: Instant) -> Vec<Hunk> {
+    let old_chars: Vec<(usize, char)> = old.char_indices().collect();
+    let new_chars: Vec<(usize, char)> = new.char_indices().collect();
+    let old_values: Vec<char> = old_chars.iter().map(|&(_, c)| c).collect();
+    let new_values: Vec<char> = new_chars.iter().map(|&(_, c)| c).collect();
+    let byte_at = |chars: &[(usize, char)], text: &str, index: usize| {
+        chars.get(index).map_or(text.len(), |&(byte, _)| byte)
+    };
+    let ops = similar::capture_diff_slices_deadline(
+        similar::Algorithm::Myers,
+        &old_values,
+        &new_values,
+        Some(deadline),
+    );
+    let mut hunks: Vec<Hunk> = Vec::new();
+    for op in ops {
+        let (old_range, new_range) = match op {
+            similar::DiffOp::Equal { .. } => continue,
+            similar::DiffOp::Delete {
+                old_index,
+                old_len,
+                new_index,
+            } => (old_index..old_index + old_len, new_index..new_index),
+            similar::DiffOp::Insert {
+                old_index,
+                new_index,
+                new_len,
+            } => (old_index..old_index, new_index..new_index + new_len),
+            similar::DiffOp::Replace {
+                old_index,
+                old_len,
+                new_index,
+                new_len,
+            } => (
+                old_index..old_index + old_len,
+                new_index..new_index + new_len,
+            ),
+        };
+        let mut old_bytes =
+            byte_at(&old_chars, old, old_range.start)..byte_at(&old_chars, old, old_range.end);
+        let mut new_bytes =
+            byte_at(&new_chars, new, new_range.start)..byte_at(&new_chars, new, new_range.end);
+        // The character widened over is unchanged, the same in both texts:
+        // a CR before the start, an LF after the end.
+        if splits_crlf(old, old_bytes.start) || splits_crlf(new, new_bytes.start) {
+            old_bytes.start -= 1;
+            new_bytes.start -= 1;
+        }
+        if splits_crlf(old, old_bytes.end) || splits_crlf(new, new_bytes.end) {
+            old_bytes.end += 1;
+            new_bytes.end += 1;
+        }
+        match hunks.last_mut() {
+            Some(last) if last.old.end >= old_bytes.start || last.new.end >= new_bytes.start => {
+                last.old.end = old_bytes.end;
+                last.new.end = new_bytes.end;
+            }
+            _ => hunks.push(Hunk {
+                old: old_bytes,
+                new: new_bytes,
+            }),
+        }
+    }
+    hunks
 }
 
 /// Whether `next` is a character that is no line break: one that begins

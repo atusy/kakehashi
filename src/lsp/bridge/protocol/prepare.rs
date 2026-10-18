@@ -969,6 +969,12 @@ impl PreparedMap {
         &self.virtual_lines.text
     }
 
+    /// The prepared text this map was built for.
+    #[cfg(test)]
+    pub(crate) fn prepared_text(&self) -> &str {
+        &self.prepared_lines.text
+    }
+
     /// Translate a position in P to V.
     pub(crate) fn to_virtual(&self, position: Position, bias: Bias) -> Position {
         let offset = self.prepared_lines.offset_clamped(position);
