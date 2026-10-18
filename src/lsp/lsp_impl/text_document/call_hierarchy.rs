@@ -287,7 +287,11 @@ fn call_hierarchy_region_geometry_is_fresh(
     expected_language: &str,
     current_language: &str,
 ) -> bool {
-    contiguous && current == expected && current_language == expected_language
+    // Alike in coordinates is enough; an answer revoked since is not.
+    contiguous
+        && current == expected
+        && !expected.prepared().is_some_and(|map| map.revoked())
+        && current_language == expected_language
 }
 
 struct HostCallHierarchyItems {

@@ -441,10 +441,27 @@ impl LatestText {
         }
     }
 
+    /// Whether this is `content`: the same text from the same answer. One
+    /// alike in coordinates from another answer (the same text prepared
+    /// again under a new epoch) replaces it: the cache must hand out the
+    /// answer that stands, not one revoked since.
     fn is(&self, content: SentText<'_>) -> bool {
         let held = self.as_sent();
-        held.text == content.text && held.map.map(Arc::as_ref) == content.map.map(Arc::as_ref)
+        held.text == content.text
+            && super::protocol::PreparedMap::same_answer(held.map, content.map)
     }
+}
+
+/// The error a send of a text from a revoked answer fails with: nothing was
+/// recorded or sent (see `DocumentTracker::record_and_queue`).
+fn revoked_text(virtual_uri: &VirtualDocumentUri) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotConnected,
+        format!(
+            "bridge: the prepared text of {} was revoked by its peer",
+            virtual_uri.to_uri_string()
+        ),
+    )
 }
 
 pub(crate) struct HostLanguageAdmission {
@@ -2753,14 +2770,16 @@ impl LanguageServerPool {
             "textDocument/didChange",
             params,
         ))?;
-        self.document_tracker.record_and_queue(
-            virtual_uri,
-            connection_key,
-            content,
-            change,
-            || sender.send_serialized(payload),
-            io::Result::is_ok,
-        )
+        self.document_tracker
+            .record_and_queue(
+                virtual_uri,
+                connection_key,
+                content,
+                change,
+                || sender.send_serialized(payload),
+                io::Result::is_ok,
+            )
+            .unwrap_or_else(|| Err(revoked_text(virtual_uri)))
     }
 
     /// Whether a text sent as is, from outside the lifecycle pass, must not
@@ -3015,14 +3034,16 @@ impl LanguageServerPool {
             virtual_content.text,
         ))
         .and_then(|payload| {
-            self.document_tracker.record_and_queue(
-                virtual_uri,
-                connection_key,
-                virtual_content,
-                document_tracker::ContentChange::opening(virtual_content.text),
-                || sender.send_serialized(payload),
-                io::Result::is_ok,
-            )
+            self.document_tracker
+                .record_and_queue(
+                    virtual_uri,
+                    connection_key,
+                    virtual_content,
+                    document_tracker::ContentChange::opening(virtual_content.text),
+                    || sender.send_serialized(payload),
+                    io::Result::is_ok,
+                )
+                .unwrap_or_else(|| Err(revoked_text(virtual_uri)))
         });
         if let Err(e) = queued {
             self.document_tracker
@@ -3446,7 +3467,8 @@ impl LanguageServerPool {
     /// Send a didChange of `content` and record it as what the connection
     /// holds (see `DocumentTracker::record_and_queue`): recorded first, so a
     /// push the server answers it with already finds it, and taken back
-    /// unless the send was queued.
+    /// unless the send was queued. `None`, nothing sent, for a map revoked
+    /// since the text was admitted.
     pub(in crate::lsp::bridge) fn send_didchange_recorded(
         &self,
         handle: &Arc<ConnectionHandle>,
@@ -3454,13 +3476,13 @@ impl LanguageServerPool {
         connection_key: &ConnectionKey,
         content: SentText<'_>,
         change: document_tracker::ContentChange,
-    ) -> NotificationSendResult {
+    ) -> Option<NotificationSendResult> {
         // Serialized before the record's lock is taken: only the enqueue
         // happens under it.
         let Some(payload) =
             Self::didchange_payload(&virtual_uri.to_uri_string(), content.text, change.version())
         else {
-            return NotificationSendResult::SerializationFailed;
+            return Some(NotificationSendResult::SerializationFailed);
         };
         self.document_tracker.record_and_queue(
             virtual_uri,
@@ -9962,6 +9984,60 @@ mod tests {
             .await;
         assert!(opened.is_err());
         assert!(rx.try_recv().is_err(), "nothing was sent");
+    }
+
+    /// The same text prepared again under a new answer, alike in
+    /// coordinates to one revoked since, replaces it in the lazy-open cache:
+    /// a request on the new answer opens with it.
+    #[tokio::test]
+    async fn the_cache_takes_a_new_answer_alike_to_a_revoked_one() {
+        let pool = LanguageServerPool::preparing();
+        let host_uri = Url::parse("file:///test/lazy-open-recovered.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        let first = answered_map(&pool, &host_uri, 1);
+        let record = |map| {
+            pool.record_latest_virtual_content(
+                &host_uri,
+                1,
+                "lua",
+                TEST_ULID_LUA_0,
+                SentText {
+                    text: "x = 1",
+                    map: Some(map),
+                },
+            )
+        };
+        record(&first);
+        pool.prepare_failures_for_test().hold_for_test(
+            &host_uri,
+            "lua",
+            TEST_ULID_LUA_0,
+            pool.prepare_epoch(),
+            Some(crate::lsp::bridge::protocol::AnswerOrigin {
+                taken: crate::lsp::bridge::protocol::next_presentation(),
+                input: 1,
+            }),
+        );
+        assert!(first.revoked());
+        let second = answered_map(&pool, &host_uri, 1);
+        assert!(!second.revoked());
+        record(&second);
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
+        pool.ensure_document_opened(
+            &mut sender,
+            &host_uri,
+            &virtual_uri,
+            SentText {
+                text: "x = 1",
+                map: Some(&second),
+            },
+            &key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened_text(&mut rx), "x = 1");
     }
 
     /// A resolve's note of the text its connection held: unchanged until

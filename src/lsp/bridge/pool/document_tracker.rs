@@ -207,7 +207,13 @@ pub(super) fn holds_request_text(
     request_map: Option<&PreparedMap>,
 ) -> bool {
     match presentation {
-        super::Presentation::Prepared(held) => request_map.is_some_and(|map| *map == *held),
+        // Alike in coordinates is enough: a reply computed on the held
+        // text reads the same through the request's map. (A revoked held
+        // map presents as unavailable; a revoked request map is refused
+        // before it gets here.)
+        super::Presentation::Prepared(held) => {
+            request_map.is_some_and(|map| PreparedMap::same_coordinates(Some(map), Some(&held)))
+        }
         // Unreachable with a map today (a request with one asks the rule
         // with its region prepared, which never answers as is), kept so the
         // answer does not rest on how the caller builds the region.
@@ -811,13 +817,19 @@ impl DocumentTracker {
                 .and_then(|docs| docs.get_mut(&uri_string))
                 .filter(|held| held.fingerprint == fp)
             {
-                let changed = held.map.as_deref() != content.map.map(Arc::as_ref);
+                // A map revoked since its text was admitted (across an
+                // await) is held through no path: the record stays.
+                if content.map.is_some_and(|map| map.revoked()) {
+                    return None;
+                }
+                // Another answer, however alike in coordinates (the same text
+                // prepared again after the first answer was revoked), is what
+                // a request built on it waits for.
+                let changed = !PreparedMap::same_answer(held.map.as_ref(), content.map);
                 if content.map.is_some() {
                     self.note_prepared(connection_key, virtual_uri, &uri_string);
                 }
                 self.rehold_locked(held, content.map.cloned());
-                // The same text under another map is what a request built
-                // on that map waits for.
                 if changed {
                     self.notify_held_changed();
                 }
@@ -839,7 +851,8 @@ impl DocumentTracker {
 
     /// Record `content` as what this connection holds, sent as `change`,
     /// then `queue` its send — taking the record back unless `queued` says
-    /// the send was queued. All under the lock what connections hold is read
+    /// the send was queued; `None`, nothing recorded or queued, for a map
+    /// revoked since. All under the lock what connections hold is read
     /// under, so no reader sees a record whose send then failed: a dropped
     /// send leaves the old fingerprint, and the next edit re-sends (#422).
     /// Recording first means a push the server answers the text with
@@ -852,12 +865,18 @@ impl DocumentTracker {
         change: ContentChange,
         queue: impl FnOnce() -> R,
         queued: impl FnOnce(&R) -> bool,
-    ) -> R {
+    ) -> Option<R> {
         let uri_string = virtual_uri.to_uri_string();
         let mut fingerprints = self
             .document_fingerprints
             .lock()
             .recover_poison("DocumentTracker::document_fingerprints");
+        // A map its peer revoked since the text was admitted — across an
+        // await of whichever path sends it (a lifecycle didChange, a save, a
+        // repair, a lazy open) — is neither recorded nor sent: `None`.
+        if content.map.is_some_and(|map| map.revoked()) {
+            return None;
+        }
         let previous = self.record_locked(
             &mut fingerprints,
             virtual_uri,
@@ -870,7 +889,7 @@ impl DocumentTracker {
         if !queued(&result) {
             take_back_locked(&mut fingerprints, uri_string, connection_key, previous);
         }
-        result
+        Some(result)
     }
 
     /// Hold the same text again, under `map`, under the records' lock. Its
@@ -1240,7 +1259,7 @@ impl DocumentTracker {
             version,
             fingerprint: content_fingerprint(content.text),
         };
-        self.record_and_queue(
+        let _ = self.record_and_queue(
             virtual_uri,
             connection_key,
             content,
@@ -2534,6 +2553,132 @@ mod tests {
             .map
     }
 
+    /// [`prepared_text`] sharing `revocation`, as the registry gives maps
+    /// answered for one input out.
+    fn revocable_text(
+        text: &str,
+        revocation: &Arc<crate::lsp::bridge::protocol::Revocation>,
+    ) -> Arc<PreparedMap> {
+        let mut map = prepared_text(text);
+        Arc::get_mut(&mut map)
+            .unwrap()
+            .set_revocation(Arc::clone(revocation));
+        map
+    }
+
+    /// The same text held again under another answer alike in coordinates
+    /// (prepared again after the first was revoked) wakes the requests
+    /// waiting on what the connection holds: one built on the new answer
+    /// waits for exactly that.
+    #[tokio::test]
+    async fn another_answer_alike_in_coordinates_wakes_waiting_requests() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let conn = ConnectionKey::for_server("lua");
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, &conn)
+            .await;
+        let revocation = Arc::default();
+        let first = revocable_text("a", &revocation);
+        tracker.record_sent_for_test(
+            &virtual_uri,
+            &conn,
+            SentText {
+                text: "a",
+                map: Some(&first),
+            },
+            1,
+        );
+        revocation.revoke(u64::MAX - 1);
+        let second = prepared_text("a");
+        assert!(PreparedMap::same_coordinates(Some(&first), Some(&second)));
+        let _waiting = tracker.wait_for_held_changes();
+        let changed = tracker.held_changed();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        assert_eq!(
+            tracker
+                .increment_version_if_content_changed(
+                    &virtual_uri,
+                    &conn,
+                    SentText {
+                        text: "a",
+                        map: Some(&second),
+                    },
+                )
+                .await
+                .map(ContentChange::version),
+            None
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), changed)
+            .await
+            .expect("woken");
+        let held = tracker
+            .held_text(&virtual_uri.to_uri_string(), &conn)
+            .unwrap();
+        assert!(Arc::ptr_eq(held.map.as_ref().unwrap(), &second));
+    }
+
+    /// A text from an answer revoked since it was admitted (across an
+    /// await) is neither recorded nor sent, however it is sent: what the
+    /// connection holds stays.
+    #[tokio::test]
+    async fn a_revoked_answer_is_neither_recorded_nor_sent() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let uri = virtual_uri.to_uri_string();
+        let conn = ConnectionKey::for_server("lua");
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, &conn)
+            .await;
+        tracker.record_sent_for_test(&virtual_uri, &conn, "a".into(), 1);
+        let before = tracker.held_text(&uri, &conn).unwrap();
+        let revocation = Arc::default();
+        let revoked = revocable_text("b", &revocation);
+        revocation.revoke(u64::MAX - 1);
+        let sent = std::cell::Cell::new(false);
+        assert_eq!(
+            tracker.record_and_queue(
+                &virtual_uri,
+                &conn,
+                SentText {
+                    text: "b",
+                    map: Some(&revoked),
+                },
+                ContentChange {
+                    version: 2,
+                    fingerprint: content_fingerprint("b"),
+                },
+                || sent.set(true),
+                |_| true,
+            ),
+            None
+        );
+        assert!(!sent.get());
+        let after = tracker.held_text(&uri, &conn).unwrap();
+        assert_eq!(after.generation, before.generation);
+        assert!(after.map.is_none());
+        // Nor is the same text held again under it.
+        let same = revocable_text("a", &revocation);
+        assert_eq!(
+            tracker
+                .increment_version_if_content_changed(
+                    &virtual_uri,
+                    &conn,
+                    SentText {
+                        text: "a",
+                        map: Some(&same),
+                    },
+                )
+                .await
+                .map(ContentChange::version),
+            None
+        );
+        assert!(tracker.held_text(&uri, &conn).unwrap().map.is_none());
+    }
+
     #[test]
     fn preparing_one_document_changes_nothing_for_another() {
         let tracker = DocumentTracker::new();
@@ -2740,7 +2885,7 @@ mod tests {
             },
             |queued| *queued,
         );
-        assert!(!seen);
+        assert_eq!(seen, Some(false));
         let after = tracker.held_text(&uri, &conn).unwrap();
         assert_eq!(after.fingerprint, before.fingerprint);
         assert_eq!(after.generation, before.generation);
@@ -2748,7 +2893,7 @@ mod tests {
 
         // A first send not queued leaves nothing on record.
         let other = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_1);
-        tracker.record_and_queue(
+        let _ = tracker.record_and_queue(
             &other,
             &conn,
             "c".into(),
