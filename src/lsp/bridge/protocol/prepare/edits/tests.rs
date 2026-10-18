@@ -3200,6 +3200,20 @@ mod formatting {
     }
 
     #[test]
+    fn a_line_written_beside_a_widened_blank_line_is_one_of_its_own() {
+        // `  w` inserted, the kept ` ` widened to two spaces: the blank
+        // lines pair, so `w` is a created line (content indent and its own
+        // two), not text written on the kept blank line.
+        let virtual_text = "  a\n \n  b\n";
+        let map = dedent_lines(virtual_text, &[2, 0, 2]);
+        let answer = [edit((0, 0), (3, 0), "a\n  w\n  \nb\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  a\n    w\n  \n  b\n")
+        );
+    }
+
+    #[test]
     fn lines_joined_keep_the_first_ones_indent() {
         // `0x` deleted and `1x` joined with `2x`: the joined line is `1x`.
         let virtual_text = "0if x:0\n    1if x:1\n    2if x:2\n";
