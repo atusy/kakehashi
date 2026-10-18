@@ -1276,62 +1276,54 @@ mod tests {
 
     #[test]
     fn additional_edits_must_map_alike_with_either_range() {
-        // `ab` dedented: with the insert range (empty at `b`) the additional
-        // edit after `b` is kept apart; with the replace range over `b` it
-        // touches it at no line start, between text — both map alike.
+        // `ab\n` dedented. An additional edit right after `b`: apart from the
+        // insert range (empty before `b`), and meeting the replace range over
+        // `b` mid-line between text — both map it alike.
         let offset = dedented_offset("  ab\n");
-        let mut completed = item(json!({
-            "label": "bc",
-            "textEdit": {
-                "insert": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 1}},
-                "replace": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 2}},
-                "newText": "bc"
-            },
-            "additionalTextEdits": [{
-                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
-                "newText": "z"
-            }]
-        }));
+        let completed = |additional: &str| {
+            item(json!({
+                "label": "bc",
+                "textEdit": {
+                    "insert": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 1}},
+                    "replace": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 2}},
+                    "newText": "bc"
+                },
+                "additionalTextEdits": [{
+                    "range": {"start": {"line": 0, "character": 2}, "end": {"line": 0, "character": 2}},
+                    "newText": additional
+                }]
+            }))
+        };
+        let mut kept = completed("z");
         assert!(transform_completion_item(
-            &mut completed,
+            &mut kept,
             &offset,
             Position::new(11, 0),
             Some(Position::new(10, 3)),
             ClientInsertMode::default(),
         ));
         assert_eq!(
-            completed.additional_text_edits,
+            kept.additional_text_edits,
             Some(vec![tower_lsp_server::ls_types::TextEdit {
                 range: tower_lsp_server::ls_types::Range::new(
-                    Position::new(10, 2),
-                    Position::new(10, 2)
+                    Position::new(10, 4),
+                    Position::new(10, 4)
                 ),
                 new_text: "z".to_string(),
             }])
         );
-        // An additional edit whose set is refused with one range only drops
-        // them: here it inserts a line break right where the insert range
-        // starts.
-        let mut completed = item(json!({
-            "label": "bc",
-            "textEdit": {
-                "insert": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 1}},
-                "replace": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 2}},
-                "newText": "bc"
-            },
-            "additionalTextEdits": [{
-                "range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 1}},
-                "newText": "\n"
-            }]
-        }));
+        // One opening with a line break still maps with the insert range,
+        // but meets the replace range with that break, where the set is
+        // refused: refused with one range, the additional edits are dropped.
+        let mut dropped = completed("\nq");
         assert!(transform_completion_item(
-            &mut completed,
+            &mut dropped,
             &offset,
             Position::new(11, 0),
             Some(Position::new(10, 3)),
             ClientInsertMode::default(),
         ));
-        assert_eq!(completed.additional_text_edits, None);
+        assert_eq!(dropped.additional_text_edits, None);
     }
 
     /// An envelope minted from a prepared document never resolves, even
