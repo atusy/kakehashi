@@ -3179,16 +3179,39 @@ mod formatting {
     }
 
     #[test]
-    fn a_kept_whitespace_line_pairs_with_itself_before_an_empty_line() {
-        // Two kept ` ` lines and an empty one; an empty line written
-        // between the two: each ` ` is the line it was, the empty lines
-        // alike among themselves.
+    fn blank_lines_pair_alike_first_then_as_many_as_can() {
+        // Two kept ` ` lines and an empty one, rewritten ` `, empty, ` `:
+        // each ` ` is the line it was, an empty line between them written
+        // anew, rather than every line rewritten in order.
         let virtual_text = "  a\n \n \n\n";
         let map = dedent_lines(virtual_text, &[2, 0, 0, 0]);
         let answer = [edit((0, 0), (4, 0), "a\n \n\n \n")];
         assert_eq!(
             formatted_either_way(&map, virtual_text, &answer).as_deref(),
             Some("  a\n \n\n \n")
+        );
+        // Of an empty line and a kept ` `, one going: the ` ` the answer
+        // keeps is the kept one, not the empty line written ` `.
+        let virtual_text = "  a\n\n \n";
+        let map = dedent_lines(virtual_text, &[2, 0, 0]);
+        let answer = [edit((0, 0), (3, 0), "a\n \n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  a\n \n")
+        );
+    }
+
+    #[test]
+    fn text_written_beside_blank_lines_is_a_line_of_its_own() {
+        // ` ` kept and `   ` dedented to ` `; the answer writes `w` above
+        // them and widens the last: the blank lines pair with the blank
+        // lines, and `w` is a created line, indented as the content.
+        let virtual_text = "  a\n \n   \n";
+        let map = dedent_lines(virtual_text, &[2, 0, 2]);
+        let answer = [edit((0, 0), (3, 0), "a\nw\n \n  \n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  a\n  w\n \n    \n")
         );
     }
 
