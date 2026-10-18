@@ -58,9 +58,10 @@ impl Kakehashi {
         // The final answer chosen: its edits checked once more against the
         // host text, which may have moved while it was held.
         let pool = self.bridge.pool();
+        let tracker = self.bridge.node_tracker();
         let response = response.map(|response| {
             response.and_then(|sourced| {
-                let current = sourced.still_current(pool);
+                let current = sourced.still_current(pool, tracker);
                 completion_still_current(sourced.value, current)
             })
         });
@@ -257,7 +258,9 @@ impl Kakehashi {
         if ask {
             requery.store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        Ok(response.map(|response| Sourced::from_region(&ctx.document, response)))
+        Ok(response.map(|response| {
+            Sourced::from_region(&ctx.document, response, self.bridge.node_tracker())
+        }))
     }
 }
 
