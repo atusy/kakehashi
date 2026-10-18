@@ -1284,6 +1284,7 @@ mod tests {
     #[case::tabstop("x$0", false)]
     #[case::placeholder("${1:x}", false)]
     #[case::escape("x\\$", false)]
+    #[case::escaped_brace("x\\}", false)]
     #[case::literal("x", true)]
     fn a_prepared_snippet_is_kept_only_as_literal_text(#[case] snippet: &str, #[case] kept: bool) {
         let offset = dedented_offset("  a\n");
@@ -1447,6 +1448,21 @@ mod tests {
                 "newText": "X"
             }
         }));
+        assert!(!transform_completion_item(
+            &mut completed,
+            &emptied_gap_offset(),
+            Position::new(11, 0),
+            Some(Position::new(10, 7)),
+            ClientInsertMode::default(),
+        ));
+    }
+
+    #[test]
+    fn an_implicit_item_whose_caret_edit_maps_off_the_caret_is_dropped() {
+        // The caret right after the emptied interpolation's host text: the
+        // label inserted there as an edit maps before that text, so the
+        // client inserting at the caret would insert other text than checked.
+        let mut completed = item(json!({"label": "q"}));
         assert!(!transform_completion_item(
             &mut completed,
             &emptied_gap_offset(),

@@ -2379,6 +2379,22 @@ fn lines_created_above_a_shallower_closing_indent_regain_the_contents() {
 }
 
 #[test]
+fn text_replacing_whole_lines_joins_the_next_as_that_line_is() {
+    // Before a line of text, what replaces the lines joins it, keeping its
+    // indent (none: `b` was left alone).
+    let virtual_text = "  a\nb\n";
+    let map = dedent_by_two(virtual_text);
+    let joined = map.map_one_with_extent(&edit((0, 0), (1, 0), "x")).unwrap();
+    assert_eq!(apply_to(virtual_text, &[joined]), "xb\n");
+    // Before a blank line, it is that line's content instead, indented as
+    // the replaced line was.
+    let virtual_text = "  a\n\n";
+    let map = dedent_by_two(virtual_text);
+    let joined = map.map_one_with_extent(&edit((0, 0), (1, 0), "x")).unwrap();
+    assert_eq!(apply_to(virtual_text, &[joined]), "  x\n");
+}
+
+#[test]
 fn only_spaces_and_tabs_are_blank() {
     // A line left alone holding an ideographic space is a line of text: what
     // is typed there joins it, regaining no indent.
