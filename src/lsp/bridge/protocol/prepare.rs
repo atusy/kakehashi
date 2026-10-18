@@ -1070,10 +1070,34 @@ fn fuses_a_line_break(prepared: &str, runs: &[Run], virtual_text: &str) -> bool 
             _ => false,
         })
         .collect();
+    // A gap rewritten otherwise still holds V's byte at an edge it kept: a
+    // LF its placeholder opens with where the gap's text did (the LF of a
+    // CRLF whose CR the content before took), or a CR it ends with where
+    // the gap's text did. One byte compared, not the gap.
+    let kept_edge = |run: &Run, offset: usize| {
+        let byte = prepared.as_bytes()[offset];
+        let virtual_bytes = virtual_text.as_bytes();
+        if offset == run.prepared.start && virtual_bytes.get(run.virtual_.start) == Some(&byte) {
+            Some(run.virtual_.start)
+        } else if offset + 1 == run.prepared.end
+            && run.virtual_.end > run.virtual_.start
+            && virtual_bytes[run.virtual_.end - 1] == byte
+        {
+            Some(run.virtual_.end - 1)
+        } else {
+            None
+        }
+    };
     let virtual_offset = |offset: usize| {
         run_of(offset).and_then(|index| {
             let run = &runs[index];
-            verbatim[index].then(|| run.virtual_.start + (offset - run.prepared.start))
+            if verbatim[index] {
+                Some(run.virtual_.start + (offset - run.prepared.start))
+            } else if matches!(run.kind, RunKind::Gap) {
+                kept_edge(run, offset)
+            } else {
+                None
+            }
         })
     };
     prepared.match_indices("\r\n").any(|(cr, _)| {
@@ -1170,9 +1194,11 @@ mod tests {
 
     /// The same split, as discovery itself makes it: combined Rust line
     /// comments with their children included take each comment's CR, and
-    /// leave the LF between them a gap. A `null` answer is accepted.
+    /// leave the LF between them a gap. A `null` answer is accepted, and so
+    /// is one keeping that LF at the head of the gap's placeholder: the
+    /// CRLF it ends is the virtual text's own.
     #[test]
-    fn a_null_answer_keeps_the_crlf_combined_comments_split() {
+    fn crlf_combined_comments_keep_their_split_line_break() {
         use crate::language::injection::InjectionResolver;
         let text = "// a\r\n// b\r\n";
         let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
@@ -1210,6 +1236,29 @@ mod tests {
         let layout = VirtualLayout::from_gaps(virtual_text, &injection.gaps);
         let prepared = apply_prepare_result(virtual_text, &layout, None).unwrap();
         assert_eq!(&prepared.text, virtual_text);
+        let mut placeholders = 0;
+        let segments: Vec<_> = layout
+            .segments()
+            .iter()
+            .map(|segment| match segment.kind {
+                SegmentKind::Content => serde_json::json!({"type": "content"}),
+                SegmentKind::Gap
+                    if virtual_text[segment.virtual_range.clone()].starts_with('\n') =>
+                {
+                    placeholders += 1;
+                    serde_json::json!({"type": "gap", "content": "\nplaceholder"})
+                }
+                SegmentKind::Gap => serde_json::json!({"type": "gap"}),
+            })
+            .collect();
+        assert!(placeholders > 0);
+        let answer = serde_json::from_value(serde_json::json!({ "segments": segments })).unwrap();
+        let prepared = apply_prepare_result(virtual_text, &layout, Some(answer)).unwrap();
+        assert!(
+            prepared.text.contains("\r\nplaceholder"),
+            "{:?}",
+            prepared.text
+        );
     }
 
     /// Checking a gap kept as is reads it once, not once per CRLF in it: a
