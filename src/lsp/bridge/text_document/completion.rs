@@ -502,6 +502,20 @@ impl EnvelopeOffset {
     }
 }
 
+impl EnvelopeOffset {
+    /// This offset as a fresh mint writes it, for an item re-enveloped after
+    /// a refused resolve, keeping the mark of an item minted from a prepared
+    /// document, which no `RegionOffset` carries without the map: dropped,
+    /// the item would describe the region again once its pair lost its peer.
+    /// An item minted as is gets exactly the bytes a fresh mint gives.
+    pub(crate) fn rewritten(&self) -> Self {
+        Self {
+            prepared: self.prepared,
+            ..Self::from(&RegionOffset::from(self))
+        }
+    }
+}
+
 impl From<&RegionOffset> for EnvelopeOffset {
     fn from(o: &RegionOffset) -> Self {
         Self {
