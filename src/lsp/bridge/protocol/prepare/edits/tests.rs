@@ -1513,17 +1513,41 @@ fn a_cr_an_edit_inserts_before_an_lf_both_documents_show_joins_alike() {
 
 #[test]
 fn an_empty_insertion_inserts_no_indent() {
-    let virtual_text = "  a\n\n";
+    // A whitespace-only line the peer kept, at the start of which a line
+    // starts in both documents with text after it.
+    let virtual_text = "  a\n \n";
     let map = prepare(
         virtual_text,
         json!([
             {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
         ]),
     );
-    for at in [(1, 0), (2, 0)] {
-        let mapped = map.map_one_with_extent(&edit(at, at, "")).unwrap();
-        assert_eq!(mapped.new_text, "", "{at:?}");
-    }
+    let mapped = map.map_one_with_extent(&edit((1, 0), (1, 0), "")).unwrap();
+    assert_eq!(mapped.new_text, "");
+    // Text there regains the indent.
+    let mapped = map.map_one_with_extent(&edit((1, 0), (1, 0), "x")).unwrap();
+    assert_eq!(mapped.new_text, "  x");
+}
+
+#[test]
+fn an_insertion_between_a_cr_and_a_gaps_lf_is_refused() {
+    // Content ending with a CR, then a gap whose masked text is the LF,
+    // emptied: an insertion after the CR maps before the gap, between the
+    // CR and the LF, where no LSP position is.
+    let prepared = prepare_pieces(
+        "\r\n",
+        [
+            (SegmentKind::Content, 0..1, String::new()),
+            (SegmentKind::Gap, 1..2, "```\n".to_string()),
+        ],
+        json!({"segments": [{"type": "content"}, {"type": "gap", "content": ""}]}),
+    );
+    assert_eq!(
+        prepared
+            .map
+            .map_one_with_extent(&edit((1, 0), (1, 0), "\n")),
+        None
+    );
 }
 
 #[test]
