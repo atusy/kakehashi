@@ -924,6 +924,79 @@ mod tests {
         );
     }
 
+    /// The server ranked first keeps its place though its reply came while
+    /// the host had moved (an edit to another fence, its pass not settled
+    /// yet) and the next one's came once it settled with the content
+    /// unchanged: whether the host moved is read once, where the answer is
+    /// chosen, not per reply, where an empty answer would hand the region
+    /// to the next.
+    #[tokio::test]
+    async fn the_server_ranked_first_wins_though_its_reply_came_before_the_host_settled() {
+        use super::super::super::protocol::{VirtualLayout, apply_prepare_result};
+        use crate::lsp::aggregation::server::priority::PriorityEntry;
+        use crate::lsp::aggregation::server::{FanInResult, TaggedResult, preferred};
+        let result = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            "  a\n  b\n",
+            &VirtualLayout::single("  a\n  b\n"),
+            Some(result),
+        )
+        .unwrap();
+        let offset = RegionOffset::new(0, 0).with_prepared(std::sync::Arc::clone(&prepared.map));
+        let pool = crate::lsp::bridge::LanguageServerPool::preparing();
+        let host = url::Url::parse("file:///test/two-fences.md").unwrap();
+        let host_lsp = crate::lsp::lsp_impl::url_to_uri(&host).unwrap();
+        let region = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        pool.open_host_incarnation(&host, 1).await;
+        pool.record_latest_prepared_for_test(&host, 1, "css", region, &prepared);
+        let reply = |label: &str| {
+            let ctx = pool.response_context_for_test(&host_lsp, (&host, "css", region), &offset);
+            color_presentation_response_to_host(
+                json!({"jsonrpc": "2.0", "id": 1, "result": [{"label": label, "textEdit": {
+                    "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 1}},
+                    "newText": label
+                }}]}),
+                &ctx,
+                Position::new(2, 0),
+                Range::new(Position::new(1, 2), Position::new(1, 3)),
+            )
+        };
+        // Another fence edited, its pass not settled: the top server replies.
+        pool.note_host_edited(&host, 1, 1);
+        let top = reply("top");
+        // Settled, this region's text unchanged: the next server replies.
+        pool.note_host_settled(&host, 1, 1);
+        let next = reply("next");
+        assert!(!next.is_empty());
+        let mut tasks = tokio::task::JoinSet::new();
+        for (server_name, value) in [("next", next), ("top", top)] {
+            tasks.spawn(async move {
+                TaggedResult {
+                    server_name: server_name.to_string(),
+                    value: Ok(value),
+                }
+            });
+        }
+        let result = preferred(
+            &mut tasks,
+            |presentations: &Vec<ColorPresentation>| !presentations.is_empty(),
+            &[
+                PriorityEntry::Server("top".to_string()),
+                PriorityEntry::Server("next".to_string()),
+            ],
+            None,
+        )
+        .await;
+        let FanInResult::Done(presentations) = result else {
+            panic!("an answer");
+        };
+        assert_eq!(presentations[0].label, "top");
+    }
+
     /// `  a\n  b\n`, dedented by two.
     fn dedented_offset() -> RegionOffset {
         use super::super::super::protocol::{VirtualLayout, apply_prepare_result};
