@@ -1034,6 +1034,59 @@ languages = ["lua"]
 }
 
 #[test]
+fn e2e_format_without_experimental_features_formats_as_unprepared() {
+    // A prepare peer configured, experimental features off: the region is
+    // formatted as on main, the formatter's text as it wrote it (the line
+    // it breaks off regains no indent).
+    let markdown = "# Test\n\n```lua\n  local x = 1; local y = 2\n```\n";
+    let ws = workspace_with(&[("doc.md", markdown)]);
+    std::fs::write(
+        ws.path().join("kakehashi.toml"),
+        format!(
+            r#"autoInstall = false
+
+[languages.markdown.bridge.lua.aggregation."kakehashi/virtualDocument/prepare"]
+priorities = ["peer"]
+
+[languages.markdown.bridge.lua.aggregation._]
+priorities = ["mock-echo"]
+
+[languageServers.peer]
+cmd = ['{bin}', 'prepare-peer']
+languages = ["lua"]
+
+[languageServers.mock-echo]
+cmd = ['{bin}', 'echo-document']
+languages = ["lua"]
+"#,
+            bin = env!("CARGO_BIN_EXE_mock-lsp-formatter")
+        ),
+    )
+    .expect("write prepare config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .arg("format")
+        .arg("--config-file")
+        .arg("kakehashi.toml")
+        .arg("doc.md")
+        .current_dir(ws.path())
+        .env("KAKEHASHI_DATA_DIR", data_dir())
+        .env_remove("KAKEHASHI_EXPERIMENTAL")
+        .output()
+        .expect("spawn kakehashi format");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "flag-off formatting must exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        read(ws.path(), "doc.md"),
+        "# Test\n\n```lua\n  LOCAL X = 1\nLOCAL Y = 2\n```\n"
+    );
+}
+
+#[test]
 fn e2e_format_preferred_non_winning_failure_is_not_counted() {
     // Preferred fan-out (the bridge-level default for formatting): the
     // higher-priority server errors, the fallback formats and WINS. Under
