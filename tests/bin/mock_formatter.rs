@@ -3056,7 +3056,10 @@ fn append_wire_log(method: &str, message: &Value) {
     else {
         return;
     };
-    let _ = writeln!(file, "{method}\t{uri}");
+    // One write of the whole line: every mock process appends to the same
+    // log, and a line written in pieces could interleave with another's.
+    // An append-mode write of a line this short lands whole.
+    let _ = file.write_all(format!("{method}\t{uri}\n").as_bytes());
 }
 
 /// True exactly once per test run, across process incarnations: the first
