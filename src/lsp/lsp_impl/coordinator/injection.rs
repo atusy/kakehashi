@@ -491,12 +491,18 @@ impl InjectionCoordinator {
             .prepare_target(host_language, &injection.language)
         else {
             // Sent as is: whatever was prepared for it no longer describes it
-            // (every candidate stopped advertising, say).
-            self.bridge.forget_prepared_region(
-                uri,
-                Some(&injection.language),
-                &injection.region_id,
-            );
+            // (every candidate stopped advertising, say). Forgotten by the
+            // holder alone: a probe off the edit lock may have found no target
+            // before a peer was enabled and the lifecycle pass looked the
+            // region up under it, and would delete that newer lookup, leaving
+            // the document held with nothing to answer it.
+            if holder == PrepareHolder::LifecyclePass {
+                self.bridge.forget_prepared_region(
+                    uri,
+                    Some(&injection.language),
+                    &injection.region_id,
+                );
+            }
             return injection;
         };
         let input = crate::lsp::bridge::PrepareInput {
@@ -2793,6 +2799,103 @@ mod tests {
             received.try_recv().is_err(),
             "reconciliation must synchronize already-opened content too"
         );
+    }
+
+    /// A probe that finds no prepare target leaves the region's lookups be:
+    /// off the edit lock, it may have found none before a peer was enabled
+    /// and the lifecycle pass looked the region up under it. The lifecycle
+    /// pass forgets them.
+    #[tokio::test]
+    async fn a_probe_without_a_target_forgets_nothing() {
+        use std::sync::Arc;
+        let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
+        let (service, _socket) = tower_lsp_server::LspService::new(|client| {
+            crate::lsp::lsp_impl::Kakehashi::with_cancel_forwarder(
+                client,
+                Arc::clone(&pool),
+                crate::lsp::CancelForwarder::new(Arc::clone(&pool)),
+            )
+        });
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), language.clone());
+        server.language.query_store().insert_injection_query(
+            "rust".into(),
+            Arc::new(
+                tree_sitter::Query::new(
+                    &language,
+                    r#"((string_literal) @injection.content (#set! injection.language "rust"))"#,
+                )
+                .unwrap(),
+            ),
+        );
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let uri = url::Url::parse("file:///hinted.rs").unwrap();
+        let text = r#"fn main() { let x = "a"; }"#;
+        server.documents.insert(
+            uri.clone(),
+            text.into(),
+            Some("rust".into()),
+            parser.parse(text, None),
+        );
+        let region = server
+            .injection_coordinator()
+            .resolve_injection_data(&uri, "rust")
+            .unwrap()
+            .remove(0);
+        // Looked up by the lifecycle pass under a peer since enabled, say.
+        let target = crate::lsp::bridge::PrepareTarget {
+            candidates: vec![crate::lsp::bridge::ResolvedServerConfig {
+                server_name: "peer".to_string(),
+                config: Arc::new(crate::config::settings::BridgeServerConfig {
+                    cmd: Some(vec!["/nonexistent/kakehashi-prepare-peer".to_string()]),
+                    ..Default::default()
+                }),
+            }]
+            .into(),
+            epoch: pool.prepare_epoch(),
+        };
+        let answer =
+            serde_json::from_value(serde_json::json!({"segments": [{"type": "content"}]})).unwrap();
+        server.bridge.answer_prepare_for_test(
+            &target,
+            crate::lsp::bridge::PrepareInput {
+                host_uri: &uri,
+                host_language: "rust",
+                injection_language: "rust",
+                region_id: &region.region_id,
+                virtual_text: &region.content,
+                gaps: &[],
+            },
+            crate::lsp::bridge::PrepareAnswer::Prepared(Arc::new(
+                crate::lsp::bridge::apply_prepare_result(
+                    &region.content,
+                    &crate::lsp::bridge::VirtualLayout::single(&region.content),
+                    Some(answer),
+                )
+                .unwrap(),
+            )),
+            true,
+        );
+        let prepared = || {
+            server
+                .bridge
+                .prepare_region(&uri, "rust", &region.region_id)
+                .prepared
+        };
+        assert!(prepared());
+        let injection = server.injection_coordinator();
+        // The probe, with the target it found missing.
+        injection.resolve_injection_data(&uri, "rust").unwrap();
+        assert!(prepared(), "a probe forgets nothing");
+        injection
+            .resolve_injection_data_as(&uri, "rust", super::PrepareHolder::LifecyclePass)
+            .unwrap();
+        assert!(!prepared(), "the lifecycle pass forgets it");
     }
 
     /// A reopen looks its regions' answers up off the edit lock and opens
