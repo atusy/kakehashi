@@ -27,6 +27,7 @@ use super::super::protocol::{
     EditMode, JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
     build_position_based_request, host_position_in_removed_indent, response_has_jsonrpc_error,
     text_edit_safe_in_region, translate_virtual_main_and_additional_edits_to_host,
+    translate_virtual_text_edits_to_host,
 };
 use tower_lsp_server::ls_types::TextDocumentPositionParams;
 
@@ -80,7 +81,12 @@ impl LanguageServerPool {
         // does: a dynamic `resolveProvider` registration can land between
         // send and reply, and the envelope decision should see it.
         let origin = std::sync::Arc::clone(&handle);
-        let insert_mode = ClientInsertMode::from_capabilities(self.client_capabilities_ref());
+        // Read only for a prepared document, the only one it bears on.
+        let insert_mode = if offset.prepared().is_some() {
+            ClientInsertMode::from_capabilities(self.client_capabilities_ref())
+        } else {
+            ClientInsertMode::default()
+        };
         self.execute_position_bridge_request_with_handle(
             handle,
             host_uri,
@@ -325,8 +331,10 @@ pub(super) fn transform_completion_item(
     // Transform text_edit if present, and the additional edits with it (on a
     // prepared document, as the one set the client applies, through each
     // range it may apply the primary with).
-    let additional = item.additional_text_edits.as_mut();
-    let additional_kept = match &mut item.text_edit {
+    // An unprepared document's additional edits are translated only once
+    // the primary is accepted, below, as on main: no work for a dropped item.
+    let additional = item.additional_text_edits.as_mut().filter(|_| prepared);
+    let mut additional_kept = match &mut item.text_edit {
         None => translate_virtual_main_and_additional_edits_to_host(
             &mut [],
             additional,
@@ -448,11 +456,8 @@ pub(super) fn transform_completion_item(
                 range: tower_lsp_server::ls_types::Range::new(at, at),
                 new_text: effective.to_string(),
             }];
-            if !super::super::protocol::translate_virtual_text_edits_to_host(
-                &mut probe,
-                offset,
-                EditMode::Extent,
-            ) || probe[0].range != tower_lsp_server::ls_types::Range::new(caret, caret)
+            if !translate_virtual_text_edits_to_host(&mut probe, offset, EditMode::Extent)
+                || probe[0].range != tower_lsp_server::ls_types::Range::new(caret, caret)
             {
                 return false;
             }
@@ -477,6 +482,10 @@ pub(super) fn transform_completion_item(
     // over fidelity, never corruption. On a prepared document an item
     // without a textEdit has no primary to check them with (the client
     // inserts at the caret, over a range it picks): they are dropped.
+    if !prepared && let Some(additional_edits) = item.additional_text_edits.as_mut() {
+        additional_kept =
+            translate_virtual_text_edits_to_host(additional_edits, offset, EditMode::Extent);
+    }
     if let Some(ref additional_edits) = item.additional_text_edits
         && (!additional_kept
             || !additional_edits
