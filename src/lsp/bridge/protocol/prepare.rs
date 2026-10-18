@@ -437,6 +437,7 @@ fn build_prepared(
                     "",
                 );
                 indents.push(SegmentIndent::from_deletions(
+                    virtual_text,
                     segment.virtual_range.clone(),
                     &deleted,
                 ));
@@ -458,6 +459,14 @@ fn build_prepared(
 
     if check_line_breaks && fuses_a_line_break(&text, &runs, virtual_text) {
         return Err(PrepareError::FusedLineBreak);
+    }
+    // A segment that says nothing of its indentation (no indent removed, no
+    // line of text starting in it: the rest of a line after an
+    // interpolation, blank lines) is indented as the content before it.
+    for index in 1..indents.len() {
+        if !indents[index].evidence {
+            indents[index].uniform = indents[index - 1].uniform.clone();
+        }
     }
 
     // Even an answer that changed nothing yields a map: the map is how every
@@ -715,10 +724,22 @@ struct SegmentIndent {
     /// text (a dedent); `None` when they differ, so a new line has no single
     /// right indentation.
     uniform: Option<String>,
+    /// Whether the segment says anything of its indentation: an indent
+    /// removed, or a line of text starting in it that kept its own.
+    evidence: bool,
 }
 
 impl SegmentIndent {
-    fn from_deletions(virtual_range: Range<usize>, deleted: &[&str]) -> Self {
+    fn from_deletions(virtual_text: &str, virtual_range: Range<usize>, deleted: &[&str]) -> Self {
+        let evidence = !deleted.is_empty()
+            || virtual_range.clone().any(|at| {
+                is_line_start(virtual_text, at)
+                    && !splits_crlf(virtual_text, at)
+                    && virtual_text[at..virtual_range.end]
+                        .split(['\n', '\r'])
+                        .next()
+                        .is_some_and(|line| !line.trim().is_empty())
+            });
         let uniform = match deleted.split_first() {
             None => Some(String::new()),
             Some((first, rest)) => rest
@@ -729,6 +750,7 @@ impl SegmentIndent {
         Self {
             virtual_range,
             uniform,
+            evidence,
         }
     }
 }
