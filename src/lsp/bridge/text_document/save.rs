@@ -22,12 +22,19 @@ use super::super::pool::{
 use super::super::protocol::{JsonRpcNotification, VirtualDocumentUri};
 
 /// Enqueue a didSave unless the didChange it follows (`None`: none needed)
-/// was not queued: refused, its text revoked (`Some(None)`), or dropped.
+/// was not queued — refused, its text revoked (`Some(None)`), or dropped —
+/// or the text the save was admitted with is `revoked` since: unchanged
+/// since the last sync, so no didChange tells, but the save (and the text
+/// it may carry) is of an answer the peer no longer gives.
 fn enqueue_did_save_if_content_synced(
     did_change: Option<Option<NotificationSendResult>>,
+    revoked: bool,
     enqueue_did_save: impl FnOnce() -> NotificationSendResult,
 ) -> Option<NotificationSendResult> {
-    if did_change.is_some_and(|outcome| !matches!(outcome, Some(NotificationSendResult::Queued))) {
+    if revoked
+        || did_change
+            .is_some_and(|outcome| !matches!(outcome, Some(NotificationSendResult::Queued)))
+    {
         return None;
     }
     Some(enqueue_did_save())
@@ -134,7 +141,9 @@ impl LanguageServerPool {
                     serde_json::json!({ "textDocument": { "uri": virtual_uri } })
                 };
                 let notification = JsonRpcNotification::new("textDocument/didSave", params);
-                let _ = enqueue_did_save_if_content_synced(did_change, || {
+                // Read after every await, with none before the enqueue.
+                let revoked = content.map.is_some_and(|map| map.revoked());
+                let _ = enqueue_did_save_if_content_synced(did_change, revoked, || {
                     handle.send_notification(notification)
                 });
                 drop(transition_guard);
@@ -221,6 +230,7 @@ mod tests {
         let did_save_enqueued = Cell::new(false);
         let result = enqueue_did_save_if_content_synced(
             Some(Some(NotificationSendResult::QueueFull)),
+            false,
             || {
                 did_save_enqueued.set(true);
                 NotificationSendResult::Queued
@@ -232,6 +242,22 @@ mod tests {
             !did_save_enqueued.get(),
             "didSave must not be attempted after its prerequisite didChange was dropped"
         );
+    }
+
+    /// A save whose text was revoked since it was admitted, unchanged since
+    /// the last sync (no didChange needed, none to refuse), sends no didSave:
+    /// it would follow, and may carry, an answer the peer no longer gives.
+    #[test]
+    fn a_revoked_text_suppresses_did_save_though_unchanged() {
+        let did_save_enqueued = Cell::new(false);
+        let enqueue = || {
+            did_save_enqueued.set(true);
+            NotificationSendResult::Queued
+        };
+        assert!(enqueue_did_save_if_content_synced(None, true, enqueue).is_none());
+        assert!(!did_save_enqueued.get());
+        assert!(enqueue_did_save_if_content_synced(None, false, enqueue).is_some());
+        assert!(did_save_enqueued.get());
     }
 
     #[tokio::test]
