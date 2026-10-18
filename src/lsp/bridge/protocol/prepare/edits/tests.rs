@@ -3210,16 +3210,16 @@ mod formatting {
     }
 
     #[test]
-    fn blank_lines_pair_alike_first_then_as_many_as_can() {
+    fn blank_lines_pair_as_many_as_can_then_alike_first() {
         // Two kept ` ` lines and an empty one, rewritten ` `, empty, ` `:
-        // each ` ` is the line it was, an empty line between them written
-        // anew, rather than every line rewritten in order.
+        // all three pair in order (as many as can), the empty line written
+        // ` ` taking the content's indent as text written on an empty line.
         let virtual_text = "  a\n \n \n\n";
         let map = dedent_lines(virtual_text, &[2, 0, 0, 0]);
         let answer = [edit((0, 0), (4, 0), "a\n \n\n \n")];
         assert_eq!(
             formatted_either_way(&map, virtual_text, &answer).as_deref(),
-            Some("  a\n \n\n \n")
+            Some("  a\n \n\n   \n")
         );
         // Of an empty line and a kept ` `, one going: the ` ` the answer
         // keeps is the kept one, not the empty line written ` `.
@@ -3229,6 +3229,20 @@ mod formatting {
         assert_eq!(
             formatted_either_way(&map, virtual_text, &answer).as_deref(),
             Some("  a\n \n")
+        );
+    }
+
+    #[test]
+    fn text_written_beside_a_kept_whitespace_line_is_a_line_of_its_own() {
+        // `  ` and ` ` kept; the answer writes `w` above ` ` and empties
+        // the other: both blank lines pair, `w` is a created line,
+        // indented as the content, not text written on the kept `  `.
+        let virtual_text = "  a\n  \n \n  b\n";
+        let map = dedent_lines(virtual_text, &[2, 0, 0, 2]);
+        let answer = [edit((0, 0), (4, 0), "a\nw\n \n\nb\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  a\n  w\n \n\n  b\n")
         );
     }
 
@@ -3770,6 +3784,10 @@ mod formatting_reference {
                 || (removed_before && (rewrites_blank || creates_beside_blank))
                 || removed.is_some_and(|at| is_blank(at) && other_blank(at))
                 || (rewrites_blank && other_blank(index))
+                // A blank line created among blank lines: which one is new
+                // is not to be told either.
+                || (matches!(rewrite, Rewrite::BlankAfter)
+                    && (0..lines.len()).any(is_blank))
             {
                 rewrite = Rewrite::Keep;
             }
