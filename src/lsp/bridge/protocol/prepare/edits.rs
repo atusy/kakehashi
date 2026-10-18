@@ -122,8 +122,10 @@ impl PreparedMap {
         if Instant::now() >= deadline {
             return None;
         }
-        // Stretches the diff keeps apart are apart by unchanged text: none
-        // touches another, so each maps on its own as an edit does.
+        // Each stretch maps on its own as an edit does: stretches touch only
+        // where one writes over the start of a line another ends at (see
+        // `diff_hunks`), each then on its own line; one taking a removed
+        // indent the other also claims is refused as an overlap once mapped.
         let mapped = hunks
             .into_iter()
             .map(|hunk| {
@@ -835,76 +837,284 @@ struct Hunk {
     new: Range<usize>,
 }
 
-/// The stretches `new` differs from `old` in, by a character diff given
-/// until `deadline`; past it the diff gives coarser stretches, which still
-/// turn `old` into `new` (see `FORMATTING_DIFF_BUDGET`).
-/// A stretch never starts or ends between a CR and its LF in either text
-/// (no LSP position names that place): it widens over the unchanged
-/// character beside it. Stretches left touching merge.
+/// The stretches `new` differs from `old` in, until `deadline`. Lines are
+/// paired first (see [`align_lines`]): a line of text with the line it was
+/// rewritten from, blank lines among themselves, lines joined onto another
+/// with that one. Each pair, and each run of lines left between pairs, is
+/// then diffed by character. So a stretch never covers a line both texts
+/// hold alike, nor does a character diff align text of one line with text
+/// of another; either would map that text as written on the wrong line,
+/// with that line's indent. Past the deadline the diffs give coarser
+/// stretches, which still turn `old` into `new` (see
+/// `FORMATTING_DIFF_BUDGET`). A stretch never starts or ends between a CR
+/// and its LF in either text (no LSP position names that place): it widens
+/// over the unchanged character beside it. Stretches left touching merge,
+/// but for one writing text from the start of a line.
 fn diff_hunks(old: &str, new: &str, deadline: Instant) -> Vec<Hunk> {
-    let old_chars: Vec<(usize, char)> = old.char_indices().collect();
-    let new_chars: Vec<(usize, char)> = new.char_indices().collect();
-    let old_values: Vec<char> = old_chars.iter().map(|&(_, c)| c).collect();
-    let new_values: Vec<char> = new_chars.iter().map(|&(_, c)| c).collect();
-    let byte_at = |chars: &[(usize, char)], text: &str, index: usize| {
-        chars.get(index).map_or(text.len(), |&(byte, _)| byte)
+    let old_lines = lines_with_breaks(old);
+    let new_lines = lines_with_breaks(new);
+    let line_start = |lines: &[(usize, &str)], text: &str, index: usize| {
+        lines.get(index).map_or(text.len(), |&(start, _)| start)
     };
-    let ops = similar::capture_diff_slices_deadline(
-        similar::Algorithm::Myers,
-        &old_values,
-        &new_values,
-        Some(deadline),
+    let line_keys = |lines: &[(usize, &str)]| -> [Vec<String>; 2] {
+        let content = |line: &str| line.trim_end_matches(['\r', '\n']).to_string();
+        [
+            lines.iter().map(|&(_, line)| content(line)).collect(),
+            lines
+                .iter()
+                .map(|&(_, line)| content(line).trim_matches([' ', '\t']).to_string())
+                .collect(),
+        ]
+    };
+    let (old_keys, new_keys) = (line_keys(&old_lines), line_keys(&new_lines));
+    let mut aligned = Vec::new();
+    align_lines(
+        &old_keys,
+        &new_keys,
+        0,
+        0..old_lines.len(),
+        0..new_lines.len(),
+        deadline,
+        &mut aligned,
     );
+    let block = |lines: &[(usize, &str)], text: &str, range: Range<usize>| {
+        line_start(lines, text, range.start)..line_start(lines, text, range.end)
+    };
+    let blocks = aligned.into_iter().filter_map(|(old_range, new_range)| {
+        // A pair alike to the byte, or nothing on either side, is no change.
+        let same = old_range.len() == 1
+            && new_range.len() == 1
+            && old_lines[old_range.start].1 == new_lines[new_range.start].1;
+        (!same && !(old_range.is_empty() && new_range.is_empty())).then(|| {
+            (
+                block(&old_lines, old, old_range),
+                block(&new_lines, new, new_range),
+            )
+        })
+    });
     let mut hunks: Vec<Hunk> = Vec::new();
-    for op in ops {
-        let (old_range, new_range) = match op {
-            similar::DiffOp::Equal { .. } => continue,
-            similar::DiffOp::Delete {
-                old_index,
-                old_len,
-                new_index,
-            } => (old_index..old_index + old_len, new_index..new_index),
-            similar::DiffOp::Insert {
-                old_index,
-                new_index,
-                new_len,
-            } => (old_index..old_index, new_index..new_index + new_len),
-            similar::DiffOp::Replace {
-                old_index,
-                old_len,
-                new_index,
-                new_len,
-            } => (
-                old_index..old_index + old_len,
-                new_index..new_index + new_len,
-            ),
+    for (old_block, new_block) in blocks {
+        let old_chars: Vec<(usize, char)> = old[old_block.clone()]
+            .char_indices()
+            .map(|(at, c)| (old_block.start + at, c))
+            .collect();
+        let new_chars: Vec<(usize, char)> = new[new_block.clone()]
+            .char_indices()
+            .map(|(at, c)| (new_block.start + at, c))
+            .collect();
+        let byte_at = |chars: &[(usize, char)], end: usize, index: usize| {
+            chars.get(index).map_or(end, |&(byte, _)| byte)
         };
-        let mut old_bytes =
-            byte_at(&old_chars, old, old_range.start)..byte_at(&old_chars, old, old_range.end);
-        let mut new_bytes =
-            byte_at(&new_chars, new, new_range.start)..byte_at(&new_chars, new, new_range.end);
-        // The character widened over is unchanged, the same in both texts:
-        // a CR before the start, an LF after the end.
-        if splits_crlf(old, old_bytes.start) || splits_crlf(new, new_bytes.start) {
-            old_bytes.start -= 1;
-            new_bytes.start -= 1;
-        }
-        if splits_crlf(old, old_bytes.end) || splits_crlf(new, new_bytes.end) {
-            old_bytes.end += 1;
-            new_bytes.end += 1;
-        }
-        match hunks.last_mut() {
-            Some(last) if last.old.end >= old_bytes.start || last.new.end >= new_bytes.start => {
-                last.old.end = old_bytes.end;
-                last.new.end = new_bytes.end;
+        let old_values: Vec<char> = old_chars.iter().map(|&(_, c)| c).collect();
+        let new_values: Vec<char> = new_chars.iter().map(|&(_, c)| c).collect();
+        for op in similar::capture_diff_slices_deadline(
+            similar::Algorithm::Myers,
+            &old_values,
+            &new_values,
+            Some(deadline),
+        ) {
+            if matches!(op, similar::DiffOp::Equal { .. }) {
+                continue;
             }
-            _ => hunks.push(Hunk {
-                old: old_bytes,
-                new: new_bytes,
-            }),
+            let (old_range, new_range) = (op.old_range(), op.new_range());
+            let mut old_bytes = byte_at(&old_chars, old_block.end, old_range.start)
+                ..byte_at(&old_chars, old_block.end, old_range.end);
+            let mut new_bytes = byte_at(&new_chars, new_block.end, new_range.start)
+                ..byte_at(&new_chars, new_block.end, new_range.end);
+            // The character widened over is unchanged, the same in both
+            // texts: a CR before the start, an LF after the end.
+            if splits_crlf(old, old_bytes.start) || splits_crlf(new, new_bytes.start) {
+                old_bytes.start -= 1;
+                new_bytes.start -= 1;
+            }
+            if splits_crlf(old, old_bytes.end) || splits_crlf(new, new_bytes.end) {
+                old_bytes.end += 1;
+                new_bytes.end += 1;
+            }
+            // Touching stretches merge (mapped apart, each would read the
+            // other's place as P's), but for one writing text over the start
+            // of a line a stretch before it ends at: merged, that text would
+            // map as a line the stretch writes anew, with the content's
+            // indent rather than its own line's.
+            let writes_from_line_start = !new_bytes.is_empty()
+                && !old_bytes.is_empty()
+                && is_line_start(old, old_bytes.start);
+            match hunks.last_mut() {
+                Some(last)
+                    if last.old.end > old_bytes.start
+                        || last.new.end > new_bytes.start
+                        || ((last.old.end == old_bytes.start
+                            || last.new.end == new_bytes.start)
+                            && !writes_from_line_start) =>
+                {
+                    last.old.end = old_bytes.end;
+                    last.new.end = new_bytes.end;
+                }
+                _ => hunks.push(Hunk {
+                    old: old_bytes,
+                    new: new_bytes,
+                }),
+            }
         }
     }
     hunks
+}
+
+/// One way [`align_lines`] pairs lines.
+#[derive(Clone, Copy)]
+enum Alignment {
+    /// Lines whose keys (0: the text without its break; 1: that trimmed of
+    /// whitespace) a diff finds alike, among the lines whose key passes.
+    Diff(usize, similar::Algorithm, fn(&str) -> bool),
+    /// A line written as an old line's text with more after it: that line,
+    /// lines joined onto it (see [`joined_lines`]).
+    Joined,
+}
+
+/// How [`align_lines`] pairs lines, from the surest to the loosest:
+///
+/// - Lines of text alike but for the whitespace around it, a line found
+///   once in each text anchoring the rest (patience): a reindented line is
+///   the line it was, and no blank line draws text away from it.
+/// - Lines of text other lines were joined onto.
+/// - Lines holding whitespace alike but for their line break (patience
+///   again: such a line unlike the others is that line), before empty
+///   lines, which are all alike, can draw it away.
+/// - Lines alike but for whitespace: blank lines given other whitespace.
+const ALIGNMENTS: [Alignment; 4] = [
+    Alignment::Diff(1, similar::Algorithm::Patience, |key| !key.is_empty()),
+    Alignment::Joined,
+    Alignment::Diff(0, similar::Algorithm::Patience, |key| !key.is_empty()),
+    Alignment::Diff(1, similar::Algorithm::Myers, |_| true),
+];
+
+/// Pairs of an old line and the new line written as its text with more
+/// after it, in order: the first such old line for each new line, past the
+/// one paired before.
+fn joined_lines(
+    old_keys: &[Vec<String>; 2],
+    new_keys: &[Vec<String>; 2],
+    old_range: &Range<usize>,
+    new_range: &Range<usize>,
+) -> Vec<(usize, usize)> {
+    let mut pairs = Vec::new();
+    let mut old_from = old_range.start;
+    for new_line in new_range.clone() {
+        let written = &new_keys[1][new_line];
+        if let Some(old_line) = (old_from..old_range.end).find(|&old_line| {
+            let text = &old_keys[1][old_line];
+            !text.is_empty() && written.starts_with(text.as_str())
+        }) {
+            pairs.push((old_line, new_line));
+            old_from = old_line + 1;
+        }
+    }
+    pairs
+}
+
+/// Pair the lines of `old_range` with those of `new_range` at
+/// `ALIGNMENTS[level]`, and each looser one between the pairs it finds:
+/// `aligned` is given in order every pair (one line each) and every run
+/// left between pairs (to diff by character). `keys` are each line's text
+/// without its break, then trimmed of whitespace. A line joined onto
+/// another is left to a run, deleted whole: the text it gave is written on
+/// the line it joined.
+fn align_lines(
+    old_keys: &[Vec<String>; 2],
+    new_keys: &[Vec<String>; 2],
+    level: usize,
+    old_range: Range<usize>,
+    new_range: Range<usize>,
+    deadline: Instant,
+    aligned: &mut Vec<(Range<usize>, Range<usize>)>,
+) {
+    if old_range.is_empty() || new_range.is_empty() {
+        aligned.push((old_range, new_range));
+        return;
+    }
+    let Some(&alignment) = ALIGNMENTS.get(level) else {
+        aligned.push((old_range, new_range));
+        return;
+    };
+    let pairs: Vec<(usize, usize)> = match alignment {
+        Alignment::Joined => joined_lines(old_keys, new_keys, &old_range, &new_range),
+        Alignment::Diff(keys, algorithm, takes_part) => {
+            let candidates = |all: &[String], range: &Range<usize>| -> Vec<usize> {
+                range
+                    .clone()
+                    .filter(|&index| takes_part(&all[index]))
+                    .collect()
+            };
+            let old_candidates = candidates(&old_keys[keys], &old_range);
+            let new_candidates = candidates(&new_keys[keys], &new_range);
+            similar::capture_diff_slices_deadline(
+                algorithm,
+                &old_candidates
+                    .iter()
+                    .map(|&index| &old_keys[keys][index])
+                    .collect::<Vec<_>>(),
+                &new_candidates
+                    .iter()
+                    .map(|&index| &new_keys[keys][index])
+                    .collect::<Vec<_>>(),
+                Some(deadline),
+            )
+            .into_iter()
+            .filter(|op| matches!(op, similar::DiffOp::Equal { .. }))
+            .flat_map(|op| op.old_range().zip(op.new_range()))
+            .map(|(old_at, new_at)| (old_candidates[old_at], new_candidates[new_at]))
+            .collect()
+        }
+    };
+    let (mut old_at, mut new_at) = (old_range.start, new_range.start);
+    for (old_line, new_line) in pairs {
+        align_lines(
+            old_keys,
+            new_keys,
+            level + 1,
+            old_at..old_line,
+            new_at..new_line,
+            deadline,
+            aligned,
+        );
+        aligned.push((old_line..old_line + 1, new_line..new_line + 1));
+        (old_at, new_at) = (old_line + 1, new_line + 1);
+    }
+    align_lines(
+        old_keys,
+        new_keys,
+        level + 1,
+        old_at..old_range.end,
+        new_at..new_range.end,
+        deadline,
+        aligned,
+    );
+}
+
+/// `text`'s lines, each with its line break (LF, CRLF or a lone CR), and
+/// the byte offset each starts at.
+fn lines_with_breaks(text: &str) -> Vec<(usize, &str)> {
+    let bytes = text.as_bytes();
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let mut at = 0;
+    while at < bytes.len() {
+        let end = match bytes[at] {
+            b'\r' if bytes.get(at + 1) == Some(&b'\n') => at + 2,
+            b'\r' | b'\n' => at + 1,
+            _ => {
+                at += 1;
+                continue;
+            }
+        };
+        lines.push((start, &text[start..end]));
+        start = end;
+        at = end;
+    }
+    if start < text.len() {
+        lines.push((start, &text[start..]));
+    }
+    lines
 }
 
 /// Whether `next` is a character that is no line break: one that begins

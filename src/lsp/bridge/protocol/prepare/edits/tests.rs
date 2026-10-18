@@ -2998,6 +2998,97 @@ mod formatting {
         );
     }
 
+    /// `virtual_text` with the indent `removed` (`""` for none) deleted
+    /// from each line.
+    fn dedent_lines(virtual_text: &str, removed: &[usize]) -> PreparedMap {
+        let changes: Vec<_> = removed
+            .iter()
+            .enumerate()
+            .filter(|&(_, &width)| width > 0)
+            .map(|(line, &width)| {
+                json!({"range": {"start": {"line": line, "character": 0}, "end": {"line": line, "character": width}}, "newText": ""})
+            })
+            .collect();
+        prepare(virtual_text, json!(changes))
+    }
+
+    #[test]
+    fn a_line_keeps_its_indent_when_the_line_before_it_goes() {
+        // `0b c0` (left alone) deleted, `1a1` reindented: the remaining
+        // line is `1a1`, not `0b c0` rewritten.
+        let virtual_text = "0b c0\n  1a1\n";
+        let map = dedent_lines(virtual_text, &[0, 2]);
+        let answer = [edit((0, 0), (2, 0), " 1a1\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("   1a1\n")
+        );
+    }
+
+    #[test]
+    fn a_line_of_text_is_not_given_up_for_a_blank_line() {
+        // A blank line written after the content could pair with the blank
+        // line above `2x`, leaving `2x` to be written anew, indented.
+        let virtual_text = "    0x\n\n2x\n";
+        let map = dedent_lines(virtual_text, &[4]);
+        let answer = [edit((0, 0), (3, 0), "0x\n  w\n\n2x\n\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("    0x\n      w\n\n2x\n\n")
+        );
+    }
+
+    #[test]
+    fn a_line_inserted_before_a_kept_whitespace_line_takes_the_content_indent() {
+        // The kept ` ` is a line of its own, not the start of the new one.
+        let virtual_text = "  if x:\n \n";
+        let map = dedent_lines(virtual_text, &[2]);
+        let answer = [edit((0, 0), (2, 0), "if x:\n  w\n \n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  if x:\n    w\n \n")
+        );
+    }
+
+    #[test]
+    fn text_written_on_a_kept_whitespace_line_gains_no_indent() {
+        // The peer removed nothing from ` `: a line left alone, which text
+        // written on keeps so. An empty line had nothing to remove: text
+        // there is the content's, indented as it is.
+        let virtual_text = "  a\n \n\n  b\n";
+        let map = dedent_lines(virtual_text, &[2, 0, 0, 2]);
+        let answer = [edit((0, 0), (4, 0), "a\n x\ny\nb\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  a\n x\n  y\n  b\n")
+        );
+    }
+
+    #[test]
+    fn lines_joined_keep_the_first_ones_indent() {
+        // `0x` deleted and `1x` joined with `2x`: the joined line is `1x`.
+        let virtual_text = "0if x:0\n    1if x:1\n    2if x:2\n";
+        let map = dedent_lines(virtual_text, &[0, 4, 4]);
+        let answer = [edit((0, 0), (3, 0), "1if x:1 2if x:2\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("    1if x:1 2if x:2\n")
+        );
+    }
+
+    #[test]
+    fn a_line_break_changed_before_text_written_on_a_line_keeps_them_apart() {
+        // CRLF turned to LF on `a`, text written on the kept ` ` below it:
+        // that text is the line's, not one after the changed break.
+        let virtual_text = "\ta\r\n \r\n";
+        let map = dedent_lines(virtual_text, &[1, 0]);
+        let answer = [edit((0, 0), (2, 0), "a\nw\r\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("\ta\nw\r\n")
+        );
+    }
+
     #[test]
     fn a_whole_document_answer_maps_back_reindented() {
         let (virtual_text, map) = dedented();
@@ -3103,10 +3194,23 @@ mod formatting {
 }
 
 /// Formatting answers checked against host text built without the map: the
-/// document is generated with the indentation its peer removes, a formatter
-/// rewrites P line by line, and the expected host text is that rewrite with
-/// the indent put back on every line and the deleted edge lines around it.
-/// Positions and the application of edits are this module's own.
+/// document is generated with the indentation its peer removes (from some
+/// lines; others, and kept whitespace-only lines, left alone), a formatter
+/// rewrites P line by line knowing which line each output line came from,
+/// and the expected host text puts back on each line the indent its rules
+/// (the ADR's) give it:
+///
+/// - a line rewritten: the indent the peer removed from it, none for one it
+///   left alone (a kept whitespace-only line too, written on or not);
+/// - a line created, or text written on an empty line (nothing there for
+///   the peer to remove): the content's, the indent the peer removed;
+/// - the indentation-only last line: its own, text written on it too;
+/// - a blank line joined to the next: that line, the blank one deleted;
+///
+/// and the deleted edge lines around it all. Positions and the application
+/// of edits are this module's own. Provenance no answer shows (a line
+/// written where one went; which of several blank lines went or changed)
+/// is not generated, rather than guessed.
 mod formatting_reference {
     use super::*;
     use proptest::prelude::*;
@@ -3205,6 +3309,29 @@ mod formatting_reference {
         output
     }
 
+    /// One line of a generated document.
+    #[derive(Debug, Clone, Copy)]
+    enum Line {
+        /// Text (`BODIES`), indented and dedented by the peer, or left at
+        /// column 0 and alone.
+        Content {
+            body: usize,
+            dedented: bool,
+        },
+        Empty,
+        /// A single space the peer left alone: shorter than any indent.
+        Space,
+    }
+
+    fn line() -> impl Strategy<Value = Line> {
+        prop_oneof![
+            5 => (0..BODIES.len(), prop::bool::weighted(0.8))
+                .prop_map(|(body, dedented)| Line::Content { body, dedented }),
+            1 => Just(Line::Empty),
+            1 => Just(Line::Space),
+        ]
+    }
+
     /// A generated document: V, the peer's changes, and the host text the
     /// map keeps around P.
     struct Document {
@@ -3215,52 +3342,81 @@ mod formatting_reference {
         /// The last line holds only the indent the peer removed, with no
         /// closing lines before it: a content line, its indent kept.
         indent_only_last_line: bool,
+        /// The indent text written on each line of P regains, in order: the
+        /// one the peer removed from it, or for an empty line (text there
+        /// starts a line of the content) `None`, the content's.
+        removed: Vec<Option<&'static str>>,
+        /// The indent of the indentation-only last line.
+        last_line_indent: &'static str,
+        /// The indent lines created in the content regain: the one the peer
+        /// removed, or none when it removed none.
+        uniform: &'static str,
     }
 
-    /// `lines` (`None` an empty line), indented by `indent`, broken by
-    /// `line_break`, between `leading` and `trailing` blank lines,
-    /// optionally ending with the indent alone.
+    /// `lines` indented by `indent` (text made unique per line, so a diff
+    /// has one way to align lines), broken by `line_break`, between
+    /// `leading` and `trailing` blank lines, optionally ending with the
+    /// indent alone.
     fn document(
-        lines: &[Option<usize>],
-        indent: &str,
+        lines: &[Line],
+        indent: &'static str,
         line_break: &str,
         (leading, trailing, closing_indent): (usize, usize, bool),
     ) -> Option<Document> {
-        if lines.iter().all(Option::is_none) {
+        if !lines
+            .iter()
+            .any(|line| matches!(line, Line::Content { .. }))
+        {
             return None;
         }
         let leading_text = line_break.repeat(leading);
         let mut text = leading_text.clone();
-        for line in lines {
-            if let Some(body) = line {
-                text.push_str(indent);
-                text.push_str(BODIES[*body]);
+        let mut dedented_lines = Vec::new();
+        let mut removed = Vec::new();
+        for (number, line) in lines.iter().enumerate() {
+            match *line {
+                Line::Content { body, dedented } => {
+                    if dedented {
+                        dedented_lines.push(text.len());
+                        text.push_str(indent);
+                    }
+                    text.push_str(&format!("{number}{}{number}", BODIES[body]));
+                    removed.push(Some(if dedented { indent } else { "" }));
+                }
+                Line::Empty => removed.push(None),
+                Line::Space => {
+                    text.push(' ');
+                    removed.push(Some(""));
+                }
             }
             text.push_str(line_break);
         }
         let content_end = text.len();
         text.push_str(&line_break.repeat(trailing));
         if closing_indent {
+            dedented_lines.push(text.len());
             text.push_str(indent);
         }
-        let starts = line_starts(&text);
         let mut changes = Vec::new();
-        for &at in &starts {
+        let change = |start: usize, end: usize| {
+            json!({"range": {
+                "start": position_of(&text, start),
+                "end": position_of(&text, end)
+            }, "newText": ""})
+        };
+        for &at in &line_starts(&text) {
             let edge_line = at < leading_text.len()
                 || (at >= content_end && at < content_end + trailing * line_break.len());
-            let end = if edge_line {
-                at + line_break.len()
-            } else if text[at..].starts_with(indent) {
-                at + indent.len()
-            } else {
-                continue;
-            };
-            changes.push(json!({"range": {
-                "start": position_of(&text, at),
-                "end": position_of(&text, end)
-            }, "newText": ""}));
+            if edge_line {
+                changes.push(change(at, at + line_break.len()));
+            } else if dedented_lines.contains(&at) {
+                changes.push(change(at, at + indent.len()));
+            }
         }
         let indent_only_last_line = closing_indent && trailing == 0;
+        let any_dedented = lines
+            .iter()
+            .any(|line| matches!(line, Line::Content { dedented: true, .. }));
         Some(Document {
             closing: if indent_only_last_line {
                 String::new()
@@ -3275,6 +3431,9 @@ mod formatting_reference {
             indent_only_last_line,
             virtual_text: text,
             changes,
+            removed,
+            last_line_indent: indent,
+            uniform: if any_dedented { indent } else { "" },
         })
     }
 
@@ -3292,6 +3451,8 @@ mod formatting_reference {
         JoinNext,
         /// Its line break switched between LF and CRLF.
         SwitchBreak,
+        /// Text written on it, after this many spaces, if it is blank.
+        Write(usize),
     }
 
     fn rewrite() -> impl Strategy<Value = Rewrite> {
@@ -3303,13 +3464,18 @@ mod formatting_reference {
             1 => Just(Rewrite::BlankAfter),
             1 => Just(Rewrite::Delete),
             1 => Just(Rewrite::JoinNext),
+            1 => (0..3usize).prop_map(Rewrite::Write),
             1 => Just(Rewrite::SwitchBreak),
         ]
     }
 
+    /// A line of a formatter's output: its text, its line break, and the
+    /// line of P it rewrites (`None` for a line it created).
+    type Output = (String, String, Option<usize>);
+
     /// `prepared` rewritten line by line (`rewrites` cycled), its final
     /// line break dropped or added when `flip_final_break`.
-    fn format(prepared: &str, rewrites: &[Rewrite], flip_final_break: bool) -> String {
+    fn format(prepared: &str, rewrites: &[Rewrite], flip_final_break: bool) -> Vec<Output> {
         let starts = line_starts(prepared);
         let mut lines: Vec<(String, String)> = (0..starts.len())
             .map(|line| {
@@ -3325,85 +3491,151 @@ mod formatting_reference {
         if lines.len() > 1 && lines.last().is_some_and(|(text, _)| text.is_empty()) {
             lines.pop();
         }
-        let mut output: Vec<(String, String)> = Vec::new();
+        let mut output: Vec<Output> = Vec::new();
         let mut rewrites = rewrites.iter().cycle();
         let mut index = 0;
+        // Whether the line before was removed: a blank line written then
+        // takes its place as much as it is written on.
+        let mut removed_before = false;
         while index < lines.len() {
-            let (mut text, mut line_break) = lines[index].clone();
+            let (mut text, line_break) = lines[index].clone();
+            let origin = Some(index);
             let some_break = if line_break.is_empty() {
                 "\n".to_string()
             } else {
                 line_break.clone()
             };
-            match rewrites.next().copied().unwrap_or(Rewrite::Keep) {
-                Rewrite::Keep => output.push((text, line_break)),
+            let mut rewrite = rewrites.next().copied().unwrap_or(Rewrite::Keep);
+            // Provenance no answer shows is left out, not guessed: a line
+            // written where a line was removed is that line rewritten as much
+            // as a new one; and with other blank lines about, which blank
+            // line went, or took other whitespace or text, is not to be told
+            // (blank lines carry nothing of their own to pair them by).
+            let created_before = output.last().is_some_and(|(_, _, origin)| origin.is_none());
+            let is_blank = |at: usize| {
+                lines
+                    .get(at)
+                    .is_some_and(|(text, _)| text.trim().is_empty())
+            };
+            let other_blank =
+                |at: usize| (0..lines.len()).any(|other| other != at && is_blank(other));
+            // The lines this rewrite removes: its own, or the next it joins.
+            let removed = match rewrite {
+                Rewrite::Delete => Some(index),
+                Rewrite::JoinNext if is_blank(index) => Some(index),
+                Rewrite::JoinNext => Some(index + 1),
+                _ => None,
+            };
+            let rewrites_blank = is_blank(index)
+                && matches!(
+                    rewrite,
+                    Rewrite::Reindent(_) | Rewrite::TrailingSpace | Rewrite::Write(_)
+                );
+            if (created_before && (removed.is_some() || rewrites_blank))
+                || (removed_before && rewrites_blank)
+                || removed.is_some_and(|at| is_blank(at) && other_blank(at))
+                || (rewrites_blank && other_blank(index))
+            {
+                rewrite = Rewrite::Keep;
+            }
+            removed_before = matches!(rewrite, Rewrite::JoinNext if index + 1 < lines.len())
+                || matches!(rewrite, Rewrite::Delete if lines.len() > 1);
+            match rewrite {
+                Rewrite::Keep => output.push((text, line_break, origin)),
+                // A formatter leaves no whitespace on a line it rewrites
+                // blank (what blank line took which whitespace is not to be
+                // told, see above).
+                Rewrite::Reindent(_) | Rewrite::TrailingSpace if is_blank(index) => {
+                    output.push((String::new(), line_break, origin))
+                }
                 Rewrite::Reindent(spaces) => {
                     let trimmed = text.trim_start_matches([' ', '\t']).to_string();
-                    output.push((format!("{}{trimmed}", " ".repeat(spaces)), line_break));
+                    output.push((
+                        format!("{}{trimmed}", " ".repeat(spaces)),
+                        line_break,
+                        origin,
+                    ));
                 }
-                Rewrite::TrailingSpace => output.push((format!("{text} "), line_break)),
+                Rewrite::TrailingSpace => output.push((format!("{text} "), line_break, origin)),
+                Rewrite::Write(spaces) if is_blank(index) => output.push((
+                    format!("{}w{index}", " ".repeat(spaces)),
+                    line_break,
+                    origin,
+                )),
+                Rewrite::Write(_) => output.push((text, line_break, origin)),
                 Rewrite::LineAfter(spaces) => {
-                    output.push((text, some_break.clone()));
-                    output.push((format!("{}w", " ".repeat(spaces)), line_break));
+                    output.push((text, some_break, origin));
+                    output.push((format!("{}w", " ".repeat(spaces)), line_break, None));
                 }
                 Rewrite::BlankAfter => {
-                    output.push((text, some_break.clone()));
-                    output.push((String::new(), line_break));
+                    output.push((text, some_break, origin));
+                    output.push((String::new(), line_break, None));
                 }
                 Rewrite::Delete if lines.len() > 1 => {}
-                Rewrite::Delete => output.push((text, line_break)),
+                Rewrite::Delete => output.push((text, line_break, origin)),
                 Rewrite::JoinNext if index + 1 < lines.len() => {
                     index += 1;
+                    // A blank line joined to the next is that line, the
+                    // blank one deleted.
+                    let origin = if text.trim().is_empty() {
+                        Some(index)
+                    } else {
+                        origin
+                    };
                     text.push(' ');
                     text.push_str(lines[index].0.trim_start());
-                    line_break = lines[index].1.clone();
-                    output.push((text, line_break));
+                    output.push((text, lines[index].1.clone(), origin));
                 }
-                Rewrite::JoinNext => output.push((text, line_break)),
+                Rewrite::JoinNext => output.push((text, line_break, origin)),
                 Rewrite::SwitchBreak => {
                     let switched = match line_break.as_str() {
                         "\n" => "\r\n",
                         "\r\n" => "\n",
                         other => other,
                     };
-                    output.push((text, switched.to_string()));
+                    output.push((text, switched.to_string(), origin));
                 }
             }
             index += 1;
         }
-        let mut formatted: String = output
-            .into_iter()
-            .map(|(text, line_break)| text + &line_break)
-            .collect();
-        if flip_final_break {
-            if formatted.ends_with("\r\n") {
-                formatted.truncate(formatted.len() - 2);
-            } else if formatted.ends_with('\n') {
-                formatted.pop();
+        if flip_final_break && let Some((_, line_break, _)) = output.last_mut() {
+            if line_break.is_empty() {
+                *line_break = "\n".to_string();
             } else {
-                formatted.push('\n');
+                line_break.clear();
             }
         }
-        formatted
+        output
     }
 
-    /// The host text `formatted` (a rewrite of P) stands for: every line it
-    /// starts indented, the deleted edge lines put back around it. `None`
-    /// when the closing lines would not start a line.
-    fn reference(document: &Document, formatted: &str, indent: &str) -> Option<String> {
+    /// The host text a formatter's `output` stands for: every line of text
+    /// it rewrote indented as that line was, every one it created as the
+    /// content is, the deleted edge lines put back around it. `None` when
+    /// the closing lines would not start a line.
+    fn reference(document: &Document, output: &[Output]) -> Option<String> {
         let mut indented = String::new();
-        let mut at_line_start = true;
-        let mut characters = formatted.chars().peekable();
-        while let Some(character) = characters.next() {
-            if at_line_start && character != '\n' && character != '\r' {
-                indented.push_str(indent);
+        for (at, (text, line_break, origin)) in output.iter().enumerate() {
+            // A line written last, with no break, is written on the
+            // indentation-only last line, whose indent it keeps.
+            let on_last_line = document.indent_only_last_line
+                && origin.is_none()
+                && line_break.is_empty()
+                && at + 1 == output.len();
+            if !text.is_empty() {
+                indented.push_str(if on_last_line {
+                    document.last_line_indent
+                } else {
+                    origin
+                        .and_then(|line| document.removed[line])
+                        .unwrap_or(document.uniform)
+                });
             }
-            indented.push(character);
-            at_line_start =
-                character == '\n' || (character == '\r' && characters.peek() != Some(&'\n'));
+            indented.push_str(text);
+            indented.push_str(line_break);
         }
+        let at_line_start = indented.is_empty() || indented.ends_with(['\n', '\r']);
         if document.indent_only_last_line && at_line_start {
-            indented.push_str(indent);
+            indented.push_str(document.last_line_indent);
         }
         if !document.closing.is_empty() && !indented.is_empty() && !at_line_start {
             return None;
@@ -3462,6 +3694,9 @@ mod formatting_reference {
         }]
     }
 
+    /// Run `cases` generated answers mapped with `budget`, checking each
+    /// accepted one against [`reference`]; how many were mapped, and how
+    /// many of those changed P.
     fn check(budget: Duration, cases: u32) -> (usize, usize) {
         let mut runner = TestRunner::new(Config {
             cases,
@@ -3470,7 +3705,7 @@ mod formatting_reference {
         });
         let (mapped_sets, changing) = (Cell::new(0), Cell::new(0));
         let strategy = (
-            prop::collection::vec(prop::option::weighted(0.8, 0..BODIES.len()), 1..6),
+            prop::collection::vec(line(), 1..6),
             prop::sample::select(vec!["  ", "\t", "    "]),
             prop::sample::select(vec!["\n", "\r\n"]),
             (0..3usize, 0..3usize, any::<bool>()),
@@ -3489,7 +3724,11 @@ mod formatting_reference {
                         serde_json::Value::from(document.changes.clone()),
                     );
                     let prepared = map.prepared_lines.text.clone();
-                    let formatted = format(&prepared, &rewrites, flip);
+                    let output = format(&prepared, &rewrites, flip);
+                    let formatted: String = output
+                        .iter()
+                        .map(|(text, line_break, _)| format!("{text}{line_break}"))
+                        .collect();
                     let edits = answer(&prepared, &formatted, shape);
                     prop_assert_eq!(apply(&prepared, &edits), formatted.clone());
                     let Some(mapped) = map.map_edits_within(&edits, EditMode::Formatting, budget)
@@ -3501,7 +3740,7 @@ mod formatting_reference {
                         changing.set(changing.get() + 1);
                     }
                     let got = apply(&document.virtual_text, &mapped);
-                    let expected = reference(&document, &formatted, indent);
+                    let expected = reference(&document, &output);
                     prop_assert_eq!(
                         Some(&got),
                         expected.as_ref(),
