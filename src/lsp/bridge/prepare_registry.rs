@@ -313,6 +313,10 @@ pub(crate) struct PrepareRegistry {
     next_revision: Arc<AtomicI32>,
     resync_tx: UnboundedSender<Resync>,
     resync_rx: std::sync::Mutex<Option<UnboundedReceiver<Resync>>>,
+    /// Run once a lookup found its host open, before its region goes in
+    /// (see `slot`): where a close can land.
+    #[cfg(test)]
+    slot_checked: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl std::fmt::Debug for PrepareRegistry {
@@ -338,6 +342,8 @@ impl Default for PrepareRegistry {
             next_revision: Arc::new(AtomicI32::new(1)),
             resync_tx,
             resync_rx: std::sync::Mutex::new(Some(resync_rx)),
+            #[cfg(test)]
+            slot_checked: std::sync::Mutex::new(None),
         }
     }
 }
@@ -860,6 +866,15 @@ impl PrepareRegistry {
         if self.closed_hosts.contains_key(host_uri) {
             return None;
         }
+        #[cfg(test)]
+        if let Some(hook) = self
+            .slot_checked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            hook();
+        }
         self.used.store(true, Ordering::Release);
         let key = input_key(target, input);
         let hash = region_hash(host_uri, input.injection_language, input.region_id);
@@ -921,6 +936,23 @@ impl PrepareRegistry {
                 break;
             };
             region.slots.remove(index + 1);
+        }
+        drop(region);
+        // Closed meanwhile: the close may have swept the host's regions
+        // before this one went in (it marks the host closed first, so a
+        // sweep that missed this region is seen here). Nothing is kept for
+        // a closed host.
+        if self.closed_hosts.contains_key(host_uri) {
+            let removed = self
+                .regions
+                .remove_if(&hash, |_, region| {
+                    region.is(host_uri, input.injection_language, input.region_id)
+                })
+                .is_some();
+            if removed {
+                self.held_changes.fetch_add(1, Ordering::AcqRel);
+            }
+            return None;
         }
         Some(slot)
     }
@@ -1375,6 +1407,45 @@ mod tests {
     use super::*;
     use crate::config::settings::BridgeServerConfig;
     use crate::lsp::bridge::pool::ConnectionKey;
+
+    /// A host closed while one of its regions is looked up keeps nothing:
+    /// the close's sweep may run before the region goes in, and the lookup
+    /// then takes it back out itself.
+    #[test]
+    fn a_lookup_racing_its_hosts_close_leaves_no_region() {
+        let registry = Arc::new(PrepareRegistry::default());
+        let host_uri = Url::parse("file:///test/closing.md").unwrap();
+        let target = PrepareTarget {
+            candidates: Arc::from([]),
+            epoch: 0,
+        };
+        let input = PrepareInput {
+            host_uri: &host_uri,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: "region",
+            virtual_text: "a",
+            gaps: &[],
+        };
+        {
+            let closer = Arc::clone(&registry);
+            let host_uri = host_uri.clone();
+            *registry.slot_checked.lock().unwrap() =
+                Some(Box::new(move || closer.forget_host(&host_uri)));
+        }
+        assert!(
+            registry
+                .slot(&target, input, Holder::LifecyclePass, 0)
+                .is_none()
+        );
+        assert!(
+            registry
+                .regions
+                .iter()
+                .all(|region| region.host_uri != host_uri.as_str()),
+            "nothing kept for the closed host"
+        );
+    }
 
     /// A failure revokes the maps answered for its input before it for as
     /// long as they live, however the registry's answers are evicted
