@@ -177,7 +177,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use tokio::sync::Mutex;
 use url::Url;
 
@@ -366,9 +366,10 @@ pub(crate) struct HostVirtualContents {
     /// (language, region id) of the regions the lifecycle pass holds for a
     /// prepare peer known to prepare them (see
     /// [`LanguageServerPool::hold_latest_virtual_content`]): no request opens
-    /// one with text as is. `None` for a pool that prepares nothing, which
-    /// holds nothing: no set is allocated for each host it opens.
-    held: Option<DashSet<(String, String)>>,
+    /// one with text as is — nor at all once its peer failed it (`true`).
+    /// `None` for a pool that prepares nothing, which holds nothing: no map
+    /// is allocated for each host it opens.
+    held: Option<DashMap<(String, String), bool>>,
     /// How many entries `held` has: read in place of `held`'s emptiness,
     /// which locks every shard, on every lazy open and every recorded text.
     held_count: std::sync::atomic::AtomicUsize,
@@ -377,11 +378,19 @@ pub(crate) struct HostVirtualContents {
 impl HostVirtualContents {
     /// Whether the lifecycle pass holds `(language, region_id)` (see `held`).
     fn holds(&self, language: &str, region_id: &str) -> bool {
-        self.held_count.load(Ordering::Acquire) > 0
-            && self
-                .held
-                .as_ref()
-                .is_some_and(|held| held.contains(&(language.to_string(), region_id.to_string())))
+        self.hold(language, region_id).is_some()
+    }
+
+    /// The hold on `(language, region_id)`, if any: whether its peer failed
+    /// it (see `held`).
+    fn hold(&self, language: &str, region_id: &str) -> Option<bool> {
+        if self.held_count.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        self.held.as_ref().and_then(|held| {
+            held.get(&(language.to_string(), region_id.to_string()))
+                .map(|failed| *failed)
+        })
     }
 }
 
@@ -2792,17 +2801,22 @@ impl LanguageServerPool {
         // with text as is (a request resolved before its pair gained the
         // peer), whether its own or the last forwarded.
         // Nothing is ever held without the prepare layer.
-        let region_held = || {
-            self.prepares()
-                && self
-                    .latest_virtual_contents
-                    .get(host_uri)
-                    .is_some_and(|host| host.holds(virtual_uri.language(), virtual_uri.region_id()))
+        // The hold on the region: `Some(failed)`. A failed one opens with
+        // no text: a request's prepared text is from an answer the peer no
+        // longer gives.
+        let region_hold = || {
+            if !self.prepares() {
+                return None;
+            }
+            self.latest_virtual_contents
+                .get(host_uri)
+                .and_then(|host| host.hold(virtual_uri.language(), virtual_uri.region_id()))
         };
-        if let VirtualOpenContent::LatestKnown(provided) = &content
-            && provided.map.is_none()
-            && region_held()
-        {
+        let refused = |content: &VirtualOpenContent<'_>, hold: Option<bool>| {
+            matches!(content, VirtualOpenContent::LatestKnown(provided)
+                if hold == Some(true) || provided.map.is_none() && hold.is_some())
+        };
+        if refused(&content, region_hold()) {
             drop(transition_guard);
             self.remove_open_transition_lock_if_unshared(virtual_uri, connection_key, &transition);
             return Err(io::Error::new(
@@ -2906,11 +2920,9 @@ impl LanguageServerPool {
         // its claim, and swept past it, is seen here; one published after
         // this read is followed by a sweep that finds the document and
         // closes it.
-        let region_held = region_held();
-        if let VirtualOpenContent::LatestKnown(provided) = &content
-            && provided.map.is_none()
-            && region_held
-        {
+        let hold = region_hold();
+        let region_held = hold.is_some();
+        if refused(&content, hold) {
             self.document_tracker
                 .rollback_open_claim_if(host_uri, virtual_uri, connection_key, &claim)
                 .await;
@@ -3116,13 +3128,16 @@ impl LanguageServerPool {
     /// for a prepare peer known to prepare it: what was last forwarded for
     /// it was sent as is, and a request opening it lazily must not send
     /// that (or its own text as is) while it waits — or after its peer
-    /// failed. Cleared once text is recorded for it again.
+    /// failed. Cleared once text is recorded for it again. `failed`: its
+    /// peer answered it unusably, and no request reads coordinates through
+    /// it either (see [`Self::prepare_failed`]).
     pub(crate) fn hold_latest_virtual_content(
         &self,
         host_uri: &Url,
         incarnation: u64,
         language: &str,
         region_id: &str,
+        failed: bool,
     ) {
         if let Some(host) = self.latest_virtual_contents.get(host_uri)
             && host.incarnation == incarnation
@@ -3132,10 +3147,23 @@ impl LanguageServerPool {
             // count never reads below what `held` holds (removals take the
             // entry out first), so no open sees a held region as free.
             host.held_count.fetch_add(1, Ordering::AcqRel);
-            if !held.insert((language.to_string(), region_id.to_string())) {
+            if held
+                .insert((language.to_string(), region_id.to_string()), failed)
+                .is_some()
+            {
                 host.held_count.fetch_sub(1, Ordering::AcqRel);
             }
         }
+    }
+
+    /// Whether the lifecycle pass holds `region_id` (under `language`) of
+    /// `host_uri` as failed by its peer (see
+    /// [`Self::hold_latest_virtual_content`]): a request built before reads
+    /// no coordinates through it, as no push is placed through it.
+    pub(crate) fn prepare_failed(&self, host_uri: &Url, language: &str, region_id: &str) -> bool {
+        self.latest_virtual_contents
+            .get(host_uri)
+            .is_some_and(|host| host.hold(language, region_id) == Some(true))
     }
 
     /// The document's lifecycle lock, created on first use. Transitions lock it
@@ -3217,7 +3245,7 @@ impl LanguageServerPool {
                 incarnation,
                 promoted_language: None,
                 contents: DashMap::new(),
-                held: self.prepares().then(DashSet::new),
+                held: self.prepares().then(DashMap::new),
                 held_count: std::sync::atomic::AtomicUsize::new(0),
             },
         );
@@ -9620,7 +9648,7 @@ mod tests {
         // forwarded as is) and regained one (the region held again).
         let map = dedent_map("  x = 1");
         pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  x = 1");
-        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, false);
         let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
         pool.ensure_document_opened(
             &mut sender,
@@ -9679,11 +9707,43 @@ mod tests {
             tokio::task::yield_now().await;
         }
         // The pass holds the region; its sweep finds nothing registered.
-        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, false);
         drop(versions);
         assert!(open.await.unwrap().is_err());
         assert!(rx.try_recv().is_err(), "nothing was sent as is");
         assert!(!pool.is_document_opened_on_connection(&virtual_uri, &key));
+    }
+
+    /// A region its peer failed is not opened lazily even with a request's
+    /// prepared text: that text is from an answer the peer no longer gives.
+    /// One merely pending is, as before.
+    #[tokio::test]
+    async fn a_region_its_peer_failed_is_not_opened_even_prepared() {
+        let pool = LanguageServerPool::preparing();
+        let host_uri = Url::parse("file:///test/lazy-open-failed.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  x = 1");
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, true);
+        let map = dedent_map("  x = 1");
+        let prepared = SentText {
+            text: "x = 1",
+            map: Some(&map),
+        };
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
+        assert!(
+            pool.ensure_document_opened(&mut sender, &host_uri, &virtual_uri, prepared, &key)
+                .await
+                .is_err()
+        );
+        assert!(rx.try_recv().is_err(), "nothing was sent");
+        // Pending again (a new epoch's attempt): the prepared text opens it.
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, false);
+        pool.ensure_document_opened(&mut sender, &host_uri, &virtual_uri, prepared, &key)
+            .await
+            .unwrap();
+        assert_eq!(opened_text(&mut rx), "x = 1");
     }
 
     #[tokio::test]
@@ -9703,7 +9763,7 @@ mod tests {
         );
         // Held for its peer.
         pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  x = 1");
-        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, false);
         assert!(pool.refuses_text_as_is(&host_uri, &virtual_uri, &key));
         // Holding a prepared text of it.
         pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  x = 1");
@@ -9734,7 +9794,7 @@ mod tests {
         let key = ConnectionKey::for_server("lua");
         pool.open_host_incarnation(&host_uri, 1).await;
         pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  x = 1");
-        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, false);
         let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
         assert!(
             pool.ensure_document_opened(&mut sender, &host_uri, &virtual_uri, "  x = 1", &key)

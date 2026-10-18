@@ -1108,12 +1108,15 @@ impl DocumentTracker {
     /// every send records and queues under (see [`Self::record_and_queue`]):
     /// no text can be recorded and queued between the check and the
     /// enqueue, so the request follows exactly the text it was checked
-    /// against. `None`, with nothing queued, when the text is not held.
+    /// against. `None`, with nothing queued, when the text is not held, or
+    /// the region's peer `failed` it: no coordinates are read through it,
+    /// as no push is placed through it.
     pub(super) fn queue_if_holding<R>(
         &self,
         virtual_uri: &str,
         connection_key: &ConnectionKey,
         request_map: Option<&PreparedMap>,
+        failed: bool,
         queue: impl FnOnce() -> R,
     ) -> Option<R> {
         let fingerprints = self
@@ -1122,7 +1125,7 @@ impl DocumentTracker {
             .recover_poison("DocumentTracker::document_fingerprints");
         let region = super::RegionPrepare {
             prepared: request_map.is_some(),
-            failed: false,
+            failed,
         };
         if self.held_texts_matter(region) {
             let (held, history) = self.held_locked(&fingerprints, virtual_uri, connection_key);

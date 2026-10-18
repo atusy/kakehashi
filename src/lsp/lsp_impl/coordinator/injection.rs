@@ -688,6 +688,44 @@ impl InjectionCoordinator {
                 }),
             };
         };
+        // Held injections are held from here, before the awaits below: a
+        // request opening one of them lazily checks the hold, and must not
+        // send its text as is while the pass is still on its way to the
+        // sweep that would close it. A failed one is marked so: no request
+        // reads coordinates through it, as no push is placed through it.
+        // Nothing is held without the prepare layer: no scan.
+        let prepares = self.bridge.pool().prepares();
+        let held: Vec<(&str, &str, bool)> = if prepares {
+            injections
+                .iter()
+                .filter(|injection| {
+                    injection.held
+                        && self
+                            .bridge
+                            .prepare_peer_known(&host_language, &injection.language)
+                })
+                .map(|injection| {
+                    (
+                        injection.language.as_str(),
+                        injection.region_id.as_str(),
+                        self.bridge
+                            .prepare_region(uri, &injection.language, &injection.region_id)
+                            .failed,
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for (language, region_id, failed) in &held {
+            self.bridge.pool().hold_latest_virtual_content(
+                uri,
+                incarnation,
+                language,
+                region_id,
+                *failed,
+            );
+        }
         // Stop the previous pass before closing a replaced language-bearing URI;
         // otherwise an old eager task can enqueue didOpen after the close and
         // resurrect the stale URI. The new batch is created below after cleanup.
@@ -738,31 +776,15 @@ impl InjectionCoordinator {
         // candidates' handshakes tell whether any prepares it is most likely
         // sent as is again once they do, and closing its documents meanwhile
         // would only drop their diagnostics.
-        // Nothing is held without the prepare layer: no scan.
-        let prepares = self.bridge.pool().prepares();
-        let held: Vec<(&str, &str)> = if prepares {
-            injections
-                .iter()
-                .filter(|injection| {
-                    injection.held
-                        && self
-                            .bridge
-                            .prepare_peer_known(&host_language, &injection.language)
-                })
-                .map(|injection| (injection.language.as_str(), injection.region_id.as_str()))
-                .collect()
-        } else {
-            Vec::new()
-        };
         if !held.is_empty() {
-            for (language, region_id) in &held {
-                self.bridge.pool().hold_latest_virtual_content(
-                    uri,
-                    incarnation,
-                    language,
-                    region_id,
-                );
-            }
+            // After the hold above, so a request lazily opening one of them
+            // as is meanwhile either saw the hold or registered before this
+            // sweep, which then finds and closes it (see
+            // `LanguageServerPool::ensure_document_opened`).
+            let held: Vec<(&str, &str)> = held
+                .iter()
+                .map(|(language, region_id, _)| (*language, *region_id))
+                .collect();
             for region_id in self.bridge.close_unprepared_held_docs(uri, &held).await {
                 self.diagnostics
                     .evict_source(uri, &DiagnosticSource::Region(region_id));
@@ -2813,6 +2835,107 @@ mod tests {
             received.try_recv().is_err(),
             "reconciliation must synchronize already-opened content too"
         );
+    }
+
+    /// The lifecycle pass holds a region its peer answered unusably as
+    /// failed — no request reads coordinates through it — and one still
+    /// pending as merely held.
+    #[tokio::test]
+    async fn the_lifecycle_pass_holds_a_region_its_peer_failed_as_failed() {
+        use std::sync::Arc;
+        let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
+        let (service, _socket) = tower_lsp_server::LspService::new(|client| {
+            crate::lsp::lsp_impl::Kakehashi::with_cancel_forwarder(
+                client,
+                Arc::clone(&pool),
+                crate::lsp::CancelForwarder::new(Arc::clone(&pool)),
+            )
+        });
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), language.clone());
+        server.language.query_store().insert_injection_query(
+            "rust".into(),
+            Arc::new(
+                tree_sitter::Query::new(
+                    &language,
+                    r#"((string_literal) @injection.content (#set! injection.language "rust"))"#,
+                )
+                .unwrap(),
+            ),
+        );
+        server
+            .bridge
+            .prepare_settings_changed(&Arc::new(crate::config::WorkspaceSettings {
+                auto_install: false,
+                language_servers: [(
+                    "peer".to_string(),
+                    crate::lsp::bridge::test_helpers::devnull_config_for_language("rust"),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            }));
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let uri = url::Url::parse("file:///hinted.rs").unwrap();
+        let text = r#"fn main() { let x = "a"; }"#;
+        server.documents.insert(
+            uri.clone(),
+            text.into(),
+            Some("rust".into()),
+            parser.parse(text, None),
+        );
+        let region = server
+            .injection_coordinator()
+            .resolve_injection_data(&uri, "rust")
+            .unwrap()
+            .remove(0);
+        let incarnation = server.documents.get(&uri).unwrap().incarnation();
+        pool.open_host_incarnation(&uri, incarnation).await;
+        pool.record_prepare_advertisement(
+            &crate::lsp::bridge::ConnectionKey::for_server("peer"),
+            true,
+        );
+        let target = server.bridge.prepare_target("rust", "rust").unwrap();
+        // The region's own text: the probe above, finding the peer
+        // configured, presented it held, with none.
+        let virtual_text = {
+            let tree = parser.parse(text, None).unwrap();
+            let query = server.language.injection_query("rust").unwrap();
+            crate::language::injection::InjectionResolver::resolve_all(
+                &server.language,
+                &crate::language::NodeTracker::new(),
+                &uri,
+                &tree,
+                text,
+                &query,
+                incarnation,
+            )
+            .remove(0)
+            .virtual_content
+        };
+        let input = crate::lsp::bridge::PrepareInput {
+            host_uri: &uri,
+            host_language: "rust",
+            injection_language: "rust",
+            region_id: &region.region_id,
+            virtual_text: &virtual_text,
+            gaps: &[],
+        };
+        let injection = server.injection_coordinator();
+        let failed = || pool.prepare_failed(&uri, "rust", &region.region_id);
+        server.bridge.answer_prepare_for_test(
+            &target,
+            input,
+            crate::lsp::bridge::PrepareAnswer::Unusable,
+            true,
+        );
+        injection.process_injections_for_resync(&uri).await;
+        assert!(failed());
     }
 
     /// A probe that finds no prepare target leaves the region's lookups be:

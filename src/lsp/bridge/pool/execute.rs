@@ -188,6 +188,14 @@ impl LanguageServerPool {
         let virtual_uri = VirtualDocumentUri::new(&host_uri_lsp, injection_language, region_id);
         let uri_string = virtual_uri.to_uri_string();
 
+        // A region its peer failed (under the current epoch, after this
+        // request was built on an earlier answer, say): no request reads
+        // coordinates through it, as no push is placed through it.
+        let failed =
+            || self.prepares() && self.prepare_failed(host_uri, injection_language, region_id);
+        if failed() {
+            return Err(request_text_not_held(connection_key));
+        }
         // Before the host lifecycle guard: the wait can last the whole
         // budget, and a didClose or reopen must not queue behind it.
         self.wait_for_request_text(&uri_string, connection_key, offset)
@@ -305,6 +313,7 @@ impl LanguageServerPool {
                 &uri_string,
                 connection_key,
                 offset,
+                failed(),
                 request,
                 request_id,
             ) {
@@ -374,12 +383,14 @@ impl LanguageServerPool {
     /// `DocumentTracker::queue_if_holding`); the request is serialized
     /// before. `None`, with nothing queued, when the text is not held. A pool
     /// that prepares nothing queues at once.
+    #[allow(clippy::too_many_arguments)]
     fn queue_request_if_holding<P: serde::Serialize>(
         &self,
         handle: &ConnectionHandle,
         uri_string: &str,
         connection_key: &super::ConnectionKey,
         offset: &RegionOffset,
+        failed: bool,
         request: JsonRpcRequest<P>,
         request_id: RequestId,
     ) -> Option<Result<(), super::BridgeError>> {
@@ -395,6 +406,7 @@ impl LanguageServerPool {
             uri_string,
             connection_key,
             offset.prepared(),
+            failed,
             || handle.send_serialized_request(payload, request_id),
         )
     }
@@ -1064,7 +1076,7 @@ mod tests {
         let key = ConnectionKey::for_server("lua");
         let queue = |request_map| {
             pool.document_tracker
-                .queue_if_holding(&uri, &key, request_map, || ())
+                .queue_if_holding(&uri, &key, request_map, false, || ())
                 .is_some()
         };
         pool.record_sent_for_test(&virtual_uri, &key, "  a".into());
@@ -1107,6 +1119,53 @@ mod tests {
         .unwrap();
         assert_ne!(other.text, prepared.text);
         assert!(!queue(Some(&other.map)));
+    }
+
+    /// A request built on an answer its region's peer no longer gives (it
+    /// failed the region since, under a new epoch, say) is not queued, though
+    /// its connection still holds that answer's text: no coordinates are read
+    /// through a failed region, as no push is placed through it.
+    #[tokio::test]
+    async fn a_request_on_a_region_its_peer_failed_is_not_queued() {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let pool = LanguageServerPool::preparing();
+        let host_uri = Url::parse("file:///test/failed.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap(),
+            "lua",
+            TEST_ULID_LUA_0,
+        );
+        let uri = virtual_uri.to_uri_string();
+        let key = ConnectionKey::for_server("lua");
+        let prepared =
+            apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(dedent_answer()))
+                .unwrap();
+        pool.record_sent_for_test(
+            &virtual_uri,
+            &key,
+            SentText {
+                text: &prepared.text,
+                map: Some(&prepared.map),
+            },
+        );
+        let queue = |failed| {
+            pool.document_tracker
+                .queue_if_holding(&uri, &key, Some(&prepared.map), failed, || ())
+                .is_some()
+        };
+        assert!(queue(false));
+        assert!(!queue(true));
+        // Read from the hold the lifecycle pass publishes.
+        pool.open_host_incarnation(&host_uri, 1).await;
+        pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  a");
+        assert!(!pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0));
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, false);
+        assert!(
+            !pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0),
+            "pending"
+        );
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, true);
+        assert!(pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0));
     }
 
     #[tokio::test]
