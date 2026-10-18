@@ -271,14 +271,14 @@ impl Kakehashi {
                 if seen_edit_ranges.contains(&span) {
                     continue;
                 }
-                // A prepared document's edits are not mapped back through its
-                // map: closed as a non-contiguous one is. Asked only of a
-                // region that formats: one outside the range, unplanned, or
-                // its span taken sends no request, so its peer is not waited
-                // for. One closed or left unformatted because its peer failed
-                // (`Unprepared`) takes no span, and is not counted as
-                // `formatting` counts it: no one-shot run range-formats, so
-                // no failure count reads it.
+                // A formatter's edits to a prepared document are not mapped
+                // back through its map: closed as a non-contiguous one is.
+                // Asked only of a region that formats: one outside the range,
+                // unplanned, or its span taken sends no request, so its peer
+                // is not waited for. One closed or left unformatted because
+                // its peer failed (`Unprepared`) takes no span, and is not
+                // counted as `formatting` counts it: no one-shot run range-
+                // formats, so no failure count reads it.
                 if self
                     .method_gate(
                         &uri,
