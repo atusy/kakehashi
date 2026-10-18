@@ -390,20 +390,50 @@ fn an_incomplete_list_dropped_whole_still_asks_to_requery() {
     );
 }
 
+/// Apply LSP `TextEdit`s to `text`, fixtures being ASCII (a UTF-16 column
+/// is a byte), end-first.
+fn apply_edits(text: &str, edits: &[Value]) -> String {
+    let offset = |position: &Value| -> usize {
+        let line = position["line"].as_u64().unwrap() as usize;
+        let character = position["character"].as_u64().unwrap() as usize;
+        let start: usize = text.split_inclusive('\n').take(line).map(str::len).sum();
+        let content = text.split_inclusive('\n').nth(line).unwrap_or("");
+        assert!(
+            character <= content.trim_end_matches('\n').len(),
+            "column {character} past line {line}"
+        );
+        start + character
+    };
+    let mut spans: Vec<(usize, usize, String)> = edits
+        .iter()
+        .map(|edit| {
+            (
+                offset(&edit["range"]["start"]),
+                offset(&edit["range"]["end"]),
+                edit["newText"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    spans.sort_by_key(|&(start, end, _)| std::cmp::Reverse((start, end)));
+    let mut text = text.to_string();
+    for (start, end, new_text) in spans {
+        text.replace_range(start..end, &new_text);
+    }
+    text
+}
+
 #[test]
-fn formatting_is_not_offered_on_a_prepared_document() {
+fn formatting_on_a_prepared_document_maps_back_reindented() {
     let (mut client, _dir) = Setup::default().start();
     let uri = "file:///prepare/format.md";
-    let text = "# t\n\n```lua\n  local x = 1\n```\n";
+    let text = "# t\n\n```lua\n  local x = 1; local y = 2\n```\n";
     open(&mut client, uri, text);
     hover_with_retry(&mut client, uri, 3, 4);
 
-    // The echo mock would uppercase the document; a formatter's edits to a
-    // prepared one are not mapped back through its map. Refused up front,
-    // not by a wait for a text the server never holds (which would take the
-    // 5 s budget).
+    // The echo mock formats the prepared (dedented) text, uppercasing it
+    // and breaking the line: the line it creates regains the indentation
+    // the peer removed.
     for method in ["textDocument/formatting", "textDocument/rangeFormatting"] {
-        let started = Instant::now();
         let response = client.send_request(
             method,
             json!({
@@ -415,48 +445,43 @@ fn formatting_is_not_offered_on_a_prepared_document() {
                 "options": { "tabSize": 2, "insertSpaces": true }
             }),
         );
-        assert!(response.get("error").is_none(), "{method}: {response}");
-        let edits = response["result"].as_array().cloned().unwrap_or_default();
-        assert!(edits.is_empty(), "{method}: {response}");
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < Duration::from_secs(3),
-            "{method} took {elapsed:?}"
+        let edits = response["result"]
+            .as_array()
+            .cloned()
+            .unwrap_or_else(|| panic!("{method}: {response}"));
+        assert_eq!(
+            apply_edits(text, &edits),
+            "# t\n\n```lua\n  LOCAL X = 1\n  LOCAL Y = 2\n```\n",
+            "{method}: {response}"
         );
     }
 }
 
 #[test]
-fn formatting_before_the_document_was_looked_up_is_refused_once_it_is_prepared() {
+fn formatting_before_the_document_was_looked_up_waits_for_its_prepared_text() {
     let (mut client, _dir) = Setup::default().start();
     let uri = "file:///prepare/format-early.md";
     let text = "# t\n\n```lua\n  local x = 1\n```\n";
     open(&mut client, uri, text);
 
-    // At once, and again while a hover may be sending the prepared text
-    // before the lifecycle pass looked the region up: each waits for the
-    // answer, and is refused up front rather than by waiting out the
-    // budget for a text its server never holds.
-    for attempt in 0..10 {
-        let started = Instant::now();
-        let response = client.send_request(
-            "textDocument/formatting",
-            json!({
-                "textDocument": { "uri": uri },
-                "options": { "tabSize": 2, "insertSpaces": true }
-            }),
-        );
-        assert!(response.get("error").is_none(), "{response}");
-        let edits = response["result"].as_array().cloned().unwrap_or_default();
-        assert!(edits.is_empty(), "{response}");
-        // The first may wait for the peer to start and answer.
-        let elapsed = started.elapsed();
-        assert!(
-            attempt == 0 || elapsed < Duration::from_millis(2500),
-            "formatting took {elapsed:?}"
-        );
-        let _ = hover(&mut client, uri, 3, 4);
-    }
+    // At once: the answer is not in yet. The request waits for it and
+    // formats the prepared text, its edits mapped back.
+    let response = client.send_request(
+        "textDocument/formatting",
+        json!({
+            "textDocument": { "uri": uri },
+            "options": { "tabSize": 2, "insertSpaces": true }
+        }),
+    );
+    let edits = response["result"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| panic!("{response}"));
+    assert_eq!(
+        apply_edits(text, &edits),
+        "# t\n\n```lua\n  LOCAL X = 1\n```\n",
+        "{response}"
+    );
 }
 
 #[test]

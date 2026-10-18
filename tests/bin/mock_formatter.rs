@@ -23,7 +23,7 @@
 //!   `diagnosticProvider`, and full sync with save; hover
 //!   answers the full text this server holds for the document, ranged over
 //!   the hovered line in its own coordinates; formatting and range
-//!   formatting uppercase; rename replaces the first line; a pull diagnostic
+//!   formatting uppercase, each `; ` breaking the line; rename replaces the first line; a pull diagnostic
 //!   spans the first line and carries the full text; completion inserts
 //!   `int(x)\nprint(y)` at the caret and the line `-- c` above the
 //!   document's first (and offers `echo-plain` with no edit), inlay hints
@@ -2852,6 +2852,8 @@ fn whole_document_edit(text: &str, mode: &str, options: Option<&Value>) -> Value
                 .unwrap_or_else(|| "missing".to_string());
             format!("-- tabSize={tab_size} insertSpaces={insert_spaces}\n")
         }
+        // Uppercased, each `; ` breaking the line (statements one per line).
+        "echo-document" => text.to_uppercase().replace("; ", "\n"),
         // "upper" and "range-upper"
         _ => text.to_uppercase(),
     };
