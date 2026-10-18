@@ -53,6 +53,13 @@ impl PreparedMap {
     /// P or once mapped (or touch where either's text bears on the other),
     /// an edit reaches into a gap, a line created in content has no single
     /// indentation to regain, or the host text would not survive.
+    ///
+    /// The host's own text, gaps and edge lines, is always kept; but on a
+    /// map with gaps the indentation lines regain is not yet exact in some
+    /// shapes (a placeholder's own line break, a gap ending the document,
+    /// segments that say nothing of their indent). Edit carriers open on
+    /// contiguous regions only, which have none; one opening on a
+    /// noncontiguous region needs those fixed first.
     pub(crate) fn map_edits(&self, edits: &[TextEdit], mode: EditMode) -> Option<Vec<TextEdit>> {
         let EditMode::Extent = mode;
         let prepared = &self.prepared_lines.text;
