@@ -50,10 +50,23 @@ impl Kakehashi {
                 completion_response_has_result,
             )
             .await?;
-        Ok(asking_to_requery(
-            response,
-            requery.load(std::sync::atomic::Ordering::Relaxed),
-        ))
+        // A layer ranked above virt can win before virt finished, which
+        // would make the ask depend on timing (and a re-query would be won
+        // by that layer again): with virt not first, an answer that came is
+        // left as it is.
+        let asked = requery.load(std::sync::atomic::Ordering::Relaxed);
+        let requery =
+            asked && keeps_requery_ask(response.is_some(), || self.completion_layers(&lsp_uri));
+        Ok(asking_to_requery(response, requery))
+    }
+
+    /// `textDocument/completion`'s layer order for `lsp_uri`'s host language.
+    fn completion_layers(&self, lsp_uri: &Uri) -> Vec<crate::config::settings::LayerSource> {
+        crate::lsp::lsp_impl::uri_to_url(lsp_uri)
+            .ok()
+            .and_then(|uri| self.document_language(&uri))
+            .map(|host_language| self.resolve_layer_config(&host_language, METHOD).priorities)
+            .unwrap_or_default()
     }
 
     /// Host layer: forward the params verbatim to the host language's own
@@ -272,6 +285,18 @@ impl HostCompletion {
     }
 }
 
+/// Whether the virt layer's ask to re-query stands for the answer the layer
+/// race gave: with nothing answered, or with virt first in `layers` (any
+/// answer then came once virt had finished); not when a layer ranked above
+/// virt answered, which could win before virt finished, so the ask would
+/// depend on timing (and a re-query be won by that layer again).
+fn keeps_requery_ask(
+    answered: bool,
+    layers: impl FnOnce() -> Vec<crate::config::settings::LayerSource>,
+) -> bool {
+    !answered || layers().first() == Some(&crate::config::settings::LayerSource::Virt)
+}
+
 /// `response`, still asking the client to re-query when a prepared
 /// document's server did (see `completion_virt_layer`): marked incomplete, or
 /// an empty incomplete list when nothing else answered.
@@ -310,6 +335,15 @@ fn completion_list_has_result(list: &CompletionList) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_requery_ask_stands_unless_a_layer_above_virt_answered() {
+        use crate::config::settings::LayerSource::{Host, Native, Virt};
+        assert!(keeps_requery_ask(false, || vec![Host, Virt]));
+        assert!(keeps_requery_ask(true, || vec![Virt, Host, Native]));
+        assert!(!keeps_requery_ask(true, || vec![Host, Virt, Native]));
+        assert!(!keeps_requery_ask(true, Vec::new));
+    }
 
     #[test]
     fn a_requery_ask_marks_whatever_answers_incomplete() {
