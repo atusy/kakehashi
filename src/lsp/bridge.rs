@@ -97,6 +97,7 @@ pub(crate) use protocol::translate_virtual_range_to_host;
 pub(crate) use protocol::workspace_edit_has_effect;
 pub(crate) use protocol::workspace_edit_preserves_line_prefixes;
 pub(crate) use protocol::workspace_edit_within_region;
+pub(crate) use protocol::{EditMode, translate_virtual_text_edits_to_host};
 /// Re-exported for tests outside the bridge that place coordinates through a
 /// prepared map.
 #[cfg(test)]

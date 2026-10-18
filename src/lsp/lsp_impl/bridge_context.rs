@@ -80,7 +80,11 @@ fn method_requires_contiguous_injection(method: &str) -> bool {
 fn method_maps_prepared_edits(method: &str) -> bool {
     matches!(
         method,
-        "textDocument/colorPresentation" | "textDocument/completion" | "textDocument/inlayHint"
+        "textDocument/colorPresentation"
+            | "textDocument/completion"
+            | "textDocument/formatting"
+            | "textDocument/inlayHint"
+            | "textDocument/rangeFormatting"
     )
 }
 
@@ -2737,15 +2741,15 @@ mod tests {
         };
         let for_method =
             |method| prepare_request_context_for(&server.bridge, "markdown", ctx(), method);
+        for method in ["textDocument/rename", "textDocument/codeAction"] {
+            assert!(for_method(method).await.is_none(), "{method} closes");
+        }
         for method in [
-            "textDocument/rename",
-            "textDocument/codeAction",
+            "textDocument/inlayHint",
+            "textDocument/completion",
             "textDocument/formatting",
             "textDocument/rangeFormatting",
         ] {
-            assert!(for_method(method).await.is_none(), "{method} closes");
-        }
-        for method in ["textDocument/inlayHint", "textDocument/completion"] {
             let open = for_method(method)
                 .await
                 .unwrap_or_else(|| panic!("{method} stays open"));
@@ -2864,13 +2868,15 @@ mod tests {
             contiguous: true,
             gaps: Default::default(),
         };
+        // Every edit method whose edits are not mapped back stays closed
+        // (inbound applyEdit is refused on its own path: the region's offset
+        // carries a map).
         for method in [
             "textDocument/rename",
             "textDocument/codeAction",
             "textDocument/prepareRename",
-            "textDocument/formatting",
-            "textDocument/rangeFormatting",
             "textDocument/linkedEditingRange",
+            "textDocument/onTypeFormatting",
         ] {
             assert!(!method_closed_to(&resolved, method, false), "{method}");
             assert!(method_closed_to(&resolved, method, true), "{method}");
@@ -2879,6 +2885,8 @@ mod tests {
             "textDocument/inlayHint",
             "textDocument/colorPresentation",
             "textDocument/completion",
+            "textDocument/formatting",
+            "textDocument/rangeFormatting",
         ] {
             assert!(!method_closed_to(&resolved, method, true), "{method}");
         }
@@ -2912,6 +2920,8 @@ mod tests {
             "textDocument/completion",
             "textDocument/inlayHint",
             "textDocument/colorPresentation",
+            "textDocument/formatting",
+            "textDocument/rangeFormatting",
         ] {
             assert!(method_maps_prepared_edits(method), "{method}");
             for prepared in [false, true] {

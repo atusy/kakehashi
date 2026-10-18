@@ -932,10 +932,10 @@ languages = ["lua"]
 }
 
 #[test]
-fn e2e_format_does_not_count_a_region_its_prepare_peer_prepared() {
-    // The same region, prepared by its peer, is no failure: the run
-    // exits 0.
-    let markdown = "# Test\n\n```lua\nprint('ok')\n```\n";
+fn e2e_format_formats_a_region_its_prepare_peer_prepared() {
+    // The same region, prepared by its peer (dedented), is formatted: the
+    // formatter's answer maps back with the indentation restored.
+    let markdown = "# Test\n\n```lua\n  print('ok')\n```\n";
     let ws = workspace_with(&[("doc.md", markdown)]);
     std::fs::write(
         ws.path().join("kakehashi.toml"),
@@ -977,9 +977,10 @@ languages = ["lua"]
         "a region its prepare peer prepared must exit 0; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    // Formatting is closed to a prepared document: the region is left as
-    // is, which the run does not count as a failure.
-    assert_eq!(read(ws.path(), "doc.md"), markdown);
+    assert_eq!(
+        read(ws.path(), "doc.md"),
+        "# Test\n\n```lua\n  PRINT('OK')\n```\n"
+    );
 }
 
 #[test]

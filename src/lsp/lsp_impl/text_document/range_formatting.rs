@@ -32,7 +32,7 @@ use crate::lsp::aggregation::server::{
     dispatch_preferred, dispatch_preferred_with_tokens, mint_region_progress_source,
 };
 use crate::lsp::bridge::{ClientProgressAggregator, ClientProgressDeregisterGuard};
-use crate::lsp::lsp_impl::bridge_context::{DocumentRequestContext, parse_host_verbatim};
+use crate::lsp::lsp_impl::bridge_context::{DocumentRequestContext, Sourced, parse_host_verbatim};
 use crate::text::PositionMapper;
 
 use super::super::{Kakehashi, uri_to_url};
@@ -78,6 +78,8 @@ impl Kakehashi {
 
             log::debug!("rangeFormatting called for {} range {:?}", uri, host_range);
 
+            // Before the text is read: see `Sourced::from_region`.
+            let revision = self.prepared_request_revision(&lsp_uri);
             let snapshot = match self.documents.get(&uri) {
                 None => {
                     log::debug!("rangeFormatting: No document found for {}", uri);
@@ -178,6 +180,9 @@ impl Kakehashi {
             let mut cp_minted: Vec<NumberOrString> = Vec::new();
 
             let mut spans = super::formatting::SpanReservations::default();
+            // The prepared regions edits are mapped through, for the final
+            // answer's check (see `formatting_sources_current`).
+            let mut sources = Vec::new();
             for resolved in all_regions.iter() {
                 // Non-contiguous combined injections contain masked host-only
                 // gaps. Even a covering range may fall back to full formatting,
@@ -296,8 +301,9 @@ impl Kakehashi {
                 )
                 .await
                 .ok();
-                // A formatter's edits to a prepared document are not mapped
-                // back through its map: closed as a non-contiguous one is.
+                // Closed as a non-contiguous region is, the document's shape
+                // read again with the context in; a prepared one stays open,
+                // its edits mapped back through its map.
                 let Some(region_ctx) = spans.admit(span, region_ctx, |ctx| {
                     !crate::lsp::lsp_impl::bridge_context::method_closed_to(
                         &ctx.resolved,
@@ -307,6 +313,14 @@ impl Kakehashi {
                 }) else {
                     continue;
                 };
+                if region_ctx.prepared.is_some() {
+                    sources.push(Sourced::from_region(
+                        &region_ctx,
+                        (),
+                        self.bridge.node_tracker(),
+                        revision,
+                    ));
+                }
                 // Mint this region's tracked-source token into the shared
                 // aggregator (the per-region map dispatch hands to its winning
                 // downstream).
@@ -424,23 +438,43 @@ impl Kakehashi {
                 )
             });
 
-            finalize_formatting_edits(outer_join_set, cancel_state.token.clone()).await
+            Ok(
+                finalize_formatting_edits(outer_join_set, cancel_state.token.clone())
+                    .await?
+                    .map(|edits| (edits, sources)),
+            )
         };
 
         // layer_method keys off "textDocument/formatting" ON PURPOSE: range
         // formatting is the partial-document counterpart of full formatting
         // and shares its layer order and aggregation key. request_method is
         // what goes on the wire to host-capable servers.
-        self.walk_layers(
-            &lsp_uri,
-            "textDocument/formatting",
-            "textDocument/rangeFormatting",
-            raw_params,
-            virt,
-            parse_host_verbatim::<Vec<TextEdit>>,
-            |edits: &Vec<TextEdit>| !edits.is_empty(),
-        )
-        .await
+        let answer = self
+            .walk_layers(
+                &lsp_uri,
+                "textDocument/formatting",
+                "textDocument/rangeFormatting",
+                raw_params,
+                virt,
+                |value| {
+                    parse_host_verbatim::<Vec<TextEdit>>(value).map(|edits| (edits, Vec::new()))
+                },
+                |(edits, _): &(Vec<TextEdit>, Vec<Sourced<()>>)| !edits.is_empty(),
+            )
+            .await?;
+        // The final answer chosen: its prepared regions' edits checked once
+        // more against the host text, which may have moved while it was held.
+        // A stale one is not counted: no one-shot run range-formats.
+        let pool = self.bridge.pool();
+        let tracker = self.bridge.node_tracker();
+        Ok(answer.and_then(|(edits, sources)| {
+            sources
+                .iter()
+                .all(|source| {
+                    source.still_current(pool, tracker, || self.host_content_version(&lsp_uri))
+                })
+                .then_some(edits)
+        }))
     }
 }
 
