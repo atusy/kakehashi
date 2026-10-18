@@ -154,16 +154,23 @@ impl Kakehashi {
             // unusably) are not sent, their save included: it is forwarded
             // to each whose prepared text is sent while the host is still at
             // the saved version (one answered unusably never is).
-            let held: Vec<String> = injections
-                .iter()
-                .filter(|injection| injection.held)
-                .map(|injection| injection.region_id.clone())
-                .collect();
+            // Nothing is held without the prepare layer: no scan.
+            let prepares = pool.prepares();
+            let held: Vec<String> = if prepares {
+                injections
+                    .iter()
+                    .filter(|injection| injection.held)
+                    .map(|injection| injection.region_id.clone())
+                    .collect()
+            } else {
+                Vec::new()
+            };
             if !held.is_empty() {
                 self.bridge
                     .hold_save(uri, saved_incarnation, saved_content_version, held);
             }
-            let injections = crate::lsp::lsp_impl::coordinator::sendable_injections(injections);
+            let injections =
+                crate::lsp::lsp_impl::coordinator::sendable_injections(prepares, injections);
             pool.sync_and_forward_did_save_to_virtual_docs(uri, saved_incarnation, &injections)
                 .await;
         }
