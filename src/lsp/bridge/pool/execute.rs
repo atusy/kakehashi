@@ -1129,6 +1129,89 @@ mod tests {
         remap.await.unwrap();
     }
 
+    /// The closing indent new lines regain differs between a whitespace-only
+    /// region (`\n  `: they take it) and one typed on at column 0 (`x\n  `:
+    /// they do not), with the same indentation removed from the same line.
+    /// A hint whose edit was made on the first and answered after the second
+    /// was recorded loses its edits, at the carrier and when chosen.
+    #[tokio::test]
+    async fn an_edit_answered_after_typing_reaches_no_hint() {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        use crate::lsp::lsp_impl::bridge_context::Sourced;
+        use tower_lsp_server::ls_types::{OneOf, Position, Range, ServerCapabilities};
+        let prepare = |text: &str| {
+            let answer = serde_json::from_value(serde_json::json!({"segments": [{
+                "type": "content", "changes": [{
+                    "range": {"start": {"line": 1, "character": 0},
+                              "end": {"line": 1, "character": 2}},
+                    "newText": ""
+                }]
+            }]}))
+            .unwrap();
+            apply_prepare_result(text, &VirtualLayout::single(text), Some(answer)).unwrap()
+        };
+        let before = prepare("\n  ");
+        let after = prepare("x\n  ");
+        let pool = Arc::new(LanguageServerPool::preparing());
+        let uri = Url::parse("file:///test/indent-policy.md").unwrap();
+        pool.open_host_incarnation(&uri, 1).await;
+        pool.record_latest_prepared_for_test(&uri, 1, "lua", TEST_ULID_LUA_0, &before);
+        let key = ConnectionKey::for_server("test-server");
+        let handle = create_handle_with_key(ConnectionState::Ready, key).await;
+        handle.set_server_capabilities(ServerCapabilities {
+            inlay_hint_provider: Some(OneOf::Left(true)),
+            ..Default::default()
+        });
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let upstream = UpstreamId::Number(991);
+        let request = {
+            let pool = Arc::clone(&pool);
+            let uri = uri.clone();
+            let upstream = upstream.clone();
+            let offset = RegionOffset::new(0, 0).with_prepared(Arc::clone(&before.map));
+            let text = before.text.clone();
+            tokio::spawn(async move {
+                pool.send_inlay_hint_request(
+                    "test-server",
+                    &devnull_config(),
+                    &uri,
+                    Range::new(Position::new(0, 0), Position::new(1, 2)),
+                    Position::new(1, 2),
+                    "lua",
+                    TEST_ULID_LUA_0,
+                    offset,
+                    &text,
+                    crate::lsp::bridge::HostRevision {
+                        incarnation: 1,
+                        content_version: 0,
+                    },
+                    Some(upstream),
+                    None,
+                )
+                .await
+            })
+        };
+        let id = wait_for_sent_request(&handle, &upstream).await;
+        pool.note_host_edited(&uri, 1, 1);
+        pool.record_latest_prepared_for_test(&uri, 1, "lua", TEST_ULID_LUA_0, &after);
+        pool.note_host_settled(&uri, 1, 1);
+        let _ = handle.router().route(serde_json::json!({
+            "jsonrpc": "2.0", "id": id.as_i64(), "result": [{
+                "position": {"line": 0, "character": 0}, "label": "add lines",
+                "textEdits": [{
+                    "range": {"start": {"line": 0, "character": 0},
+                              "end": {"line": 0, "character": 0}},
+                    "newText": "a\nb\n"
+                }]
+            }]
+        }));
+        let hints = request.await.unwrap().unwrap().unwrap();
+        assert_eq!(hints.len(), 1, "the hint stays shown");
+        assert!(hints[0].text_edits.is_none());
+        let sourced = Sourced::prepared_for_test(hints, &uri, "lua", TEST_ULID_LUA_0, &before.map);
+        assert!(!sourced.still_current(&pool));
+    }
+
     /// Typing that changed P as the indentation changed (`  f` to
     /// `    fo`) leaves no position of the request's map where it was: an
     /// edit replacing `f` through it would overwrite the new indentation.
@@ -1191,13 +1274,12 @@ mod tests {
         assert!(!ctx.request_map_current);
     }
 
-    /// A response is placed through its request's map only while that map
-    /// describes the region's current host text, read from the latest
-    /// recorded content: not while the host's newer text waits for its
-    /// answer, not once the same prepared text is recorded under a new map
-    /// (an edit to the host indentation the peer removes) — whatever the
-    /// connection still holds, which lags behind — but still after typing
-    /// recorded another prepared text, as any answer is stale then.
+    /// A response is placed through its request's map only while the
+    /// region's latest recorded content is the request's very text in the
+    /// very same coordinates: not while the host's newer text waits for its
+    /// answer, nor once another text is recorded — re-indented under the
+    /// same prepared text, or typed on — whatever the connection still
+    /// holds, which lags behind.
     #[tokio::test]
     async fn a_response_is_placed_only_while_its_map_describes_the_current_host_text() {
         use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
@@ -1279,28 +1361,39 @@ mod tests {
         // prepared text under a new map, however late the connection is.
         record(&reindented);
         assert!(!current(&request));
-        // Typing on recorded another prepared text: kept.
+        // Typing on recorded another prepared text: dropped too (the
+        // client asks again for it).
         record(&typed);
+        assert!(!current(&request));
+        // The request's own text current again (an undo): kept, in the same
+        // coordinates whichever answer gave them.
+        record(&strip("  red\n", 2));
         assert!(current(&request));
-        // The request's own map current again (an undo): kept.
-        record(&before);
-        assert!(current(&request));
-        // Typed on as its indentation changed (`  red` to `    redx`): P
-        // changed too, yet positions through the request's map land in the
-        // new indentation — dropped.
+        // Typed on as its indentation changed (`  red` to `    redx`).
         record(&strip("    redx\n", 4));
         assert!(!current(&request));
-        // A line added before a dedented one moves its removed indent to
-        // another line: dropped. (Availability only: the next request maps.)
+        // Lines added, before or after a dedented one, or left alone: other
+        // texts, whose blank lines and joins place an edit otherwise.
         let two_lines = strip_lines("  red\n  b\n");
         let two_request = RegionOffset::new(0, 0).with_prepared(Arc::clone(&two_lines.map));
         record(&two_lines);
         assert!(current(&two_request));
         record(&strip_lines("  red\n  x\n  b\n"));
         assert!(!current(&two_request));
-        // Lines left alone (not dedented) added after it: the same layout.
         record(&strip_lines("  red\n  b\nc\n"));
-        assert!(current(&two_request));
+        assert!(!current(&two_request));
+        // A blank line typed on (`  a\n\n` to `  a\nb\n`): the request's
+        // map gives an inserted line the content's indentation, the current
+        // one joins `b` as typed.
+        let blank = strip_lines("  a\n\n");
+        let blank_request = RegionOffset::new(0, 0).with_prepared(Arc::clone(&blank.map));
+        record(&blank);
+        assert!(current(&blank_request));
+        record(&strip_lines("  a\nb\n"));
+        assert!(!current(&blank_request));
+        // The region sent as is since (its pair lost its peer).
+        pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  red\n");
+        assert!(!current(&request));
         record(&before);
         // The host edited, its pass not settled yet (the parse window,
         // before any hold is published): the recorded text may be the one

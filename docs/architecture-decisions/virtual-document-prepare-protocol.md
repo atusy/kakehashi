@@ -255,26 +255,30 @@ edited V. It is refused, and dropped like any unsafe set, when:
 No edit in P reaches into the deleted edge lines or the closing indent
 deleted with them: P has no position inside them.
 
-An answer's edits are mapped only while the map its request was built on
-still describes the region's current host text, as recorded: read when
-the answer arrives, and once more when the final answer is chosen, since
-the servers' fan-in or the layer race can hold an answer while the host
-moves. They are dropped while the host's last edit has not been
-settled yet (its parse or lifecycle pass still running, so the recorded
-text may predate it), while the host's newer text waits for its prepare
-answer, once the recorded map lays V out otherwise (a line's removed
-indentation changed — an edit to indentation the peer removes, whether P
-changed with it or not — or lines moved past a removed indent, or a gap
-moved), and once the peer failed the request's input (see Failure; a reply
-arriving after that is refused whole, and one the failure lands under keeps
-no edit). Then completion and color presentations answer nothing, and inlay
-hints stay shown without their edits. Once typing has recorded another
-prepared text with the same layout (text within lines both documents
-share), an answer is stale as any LSP answer is when the document changes
-meanwhile, and is kept, as on unprepared documents; so an answer arriving
-within a keystroke's parse and prepare round-trip is dropped, one arriving
-after it kept. A line typed before a dedented one drops it too: an
-availability cost only, the next request answering for the new layout.
+An answer's edits are mapped only while the region's latest recorded
+content is the very text its request was built on, in the very same
+coordinates. This is read when the answer arrives, and once more when the
+final answer is chosen, since the servers' fan-in or the layer race can
+hold an answer while the host moves. The edits are dropped while the
+host's last edit has not been settled yet (its parse or lifecycle pass
+still running, so the recorded text may predate it), while the host's
+newer text waits for its prepare answer, once any other text is recorded
+(typed on, re-indented, sent as is), and once the peer failed the
+request's input (see Failure; a reply arriving after that is refused
+whole, and one the failure lands under keeps no edit). Then completion
+answers nothing (an empty incomplete list when it asked to re-query),
+color presentations answer nothing, and inlay hints stay shown without
+their edits.
+
+Unlike on an unprepared document, an answer overtaken by typing is
+dropped, not kept stale. How an edit maps back depends on the whole text
+— which lines are blank, what an inserted line joins, which indentation
+a created line regains — so no text but the request's is known to place
+it as the server meant, and a stale edit could land in indentation the
+host has and P never showed. Clients ask again on every keystroke, so the
+answer for the latest text still arrives and is kept: the cost is
+availability (an answer within a keystroke's parse and prepare
+round-trip), never a misplaced edit.
 
 A color presentation without a `textEdit` replaces the request range with
 its label; on a prepared document that edit is made explicit and mapped

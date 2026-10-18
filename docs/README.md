@@ -953,7 +953,9 @@ like work as on any document. The edits of completion items, inlay hints
 and color presentations are mapped back too: lines they add regain the
 indentation the prepare server removed, and edits that would reach into host
 text the prepared document does not show are dropped (completion snippets are
-offered only when they are literal text). Code actions, rename, formatting
+offered only when they are literal text). An answer to a request the
+document was edited after brings no edits: the editor's next request
+answers for the edited text. Code actions, rename, formatting
 and the other edit-producing methods are not available on a prepared
 document. Items listed from a prepared document are not resolved further:
 `*/resolve`, and call and type hierarchy follow-ups (incoming and outgoing
