@@ -51,6 +51,9 @@ struct Setup {
     /// it says: `preferred` ranks host first, `concatenated` runs virt then
     /// host.
     slow_host: Option<&'static str>,
+    /// Format markdown's lua documents with the concatenated pipeline (the
+    /// echo mock its one step).
+    concatenated: bool,
 }
 
 impl Default for Setup {
@@ -65,6 +68,7 @@ impl Default for Setup {
             wire_log: false,
             experimental: true,
             slow_host: None,
+            concatenated: false,
         }
     }
 }
@@ -83,6 +87,10 @@ impl Setup {
         } } } });
         if self.unprepared_python {
             markdown["bridge"]["python"] = json!({});
+        }
+        if self.concatenated {
+            markdown["bridge"]["lua"]["aggregation"]["textDocument/formatting"] =
+                json!({ "strategy": "concatenated", "priorities": ["echo"] });
         }
         if let Some(strategy) = self.slow_host {
             markdown["bridge"]["_self"] = json!({ "enabled": true });
@@ -510,6 +518,42 @@ fn on_type_formatting_on_a_prepared_document_maps_back_reindented() {
         "# t\n\n```lua\n  LOCAL X = 1\n  LOCAL Y = 2\n```\n",
         "{response}"
     );
+}
+
+#[test]
+fn the_concatenated_pipeline_formats_a_prepared_document() {
+    let (mut client, _dir) = Setup {
+        concatenated: true,
+        ..Setup::default()
+    }
+    .start();
+    // The second fence's leading blank line is deleted by the peer: the
+    // host keeps it.
+    for (index, text, formatted) in [
+        (
+            0,
+            "# t\n\n```lua\n  local x = 1; local y = 2\n```\n",
+            "# t\n\n```lua\n  LOCAL X = 1\n  LOCAL Y = 2\n```\n",
+        ),
+        (
+            1,
+            "# t\n\n```lua\n\n  local x = 1; local y = 2\n```\n",
+            "# t\n\n```lua\n\n  LOCAL X = 1\n  LOCAL Y = 2\n```\n",
+        ),
+    ] {
+        let uri = format!("file:///prepare/pipeline-{index}.md");
+        open(&mut client, &uri, text);
+        hover_with_retry(&mut client, &uri, 3 + index, 4);
+        let response = client.send_request(
+            "textDocument/formatting",
+            formatting_params("textDocument/formatting", &uri),
+        );
+        let edits = response["result"]
+            .as_array()
+            .cloned()
+            .unwrap_or_else(|| panic!("{response}"));
+        assert_eq!(apply_edits(text, &edits), formatted, "{response}");
+    }
 }
 
 /// The params of `method` over the whole of `uri`, typed at host (3, 14)
