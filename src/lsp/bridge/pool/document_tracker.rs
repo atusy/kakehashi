@@ -170,6 +170,13 @@ pub(crate) struct HeldText {
     /// The document version the text was sent under, which a server's push
     /// may name.
     pub(crate) version: i32,
+    /// The watermark at which the same text, held prepared, was held as is
+    /// again (a peer answering `null` gives a prepared text identical to
+    /// the one as is, then the pair loses its peer); 0 if never. The
+    /// coordinates are the same, so pushes still place, but an inbound edit
+    /// read before is not placed as is, where the refusal of edits through
+    /// a prepared document would not see it.
+    pub(crate) as_is_since: u64,
 }
 
 /// Put `previous` back as what `connection_key` holds for `uri_string`
@@ -805,12 +812,10 @@ impl DocumentTracker {
                 .filter(|held| held.fingerprint == fp)
             {
                 let changed = held.map.as_deref() != content.map.map(Arc::as_ref);
-                if let Some(map) = content.map {
+                if content.map.is_some() {
                     self.note_prepared(connection_key, virtual_uri, &uri_string);
-                    held.map = Some(Arc::clone(map));
-                } else {
-                    held.map = None;
                 }
+                self.rehold_locked(held, content.map.cloned());
                 // The same text under another map is what a request built
                 // on that map waits for.
                 if changed {
@@ -866,6 +871,22 @@ impl DocumentTracker {
             take_back_locked(&mut fingerprints, uri_string, connection_key, previous);
         }
         result
+    }
+
+    /// Hold the same text again, under `map`, under the records' lock. Its
+    /// coordinates stay those of the text, so its generation stays. Going
+    /// from prepared to as is (a peer answering `null` gives a prepared text
+    /// identical to the one as is, then the pair loses its peer) is noted
+    /// in `as_is_since`, past every watermark read before.
+    fn rehold_locked(&self, held: &mut HeldText, map: Option<Arc<PreparedMap>>) {
+        if held.map.is_some() && map.is_none() {
+            // Given out under this lock, published once the record is in
+            // (see `record_locked`).
+            let watermark = self.held_generations.load(Ordering::Relaxed) + 1;
+            held.as_is_since = watermark;
+            self.held_generations.store(watermark, Ordering::Release);
+        }
+        held.map = map;
     }
 
     /// Note that `connection_key` holds a prepared text of `virtual_uri`
@@ -1021,7 +1042,7 @@ impl DocumentTracker {
             // The same text: what the server computed stays in the same
             // coordinates, even when it maps back differently now.
             let previous = held.clone();
-            held.map = map;
+            self.rehold_locked(held, map);
             held.version = change.version;
             self.notify_held_changed();
             return Some(previous);
@@ -1035,6 +1056,7 @@ impl DocumentTracker {
             map,
             generation,
             version: change.version,
+            as_is_since: 0,
         };
         // The key is copied only for a document not on record yet.
         let previous = match docs.get_mut(uri_string) {
@@ -2208,12 +2230,73 @@ mod tests {
         assert_eq!(remapped.version, 2);
         assert!(Arc::ptr_eq(remapped.map.as_ref().unwrap(), &mapped));
         assert!(tracker.ever_held_prepared());
+        // Under another map: likewise.
+        let other = apply_prepare_result("a", &VirtualLayout::single("a"), None)
+            .unwrap()
+            .map;
+        tracker.record_sent_for_test(
+            &virtual_uri,
+            &conn,
+            SentText {
+                text: "a",
+                map: Some(&other),
+            },
+            2,
+        );
+        assert_eq!(
+            tracker.held_text(&uri, &conn).unwrap().generation,
+            remapped.generation
+        );
 
         tracker.record_sent_for_test(&virtual_uri, &conn, "b".into(), 3);
         let changed = tracker.held_text(&uri, &conn).unwrap();
         assert!(changed.generation > first.generation);
         assert!(changed.generation <= tracker.held_through());
         assert!(changed.map.is_none());
+    }
+
+    /// An inbound edit read while a peer's `null` answer held a prepared
+    /// text identical to the one as is, placed after the pair lost its peer
+    /// and the same text was held as is again: the watermark it was read
+    /// under no longer covers what is held, so it places nowhere rather
+    /// than as is (where the refusal of prepared edits would not see it).
+    #[test]
+    fn an_edit_read_under_a_prepared_text_places_nowhere_once_it_is_held_as_is() {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let uri = virtual_uri.to_uri_string();
+        let conn = ConnectionKey::for_server("lua");
+        let mapped = apply_prepare_result("a", &VirtualLayout::single("a"), None)
+            .unwrap()
+            .map;
+        tracker.record_sent_for_test(
+            &virtual_uri,
+            &conn,
+            SentText {
+                text: "a",
+                map: Some(&mapped),
+            },
+            1,
+        );
+        let read = tracker.observe_through();
+        let generation = tracker.held_text(&uri, &conn).unwrap().generation;
+        tracker.record_sent_for_test(&virtual_uri, &conn, "a".into(), 1);
+        assert!(matches!(
+            tracker.presentation(&uri, &conn, read, RegionPrepare::default(), "a"),
+            Presentation::Unavailable
+        ));
+        // A push read then is in the same coordinates, and still places.
+        let pushed = super::super::Observed::Read {
+            generation: Some(generation),
+            prepared: true,
+            stale_version: false,
+        };
+        assert!(matches!(
+            tracker.presentation(&uri, &conn, pushed, RegionPrepare::default(), "a"),
+            Presentation::AsIs
+        ));
     }
 
     #[tokio::test]
@@ -2250,8 +2333,9 @@ mod tests {
         assert!(Arc::ptr_eq(remapped.map.as_ref().unwrap(), &mapped));
         assert_eq!(remapped.generation, first.generation);
         assert_eq!(remapped.version, first.version);
+        assert_eq!(remapped.as_is_since, 0);
 
-        // And back as is.
+        // And back as is: the same generation, held as is since then.
         assert_eq!(
             tracker
                 .increment_version_if_content_changed(&virtual_uri, &conn, "a")
@@ -2259,7 +2343,10 @@ mod tests {
                 .map(ContentChange::version),
             None
         );
-        assert!(tracker.held_text(&uri, &conn).unwrap().map.is_none());
+        let as_is = tracker.held_text(&uri, &conn).unwrap();
+        assert!(as_is.map.is_none());
+        assert_eq!(as_is.generation, remapped.generation);
+        assert!(as_is.as_is_since > remapped.generation);
 
         // Another text is a send, which alone records it.
         assert!(
