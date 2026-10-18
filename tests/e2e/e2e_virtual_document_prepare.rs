@@ -860,6 +860,40 @@ fn range_formatting_does_not_wait_for_regions_outside_its_range() {
 }
 
 #[test]
+fn without_experimental_features_formatting_answers_as_unprepared() {
+    // With experimental features off, the formatting methods answer as on
+    // main: the edits' ranges translated, their text as the server wrote it
+    // (the line the formatter breaks off regains no indent).
+    let (mut client, _dir) = Setup {
+        experimental: false,
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/flag-off-format.md";
+    let text = "# t\n\n```lua\n  local x = 1; local y = 2\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+    for method in [
+        "textDocument/formatting",
+        "textDocument/rangeFormatting",
+        "textDocument/onTypeFormatting",
+    ] {
+        let response = client.send_request(method, formatting_params(method, uri));
+        assert_eq!(
+            response["result"],
+            json!([{
+                "range": {
+                    "start": { "line": 3, "character": 0 },
+                    "end": { "line": 4, "character": 0 }
+                },
+                "newText": "  LOCAL X = 1\nLOCAL Y = 2\n"
+            }]),
+            "{method}"
+        );
+    }
+}
+
+#[test]
 fn without_experimental_features_nothing_is_prepared() {
     // The peer advertises the request and is configured to prepare lua, but
     // with experimental features off it is never asked: the document goes
