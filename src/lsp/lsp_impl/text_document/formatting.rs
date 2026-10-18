@@ -182,8 +182,12 @@ impl Kakehashi {
                 // once more against the host text, which may have moved while
                 // it was held.
                 answer.and_then(|(edits, sources)| {
-                    self.formatting_sources_current(&lsp_uri, &sources, &cancel_state)
-                        .then_some(edits)
+                    self.formatting_sources_current(
+                        &lsp_uri,
+                        &sources,
+                        &cancel_state.request_error_sink,
+                    )
+                    .then_some(edits)
                 })
             }
             AggregationStrategy::Concatenated => {
@@ -225,8 +229,12 @@ impl Kakehashi {
                             )
                             .await?
                             .and_then(|(edits, sources)| {
-                                self.formatting_sources_current(&lsp_uri, &sources, &cancel_state)
-                                    .then_some(edits)
+                                self.formatting_sources_current(
+                                    &lsp_uri,
+                                    &sources,
+                                    &cancel_state.request_error_sink,
+                                )
+                                .then_some(edits)
                             })
                         }
                         LayerSource::Host => {
@@ -567,7 +575,8 @@ impl Kakehashi {
 
     /// Whether every prepared region a formatting answer was mapped through
     /// is still the host's text (see [`Sourced::still_current`]). One that
-    /// is not fails the request — counted, for the CLI to exit non-zero —
+    /// is not fails the request — counted in `failure_sink`, for the CLI to
+    /// exit non-zero —
     /// and the answer's virt edits are dropped, whichever region they came
     /// from: the host moved under the answer, and an edit read for a region
     /// no longer as it was would land elsewhere.
@@ -575,7 +584,7 @@ impl Kakehashi {
         &self,
         lsp_uri: &tower_lsp_server::ls_types::Uri,
         sources: &[Sourced<()>],
-        cancel_state: &FormattingCancelState<'_>,
+        failure_sink: &RequestErrorSink,
     ) -> bool {
         let pool = self.bridge.pool();
         let tracker = self.bridge.node_tracker();
@@ -589,7 +598,7 @@ impl Kakehashi {
             "formatting result for {} dropped: the host text moved under a prepared virtual document it was mapped through",
             lsp_uri.as_str()
         );
-        count_request_errors(&cancel_state.request_error_sink, 1);
+        count_request_errors(failure_sink, 1);
         false
     }
 
