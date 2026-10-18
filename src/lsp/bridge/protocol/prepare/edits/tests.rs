@@ -176,6 +176,24 @@ fn touching_edits_are_refused() {
 }
 
 #[test]
+fn edits_touching_mid_line_between_text_map() {
+    // Neither decides an indent nor a line break where they meet (a
+    // completion rewriting the receiver right before its own range, say).
+    let (virtual_text, map) = dedented();
+    let edits = [edit((0, 3), (0, 3), "z"), edit((0, 2), (0, 3), "_")];
+    let mapped = map.map_edits(&edits, EditMode::Extent).unwrap();
+    assert_eq!(apply_to(&virtual_text, &mapped), "  if_zx:\n    y\n");
+    // With no text, or a line break, on the side where they meet, they do.
+    for edits in [
+        [edit((0, 2), (0, 3), ""), edit((0, 3), (0, 3), "z")],
+        [edit((0, 2), (0, 3), "\n"), edit((0, 3), (0, 3), "z")],
+        [edit((0, 2), (0, 3), "_"), edit((0, 3), (0, 3), "\rz")],
+    ] {
+        assert_eq!(map.map_edits(&edits, EditMode::Extent), None, "{edits:?}");
+    }
+}
+
+#[test]
 fn a_reversed_edit_past_the_end_is_refused() {
     let map = prepare("a", json!([]));
     assert_eq!(map.map_one_with_extent(&edit((2, 0), (1, 0), "X")), None);

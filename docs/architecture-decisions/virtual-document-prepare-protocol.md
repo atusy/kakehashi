@@ -218,9 +218,11 @@ A set of edits the client applies together (a hint's `textEdits`) is mapped
 one by one and checked as a whole on the edited V. It is refused, and
 dropped like any unsafe set, when:
 
-- an edit is reversed; edits overlap or touch in P (one ending where
-  another starts, or two inserting at one place: how each regains a removed
-  indent depends on the other's text), or overlap once mapped;
+- an edit is reversed; edits overlap in P or once mapped; or edits touch
+  (one ending where another starts, or two inserting at one place) at a
+  line start, or with a line break or no text on the side where they meet:
+  how each regains a removed indent, or where a CR and an LF meet, depends
+  on the other's text;
 - an edge of a mapped edit falls between a CR and an LF of V, where no LSP
   position is;
 - an edit reaches into a gap's text (or, for a gap the peer emptied,
