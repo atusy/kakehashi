@@ -3777,8 +3777,11 @@ mod formatting_reference {
         if !document.closing.is_empty() && !indented.is_empty() && !at_line_start {
             return None;
         }
-        // A lone CR ending the text would fuse with the closing lines' LF.
-        if indented.ends_with('\r') && document.closing.starts_with('\n') {
+        // A lone CR ending the text would fuse with the closing lines' LF,
+        // and an LF starting it with the leading lines' CR.
+        if indented.ends_with('\r') && document.closing.starts_with('\n')
+            || document.leading.ends_with('\r') && indented.starts_with('\n')
+        {
             return None;
         }
         Some(format!(
@@ -3844,7 +3847,7 @@ mod formatting_reference {
             failure_persistence: None,
             ..Config::default()
         });
-        let (mapped_sets, changing) = (Cell::new(0), Cell::new(0));
+        let (mapped_sets, changing, over_refused) = (Cell::new(0), Cell::new(0), Cell::new(0));
         let strategy = (
             prop::collection::vec(line(), 1..6),
             prop::sample::select(vec!["  ", "\t", "    "]),
@@ -3881,6 +3884,13 @@ mod formatting_reference {
                     prop_assert_eq!(apply(&prepared, &edits), formatted.clone());
                     let Some(mapped) = map.map_edits_within(&edits, EditMode::Formatting, budget)
                     else {
+                        // Refused with time enough: an answer the host
+                        // cannot take, or (rarely) one turning line breaks
+                        // among several blank lines, whose pairing can meet
+                        // a CR and an LF the check refuses.
+                        if budget > Duration::ZERO && reference(&document, &output).is_some() {
+                            over_refused.set(over_refused.get() + 1);
+                        }
                         return Ok(());
                     };
                     mapped_sets.set(mapped_sets.get() + 1);
@@ -3902,13 +3912,21 @@ mod formatting_reference {
                 },
             )
             .unwrap();
+        // Cases the host could take, refused: availability only, and rare.
+        assert!(
+            over_refused.get() * 200 <= cases as usize,
+            "refused {} answers the host could take",
+            over_refused.get()
+        );
         (mapped_sets.get(), changing.get())
     }
 
     #[test]
     fn formatting_answers_give_exactly_the_reference_host_text() {
-        let (mapped, changing) = check(Duration::from_secs(10), 3000);
-        assert!(changing > 1200, "mapped {mapped}, {changing} changing P");
+        let (mapped, changing) = check(FORMATTING_DIFF_BUDGET, 3000);
+        // Every refusal is checked above; this only keeps the run from
+        // passing on nothing.
+        assert!(changing > 1000, "mapped {mapped}, {changing} changing P");
     }
 
     #[test]
