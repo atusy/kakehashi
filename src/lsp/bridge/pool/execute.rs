@@ -1188,7 +1188,7 @@ mod tests {
         };
         assert!(current(&request));
         // The host's newer text waits for its answer: held.
-        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, None);
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
         assert!(!current(&request));
         // Its answer recorded (the hold cleared in the same step): the same
         // prepared text under a new map, however late the connection is.
@@ -1222,10 +1222,22 @@ mod tests {
         pool.note_host_settled(&host_uri, 1, 8);
         assert!(!current(&request));
         record(&before);
+        // A map its peer revoked since describes nothing it still gives.
+        let revocation = Arc::new(crate::lsp::bridge::protocol::Revocation::default());
+        let mut revoked = strip("  red\n", 2).map;
+        Arc::get_mut(&mut revoked)
+            .unwrap()
+            .set_revocation(Arc::clone(&revocation));
+        record(&before);
+        let revoked_request = RegionOffset::new(0, 0).with_prepared(Arc::clone(&revoked));
+        assert!(current(&revoked_request));
+        revocation.revoke(crate::lsp::bridge::protocol::next_presentation());
+        assert!(revoked.revoked());
+        assert!(!current(&revoked_request));
         // A request as is reads nothing.
         pool.note_host_edited(&host_uri, 1, 9);
         assert!(current(&RegionOffset::new(0, 0)));
-        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, None);
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
         assert!(current(&RegionOffset::new(0, 0)));
     }
 
