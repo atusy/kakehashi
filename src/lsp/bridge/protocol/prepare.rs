@@ -725,6 +725,15 @@ impl PreparedMap {
         self.input = input;
     }
 
+    /// The length (in UTF-16 units, its line break excluded) of the virtual
+    /// document's `line`; the last line's for one past the end.
+    pub(crate) fn virtual_line_length(&self, line: u32) -> u32 {
+        let end = self
+            .virtual_lines
+            .offset_clamped(Position::new(line, u32::MAX));
+        self.virtual_lines.position(end).character
+    }
+
     /// The virtual text this map's answer was given for.
     pub(crate) fn virtual_text(&self) -> &str {
         &self.virtual_lines.text
