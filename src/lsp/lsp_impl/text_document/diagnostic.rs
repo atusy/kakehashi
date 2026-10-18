@@ -289,6 +289,9 @@ impl Kakehashi {
         // answer is incomplete until that document is sent. (One the peer
         // answered unusably is not bridged at all, by design.)
         let prepare_skipped = std::sync::atomic::AtomicBool::new(false);
+        // Before any region is looked up: an answer landing from here on may
+        // re-sync the host before this pull owes it a refresh.
+        let prepare_answers_then = self.bridge.prepare_host_answers(&uri);
         let virt_fut = async {
             let mut outer_join_set: JoinSet<Vec<Diagnostic>> = JoinSet::new();
             for resolved in virt_regions.iter() {
@@ -504,7 +507,8 @@ impl Kakehashi {
             // Owed a refresh once the region's prepared text is sent (the
             // prepare resync settles the debt), not right away: a re-pull now
             // would find the region still waiting on its peer.
-            self.bridge.owe_pull_after_prepare(&uri);
+            self.bridge
+                .owe_pull_after_prepare(&uri, prepare_answers_then);
         } else {
             // A failed/partial fan-out (`!pull_clean`) still advances the
             // coverage version but clears neither the pull-view lag nor the
