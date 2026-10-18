@@ -529,6 +529,61 @@ impl InjectionCoordinator {
         presented_injection(injection, lookup)
     }
 
+    /// Hold `uri`'s held injections whose pair a peer is known to prepare
+    /// (see `LanguageServerPool::hold_latest_virtual_content`), each marked
+    /// with when its failed input was taken if its peer failed it: no request
+    /// opens one with text as is, nor reads coordinates through a failed one
+    /// from an answer taken before, as no push is placed through it. By
+    /// whoever holds the documents on their inputs (the lifecycle pass, a
+    /// save at the saved version), under the edit lock. Returns the held
+    /// regions, for [`Self::close_unprepared_held`]. Nothing is held
+    /// without the prepare layer: no scan.
+    pub(crate) fn publish_holds<'a>(
+        &self,
+        uri: &Url,
+        incarnation: u64,
+        host_language: &str,
+        injections: &'a [BridgeInjection],
+    ) -> Vec<(&'a str, &'a str)> {
+        if !self.bridge.pool().prepares() {
+            return Vec::new();
+        }
+        let held: Vec<(&str, &str)> = injections
+            .iter()
+            .filter(|injection| {
+                injection.held
+                    && self
+                        .bridge
+                        .prepare_peer_known(host_language, &injection.language)
+            })
+            .map(|injection| (injection.language.as_str(), injection.region_id.as_str()))
+            .collect();
+        for (language, region_id) in &held {
+            self.bridge.pool().hold_latest_virtual_content(
+                uri,
+                incarnation,
+                language,
+                region_id,
+                self.bridge.prepare_failed_at(uri, language, region_id),
+            );
+        }
+        held
+    }
+
+    /// Close the documents of `held` (see [`Self::publish_holds`]) whose
+    /// servers still hold the text sent before their pair gained a peer:
+    /// held documents keep the text sent last, which for them is
+    /// unprepared, and a prepared pair never bridges unprepared text.
+    pub(crate) async fn close_unprepared_held(&self, uri: &Url, held: &[(&str, &str)]) {
+        if held.is_empty() {
+            return;
+        }
+        for region_id in self.bridge.close_unprepared_held_docs(uri, held).await {
+            self.diagnostics
+                .evict_source(uri, &DiagnosticSource::Region(region_id));
+        }
+    }
+
     /// Process injected languages: resolve injection data, optionally forward didChange,
     /// auto-install missing parsers, and eagerly open virtual documents.
     ///
@@ -691,43 +746,9 @@ impl InjectionCoordinator {
         // Held injections are held from here, before the awaits below: a
         // request opening one of them lazily checks the hold, and must not
         // send its text as is while the pass is still on its way to the
-        // sweep that would close it. A failed one is marked so: no request
-        // reads coordinates through it, as no push is placed through it.
-        // Nothing is held without the prepare layer: no scan.
+        // sweep that would close it.
+        let held = self.publish_holds(uri, incarnation, &host_language, &injections);
         let prepares = self.bridge.pool().prepares();
-        let held: Vec<(&str, &str, Option<u64>)> = if prepares {
-            injections
-                .iter()
-                .filter(|injection| {
-                    injection.held
-                        && self
-                            .bridge
-                            .prepare_peer_known(&host_language, &injection.language)
-                })
-                .map(|injection| {
-                    (
-                        injection.language.as_str(),
-                        injection.region_id.as_str(),
-                        self.bridge.prepare_failed_at(
-                            uri,
-                            &injection.language,
-                            &injection.region_id,
-                        ),
-                    )
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        for (language, region_id, failed_at) in &held {
-            self.bridge.pool().hold_latest_virtual_content(
-                uri,
-                incarnation,
-                language,
-                region_id,
-                *failed_at,
-            );
-        }
         // Stop the previous pass before closing a replaced language-bearing URI;
         // otherwise an old eager task can enqueue didOpen after the close and
         // resurrect the stale URI. The new batch is created below after cleanup.
@@ -778,20 +799,11 @@ impl InjectionCoordinator {
         // candidates' handshakes tell whether any prepares it is most likely
         // sent as is again once they do, and closing its documents meanwhile
         // would only drop their diagnostics.
-        if !held.is_empty() {
-            // After the hold above, so a request lazily opening one of them
-            // as is meanwhile either saw the hold or registered before this
-            // sweep, which then finds and closes it (see
-            // `LanguageServerPool::ensure_document_opened`).
-            let held: Vec<(&str, &str)> = held
-                .iter()
-                .map(|(language, region_id, _)| (*language, *region_id))
-                .collect();
-            for region_id in self.bridge.close_unprepared_held_docs(uri, &held).await {
-                self.diagnostics
-                    .evict_source(uri, &DiagnosticSource::Region(region_id));
-            }
-        }
+        // After the hold above, so a request lazily opening one of them as
+        // is meanwhile either saw the hold or registered before this sweep,
+        // which then finds and closes it (see
+        // `LanguageServerPool::ensure_document_opened`).
+        self.close_unprepared_held(uri, &held).await;
         let still_held: HashSet<String> = if replay_held_save && prepares {
             injections
                 .iter()
