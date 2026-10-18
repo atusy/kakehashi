@@ -210,10 +210,10 @@ replaces, clears or deletes whole lines, or opens with a line break, also
 covers the indentation the peer removed from that line, and a change ending
 at a line start keeps that line's own removed indentation (the change takes
 it along and gives it back). Every line the edit's text begins regains the
-indentation the peer removed from the segment it lands in, provided the
-peer removed the same indentation from every line of that segment;
-otherwise an edit creating a line there is refused, since no single
-indentation is right.
+indentation the peer removed from the segment it lands in, provided every
+indentation the peer removed in that segment is the same (lines it left
+alone do not count); otherwise an edit creating a line there is refused,
+since no single indentation is right.
 
 A set of edits the client applies together (a hint's `textEdits`, a
 completion item's or color presentation's main edit with its
