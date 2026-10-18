@@ -427,10 +427,10 @@ pub(super) fn transform_completion_item(
             return false;
         }
         // On a prepared document the client inserts the text at the caret
-        // as is. Where the same text as an edit would come back otherwise —
-        // regaining an indent at a blank line among dedented ones — the two
-        // disagree, and which is right is no range the client was given:
-        // refused.
+        // as is. Where the same text as an edit at the caret regains an
+        // indent (a blank line among dedented ones, where no word prefix is
+        // the client's to replace), the item goes out as that edit, as an
+        // item with one would; one mapping anywhere else is refused.
         if prepared
             && let Some(caret) = request_host_position
             && !effective.is_empty()
@@ -446,9 +446,12 @@ pub(super) fn transform_completion_item(
                 offset,
                 EditMode::Extent,
             ) || probe[0].range != tower_lsp_server::ls_types::Range::new(caret, caret)
-                || probe[0].new_text != effective
             {
                 return false;
+            }
+            if probe[0].new_text != effective {
+                let [edit] = probe;
+                item.text_edit = Some(CompletionTextEdit::Edit(edit));
             }
         }
     }
@@ -1048,7 +1051,7 @@ mod tests {
     }
 
     #[test]
-    fn a_prepared_item_inserted_at_the_caret_must_mean_what_its_edit_would() {
+    fn a_prepared_item_inserted_at_the_caret_goes_out_as_its_edit_would() {
         // `    abc\n\n    xyz\n` dedented by four: on the blank line an edit
         // would regain the indent the client's verbatim insertion lacks.
         let virtual_text = "    abc\n\n    xyz\n";
@@ -1069,21 +1072,36 @@ mod tests {
         };
         let offset = RegionOffset::new(10, 0).with_prepared(map);
         let plain = || item(json!({"label": "foo"}));
-        assert!(!transform_completion_item(
-            &mut plain(),
+        let mut on_blank = plain();
+        assert!(transform_completion_item(
+            &mut on_blank,
             &offset,
             Position::new(13, 0),
             Some(Position::new(11, 0)),
             ClientInsertMode::default(),
         ));
-        // After text, the insertion is what the edit would be.
+        assert_eq!(
+            on_blank.text_edit,
+            Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(
+                tower_lsp_server::ls_types::TextEdit {
+                    range: tower_lsp_server::ls_types::Range::new(
+                        Position::new(11, 0),
+                        Position::new(11, 0)
+                    ),
+                    new_text: "    foo".to_string(),
+                }
+            ))
+        );
+        // After text, the insertion is what the edit would be: as it came.
+        let mut after_text = plain();
         assert!(transform_completion_item(
-            &mut plain(),
+            &mut after_text,
             &offset,
             Position::new(13, 0),
             Some(Position::new(10, 7)),
             ClientInsertMode::default(),
         ));
+        assert_eq!(after_text.text_edit, None);
     }
 
     #[test]
