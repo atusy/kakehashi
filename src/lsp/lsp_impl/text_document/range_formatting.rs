@@ -465,14 +465,8 @@ impl Kakehashi {
         // The final answer chosen: its prepared regions' edits checked once
         // more against the host text, which may have moved while it was held.
         // A stale one is not counted: no one-shot run range-formats.
-        let pool = self.bridge.pool();
-        let tracker = self.bridge.node_tracker();
         Ok(answer.and_then(|(edits, sources)| {
-            sources
-                .iter()
-                .all(|source| {
-                    source.still_current(pool, tracker, || self.host_content_version(&lsp_uri))
-                })
+            self.formatting_sources_current(&lsp_uri, &sources, &None)
                 .then_some(edits)
         }))
     }
