@@ -319,7 +319,16 @@ impl LanguageServerPool {
             .await
         {
             Some(mut resolved) => {
-                if transform_completion_item(&mut resolved, &offset, region_end, None) {
+                // No prepared region gets this far (its items never resolve:
+                // `Kakehashi::completion_resolve_region`), so the client's insert mode,
+                // which only a prepared edit consults, does not matter.
+                if transform_completion_item(
+                    &mut resolved,
+                    &offset,
+                    region_end,
+                    None,
+                    super::completion::ClientInsertMode::default(),
+                ) {
                     // A client may resolve this result again. Its ranges now
                     // use the live geometry, so their next inverse mapping
                     // must use that same geometry rather than the producer's.

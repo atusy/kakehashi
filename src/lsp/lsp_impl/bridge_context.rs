@@ -80,7 +80,7 @@ fn method_requires_contiguous_injection(method: &str) -> bool {
 fn method_maps_prepared_edits(method: &str) -> bool {
     matches!(
         method,
-        "textDocument/colorPresentation" | "textDocument/inlayHint"
+        "textDocument/colorPresentation" | "textDocument/completion" | "textDocument/inlayHint"
     )
 }
 
@@ -2332,7 +2332,7 @@ mod tests {
 
     /// An edit method on a region the lifecycle pass has not looked up yet
     /// is closed once its answer is in, unless the document goes as is;
-    /// inlay hints stay open (their edits are mapped back).
+    /// inlay hints and completion stay open (their edits are mapped back).
     #[tokio::test]
     async fn an_answer_closes_edit_methods_before_the_lifecycle_pass_looks() {
         let (service, resolved, uri) = kakehashi_with_an_unlooked_region();
@@ -2361,12 +2361,14 @@ mod tests {
         let for_method =
             |method| prepare_request_context_for(&server.bridge, "markdown", ctx(), method);
         assert!(for_method("textDocument/rename").await.is_none());
-        assert!(for_method("textDocument/completion").await.is_none());
-        let hint = for_method("textDocument/inlayHint")
-            .await
-            .expect("hints stay open");
-        assert!(hint.prepared.is_some());
-        assert_eq!(hint.resolved.virtual_content, "a");
+        assert!(for_method("textDocument/codeAction").await.is_none());
+        for method in ["textDocument/inlayHint", "textDocument/completion"] {
+            let open = for_method(method)
+                .await
+                .unwrap_or_else(|| panic!("{method} stays open"));
+            assert!(open.prepared.is_some());
+            assert_eq!(open.resolved.virtual_content, "a");
+        }
     }
 
     /// A region the lifecycle pass holds on an unusable answer is not
@@ -2475,7 +2477,6 @@ mod tests {
         };
         for method in [
             "textDocument/rename",
-            "textDocument/completion",
             "textDocument/codeAction",
             "textDocument/prepareRename",
             "textDocument/formatting",
@@ -2485,7 +2486,11 @@ mod tests {
             assert!(!method_closed_to(&resolved, method, false), "{method}");
             assert!(method_closed_to(&resolved, method, true), "{method}");
         }
-        for method in ["textDocument/inlayHint", "textDocument/colorPresentation"] {
+        for method in [
+            "textDocument/inlayHint",
+            "textDocument/colorPresentation",
+            "textDocument/completion",
+        ] {
             assert!(!method_closed_to(&resolved, method, true), "{method}");
         }
         assert!(!method_closed_to(&resolved, "textDocument/hover", true));

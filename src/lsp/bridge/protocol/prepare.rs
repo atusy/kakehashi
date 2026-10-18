@@ -968,6 +968,19 @@ impl PreparedMap {
             .take_while(move |run| run.virtual_.start <= offset)
     }
 
+    /// Whether a V position sits within indentation or blank lines the peer
+    /// removed: P has no position there, and one at the line's content (or
+    /// the content's end) stands in for it, starts included.
+    pub(crate) fn virtual_position_in_removed_indent(&self, position: Position) -> bool {
+        let offset = self.virtual_lines.offset_clamped(position);
+        self.offset_in_removed_lines(offset)
+            || self.runs_at_virtual(offset).any(|run| {
+                run.kind == RunKind::Deleted
+                    && run.virtual_.start <= offset
+                    && offset < run.virtual_.end
+            })
+    }
+
     /// Whether the V range reaches inside a gap's host text (an empty range:
     /// whether it sits strictly inside one).
     pub(crate) fn virtual_range_in_gap(&self, range: tower_lsp_server::ls_types::Range) -> bool {

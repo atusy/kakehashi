@@ -949,12 +949,13 @@ export default async () => ({
 
 kakehashi translates every position and range between the prepared and the
 original document: hovers, definitions, diagnostics, folding ranges and the
-like work as on any document. The edits of inlay hints and color
-presentations are mapped back too: lines they add regain the indentation the
-prepare server removed, and edits that would touch host text the prepared
-document does not show are dropped.
-Completion, code actions, rename, formatting and the other edit-producing
-methods are not available on a prepared document. Items listed from a prepared document are not resolved further:
+like work as on any document. The edits of completion items, inlay hints
+and color presentations are mapped back too: lines they add regain the
+indentation the prepare server removed, and edits that would touch host text
+the prepared document does not show are dropped (completion snippets are
+offered only when they are literal text). Code actions, rename, formatting
+and the other edit-producing methods are not available on a prepared
+document. Items listed from a prepared document are not resolved further:
 `*/resolve`, and call and type hierarchy follow-ups (incoming and outgoing
 calls, supertypes and subtypes), return nothing more. A document the server fails to prepare is not sent downstream at
 all; answer `null` to keep a document unchanged.

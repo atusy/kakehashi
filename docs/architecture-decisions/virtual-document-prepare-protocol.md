@@ -193,9 +193,9 @@ The methods closed to a non-contiguous combined document — codeAction,
 colorPresentation, completion, formatting, inlayHint, linkedEditingRange,
 onTypeFormatting, prepareRename, rangeFormatting, rename — are closed to a
 prepared one too, as is an inbound `workspace/applyEdit` computed for a
-prepared text, but for inlay hints and color presentations: they stay
-available on a contiguous prepared document, their edits mapped as Edits
-describes.
+prepared text, but for completion, inlay hints and color presentations:
+they stay available on a contiguous prepared document, their edits mapped
+as Edits describes.
 A `*/resolve` envelope minted from a prepared document never resolves,
 nor does a call or type hierarchy item minted from one answer its
 follow-ups (`callHierarchy/incomingCalls`, `outgoingCalls`,
@@ -215,9 +215,9 @@ peer removed the same indentation from every line of that segment;
 otherwise an edit creating a line there is refused, since no single
 indentation is right.
 
-A set of edits the client applies together (a hint's `textEdits`, a color
-presentation's main edit with its `additionalTextEdits`) is mapped one by
-one and checked as a whole on the edited V. It is refused, and dropped like
+A set of edits the client applies together (a hint's `textEdits`, a
+completion item's or color presentation's main edit with its
+`additionalTextEdits`) is mapped one by one and checked as a whole on the edited V. It is refused, and dropped like
 any unsafe set, when:
 
 - an edit is reversed; edits overlap in P or once mapped; or edits touch
@@ -248,6 +248,24 @@ presentation may replace (with the gap emptied, its prepared range is even
 empty, and an edit there would only insert beside it): no presentation is
 returned. Additional edits refused with the main edit are dropped, the main
 edit kept as it maps alone.
+
+Completion keeps to what the client inserts where it asked:
+
+- A caret inside indentation or blank lines the peer removed (or from
+  where the deleted closing lines start) gets no completion: the server
+  sees it elsewhere, and its items would edit away from it.
+- An item's edit must contain the caret once mapped (a caret right after a
+  gap the peer emptied reaches the server where the gap's start does); an
+  insert/replace edit maps through both ranges, which must map the shared
+  text alike and keep their shared start.
+- A snippet is kept only when it is literal text: what a client expands
+  tabstops, placeholders, variables or escapes to is not the text checked.
+- An item without a `textEdit` is inserted at the caret, outside the map:
+  it is dropped when its text breaks a line, and its additional edits are
+  dropped, having no main edit to be checked with.
+- A mapped multi-line edit already regained the removed indentation: the
+  item asks a client that supports it to insert as is, and is dropped for
+  one that always adjusts indentation.
 
 ### Failure
 
@@ -454,9 +472,11 @@ a hook per kind of change.
 - With experimental features on, a language's first document waits for its
   servers' handshakes to learn whether any prepares it, even when none
   does.
-- Edit-producing methods (completion, code actions, rename, formatting and
-  the others listed in Coordinates) and inbound `workspace/applyEdit` are
-  not available on prepared documents.
+- Edit-producing methods other than completion, inlay hints and color
+  presentations (code actions, rename, formatting and the others listed in
+  Coordinates) and inbound `workspace/applyEdit` are not available on
+  prepared documents; completion items there are snippets only as literal
+  text, and are not resolved.
 - A peer must be bridged for the languages it prepares, so it receives
   their documents too; keeping it out of other methods takes `priorities`.
 - A peer that cannot start leaves its documents unprepared rather than
