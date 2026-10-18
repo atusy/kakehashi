@@ -50,17 +50,11 @@ impl Kakehashi {
                 completion_response_has_result,
             )
             .await;
-        let asked = requery.load(std::sync::atomic::Ordering::Relaxed);
-        match response {
-            Ok(response) => {
-                let requery = asked && keeps_requery_ask(response.is_some(), &layers);
-                Ok(asking_to_requery(response, requery))
-            }
-            // A layer failing is no answer of its own, and the ask is all
-            // the virt layer said: an empty incomplete list.
-            Err(error) if asked && !error_is_cancel(&error) => Ok(asking_to_requery(None, true)),
-            Err(error) => Err(error),
-        }
+        completion_answer(
+            response,
+            requery.load(std::sync::atomic::Ordering::Relaxed),
+            &layers,
+        )
     }
 
     /// Host layer: forward the params verbatim to the host language's own
@@ -166,13 +160,13 @@ impl Kakehashi {
     ///
     /// On a prepared document an incomplete list without items (the
     /// server's own, or one whose every item did not map back) is no result:
-    /// it would win over another server's items or the host layer's. When no
-    /// server of the layer answers with items, its ask to re-query is kept in
-    /// `requery` for whatever answer wins: the next keystroke can move the
-    /// caret to where items map (off an emptied gap's end, say). Asks from a
-    /// layer that answered are moot (its items win again on re-query) and,
-    /// arriving in any order around the winner, would make the ask depend on
-    /// timing: they are not kept.
+    /// it would win over another server's items or the host layer's. Its ask
+    /// to re-query still stands when the server ranks above the layer's
+    /// winner (see [`asked_above_the_winner`]): the next keystroke can move
+    /// the caret to where its items map (off an emptied gap's end, say). The
+    /// layer's own winner then carries it, marked incomplete; with no winner
+    /// it is kept in `requery` for whatever answer the layers give (see
+    /// [`completion_answer`]).
     async fn completion_virt_layer(
         &self,
         lsp_uri: &Uri,
@@ -253,19 +247,22 @@ impl Kakehashi {
                 Ok(v.map(CompletionResponse::List))
             })
             .await?;
-        if let Some(answers) = answers
-            && let Ok(answers) = answers.lock()
-            && asked_above_the_winner(
-                &answers,
-                &crate::lsp::aggregation::server::truncate_entries(
-                    crate::lsp::aggregation::server::expand_priorities(
-                        &ctx.document.priorities,
-                        &ctx.document.configs,
+        let asked = answers.is_some_and(|answers| {
+            answers.lock().is_ok_and(|answers| {
+                asked_above_the_winner(
+                    &answers,
+                    &crate::lsp::aggregation::server::truncate_entries(
+                        crate::lsp::aggregation::server::expand_priorities(
+                            &ctx.document.priorities,
+                            &ctx.document.configs,
+                        ),
+                        ctx.document.max_fan_out,
                     ),
-                    ctx.document.max_fan_out,
-                ),
-            )
-        {
+                )
+            })
+        });
+        let (response, ask) = virt_layer_answer(response, asked);
+        if ask {
             requery.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(response)
@@ -296,6 +293,47 @@ impl HostCompletion {
             self.server_resolves,
         );
         self.response
+    }
+}
+
+/// The virt layer's answer once its servers answered, `asked` whether one
+/// ranked above its winner asked to re-query, and whether that ask is left
+/// for the layers' answer to carry (see [`completion_answer`]): only with no
+/// winner. A winner carries the ask itself, marked incomplete, which holds
+/// whichever layer order: should another layer's answer win instead, the
+/// virt layer's lost anyway.
+fn virt_layer_answer(
+    response: Option<CompletionResponse>,
+    asked: bool,
+) -> (Option<CompletionResponse>, bool) {
+    if !asked {
+        return (response, false);
+    }
+    match response {
+        Some(response) if completion_response_has_result(&response) => {
+            (asking_to_requery(Some(response), true), false)
+        }
+        response => (response, true),
+    }
+}
+
+/// The completion answer the layer race gave, still asking to re-query when
+/// the virt layer asked without items of its own (`asked`): marked
+/// incomplete when the ask stands for the winner (see [`keeps_requery_ask`]).
+/// A layer failing is no answer of its own, and the ask is all the virt
+/// layer said: an empty incomplete list. The client's cancellation stays one.
+fn completion_answer(
+    response: Result<Option<CompletionResponse>>,
+    asked: bool,
+    layers: &[crate::config::settings::LayerSource],
+) -> Result<Option<CompletionResponse>> {
+    match response {
+        Ok(response) => {
+            let requery = asked && keeps_requery_ask(response.is_some(), layers);
+            Ok(asking_to_requery(response, requery))
+        }
+        Err(error) if asked && !error_is_cancel(&error) => Ok(asking_to_requery(None, true)),
+        Err(error) => Err(error),
     }
 }
 
@@ -461,6 +499,79 @@ mod tests {
             Some(CompletionResponse::Array(vec![item]))
         );
         assert_eq!(asking_to_requery(None, false), None);
+    }
+
+    /// The re-query truth table, a row per case: what the virt layer's
+    /// servers answered (an ask ranked above the winner, or not), what the
+    /// layers gave, and what the client gets.
+    #[test]
+    fn a_requery_ask_reaches_the_client_through_whichever_answer_carries_it() {
+        use crate::config::settings::LayerSource::{Host, Native, Virt};
+        use tower_lsp_server::ls_types::CompletionItem;
+        let items = |label: &str, is_incomplete| {
+            Some(CompletionResponse::List(CompletionList {
+                is_incomplete,
+                items: vec![CompletionItem {
+                    label: label.to_string(),
+                    ..Default::default()
+                }],
+            }))
+        };
+        let empty_incomplete = Some(CompletionResponse::List(CompletionList {
+            is_incomplete: true,
+            items: vec![],
+        }));
+        let answer =
+            |response, asked, layers: &[_]| completion_answer(Ok(response), asked, layers).unwrap();
+
+        // 1. A virt winner below an asking server carries the ask itself,
+        // whatever the layer order: ["virt"], or ["host", "virt"] with host
+        // answering nothing.
+        let (virt, ask) = virt_layer_answer(items("b", false), true);
+        assert_eq!((virt.clone(), ask), (items("b", true), false));
+        assert_eq!(answer(virt.clone(), ask, &[Virt]), items("b", true));
+        assert_eq!(answer(virt, ask, &[Host, Virt]), items("b", true));
+        // 2. Without an ask above it, the winner passes as it is.
+        assert_eq!(
+            virt_layer_answer(items("b", false), false),
+            (items("b", false), false)
+        );
+        // 3. No virt items, an ask: left to the layers' answer.
+        assert_eq!(virt_layer_answer(None, true), (None, true));
+        // 3a. Nothing answered: an empty incomplete list.
+        assert_eq!(answer(None, true, &[Virt, Host]), empty_incomplete);
+        assert_eq!(answer(None, true, &[Host, Virt]), empty_incomplete);
+        // 3b. Host answered after virt finished: marked incomplete.
+        assert_eq!(
+            answer(items("h", false), true, &[Virt, Host, Native]),
+            items("h", true)
+        );
+        // 3c. Host ranked first answered: as it is (it wins again).
+        assert_eq!(
+            answer(items("h", false), true, &[Host, Virt]),
+            items("h", false)
+        );
+        // 4. No ask: null stays null, answers pass as they are (as on
+        // unprepared documents).
+        assert_eq!(virt_layer_answer(None, false), (None, false));
+        assert_eq!(answer(None, false, &[Virt, Host]), None);
+        assert_eq!(answer(items("h", false), false, &[Virt]), items("h", false));
+        // 5. A layer failing: the ask answers an empty incomplete list;
+        // without it, or on the client's cancellation, the error stands.
+        let failed = || tower_lsp_server::jsonrpc::Error::internal_error();
+        assert_eq!(
+            completion_answer(Err(failed()), true, &[Virt]).unwrap(),
+            empty_incomplete
+        );
+        assert!(completion_answer(Err(failed()), false, &[Virt]).is_err());
+        assert!(
+            completion_answer(
+                Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
+                true,
+                &[Virt]
+            )
+            .is_err()
+        );
     }
 
     #[test]
