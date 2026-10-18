@@ -8,7 +8,7 @@ use crate::lsp::aggregation::server::{
     HostFanOutTask, dispatch_host_preferred, dispatch_preferred,
 };
 use crate::lsp::bridge::HostDocument;
-use crate::lsp::lsp_impl::bridge_context::parse_host_verbatim;
+use crate::lsp::lsp_impl::bridge_context::{Sourced, parse_host_verbatim};
 
 const METHOD: &str = "textDocument/colorPresentation";
 
@@ -19,23 +19,44 @@ impl Kakehashi {
     ) -> Result<Vec<ColorPresentation>> {
         let raw_params = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
         let lsp_uri = params.text_document.uri;
-        let virt = self.color_presentation_virt_layer(&lsp_uri, params.range, params.color);
-        let host = self.color_presentation_host_layer(&lsp_uri, raw_params);
-        self.walk_layers_by_strategy(
-            &lsp_uri,
-            METHOD,
-            METHOD,
-            virt,
-            host,
-            std::future::ready(Ok(None)),
-            |presentations: &Vec<ColorPresentation>| !presentations.is_empty(),
-            |mut acc, mut next| {
-                acc.append(&mut next);
-                acc
-            },
-        )
-        .await
-        .map(Option::unwrap_or_default)
+        // Each layer's presentations kept apart, in order, so a stale
+        // prepared part can be dropped without the others.
+        let virt = async {
+            let presentations = self
+                .color_presentation_virt_layer(&lsp_uri, params.range, params.color)
+                .await?;
+            Ok(presentations.map(|presentations| vec![presentations]))
+        };
+        let host = async {
+            let presentations = self
+                .color_presentation_host_layer(&lsp_uri, raw_params)
+                .await?;
+            Ok(presentations.map(|presentations| vec![Sourced::unprepared(presentations)]))
+        };
+        let parts = self
+            .walk_layers_by_strategy(
+                &lsp_uri,
+                METHOD,
+                METHOD,
+                virt,
+                host,
+                std::future::ready(Ok(None)),
+                |parts: &Vec<Sourced<Vec<ColorPresentation>>>| {
+                    parts.iter().any(|part| !part.value.is_empty())
+                },
+                |mut acc, mut next| {
+                    acc.append(&mut next);
+                    acc
+                },
+            )
+            .await?;
+        // The final answer chosen: each part's edits checked once more
+        // against the host text, which may have moved while it was held.
+        let pool = self.bridge.pool();
+        Ok(color_presentations_still_current(
+            parts.unwrap_or_default(),
+            |part| part.still_current(pool),
+        ))
     }
 
     async fn color_presentation_virt_layer(
@@ -43,7 +64,7 @@ impl Kakehashi {
         lsp_uri: &Uri,
         range: Range,
         color: Color,
-    ) -> Result<Option<Vec<ColorPresentation>>> {
+    ) -> Result<Option<Sourced<Vec<ColorPresentation>>>> {
         let Some(ctx) = self
             .resolve_bridge_contexts_for_range(lsp_uri, range, METHOD)
             .await
@@ -82,11 +103,12 @@ impl Kakehashi {
         )
         .await;
 
-        result
+        let presentations = result
             .handle(&self.notifier(), "color presentation", None, |items| {
                 Ok((!items.is_empty()).then_some(items))
             })
-            .await
+            .await?;
+        Ok(presentations.map(|items| Sourced::from_region(&ctx.document, items)))
     }
 
     async fn color_presentation_host_layer(
@@ -138,5 +160,55 @@ impl Kakehashi {
         .await;
         self.host_layer_result(fan_in, &ctx, METHOD, |won| won)
             .await
+    }
+}
+
+/// The chosen presentations, each layer's part kept only while its edits
+/// still land where they were mapped (`current`): a stale part answers
+/// nothing, the others stay.
+fn color_presentations_still_current(
+    parts: Vec<Sourced<Vec<ColorPresentation>>>,
+    current: impl Fn(&Sourced<Vec<ColorPresentation>>) -> bool,
+) -> Vec<ColorPresentation> {
+    parts
+        .into_iter()
+        .filter(|part| current(part))
+        .flat_map(|part| part.value)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stale_part_answers_nothing_and_the_others_stay() {
+        let presentation = |label: &str| ColorPresentation {
+            label: label.to_string(),
+            text_edit: None,
+            additional_text_edits: None,
+        };
+        let parts = || {
+            vec![
+                Sourced::unprepared(vec![presentation("host")]),
+                Sourced::unprepared(vec![presentation("virt")]),
+            ]
+        };
+        let labels = |presentations: Vec<ColorPresentation>| {
+            presentations
+                .into_iter()
+                .map(|presentation| presentation.label)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            labels(color_presentations_still_current(parts(), |_| true)),
+            ["host", "virt"]
+        );
+        assert_eq!(
+            labels(color_presentations_still_current(parts(), |part| {
+                part.value[0].label != "virt"
+            })),
+            ["host"]
+        );
     }
 }
