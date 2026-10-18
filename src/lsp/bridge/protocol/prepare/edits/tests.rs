@@ -200,6 +200,27 @@ fn a_reversed_edit_past_the_end_is_refused() {
 }
 
 #[test]
+fn an_edit_on_a_line_past_the_prepared_text_is_refused() {
+    // P `if x:\n  y\n` has lines 0 to 2 (the last empty).
+    let (virtual_text, map) = dedented();
+    assert_eq!(
+        map.map_one_with_extent(&edit((7, 0), (7, 0), "import x\n")),
+        None
+    );
+    assert_eq!(map.map_one_with_extent(&edit((1, 0), (3, 0), "")), None);
+    let appended = map
+        .map_one_with_extent(&edit((2, 0), (2, 0), "z\n"))
+        .unwrap();
+    assert_eq!(
+        apply_to(&virtual_text, &[appended]),
+        "  if x:\n    y\n  z\n"
+    );
+    // A column past a line is its end.
+    let completed = map.map_one_with_extent(&edit((1, 3), (1, 9), "!")).unwrap();
+    assert_eq!(apply_to(&virtual_text, &[completed]), "  if x:\n    y!\n");
+}
+
+#[test]
 fn edits_overlapping_in_the_prepared_text_are_refused() {
     let (_, map) = dedented();
     assert_eq!(
