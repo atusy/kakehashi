@@ -1249,13 +1249,17 @@ mod tests {
         }
         // Kept, it goes out as the plain text it is.
         let mut literal = item(json!({"label": "x", "insertTextFormat": 2, "insertText": snippet}));
-        if transform_completion_item(
-            &mut literal,
-            &offset,
-            Position::new(11, 0),
-            Some(Position::new(10, 3)),
-            ClientInsertMode::default(),
-        ) {
+        assert_eq!(
+            transform_completion_item(
+                &mut literal,
+                &offset,
+                Position::new(11, 0),
+                Some(Position::new(10, 3)),
+                ClientInsertMode::default(),
+            ),
+            kept
+        );
+        if kept {
             assert_eq!(
                 literal.insert_text_format,
                 Some(tower_lsp_server::ls_types::InsertTextFormat::PLAIN_TEXT)

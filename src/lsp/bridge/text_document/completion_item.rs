@@ -31,10 +31,7 @@ use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, response_has_jsonrpc_error,
     translate_host_range_to_virtual,
 };
-use super::completion::{
-    EnvelopeContext, KakehashiEnvelope, envelope_item_data, strip_envelope,
-    transform_completion_item,
-};
+use super::completion::{KakehashiEnvelope, strip_envelope, transform_completion_item};
 use super::host::{HostDocument, sync_host_document};
 use crate::config::settings::WorkspaceSettings;
 use crate::config::{
@@ -605,21 +602,21 @@ fn translate_item_ranges_host_to_virtual(item: &mut CompletionItem, offset: &Reg
 /// The resolved item may have its own `data` (from the downstream's resolve
 /// response). We wrap it again so that future resolves can still be routed.
 fn re_envelope_item(item: &mut CompletionItem, envelope: &KakehashiEnvelope) {
-    let ctx = EnvelopeContext {
-        server_name: &envelope.origin,
-        injection_language: &envelope.injection_language,
-        incarnation: envelope.incarnation,
-        host_uri: &envelope.host_uri,
-        region_id: &envelope.region_id,
-        offset: &RegionOffset::from(&envelope.offset),
-        region_end: envelope
-            .region_end
-            .map(|(line, character)| Position { line, character }),
-        // Preserve the layer: a host-layer item that has been resolved once
-        // must still take the host path on the client's NEXT resolve of it.
-        host_layer: envelope.host_layer,
+    // The offset is written as a fresh mint writes it, but keeps the mark of
+    // an item minted from a prepared document, which no RegionOffset carries
+    // without the map: dropped, the item would describe the region again once
+    // the pair lost its peer, and resolve through a map-less offset. The
+    // layer is kept too: a host-layer item resolved once must still take the
+    // host path on the client's NEXT resolve of it.
+    let mut offset = super::completion::EnvelopeOffset::from(&RegionOffset::from(&envelope.offset));
+    offset.prepared = envelope.offset.prepared;
+    let rebuilt = KakehashiEnvelope {
+        offset,
+        inner: None,
+        ..envelope.clone()
     };
-    envelope_item_data(item, &ctx);
+    let inner = item.data.take();
+    item.data = Some(crate::lsp::bridge::envelope::wrap_envelope(&rebuilt, inner));
 }
 
 #[cfg(test)]
@@ -649,6 +646,30 @@ mod tests {
             region_end: Some((9, 0)),
             host_layer: false,
         }
+    }
+
+    #[test]
+    fn a_refused_resolve_keeps_the_prepared_mark() {
+        let mut envelope = test_envelope();
+        envelope.offset.prepared = true;
+        let mut item = CompletionItem {
+            label: "x".to_string(),
+            data: Some(json!({"resolve_id": 99})),
+            ..Default::default()
+        };
+        re_envelope_item(&mut item, &envelope);
+        let back = extract_envelope(&item).expect("re-enveloped");
+        assert!(back.offset.prepared);
+        // As is, the envelope is written as before.
+        let mut item = CompletionItem {
+            label: "x".to_string(),
+            data: Some(json!({"resolve_id": 99})),
+            ..Default::default()
+        };
+        re_envelope_item(&mut item, &test_envelope());
+        let back = extract_envelope(&item).expect("re-enveloped");
+        assert!(!back.offset.prepared);
+        assert_eq!(back.offset.line_column_offsets, Some(vec![0]));
     }
 
     #[cfg(unix)]
