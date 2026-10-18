@@ -71,10 +71,21 @@ impl PreparedMap {
         // text, keeps to that line — provided it maps after the insertion
         // (one taking the line's removed indent along would not; checked
         // once mapped).
+        // Only at a line start the host has too: one a placeholder's own line
+        // break shows in P mid-line in V starts no existing host line, whose
+        // indent the inserted lines' last break could give back.
+        let host_line_start = |offset: usize| {
+            empty_run(&self.runs, offset, |kind| kind == RunKind::Deleted).is_some()
+                || is_line_start(
+                    &self.virtual_lines.text,
+                    map_offset(&self.runs, offset, Bias::Start, Side::Prepared),
+                )
+        };
         let lines_before = |earlier: usize, later: usize| {
             ranges[earlier].is_empty()
                 && edits[earlier].new_text.ends_with(['\n', '\r'])
                 && begins_line(edits[later].new_text.chars().next())
+                && host_line_start(ranges[later].start)
         };
         let mut lines_inserted_before = Vec::new();
         for pair in order.windows(2) {
