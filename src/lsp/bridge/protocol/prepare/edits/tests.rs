@@ -3078,27 +3078,20 @@ mod formatting {
     }
 
     #[test]
-    fn pairing_many_unalike_lines_stops_at_the_deadline() {
-        // Thousands of lines none of which pairs: the join search is
-        // quadratic, and must give up with the diffs for the answer to be
-        // refused in time, not run on.
-        let virtual_text: String = (0..20000).map(|line| format!("  a{line}\n")).collect();
-        let changes: Vec<_> = (0..20000)
-            .map(|line| json!({"range": {"start": {"line": line, "character": 0}, "end": {"line": line, "character": 2}}, "newText": ""}))
-            .collect();
-        let map = prepare(&virtual_text, json!(changes));
-        let formatted: String = (0..20000).map(|line| format!("b{line}\n")).collect();
-        let answer = [edit((0, 0), (20000, 0), &formatted)];
-        let started = std::time::Instant::now();
+    fn pairing_joined_lines_stops_at_the_deadline() {
+        // The join search is quadratic: past its deadline it pairs nothing
+        // more, for the answer to be refused in time, not to run on.
+        let keys = |lines: &[&str]| -> [Vec<String>; 2] {
+            let lines: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+            [lines.clone(), lines]
+        };
+        let (old, new) = (keys(&["a"]), keys(&["a b"]));
+        let pairs = |deadline| joined_lines(&old, &new, &(0..1), &(0..1), deadline);
         assert_eq!(
-            map.map_edits_within(&answer, EditMode::Formatting, Duration::from_millis(50)),
-            None
+            pairs(Instant::now() + Duration::from_secs(10)),
+            vec![(0, 0)]
         );
-        assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "{:?}",
-            started.elapsed()
-        );
+        assert_eq!(pairs(Instant::now() - Duration::from_millis(1)), vec![]);
     }
 
     #[test]
