@@ -416,24 +416,17 @@ impl Kakehashi {
             // The document as its servers see it: prepared when its peer
             // prepares it, waiting for the answer (the lifecycle pass has
             // started every region's attempt already: waiting for each in
-            // turn costs the slowest one).
-            let region_ctx = crate::lsp::lsp_impl::bridge_context::prepare_request_context(
+            // turn costs the slowest one), and the method closed to it as
+            // the answer's shape says (a prepared one stays open, its edits
+            // mapped back through its map).
+            let region_ctx = crate::lsp::lsp_impl::bridge_context::prepare_request_context_for(
                 &self.bridge,
                 language_name,
                 region_ctx,
+                "textDocument/formatting",
             )
-            .await
-            .ok();
-            // Closed as a non-contiguous region is, the document's shape
-            // read again with the context in; a prepared one stays open, its
-            // edits mapped back through its map.
-            let Some(region_ctx) = spans.admit(span, region_ctx, |ctx| {
-                !crate::lsp::lsp_impl::bridge_context::method_closed_to(
-                    &ctx.resolved,
-                    "textDocument/formatting",
-                    ctx.prepared.is_some(),
-                )
-            }) else {
+            .await;
+            let Some(region_ctx) = spans.admit(span, region_ctx) else {
                 continue;
             };
             // One unprepared before it counts unless this one answers for
@@ -946,7 +939,7 @@ async fn pipeline_step_request_kind(
 /// Discovery orders same-range alternate languages by query-pattern
 /// priority, but an unconfigured or explicitly disabled language (never
 /// offered here), one whose peer could not prepare it, or one closed to the
-/// method (`runnable`) is not a winner: the span is reserved only by the
+/// method is not a winner: the span is reserved only by the
 /// first alternative that can format it, and later ones are suppressed to
 /// keep emitted edits non-overlapping.
 #[derive(Default)]
@@ -962,25 +955,23 @@ impl SpanReservations {
         self.reserved.contains(&span)
     }
 
-    /// The context to format `span` with, offered in discovery order:
-    /// `None` when an earlier alternative reserved the span, or this one
-    /// has no prepared context or cannot run.
-    pub(super) fn admit<T>(
+    /// The context to format `span` with, offered in discovery order (see
+    /// `prepare_request_context_for`): `None` when an earlier alternative
+    /// reserved the span, or this one could not be prepared (`Err`,
+    /// remembered) or is closed to the method (`Ok(None)`).
+    pub(super) fn admit<T, E>(
         &mut self,
         span: (usize, usize),
-        ctx: Option<T>,
-        runnable: impl FnOnce(&T) -> bool,
+        ctx: std::result::Result<Option<T>, E>,
     ) -> Option<T> {
         if self.reserved.contains(&span) {
             return None;
         }
-        let Some(ctx) = ctx else {
+        let Ok(ctx) = ctx else {
             self.unprepared.insert(span);
             return None;
         };
-        if !runnable(&ctx) {
-            return None;
-        }
+        let ctx = ctx?;
         self.reserved.insert(span);
         Some(ctx)
     }
@@ -2433,26 +2424,25 @@ mod tests {
     #[test]
     fn a_span_goes_to_the_first_alternative_that_can_format_it() {
         let mut spans = SpanReservations::default();
-        let runnable = |ctx: &&str| *ctx != "closed";
-        // The first alternative's peer could not prepare it: the next one
-        // that can run formats the span.
-        assert_eq!(spans.admit((0, 4), None, runnable), None);
-        assert_eq!(spans.admit((0, 4), Some("closed"), runnable), None);
+        // The first alternative's peer could not prepare it, the next is
+        // closed to the method: the one after that formats the span.
+        assert_eq!(spans.admit::<&str, ()>((0, 4), Err(())), None);
+        assert_eq!(spans.admit::<&str, ()>((0, 4), Ok(None)), None);
         assert!(!spans.is_reserved((0, 4)));
-        assert_eq!(spans.admit((0, 4), Some("lua"), runnable), Some("lua"));
+        assert_eq!(spans.admit::<_, ()>((0, 4), Ok(Some("lua"))), Some("lua"));
         assert!(spans.is_reserved((0, 4)));
-        assert_eq!(spans.admit((0, 4), Some("vim"), runnable), None);
+        assert_eq!(spans.admit::<_, ()>((0, 4), Ok(Some("vim"))), None);
         // A span only an unprepared alternative was offered for is left
         // unformatted.
-        assert_eq!(spans.admit((5, 9), None, runnable), None);
+        assert_eq!(spans.admit::<&str, ()>((5, 9), Err(())), None);
         assert_eq!(spans.unprepared(), 1);
         // The alternative taking a span after an unprepared one answers
         // for it; one taking it first owes nothing.
         assert!(spans.owes((0, 4)));
-        assert_eq!(spans.admit((5, 9), Some("lua"), runnable), Some("lua"));
+        assert_eq!(spans.admit::<_, ()>((5, 9), Ok(Some("lua"))), Some("lua"));
         assert!(spans.owes((5, 9)));
         assert_eq!(spans.unprepared(), 0);
-        assert_eq!(spans.admit((10, 14), Some("lua"), runnable), Some("lua"));
+        assert_eq!(spans.admit::<_, ()>((10, 14), Ok(Some("lua"))), Some("lua"));
         assert!(!spans.owes((10, 14)));
     }
 
