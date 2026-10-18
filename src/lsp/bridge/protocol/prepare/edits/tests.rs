@@ -3160,6 +3160,19 @@ mod formatting {
     }
 
     #[test]
+    fn a_line_deleted_after_a_changed_line_break_goes_with_it() {
+        // The break turned CRLF, the dedented line after it deleted: the
+        // deletion takes the line's removed indent, so the two go together.
+        let virtual_text = "0a0\n  1a1\n";
+        let map = dedent_lines(virtual_text, &[0, 2]);
+        let answer = [edit((0, 0), (2, 0), "0a0\r\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("0a0\r\n")
+        );
+    }
+
+    #[test]
     fn lines_joined_keep_the_first_ones_indent() {
         // `0x` deleted and `1x` joined with `2x`: the joined line is `1x`.
         let virtual_text = "0if x:0\n    1if x:1\n    2if x:2\n";
