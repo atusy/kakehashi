@@ -61,7 +61,8 @@ impl Kakehashi {
         let tracker = self.bridge.node_tracker();
         let response = response.map(|response| {
             response.and_then(|sourced| {
-                let current = sourced.still_current(pool, tracker);
+                let current =
+                    sourced.still_current(pool, tracker, || self.host_content_version(&lsp_uri));
                 completion_still_current(sourced.value, current)
             })
         });
@@ -188,6 +189,8 @@ impl Kakehashi {
         position: Position,
         requery: &std::sync::atomic::AtomicBool,
     ) -> Result<Option<Sourced<CompletionResponse>>> {
+        // Before the text is read: see `Sourced::from_region`.
+        let content_version = self.prepared_request_content_version(lsp_uri);
         // Use shared preamble to resolve injection context with ALL matching servers
         let Some(ctx) = self
             .resolve_bridge_contexts(lsp_uri, position, METHOD)
@@ -259,7 +262,12 @@ impl Kakehashi {
             requery.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(response.map(|response| {
-            Sourced::from_region(&ctx.document, response, self.bridge.node_tracker())
+            Sourced::from_region(
+                &ctx.document,
+                response,
+                self.bridge.node_tracker(),
+                content_version,
+            )
         }))
     }
 }
