@@ -187,15 +187,21 @@ translated through P ↔ V ↔ host. Deleted edge blank lines stay in V: P's
 start maps after the leading ones and P's end before the trailing ones. A
 request is not made at all at a host position with no corresponding
 position in P, such as one strictly inside a gap or on a deleted edge line,
-since the server would answer it for another place.
+since the server would answer it for another place. A position inside
+indentation the peer removed names the start of its line in P (completion
+alone refuses it, see Edits): on-type formatting typed there answers for
+that line.
 
 The methods closed to a non-contiguous combined document — codeAction,
 colorPresentation, completion, formatting, inlayHint, linkedEditingRange,
 onTypeFormatting, prepareRename, rangeFormatting, rename — are closed to a
 prepared one too, as is an inbound `workspace/applyEdit` computed for a
-prepared text, but for completion, inlay hints and color presentations:
-they stay available on a contiguous prepared document, their edits mapped
-as Edits describes.
+prepared text, but for completion, inlay hints, color presentations,
+formatting, range formatting and on-type formatting: they stay available on
+a contiguous prepared document, their edits mapped as Edits describes. A
+non-contiguous prepared document (one with gaps) stays closed to all of
+them: on a map with gaps the indentation lines regain is not exact in every
+shape.
 A `*/resolve` envelope minted from a prepared document never resolves,
 nor does a call or type hierarchy item minted from one answer its
 follow-ups (`callHierarchy/incomingCalls`, `outgoingCalls`,
@@ -258,6 +264,35 @@ edited V. It is refused, and dropped like any unsafe set, when:
 No edit in P reaches into the deleted edge lines or the closing indent
 deleted with them: P has no position inside them.
 
+A formatter's answer (formatting, range and on-type formatting, and the
+concatenated pipeline's result) is read as what it changes, not edit for
+edit: its edits are applied to P (an end at the start of the line just past
+P's last naming P's end, as whole-document answers do), the region's edge
+layout of P restored as for any document, and the result diffed against
+P. Lines are paired first: a line of text with the line it was rewritten
+from (alike but for the whitespace around its text, a line found once in
+each text anchoring the rest), then a line other lines were joined onto,
+then blank lines with blank lines — a whitespace line with one holding the
+same whitespace first, then as many as can pair, so that text the formatter
+writes beside blank lines is a line of its own, not text written on one
+(which, on a whitespace line the peer kept, would regain no indentation and
+lose the formatter's relative indentation). Each pair, and each run of lines
+left between pairs, is then diffed by character, and every stretch the
+result differs from P in maps as one edit does above; stretches touching at
+a line start stay apart where the later writes text there or changes only
+that line's leading whitespace. The set is then checked as a whole, as
+above. Which of several blank lines alike a line was written on, or which
+went, no answer tells: the run's diff decides.
+
+The diff has a budget (200 ms of search). An answer whose diff runs out of
+it is refused: out of time, the diff falls back to coarser stretches, which
+can span lines the formatter left alone and would map them with the
+content's indentation, not their own. Pairing blank lines takes a table
+quadratic in them; past four million cells the answer is refused as well.
+So the budget and the bound decide only which answers are refused, never
+what an accepted one writes; a large region heavily reformatted may be
+refused.
+
 An answer's edits are mapped only while they would land where the server
 meant them. This is read where an answer is chosen, not as each reply
 arrives: the servers' fan-in or the layer race can hold an answer while
@@ -303,7 +338,13 @@ The answer is checked against:
 
 Dropped, completion answers nothing (an empty incomplete list when it
 asked to re-query), color presentations answer nothing, and inlay hints
-stay shown without their edits.
+stay shown without their edits. A formatting answer the host moved under,
+or one its map refuses, fails the request: refused per response, that
+server's answer counts as a failure; dropped when the final answer is
+chosen, all the answer's injected edits go (those of regions still current
+too) and the request is counted failed, so `kakehashi format` exits 2 and
+writes nothing (range and on-type formatting, which no one-shot run makes,
+answer without them).
 
 Unlike on an unprepared document, an answer overtaken by typing is
 dropped, not kept stale. How an edit maps back depends on the whole text
@@ -554,6 +595,8 @@ a hook per kind of change.
   (tsudoi handlers) instead of kakehashi and its query vocabulary.
 - Read-only features — hover, definitions, diagnostics, folding, inlay
   hints — work on embedded code its servers could not parse as written.
+- So do completion and formatting, their edits placed back with the
+  indentation the peer removed.
 
 ### Negative
 
@@ -562,11 +605,21 @@ a hook per kind of change.
 - With experimental features on, a language's first document waits for its
   servers' handshakes to learn whether any prepares it, even when none
   does.
-- Edit-producing methods other than completion, inlay hints and color
-  presentations (code actions, rename, formatting and the others listed in
-  Coordinates) and inbound `workspace/applyEdit` are not available on
-  prepared documents; completion items there are snippets only as literal
-  text, and are not resolved.
+- Edit-producing methods other than completion, inlay hints, color
+  presentations and the formatting methods (code actions, rename and the
+  others listed in Coordinates) and inbound `workspace/applyEdit` are not
+  available on prepared documents, nor is any on a prepared document with
+  gaps; completion items there are snippets only as literal text, and are
+  not resolved.
+- A formatting answer whose diff runs out of its budget is refused, so a
+  large region heavily reformatted may be left as it is (counted a failure
+  by `kakehashi format`).
+- The concatenated formatting pipeline does not re-apply host line prefixes
+  on a prepared document: a prefixed (blockquoted) prepared region fails
+  the request instead.
+- Text a formatter writes on a whitespace-only line the peer kept regains no
+  indentation, the rule set for typing there; where an answer reads as
+  well as a line of its own beside the blank lines, that reading is taken.
 - A peer must be bridged for the languages it prepares, so it receives
   their documents too; keeping it out of other methods takes `priorities`.
 - A peer that cannot start leaves its documents unprepared rather than
