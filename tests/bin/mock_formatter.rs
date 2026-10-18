@@ -1179,6 +1179,24 @@ fn main() {
                     .unwrap_or(Value::Null);
                 respond(&mut writer, id, result);
             }
+            // A document holding `SNIPPETS` gets an incomplete list of
+            // snippets only, which a prepared document drops whole.
+            "textDocument/completion"
+                if mode == "echo-document"
+                    && message
+                        .pointer("/params/textDocument/uri")
+                        .and_then(Value::as_str)
+                        .and_then(|uri| documents.get(uri))
+                        .is_some_and(|text| text.contains("SNIPPETS")) =>
+            {
+                respond(
+                    &mut writer,
+                    id,
+                    json!({"isIncomplete": true, "items": [
+                        {"label": "s", "insertTextFormat": 2, "insertText": "s$0"}
+                    ]}),
+                );
+            }
             "textDocument/completion" if mode == "echo-document" => {
                 let position = message["params"]["position"].clone();
                 let result = json!({"isIncomplete": false, "items": [{ "label": "echo-plain" }, {

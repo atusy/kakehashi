@@ -370,6 +370,27 @@ fn edits_on_a_prepared_document_map_back_reindented() {
 }
 
 #[test]
+fn an_incomplete_list_dropped_whole_still_asks_to_requery() {
+    // Every item is a snippet, which a prepared document cannot carry: no
+    // item comes back, but the ask to re-query does, as the next keystroke
+    // may yield items that map.
+    let (mut client, _dir) = Setup::default().start();
+    let uri = "file:///prepare/requery.md";
+    let text = "# t\n\n```lua\n  local SNIPPETS = 1\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+    let response = client.send_request(
+        "textDocument/completion",
+        json!({ "textDocument": { "uri": uri }, "position": { "line": 3, "character": 7 } }),
+    );
+    assert_eq!(
+        response["result"],
+        json!({ "isIncomplete": true, "items": [] }),
+        "{response}"
+    );
+}
+
+#[test]
 fn formatting_is_not_offered_on_a_prepared_document() {
     let (mut client, _dir) = Setup::default().start();
     let uri = "file:///prepare/format.md";

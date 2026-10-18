@@ -36,18 +36,24 @@ impl Kakehashi {
         let lsp_uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
-        let virt = self.completion_virt_layer(&lsp_uri, position);
+        let requery = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let virt = self.completion_virt_layer(&lsp_uri, position, &requery);
         let host = self.completion_host_layer(&lsp_uri, raw_params);
-        self.walk_layer_futures(
-            &lsp_uri,
-            METHOD,
-            METHOD,
-            virt,
-            host,
-            std::future::ready(Ok(None)),
-            completion_response_has_result,
-        )
-        .await
+        let response = self
+            .walk_layer_futures(
+                &lsp_uri,
+                METHOD,
+                METHOD,
+                virt,
+                host,
+                std::future::ready(Ok(None)),
+                completion_response_has_result,
+            )
+            .await?;
+        Ok(asking_to_requery(
+            response,
+            requery.load(std::sync::atomic::Ordering::Relaxed),
+        ))
     }
 
     /// Host layer: forward the params verbatim to the host language's own
@@ -150,10 +156,18 @@ impl Kakehashi {
     }
 
     /// Virt layer: bridge the injection region under the cursor.
+    ///
+    /// On a prepared document an incomplete list without items (the
+    /// server's own, or one whose every item did not map back) is no result:
+    /// it would win over another server's items or the host layer's. Its ask
+    /// to re-query is kept in `requery` for the answer that does win: the
+    /// next keystroke can move the caret to where items map (off an emptied
+    /// gap's end, say).
     async fn completion_virt_layer(
         &self,
         lsp_uri: &Uri,
         position: Position,
+        requery: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Option<CompletionResponse>> {
         // Use shared preamble to resolve injection context with ALL matching servers
         let Some(ctx) = self
@@ -172,21 +186,33 @@ impl Kakehashi {
         let result = dispatch_preferred(
             &ctx.document,
             pool.clone(),
-            |t| async move {
-                t.pool
-                    .send_completion_request(
-                        &t.server_name,
-                        &t.server_config,
-                        &t.uri,
-                        position,
-                        t.region_end(),
-                        &t.injection_language,
-                        &t.region_id,
-                        t.offset,
-                        &t.virtual_content,
-                        t.upstream_id,
-                    )
-                    .await
+            |t| {
+                let requery = std::sync::Arc::clone(requery);
+                async move {
+                    let prepared = t.offset.prepared().is_some();
+                    let list = t
+                        .pool
+                        .send_completion_request(
+                            &t.server_name,
+                            &t.server_config,
+                            &t.uri,
+                            position,
+                            t.region_end(),
+                            &t.injection_language,
+                            &t.region_id,
+                            t.offset,
+                            &t.virtual_content,
+                            t.upstream_id,
+                        )
+                        .await?;
+                    Ok(match list {
+                        Some(list) if prepared && list.items.is_empty() && list.is_incomplete => {
+                            requery.store(true, std::sync::atomic::Ordering::Relaxed);
+                            None
+                        }
+                        list => list,
+                    })
+                }
             },
             |opt| opt.as_ref().is_some_and(completion_list_has_result),
             cancel_rx,
@@ -228,6 +254,28 @@ impl HostCompletion {
     }
 }
 
+/// `response`, still asking the client to re-query when a prepared
+/// document's server did (see `completion_virt_layer`): marked incomplete, or
+/// an empty incomplete list when nothing else answered.
+fn asking_to_requery(
+    response: Option<CompletionResponse>,
+    requery: bool,
+) -> Option<CompletionResponse> {
+    if !requery {
+        return response;
+    }
+    let mut list = match response {
+        None => CompletionList::default(),
+        Some(CompletionResponse::Array(items)) => CompletionList {
+            is_incomplete: false,
+            items,
+        },
+        Some(CompletionResponse::List(list)) => list,
+    };
+    list.is_incomplete = true;
+    Some(CompletionResponse::List(list))
+}
+
 fn completion_response_has_result(resp: &CompletionResponse) -> bool {
     match resp {
         CompletionResponse::Array(items) => !items.is_empty(),
@@ -244,6 +292,35 @@ fn completion_list_has_result(list: &CompletionList) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_requery_ask_marks_whatever_answers_incomplete() {
+        use tower_lsp_server::ls_types::CompletionItem;
+        let item = CompletionItem {
+            label: "x".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            asking_to_requery(None, true),
+            Some(CompletionResponse::List(CompletionList {
+                is_incomplete: true,
+                items: vec![]
+            }))
+        );
+        assert_eq!(
+            asking_to_requery(Some(CompletionResponse::Array(vec![item.clone()])), true),
+            Some(CompletionResponse::List(CompletionList {
+                is_incomplete: true,
+                items: vec![item.clone()]
+            }))
+        );
+        // Without the ask, answers pass as they are.
+        assert_eq!(
+            asking_to_requery(Some(CompletionResponse::Array(vec![item.clone()])), false),
+            Some(CompletionResponse::Array(vec![item]))
+        );
+        assert_eq!(asking_to_requery(None, false), None);
+    }
 
     #[test]
     fn incomplete_empty_completion_list_counts_as_result() {
