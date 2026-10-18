@@ -127,9 +127,11 @@ impl LanguageServerPool {
 }
 
 /// [`transform_completion_response_to_host`] for a response as the executor
-/// hands it over: nothing when the request's map no longer describes the
-/// region's current host text (see `BridgeResponseContext`), its items'
-/// edits made for host coordinates that moved since.
+/// hands it over. When the request's map no longer describes the region's
+/// current host text (see `BridgeResponseContext`), no item is kept, its
+/// edits made for host coordinates that moved since — but an incomplete
+/// list still asks to re-query, as an empty incomplete list (its items not
+/// even read), as the final check answers too.
 fn completion_response_to_host(
     response: serde_json::Value,
     ctx: &super::super::pool::BridgeResponseContext<'_>,
@@ -140,7 +142,15 @@ fn completion_response_to_host(
     insert_mode: ClientInsertMode,
 ) -> Option<CompletionList> {
     if !ctx.request_map_current {
-        return None;
+        let incomplete = !response_has_jsonrpc_error(&response, "textDocument/completion")
+            && response.get("result").is_some_and(|result| {
+                result.get("isIncomplete").and_then(Value::as_bool) == Some(true)
+                    && result.get("items").is_some_and(Value::is_array)
+            });
+        return incomplete.then(|| CompletionList {
+            is_incomplete: true,
+            items: vec![],
+        });
     }
     transform_completion_response_to_host(
         response,
@@ -1783,6 +1793,55 @@ mod tests {
             )
         };
         assert_eq!(answer(true).map(|list| list.items.len()), Some(1));
+        assert_eq!(answer(false), None);
+    }
+
+    /// A stale incomplete list keeps its ask to re-query, its items (and
+    /// their edits) dropped; a stale complete one answers nothing.
+    #[test]
+    fn a_stale_incomplete_list_still_asks_to_requery() {
+        let offset = dedented_offset("  a\n");
+        let host_uri: tower_lsp_server::ls_types::Uri = "file:///test.md".parse().unwrap();
+        let ctx = super::super::super::pool::BridgeResponseContext {
+            virtual_uri_string: "file:///test.md/v.lua".to_string(),
+            host_uri_lsp: &host_uri,
+            offset: &offset,
+            request_map_current: false,
+        };
+        let answer = |is_incomplete: bool| {
+            completion_response_to_host(
+                json!({"jsonrpc": "2.0", "id": 1, "result": {
+                    "isIncomplete": is_incomplete,
+                    "items": [{"label": "abc", "textEdit": {
+                        "range": {"start": {"line": 0, "character": 0},
+                                  "end": {"line": 0, "character": 1}},
+                        "newText": "abc"
+                    }}]
+                }}),
+                &ctx,
+                Position::new(11, 0),
+                Position::new(10, 3),
+                false,
+                &EnvelopeContext {
+                    server_name: "lua-ls",
+                    injection_language: "lua",
+                    incarnation: Some(1),
+                    host_uri: "file:///test.md",
+                    region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    offset: &offset,
+                    region_end: Some(Position::new(11, 0)),
+                    host_layer: false,
+                },
+                ClientInsertMode::default(),
+            )
+        };
+        assert_eq!(
+            answer(true),
+            Some(CompletionList {
+                is_incomplete: true,
+                items: vec![],
+            })
+        );
         assert_eq!(answer(false), None);
     }
 
