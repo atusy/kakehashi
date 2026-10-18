@@ -2530,6 +2530,39 @@ mod tests {
         assert!(method_closed_to(&resolved, "textDocument/inlayHint", false));
     }
 
+    /// The carriers mapping edits back through a prepared map open on
+    /// contiguous regions only: a noncontiguous one, whose map has gaps
+    /// (where `map_edits`' indentation is not yet exact), never reaches it,
+    /// prepared or not.
+    #[test]
+    fn edit_carriers_mapping_prepared_edits_stay_closed_to_noncontiguous_regions() {
+        let resolved = crate::language::injection::ResolvedInjection {
+            region: crate::language::injection::CacheableInjectionRegion {
+                language: "lua".to_string(),
+                byte_range: 0..1,
+                line_range: 0..1,
+                start_column: 0,
+                region_id: String::new(),
+                content_hash: 0,
+            },
+            injection_language: "lua".to_string(),
+            virtual_content: String::new(),
+            line_column_offsets: vec![],
+            contiguous: false,
+            gaps: Default::default(),
+        };
+        for method in [
+            "textDocument/completion",
+            "textDocument/inlayHint",
+            "textDocument/colorPresentation",
+        ] {
+            assert!(method_maps_prepared_edits(method), "{method}");
+            for prepared in [false, true] {
+                assert!(method_closed_to(&resolved, method, prepared), "{method}");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn host_resolve_snapshot_keeps_language_and_text_together_during_edits() {
         let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
