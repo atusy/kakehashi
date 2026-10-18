@@ -1267,10 +1267,15 @@ impl LanguageServerPool {
     }
 
     /// Get the upstream client capabilities.
-    pub(crate) fn client_capabilities(
-        &self,
-    ) -> Option<tower_lsp_server::ls_types::ClientCapabilities> {
+    fn client_capabilities(&self) -> Option<tower_lsp_server::ls_types::ClientCapabilities> {
         self.client_capabilities.get().cloned()
+    }
+
+    /// [`Self::client_capabilities`], borrowed: for a read on a hot path.
+    pub(in crate::lsp::bridge) fn client_capabilities_ref(
+        &self,
+    ) -> Option<&tower_lsp_server::ls_types::ClientCapabilities> {
+        self.client_capabilities.get()
     }
 
     /// Take the upstream notification receiver for forwarding to the editor.
