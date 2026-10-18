@@ -459,11 +459,20 @@ fn re_envelope_item(
 ) {
     // Written as a fresh mint writes it, but keeping the mark of an item
     // minted from a prepared document (see `EnvelopeOffset::rewritten`).
+    // Field by field: the offset is rewritten, not cloned to be dropped.
     let rebuilt = TypeHierarchyEnvelope {
+        origin: envelope.origin.clone(),
+        host_uri: envelope.host_uri.clone(),
+        region_id: envelope.region_id.clone(),
+        injection_language: envelope.injection_language.clone(),
+        incarnation: envelope.incarnation,
+        content_version: envelope.content_version,
+        connection_generation: envelope.connection_generation,
+        connection_key: envelope.connection_key.clone(),
         offset: envelope.offset.rewritten(),
         inner: item.data.take(),
+        host_layer: envelope.host_layer,
         projected_from_virtual,
-        ..envelope.clone()
     };
     item.data = Some(serde_json::json!({ ENVELOPE_KEY: rebuilt }));
 }
