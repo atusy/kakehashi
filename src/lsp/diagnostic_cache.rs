@@ -118,11 +118,11 @@ pub(crate) struct SlotEntry {
 pub(crate) struct HeldStamp {
     pub(crate) connection: crate::lsp::bridge::ConnectionKey,
     pub(crate) observed: crate::lsp::bridge::Observed,
-    /// The virtual document the coordinates are about, for a push: placed
-    /// only through that document, never through another one its region
-    /// resolves to by now (re-routed to another language under the same
-    /// id). `None` for a request's stamp, whose document is checked where
-    /// it is placed.
+    /// The virtual document the coordinates are about, for a recorded push
+    /// (filled in as its slot is recorded): placed only through that
+    /// document, never through another one its region resolves to by now
+    /// (re-routed to another language under the same id). `None` for a
+    /// request's stamp, whose document is checked where it is placed.
     pub(crate) origin: Option<String>,
 }
 
