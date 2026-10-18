@@ -1129,6 +1129,68 @@ mod tests {
         remap.await.unwrap();
     }
 
+    /// Typing that changed P as the indentation changed (`  f` to
+    /// `    fo`) leaves no position of the request's map where it was: an
+    /// edit replacing `f` through it would overwrite the new indentation.
+    #[tokio::test]
+    async fn typing_as_the_indentation_changed_leaves_the_request_map_stale() {
+        use crate::lsp::bridge::protocol::{
+            EditMode, VirtualLayout, apply_prepare_result, translate_virtual_text_edits_to_host,
+        };
+        use tower_lsp_server::ls_types::{Position, Range, TextEdit};
+        let strip = |text: &str, columns: u32| {
+            let answer = serde_json::from_value(serde_json::json!({"segments": [{
+                "type": "content", "changes": [{
+                    "range": {"start": {"line": 0, "character": 0},
+                              "end": {"line": 0, "character": columns}},
+                    "newText": ""
+                }]
+            }]}))
+            .unwrap();
+            apply_prepare_result(text, &VirtualLayout::single(text), Some(answer)).unwrap()
+        };
+        let before = strip("  f\n", 2);
+        let after = strip("    fo\n", 4);
+        let pool = LanguageServerPool::preparing();
+        let uri = Url::parse("file:///test/type-and-reindent.md").unwrap();
+        pool.open_host_incarnation(&uri, 1).await;
+        let record = |prepared: &crate::lsp::bridge::protocol::PreparedDocument| {
+            pool.record_latest_virtual_content(
+                &uri,
+                1,
+                "lua",
+                TEST_ULID_LUA_0,
+                SentText {
+                    text: &prepared.text,
+                    map: Some(&prepared.map),
+                },
+            );
+        };
+        record(&before);
+        pool.note_host_edited(&uri, 1, 1);
+        record(&after);
+        pool.note_host_settled(&uri, 1, 1);
+        let offset = RegionOffset::new(0, 0).with_prepared(Arc::clone(&before.map));
+        let lsp_uri = crate::lsp::lsp_impl::url_to_uri(&uri).unwrap();
+        let ctx =
+            pool.response_context("virtual", &lsp_uri, (&uri, "lua", TEST_ULID_LUA_0), &offset);
+        // What the edit would do through the request's map.
+        let mut edits = [TextEdit {
+            range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+            new_text: "foo".to_string(),
+        }];
+        assert!(translate_virtual_text_edits_to_host(
+            &mut edits,
+            ctx.offset,
+            EditMode::Extent
+        ));
+        assert_eq!(
+            edits[0].range,
+            Range::new(Position::new(0, 2), Position::new(0, 3))
+        );
+        assert!(!ctx.request_map_current);
+    }
+
     /// A response is placed through its request's map only while that map
     /// describes the region's current host text, read from the latest
     /// recorded content: not while the host's newer text waits for its
@@ -1143,6 +1205,29 @@ mod tests {
             let answer = serde_json::from_value(serde_json::json!({"segments": [{"type": "content", "changes": [
                 {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": columns}}, "newText": ""}
             ]}]}))
+            .unwrap();
+            apply_prepare_result(
+                virtual_text,
+                &VirtualLayout::single(virtual_text),
+                Some(answer),
+            )
+            .unwrap()
+        };
+        // Every line's two leading spaces stripped (lines with fewer are
+        // left alone).
+        let strip_lines = |virtual_text: &str| {
+            let changes: Vec<_> = virtual_text
+                .split('\n')
+                .enumerate()
+                .filter(|(_, line)| line.starts_with("  "))
+                .map(|(line, _)| serde_json::json!({
+                    "range": {"start": {"line": line, "character": 0}, "end": {"line": line, "character": 2}},
+                    "newText": ""
+                }))
+                .collect();
+            let answer = serde_json::from_value(
+                serde_json::json!({"segments": [{"type": "content", "changes": changes}]}),
+            )
             .unwrap();
             apply_prepare_result(
                 virtual_text,
@@ -1200,6 +1285,23 @@ mod tests {
         // The request's own map current again (an undo): kept.
         record(&before);
         assert!(current(&request));
+        // Typed on as its indentation changed (`  red` to `    redx`): P
+        // changed too, yet positions through the request's map land in the
+        // new indentation — dropped.
+        record(&strip("    redx\n", 4));
+        assert!(!current(&request));
+        // A line added before a dedented one moves its removed indent to
+        // another line: dropped. (Availability only: the next request maps.)
+        let two_lines = strip_lines("  red\n  b\n");
+        let two_request = RegionOffset::new(0, 0).with_prepared(Arc::clone(&two_lines.map));
+        record(&two_lines);
+        assert!(current(&two_request));
+        record(&strip_lines("  red\n  x\n  b\n"));
+        assert!(!current(&two_request));
+        // Lines left alone (not dedented) added after it: the same layout.
+        record(&strip_lines("  red\n  b\nc\n"));
+        assert!(current(&two_request));
+        record(&before);
         // The host edited, its pass not settled yet (the parse window,
         // before any hold is published): the recorded text may be the one
         // before the edit, so pending.
@@ -1223,6 +1325,7 @@ mod tests {
         assert!(!current(&request));
         record(&before);
         // A map its peer revoked since describes nothing it still gives.
+        // (Its own map recorded first: only the revocation refuses it.)
         let revocation = Arc::new(crate::lsp::bridge::protocol::Revocation::default());
         let mut revoked = strip("  red\n", 2).map;
         Arc::get_mut(&mut revoked)

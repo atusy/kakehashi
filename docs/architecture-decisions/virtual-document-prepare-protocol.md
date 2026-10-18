@@ -257,19 +257,22 @@ deleted with them: P has no position inside them.
 
 An answer's edits are mapped only while the map its request was built on
 still describes the region's current host text, as recorded when the
-answer arrives. While the host's last edit has not been settled yet (its
-parse or lifecycle pass still running, so the recorded text may predate
-it), while the host's newer text waits for its prepare answer, or once
-the same prepared text is recorded under another map (an edit to
-indentation the peer removes changes the host but not P), or once the
-peer failed the request's input (see Failure; a reply arriving after that
-is refused whole, and one the failure lands under keeps no edit), the
-answer's edits are dropped: completion and color presentations answer nothing,
-inlay hints stay shown without their edits. Once typing has recorded
-another prepared text, an answer is stale as any LSP answer is when the
-document changes meanwhile, and is kept, as on unprepared documents; so
-an answer arriving within a keystroke's parse and prepare round-trip is
-dropped, one arriving after it kept.
+answer arrives. They are dropped while the host's last edit has not been
+settled yet (its parse or lifecycle pass still running, so the recorded
+text may predate it), while the host's newer text waits for its prepare
+answer, once the recorded map lays V out otherwise (a line's removed
+indentation changed — an edit to indentation the peer removes, whether P
+changed with it or not — or lines moved past a removed indent, or a gap
+moved), and once the peer failed the request's input (see Failure; a reply
+arriving after that is refused whole, and one the failure lands under keeps
+no edit). Then completion and color presentations answer nothing, and inlay
+hints stay shown without their edits. Once typing has recorded another
+prepared text with the same layout (text within lines both documents
+share), an answer is stale as any LSP answer is when the document changes
+meanwhile, and is kept, as on unprepared documents; so an answer arriving
+within a keystroke's parse and prepare round-trip is dropped, one arriving
+after it kept. A line typed before a dedented one drops it too: an
+availability cost only, the next request answering for the new layout.
 
 A color presentation without a `textEdit` replaces the request range with
 its label; on a prepared document that edit is made explicit and mapped
