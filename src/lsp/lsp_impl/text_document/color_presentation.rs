@@ -48,7 +48,9 @@ impl Kakehashi {
         let pool = self.bridge.pool();
         let tracker = self.bridge.node_tracker();
         Ok(answer.map_or_else(Vec::new, |answer| {
-            answer.still_current(|source| source.still_current(pool, tracker))
+            answer.still_current(|source| {
+                source.still_current(pool, tracker, || self.host_content_version(&lsp_uri))
+            })
         }))
     }
 
@@ -58,6 +60,8 @@ impl Kakehashi {
         range: Range,
         color: Color,
     ) -> Result<Option<Sourced<Vec<ColorPresentation>>>> {
+        // Before the text is read: see `Sourced::from_region`.
+        let content_version = self.prepared_request_content_version(lsp_uri);
         let Some(ctx) = self
             .resolve_bridge_contexts_for_range(lsp_uri, range, METHOD)
             .await
@@ -101,8 +105,14 @@ impl Kakehashi {
                 Ok((!items.is_empty()).then_some(items))
             })
             .await?;
-        Ok(presentations
-            .map(|items| Sourced::from_region(&ctx.document, items, self.bridge.node_tracker())))
+        Ok(presentations.map(|items| {
+            Sourced::from_region(
+                &ctx.document,
+                items,
+                self.bridge.node_tracker(),
+                content_version,
+            )
+        }))
     }
 
     async fn color_presentation_host_layer(
@@ -236,6 +246,7 @@ mod tests {
                     "01ARZ3NDEKTSV4RRFFQ69G5FAV",
                     &map,
                     1,
+                    0,
                 ),
             ))
         };

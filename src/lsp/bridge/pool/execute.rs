@@ -1214,8 +1214,9 @@ mod tests {
         let hints = request.await.unwrap().unwrap().unwrap();
         assert_eq!(hints.len(), 1, "the hint stays shown");
         assert!(hints[0].text_edits.is_none());
-        let sourced = Sourced::prepared_for_test(hints, &uri, "lua", &region, &before.map, 1);
-        assert!(!sourced.still_current(&pool, &tracker));
+        let sourced = Sourced::prepared_for_test(hints, &uri, "lua", &region, &before.map, 1, 0);
+        // Dropped by the store alone, before the host version is read.
+        assert!(!sourced.still_current(&pool, &tracker, || Some(0)));
     }
 
     /// Typing that changed P as the indentation changed (`  f` to

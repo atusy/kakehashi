@@ -260,6 +260,10 @@ meant them. This is read when the answer arrives, and once more when the
 final answer is chosen, since the servers' fan-in or the layer race can
 hold an answer while the host moves:
 
+- the host was edited since the request's text was read (anywhere: an
+  edit above the region moves the host coordinates its edits were
+  translated to, though the region's text and map stay the same) —
+  dropped, when the final answer is chosen;
 - the region is no longer live (no longer tracked under the host
   lifetime it was tracked under as the answer was made: deleted,
   invalidated by an edit over it, its host closed or reopened) — dropped;
@@ -273,7 +277,8 @@ hold an answer while the host moves:
   recorded its text) — kept;
 - recorded with the request's very text in the very same coordinates —
   kept;
-- anything else recorded (typed on, re-indented, sent as is, or the
+- anything else recorded (typed on, re-indented, or, with the host
+  unedited, sent as is or answered anew after an epoch move, or the
   region rerouted to another language) — dropped.
 
 Dropped, completion answers nothing (an empty incomplete list when it
