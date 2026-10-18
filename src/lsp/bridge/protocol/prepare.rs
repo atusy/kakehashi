@@ -1013,17 +1013,21 @@ fn fuses_a_line_break(prepared: &str, runs: &[Run], virtual_text: &str) -> bool 
     // The V offset of the prepared byte at `offset`, when it is one V holds
     // verbatim: unchanged content, or a gap kept as its original text (a
     // CRLF's LF left out of combined captures that took its CR, say).
+    // Once per run, not per CRLF: a gap's comparison reads all of it.
+    let verbatim: Vec<bool> = runs
+        .iter()
+        .map(|run| match run.kind {
+            RunKind::Identity => true,
+            RunKind::Gap => {
+                prepared.get(run.prepared.clone()) == virtual_text.get(run.virtual_.clone())
+            }
+            _ => false,
+        })
+        .collect();
     let virtual_offset = |offset: usize| {
         run_of(offset).and_then(|index| {
             let run = &runs[index];
-            let verbatim = match run.kind {
-                RunKind::Identity => true,
-                RunKind::Gap => {
-                    prepared.get(run.prepared.clone()) == virtual_text.get(run.virtual_.clone())
-                }
-                _ => false,
-            };
-            verbatim.then(|| run.virtual_.start + (offset - run.prepared.start))
+            verbatim[index].then(|| run.virtual_.start + (offset - run.prepared.start))
         })
     };
     prepared.match_indices("\r\n").any(|(cr, _)| {
@@ -1160,6 +1164,28 @@ mod tests {
         let layout = VirtualLayout::from_gaps(virtual_text, &injection.gaps);
         let prepared = apply_prepare_result(virtual_text, &layout, None).unwrap();
         assert_eq!(&prepared.text, virtual_text);
+    }
+
+    /// Checking a gap kept as is reads it once, not once per CRLF in it: a
+    /// gap of many CRLFs is checked in linear time.
+    #[test]
+    fn a_kept_gap_of_many_crlfs_is_checked_in_linear_time() {
+        let gap = "\r\n".repeat(200_000);
+        let virtual_text = format!("a\r{gap}\nb");
+        let gaps = [VirtualGap {
+            virtual_range: 2..2 + gap.len(),
+            host_text: gap.clone(),
+        }];
+        let layout = VirtualLayout::from_gaps(&virtual_text, &gaps);
+        let started = std::time::Instant::now();
+        assert!(apply_prepare_result(&virtual_text, &layout, None).is_ok());
+        // Quadratic, this takes seconds (200k CRLFs, each comparing the
+        // whole 400 kB gap); linear, milliseconds even unoptimized.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     /// A gap placeholder that would complete a CRLF with the content beside
