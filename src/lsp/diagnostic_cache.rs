@@ -1117,6 +1117,31 @@ impl DiagnosticAggregator {
         } else {
             cache.entry(host.clone()).or_default()
         };
+        // Monotonic per connection: a push read under an older text than the
+        // slot's (recorded later, past the check that would have dropped it)
+        // never replaces it — it would place nowhere, and take the newer
+        // push's diagnostics with it.
+        let read = |stamp: &HeldStamp| match stamp.observed {
+            crate::lsp::bridge::Observed::Read {
+                generation: Some(generation),
+                ..
+            } => Some(generation),
+            _ => None,
+        };
+        let older = source_slots
+            .get(&source)
+            .and_then(|servers| servers.get(&server))
+            .and_then(|slot| slot.held.as_ref())
+            .zip(held.as_ref())
+            .is_some_and(|(existing, incoming)| {
+                existing.connection == incoming.connection
+                    && read(existing)
+                        .zip(read(incoming))
+                        .is_some_and(|(existing, incoming)| existing > incoming)
+            });
+        if older {
+            return false;
+        }
         let changed = source_slots
             .get(&source)
             .and_then(|servers| servers.get(&server))
@@ -3487,6 +3512,45 @@ mod tests {
 
     /// The same diagnostics under another stamp place differently: the
     /// republish must not skip them.
+    #[test]
+    fn a_push_read_under_an_older_text_never_replaces_a_newer_one() {
+        use crate::lsp::bridge::{ConnectionKey, Observed};
+        let agg = DiagnosticAggregator::new();
+        let host = Url::parse("file:///test.md").unwrap();
+        let stamp = |generation| {
+            Some(HeldStamp {
+                connection: ConnectionKey::for_server("luals"),
+                observed: Observed::Read {
+                    generation: Some(generation),
+                    prepared: true,
+                    stale_version: false,
+                },
+                origin: None,
+            })
+        };
+        let record = |generation, message: &str| {
+            agg.record_held(
+                &host,
+                DiagnosticSource::Region("r".to_string()),
+                "luals".to_string(),
+                None,
+                stamp(generation),
+                vec![Diagnostic {
+                    message: message.to_string(),
+                    ..Default::default()
+                }],
+            )
+        };
+        assert!(record(2, "newer"));
+        assert!(!record(1, "older"), "kept");
+        let slots = agg.snapshot(&host);
+        assert_eq!(
+            slots[&DiagnosticSource::Region("r".to_string())]["luals"].diagnostics[0].message,
+            "newer"
+        );
+        assert!(record(3, "newest"), "a newer one still replaces it");
+    }
+
     #[test]
     fn a_new_stamp_on_the_same_diagnostics_is_a_change() {
         use crate::lsp::bridge::{ConnectionKey, Observed};
