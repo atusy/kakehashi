@@ -372,17 +372,30 @@ impl LanguageServerPool {
         Ok(transform_response(response, &context))
     }
 
-    /// Whether a request built on `offset` describes what `connection_key`
-    /// holds as its response arrives: always so for a request built as is
-    /// (whose staleness is that of any LSP request), otherwise
-    /// [`Self::holds_request_text`].
+    /// Whether the map a request was built on still places its response as
+    /// it arrives: false only when `connection_key` holds the request's very
+    /// prepared text under another map — host indentation the peer removes
+    /// was edited, with no didChange, so the same answer now stands for
+    /// other host coordinates. A newer text sent (typing), or the document
+    /// gone as is, is the in-flight staleness any LSP answer has, which an
+    /// unprepared document's answers carry too; a request built as is reads
+    /// nothing.
     fn still_holds_request_text(
         &self,
         uri_string: &str,
         connection_key: &super::ConnectionKey,
         offset: &RegionOffset,
     ) -> bool {
-        offset.prepared().is_none() || self.holds_request_text(uri_string, connection_key, offset)
+        let Some(request_map) = offset.prepared() else {
+            return true;
+        };
+        let (held, _) = self.document_tracker.held_now(uri_string, connection_key);
+        match held.and_then(|held| held.map) {
+            Some(held) => {
+                *held == *request_map || held.prepared_text() != request_map.prepared_text()
+            }
+            None => true,
+        }
     }
 
     /// Whether `connection_key` holds exactly the text a request built on
@@ -1179,6 +1192,57 @@ mod tests {
         assert!(sent.is_none());
         assert!(!pool.still_holds_request_text(&uri, &key, &request));
         assert!(pool.still_holds_request_text(&uri, &key, &RegionOffset::new(0, 0)));
+    }
+
+    /// A response arriving after a newer text was sent (typing) is still
+    /// placed through the request's map: the server answered for the text
+    /// that map describes, stale only as any LSP answer is.
+    #[tokio::test]
+    async fn a_response_after_a_newer_text_was_sent_still_places_through_its_map() {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let dedent = |virtual_text: &str| {
+            let answer = serde_json::from_value(serde_json::json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+            ]}]}))
+            .unwrap();
+            apply_prepare_result(
+                virtual_text,
+                &VirtualLayout::single(virtual_text),
+                Some(answer),
+            )
+            .unwrap()
+        };
+        let before = dedent("  re\n");
+        let typed = dedent("  red\n");
+        let pool = LanguageServerPool::preparing();
+        let host_uri = Url::parse("file:///test/typed.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap(),
+            "lua",
+            TEST_ULID_LUA_0,
+        );
+        let uri = virtual_uri.to_uri_string();
+        let key = ConnectionKey::for_server("lua");
+        pool.register_opened_document(&host_uri, &virtual_uri, &key)
+            .await;
+        pool.record_sent_for_test(
+            &virtual_uri,
+            &key,
+            SentText {
+                text: &before.text,
+                map: Some(&before.map),
+            },
+        );
+        let request = RegionOffset::new(0, 0).with_prepared(Arc::clone(&before.map));
+        pool.record_sent_for_test(
+            &virtual_uri,
+            &key,
+            SentText {
+                text: &typed.text,
+                map: Some(&typed.map),
+            },
+        );
+        assert!(pool.still_holds_request_text(&uri, &key, &request));
     }
 
     /// A request is queued only while its connection holds the text it was
