@@ -188,11 +188,14 @@ impl LanguageServerPool {
         let virtual_uri = VirtualDocumentUri::new(&host_uri_lsp, injection_language, region_id);
         let uri_string = virtual_uri.to_uri_string();
 
-        // A region its peer failed (under the current epoch, after this
-        // request was built on an earlier answer, say): no request reads
-        // coordinates through it, as no push is placed through it.
-        let failed =
-            || self.prepares() && self.prepare_failed(host_uri, injection_language, region_id);
+        // A region its peer failed since this request's answer was taken
+        // (under a new epoch, say): the request reads no coordinates through
+        // it, as no push is placed through it. One answered after the
+        // failure (for a newer text) is not refused.
+        let built = offset.prepared().map(|map| map.built());
+        let failed = || {
+            self.prepares() && self.prepare_failed(host_uri, injection_language, region_id, built)
+        };
         if failed() {
             return Err(request_text_not_held(connection_key));
         }
@@ -1158,14 +1161,25 @@ mod tests {
         // Read from the hold the lifecycle pass publishes.
         pool.open_host_incarnation(&host_uri, 1).await;
         pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  a");
-        assert!(!pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0));
+        let built = Some(prepared.map.built());
+        let failed = || pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0, built);
+        assert!(!failed());
         pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, false);
-        assert!(
-            !pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0),
-            "pending"
-        );
+        assert!(!failed(), "pending");
         pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, true);
-        assert!(pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0));
+        assert!(failed(), "an answer taken before the failure");
+        assert!(
+            pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0, None),
+            "as is"
+        );
+        // An answer taken after the failure (a newer text's, which the next
+        // pass is about to send) is not refused by the stale hold, nor by
+        // the same failure held again.
+        let newer =
+            apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(dedent_answer()))
+                .unwrap();
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, true);
+        assert!(!pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0, Some(newer.map.built())));
     }
 
     #[tokio::test]

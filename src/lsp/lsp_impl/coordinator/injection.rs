@@ -2927,7 +2927,7 @@ mod tests {
             gaps: &[],
         };
         let injection = server.injection_coordinator();
-        let failed = || pool.prepare_failed(&uri, "rust", &region.region_id);
+        let failed = || pool.prepare_failed(&uri, "rust", &region.region_id, None);
         server.bridge.answer_prepare_for_test(
             &target,
             input,
