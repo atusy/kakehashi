@@ -121,6 +121,8 @@ fn transform_linked_editing_range_response_to_host(
         return None;
     }
 
+    // Never through a prepared text: the method is closed to prepared
+    // documents (see `bridge_context::method_closed_to`).
     for range in &mut linked.ranges {
         translate_virtual_range_to_host(range, offset);
     }
