@@ -984,8 +984,9 @@ enum Alignment {
     /// A line written as an old line's text with more after it: that line,
     /// lines joined onto it (see [`joined_lines`]).
     Joined,
-    /// Blank lines with blank lines, as many as can pair, those alike to
-    /// the whitespace first (see [`blank_lines`]).
+    /// Blank lines with blank lines: as many as can pair, and among those
+    /// alignments, the one with the most pairs alike to the whitespace (see
+    /// [`blank_lines`]).
     Blanks,
 }
 
@@ -997,8 +998,9 @@ enum Alignment {
 /// - Lines of text other lines were joined onto.
 /// - Blank lines among themselves: as many as can pair, so that text the
 ///   formatter writes beside blank lines is never read as written on one
-///   while a blank line of the answer could be that line; among as many,
-///   those alike to the whitespace (a kept whitespace line kept as it was).
+///   while a blank line of the answer could be that line; of the
+///   alignments pairing as many, the one with the most pairs alike to the
+///   whitespace (a kept whitespace line kept as it was).
 ///
 /// What is left between pairs (lines rewritten past telling, lines written
 /// or removed) is diffed by character as one run. Which of several blank
@@ -1044,9 +1046,11 @@ fn blank_lines(
     let alike = |old_line: usize, new_line: usize| {
         !old_keys[0][old_line].is_empty() && old_keys[0][old_line] == new_keys[0][new_line]
     };
-    // score[i][j]: the best of old[i..] against new[j..]; a pair counts 1,
-    // and 2 more when alike to the whitespace: a pair alike outweighs any
-    // one other pair it would cost.
+    // score[i][j]: the best of old[i..] against new[j..], by the count of
+    // pairs, then of pairs alike: a pair counts `pair`, more than every
+    // pair alike together, and a pair alike 1 more. (Below the cell cap,
+    // the shorter side holds at most 2048 lines: no overflow.)
+    let pair = u32::try_from(old.len().min(new.len())).unwrap_or(u32::MAX - 1) + 1;
     let mut score = vec![vec![0u32; new.len() + 1]; old.len() + 1];
     for i in (0..old.len()).rev() {
         if Instant::now() >= deadline {
@@ -1054,7 +1058,7 @@ fn blank_lines(
         }
         for j in (0..new.len()).rev() {
             let alike = alike(old[i], new[j]);
-            let paired = score[i + 1][j + 1] + 1 + 2 * u32::from(alike);
+            let paired = score[i + 1][j + 1] + pair + u32::from(alike);
             score[i][j] = paired.max(score[i + 1][j]).max(score[i][j + 1]);
         }
     }
@@ -1062,7 +1066,7 @@ fn blank_lines(
     let (mut i, mut j) = (0, 0);
     while i < old.len() && j < new.len() {
         let alike = alike(old[i], new[j]);
-        if score[i][j] == score[i + 1][j + 1] + 1 + 2 * u32::from(alike) {
+        if score[i][j] == score[i + 1][j + 1] + pair + u32::from(alike) {
             pairs.push((old[i], new[j]));
             (i, j) = (i + 1, j + 1);
         } else if score[i][j] == score[i + 1][j] {

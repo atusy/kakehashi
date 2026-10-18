@@ -272,9 +272,11 @@ layout of P restored as for any document, and the result diffed against
 P. Lines are paired first: a line of text with the line it was rewritten
 from (alike but for the whitespace around its text, a line found once in
 each text anchoring the rest), then a line other lines were joined onto,
-then blank lines with blank lines — a whitespace line with one holding the
-same whitespace first, then as many as can pair, so that text the formatter
-writes beside blank lines is a line of its own, not text written on one
+then blank lines with blank lines — as many as can pair, and of the
+alignments pairing as many, the one keeping most whitespace lines with ones
+holding the same whitespace, so that text the formatter writes beside blank
+lines is a line of its own whenever a blank line of the answer could be the
+line it would otherwise be written on, not text written on one
 (which, on a whitespace line the peer kept, would regain no indentation and
 lose the formatter's relative indentation). Each pair, and each run of lines
 left between pairs, is then diffed by character, and every stretch the
