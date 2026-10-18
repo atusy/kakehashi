@@ -1752,14 +1752,32 @@ mod tests {
     }
 
     /// A resolve has no text check of its own: one whose reply was computed
-    /// on another text than its connection held as it was queued (a
-    /// prepared one sent ahead of it after its pair gained a peer) is
-    /// dropped, its edit being in other coordinates than the envelope's.
+    /// on a prepared text (sent before the resolve was queued, or after,
+    /// once its pair gained a peer) is dropped, its edit being in other
+    /// coordinates than the envelope's as-is ones.
     #[tokio::test]
     async fn a_resolve_computed_on_a_text_sent_after_it_was_queued_is_dropped() {
         use crate::lsp::bridge::pool::SentText;
         use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
-        for text_sent_since in [false, true] {
+        let record_prepared = |pool: &LanguageServerPool, virtual_uri: &VirtualDocumentUri| {
+            let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+            ]}]}))
+            .unwrap();
+            let prepared =
+                apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(answer)).unwrap();
+            pool.record_sent_for_test(
+                virtual_uri,
+                &ConnectionKey::for_server("ruff"),
+                SentText {
+                    text: &prepared.text,
+                    map: Some(&prepared.map),
+                },
+            );
+        };
+        // When a prepared text is sent: never, before the resolve is queued,
+        // or after.
+        for sent in [None, Some("before"), Some("after")] {
             let pool = Arc::new(LanguageServerPool::preparing());
             let key = ConnectionKey::for_server("ruff");
             let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
@@ -1771,6 +1789,9 @@ mod tests {
                 "01JPMQ8ZYYQA1W3AVPW4JDRZFR",
             );
             pool.record_sent_for_test(&virtual_uri, &key, SentText::from("  a"));
+            if sent == Some("before") {
+                record_prepared(&pool, &virtual_uri);
+            }
             let upstream_id = UpstreamId::Number(78);
             let request = {
                 let pool = Arc::clone(&pool);
@@ -1813,22 +1834,8 @@ mod tests {
             })
             .await
             .expect("resolve request must be sent");
-            if text_sent_since {
-                let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
-                    {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
-                ]}]}))
-                .unwrap();
-                let prepared =
-                    apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(answer))
-                        .unwrap();
-                pool.record_sent_for_test(
-                    &virtual_uri,
-                    &key,
-                    SentText {
-                        text: &prepared.text,
-                        map: Some(&prepared.map),
-                    },
-                );
+            if sent == Some("after") {
+                record_prepared(&pool, &virtual_uri);
             }
             let _ = handle.router().route(json!({
                 "jsonrpc": "2.0",
@@ -1837,8 +1844,8 @@ mod tests {
             }));
             assert_eq!(
                 request.await.unwrap().is_some(),
-                !text_sent_since,
-                "text sent since: {text_sent_since}"
+                sent.is_none(),
+                "prepared text sent: {sent:?}"
             );
         }
     }
