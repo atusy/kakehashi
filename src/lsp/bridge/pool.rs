@@ -3200,6 +3200,26 @@ impl LanguageServerPool {
         }))
     }
 
+    /// [`Self::note_held`] for the virtual document of `region_id` (under
+    /// `injection_language`) of `host_uri`, as a resolve names it by its
+    /// envelope. `None` without the prepare layer, where nothing is noted
+    /// (and no URI is built), or for a host URI no virtual document is named
+    /// under.
+    pub(crate) fn note_region_held(
+        &self,
+        host_uri: &Url,
+        injection_language: &str,
+        region_id: &str,
+        connection_key: &ConnectionKey,
+    ) -> Option<HeldNote> {
+        if !self.prepares() {
+            return None;
+        }
+        let host = crate::lsp::lsp_impl::url_to_uri(host_uri).ok()?;
+        let virtual_uri = VirtualDocumentUri::new(&host, injection_language, region_id);
+        Some(self.note_held(&virtual_uri.to_uri_string(), connection_key))
+    }
+
     /// Whether the reply to a resolve noted as `note` was computed on a text
     /// held as is: the connection held one as the resolve was queued (not a
     /// prepared text sent before it, after a peer was gained), and no text
