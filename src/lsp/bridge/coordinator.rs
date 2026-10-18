@@ -708,6 +708,19 @@ impl BridgeCoordinator {
             .await
     }
 
+    /// Record `text` as sent to `connection_key` for `virtual_uri`, as a
+    /// queued send as is would.
+    #[cfg(test)]
+    pub(crate) fn record_sent_as_is_for_test(
+        &self,
+        virtual_uri: &crate::lsp::bridge::protocol::VirtualDocumentUri,
+        connection_key: &crate::lsp::bridge::pool::ConnectionKey,
+        text: &str,
+    ) {
+        self.pool
+            .record_sent_for_test(virtual_uri, connection_key, text.into());
+    }
+
     /// Bump a virtual document's tracked version, as a content-changing
     /// `didChange` forward would (test helper for the applyEdit version
     /// validation).
