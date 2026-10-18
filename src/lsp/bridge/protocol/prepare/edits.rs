@@ -144,6 +144,9 @@ impl PreparedMap {
     /// together.
     fn mapped_edits_keep_host_text(&self, mapped: &[(Range<usize>, String)]) -> bool {
         let virtual_text = &self.virtual_lines.text;
+        // Edits apart in P map apart (touching ones are refused or keep
+        // their order, see `map_edits`); the overlap check stays as the
+        // guard every later read of the sorted set relies on.
         let mut sorted: Vec<&(Range<usize>, String)> = mapped.iter().collect();
         sorted.sort_by_key(|(range, _)| (range.start, range.end));
         if sorted
@@ -448,7 +451,9 @@ impl PreparedMap {
             .any(|gap| {
                 if gap.prepared.is_empty() {
                     // A gap replaced by nothing: only a change spanning its
-                    // position removes the host text around it.
+                    // position removes the host text around it. (The mapped
+                    // range's backstop in `hunk_to_virtual` refuses this
+                    // too; kept so this check alone states the rule.)
                     old.start < gap.prepared.start && gap.prepared.start < old.end
                 } else {
                     old.start < gap.prepared.end && gap.prepared.start < old.end
