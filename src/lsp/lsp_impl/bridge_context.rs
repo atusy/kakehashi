@@ -325,6 +325,85 @@ impl Drop for UpstreamRegistrySweepGuard {
     }
 }
 
+/// A layer's answer, with the prepared region its edits were mapped
+/// through, if any: what the final answer is checked against once, as it
+/// is chosen (see [`Self::still_current`]).
+pub(crate) struct Sourced<T> {
+    pub(crate) value: T,
+    prepared: Option<PreparedSource>,
+}
+
+/// The region and request map a prepared answer was transformed through.
+struct PreparedSource {
+    host_uri: Url,
+    language: String,
+    region_id: String,
+    map: std::sync::Arc<crate::lsp::bridge::PreparedMap>,
+}
+
+impl<T> Sourced<T> {
+    /// An answer read through no prepared map (the host layer's, or an
+    /// unprepared region's).
+    pub(crate) fn unprepared(value: T) -> Self {
+        Self {
+            value,
+            prepared: None,
+        }
+    }
+
+    /// An answer mapped through `map`, for `region_id` (under `language`)
+    /// of `host_uri`.
+    #[cfg(test)]
+    pub(crate) fn prepared_for_test(
+        value: T,
+        host_uri: &Url,
+        language: &str,
+        region_id: &str,
+        map: &std::sync::Arc<crate::lsp::bridge::PreparedMap>,
+    ) -> Self {
+        Self {
+            value,
+            prepared: Some(PreparedSource {
+                host_uri: host_uri.clone(),
+                language: language.to_string(),
+                region_id: region_id.to_string(),
+                map: std::sync::Arc::clone(map),
+            }),
+        }
+    }
+
+    /// The virt layer's answer for `ctx`'s region: through its map, when
+    /// the region is prepared.
+    pub(crate) fn from_region(ctx: &DocumentRequestContext, value: T) -> Self {
+        Self {
+            value,
+            prepared: ctx.prepared.as_ref().map(|map| PreparedSource {
+                host_uri: ctx.uri.clone(),
+                language: ctx.resolved.injection_language.clone(),
+                region_id: ctx.resolved.region.region_id.clone(),
+                map: std::sync::Arc::clone(map),
+            }),
+        }
+    }
+
+    /// Whether the edits mapped into the answer still land where they were
+    /// mapped: always so without a map, and otherwise as the executor read
+    /// it as the reply arrived (`LanguageServerPool::host_text_still_current`),
+    /// read again here because a fan-in or the layer race can hold a
+    /// transformed answer while the host moves. Read once, where the final
+    /// answer is chosen.
+    pub(crate) fn still_current(&self, pool: &crate::lsp::bridge::LanguageServerPool) -> bool {
+        self.prepared.as_ref().is_none_or(|source| {
+            pool.host_text_still_current(
+                &source.host_uri,
+                &source.language,
+                &source.region_id,
+                &source.map,
+            )
+        })
+    }
+}
+
 /// All resolved context needed to send bridge requests to multiple servers.
 ///
 /// Produced by `Kakehashi::resolve_bridge_contexts`. Returns ALL matching server
@@ -2261,6 +2340,45 @@ mod tests {
     use crate::config::settings::{
         AggregationConfig, AggregationStrategy, BridgeLanguageConfig, LanguageSettings,
     };
+
+    /// A transformed answer a fan-in or the layer race held while the host
+    /// was re-indented (the same prepared text under a new map) is stale
+    /// when the final answer is chosen, though it was current as its reply
+    /// was transformed.
+    #[tokio::test]
+    async fn an_answer_held_while_the_host_moved_is_stale_when_chosen() {
+        use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
+        let strip = |text: &str, columns: u32| {
+            let answer = serde_json::from_value(serde_json::json!({"segments": [{
+                "type": "content", "changes": [{
+                    "range": {"start": {"line": 0, "character": 0},
+                              "end": {"line": 0, "character": columns}},
+                    "newText": ""
+                }]
+            }]}))
+            .unwrap();
+            apply_prepare_result(text, &VirtualLayout::single(text), Some(answer)).unwrap()
+        };
+        let before = strip("  red\n", 2);
+        let after = strip("    red\n", 4);
+        assert_eq!(before.text, after.text);
+        let pool = crate::lsp::bridge::LanguageServerPool::preparing();
+        let host = Url::parse("file:///test/held-reindent.md").unwrap();
+        let region = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        pool.open_host_incarnation(&host, 1).await;
+        pool.record_latest_prepared_for_test(&host, 1, "lua", region, &before);
+        let held = Sourced::prepared_for_test((), &host, "lua", region, &before.map);
+        assert!(
+            held.still_current(&pool),
+            "current as its reply was transformed"
+        );
+        pool.note_host_edited(&host, 1, 1);
+        pool.record_latest_prepared_for_test(&host, 1, "lua", region, &after);
+        pool.note_host_settled(&host, 1, 1);
+        assert!(!held.still_current(&pool));
+        // An answer through no map reads nothing.
+        assert!(Sourced::unprepared(()).still_current(&pool));
+    }
 
     /// A Kakehashi over a preparing pool whose markdown lua documents have
     /// one candidate, and a region of it no lifecycle pass looked up.

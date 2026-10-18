@@ -3362,6 +3362,29 @@ impl LanguageServerPool {
         debug_assert!(installed, "the prepare failures were read before installed");
     }
 
+    /// Record `prepared` as the region's latest text, as a forwarding pass
+    /// does (see [`Self::record_latest_virtual_content`]).
+    #[cfg(test)]
+    pub(crate) fn record_latest_prepared_for_test(
+        &self,
+        host_uri: &Url,
+        incarnation: u64,
+        language: &str,
+        region_id: &str,
+        prepared: &super::protocol::PreparedDocument,
+    ) {
+        self.record_latest_virtual_content(
+            host_uri,
+            incarnation,
+            language,
+            region_id,
+            SentText {
+                text: &prepared.text,
+                map: Some(&prepared.map),
+            },
+        );
+    }
+
     /// The failures [`Self::prepare_failed`] reads, installed on first use
     /// for a pool no prepare layer was built over.
     #[cfg(test)]

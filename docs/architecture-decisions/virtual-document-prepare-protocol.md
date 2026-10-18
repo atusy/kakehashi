@@ -256,8 +256,10 @@ No edit in P reaches into the deleted edge lines or the closing indent
 deleted with them: P has no position inside them.
 
 An answer's edits are mapped only while the map its request was built on
-still describes the region's current host text, as recorded when the
-answer arrives. They are dropped while the host's last edit has not been
+still describes the region's current host text, as recorded: read when
+the answer arrives, and once more when the final answer is chosen, since
+the servers' fan-in or the layer race can hold an answer while the host
+moves. They are dropped while the host's last edit has not been
 settled yet (its parse or lifecycle pass still running, so the recorded
 text may predate it), while the host's newer text waits for its prepare
 answer, once the recorded map lays V out otherwise (a line's removed

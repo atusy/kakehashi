@@ -23,7 +23,7 @@ use crate::lsp::aggregation::server::{
     HostFanOutTask, dispatch_host_preferred, dispatch_preferred,
 };
 use crate::lsp::bridge::{HostDocument, bridge_host_completion_items};
-use crate::lsp::lsp_impl::bridge_context::parse_host_verbatim;
+use crate::lsp::lsp_impl::bridge_context::{Sourced, parse_host_verbatim};
 
 const METHOD: &str = "textDocument/completion";
 
@@ -38,7 +38,10 @@ impl Kakehashi {
 
         let requery = std::sync::atomic::AtomicBool::new(false);
         let virt = self.completion_virt_layer(&lsp_uri, position, &requery);
-        let host = self.completion_host_layer(&lsp_uri, raw_params);
+        let host = async {
+            let response = self.completion_host_layer(&lsp_uri, raw_params).await?;
+            Ok(response.map(Sourced::unprepared))
+        };
         let (response, layers) = self
             .walk_layer_futures_in_order(
                 &lsp_uri,
@@ -47,9 +50,20 @@ impl Kakehashi {
                 virt,
                 host,
                 std::future::ready(Ok(None)),
-                completion_response_has_result,
+                |sourced: &Sourced<CompletionResponse>| {
+                    completion_response_has_result(&sourced.value)
+                },
             )
             .await;
+        // The final answer chosen: its edits checked once more against the
+        // host text, which may have moved while it was held.
+        let pool = self.bridge.pool();
+        let response = response.map(|response| {
+            response.and_then(|sourced| {
+                let current = sourced.still_current(pool);
+                completion_still_current(sourced.value, current)
+            })
+        });
         completion_answer(
             response,
             requery.load(std::sync::atomic::Ordering::Relaxed),
@@ -172,7 +186,7 @@ impl Kakehashi {
         lsp_uri: &Uri,
         position: Position,
         requery: &std::sync::atomic::AtomicBool,
-    ) -> Result<Option<CompletionResponse>> {
+    ) -> Result<Option<Sourced<CompletionResponse>>> {
         // Use shared preamble to resolve injection context with ALL matching servers
         let Some(ctx) = self
             .resolve_bridge_contexts(lsp_uri, position, METHOD)
@@ -243,7 +257,29 @@ impl Kakehashi {
         if ask {
             requery.store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        Ok(response)
+        Ok(response.map(|response| Sourced::from_region(&ctx.document, response)))
+    }
+}
+
+/// The chosen completion answer once its edits were checked against the
+/// host text (`current`): as it is, or, its edits stale, no items — still
+/// asking to re-query when the answer did (an empty incomplete list), as a
+/// virt layer without items would.
+fn completion_still_current(
+    response: CompletionResponse,
+    current: bool,
+) -> Option<CompletionResponse> {
+    if current {
+        return Some(response);
+    }
+    match response {
+        CompletionResponse::List(list) if list.is_incomplete => {
+            Some(CompletionResponse::List(CompletionList {
+                is_incomplete: true,
+                items: vec![],
+            }))
+        }
+        _ => None,
     }
 }
 
@@ -558,6 +594,34 @@ mod tests {
     /// The re-query truth table, a row per case: what the virt layer's
     /// servers answered (an ask ranked above the winner, or not), what the
     /// layers gave, and what the client gets.
+    #[test]
+    fn a_stale_completion_answers_no_items() {
+        use tower_lsp_server::ls_types::CompletionItem;
+        let list = |is_incomplete| {
+            CompletionResponse::List(CompletionList {
+                is_incomplete,
+                items: vec![CompletionItem {
+                    label: "x".to_string(),
+                    ..Default::default()
+                }],
+            })
+        };
+        assert_eq!(
+            completion_still_current(list(false), true),
+            Some(list(false))
+        );
+        // Stale: nothing, as a virt layer without items answers...
+        assert_eq!(completion_still_current(list(false), false), None);
+        // ...still asking to re-query when the answer did.
+        assert_eq!(
+            completion_still_current(list(true), false),
+            Some(CompletionResponse::List(CompletionList {
+                is_incomplete: true,
+                items: vec![],
+            }))
+        );
+    }
+
     #[test]
     fn a_requery_ask_reaches_the_client_through_whichever_answer_carries_it() {
         use crate::config::settings::LayerSource::{Host, Native, Virt};
