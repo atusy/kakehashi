@@ -1267,7 +1267,9 @@ impl LanguageServerPool {
     }
 
     /// Get the upstream client capabilities.
-    fn client_capabilities(&self) -> Option<tower_lsp_server::ls_types::ClientCapabilities> {
+    pub(crate) fn client_capabilities(
+        &self,
+    ) -> Option<tower_lsp_server::ls_types::ClientCapabilities> {
         self.client_capabilities.get().cloned()
     }
 

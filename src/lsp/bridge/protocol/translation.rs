@@ -341,6 +341,24 @@ pub(crate) fn host_range_in_prepared_gap(host_range: Range, offset: &RegionOffse
     prepared.virtual_range_in_gap(range)
 }
 
+/// Whether `host_position` lies within indentation or blank lines the
+/// prepare peer removed from the document `offset` maps to, starts included
+/// (and from where the deleted closing lines start). Downstream sees the
+/// caret elsewhere instead — at the line's content, the document's start or
+/// the content's end — so an edit it anchors there (a completion's replace
+/// range) would not contain the caret the client asked at.
+pub(crate) fn host_position_in_removed_indent(
+    host_position: Position,
+    offset: &RegionOffset,
+) -> bool {
+    let Some(prepared) = offset.prepared() else {
+        return false;
+    };
+    let mut position = host_position;
+    translate_host_position_to_unprepared_virtual(&mut position, offset);
+    prepared.virtual_position_in_removed_indent(position)
+}
+
 /// [`host_position_within_region`] plus the trailing bound: the position must
 /// also not lie past `region_end` — the region's end-of-content mapped to host
 /// coordinates (`region_host_end(virtual_content, offset)`).
