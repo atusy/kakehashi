@@ -145,6 +145,8 @@ struct Cell {
     /// `protocol::next_presentation`): an answer to it is as new as its
     /// virtual text, not as the moment it came.
     taken: u64,
+    /// The input apart from its epoch and candidates (see [`input_identity`]).
+    input: u64,
     /// Set once an attempt got an answer.
     outcome: std::sync::OnceLock<Answer>,
     /// An attempt is running.
@@ -164,10 +166,11 @@ struct Cell {
 }
 
 impl Cell {
-    fn new(epoch: u64) -> Self {
+    fn new(epoch: u64, input: u64) -> Self {
         Self {
             epoch,
             taken: super::protocol::next_presentation(),
+            input,
             outcome: std::sync::OnceLock::new(),
             in_flight: AtomicBool::new(false),
             misses: AtomicU32::new(0),
@@ -474,24 +477,30 @@ impl PrepareRegistry {
             .unwrap_or_default()
     }
 
-    /// When the input the lifecycle pass holds `region_id` (under
-    /// `injection_language`) of `host_uri` on was taken, in the presentation
-    /// order, if its answer standing at `epoch` is unusable: identifies that
-    /// failure, so an answer taken before it is told from one taken after.
+    /// The input the lifecycle pass holds `region_id` (under
+    /// `injection_language`) of `host_uri` on, if its answer standing at
+    /// `epoch` is unusable: when it was taken and what it is, so the answers
+    /// that failure revokes (for the same input, taken before) are told from
+    /// the others.
     pub(crate) fn failed_at(
         &self,
         host_uri: &Url,
         injection_language: &str,
         region_id: &str,
         epoch: u64,
-    ) -> Option<u64> {
+    ) -> Option<super::protocol::AnswerOrigin> {
         let host_uri = host_uri.as_str();
         self.regions
             .get(&region_hash(host_uri, injection_language, region_id))
             .filter(|region| region.is(host_uri, injection_language, region_id))
             .and_then(|region| {
                 region.held_cell().and_then(|cell| {
-                    matches!(cell.standing(epoch), Ok(Some(Answer::Unusable))).then_some(cell.taken)
+                    matches!(cell.standing(epoch), Ok(Some(Answer::Unusable))).then_some(
+                        super::protocol::AnswerOrigin {
+                            taken: cell.taken,
+                            input: cell.input,
+                        },
+                    )
                 })
             })
     }
@@ -724,7 +733,7 @@ impl PrepareRegistry {
             Some(index) => region.slots.remove(index),
             None => Slot {
                 key,
-                cell: Arc::new(Cell::new(target.epoch)),
+                cell: Arc::new(Cell::new(target.epoch, input_identity(input))),
             },
         };
         if moved {
@@ -793,7 +802,7 @@ impl PrepareRegistry {
         let revisions = Arc::clone(&self.next_revision);
         let pool = Arc::clone(pool);
         let candidates = Arc::clone(&target.candidates);
-        let job = PrepareJob::new(input, cell.taken);
+        let job = PrepareJob::new(input, cell.taken, cell.input);
         let resync_tx = self.resync_tx.clone();
         let held_changes = Arc::clone(&self.held_changes);
         let closed_hosts = Arc::clone(&self.closed_hosts);
@@ -903,6 +912,17 @@ fn region_hash(host_uri: &str, injection_language: &str, region_id: &str) -> u64
 /// The input's identity: its text and gaps, the host language and the
 /// candidates (by name and launch config), under the epoch the target was
 /// resolved in.
+/// An input's identity apart from the epoch and candidates it is asked
+/// under (see `protocol::AnswerOrigin`): the same text, asked again after
+/// the epoch moved, has the same one.
+fn input_identity(input: PrepareInput<'_>) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    input.host_language.hash(&mut hasher);
+    input.virtual_text.hash(&mut hasher);
+    input.gaps.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn input_key(target: &PrepareTarget, input: PrepareInput<'_>) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     target.epoch.hash(&mut hasher);
@@ -923,6 +943,8 @@ fn input_key(target: &PrepareTarget, input: PrepareInput<'_>) -> u64 {
 struct PrepareJob {
     /// See `Cell::taken`.
     taken: u64,
+    /// See `Cell::input`.
+    identity: u64,
     host_uri: Url,
     host_language: String,
     injection_language: String,
@@ -932,9 +954,10 @@ struct PrepareJob {
 }
 
 impl PrepareJob {
-    fn new(input: PrepareInput<'_>, taken: u64) -> Self {
+    fn new(input: PrepareInput<'_>, taken: u64, identity: u64) -> Self {
         Self {
             taken,
+            identity,
             host_uri: input.host_uri.clone(),
             host_language: input.host_language.to_string(),
             injection_language: input.injection_language.to_string(),
@@ -1145,7 +1168,13 @@ async fn try_run(
         };
         return Ok(
             apply_prepare_result_at(&job.virtual_text, &layout, result, job.taken)
-                .map(Some)
+                .map(|mut prepared| {
+                    // Fresh: its only reference.
+                    if let Some(map) = Arc::get_mut(&mut prepared.map) {
+                        map.set_input(job.identity);
+                    }
+                    Some(prepared)
+                })
                 .map_err(|error| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -1588,12 +1617,26 @@ mod tests {
         delay: f64,
         code: i64,
     ) {
+        let refusal =
+            format!(r#"{{"jsonrpc":"2.0","id":2,"error":{{"code":{code},"message":"no"}}}}"#);
+        answering_candidate(pool, name, path, delay, &refusal).await;
+    }
+
+    /// A candidate advertising the request that answers it (its first
+    /// request, id 2) with the raw `refusal` response `delay` seconds after
+    /// it arrived, recording what it was sent at `path`.
+    #[cfg(unix)]
+    async fn answering_candidate(
+        pool: &LanguageServerPool,
+        name: &str,
+        path: &std::path::Path,
+        delay: f64,
+        refusal: &str,
+    ) {
         use crate::lsp::bridge::pool::ConnectionState;
         use crate::lsp::bridge::pool::test_helpers::{
             advertise_prepare_for_test, create_handle_with_command,
         };
-        let refusal =
-            format!(r#"{{"jsonrpc":"2.0","id":2,"error":{{"code":{code},"message":"no"}}}}"#);
         // A negative delay: answer once `<path>.release` exists.
         let pause = if delay < 0.0 {
             "while [ ! -e \"$1.release\" ]; do sleep 0.01; done".to_string()
@@ -1622,6 +1665,50 @@ mod tests {
         .await;
         advertise_prepare_for_test(&handle, true);
         pool.insert_connection(handle).await;
+    }
+
+    /// A map from a peer's answer names the answer it came from: its input's
+    /// stamp and identity, the same identity a failure of that input holds
+    /// (see `AnswerOrigin::revoked_by`).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_answers_map_names_the_input_it_answers() {
+        let registry = PrepareRegistry::default();
+        let pool = Arc::new(LanguageServerPool::preparing());
+        let dir = tempfile::tempdir().unwrap();
+        answering_candidate(
+            &pool,
+            "peer",
+            &dir.path().join("peer"),
+            0.0,
+            r#"{"jsonrpc":"2.0","id":2,"result":null}"#,
+        )
+        .await;
+        let host = Url::parse("file:///host.md").unwrap();
+        let target = target_of(&pool, &[("peer", &["peer"])]);
+        let Ok(Answer::Prepared(prepared)) =
+            registry.prepare(&pool, &target, input(&host, "a")).await
+        else {
+            panic!("prepared");
+        };
+        let cell = cell(
+            &registry,
+            &pool,
+            &target,
+            input(&host, "a"),
+            Holder::Request,
+        );
+        assert_eq!(
+            prepared.map.origin(),
+            super::super::protocol::AnswerOrigin {
+                taken: cell.taken,
+                input: input_identity(input(&host, "a")),
+            }
+        );
+        assert_ne!(
+            input_identity(input(&host, "a")),
+            input_identity(input(&host, "b"))
+        );
     }
 
     #[cfg(unix)]

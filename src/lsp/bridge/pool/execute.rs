@@ -192,7 +192,7 @@ impl LanguageServerPool {
         // (under a new epoch, say): the request reads no coordinates through
         // it, as no push is placed through it. One answered after the
         // failure (for a newer text) is not refused.
-        let built = offset.prepared().map(|map| map.built());
+        let built = offset.prepared().map(|map| map.origin());
         let failed = || {
             self.prepares() && self.prepare_failed(host_uri, injection_language, region_id, built)
         };
@@ -1161,15 +1161,23 @@ mod tests {
         // Read from the hold the lifecycle pass publishes.
         pool.open_host_incarnation(&host_uri, 1).await;
         pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  a");
-        let built = Some(prepared.map.built());
-        let failed = || pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0, built);
+        let answer = prepared.map.origin();
+        let failed = || pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0, Some(answer));
         assert!(!failed());
         pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, None);
         assert!(!failed(), "pending");
-        // The failed input, taken after the request's.
-        let first = crate::lsp::bridge::protocol::next_presentation();
+        // The same input asked again (under a new epoch, say), taken after
+        // the request's, and failed.
+        let failure = |input| crate::lsp::bridge::protocol::AnswerOrigin {
+            taken: crate::lsp::bridge::protocol::next_presentation(),
+            input,
+        };
+        let first = failure(answer.input);
         pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, Some(first));
-        assert!(failed(), "an answer taken before the failure");
+        assert!(
+            failed(),
+            "an answer for the failed input taken before it failed"
+        );
         assert!(
             pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0, None),
             "as is"
@@ -1181,13 +1189,22 @@ mod tests {
             apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(dedent_answer()))
                 .unwrap();
         let newer_failed =
-            || pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0, Some(newer.map.built()));
+            || pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0, Some(newer.map.origin()));
         pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, Some(first));
         assert!(!newer_failed());
-        // ...but is by a later failure (another epoch's, say).
-        let later = crate::lsp::bridge::protocol::next_presentation();
+        // ...but is by a later failure of its input (another epoch's, say).
+        let later = failure(newer.map.origin().input);
         pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, Some(later));
         assert!(newer_failed());
+        // A failure of another text revokes no answer for this one, however
+        // old (an undo back to a text answered before the edit that failed).
+        let other = failure(answer.input.wrapping_add(1));
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, Some(other));
+        assert!(!failed());
+        assert!(
+            pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0, None),
+            "a text as is still is"
+        );
     }
 
     #[tokio::test]
