@@ -362,14 +362,26 @@ impl LanguageServerPool {
         }
 
         // Build context and transform response via caller-provided closure
-        let context = BridgeResponseContext {
-            virtual_uri_string: virtual_uri.to_uri_string(),
-            host_uri_lsp: &host_uri_lsp,
-            offset,
-            request_text_held: self.still_holds_request_text(&uri_string, connection_key, offset),
-        };
+        let context = self.response_context(&uri_string, &host_uri_lsp, connection_key, offset);
 
         Ok(transform_response(response, &context))
+    }
+
+    /// The context a response from `connection_key` about `uri_string` is
+    /// transformed in, read as it arrives.
+    fn response_context<'a>(
+        &self,
+        uri_string: &str,
+        host_uri_lsp: &'a Uri,
+        connection_key: &super::ConnectionKey,
+        offset: &'a RegionOffset,
+    ) -> BridgeResponseContext<'a> {
+        BridgeResponseContext {
+            virtual_uri_string: uri_string.to_string(),
+            host_uri_lsp,
+            offset,
+            request_text_held: self.still_holds_request_text(uri_string, connection_key, offset),
+        }
     }
 
     /// Whether the map a request was built on still places its response as
@@ -1177,7 +1189,12 @@ mod tests {
             },
         );
         let request = RegionOffset::new(0, 0).with_prepared(Arc::clone(&before.map));
-        assert!(pool.still_holds_request_text(&uri, &key, &request));
+        let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap();
+        let held = |offset: &RegionOffset| {
+            pool.response_context(&uri, &host_uri_lsp, &key, offset)
+                .request_text_held
+        };
+        assert!(held(&request));
         // The lifecycle pass holds the same text under the new map.
         let sent = pool
             .increment_version_if_content_changed(
@@ -1190,8 +1207,8 @@ mod tests {
             )
             .await;
         assert!(sent.is_none());
-        assert!(!pool.still_holds_request_text(&uri, &key, &request));
-        assert!(pool.still_holds_request_text(&uri, &key, &RegionOffset::new(0, 0)));
+        assert!(!held(&request));
+        assert!(held(&RegionOffset::new(0, 0)));
     }
 
     /// A response arriving after a newer text was sent (typing) is still
