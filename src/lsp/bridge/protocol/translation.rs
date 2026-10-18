@@ -535,6 +535,21 @@ mod tests {
     }
 
     #[test]
+    fn a_host_position_inside_a_removed_indent_snaps_to_its_prepared_line_start() {
+        // Host (11, 1) is inside V line 1's removed two-space indent: a
+        // request there (on-type formatting typed on that line, say) names
+        // P (1, 0), the line's start, as no column of P lies in the indent.
+        let offset = prepared_offset();
+        assert!(host_position_in_removed_indent(
+            Position::new(11, 1),
+            &offset
+        ));
+        let mut pos = Position::new(11, 1);
+        translate_host_position_to_virtual(&mut pos, &offset);
+        assert_eq!(pos, Position::new(1, 0));
+    }
+
+    #[test]
     fn prepared_positions_compose_with_the_region_offset() {
         let offset = prepared_offset();
         // P (1, 2) is `y`: V (1, 4), host (11, 4).
