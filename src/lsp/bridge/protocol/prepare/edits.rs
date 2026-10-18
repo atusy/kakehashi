@@ -201,6 +201,7 @@ impl PreparedMap {
         if self.hunk_touches_gap(&old) {
             return None;
         }
+        let prepared_after = following;
         // A change starting at a P line start that removes whole lines (its
         // old text spans a line break), clears a line, or opens with a line
         // break covers the whole line in V, its removed indent included:
@@ -285,8 +286,45 @@ impl PreparedMap {
             }
             None => FirstIndent::None,
         };
-        let new_text = self.reindent(virtual_start, first, new_text, following, tail)?;
-        Some((virtual_start..virtual_end, new_text))
+        // An empty insertion inserts nothing, not even an indent.
+        let first = if old.is_empty() && new_text.is_empty() {
+            FirstIndent::None
+        } else {
+            first
+        };
+        let inserted = self.reindent(virtual_start, first, new_text, following, tail)?;
+        // A CR and an LF meeting at either edge of the change make one line
+        // break in P, or two in V where host text the change stops beside (an
+        // emptied gap) sits between them: the server's lines would no longer
+        // be V's. Each edge must join or keep apart alike on both sides.
+        let fuses =
+            |before: Option<char>, after: Option<char>| before == Some('\r') && after == Some('\n');
+        let prepared_before = prepared[..old.start].chars().next_back();
+        let virtual_before = virtual_text[..virtual_start].chars().next_back();
+        let virtual_after = virtual_text[virtual_end..].chars().next();
+        let edges = [
+            (
+                fuses(prepared_before, new_text.chars().next().or(prepared_after)),
+                fuses(virtual_before, inserted.chars().next().or(virtual_after)),
+            ),
+            (
+                fuses(
+                    new_text.chars().next_back().or(prepared_before),
+                    prepared_after,
+                ),
+                fuses(
+                    inserted.chars().next_back().or(virtual_before),
+                    virtual_after,
+                ),
+            ),
+        ];
+        if edges
+            .iter()
+            .any(|(prepared, virtual_)| prepared != virtual_)
+        {
+            return None;
+        }
+        Some((virtual_start..virtual_end, inserted))
     }
 
     /// Whether replacing P's `old` bytes reaches into a gap's text in P (a
