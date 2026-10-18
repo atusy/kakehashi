@@ -849,7 +849,8 @@ struct Hunk {
 /// `FORMATTING_DIFF_BUDGET`). A stretch never starts or ends between a CR
 /// and its LF in either text (no LSP position names that place): it widens
 /// over the unchanged character beside it. Stretches left touching merge,
-/// but for one writing text from the start of a line.
+/// but at the start of a line one writes text over or the other's line
+/// break ends before.
 fn diff_hunks(old: &str, new: &str, deadline: Instant) -> Vec<Hunk> {
     let old_lines = lines_with_breaks(old);
     let new_lines = lines_with_breaks(new);
@@ -932,20 +933,24 @@ fn diff_hunks(old: &str, new: &str, deadline: Instant) -> Vec<Hunk> {
                 new_bytes.end += 1;
             }
             // Touching stretches merge (mapped apart, each would read the
-            // other's place as P's), but for one writing text over the start
-            // of a line a stretch before it ends at: merged, that text would
-            // map as a line the stretch writes anew, with the content's
-            // indent rather than its own line's.
-            let writes_from_line_start = !new_bytes.is_empty()
-                && !old_bytes.is_empty()
-                && is_line_start(old, old_bytes.start);
+            // other's place as P's), but not at a line start where the later
+            // writes text over that line's start, or the earlier ends with a
+            // line break in both texts: merged, the later line would map as
+            // one the stretch writes anew, with the content's indent rather
+            // than its own. Apart, neither's text bears on the other there.
+            let apart = |last: &Hunk| {
+                let breaks = |text: &str, end: usize| text[..end].ends_with(['\n', '\r']);
+                is_line_start(old, old_bytes.start)
+                    && ((!new_bytes.is_empty() && !old_bytes.is_empty())
+                        || (breaks(old, last.old.end) && breaks(new, last.new.end)))
+            };
             match hunks.last_mut() {
                 Some(last)
                     if last.old.end > old_bytes.start
                         || last.new.end > new_bytes.start
                         || ((last.old.end == old_bytes.start
                             || last.new.end == new_bytes.start)
-                            && !writes_from_line_start) =>
+                            && !apart(last)) =>
                 {
                     last.old.end = old_bytes.end;
                     last.new.end = new_bytes.end;

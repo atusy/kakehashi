@@ -3065,6 +3065,19 @@ mod formatting {
     }
 
     #[test]
+    fn a_line_break_changed_above_a_line_left_alone_keeps_that_lines_indent() {
+        // `q` was left alone (no indent removed), `b` dedented: the break
+        // above `q` turned CRLF and `q` written at column 0 keep apart.
+        let virtual_text = "x\n  q\n  b\n";
+        let map = dedent_lines(virtual_text, &[0, 0, 2]);
+        let answer = [edit((0, 0), (3, 0), "x\r\nq\nb\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("x\r\nq\n  b\n")
+        );
+    }
+
+    #[test]
     fn lines_joined_keep_the_first_ones_indent() {
         // `0x` deleted and `1x` joined with `2x`: the joined line is `1x`.
         let virtual_text = "0if x:0\n    1if x:1\n    2if x:2\n";
