@@ -2240,3 +2240,61 @@ fn text_after_a_fence_shown_without_its_line_break_starts_a_line() {
         .unwrap();
     assert_eq!(apply_to(virtual_text, &[typed]), "  a\n\n  z\n  b\n");
 }
+
+#[test]
+fn a_line_left_alone_after_an_interpolation_does_not_unindent_new_lines() {
+    // `  foo ${x} bar\nbaz\n`, `baz` left alone: as without the
+    // interpolation, a line created on the first line regains its indent.
+    let virtual_text = "  foo      bar\nbaz\n";
+    let prepared = prepare_pieces(
+        virtual_text,
+        [
+            (SegmentKind::Content, 0..6, String::new()),
+            (SegmentKind::Gap, 6..10, "${x}".to_string()),
+            (SegmentKind::Content, 10..19, String::new()),
+        ],
+        json!({"segments": [
+            {"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+            ]},
+            {"type": "gap", "content": "1"},
+            {"type": "content"}
+        ]}),
+    );
+    assert_eq!(prepared.text, "foo 1 bar\nbaz\n");
+    let broken = prepared
+        .map
+        .map_one_with_extent(&edit((0, 9), (0, 9), "\nq"))
+        .unwrap();
+    assert_eq!(
+        apply_to(virtual_text, &[broken]),
+        "  foo      bar\n  q\nbaz\n"
+    );
+}
+
+#[test]
+fn a_block_the_peer_left_unindented_regains_no_indent() {
+    // `  a\n` + a fence + `b\n`: the block after the fence was not
+    // dedented, so a line created in it regains nothing.
+    let virtual_text = "  a\n\nb\n";
+    let prepared = prepare_pieces(
+        virtual_text,
+        [
+            (SegmentKind::Content, 0..4, String::new()),
+            (SegmentKind::Gap, 4..5, "```\n".to_string()),
+            (SegmentKind::Content, 5..7, String::new()),
+        ],
+        json!({"segments": [
+            {"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+            ]},
+            {"type": "gap"},
+            {"type": "content"}
+        ]}),
+    );
+    let added = prepared
+        .map
+        .map_one_with_extent(&edit((2, 1), (2, 1), "\nc"))
+        .unwrap();
+    assert_eq!(apply_to(virtual_text, &[added]), "  a\n\nb\nc\n");
+}
