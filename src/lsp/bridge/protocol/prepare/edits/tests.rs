@@ -3116,6 +3116,32 @@ mod formatting {
     }
 
     #[test]
+    fn a_rewritten_line_pairs_with_its_own_text_before_any_it_starts_with() {
+        // `ab` (dedented) stays, `a` (left alone) goes: `ab` starts with
+        // `a`, but is itself, not `a` with text joined onto it.
+        let virtual_text = "a\n  ab\n";
+        let map = dedent_lines(virtual_text, &[0, 2]);
+        let answer = [edit((0, 0), (2, 0), "ab\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  ab\n")
+        );
+    }
+
+    #[test]
+    fn a_line_reindented_from_a_tab_is_the_line_it_was() {
+        // `\tb` (dedented, a tab of its own past it) reindented with
+        // spaces: the same line of text, keeping the removed indent.
+        let virtual_text = "a\n  \tb\n";
+        let map = dedent_lines(virtual_text, &[0, 2]);
+        let answer = [edit((0, 0), (2, 0), "  b\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("    b\n")
+        );
+    }
+
+    #[test]
     fn lines_joined_keep_the_first_ones_indent() {
         // `0x` deleted and `1x` joined with `2x`: the joined line is `1x`.
         let virtual_text = "0if x:0\n    1if x:1\n    2if x:2\n";
@@ -3246,7 +3272,8 @@ mod formatting {
 
 /// Formatting answers checked against host text built without the map: the
 /// document is generated with the indentation its peer removes (from some
-/// lines; others, and kept whitespace-only lines, left alone), a formatter
+/// lines, some with indentation of their own past it; others, and kept
+/// whitespace-only lines, left alone), a formatter
 /// rewrites P line by line knowing which line each output line came from,
 /// and the expected host text puts back on each line the indent its rules
 /// (the ADR's) give it:
@@ -3368,6 +3395,8 @@ mod formatting_reference {
         Content {
             body: usize,
             dedented: bool,
+            /// Indentation of its own past what the peer removes.
+            deeper: usize,
         },
         Empty,
         /// A single space the peer left alone: shorter than any indent.
@@ -3377,7 +3406,15 @@ mod formatting_reference {
     fn line() -> impl Strategy<Value = Line> {
         prop_oneof![
             5 => (0..BODIES.len(), prop::bool::weighted(0.8))
-                .prop_map(|(body, dedented)| Line::Content { body, dedented }),
+                .prop_flat_map(|(body, dedented)| {
+                    prop_oneof![4 => Just(0usize), 1 => Just(1usize), 1 => Just(2usize)].prop_map(
+                        move |deeper| Line::Content {
+                            body,
+                            dedented,
+                            deeper,
+                        },
+                    )
+                }),
             1 => Just(Line::Empty),
             1 => Just(Line::Space),
         ]
@@ -3426,11 +3463,16 @@ mod formatting_reference {
         let mut removed = Vec::new();
         for (number, line) in lines.iter().enumerate() {
             match *line {
-                Line::Content { body, dedented } => {
+                Line::Content {
+                    body,
+                    dedented,
+                    deeper,
+                } => {
                     if dedented {
                         dedented_lines.push(text.len());
                         text.push_str(indent);
                     }
+                    text.push_str(["", "\t", "  "][deeper]);
                     text.push_str(&format!("{number}{}{number}", BODIES[body]));
                     removed.push(Some(if dedented { indent } else { "" }));
                 }
@@ -3548,6 +3590,9 @@ mod formatting_reference {
         // Whether the line before was removed: a blank line written then
         // takes its place as much as it is written on.
         let mut removed_before = false;
+        // Whether the line before was a blank line written on: a line
+        // removed after it reads alike as that line rewritten.
+        let mut written_blank_before = false;
         while index < lines.len() {
             let (mut text, line_break) = lines[index].clone();
             let origin = Some(index);
@@ -3589,13 +3634,14 @@ mod formatting_reference {
                 );
             let creates_beside_blank =
                 is_blank(index) && matches!(rewrite, Rewrite::LineAfter(_) | Rewrite::BlankAfter);
-            if (created_before && (removed.is_some() || rewrites_blank))
+            if ((created_before || written_blank_before) && (removed.is_some() || rewrites_blank))
                 || (removed_before && (rewrites_blank || creates_beside_blank))
                 || removed.is_some_and(|at| is_blank(at) && other_blank(at))
                 || (rewrites_blank && other_blank(index))
             {
                 rewrite = Rewrite::Keep;
             }
+            written_blank_before = is_blank(index) && matches!(rewrite, Rewrite::Write(_));
             removed_before = matches!(rewrite, Rewrite::JoinNext if index + 1 < lines.len())
                 || matches!(rewrite, Rewrite::Delete if lines.len() > 1)
                 || (removed_before && is_blank(index));
