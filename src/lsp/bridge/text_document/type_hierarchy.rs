@@ -238,6 +238,9 @@ impl LanguageServerPool {
             type_hierarchy_item_to_downstream(params.item, &envelope, virtual_uri.as_ref());
         let request = build_type_hierarchy_expansion_request(request_id, method, params);
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
+        // What the producer holds for the virtual document as the request
+        // is queued: the reply must be computed on that text.
+        let mut held = None;
         let (send_result, virtual_uri_observer) = {
             let connections = self.connections().await;
             let producer_is_live = connections.get(connection_key).is_some_and(|current| {
@@ -259,6 +262,7 @@ impl LanguageServerPool {
                     envelope.connection_generation,
                 );
                 if let Some(uri) = virtual_uri.as_ref().map(VirtualDocumentUri::to_uri_string) {
+                    held = Some(self.note_held(&uri, connection_key));
                     observer.insert(uri);
                 }
                 let queued = if handle.has_static_type_hierarchy_provider() {
@@ -308,6 +312,12 @@ impl LanguageServerPool {
             )
             .await
         {
+            return None;
+        }
+        // Computed on another text than the one noted (a prepared one sent
+        // ahead of it after its pair gained a peer, say): its items are not
+        // in the envelope's coordinates.
+        if held.is_some_and(|held| !self.held_unchanged(&held)) {
             return None;
         }
         transform_type_hierarchy_expansion_response_to_host(

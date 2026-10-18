@@ -360,6 +360,9 @@ impl LanguageServerPool {
         let request =
             JsonRpcRequest::new(request_id.as_i64(), "callHierarchy/incomingCalls", params);
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
+        // What the producer holds for the virtual document as the request
+        // is queued: the reply must be computed on that text.
+        let mut held = None;
         let (send_result, virtual_uri_observer) = {
             let connections = self.connections().await;
             let producer_is_live = connections.get(connection_key).is_some_and(|current| {
@@ -384,6 +387,7 @@ impl LanguageServerPool {
                     envelope.connection_generation,
                 );
                 if let Some(uri) = virtual_uri.as_ref().map(VirtualDocumentUri::to_uri_string) {
+                    held = Some(self.note_held(&uri, connection_key));
                     observer.insert(uri);
                 }
                 (
@@ -421,6 +425,12 @@ impl LanguageServerPool {
             )
             .await
         {
+            return None;
+        }
+        // Computed on another text than the one noted (a prepared one sent
+        // ahead of it after its pair gained a peer, say): its items are not
+        // in the envelope's coordinates.
+        if held.is_some_and(|held| !self.held_unchanged(&held)) {
             return None;
         }
         transform_call_hierarchy_incoming_response_to_host(
@@ -493,6 +503,9 @@ impl LanguageServerPool {
         let request =
             JsonRpcRequest::new(request_id.as_i64(), "callHierarchy/outgoingCalls", params);
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
+        // What the producer holds for the virtual document as the request
+        // is queued: the reply must be computed on that text.
+        let mut held = None;
         let (send_result, virtual_uri_observer) = {
             let connections = self.connections().await;
             let producer_is_live = connections.get(connection_key).is_some_and(|current| {
@@ -514,6 +527,7 @@ impl LanguageServerPool {
                     envelope.connection_generation,
                 );
                 if let Some(uri) = virtual_uri.as_ref().map(VirtualDocumentUri::to_uri_string) {
+                    held = Some(self.note_held(&uri, connection_key));
                     observer.insert(uri);
                 }
                 (
@@ -549,6 +563,12 @@ impl LanguageServerPool {
             )
             .await
         {
+            return None;
+        }
+        // Computed on another text than the one noted (a prepared one sent
+        // ahead of it after its pair gained a peer, say): its items are not
+        // in the envelope's coordinates.
+        if held.is_some_and(|held| !self.held_unchanged(&held)) {
             return None;
         }
         transform_call_hierarchy_outgoing_response_to_host(

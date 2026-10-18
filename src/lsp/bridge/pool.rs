@@ -403,6 +403,11 @@ fn failed_for(failed_at: Option<u64>, built: Option<u64>) -> bool {
     failed_at.is_some_and(|failed_at| built.is_none_or(|built| built < failed_at))
 }
 
+/// What a connection held for a virtual document as a resolve was queued
+/// (see [`LanguageServerPool::note_held`]): its URI, the connection, and the
+/// generation of the text on record. Empty without the prepare layer.
+pub(crate) struct HeldNote(Option<(String, ConnectionKey, Option<u64>)>);
+
 /// The latest text forwarded for a virtual document, which a deferred
 /// didOpen substitutes: what downstream servers are sent, with the prepared
 /// map when a peer prepared it.
@@ -3166,6 +3171,36 @@ impl LanguageServerPool {
                 host.held_count.fetch_sub(1, Ordering::AcqRel);
             }
         }
+    }
+
+    /// What `connection_key` holds for `virtual_uri`, noted as a resolve is
+    /// queued: a resolve has no text check of its own (its item is from a
+    /// text the region had then), so whether its reply was computed on the
+    /// text noted is told afterwards by [`Self::held_unchanged`]. Nothing is
+    /// noted without the prepare layer, where every text is held as is.
+    pub(crate) fn note_held(&self, virtual_uri: &str, connection_key: &ConnectionKey) -> HeldNote {
+        HeldNote(self.prepares().then(|| {
+            (
+                virtual_uri.to_owned(),
+                connection_key.clone(),
+                self.held_text(virtual_uri, connection_key)
+                    .map(|held| held.generation),
+            )
+        }))
+    }
+
+    /// Whether the connection still holds the text `note` was taken on: no
+    /// text was recorded for the document since (a prepared one sent ahead
+    /// of the resolve after a peer was gained, say), so the reply is in the
+    /// coordinates of the text noted.
+    pub(crate) fn held_unchanged(&self, note: &HeldNote) -> bool {
+        note.0
+            .as_ref()
+            .is_none_or(|(virtual_uri, connection_key, generation)| {
+                self.held_text(virtual_uri, connection_key)
+                    .map(|held| held.generation)
+                    == *generation
+            })
     }
 
     /// Whether the lifecycle pass holds `region_id` (under `language`) of
@@ -9773,6 +9808,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(opened_text(&mut rx), "x = 1");
+    }
+
+    /// A resolve's note of the text its connection held: unchanged until
+    /// another text is recorded; never taken without the prepare layer.
+    #[tokio::test]
+    async fn a_held_note_tells_a_text_recorded_since() {
+        let host_uri = Url::parse("file:///test/held-note.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let uri = virtual_uri.to_uri_string();
+        let key = ConnectionKey::for_server("lua");
+        let pool = LanguageServerPool::preparing();
+        pool.record_sent_for_test(&virtual_uri, &key, SentText::from("  a"));
+        let note = pool.note_held(&uri, &key);
+        assert!(pool.held_unchanged(&note));
+        let map = dedent_map("  a");
+        pool.record_sent_for_test(
+            &virtual_uri,
+            &key,
+            SentText {
+                text: "a",
+                map: Some(&map),
+            },
+        );
+        assert!(!pool.held_unchanged(&note));
+        let plain = LanguageServerPool::new();
+        plain.record_sent_for_test(&virtual_uri, &key, SentText::from("  a"));
+        let note = plain.note_held(&uri, &key);
+        plain.record_sent_for_test(&virtual_uri, &key, SentText::from("  b"));
+        assert!(plain.held_unchanged(&note), "nothing noted flag off");
     }
 
     #[tokio::test]

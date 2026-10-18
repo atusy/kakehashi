@@ -502,8 +502,16 @@ impl LanguageServerPool {
         // envelope, so resolve those actions downstream now (bounded: only the
         // lazy ones). Failures fall through to the phase-3 REASON_RESOLVE path.
         if !upstream_caps.can_envelope() {
-            self.eager_resolve_lazy_actions(&handle, &mut actions, upstream_request_id)
-                .await;
+            let virtual_uri = crate::lsp::lsp_impl::url_to_uri(host_uri).ok().map(|host| {
+                VirtualDocumentUri::new(&host, injection_language, region_id).to_uri_string()
+            });
+            self.eager_resolve_lazy_actions(
+                &handle,
+                &mut actions,
+                upstream_request_id,
+                virtual_uri.as_deref(),
+            )
+            .await;
         }
 
         // Phase 3: apply the bridge policy (coordinate translation, title
@@ -557,6 +565,7 @@ impl LanguageServerPool {
         handle: &Arc<ConnectionHandle>,
         actions: &mut [CodeActionOrCommand],
         upstream_id: Option<UpstreamId>,
+        virtual_uri: Option<&str>,
     ) {
         if !handle.has_capability("codeAction/resolve") {
             return;
@@ -597,8 +606,14 @@ impl LanguageServerPool {
                 async move {
                     (
                         idx,
-                        self.send_code_action_resolve_on_handle(handle, action, upstream_id, None)
-                            .await,
+                        self.send_code_action_resolve_on_handle(
+                            handle,
+                            action,
+                            upstream_id,
+                            None,
+                            virtual_uri,
+                        )
+                        .await,
                     )
                 }
             }))
@@ -794,6 +809,7 @@ impl LanguageServerPool {
                     connection_generation: None,
                     read: read_host,
                 }),
+                None,
             )
             .await
         else {
@@ -899,8 +915,18 @@ impl LanguageServerPool {
             std::mem::replace(&mut outgoing.title, envelope.original_title.clone());
         translate_action_ranges_host_to_virtual(&mut outgoing, &offset);
 
+        let virtual_uri = host_uri_lsp.as_ref().map(|host| {
+            VirtualDocumentUri::new(host, &envelope.injection_language, &envelope.region_id)
+                .to_uri_string()
+        });
         let Some(resolved) = self
-            .send_code_action_resolve_on_handle(&handle, outgoing, upstream_id, None)
+            .send_code_action_resolve_on_handle(
+                &handle,
+                outgoing,
+                upstream_id,
+                None,
+                virtual_uri.as_deref(),
+            )
             .await
         else {
             // Per-selection warn (bounded: one per user-selected action) — the
@@ -1072,6 +1098,7 @@ impl LanguageServerPool {
         action: CodeAction,
         upstream_id: Option<UpstreamId>,
         host_context: Option<HostResolveContext<'_>>,
+        virtual_uri: Option<&str>,
     ) -> Option<CodeAction> {
         let connection_key = handle.key();
         if let Some(ref id) = upstream_id {
@@ -1098,6 +1125,7 @@ impl LanguageServerPool {
         let request = JsonRpcRequest::new(request_id.as_i64(), "codeAction/resolve", &action);
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
 
+        let mut held = None;
         // Verify `handle` is still the pool's LIVE connection for its key
         // before sending, under the `connections` lock (the same guard the
         // executeCommand and generic execute paths use): a respawn between
@@ -1130,6 +1158,9 @@ impl LanguageServerPool {
                 }
                 return None;
             }
+            // What the producer holds for the virtual document as the
+            // resolve is queued: the reply must be computed on that text.
+            held = virtual_uri.map(|uri| self.note_held(uri, connection_key));
             if let Err(e) = handle.send_request(request, request_id) {
                 drop(connections);
                 // DEBUG: see the register-failure note above.
@@ -1163,6 +1194,12 @@ impl LanguageServerPool {
                 return None;
             }
         };
+        // Computed on another text than the one noted (a prepared one sent
+        // ahead of it after its pair gained a peer, say): its edit is not in
+        // the envelope's coordinates.
+        if held.is_some_and(|held| !self.held_unchanged(&held)) {
+            return None;
+        }
         // Retirement alone does not invalidate a matched reply. Callers retain
         // their document freshness and edit translation checks. Returned commands
         // retain ConnectionKey-based reconnect routing: checking liveness here
@@ -1714,6 +1751,98 @@ mod tests {
         VirtualDocumentUri::new(&make_host_uri(), "lua", "region-0").to_uri_string()
     }
 
+    /// A resolve has no text check of its own: one whose reply was computed
+    /// on another text than its connection held as it was queued (a
+    /// prepared one sent ahead of it after its pair gained a peer) is
+    /// dropped, its edit being in other coordinates than the envelope's.
+    #[tokio::test]
+    async fn a_resolve_computed_on_a_text_sent_after_it_was_queued_is_dropped() {
+        use crate::lsp::bridge::pool::SentText;
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        for text_sent_since in [false, true] {
+            let pool = Arc::new(LanguageServerPool::preparing());
+            let key = ConnectionKey::for_server("ruff");
+            let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+            pool.insert_connection(Arc::clone(&handle)).await;
+            let host = Url::parse("file:///test.md").unwrap();
+            let virtual_uri = VirtualDocumentUri::new(
+                &crate::lsp::lsp_impl::url_to_uri(&host).unwrap(),
+                "lua",
+                "01JPMQ8ZYYQA1W3AVPW4JDRZFR",
+            );
+            pool.record_sent_for_test(&virtual_uri, &key, SentText::from("  a"));
+            let upstream_id = UpstreamId::Number(78);
+            let request = {
+                let pool = Arc::clone(&pool);
+                let handle = Arc::clone(&handle);
+                let upstream_id = upstream_id.clone();
+                let uri = virtual_uri.to_uri_string();
+                tokio::spawn(async move {
+                    pool.send_code_action_resolve_on_handle(
+                        &handle,
+                        CodeAction {
+                            title: "lazy".into(),
+                            ..Default::default()
+                        },
+                        Some(upstream_id),
+                        None,
+                        Some(&uri),
+                    )
+                    .await
+                })
+            };
+            let downstream_id = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    if let Some(id) = handle
+                        .router()
+                        .lookup_downstream_ids(&upstream_id)
+                        .into_iter()
+                        .next()
+                    {
+                        break id;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("resolve request must be admitted");
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while !handle.router().is_sent(downstream_id) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("resolve request must be sent");
+            if text_sent_since {
+                let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+                    {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+                ]}]}))
+                .unwrap();
+                let prepared =
+                    apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(answer))
+                        .unwrap();
+                pool.record_sent_for_test(
+                    &virtual_uri,
+                    &key,
+                    SentText {
+                        text: &prepared.text,
+                        map: Some(&prepared.map),
+                    },
+                );
+            }
+            let _ = handle.router().route(json!({
+                "jsonrpc": "2.0",
+                "id": downstream_id.as_i64(),
+                "result": { "title": "resolved" }
+            }));
+            assert_eq!(
+                request.await.unwrap().is_some(),
+                !text_sent_since,
+                "text sent since: {text_sent_since}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn resolve_response_accepts_a_retired_producer_after_send() {
         let pool = Arc::new(LanguageServerPool::new());
@@ -1733,6 +1862,7 @@ mod tests {
                         ..Default::default()
                     },
                     Some(upstream_id),
+                    None,
                     None,
                 )
                 .await
