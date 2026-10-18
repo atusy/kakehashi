@@ -455,7 +455,7 @@ impl PreparedMap {
 /// in the order they apply: by start, then end, so an insertion goes before
 /// a replacement starting where it is, in whichever order they came, and
 /// same-position insertions in the order they were sent. `None` when an
-/// edit is reversed or edits overlap.
+/// edit is reversed, names a line past the text's last, or edits overlap.
 fn sorted_extents(lines: &LineMap, edits: &[TextEdit]) -> Option<(Vec<Range<usize>>, Vec<usize>)> {
     let ranges = edits
         .iter()
@@ -465,6 +465,11 @@ fn sorted_extents(lines: &LineMap, edits: &[TextEdit]) -> Option<(Vec<Range<usiz
             if edit.range.start > edit.range.end {
                 return None;
             }
+            // A line past the text's last names no place in it: LSP reads a
+            // column past its line as the line's end, but not a line past the
+            // document as its end (an import "at line 7" of a 3-line P would
+            // land after its content).
+            lines.index.0.line(edit.range.end.line)?;
             let start = lines.offset_clamped(edit.range.start);
             let end = lines.offset_clamped(edit.range.end);
             (start <= end).then_some(start..end)
