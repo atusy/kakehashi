@@ -233,11 +233,21 @@ impl InjectionCoordinator {
         // recreate the slot we just evicted. The merge already *skips* a region with
         // no current offset, so the editor never sees stale diagnostics; this
         // reclaims the lingering slot on the edit that orphaned it.
-        let region_ids: Vec<String> = invalidated_ulids.iter().map(ToString::to_string).collect();
-        self.bridge.forget_prepared_regions(host_uri, &region_ids);
-        for region_id in region_ids {
-            self.diagnostics
-                .evict_source(host_uri, &DiagnosticSource::Region(region_id));
+        // Their prepare lookups go too, with the prepare layer only: without
+        // it the ids are not collected for nothing.
+        if self.bridge.pool().prepares() {
+            let region_ids: Vec<String> =
+                invalidated_ulids.iter().map(ToString::to_string).collect();
+            self.bridge.forget_prepared_regions(host_uri, &region_ids);
+            for region_id in region_ids {
+                self.diagnostics
+                    .evict_source(host_uri, &DiagnosticSource::Region(region_id));
+            }
+        } else {
+            for ulid in invalidated_ulids {
+                self.diagnostics
+                    .evict_source(host_uri, &DiagnosticSource::Region(ulid.to_string()));
+            }
         }
     }
 
@@ -776,12 +786,16 @@ impl InjectionCoordinator {
         for region_id in replaced_regions {
             // The region may live on under another language (a shebang edit
             // re-routing an `unknown` fence), whose document is preparing.
-            let current_language = injections
-                .iter()
-                .find(|injection| injection.region_id == region_id)
-                .map(|injection| injection.language.as_str());
-            self.bridge
-                .forget_replaced_prepared_region(uri, &region_id, current_language);
+            // Looked up with the prepare layer only: without it there is no
+            // lookup to forget, and no scan of the injections for each region.
+            if prepares {
+                let current_language = injections
+                    .iter()
+                    .find(|injection| injection.region_id == region_id)
+                    .map(|injection| injection.language.as_str());
+                self.bridge
+                    .forget_replaced_prepared_region(uri, &region_id, current_language);
+            }
             self.diagnostics
                 .evict_source(uri, &DiagnosticSource::Region(region_id));
         }
