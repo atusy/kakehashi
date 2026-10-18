@@ -3190,12 +3190,14 @@ impl LanguageServerPool {
     /// is noted without the prepare layer, where every text is held as is.
     pub(crate) fn note_held(&self, virtual_uri: &str, connection_key: &ConnectionKey) -> HeldNote {
         HeldNote(self.prepares().then(|| {
-            let held = self.held_text(virtual_uri, connection_key);
+            let (generation, as_is) = self
+                .document_tracker
+                .held_as_is(virtual_uri, connection_key);
             (
                 virtual_uri.to_owned(),
                 connection_key.clone(),
-                held.as_ref().map(|held| held.generation),
-                held.is_none_or(|held| held.map.is_none()),
+                generation,
+                as_is,
             )
         }))
     }

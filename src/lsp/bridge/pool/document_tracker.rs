@@ -953,6 +953,24 @@ impl DocumentTracker {
         self.held_locked(&fingerprints, virtual_uri, connection_key)
     }
 
+    /// What `connection_key` holds for `virtual_uri` for a resolve's note
+    /// (see `LanguageServerPool::note_held`): the generation of its record,
+    /// and whether what it computes now is of the document's text as is —
+    /// a text held as is, or nothing on record for a document it was never
+    /// sent a prepared text of. A document it held prepared and closed since
+    /// is not: the server may still answer from that text.
+    pub(super) fn held_as_is(
+        &self,
+        virtual_uri: &str,
+        connection_key: &ConnectionKey,
+    ) -> (Option<u64>, bool) {
+        let (held, history) = self.held_now(virtual_uri, connection_key);
+        match held {
+            Some(held) => (Some(held.generation), held.map.is_none()),
+            None => (None, !history),
+        }
+    }
+
     /// [`Self::held_now`] under the records' lock, taken by the caller.
     fn held_locked(
         &self,
