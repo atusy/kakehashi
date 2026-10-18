@@ -1056,10 +1056,10 @@ fn fuses_a_line_break(prepared: &str, runs: &[Run], virtual_text: &str) -> bool 
             .filter(|run| run.prepared.contains(&offset))
             .map(|_| index)
     };
-    // The V offset of the prepared byte at `offset`, when it is one V holds
-    // verbatim: unchanged content, or a gap kept as its original text (a
-    // CRLF's LF left out of combined captures that took its CR, say).
-    // Once per run, not per CRLF: a gap's comparison reads all of it.
+    // Whether each run holds V's text verbatim: unchanged content, or a gap
+    // kept as its original text (a CRLF's LF left out of combined captures
+    // that took its CR, say). Once per run, not per CRLF: a gap's
+    // comparison reads all of it.
     let verbatim: Vec<bool> = runs
         .iter()
         .map(|run| match run.kind {
@@ -1070,45 +1070,52 @@ fn fuses_a_line_break(prepared: &str, runs: &[Run], virtual_text: &str) -> bool 
             _ => false,
         })
         .collect();
-    // A gap rewritten otherwise still holds V's byte at an edge it kept: a
-    // LF its placeholder opens with where the gap's text did (the LF of a
-    // CRLF whose CR the content before took), or a CR it ends with where
-    // the gap's text did. One byte compared, not the gap.
-    let kept_edge = |run: &Run, offset: usize| {
-        let byte = prepared.as_bytes()[offset];
-        let virtual_bytes = virtual_text.as_bytes();
-        if offset == run.prepared.start && virtual_bytes.get(run.virtual_.start) == Some(&byte) {
-            Some(run.virtual_.start)
-        } else if offset + 1 == run.prepared.end
-            && run.virtual_.end > run.virtual_.start
-            && virtual_bytes[run.virtual_.end - 1] == byte
-        {
-            Some(run.virtual_.end - 1)
-        } else {
-            None
+    // The V offset of the prepared byte at `offset` in run `index`, when V
+    // holds it there: anywhere in a verbatim run; in a gap rewritten
+    // otherwise, only at the `edge` it meets a neighbour at, where it is the
+    // byte the gap's text has there (the LF of a CRLF whose CR the content
+    // before took, say). One byte compared, not the gap.
+    let virtual_offset = |index: usize, offset: usize, edge: Edge| {
+        let run = &runs[index];
+        if verbatim[index] {
+            return Some(run.virtual_.start + (offset - run.prepared.start));
         }
-    };
-    let virtual_offset = |offset: usize| {
-        run_of(offset).and_then(|index| {
-            let run = &runs[index];
-            if verbatim[index] {
-                Some(run.virtual_.start + (offset - run.prepared.start))
-            } else if matches!(run.kind, RunKind::Gap) {
-                kept_edge(run, offset)
-            } else {
-                None
-            }
-        })
+        if !matches!(run.kind, RunKind::Gap) || run.virtual_.is_empty() {
+            return None;
+        }
+        let virtual_at = match edge {
+            Edge::Leading => run.virtual_.start,
+            Edge::Trailing => run.virtual_.end - 1,
+        };
+        (virtual_text.as_bytes()[virtual_at] == prepared.as_bytes()[offset]).then_some(virtual_at)
     };
     prepared.match_indices("\r\n").any(|(cr, _)| {
-        match (virtual_offset(cr), virtual_offset(cr + 1)) {
+        let (Some(left), Some(right)) = (run_of(cr), run_of(cr + 1)) else {
+            return true;
+        };
+        if left == right {
+            // Within one run: as V has it there (a verbatim run), or the
+            // placeholder's (or the answer's) own line break.
+            return false;
+        }
+        // Across a seam: the CR ends the left run, the LF opens the right.
+        match (
+            virtual_offset(left, cr, Edge::Trailing),
+            virtual_offset(right, cr + 1, Edge::Leading),
+        ) {
             (Some(virtual_cr), Some(virtual_lf)) => {
                 virtual_lf != virtual_cr + 1 || !splits_crlf(virtual_text, virtual_lf)
             }
-            // Both from one placeholder: its own line break.
-            _ => run_of(cr) != run_of(cr + 1),
+            _ => true,
         }
     })
+}
+
+/// Which edge of a run a byte meets its neighbour at.
+#[derive(Clone, Copy)]
+enum Edge {
+    Leading,
+    Trailing,
 }
 
 /// Whether `offset` sits between the CR and LF of a CRLF: past its line's
@@ -1259,6 +1266,43 @@ mod tests {
             "{:?}",
             prepared.text
         );
+    }
+
+    /// A rewritten gap's CRLFs: one wholly inside its placeholder is the
+    /// placeholder's own line break, whatever the gap's text; across a seam,
+    /// the CR is the left run's last byte and the LF the right run's first,
+    /// so a one-byte placeholder is read at the edge that meets the seam.
+    #[test]
+    fn a_rewritten_gap_keeps_the_crlfs_it_should() {
+        let answer = |placeholder: &str| -> PrepareResult {
+            serde_json::from_value(serde_json::json!({"segments": [
+                {"type": "content"},
+                {"type": "gap", "content": placeholder},
+                {"type": "content"}
+            ]}))
+            .unwrap()
+        };
+        let apply = |virtual_text: &str, gap: Range<usize>, placeholder: &str| {
+            let gaps = [VirtualGap {
+                virtual_range: gap.clone(),
+                host_text: virtual_text[gap].to_string(),
+            }];
+            let layout = VirtualLayout::from_gaps(virtual_text, &gaps);
+            apply_prepare_result(virtual_text, &layout, Some(answer(placeholder)))
+        };
+        // Two CRLFs replaced by one, wholly the placeholder's.
+        assert!(apply("a\r\n\r\nb", 1..5, "\r\n").is_ok());
+        // A CR ending the gap's text kept before content opening with the
+        // LF: the virtual text's own CRLF.
+        assert!(apply("a\r  \r\nb", 1..5, "\r").is_ok());
+        // The same CR read at the gap's head instead would not be one.
+        assert!(apply("a\r  x\nb", 1..5, "\r").is_err());
+        // A LF opening the gap's text kept after content closing with the
+        // CR, more placeholder text after it.
+        assert!(apply("a\r\n  b", 2..5, "\nx").is_ok());
+        // A placeholder bringing the CR or the LF its edge did not have.
+        assert!(apply("a\r \nb", 2..3, "\n").is_err());
+        assert!(apply("ax\nb", 1..2, "\r").is_err());
     }
 
     /// Checking a gap kept as is reads it once, not once per CRLF in it: a
