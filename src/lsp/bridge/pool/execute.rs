@@ -362,52 +362,74 @@ impl LanguageServerPool {
         }
 
         // Build context and transform response via caller-provided closure
-        let context = self.response_context(&uri_string, &host_uri_lsp, connection_key, offset);
+        let region_held = || self.region_held(host_uri, injection_language, region_id);
+        let context = self.response_context(
+            &uri_string,
+            &host_uri_lsp,
+            connection_key,
+            offset,
+            region_held,
+        );
 
         Ok(transform_response(response, &context))
     }
 
     /// The context a response from `connection_key` about `uri_string` is
     /// transformed in, read as it arrives.
+    /// The context a response from `connection_key` about `uri_string` is
+    /// transformed in, read as it arrives; `region_held` says whether the
+    /// lifecycle pass holds the region (see `LanguageServerPool::region_held`).
     fn response_context<'a>(
         &self,
         uri_string: &str,
         host_uri_lsp: &'a Uri,
         connection_key: &super::ConnectionKey,
         offset: &'a RegionOffset,
+        region_held: impl FnOnce() -> bool,
     ) -> BridgeResponseContext<'a> {
         BridgeResponseContext {
             virtual_uri_string: uri_string.to_string(),
             host_uri_lsp,
             offset,
-            request_text_held: self.still_holds_request_text(uri_string, connection_key, offset),
+            request_text_held: self.still_holds_request_text(
+                uri_string,
+                connection_key,
+                offset,
+                region_held,
+            ),
         }
     }
 
     /// Whether the map a request was built on still places its response as
-    /// it arrives: false only when `connection_key` holds the request's very
-    /// prepared text under another map — host indentation the peer removes
-    /// was edited, with no didChange, so the same answer now stands for
-    /// other host coordinates. A newer text sent (typing), or the document
-    /// gone as is, is the in-flight staleness any LSP answer has, which an
-    /// unprepared document's answers carry too; a request built as is reads
-    /// nothing.
+    /// it arrives. The line: while `connection_key` still holds the request's
+    /// prepared text, the server's answer is current for the text it holds,
+    /// so its edits are mapped only if the host has not moved under that
+    /// text — the same map is held, and no newer input of the region is
+    /// pending (or failed) in the lifecycle pass (`region_held`): a host edit
+    /// to indentation the peer removes leaves the prepared text as it was,
+    /// and the answer would land where the old indentation was. Once a newer
+    /// text was sent (typing), or the document went as is, the answer is
+    /// stale as any LSP answer is when the document changed meanwhile, which
+    /// an unprepared document's answers carry too: kept. A request built as
+    /// is reads nothing.
     fn still_holds_request_text(
         &self,
         uri_string: &str,
         connection_key: &super::ConnectionKey,
         offset: &RegionOffset,
+        region_held: impl FnOnce() -> bool,
     ) -> bool {
         let Some(request_map) = offset.prepared() else {
             return true;
         };
         let (held, _) = self.document_tracker.held_now(uri_string, connection_key);
-        match held.and_then(|held| held.map) {
-            Some(held) => {
-                *held == *request_map || held.prepared_text() != request_map.prepared_text()
-            }
-            None => true,
+        let Some(held) = held.and_then(|held| held.map) else {
+            return true;
+        };
+        if held.prepared_text() != request_map.prepared_text() {
+            return true;
         }
+        *held == *request_map && !region_held()
     }
 
     /// Whether `connection_key` holds exactly the text a request built on
@@ -1170,6 +1192,8 @@ mod tests {
         let after = strip("    red\n", 4);
         assert_eq!(before.text, after.text);
         let pool = LanguageServerPool::preparing();
+        // The prepare layer's table, which holds are kept in.
+        pool.prepare_failures_for_test();
         let host_uri = Url::parse("file:///test/reindent.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(
             &crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap(),
@@ -1190,12 +1214,29 @@ mod tests {
         );
         let request = RegionOffset::new(0, 0).with_prepared(Arc::clone(&before.map));
         let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap();
+        let region_held = || pool.region_held(&host_uri, "lua", TEST_ULID_LUA_0);
         let held = |offset: &RegionOffset| {
-            pool.response_context(&uri, &host_uri_lsp, &key, offset)
+            pool.response_context(&uri, &host_uri_lsp, &key, offset, region_held)
                 .request_text_held
         };
         assert!(held(&request));
-        // The lifecycle pass holds the same text under the new map.
+        // While the new text's answer is pending, the lifecycle pass holds
+        // the region: the host moved under the text the server still holds.
+        pool.open_host_incarnation(&host_uri, 1).await;
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, None);
+        assert!(!held(&request));
+        // The answer in, the lifecycle pass holds the same text under the
+        // new map.
+        pool.record_latest_virtual_content(
+            &host_uri,
+            1,
+            "lua",
+            TEST_ULID_LUA_0,
+            SentText {
+                text: &after.text,
+                map: Some(&after.map),
+            },
+        );
         let sent = pool
             .increment_version_if_content_changed(
                 &virtual_uri,
@@ -1259,7 +1300,10 @@ mod tests {
                 map: Some(&typed.map),
             },
         );
-        assert!(pool.still_holds_request_text(&uri, &key, &request));
+        // Its answer pending or in, typing keeps the answer once the newer
+        // text was sent, whatever the region's hold says.
+        assert!(pool.still_holds_request_text(&uri, &key, &request, || true));
+        assert!(pool.still_holds_request_text(&uri, &key, &request, || false));
     }
 
     /// A request is queued only while its connection holds the text it was
