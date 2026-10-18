@@ -339,6 +339,18 @@ pub(crate) fn apply_prepare_result_at(
     result: Option<PrepareResult>,
     taken: u64,
 ) -> Result<PreparedDocument, PrepareError> {
+    build_prepared(virtual_text, layout, result, taken, true)
+}
+
+/// [`apply_prepare_result_at`], refusing an answer that fuses a line break
+/// only when `check_line_breaks` (see [`fuses_a_line_break`]).
+fn build_prepared(
+    virtual_text: &str,
+    layout: &VirtualLayout,
+    result: Option<PrepareResult>,
+    taken: u64,
+    check_line_breaks: bool,
+) -> Result<PreparedDocument, PrepareError> {
     // `null` keeps every segment, and still yields a map (see below).
     let result = result.unwrap_or_else(|| PrepareResult {
         segments: layout
@@ -419,7 +431,7 @@ pub(crate) fn apply_prepare_result_at(
         }
     }
 
-    if fuses_a_line_break(&text, &runs, virtual_text) {
+    if check_line_breaks && fuses_a_line_break(&text, &runs, virtual_text) {
         return Err(PrepareError::FusedLineBreak);
     }
 
@@ -1099,12 +1111,15 @@ fn fuses_a_line_break(prepared: &str, runs: &[Run], virtual_text: &str) -> bool 
             return false;
         }
         // Across a seam: the CR ends the left run, the LF opens the right.
+        // Each must be half of a CRLF of V — the same one, or two whose
+        // other halves the seam left out — so no position of V lies between
+        // them that P would have none for.
         match (
             virtual_offset(left, cr, Edge::Trailing),
             virtual_offset(right, cr + 1, Edge::Leading),
         ) {
             (Some(virtual_cr), Some(virtual_lf)) => {
-                virtual_lf != virtual_cr + 1 || !splits_crlf(virtual_text, virtual_lf)
+                !splits_crlf(virtual_text, virtual_cr + 1) || !splits_crlf(virtual_text, virtual_lf)
             }
             _ => true,
         }
@@ -1303,6 +1318,184 @@ mod tests {
         // A placeholder bringing the CR or the LF its edge did not have.
         assert!(apply("a\r \nb", 2..3, "\n").is_err());
         assert!(apply("ax\nb", 1..2, "\r").is_err());
+    }
+
+    /// Every small layout and placeholder, against an oracle that knows
+    /// nothing of how CRs and LFs are told apart at a gap's edges: an
+    /// answer is refused exactly when, built anyway, the map sends an LSP
+    /// position of one text's content between a CR and a LF of the other
+    /// that are not split there in the first (two line breaks made one, or
+    /// one made two: no position names that place).
+    ///
+    /// Bounded to finish quickly; [`line_break_refusals_match_exhaustively`]
+    /// runs the wider bounds.
+    #[test]
+    fn line_break_refusals_match_what_positions_survive() {
+        let started = std::time::Instant::now();
+        let cases = check_line_break_refusals(b"a\r\n", 4, 2);
+        assert!(cases > 5_000, "{cases}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// [`line_break_refusals_match_what_positions_survive`] over a wider
+    /// alphabet and longer texts: millions of cases, tens of seconds.
+    #[test]
+    #[ignore = "exhaustive: run with --ignored"]
+    fn line_break_refusals_match_exhaustively() {
+        check_line_break_refusals(b"a\r\n ", 5, 3);
+    }
+
+    /// Check every virtual text over `alphabet` up to `max_virtual` bytes,
+    /// every split of it into content and gaps, and every answer replacing
+    /// its gaps (up to `max_placeholder` bytes for a single gap, one for
+    /// several): the cases checked.
+    fn check_line_break_refusals(
+        alphabet: &[u8],
+        max_virtual: usize,
+        max_placeholder: usize,
+    ) -> usize {
+        fn strings(alphabet: &[u8], max: usize) -> Vec<Vec<u8>> {
+            let mut all = vec![Vec::new()];
+            let mut level = vec![Vec::new()];
+            for _ in 0..max {
+                level = level
+                    .iter()
+                    .flat_map(|prefix: &Vec<u8>| {
+                        alphabet.iter().map(move |byte| {
+                            let mut next = prefix.clone();
+                            next.push(*byte);
+                            next
+                        })
+                    })
+                    .collect();
+                all.extend(level.iter().cloned());
+            }
+            all
+        }
+
+        let placeholders = |max| -> Vec<Option<String>> {
+            std::iter::once(None)
+                .chain(
+                    strings(alphabet, max)
+                        .into_iter()
+                        .map(|bytes| Some(String::from_utf8(bytes).unwrap())),
+                )
+                .collect()
+        };
+        let long = placeholders(max_placeholder);
+        let short = placeholders(1);
+        let mut cases = 0usize;
+        for virtual_bytes in strings(alphabet, max_virtual) {
+            let virtual_text = String::from_utf8(virtual_bytes).unwrap();
+            let len = virtual_text.len();
+            // Each byte content or gap; runs of one kind form a segment.
+            for labels in 0u32..(1 << len) {
+                let mut gaps = Vec::new();
+                let mut index = 0;
+                while index < len {
+                    if labels & (1 << index) != 0 {
+                        let start = index;
+                        while index < len && labels & (1 << index) != 0 {
+                            index += 1;
+                        }
+                        gaps.push(VirtualGap {
+                            virtual_range: start..index,
+                            host_text: virtual_text[start..index].to_string(),
+                        });
+                    } else {
+                        index += 1;
+                    }
+                }
+                let layout = VirtualLayout::from_gaps(&virtual_text, &gaps);
+                let gap_count = layout
+                    .segments()
+                    .iter()
+                    .filter(|segment| segment.kind == SegmentKind::Gap)
+                    .count();
+                let choices = if gap_count > 1 { &short } else { &long };
+                let mut picks = vec![0usize; gap_count];
+                loop {
+                    let mut gap = 0;
+                    let segments: Vec<_> = layout
+                        .segments()
+                        .iter()
+                        .map(|segment| match segment.kind {
+                            SegmentKind::Content => serde_json::json!({"type": "content"}),
+                            SegmentKind::Gap => {
+                                let content = &choices[picks[gap]];
+                                gap += 1;
+                                serde_json::json!({"type": "gap", "content": content})
+                            }
+                        })
+                        .collect();
+                    let answer = || -> PrepareResult {
+                        serde_json::from_value(serde_json::json!({ "segments": segments })).unwrap()
+                    };
+                    cases += 1;
+                    let verdict = build_prepared(&virtual_text, &layout, Some(answer()), 0, true);
+                    let built = build_prepared(&virtual_text, &layout, Some(answer()), 0, false)
+                        .expect("an answer without changes always builds");
+                    // Every LSP position of one text maps to one of the
+                    // other: a content offset of V (or a P offset of
+                    // unchanged content) never lands between a CR and a LF
+                    // the other text does not have there.
+                    let runs = &built.map.runs;
+                    let prepared = &built.text;
+                    let virtual_positions = layout
+                        .segments()
+                        .iter()
+                        .filter(|segment| segment.kind == SegmentKind::Content)
+                        .flat_map(|segment| segment.virtual_range.start..=segment.virtual_range.end)
+                        .all(|offset| {
+                            splits_crlf(&virtual_text, offset)
+                                || !splits_crlf(
+                                    prepared,
+                                    map_offset(runs, offset, Bias::Start, Side::Virtual),
+                                )
+                        });
+                    let prepared_positions = runs
+                        .iter()
+                        .filter(|run| run.kind == RunKind::Identity)
+                        .flat_map(|run| run.prepared.start..=run.prepared.end)
+                        .all(|offset| {
+                            !splits_crlf(prepared, offset)
+                                || splits_crlf(
+                                    &virtual_text,
+                                    map_offset(runs, offset, Bias::Start, Side::Prepared),
+                                )
+                        });
+                    let survives = virtual_positions && prepared_positions;
+                    assert_eq!(
+                        verdict.is_ok(),
+                        survives,
+                        "{virtual_text:?} gaps {:?} answer {:?} prepared {:?}",
+                        gaps.iter()
+                            .map(|gap| gap.virtual_range.clone())
+                            .collect::<Vec<_>>(),
+                        picks.iter().map(|pick| &choices[*pick]).collect::<Vec<_>>(),
+                        built.text,
+                    );
+                    // Next combination of placeholders.
+                    let mut digit = 0;
+                    while digit < gap_count {
+                        picks[digit] += 1;
+                        if picks[digit] < choices.len() {
+                            break;
+                        }
+                        picks[digit] = 0;
+                        digit += 1;
+                    }
+                    if digit == gap_count {
+                        break;
+                    }
+                }
+            }
+        }
+        cases
     }
 
     /// Checking a gap kept as is reads it once, not once per CRLF in it: a
