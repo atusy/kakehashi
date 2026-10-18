@@ -611,6 +611,45 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_single_edit_is_left_as_it_came() {
+        let offset = prepared_offset();
+        let mut edit = TextEdit {
+            range: Range::new(Position::new(1, 3), Position::new(1, 3)),
+            new_text: "\n  z".to_string(),
+        };
+        assert!(translate_virtual_text_edit_to_host(&mut edit, &offset));
+        assert_eq!(
+            edit.range,
+            Range::new(Position::new(11, 5), Position::new(11, 5))
+        );
+        let reversed = TextEdit {
+            range: Range::new(Position::new(1, 3), Position::new(0, 0)),
+            new_text: "x".to_string(),
+        };
+        let mut edit = reversed.clone();
+        assert!(!translate_virtual_text_edit_to_host(&mut edit, &offset));
+        assert_eq!(edit, reversed);
+        // A main edit refused drops its carrier, additional edits or not.
+        let mut mains = [reversed.clone()];
+        assert_eq!(
+            translate_virtual_main_and_additional_edits_to_host(&mut mains, None, &offset),
+            None
+        );
+        let mut additional = vec![TextEdit {
+            range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+            new_text: "y".to_string(),
+        }];
+        assert_eq!(
+            translate_virtual_main_and_additional_edits_to_host(
+                &mut mains,
+                Some(&mut additional),
+                &offset
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn unprepared_text_edits_translate_as_ranges() {
         let mut edits = vec![TextEdit {
             range: Range::new(Position::new(0, 1), Position::new(1, 0)),
