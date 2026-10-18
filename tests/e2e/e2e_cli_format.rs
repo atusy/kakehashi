@@ -1034,6 +1034,63 @@ languages = ["lua"]
 }
 
 #[test]
+fn e2e_format_fails_a_prefixed_prepared_region_through_the_pipeline() {
+    // A list item's fence, its leading blank lines deleted by the peer:
+    // only the content line carries the item's "  " prefix, past the
+    // prepared text's line count. The concatenated pipeline re-applies no
+    // prefix to a prepared document, so the region fails closed: exit 2,
+    // the file untouched (counting prefixes over the prepared text would
+    // miss that line's and write code out of the list item).
+    let markdown = "- a\n\n  ```lua\n\n\n  local x = 1; local y = 2\n  ```\n";
+    let ws = workspace_with(&[("doc.md", markdown)]);
+    std::fs::write(
+        ws.path().join("kakehashi.toml"),
+        format!(
+            r#"autoInstall = false
+
+[languages.markdown.bridge.lua.aggregation."kakehashi/virtualDocument/prepare"]
+priorities = ["peer"]
+
+[languages.markdown.bridge.lua.aggregation._]
+priorities = ["mock-echo"]
+
+[languages.markdown.bridge.lua.aggregation."textDocument/formatting"]
+strategy = "concatenated"
+priorities = ["mock-echo"]
+
+[languageServers.peer]
+cmd = ['{bin}', 'prepare-peer']
+languages = ["lua"]
+
+[languageServers.mock-echo]
+cmd = ['{bin}', 'echo-document']
+languages = ["lua"]
+"#,
+            bin = env!("CARGO_BIN_EXE_mock-lsp-formatter")
+        ),
+    )
+    .expect("write prepare config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .arg("format")
+        .arg("--config-file")
+        .arg("kakehashi.toml")
+        .arg("doc.md")
+        .current_dir(ws.path())
+        .env("KAKEHASHI_DATA_DIR", data_dir())
+        .env("KAKEHASHI_EXPERIMENTAL", "true")
+        .output()
+        .expect("spawn kakehashi format");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a prefixed prepared region must fail the pipeline; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(read(ws.path(), "doc.md"), markdown);
+}
+
+#[test]
 fn e2e_format_without_experimental_features_formats_as_unprepared() {
     // A prepare peer configured, experimental features off: the region is
     // formatted as on main, the formatter's text as it wrote it (the line
