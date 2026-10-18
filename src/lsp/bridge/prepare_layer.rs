@@ -261,7 +261,9 @@ impl super::BridgeCoordinator {
     /// [`Self::prepare_host_answers`] read it when the pull started), its
     /// resync may already have looked for the debt, before it was owed: the
     /// host is synced again, as ready, so the pass settles it though another
-    /// of its documents is still pending. So it is when none is pending any
+    /// of its documents is still pending; as an edit's, so it collects
+    /// through the debounce, which that answer's own resync arranged already,
+    /// rather than once more at once. So it is when none is pending any
     /// more.
     pub(crate) fn owe_pull_after_prepare(&self, host: &Url, answers_then: u64) {
         let Some(layer) = &self.prepare else {
@@ -282,7 +284,7 @@ impl super::BridgeCoordinator {
                     host_uri: host.clone(),
                     ready: answered,
                     recollect: false,
-                    edited: false,
+                    edited: answered,
                 },
                 std::time::Duration::ZERO,
             );
@@ -739,6 +741,7 @@ mod tests {
             .unwrap();
         assert_eq!(resync.host_uri, host);
         assert!(resync.ready, "settles the debt");
+        assert!(resync.edited, "and collects through the debounce, not at once");
         // A pull that saw that answer already waits for the other.
         coordinator.owe_pull_after_prepare(&host, coordinator.prepare_host_answers(&host));
         assert!(
