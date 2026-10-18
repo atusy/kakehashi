@@ -41,7 +41,9 @@ use tower_lsp_server::ls_types::{
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
-use super::super::protocol::translate_virtual_range_to_host;
+use super::super::protocol::{
+    EditMode, translate_virtual_range_to_host, translate_virtual_text_edits_to_host,
+};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, region_host_end,
     response_has_jsonrpc_error, text_edit_safe_in_region,
@@ -652,8 +654,27 @@ fn transform_formatting_style_response(
         edits = keep_edge_layout(edits, virtual_content, offset);
     }
 
-    for edit in &mut edits {
-        translate_virtual_range_to_host(&mut edit.range, offset);
+    // On a prepared document the server formatted P (`virtual_content`),
+    // whose edges the layout kept above. Its answer maps back through the
+    // map, which restores the indentation the peer removed and keeps the
+    // host text P does not show (the deleted edge lines). An answer the map
+    // refuses fails the request (the CLI reports it), unlike the malformed
+    // answers dropped below: the server did its job, and the region is left
+    // unformatted only because its result cannot be placed in the host.
+    if offset.prepared().is_some() {
+        if !translate_virtual_text_edits_to_host(&mut edits, offset, EditMode::Formatting) {
+            warn!(
+                target: "kakehashi::bridge",
+                "Refused a formatting response: its result cannot be mapped back through the prepared virtual document"
+            );
+            return Err(io::Error::other(
+                "formatting response cannot be mapped back through the prepared virtual document",
+            ));
+        }
+    } else {
+        for edit in &mut edits {
+            translate_virtual_range_to_host(&mut edit.range, offset);
+        }
     }
 
     // Clamp positions past the end of the last content line into the region:
@@ -2014,6 +2035,126 @@ mod tests {
         assert!(
             edits.is_empty(),
             "edits starting more than one line past EOF must still be dropped"
+        );
+    }
+
+    /// `virtual_content` prepared by a peer answering `changes` to its one
+    /// content segment, at host line 0, column `column`.
+    fn prepared_offset(
+        virtual_content: &str,
+        column: u32,
+        changes: serde_json::Value,
+    ) -> RegionOffset {
+        use super::super::super::protocol::{VirtualLayout, apply_prepare_result};
+        let result =
+            serde_json::from_value(json!({"segments": [{"type": "content", "changes": changes}]}))
+                .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_content,
+            &VirtualLayout::single(virtual_content),
+            Some(result),
+        )
+        .unwrap();
+        RegionOffset::new(0, column).with_prepared(prepared.map)
+    }
+
+    /// A Nix `''` string's JSON, its content dedented by the peer.
+    const NIX_JSON_HOST: &str = "x = ''\n    {\"a\":1}\n  '';\n";
+    const NIX_JSON: &str = "\n    {\"a\":1}\n  ";
+
+    fn nix_json_offset() -> RegionOffset {
+        prepared_offset(
+            NIX_JSON,
+            6,
+            json!([{"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 4}}, "newText": ""}]),
+        )
+    }
+
+    #[test]
+    fn a_prepared_region_maps_a_whole_document_answer_back_reindented() {
+        // jsonls drops the line break after `''` and the closing indent of
+        // the prepared text it formatted; both are the region's edges.
+        let offset = nix_json_offset();
+        let prepared = offset.prepared().unwrap().prepared_text().to_string();
+        assert_eq!(prepared, "\n{\"a\":1}\n  ");
+        let host = format_host(
+            NIX_JSON_HOST,
+            offset,
+            &prepared,
+            json!([{
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 2, "character": 2 } },
+                "newText": "{\n  \"a\": 1\n}"
+            }]),
+        );
+        assert_eq!(host, "x = ''\n    {\n      \"a\": 1\n    }\n  '';\n");
+    }
+
+    #[test]
+    fn a_prepared_answer_the_map_refuses_fails_the_request() {
+        // Lines dedented by two and by four: a new line has no one indent.
+        let virtual_content = "  a\n    b\n";
+        let offset = prepared_offset(
+            virtual_content,
+            0,
+            json!([
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 4}}, "newText": ""}
+            ]),
+        );
+        let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [{
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 2, "character": 0 } },
+            "newText": "a\nb\nc\n"
+        }]});
+        let region_end = region_host_end("a\nb\n", &offset);
+        assert!(
+            transform_formatting_response_to_host(response, &offset, "a\nb\n", region_end).is_err()
+        );
+    }
+
+    #[test]
+    fn a_prepared_region_keeps_its_indentation_only_last_line() {
+        // The indentation-only last line is deleted with the peer's dedent:
+        // an edit taking the line before it along ends after it, where the
+        // region does.
+        let host = "x = ''\n  foo\n  '';\n";
+        let virtual_content = "\n  foo\n  ";
+        let offset = prepared_offset(
+            virtual_content,
+            6,
+            json!([
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""},
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""},
+                {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
+            ]),
+        );
+        let prepared = offset.prepared().unwrap().prepared_text().to_string();
+        assert_eq!(prepared, "foo\n");
+        let formatted = format_host(
+            host,
+            offset.clone(),
+            &prepared,
+            json!([{
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 0 } },
+                "newText": "bar\n"
+            }]),
+        );
+        assert_eq!(formatted, "x = ''\n  bar\n  '';\n");
+        // Joining the last line onto the one before it (an on-type answer
+        // keeps no edges) takes the deleted indent along, past P's end.
+        let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [{
+            "range": { "start": { "line": 0, "character": 3 }, "end": { "line": 1, "character": 0 } },
+            "newText": ""
+        }]});
+        let edits = transform_on_type_formatting_response_to_host(
+            response,
+            &offset,
+            &prepared,
+            region_host_end(&prepared, &offset),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::text::edit::apply_text_edits(host, &edits),
+            "x = ''\n  foo'';\n"
         );
     }
 }

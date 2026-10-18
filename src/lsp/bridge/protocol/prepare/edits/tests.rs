@@ -32,7 +32,7 @@ fn edit(start: (u32, u32), end: (u32, u32), new_text: &str) -> TextEdit {
 /// `text` with `edits` applied (a column past a line's end meaning its end).
 pub(super) fn apply_to(text: &str, edits: &[TextEdit]) -> String {
     let lines = LineMap::new(text.to_string());
-    let (ranges, order) = sorted_extents(&lines, edits).expect("edits apply");
+    let (ranges, order) = sorted_extents(&lines, edits, true).expect("edits apply");
     let mut output = String::with_capacity(text.len());
     let mut cursor = 0;
     for index in order {
@@ -2934,5 +2934,561 @@ fn many_edits_on_one_long_line_look_at_it_in_linear_work() {
             "{scanned} bytes scanned for a {}-byte line",
             virtual_text.len()
         );
+    }
+}
+
+mod formatting {
+    use super::*;
+    use std::time::Duration;
+
+    /// V formatted through `map` by a formatter answering `edits` to P, the
+    /// diff given `budget`; `None` when the map refuses the answer.
+    fn formatted(
+        map: &PreparedMap,
+        virtual_text: &str,
+        edits: &[TextEdit],
+        budget: Duration,
+    ) -> Option<String> {
+        let mapped = map.map_edits_within(edits, EditMode::Formatting, budget)?;
+        Some(apply_to(virtual_text, &mapped))
+    }
+
+    /// [`formatted`] with time enough and with none, which must agree.
+    fn formatted_either_way(
+        map: &PreparedMap,
+        virtual_text: &str,
+        edits: &[TextEdit],
+    ) -> Option<String> {
+        let precise = formatted(map, virtual_text, edits, Duration::from_secs(10));
+        let coarse = formatted(map, virtual_text, edits, Duration::ZERO);
+        if let Some(coarse) = &coarse {
+            assert_eq!(Some(coarse), precise.as_ref(), "a coarse diff maps alike");
+        }
+        precise
+    }
+
+    #[test]
+    fn a_whole_document_answer_maps_back_reindented() {
+        let (virtual_text, map) = dedented();
+        assert_eq!(map.prepared_lines.text, "if x:\n  y\n");
+        let answer = [edit((0, 0), (2, 0), "if x:\n    y\n    z\n")];
+        assert_eq!(
+            formatted_either_way(&map, &virtual_text, &answer).as_deref(),
+            Some("  if x:\n      y\n      z\n")
+        );
+        // Only what changed is edited: the first line is left alone.
+        let mapped = map.map_edits(&answer, EditMode::Formatting).unwrap();
+        assert!(mapped.iter().all(|edit| edit.range.start.line >= 1));
+    }
+
+    #[test]
+    fn an_answer_changing_nothing_maps_to_no_edit() {
+        let (_, map) = dedented();
+        let answer = [edit((0, 0), (2, 0), "if x:\n  y\n")];
+        assert_eq!(map.map_edits(&answer, EditMode::Formatting), Some(vec![]));
+        assert_eq!(map.map_edits(&[], EditMode::Formatting), Some(vec![]));
+    }
+
+    #[test]
+    fn a_whole_document_range_may_end_on_the_line_past_the_last() {
+        let (virtual_text, map) = dedented();
+        // P has three lines, the last empty: (3, 0) names its end.
+        let answer = [edit((0, 0), (3, 0), "if  x:\n  y\n")];
+        assert_eq!(
+            formatted_either_way(&map, &virtual_text, &answer).as_deref(),
+            Some("  if  x:\n    y\n")
+        );
+        // Only that exact place: not a column on it, nor a line further.
+        for end in [(3, 1), (4, 0)] {
+            assert_eq!(
+                map.map_edits(&[edit((0, 0), end, "")], EditMode::Formatting),
+                None,
+                "{end:?}"
+            );
+        }
+        // An extent names no such place.
+        assert_eq!(
+            map.map_edits(&[edit((0, 0), (3, 0), "")], EditMode::Extent),
+            None
+        );
+    }
+
+    #[test]
+    fn crlf_turned_to_lf_maps_without_splitting_a_line_break() {
+        let virtual_text = "  a\r\n  b\r\n";
+        let map = dedent_by_two(virtual_text);
+        assert_eq!(map.prepared_lines.text, "a\r\nb\r\n");
+        let answer = [edit((0, 0), (2, 0), "a\nb\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  a\n  b\n")
+        );
+    }
+
+    #[test]
+    fn lines_created_without_one_indent_to_regain_are_refused() {
+        // Line 0 lost two spaces, line 1 four: no indent for a new line.
+        let virtual_text = "  a\n    b\n";
+        let map = prepare(
+            virtual_text,
+            json!([
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 4}}, "newText": ""}
+            ]),
+        );
+        let answer = [edit((0, 0), (2, 0), "a\nb\nc\n")];
+        assert_eq!(map.map_edits(&answer, EditMode::Formatting), None);
+        // Changing text within a line needs no indent.
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &[edit((0, 0), (2, 0), "A\nb\n")]).as_deref(),
+            Some("  A\n    b\n")
+        );
+    }
+
+    #[test]
+    fn deleted_edge_lines_stay_whatever_the_answer() {
+        let (virtual_text, map) = leading_blank_dedented();
+        assert_eq!(map.prepared_lines.text, "a\nb\n");
+        let answer = [edit((0, 0), (3, 0), "a\n\nb\n")];
+        assert_eq!(
+            formatted_either_way(&map, &virtual_text, &answer).as_deref(),
+            Some("\n  a\n\n  b\n")
+        );
+    }
+
+    #[test]
+    fn overlapping_or_reversed_answers_are_refused() {
+        let (_, map) = dedented();
+        let overlapping = [edit((0, 0), (1, 0), "x"), edit((0, 2), (0, 3), "y")];
+        assert_eq!(map.map_edits(&overlapping, EditMode::Formatting), None);
+        let reversed = [edit((1, 0), (0, 0), "x")];
+        assert_eq!(map.map_edits(&reversed, EditMode::Formatting), None);
+    }
+}
+
+/// Formatting answers checked against host text built without the map: the
+/// document is generated with the indentation its peer removes, a formatter
+/// rewrites P line by line, and the expected host text is that rewrite with
+/// the indent put back on every line and the deleted edge lines around it.
+/// Positions and the application of edits are this module's own.
+mod formatting_reference {
+    use super::*;
+    use proptest::prelude::*;
+    use proptest::test_runner::{Config, TestCaseError, TestRunner};
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    const BODIES: [&str; 5] = ["a", "é", "𝄞x", "b c", "if x:"];
+
+    /// Byte offsets of every line start in `text` (LF, CRLF and a lone CR
+    /// each end a line).
+    fn line_starts(text: &str) -> Vec<usize> {
+        let bytes = text.as_bytes();
+        let mut starts = vec![0];
+        let mut at = 0;
+        while at < bytes.len() {
+            match bytes[at] {
+                b'\r' if bytes.get(at + 1) == Some(&b'\n') => {
+                    at += 2;
+                    starts.push(at);
+                }
+                b'\r' | b'\n' => {
+                    at += 1;
+                    starts.push(at);
+                }
+                _ => at += 1,
+            }
+        }
+        starts
+    }
+
+    /// The end of line `line`'s content (before its line break).
+    fn content_end(text: &str, starts: &[usize], line: usize) -> usize {
+        let end = starts.get(line + 1).copied().unwrap_or(text.len());
+        let line_text = &text[starts[line]..end];
+        let content = line_text
+            .strip_suffix("\r\n")
+            .or_else(|| line_text.strip_suffix('\n'))
+            .or_else(|| line_text.strip_suffix('\r'))
+            .unwrap_or(line_text);
+        starts[line] + content.len()
+    }
+
+    /// The LSP position (UTF-16 columns) of byte `offset`.
+    fn position_of(text: &str, offset: usize) -> Position {
+        let starts = line_starts(text);
+        let line = starts.partition_point(|&start| start <= offset) - 1;
+        let column: usize = text[starts[line]..offset]
+            .chars()
+            .map(char::len_utf16)
+            .sum();
+        Position::new(line as u32, column as u32)
+    }
+
+    /// The byte offset of `position`: a column past the line's content
+    /// means its end; a line past the last, the text's end.
+    fn offset_of(text: &str, position: Position) -> usize {
+        let starts = line_starts(text);
+        let line = position.line as usize;
+        if line >= starts.len() {
+            return text.len();
+        }
+        let end = content_end(text, &starts, line);
+        let mut column = 0;
+        for (at, character) in text[starts[line]..end].char_indices() {
+            if column >= position.character as usize {
+                return starts[line] + at;
+            }
+            column += character.len_utf16();
+        }
+        end
+    }
+
+    /// `text` with `edits` applied, in order of their start then end.
+    fn apply(text: &str, edits: &[TextEdit]) -> String {
+        let mut spans: Vec<(usize, usize, &str)> = edits
+            .iter()
+            .map(|edit| {
+                (
+                    offset_of(text, edit.range.start),
+                    offset_of(text, edit.range.end),
+                    edit.new_text.as_str(),
+                )
+            })
+            .collect();
+        spans.sort_by_key(|&(start, end, _)| (start, end));
+        let mut output = String::new();
+        let mut cursor = 0;
+        for (start, end, new_text) in spans {
+            assert!(cursor <= start && start <= end, "edits apply in order");
+            output.push_str(&text[cursor..start]);
+            output.push_str(new_text);
+            cursor = end;
+        }
+        output.push_str(&text[cursor..]);
+        output
+    }
+
+    /// A generated document: V, the peer's changes, and the host text the
+    /// map keeps around P.
+    struct Document {
+        virtual_text: String,
+        changes: Vec<serde_json::Value>,
+        leading: String,
+        closing: String,
+        /// The last line holds only the indent the peer removed, with no
+        /// closing lines before it: a content line, its indent kept.
+        indent_only_last_line: bool,
+    }
+
+    /// `lines` (`None` an empty line), indented by `indent`, broken by
+    /// `line_break`, between `leading` and `trailing` blank lines,
+    /// optionally ending with the indent alone.
+    fn document(
+        lines: &[Option<usize>],
+        indent: &str,
+        line_break: &str,
+        (leading, trailing, closing_indent): (usize, usize, bool),
+    ) -> Option<Document> {
+        if lines.iter().all(Option::is_none) {
+            return None;
+        }
+        let leading_text = line_break.repeat(leading);
+        let mut text = leading_text.clone();
+        for line in lines {
+            if let Some(body) = line {
+                text.push_str(indent);
+                text.push_str(BODIES[*body]);
+            }
+            text.push_str(line_break);
+        }
+        let content_end = text.len();
+        text.push_str(&line_break.repeat(trailing));
+        if closing_indent {
+            text.push_str(indent);
+        }
+        let starts = line_starts(&text);
+        let mut changes = Vec::new();
+        for &at in &starts {
+            let edge_line = at < leading_text.len()
+                || (at >= content_end && at < content_end + trailing * line_break.len());
+            let end = if edge_line {
+                at + line_break.len()
+            } else if text[at..].starts_with(indent) {
+                at + indent.len()
+            } else {
+                continue;
+            };
+            changes.push(json!({"range": {
+                "start": position_of(&text, at),
+                "end": position_of(&text, end)
+            }, "newText": ""}));
+        }
+        let indent_only_last_line = closing_indent && trailing == 0;
+        Some(Document {
+            closing: if indent_only_last_line {
+                String::new()
+            } else {
+                format!(
+                    "{}{}",
+                    line_break.repeat(trailing),
+                    if closing_indent { indent } else { "" }
+                )
+            },
+            leading: leading_text,
+            indent_only_last_line,
+            virtual_text: text,
+            changes,
+        })
+    }
+
+    /// One way a formatter rewrites a line.
+    #[derive(Debug, Clone, Copy)]
+    enum Rewrite {
+        Keep,
+        /// Its leading whitespace becomes this many spaces.
+        Reindent(usize),
+        TrailingSpace,
+        /// A line of text after it, indented by this many spaces.
+        LineAfter(usize),
+        BlankAfter,
+        Delete,
+        JoinNext,
+        /// Its line break switched between LF and CRLF.
+        SwitchBreak,
+    }
+
+    fn rewrite() -> impl Strategy<Value = Rewrite> {
+        prop_oneof![
+            4 => Just(Rewrite::Keep),
+            2 => (0..5usize).prop_map(Rewrite::Reindent),
+            1 => Just(Rewrite::TrailingSpace),
+            2 => (0..3usize).prop_map(Rewrite::LineAfter),
+            1 => Just(Rewrite::BlankAfter),
+            1 => Just(Rewrite::Delete),
+            1 => Just(Rewrite::JoinNext),
+            1 => Just(Rewrite::SwitchBreak),
+        ]
+    }
+
+    /// `prepared` rewritten line by line (`rewrites` cycled), its final
+    /// line break dropped or added when `flip_final_break`.
+    fn format(prepared: &str, rewrites: &[Rewrite], flip_final_break: bool) -> String {
+        let starts = line_starts(prepared);
+        let mut lines: Vec<(String, String)> = (0..starts.len())
+            .map(|line| {
+                let end = content_end(prepared, &starts, line);
+                let next = starts.get(line + 1).copied().unwrap_or(prepared.len());
+                (
+                    prepared[starts[line]..end].to_string(),
+                    prepared[end..next].to_string(),
+                )
+            })
+            .collect();
+        // The empty line after a final break is no line a formatter sees.
+        if lines.len() > 1 && lines.last().is_some_and(|(text, _)| text.is_empty()) {
+            lines.pop();
+        }
+        let mut output: Vec<(String, String)> = Vec::new();
+        let mut rewrites = rewrites.iter().cycle();
+        let mut index = 0;
+        while index < lines.len() {
+            let (mut text, mut line_break) = lines[index].clone();
+            let some_break = if line_break.is_empty() {
+                "\n".to_string()
+            } else {
+                line_break.clone()
+            };
+            match rewrites.next().copied().unwrap_or(Rewrite::Keep) {
+                Rewrite::Keep => output.push((text, line_break)),
+                Rewrite::Reindent(spaces) => {
+                    let trimmed = text.trim_start_matches([' ', '\t']).to_string();
+                    output.push((format!("{}{trimmed}", " ".repeat(spaces)), line_break));
+                }
+                Rewrite::TrailingSpace => output.push((format!("{text} "), line_break)),
+                Rewrite::LineAfter(spaces) => {
+                    output.push((text, some_break.clone()));
+                    output.push((format!("{}w", " ".repeat(spaces)), line_break));
+                }
+                Rewrite::BlankAfter => {
+                    output.push((text, some_break.clone()));
+                    output.push((String::new(), line_break));
+                }
+                Rewrite::Delete if lines.len() > 1 => {}
+                Rewrite::Delete => output.push((text, line_break)),
+                Rewrite::JoinNext if index + 1 < lines.len() => {
+                    index += 1;
+                    text.push(' ');
+                    text.push_str(lines[index].0.trim_start());
+                    line_break = lines[index].1.clone();
+                    output.push((text, line_break));
+                }
+                Rewrite::JoinNext => output.push((text, line_break)),
+                Rewrite::SwitchBreak => {
+                    let switched = match line_break.as_str() {
+                        "\n" => "\r\n",
+                        "\r\n" => "\n",
+                        other => other,
+                    };
+                    output.push((text, switched.to_string()));
+                }
+            }
+            index += 1;
+        }
+        let mut formatted: String = output
+            .into_iter()
+            .map(|(text, line_break)| text + &line_break)
+            .collect();
+        if flip_final_break {
+            if formatted.ends_with("\r\n") {
+                formatted.truncate(formatted.len() - 2);
+            } else if formatted.ends_with('\n') {
+                formatted.pop();
+            } else {
+                formatted.push('\n');
+            }
+        }
+        formatted
+    }
+
+    /// The host text `formatted` (a rewrite of P) stands for: every line it
+    /// starts indented, the deleted edge lines put back around it. `None`
+    /// when the closing lines would not start a line.
+    fn reference(document: &Document, formatted: &str, indent: &str) -> Option<String> {
+        let mut indented = String::new();
+        let mut at_line_start = true;
+        let mut characters = formatted.chars().peekable();
+        while let Some(character) = characters.next() {
+            if at_line_start && character != '\n' && character != '\r' {
+                indented.push_str(indent);
+            }
+            indented.push(character);
+            at_line_start =
+                character == '\n' || (character == '\r' && characters.peek() != Some(&'\n'));
+        }
+        if document.indent_only_last_line && at_line_start {
+            indented.push_str(indent);
+        }
+        if !document.closing.is_empty() && !indented.is_empty() && !at_line_start {
+            return None;
+        }
+        Some(format!(
+            "{}{indented}{}",
+            document.leading, document.closing
+        ))
+    }
+
+    /// The answer a formatter gives for turning `prepared` into
+    /// `formatted`, in one of a few shapes servers use.
+    fn answer(prepared: &str, formatted: &str, shape: u8) -> Vec<TextEdit> {
+        let whole_end = match shape % 3 {
+            // To the start of the line just past the last.
+            0 => Position::new(line_starts(prepared).len() as u32, 0),
+            // To the document end.
+            1 => position_of(prepared, prepared.len()),
+            // Only what differs, trimmed to whole characters off a CRLF.
+            _ => {
+                let prefix: usize = prepared
+                    .chars()
+                    .zip(formatted.chars())
+                    .take_while(|(a, b)| a == b)
+                    .map(|(a, _)| a.len_utf8())
+                    .sum();
+                let mut prefix = prefix;
+                if prepared[..prefix].ends_with('\r') || formatted[..prefix].ends_with('\r') {
+                    prefix -= 1;
+                }
+                let suffix: usize = prepared[prefix..]
+                    .chars()
+                    .rev()
+                    .zip(formatted[prefix..].chars().rev())
+                    .take_while(|(a, b)| a == b)
+                    .map(|(a, _)| a.len_utf8())
+                    .sum();
+                let mut suffix = suffix;
+                let (old_end, new_end) = (prepared.len() - suffix, formatted.len() - suffix);
+                if prepared[old_end..].starts_with('\n') || formatted[new_end..].starts_with('\n') {
+                    suffix -= 1;
+                }
+                let (old_end, new_end) = (prepared.len() - suffix, formatted.len() - suffix);
+                return vec![TextEdit {
+                    range: LspRange::new(
+                        position_of(prepared, prefix),
+                        position_of(prepared, old_end),
+                    ),
+                    new_text: formatted[prefix..new_end].to_string(),
+                }];
+            }
+        };
+        vec![TextEdit {
+            range: LspRange::new(Position::new(0, 0), whole_end),
+            new_text: formatted.to_string(),
+        }]
+    }
+
+    fn check(budget: Duration, cases: u32) -> (usize, usize) {
+        let mut runner = TestRunner::new(Config {
+            cases,
+            failure_persistence: None,
+            ..Config::default()
+        });
+        let (mapped_sets, refused) = (Cell::new(0), Cell::new(0));
+        let strategy = (
+            prop::collection::vec(prop::option::weighted(0.8, 0..BODIES.len()), 1..6),
+            prop::sample::select(vec!["  ", "\t", "    "]),
+            prop::sample::select(vec!["\n", "\r\n"]),
+            (0..3usize, 0..3usize, any::<bool>()),
+            prop::collection::vec(rewrite(), 1..6),
+            (any::<bool>(), any::<u8>()),
+        );
+        runner
+            .run(
+                &strategy,
+                |(lines, indent, line_break, edges, rewrites, (flip, shape))| {
+                    let Some(document) = document(&lines, indent, line_break, edges) else {
+                        return Ok(());
+                    };
+                    let map = prepare(
+                        &document.virtual_text,
+                        serde_json::Value::from(document.changes.clone()),
+                    );
+                    let prepared = map.prepared_lines.text.clone();
+                    let formatted = format(&prepared, &rewrites, flip);
+                    let edits = answer(&prepared, &formatted, shape);
+                    prop_assert_eq!(apply(&prepared, &edits), formatted.clone());
+                    let Some(mapped) = map.map_edits_within(&edits, EditMode::Formatting, budget)
+                    else {
+                        refused.set(refused.get() + 1);
+                        return Ok(());
+                    };
+                    mapped_sets.set(mapped_sets.get() + 1);
+                    let got = apply(&document.virtual_text, &mapped);
+                    let expected = reference(&document, &formatted, indent);
+                    prop_assert_eq!(
+                        Some(&got),
+                        expected.as_ref(),
+                        "{:?} -> {:?} on {:?} (P {:?})",
+                        edits,
+                        mapped,
+                        document.virtual_text,
+                        prepared
+                    );
+                    Ok::<(), TestCaseError>(())
+                },
+            )
+            .unwrap();
+        (mapped_sets.get(), refused.get())
+    }
+
+    #[test]
+    fn formatting_answers_give_exactly_the_reference_host_text() {
+        let (mapped, refused) = check(Duration::from_secs(10), 3000);
+        assert!(mapped > 1500, "mapped {mapped}, refused {refused}");
+    }
+
+    #[test]
+    fn coarse_diffs_give_exactly_the_reference_host_text_or_are_refused() {
+        let (mapped, refused) = check(Duration::ZERO, 3000);
+        assert!(mapped > 300, "mapped {mapped}, refused {refused}");
     }
 }
