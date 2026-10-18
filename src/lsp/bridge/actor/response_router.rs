@@ -182,6 +182,18 @@ impl ResponseRouter {
         self.register_with_upstream(id, None)
     }
 
+    /// [`Self::register`], recording why the router failed it, if it does
+    /// (see [`Self::take_failure`]): for a request whose caller must tell
+    /// the router's synthetic error reply from the peer's own.
+    pub(crate) fn register_tracked(
+        &self,
+        id: RequestId,
+    ) -> Option<oneshot::Receiver<serde_json::Value>> {
+        self.register_with_upstream_liveness_mode(id, None, true, None)
+            .ok()
+            .map(|(rx, _)| rx)
+    }
+
     /// Register a pending request with upstream ID mapping for cancel forwarding.
     ///
     /// Like `register()`, but also stores an upstream→downstream ID mapping so

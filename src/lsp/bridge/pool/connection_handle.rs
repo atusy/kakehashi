@@ -605,7 +605,7 @@ impl ConnectionHandle {
         let request_id = RequestId::new(self.next_request_id());
         let response_rx = self
             .router()
-            .register(request_id)
+            .register_tracked(request_id)
             .ok_or_else(|| io::Error::other("bridge: duplicate prepare request ID"))?;
         let mut cleanup = RouterCleanupGuard::new(Arc::clone(self.router()), request_id);
         let request = JsonRpcRequest::new(request_id.as_i64(), PREPARE_METHOD, params);
@@ -633,6 +633,21 @@ impl ConnectionHandle {
             }
         };
         cleanup.disarm();
+        // The router's own reply for a connection lost (or a write that
+        // timed out) is no answer from the peer: retried, not taken as an
+        // unusable one.
+        if let Some(failure) = self.router.take_failure(request_id) {
+            let kind = match failure {
+                super::super::actor::BridgeFailure::ConnectionLost => {
+                    io::ErrorKind::ConnectionAborted
+                }
+                super::super::actor::BridgeFailure::RequestTimeout => io::ErrorKind::TimedOut,
+            };
+            return Err(io::Error::new(
+                kind,
+                "bridge: the prepare peer gave no answer",
+            ));
+        }
         if jsonrpc_error_code(&response) == Some(-32601) {
             self.set_virtual_document_prepare(false);
             return Err(io::Error::new(
@@ -1572,6 +1587,63 @@ mod tests {
     /// Create a default DynamicCapabilityRegistry for tests that don't need it.
     fn default_dynamic_caps() -> Arc<DynamicCapabilityRegistry> {
         Arc::new(DynamicCapabilityRegistry::new())
+    }
+
+    /// A prepare request whose connection is lost gets the router's
+    /// synthetic error, which is no answer from the peer: retryable, not an
+    /// unusable answer that holds the input failed until its next edit. A
+    /// peer's own internal error still is one.
+    #[tokio::test]
+    async fn a_lost_connection_is_no_prepare_answer() {
+        use crate::lsp::bridge::protocol::{
+            PrepareHostTextDocument, PrepareParams, PrepareTextDocument, VirtualLayout,
+        };
+        let layout = VirtualLayout::single("a");
+        let params = PrepareParams::new(
+            PrepareTextDocument {
+                uri: "file:///virtual.lua",
+                language_id: "lua",
+                version: 1,
+            },
+            PrepareHostTextDocument {
+                uri: "file:///host.md",
+                language_id: "markdown",
+            },
+            &layout,
+        );
+        for lost in [true, false] {
+            let handle = crate::lsp::bridge::pool::test_helpers::create_handle_with_state(
+                ConnectionState::Ready,
+            )
+            .await;
+            handle.set_virtual_document_prepare(true);
+            let request = handle.request_virtual_document_prepare(&params);
+            tokio::pin!(request);
+            let id = loop {
+                tokio::select! {
+                    _ = &mut request => panic!("answered before anything was routed"),
+                    _ = tokio::task::yield_now() => {}
+                }
+                if let Some(id) = handle.router().pending_ids().first().copied() {
+                    break id;
+                }
+            };
+            if lost {
+                handle.router().fail_all("bridge: connection lost");
+            } else {
+                let _ = handle.router().route(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id.as_i64(),
+                    "error": {"code": -32603, "message": "the peer failed"}
+                }));
+            }
+            let error = request.await.unwrap_err();
+            assert_eq!(
+                error.kind() == io::ErrorKind::InvalidData,
+                !lost,
+                "{lost}: {error}"
+            );
+        }
     }
 
     /// The generic timeout must not erase the one entry that proves the
