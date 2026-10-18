@@ -223,9 +223,13 @@ fn transform_color_presentation_response_to_host(
                 }
             }
         }
-        let Some(additional_kept) = translate_virtual_main_and_additional_edits_to_host(
+        // An unprepared document's additional edits are translated only once
+        // the primary is accepted, below, as on main: no work for a dropped
+        // presentation. A prepared one's map with the primary as one set.
+        let prepared = offset.prepared().is_some();
+        let Some(mut additional_kept) = translate_virtual_main_and_additional_edits_to_host(
             presentation.text_edit.as_mut_slice(),
-            presentation.additional_text_edits.as_mut(),
+            presentation.additional_text_edits.as_mut().filter(|_| prepared),
             offset,
             EditMode::Extent,
         ) else {
@@ -235,6 +239,10 @@ fn transform_color_presentation_response_to_host(
             && !text_edit_safe_in_region(text_edit, offset, region_end)
         {
             return false;
+        }
+        if !prepared && let Some(additional_edits) = presentation.additional_text_edits.as_mut() {
+            additional_kept =
+                translate_virtual_text_edits_to_host(additional_edits, offset, EditMode::Extent);
         }
 
         // ALL-OR-NOTHING (same reasoning as completion): the array can carry
