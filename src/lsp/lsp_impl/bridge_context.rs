@@ -1890,22 +1890,54 @@ impl Kakehashi {
         native: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
         is_nonempty: impl Fn(&R) -> bool,
     ) -> tower_lsp_server::jsonrpc::Result<Option<R>> {
-        let Ok(uri) = uri_to_url(lsp_uri) else {
-            log::warn!("Invalid URI in {}: {}", request_method, lsp_uri.as_str());
-            return Ok(None);
-        };
-        let Some(host_language) = self.document_language(&uri) else {
-            return Ok(None);
-        };
-        let layer_cfg = self.resolve_layer_config(&host_language, layer_method);
-        self.run_layer_race(race_layers_preferred(
-            &layer_cfg.priorities,
+        self.walk_layer_futures_in_order(
+            lsp_uri,
+            layer_method,
+            request_method,
             virt,
             host,
             native,
             is_nonempty,
-        ))
+        )
         .await
+        .0
+    }
+
+    /// [`Self::walk_layer_futures`], also handing back the layer order the
+    /// walk raced in (empty when it did not run), read from the same
+    /// settings snapshot.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn walk_layer_futures_in_order<R>(
+        &self,
+        lsp_uri: &Uri,
+        layer_method: &'static str,
+        request_method: &'static str,
+        virt: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+        host: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+        native: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+        is_nonempty: impl Fn(&R) -> bool,
+    ) -> (
+        tower_lsp_server::jsonrpc::Result<Option<R>>,
+        Vec<LayerSource>,
+    ) {
+        let Ok(uri) = uri_to_url(lsp_uri) else {
+            log::warn!("Invalid URI in {}: {}", request_method, lsp_uri.as_str());
+            return (Ok(None), Vec::new());
+        };
+        let Some(host_language) = self.document_language(&uri) else {
+            return (Ok(None), Vec::new());
+        };
+        let layer_cfg = self.resolve_layer_config(&host_language, layer_method);
+        let result = self
+            .run_layer_race(race_layers_preferred(
+                &layer_cfg.priorities,
+                virt,
+                host,
+                native,
+                is_nonempty,
+            ))
+            .await;
+        (result, layer_cfg.priorities)
     }
 
     /// Run a pre-built layer race under a walk-wide cancel subscription, then

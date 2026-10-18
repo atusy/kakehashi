@@ -39,8 +39,8 @@ impl Kakehashi {
         let requery = std::sync::atomic::AtomicBool::new(false);
         let virt = self.completion_virt_layer(&lsp_uri, position, &requery);
         let host = self.completion_host_layer(&lsp_uri, raw_params);
-        let response = self
-            .walk_layer_futures(
+        let (response, layers) = self
+            .walk_layer_futures_in_order(
                 &lsp_uri,
                 METHOD,
                 METHOD,
@@ -49,24 +49,18 @@ impl Kakehashi {
                 std::future::ready(Ok(None)),
                 completion_response_has_result,
             )
-            .await?;
-        // A layer ranked above virt can win before virt finished, which
-        // would make the ask depend on timing (and a re-query would be won
-        // by that layer again): with virt not first, an answer that came is
-        // left as it is.
+            .await;
         let asked = requery.load(std::sync::atomic::Ordering::Relaxed);
-        let requery =
-            asked && keeps_requery_ask(response.is_some(), || self.completion_layers(&lsp_uri));
-        Ok(asking_to_requery(response, requery))
-    }
-
-    /// `textDocument/completion`'s layer order for `lsp_uri`'s host language.
-    fn completion_layers(&self, lsp_uri: &Uri) -> Vec<crate::config::settings::LayerSource> {
-        crate::lsp::lsp_impl::uri_to_url(lsp_uri)
-            .ok()
-            .and_then(|uri| self.document_language(&uri))
-            .map(|host_language| self.resolve_layer_config(&host_language, METHOD).priorities)
-            .unwrap_or_default()
+        match response {
+            Ok(response) => {
+                let requery = asked && keeps_requery_ask(response.is_some(), &layers);
+                Ok(asking_to_requery(response, requery))
+            }
+            // A layer failing is no answer of its own, and the ask is all
+            // the virt layer said: an empty incomplete list.
+            Err(error) if asked && !error_is_cancel(&error) => Ok(asking_to_requery(None, true)),
+            Err(error) => Err(error),
+        }
     }
 
     /// Host layer: forward the params verbatim to the host language's own
@@ -199,18 +193,20 @@ impl Kakehashi {
         // Fan-out completion requests to all matching servers
         let pool = self.bridge.pool_arc();
         let position = ctx.position;
-        // Only a prepared document's servers can ask without answering.
-        let asked = ctx
+        // Only a prepared document's servers can ask without answering:
+        // what each answered, read once the fan-in decided.
+        let answers = ctx
             .document
             .prepared
             .is_some()
-            .then(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+            .then(|| std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, bool)>::new())));
         let result = dispatch_preferred(
             &ctx.document,
             pool.clone(),
             |t| {
-                let asked = asked.clone();
+                let answers = answers.clone();
                 async move {
+                    let server_name = answers.as_ref().map(|_| t.server_name.clone());
                     let list = t
                         .pool
                         .send_completion_request(
@@ -226,14 +222,24 @@ impl Kakehashi {
                             t.upstream_id,
                         )
                         .await?;
-                    Ok(match (list, asked) {
-                        (Some(list), Some(asked))
-                            if list.items.is_empty() && list.is_incomplete =>
-                        {
-                            asked.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let Some(answers) = answers else {
+                        return Ok(list);
+                    };
+                    let record = |asked| {
+                        if let Ok(mut answers) = answers.lock() {
+                            answers.push((server_name.unwrap_or_default(), asked));
+                        }
+                    };
+                    Ok(match list {
+                        Some(list) if list.items.is_empty() && list.is_incomplete => {
+                            record(true);
                             None
                         }
-                        (list, _) => list,
+                        Some(list) if completion_list_has_result(&list) => {
+                            record(false);
+                            Some(list)
+                        }
+                        list => list,
                     })
                 }
             },
@@ -247,10 +253,18 @@ impl Kakehashi {
                 Ok(v.map(CompletionResponse::List))
             })
             .await?;
-        // With no winner every server finished (or the request was
-        // cancelled), so the ask is read once all are in.
-        if response.is_none()
-            && asked.is_some_and(|asked| asked.load(std::sync::atomic::Ordering::Relaxed))
+        if let Some(answers) = answers
+            && let Ok(answers) = answers.lock()
+            && asked_above_the_winner(
+                &answers,
+                &crate::lsp::aggregation::server::truncate_entries(
+                    crate::lsp::aggregation::server::expand_priorities(
+                        &ctx.document.priorities,
+                        &ctx.document.configs,
+                    ),
+                    ctx.document.max_fan_out,
+                ),
+            )
         {
             requery.store(true, std::sync::atomic::Ordering::Relaxed);
         }
@@ -286,15 +300,56 @@ impl HostCompletion {
 }
 
 /// Whether the virt layer's ask to re-query stands for the answer the layer
-/// race gave: with nothing answered, or with virt first in `layers` (any
-/// answer then came once virt had finished); not when a layer ranked above
-/// virt answered, which could win before virt finished, so the ask would
-/// depend on timing (and a re-query be won by that layer again).
-fn keeps_requery_ask(
-    answered: bool,
-    layers: impl FnOnce() -> Vec<crate::config::settings::LayerSource>,
+/// race gave in the order `layers`: with nothing answered, or with virt
+/// ranked before the host layer, the only other one answering completion
+/// (native contributes none): its answer then came once virt had finished
+/// without items, and a re-query may bring virt's. Not when host ranks
+/// before virt: it could win before virt finished, so the ask would depend
+/// on timing, and a re-query would be won by host again.
+fn keeps_requery_ask(answered: bool, layers: &[crate::config::settings::LayerSource]) -> bool {
+    use crate::config::settings::LayerSource::{Host, Virt};
+    let rank = |layer| layers.iter().position(|candidate| *candidate == layer);
+    !answered || matches!((rank(Virt), rank(Host)), (Some(virt), Some(host)) if virt < host)
+}
+
+/// Whether `error` is the client's cancellation, which no answer replaces.
+fn error_is_cancel(error: &tower_lsp_server::jsonrpc::Error) -> bool {
+    error.code == tower_lsp_server::jsonrpc::Error::request_cancelled().code
+}
+
+/// Whether a server of a prepared document asked to re-query, ranked
+/// strictly above the server whose items won (any, with no winner): one
+/// ranked above was waited for before the winner was taken, so its ask is in
+/// whatever the timing, and a re-query may bring its items. One ranked below,
+/// or in the winner's `"*"` group (first-win, unranked), is not counted: it
+/// may not have answered yet, and the winner wins again on re-query.
+/// `answers`: each answering server's name, and whether it asked (or
+/// answered with items).
+/// `entries`: the fan-in's priority walk.
+fn asked_above_the_winner(
+    answers: &[(String, bool)],
+    entries: &[crate::lsp::aggregation::server::priority::PriorityEntry],
 ) -> bool {
-    !answered || layers().first() == Some(&crate::config::settings::LayerSource::Virt)
+    use crate::lsp::aggregation::server::priority::PriorityEntry;
+    if !answers.iter().any(|(_, asked)| *asked) {
+        return false;
+    }
+    let rank = |server: &str| {
+        entries.iter().position(|entry| match entry {
+            PriorityEntry::Server(name) => name == server,
+            PriorityEntry::Rest(names) => names.iter().any(|name| name == server),
+        })
+    };
+    let winner = answers
+        .iter()
+        .filter(|(_, asked)| !*asked)
+        .filter_map(|(server, _)| rank(server))
+        .min();
+    answers
+        .iter()
+        .filter(|(_, asked)| *asked)
+        .filter_map(|(server, _)| rank(server))
+        .any(|asker| winner.is_none_or(|winner| asker < winner))
 }
 
 /// `response`, still asking the client to re-query when a prepared
@@ -337,12 +392,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_requery_ask_stands_unless_a_layer_above_virt_answered() {
+    fn a_server_ranked_above_the_winner_asks_for_the_answer() {
+        use crate::lsp::aggregation::server::priority::PriorityEntry::{Rest, Server};
+        let entries = [
+            Server("a".to_string()),
+            Server("b".to_string()),
+            Rest(vec!["c".to_string(), "d".to_string()]),
+        ];
+        let answers = |answers: &[(&str, bool)]| -> Vec<(String, bool)> {
+            answers
+                .iter()
+                .map(|(server, asked)| (server.to_string(), *asked))
+                .collect()
+        };
+        // Above the winner: asks.
+        assert!(asked_above_the_winner(
+            &answers(&[("a", true), ("b", false)]),
+            &entries
+        ));
+        // Nothing won: any ask.
+        assert!(asked_above_the_winner(&answers(&[("d", true)]), &entries));
+        // Below the winner, or in its `*` group: no ask.
+        assert!(!asked_above_the_winner(
+            &answers(&[("a", false), ("b", true)]),
+            &entries
+        ));
+        assert!(!asked_above_the_winner(
+            &answers(&[("c", false), ("d", true)]),
+            &entries
+        ));
+        assert!(!asked_above_the_winner(&answers(&[("a", false)]), &entries));
+    }
+
+    #[test]
+    fn a_requery_ask_stands_unless_the_host_layer_ranks_above_virt() {
         use crate::config::settings::LayerSource::{Host, Native, Virt};
-        assert!(keeps_requery_ask(false, || vec![Host, Virt]));
-        assert!(keeps_requery_ask(true, || vec![Virt, Host, Native]));
-        assert!(!keeps_requery_ask(true, || vec![Host, Virt, Native]));
-        assert!(!keeps_requery_ask(true, Vec::new));
+        assert!(keeps_requery_ask(false, &[Host, Virt]));
+        assert!(keeps_requery_ask(true, &[Virt, Host, Native]));
+        assert!(keeps_requery_ask(true, &[Native, Virt, Host]));
+        assert!(!keeps_requery_ask(true, &[Host, Virt, Native]));
+        assert!(!keeps_requery_ask(true, &[]));
     }
 
     #[test]
