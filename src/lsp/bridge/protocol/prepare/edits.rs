@@ -167,10 +167,17 @@ impl PreparedMap {
         // in V, where each held: those are the runs looked at. A CR and an LF
         // already meeting across such an edge in V cannot be one a change
         // meets: its edge would fall between them, refused above.
+        // The document's deleted closing lines are among the runs empty in
+        // P at its end: searched from there, not through the whole map.
         let first_closing_line = self
             .runs
             .iter()
-            .position(|run| run.kind == RunKind::TrailingLines);
+            .enumerate()
+            .rev()
+            .take_while(|(_, run)| run.prepared.is_empty())
+            .filter(|(_, run)| run.kind == RunKind::TrailingLines)
+            .last()
+            .map(|(index, _)| index);
         let prepared = &self.prepared_lines.text;
         let host_owned = |run: &Run| {
             matches!(
