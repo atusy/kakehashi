@@ -1008,11 +1008,22 @@ impl DocumentTracker {
     /// documents arrive — an applyEdit's, a showDocument's — whose records
     /// are read later: the watermark of texts held so far. While no
     /// connection was ever sent a prepared text, without reading it.
-    pub(in crate::lsp::bridge) fn observe_through(&self) -> super::Observed {
+    pub(in crate::lsp::bridge) fn observe_through(
+        &self,
+        connection_key: &ConnectionKey,
+    ) -> super::Observed {
         if !self.held_texts_matter(super::RegionPrepare::default()) {
             return super::Observed::AsIsThen;
         }
-        super::Observed::Through(self.held_through())
+        super::Observed::Through {
+            generation: self.held_through(),
+            prepared: self
+                .prepared_history
+                .lock()
+                .recover_poison("DocumentTracker::prepared_history")
+                .get(connection_key)
+                .is_some_and(|uris| !uris.is_empty()),
+        }
     }
 
     /// Record the text of `fingerprint`, sent with `map`, in `fingerprints`,
@@ -2280,7 +2291,7 @@ mod tests {
             },
             1,
         );
-        let read = tracker.observe_through();
+        let read = tracker.observe_through(&conn);
         let generation = tracker.held_text(&uri, &conn).unwrap().generation;
         tracker.record_sent_for_test(&virtual_uri, &conn, "a".into(), 1);
         assert!(matches!(
@@ -2296,6 +2307,47 @@ mod tests {
         assert!(matches!(
             tracker.presentation(&uri, &conn, pushed, RegionPrepare::default(), "a"),
             Presentation::AsIs
+        ));
+    }
+
+    /// An inbound edit read from a connection that had held a prepared
+    /// text, placed after the connection retired and its records were
+    /// purged: no record is no proof of a text as is, so it places nowhere.
+    /// One from a connection that never held a prepared text places as
+    /// before.
+    #[tokio::test]
+    async fn an_edit_from_a_retired_preparing_connection_places_nowhere() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let uri = virtual_uri.to_uri_string();
+        let preparing = ConnectionKey::for_server("a");
+        let plain = ConnectionKey::for_server("b");
+        let map = prepared_text("  a");
+        tracker.record_sent_for_test(
+            &virtual_uri,
+            &preparing,
+            SentText {
+                text: "a",
+                map: Some(&map),
+            },
+            1,
+        );
+        tracker.record_sent_for_test(&virtual_uri, &plain, "  a".into(), 1);
+        let from_preparing = tracker.observe_through(&preparing);
+        let from_plain = tracker.observe_through(&plain);
+        tracker.purge_connection(&preparing).await;
+        tracker.purge_connection(&plain).await;
+        let ask = |key: &ConnectionKey, observed| {
+            tracker.presentation(&uri, key, observed, RegionPrepare::default(), "  a")
+        };
+        assert!(matches!(
+            ask(&preparing, from_preparing),
+            Presentation::Unavailable
+        ));
+        assert!(!matches!(
+            ask(&plain, from_plain),
+            Presentation::Unavailable
         ));
     }
 
@@ -2382,7 +2434,13 @@ mod tests {
         tracker.record_sent_for_test(&plain, &conn, "b".into(), 2);
         let ask =
             |observed| tracker.presentation(&uri, &conn, observed, RegionPrepare::default(), "b");
-        let before = (ask(stale), ask(Observed::Through(0)));
+        let before = (
+            ask(stale),
+            ask(Observed::Through {
+                generation: 0,
+                prepared: false,
+            }),
+        );
         assert!(matches!(before, (Presentation::AsIs, Presentation::AsIs)));
 
         // Another document is prepared.
@@ -2400,7 +2458,13 @@ mod tests {
         assert!(tracker.ever_held_prepared());
         let stale = tracker.observe(&uri, &conn, Some(0));
         assert!(matches!(
-            (ask(stale), ask(Observed::Through(0))),
+            (
+                ask(stale),
+                ask(Observed::Through {
+                    generation: 0,
+                    prepared: false
+                })
+            ),
             (Presentation::AsIs, Presentation::AsIs)
         ));
     }
