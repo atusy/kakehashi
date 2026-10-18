@@ -12,7 +12,7 @@ use std::ops::Range;
 use tower_lsp_server::ls_types::{Range as LspRange, TextEdit};
 
 use super::{
-    Bias, LineMap, PreparedMap, RunKind, Side, empty_run, is_line_start, map_offset,
+    Bias, LineMap, PreparedMap, Run, RunKind, Side, empty_run, is_line_start, map_offset,
     map_offset_stopping, splits_crlf,
 };
 
@@ -162,46 +162,68 @@ impl PreparedMap {
             virtual_text[offset..].chars().next()
         };
         // Changes never reach into a gap (see `hunk_touches_gap`) nor into
-        // the deleted edge lines, which P has no position inside.
+        // the deleted edge lines, which P has no position inside. Only a run
+        // a change meets at one of its edges can read differently there than
+        // in V, where each held: those are the runs looked at.
         let first_closing_line = self
             .runs
             .iter()
-            .find(|run| run.kind == RunKind::TrailingLines);
-        let line_starts = self
-            .runs
-            .iter()
-            .filter(|run| {
-                run.kind == RunKind::Gap && is_line_start(virtual_text, run.virtual_.start)
-            })
-            .chain(first_closing_line);
-        for run in line_starts {
-            if begins_line(before(run.virtual_.start)) {
-                return false;
-            }
-        }
+            .position(|run| run.kind == RunKind::TrailingLines);
         let prepared = &self.prepared_lines.text;
-        let host_owned = self.runs.iter().filter(|run| {
+        let host_owned = |run: &Run| {
             matches!(
                 run.kind,
                 RunKind::Gap | RunKind::LeadingLines | RunKind::TrailingLines
             )
-        });
-        for run in host_owned {
-            let text = &virtual_text[run.virtual_.clone()];
-            // A line break at the run's edge is hidden when P does not show
-            // it there: one the peer's text shows too (a gap replaced by text
-            // ending with the same CR) was the server's to join.
-            let shown = &prepared[run.prepared.clone()];
-            let cr_hidden = text.ends_with('\r') && !shown.ends_with('\r');
-            let lf_hidden = text.starts_with('\n') && !shown.starts_with('\n');
-            let fused_after = cr_hidden
-                && after(run.virtual_.end) == Some('\n')
-                && !virtual_text[run.virtual_.end..].starts_with('\n');
-            let fused_before = lf_hidden
-                && before(run.virtual_.start) == Some('\r')
-                && !virtual_text[..run.virtual_.start].ends_with('\r');
-            if fused_after || fused_before {
-                return false;
+        };
+        for (range, _) in &sorted {
+            // Runs starting where the change ends.
+            let first = self
+                .runs
+                .partition_point(|run| run.virtual_.start < range.end);
+            for (index, run) in self.runs[first..]
+                .iter()
+                .enumerate()
+                .take_while(|(_, run)| run.virtual_.start == range.end)
+            {
+                let starts_line = (run.kind == RunKind::Gap
+                    && is_line_start(virtual_text, run.virtual_.start))
+                    || first_closing_line == Some(first + index);
+                let before = before(run.virtual_.start);
+                if starts_line && begins_line(before) {
+                    return false;
+                }
+                // A line break at the run's edge is hidden when P does not
+                // show it there: one the peer's text shows too (a gap
+                // replaced by text opening with the same LF) was the
+                // server's to join.
+                let shown = &prepared[run.prepared.clone()];
+                if host_owned(run)
+                    && virtual_text[run.virtual_.clone()].starts_with('\n')
+                    && !shown.starts_with('\n')
+                    && before == Some('\r')
+                    && !virtual_text[..run.virtual_.start].ends_with('\r')
+                {
+                    return false;
+                }
+            }
+            // Runs ending where the change starts.
+            let first = self
+                .runs
+                .partition_point(|run| run.virtual_.end < range.start);
+            for run in self.runs[first..]
+                .iter()
+                .take_while(|run| run.virtual_.end == range.start)
+            {
+                let shown = &prepared[run.prepared.clone()];
+                if host_owned(run)
+                    && virtual_text[run.virtual_.clone()].ends_with('\r')
+                    && !shown.ends_with('\r')
+                    && after(run.virtual_.end) == Some('\n')
+                    && !virtual_text[run.virtual_.end..].starts_with('\n')
+                {
+                    return false;
+                }
             }
         }
         true
