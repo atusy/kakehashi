@@ -502,9 +502,14 @@ impl LanguageServerPool {
         // envelope, so resolve those actions downstream now (bounded: only the
         // lazy ones). Failures fall through to the phase-3 REASON_RESOLVE path.
         if !upstream_caps.can_envelope() {
-            let virtual_uri = crate::lsp::lsp_impl::url_to_uri(host_uri).ok().map(|host| {
-                VirtualDocumentUri::new(&host, injection_language, region_id).to_uri_string()
-            });
+            // Only noted with the prepare layer (see `note_held`).
+            let virtual_uri = self
+                .prepares()
+                .then(|| crate::lsp::lsp_impl::url_to_uri(host_uri).ok())
+                .flatten()
+                .map(|host| {
+                    VirtualDocumentUri::new(&host, injection_language, region_id).to_uri_string()
+                });
             self.eager_resolve_lazy_actions(
                 &handle,
                 &mut actions,
@@ -915,10 +920,14 @@ impl LanguageServerPool {
             std::mem::replace(&mut outgoing.title, envelope.original_title.clone());
         translate_action_ranges_host_to_virtual(&mut outgoing, &offset);
 
-        let virtual_uri = host_uri_lsp.as_ref().map(|host| {
-            VirtualDocumentUri::new(host, &envelope.injection_language, &envelope.region_id)
-                .to_uri_string()
-        });
+        // Only noted with the prepare layer (see `note_held`).
+        let virtual_uri = host_uri_lsp
+            .as_ref()
+            .filter(|_| self.prepares())
+            .map(|host| {
+                VirtualDocumentUri::new(host, &envelope.injection_language, &envelope.region_id)
+                    .to_uri_string()
+            });
         let Some(resolved) = self
             .send_code_action_resolve_on_handle(
                 &handle,
