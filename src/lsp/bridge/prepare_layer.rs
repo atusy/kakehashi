@@ -41,6 +41,10 @@ pub(crate) struct PrepareLayer {
     /// Saves held virtual documents missed: forwarded to each once its
     /// prepared text is sent, while the host is still at the saved version.
     held_saves: DashMap<Url, HeldSave>,
+    /// Run once a target's candidates are read, before its epoch is read
+    /// again (see `prepare_target`): where an epoch move can land.
+    #[cfg(test)]
+    target_read: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// A save that reached a host while some of its virtual documents were held
@@ -67,6 +71,8 @@ impl PrepareLayer {
             warned_strategy: DashSet::new(),
             pull_debts: DashSet::new(),
             held_saves: DashMap::new(),
+            #[cfg(test)]
+            target_read: std::sync::Mutex::new(None),
         }
     }
 }
@@ -112,9 +118,38 @@ impl super::BridgeCoordinator {
         injection_language: &str,
     ) -> Option<super::PrepareTarget> {
         let layer = self.prepare.as_ref()?;
-        // Before the settings: a settings change stores them, then moves the
-        // epoch, so a target never pairs older candidates with a newer epoch.
-        let epoch = self.pool.prepare_epoch();
+        loop {
+            // Before the settings: a settings change stores them, then moves
+            // the epoch, so a target never pairs older candidates with a
+            // newer epoch.
+            let epoch = self.pool.prepare_epoch();
+            let target = self.prepare_target_under(layer, epoch, host_language, injection_language);
+            #[cfg(test)]
+            if let Some(hook) = layer
+                .target_read
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                hook();
+            }
+            // Nor newer candidates with an older epoch, which no lookup
+            // admits: the epoch moved while they were read (settings
+            // changed, an advertisement), so read them again.
+            if self.pool.prepare_epoch() == epoch {
+                return target;
+            }
+        }
+    }
+
+    /// [`Self::prepare_target`] under `epoch`, read before the targets.
+    fn prepare_target_under(
+        &self,
+        layer: &PrepareLayer,
+        epoch: u64,
+        host_language: &str,
+        injection_language: &str,
+    ) -> Option<super::PrepareTarget> {
         let targets = layer.targets.load();
         // The first resolution wins for every caller: answers are keyed by
         // the candidates' launch configs by identity, which two resolutions
@@ -613,6 +648,41 @@ mod tests {
             Some(answer),
         )
         .unwrap()
+    }
+
+    /// A target never pairs candidates with an epoch older than theirs:
+    /// one read across an epoch move (a settings change, an advertisement)
+    /// is read again, so the lookup it reaches admits it.
+    #[test]
+    fn a_target_read_across_an_epoch_move_is_read_again() {
+        let pool = Arc::new(LanguageServerPool::preparing());
+        let coordinator = BridgeCoordinator::with_cancel_forwarder(
+            Arc::clone(&pool),
+            CancelForwarder::new(Arc::clone(&pool)),
+        );
+        coordinator.prepare_settings_changed(&Arc::new(crate::config::WorkspaceSettings {
+            auto_install: false,
+            language_servers: [(
+                "peer".to_string(),
+                crate::lsp::bridge::test_helpers::devnull_config_for_language("rust"),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        }));
+        pool.record_prepare_advertisement(&ConnectionKey::for_server("peer"), true);
+        {
+            let pool = Arc::clone(&pool);
+            *coordinator
+                .prepare
+                .as_ref()
+                .unwrap()
+                .target_read
+                .lock()
+                .unwrap() = Some(Box::new(move || pool.advance_prepare_epoch()));
+        }
+        let target = coordinator.prepare_target("rust", "rust").unwrap();
+        assert_eq!(target.epoch, pool.prepare_epoch());
     }
 
     #[test]
