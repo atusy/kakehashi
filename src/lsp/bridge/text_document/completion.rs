@@ -193,7 +193,7 @@ fn transform_completion_response_to_host(
     if dropped > 0 {
         log::warn!(
             target: "kakehashi::bridge",
-            "completion: dropped {dropped} item(s) whose primary insertion/edit is unsafe for the injection region (escapes it, breaks line prefixes, splits the host line, or merges content into the closing fence)"
+            "completion: dropped {dropped} item(s) whose primary insertion/edit is unsafe for the injection region (escapes it, breaks line prefixes, splits the host line, or merges content into the closing fence) or does not map back through its prepared document"
         );
     }
 
@@ -203,13 +203,21 @@ fn transform_completion_response_to_host(
 /// Transform textEdit range in a single completion item to host coordinates.
 ///
 /// Handles both TextEdit format and InsertReplaceEdit format. Also transforms
-/// additionalTextEdits if present.
+/// additionalTextEdits if present. On a prepared document the edits go
+/// through its map (`translate_virtual_main_and_additional_edits_to_host`),
+/// their text re-indented, and the item may be given `insertTextMode: asIs`
+/// (see `ClientInsertMode`).
 ///
 /// Returns `false` when the item's primary insertion — its text edit, or the
 /// insertText/label fallback applied at the request position — is unsafe for the
 /// injection region — escapes it, corrupts per-line `> ` prefixes, or merges
 /// content into the closing fence — if applied verbatim; the caller must
 /// drop the whole item (same fail-closed rule as WorkspaceEdit bridging).
+/// On a prepared document also when its edit does not map back (or its
+/// insert and replace ranges map its text apart), a mapped range no longer
+/// contains the caret, its snippet is no literal text, its text without an
+/// edit breaks a line, or its multi-line edit would reach a client that
+/// always adjusts indentation.
 /// An unsafe `additionalTextEdits` member drops the whole array instead:
 /// the primary insertion still applies, though possibly semantically
 /// incomplete (e.g. without its auto-import) — availability over fidelity.
