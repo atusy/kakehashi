@@ -114,8 +114,11 @@ fn build_color_presentation_request(
 }
 
 /// Transform a color presentation response from virtual to host coordinates,
-/// translating the ranges of each item's `textEdit` and `additionalTextEdits`
-/// while leaving the label unchanged.
+/// translating each item's `textEdit` and `additionalTextEdits` while leaving
+/// the label unchanged. On a prepared document they go through its map (their
+/// text re-indented), a label without a `textEdit` becomes an explicit edit
+/// over the request range, and a request range the map cannot carry (into a
+/// gap, or right after one it emptied) gets no presentation.
 fn transform_color_presentation_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,
