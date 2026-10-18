@@ -84,6 +84,7 @@ fn method_maps_prepared_edits(method: &str) -> bool {
             | "textDocument/completion"
             | "textDocument/formatting"
             | "textDocument/inlayHint"
+            | "textDocument/onTypeFormatting"
             | "textDocument/rangeFormatting"
     )
 }
@@ -2876,7 +2877,6 @@ mod tests {
             "textDocument/codeAction",
             "textDocument/prepareRename",
             "textDocument/linkedEditingRange",
-            "textDocument/onTypeFormatting",
         ] {
             assert!(!method_closed_to(&resolved, method, false), "{method}");
             assert!(method_closed_to(&resolved, method, true), "{method}");
@@ -2887,6 +2887,7 @@ mod tests {
             "textDocument/completion",
             "textDocument/formatting",
             "textDocument/rangeFormatting",
+            "textDocument/onTypeFormatting",
         ] {
             assert!(!method_closed_to(&resolved, method, true), "{method}");
         }
@@ -2922,6 +2923,7 @@ mod tests {
             "textDocument/colorPresentation",
             "textDocument/formatting",
             "textDocument/rangeFormatting",
+            "textDocument/onTypeFormatting",
         ] {
             assert!(method_maps_prepared_edits(method), "{method}");
             for prepared in [false, true] {

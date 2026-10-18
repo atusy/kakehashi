@@ -458,6 +458,36 @@ fn formatting_on_a_prepared_document_maps_back_reindented() {
 }
 
 #[test]
+fn on_type_formatting_on_a_prepared_document_maps_back_reindented() {
+    let (mut client, _dir) = Setup::default().start();
+    let uri = "file:///prepare/on-type.md";
+    let text = "# t\n\n```lua\n  local x = 1; local y = 2\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+
+    // `;` typed after `1`: the echo mock answers for the whole prepared
+    // text, its line broken; the new line regains the removed indent.
+    let response = client.send_request(
+        "textDocument/onTypeFormatting",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 3, "character": 14 },
+            "ch": ";",
+            "options": { "tabSize": 2, "insertSpaces": true }
+        }),
+    );
+    let edits = response["result"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| panic!("{response}"));
+    assert_eq!(
+        apply_edits(text, &edits),
+        "# t\n\n```lua\n  LOCAL X = 1\n  LOCAL Y = 2\n```\n",
+        "{response}"
+    );
+}
+
+#[test]
 fn formatting_before_the_document_was_looked_up_waits_for_its_prepared_text() {
     let (mut client, _dir) = Setup::default().start();
     let uri = "file:///prepare/format-early.md";

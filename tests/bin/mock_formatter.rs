@@ -22,8 +22,8 @@
 //!   `documentRangeFormattingProvider`, `renameProvider`,
 //!   `diagnosticProvider`, and full sync with save; hover
 //!   answers the full text this server holds for the document, ranged over
-//!   the hovered line in its own coordinates; formatting and range
-//!   formatting uppercase, each `; ` breaking the line; rename replaces the first line; a pull diagnostic
+//!   the hovered line in its own coordinates; formatting, range and on-type
+//!   (`;`) formatting uppercase, each `; ` breaking the line; rename replaces the first line; a pull diagnostic
 //!   spans the first line and carries the full text; completion inserts
 //!   `int(x)\nprint(y)` at the caret and the line `-- c` above the
 //!   document's first (and offers `echo-plain` with no edit), inlay hints
@@ -366,6 +366,7 @@ fn main() {
                         "colorProvider": true,
                         "documentFormattingProvider": true,
                         "documentRangeFormattingProvider": true,
+                        "documentOnTypeFormattingProvider": { "firstTriggerCharacter": ";" },
                         "renameProvider": true,
                         "textDocumentSync": { "openClose": true, "change": 1, "save": true },
                         "diagnosticProvider": {

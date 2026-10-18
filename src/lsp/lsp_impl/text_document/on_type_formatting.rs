@@ -13,7 +13,7 @@ use tower_lsp_server::ls_types::{
 
 use super::super::Kakehashi;
 use crate::lsp::aggregation::server::dispatch_preferred;
-use crate::lsp::lsp_impl::bridge_context::parse_host_verbatim;
+use crate::lsp::lsp_impl::bridge_context::{Sourced, parse_host_verbatim};
 
 const METHOD: &str = "textDocument/onTypeFormatting";
 
@@ -28,16 +28,27 @@ impl Kakehashi {
 
         let virt =
             self.on_type_formatting_virt_layer(&lsp_uri, position, &params.ch, params.options);
-        self.walk_layers(
-            &lsp_uri,
-            METHOD,
-            METHOD,
-            raw_params,
-            virt,
-            parse_host_verbatim::<Vec<TextEdit>>,
-            |edits: &Vec<TextEdit>| !edits.is_empty(),
-        )
-        .await
+        let answer = self
+            .walk_layers(
+                &lsp_uri,
+                METHOD,
+                METHOD,
+                raw_params,
+                virt,
+                |value| parse_host_verbatim::<Vec<TextEdit>>(value).map(Sourced::unprepared),
+                |edits: &Sourced<Vec<TextEdit>>| !edits.value.is_empty(),
+            )
+            .await?;
+        // The final answer chosen: its edits checked once more against the
+        // host text, which may have moved while it was held. A stale one is
+        // no answer.
+        let pool = self.bridge.pool();
+        let tracker = self.bridge.node_tracker();
+        Ok(answer.and_then(|sourced| {
+            sourced
+                .still_current(pool, tracker, || self.host_content_version(&lsp_uri))
+                .then_some(sourced.value)
+        }))
     }
 
     /// Virt layer: bridge the injection region under the typed character.
@@ -47,7 +58,9 @@ impl Kakehashi {
         position: Position,
         ch: &str,
         options: FormattingOptions,
-    ) -> Result<Option<Vec<TextEdit>>> {
+    ) -> Result<Option<Sourced<Vec<TextEdit>>>> {
+        // Before the text is read: see `Sourced::from_region`.
+        let revision = self.prepared_request_revision(lsp_uri);
         let Some(ctx) = self
             .resolve_bridge_contexts(lsp_uri, position, METHOD)
             .await
@@ -92,8 +105,11 @@ impl Kakehashi {
             cancel_rx,
         )
         .await;
-        result
+        let edits = result
             .handle(&self.notifier(), "onTypeFormatting", None, Ok)
-            .await
+            .await?;
+        Ok(edits.map(|edits| {
+            Sourced::from_region(&ctx.document, edits, self.bridge.node_tracker(), revision)
+        }))
     }
 }
