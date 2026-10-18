@@ -165,7 +165,8 @@ fn transform_color_presentation_response_to_host(
         // On a prepared document the label must also map through it like
         // any edit (a removed indent, a hidden line break beside it): the
         // implicit edit is made explicit, in prepared coordinates.
-        if presentation.text_edit.is_none() {
+        let implicit = presentation.text_edit.is_none();
+        if implicit {
             if offset.prepared().is_some() {
                 let mut range = host_request_range;
                 translate_host_range_to_virtual(&mut range, offset);
@@ -196,7 +197,11 @@ fn transform_color_presentation_response_to_host(
                 std::slice::from_mut(text_edit),
                 offset,
                 EditMode::Extent,
-            ) || !text_edit_safe_in_region(text_edit, offset, region_end))
+            ) || !text_edit_safe_in_region(text_edit, offset, region_end)
+                // The label replaces the request range: mapped elsewhere (an
+                // empty range at an emptied gap's end maps before the gap's
+                // host text), it would not land where the client asked.
+                || implicit && text_edit.range != host_request_range)
         {
             return false;
         }
@@ -822,6 +827,51 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn a_label_mapped_away_from_its_request_range_is_dropped() {
+        use super::super::super::protocol::{SegmentKind, VirtualLayout, apply_prepare_result};
+        // `color: #${c};` with the interpolation emptied: a request range
+        // empty right after it reaches the server where its start does.
+        let virtual_text = "color: #    ;";
+        let layout = VirtualLayout::from_pieces(
+            virtual_text,
+            [
+                (SegmentKind::Content, 0..8, String::new()),
+                (SegmentKind::Gap, 8..12, "${c}".to_string()),
+                (SegmentKind::Content, 12..13, String::new()),
+            ],
+        );
+        let result = serde_json::from_value(json!({"segments": [
+            {"type": "content"}, {"type": "gap", "content": ""}, {"type": "content"}
+        ]}))
+        .unwrap();
+        let map = apply_prepare_result(virtual_text, &layout, Some(result))
+            .unwrap()
+            .map;
+        let offset = RegionOffset::new(0, 0).with_prepared(map);
+        let response = json!({"jsonrpc": "2.0", "id": 1, "result": [{"label": "#00ff00"}]});
+        let at_gap_end = Range::new(Position::new(0, 12), Position::new(0, 12));
+        let kept = transform_color_presentation_response_to_host(
+            response.clone(),
+            &offset,
+            Position::new(0, 13),
+            at_gap_end,
+        );
+        assert!(kept.is_empty(), "{kept:?}");
+        // Over the text after the gap, it maps where it was asked.
+        let after_gap = Range::new(Position::new(0, 12), Position::new(0, 13));
+        let kept = transform_color_presentation_response_to_host(
+            response,
+            &offset,
+            Position::new(0, 13),
+            after_gap,
+        );
+        assert_eq!(
+            kept[0].text_edit.as_ref().map(|edit| edit.range),
+            Some(after_gap)
+        );
     }
 
     /// `  a\n  b\n`, dedented by two.
