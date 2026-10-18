@@ -3299,6 +3299,13 @@ impl LanguageServerPool {
             })
     }
 
+    /// Whether the lifecycle pass holds `region_id` (under `language`) of
+    /// `host_uri`: a newer input for it is being prepared, or its peer
+    /// failed it — either way the host moved past what was last sent for it.
+    pub(crate) fn region_held(&self, host_uri: &Url, language: &str, region_id: &str) -> bool {
+        self.region_admission(host_uri, language, region_id).held
+    }
+
     /// Whether a text from `answer`'s map (`None`: a text as is) is refused
     /// for `region_id` (under `language`) of `host_uri`: a map its peer
     /// revoked since (see `PreparedMap::revoked`), or a text as is while the
