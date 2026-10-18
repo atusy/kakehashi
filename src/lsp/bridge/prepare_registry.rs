@@ -283,6 +283,8 @@ pub(crate) struct PrepareRegistry {
     /// Keyed by a hash of (host URI, injection language, region id), so a
     /// lookup allocates nothing; the entry holds the identity it checks.
     regions: Arc<Regions>,
+    /// What revokes the maps it gave out (see [`Revocations`]).
+    revocations: Arc<Revocations>,
     /// Some region was ever looked up: until then every query answers "no
     /// region" without touching the map.
     used: AtomicBool,
@@ -326,6 +328,7 @@ impl Default for PrepareRegistry {
         let (resync_tx, resync_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             regions: Arc::default(),
+            revocations: Arc::default(),
             used: AtomicBool::new(false),
             held_changes: Arc::default(),
             prepared_scan: std::sync::Mutex::new(None),
@@ -339,80 +342,133 @@ impl Default for PrepareRegistry {
     }
 }
 
+/// The [`Revocation`](super::protocol::Revocation) of each input of each
+/// region a live map was answered for: held weakly, so a record lives
+/// exactly as long as a map that a failure of its input could revoke.
+#[derive(Default)]
+struct Revocations {
+    records: DashMap<(u64, u64), std::sync::Weak<super::protocol::Revocation>>,
+    /// Records seen live at the last sweep of dead ones: the next sweeps
+    /// once the table has doubled since.
+    swept: AtomicU64,
+}
+
+impl Revocations {
+    /// The record answers for `input` of `region` share, created if no
+    /// live map holds one.
+    fn record(&self, region: u64, input: u64) -> Arc<super::protocol::Revocation> {
+        let record = {
+            let mut entry = self.records.entry((region, input)).or_default();
+            match entry.upgrade() {
+                Some(record) => record,
+                None => {
+                    let record = Arc::default();
+                    *entry = Arc::downgrade(&record);
+                    record
+                }
+            }
+        };
+        let len = self.records.len() as u64;
+        if len > 2 * self.swept.load(Ordering::Relaxed).max(16) {
+            self.records.retain(|_, record| record.strong_count() > 0);
+            self.swept
+                .store(self.records.len() as u64, Ordering::Relaxed);
+        }
+        record
+    }
+
+    /// Record a failure of `input` of `region` taken at `taken`: every live
+    /// map answered for it before then is revoked.
+    fn revoke(&self, region: u64, input: u64, taken: u64) {
+        if let Some(record) = self
+            .records
+            .get(&(region, input))
+            .and_then(|record| record.upgrade())
+        {
+            record.revoke(taken);
+        }
+    }
+}
+
 /// The failures the lifecycle pass holds regions on, read from the
 /// registry's own table: what a request or a lazy open asks before it reads
 /// coordinates through a region, at the moment an answer is recorded, with
 /// no copy to wait for.
 #[derive(Clone, Default)]
-pub(crate) struct PrepareFailures(Arc<Regions>);
+pub(crate) struct PrepareFailures {
+    regions: Arc<Regions>,
+    /// The registry's, marked by the test helpers as the registry marks it.
+    #[cfg(test)]
+    revocations: Arc<Revocations>,
+}
 
 impl PrepareFailures {
-    /// Whether a text from `answer` (`None`: a text as is) is refused by a
-    /// failure recorded for `region_id` (under `injection_language`) of
-    /// `host_uri`:
-    /// - an answer any failure kept for the region revokes (for the same
-    ///   input, taken before it; see `AnswerOrigin::revoked_by`) is one the
-    ///   peer no longer gives, whatever epoch the failure was taken under,
-    ///   and wherever the lifecycle pass holds the region now (an edit
-    ///   moving it on while a request ran, a request's own lookup failing);
-    /// - a text as is is refused while the failure the pass holds the
-    ///   region on stands at `epoch` (the region is not bridged).
-    pub(crate) fn revokes(
+    /// Whether a text as is is refused for `region_id` (under
+    /// `injection_language`) of `host_uri`: the failure the lifecycle pass
+    /// holds the region on stands at `epoch`, so the region is not bridged.
+    /// (Whether a prepared text is refused is the map's own to say: see
+    /// `PreparedMap::revoked`.)
+    pub(crate) fn region_failed(
         &self,
         host_uri: &Url,
         injection_language: &str,
         region_id: &str,
         epoch: u64,
-        answer: Option<super::protocol::AnswerOrigin>,
     ) -> bool {
         let host_uri = host_uri.as_str();
-        let failed = |cell: &Cell| matches!(cell.outcome.get(), Some(Answer::Unusable));
-        self.0
+        self.regions
             .get(&region_hash(host_uri, injection_language, region_id))
             .filter(|region| region.is(host_uri, injection_language, region_id))
-            .is_some_and(|region| match answer {
-                // A region keeps at most a few slots.
-                Some(answer) => region.slots.iter().any(|slot| {
-                    failed(&slot.cell)
-                        && answer.revoked_by(super::protocol::AnswerOrigin {
-                            taken: slot.cell.taken,
-                            input: slot.cell.input,
-                        })
-                }),
-                None => region
-                    .held_cell()
-                    .is_some_and(|cell| failed(cell) && cell.epoch == epoch),
+            .and_then(|region| {
+                region.held_cell().map(|cell| {
+                    matches!(cell.outcome.get(), Some(Answer::Unusable)) && cell.epoch == epoch
+                })
             })
+            .unwrap_or(false)
     }
 
-    /// Keep a failure of `failure`'s input, taken as `failure` says, among
-    /// `region_id`'s answers, without the lifecycle pass holding the region
-    /// on it (one it moved off, or a request's own lookup).
+    /// An answer for `input`, taken at `taken` in the presentation order, as
+    /// the registry gives it out (its input named, sharing its input's
+    /// record).
     #[cfg(test)]
-    pub(crate) fn keep_failure_for_test(
+    pub(crate) fn answered_for_test(
+        &self,
+        input: PrepareInput<'_>,
+        taken: u64,
+    ) -> super::protocol::PreparedDocument {
+        let mut prepared = super::protocol::apply_prepare_result_at(
+            input.virtual_text,
+            &super::protocol::VirtualLayout::single(input.virtual_text),
+            None,
+            taken,
+        )
+        .expect("a null answer");
+        let map = Arc::get_mut(&mut prepared.map).expect("fresh");
+        map.set_input(input_identity(input));
+        self.share_for_test(
+            input.host_uri,
+            input.injection_language,
+            input.region_id,
+            map,
+        );
+        prepared
+    }
+
+    /// Share the record of `map`'s input of `region_id` (under
+    /// `injection_language`) of `host_uri`, as an answer the registry gave.
+    #[cfg(test)]
+    pub(crate) fn share_for_test(
         &self,
         host_uri: &Url,
         injection_language: &str,
         region_id: &str,
-        epoch: u64,
-        failure: super::protocol::AnswerOrigin,
+        map: &mut super::protocol::PreparedMap,
     ) {
-        let mut cell = Cell::new(epoch, failure.input);
-        cell.taken = failure.taken;
-        let _ = cell.outcome.set(Answer::Unusable);
-        let mut region = self
-            .0
-            .get_mut(&region_hash(
-                host_uri.as_str(),
-                injection_language,
-                region_id,
-            ))
-            .expect("a region held");
-        let key = region.slots.iter().map(|slot| slot.key).max().unwrap_or(0) + 1;
-        region.slots.push(Slot {
-            key,
-            cell: Arc::new(cell),
-        });
+        let input = map.origin().input;
+        map.set_revocation(self.revocations.record(
+            region_hash(host_uri.as_str(), injection_language, region_id),
+            input,
+        ));
     }
 
     /// Hold `region_id` (under `injection_language`) of `host_uri` on an
@@ -430,9 +486,14 @@ impl PrepareFailures {
         let mut cell = Cell::new(epoch, failure.map_or(0, |failure| failure.input));
         if let Some(failure) = failure {
             cell.taken = failure.taken;
+            self.revocations.revoke(
+                region_hash(host_uri.as_str(), injection_language, region_id),
+                failure.input,
+                failure.taken,
+            );
             let _ = cell.outcome.set(Answer::Unusable);
         }
-        self.0.insert(
+        self.regions.insert(
             region_hash(host_uri.as_str(), injection_language, region_id),
             Region {
                 host_uri: host_uri.to_string(),
@@ -452,7 +513,11 @@ impl PrepareRegistry {
     /// The failures the lifecycle pass holds regions on (see
     /// [`PrepareFailures`]), shared with the table they are read from.
     pub(crate) fn failures(&self) -> PrepareFailures {
-        PrepareFailures(Arc::clone(&self.regions))
+        PrepareFailures {
+            regions: Arc::clone(&self.regions),
+            #[cfg(test)]
+            revocations: Arc::clone(&self.revocations),
+        }
     }
 
     /// Whether no region was ever looked up (see `used`).
@@ -590,35 +655,6 @@ impl PrepareRegistry {
                 })
             })
             .unwrap_or_default()
-    }
-
-    /// The input the lifecycle pass holds `region_id` (under
-    /// `injection_language`) of `host_uri` on, if its answer standing at
-    /// `epoch` is unusable: when it was taken and what it is, so the answers
-    /// that failure revokes (for the same input, taken before) are told from
-    /// the others.
-    #[cfg(test)]
-    pub(crate) fn failed_at(
-        &self,
-        host_uri: &Url,
-        injection_language: &str,
-        region_id: &str,
-        epoch: u64,
-    ) -> Option<super::protocol::AnswerOrigin> {
-        let host_uri = host_uri.as_str();
-        self.regions
-            .get(&region_hash(host_uri, injection_language, region_id))
-            .filter(|region| region.is(host_uri, injection_language, region_id))
-            .and_then(|region| {
-                region.held_cell().and_then(|cell| {
-                    matches!(cell.standing(epoch), Ok(Some(Answer::Unusable))).then_some(
-                        super::protocol::AnswerOrigin {
-                            taken: cell.taken,
-                            input: cell.input,
-                        },
-                    )
-                })
-            })
     }
 
     /// Whether the lifecycle pass prepares any region (holds it on an answer
@@ -782,6 +818,17 @@ impl PrepareRegistry {
         let slot = self
             .slot(target, input, holder, target.epoch)
             .expect("an input under the current epoch");
+        if matches!(answer, Answer::Unusable) {
+            self.revocations.revoke(
+                region_hash(
+                    input.host_uri.as_str(),
+                    input.injection_language,
+                    input.region_id,
+                ),
+                slot.cell.input,
+                slot.cell.taken,
+            );
+        }
         assert!(slot.cell.outcome.set(answer).is_ok(), "answered already");
         self.held_changes.fetch_add(1, Ordering::AcqRel);
         if held {
@@ -918,7 +965,13 @@ impl PrepareRegistry {
         let revisions = Arc::clone(&self.next_revision);
         let pool = Arc::clone(pool);
         let candidates = Arc::clone(&target.candidates);
-        let job = PrepareJob::new(input, cell.taken, cell.input);
+        let job = PrepareJob::new(
+            input,
+            cell.taken,
+            cell.input,
+            self.revocations.record(region, cell.input),
+        );
+        let revocations = Arc::clone(&self.revocations);
         let resync_tx = self.resync_tx.clone();
         let held_changes = Arc::clone(&self.held_changes);
         let closed_hosts = Arc::clone(&self.closed_hosts);
@@ -952,6 +1005,11 @@ impl PrepareRegistry {
             match run(&pool, &candidates, &job, &next_version, &admitted, retrying).await {
                 Ok(answer) => {
                     let ready = !matches!(answer, Answer::Unusable);
+                    // Revoked before the failure is published: a request
+                    // reading it already finds its map revoked.
+                    if !ready {
+                        revocations.revoke(region, job.identity, job.taken);
+                    }
                     let _ = cell.outcome.set(answer);
                     held_changes.fetch_add(1, Ordering::AcqRel);
                     // The answer the lifecycle pass holds the document on
@@ -1061,6 +1119,8 @@ struct PrepareJob {
     taken: u64,
     /// See `Cell::input`.
     identity: u64,
+    /// What revokes the map its answer yields (see [`Revocations`]).
+    revocation: Arc<super::protocol::Revocation>,
     host_uri: Url,
     host_language: String,
     injection_language: String,
@@ -1070,10 +1130,16 @@ struct PrepareJob {
 }
 
 impl PrepareJob {
-    fn new(input: PrepareInput<'_>, taken: u64, identity: u64) -> Self {
+    fn new(
+        input: PrepareInput<'_>,
+        taken: u64,
+        identity: u64,
+        revocation: Arc<super::protocol::Revocation>,
+    ) -> Self {
         Self {
             taken,
             identity,
+            revocation,
             host_uri: input.host_uri.clone(),
             host_language: input.host_language.to_string(),
             injection_language: input.injection_language.to_string(),
@@ -1287,7 +1353,9 @@ async fn try_run(
                 .map(|mut prepared| {
                     // Fresh: its only reference.
                     if let Some(map) = Arc::get_mut(&mut prepared.map) {
+                        #[cfg(test)]
                         map.set_input(job.identity);
+                        map.set_revocation(Arc::clone(&job.revocation));
                     }
                     Some(prepared)
                 })
@@ -1307,6 +1375,53 @@ mod tests {
     use super::*;
     use crate::config::settings::BridgeServerConfig;
     use crate::lsp::bridge::pool::ConnectionKey;
+
+    /// A failure revokes the maps answered for its input before it for as
+    /// long as they live, however the registry's answers are evicted
+    /// meanwhile: what revokes them is the maps' own.
+    #[test]
+    fn a_failure_revokes_its_inputs_maps_past_the_eviction_of_its_answer() {
+        let registry = PrepareRegistry::default();
+        let failures = registry.failures();
+        let host_uri = Url::parse("file:///test/revoked-evicted.md").unwrap();
+        let target = PrepareTarget {
+            candidates: Arc::from([]),
+            epoch: 0,
+        };
+        let input = |virtual_text| PrepareInput {
+            host_uri: &host_uri,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: "region",
+            virtual_text,
+            gaps: &[],
+        };
+        let answered = failures.answered_for_test(input("a"), 0);
+        let other = failures.answered_for_test(input("b"), 0);
+        registry.answer_for_test(&target, input("a"), Answer::Unusable, true);
+        assert!(answered.map.revoked());
+        assert!(!other.map.revoked(), "another input's");
+        // Later inputs held one after another evict the failed answer.
+        for text in ["c", "d", "e", "f", "g"] {
+            registry.answer_for_test(&target, input(text), Answer::AsIs, true);
+        }
+        let identity = input_identity(input("a"));
+        assert!(
+            registry
+                .regions
+                .iter()
+                .all(|region| region.slots.iter().all(|slot| slot.cell.input != identity)),
+            "evicted"
+        );
+        assert!(answered.map.revoked());
+        // An answer taken after the failure is not revoked by it; a later
+        // failure of its input revokes it, though the first is gone.
+        let later =
+            failures.answered_for_test(input("a"), super::super::protocol::next_presentation());
+        assert!(!later.map.revoked());
+        registry.answer_for_test(&target, input("a"), Answer::Unusable, true);
+        assert!(later.map.revoked());
+    }
 
     const REGION: &str = "01J0000000000000000000000A";
 
@@ -1784,8 +1899,8 @@ mod tests {
     }
 
     /// A map from a peer's answer names the answer it came from: its input's
-    /// stamp and identity, the same identity a failure of that input holds
-    /// (see `AnswerOrigin::revoked_by`).
+    /// stamp and identity, and shares what revokes it with every answer for
+    /// that input of its region, which a failure of the input marks.
     #[cfg(unix)]
     #[tokio::test]
     async fn an_answers_map_names_the_input_it_answers() {
@@ -1825,6 +1940,15 @@ mod tests {
             input_identity(input(&host, "a")),
             input_identity(input(&host, "b"))
         );
+        let shared = registry.failures().answered_for_test(input(&host, "a"), 0);
+        assert!(!prepared.map.revoked());
+        registry.revocations.revoke(
+            region_hash(host.as_str(), "lua", REGION),
+            input_identity(input(&host, "a")),
+            u64::MAX,
+        );
+        assert!(prepared.map.revoked());
+        assert!(shared.map.revoked());
     }
 
     #[cfg(unix)]
@@ -1929,6 +2053,8 @@ mod tests {
             Holder::LifecyclePass,
             target.epoch,
         );
+        // An answer for the input taken before (under an earlier epoch, say).
+        let earlier = registry.failures().answered_for_test(input(&host, "a"), 0);
         assert_eq!(
             registry
                 .prepare(&pool, &target, input(&host, "a"))
@@ -1936,6 +2062,7 @@ mod tests {
                 .err(),
             Some(PrepareMiss::Failed)
         );
+        assert!(earlier.map.revoked(), "revoked by the failure");
         assert_eq!(
             registry.region(&host, "lua", REGION, pool.prepare_epoch()),
             RegionPrepare {

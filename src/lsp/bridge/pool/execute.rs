@@ -192,7 +192,7 @@ impl LanguageServerPool {
         // (under a new epoch, say): the request reads no coordinates through
         // it, as no push is placed through it. One answered after the
         // failure (for a newer text) is not refused.
-        let built = offset.prepared().map(|map| map.origin());
+        let built = offset.prepared();
         let failed = || {
             self.prepares() && self.prepare_failed(host_uri, injection_language, region_id, built)
         };
@@ -1169,9 +1169,15 @@ mod tests {
             "lua",
             TEST_ULID_LUA_0,
         );
-        let prepared =
+        let mut prepared =
             apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(dedent_answer()))
                 .unwrap();
+        {
+            let map = Arc::get_mut(&mut prepared.map).unwrap();
+            map.set_input(1);
+            pool.prepare_failures_for_test()
+                .share_for_test(&host, "lua", TEST_ULID_LUA_0, map);
+        }
         pool.ensure_document_opened(
             &mut ConnectionHandleSender(&handle),
             &host,
@@ -1234,63 +1240,12 @@ mod tests {
         assert!(task.await.unwrap().is_err(), "its reply is dropped");
     }
 
-    /// A failure keeps revoking the answers it revokes once the lifecycle
-    /// pass holds the region on another input (an edit while a request
-    /// ran), or never held it there (a request's own lookup): a reply on
-    /// such an answer is not read. A text as is follows only the input the
-    /// region is held on.
-    #[tokio::test]
-    async fn a_failure_not_held_still_revokes_the_answers_it_revokes() {
-        use crate::lsp::bridge::protocol::{AnswerOrigin, VirtualLayout, apply_prepare_result};
-        let pool = LanguageServerPool::preparing();
-        let host_uri = Url::parse("file:///test/failure-not-held.md").unwrap();
-        let answer =
-            apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(dedent_answer()))
-                .unwrap()
-                .map
-                .origin();
-        let failures = pool.prepare_failures_for_test();
-        // Held on another input, still waiting for its answer.
-        failures.hold_for_test(
-            &host_uri,
-            "lua",
-            TEST_ULID_LUA_0,
-            pool.prepare_epoch(),
-            None,
-        );
-        let failure = AnswerOrigin {
-            taken: crate::lsp::bridge::protocol::next_presentation(),
-            input: answer.input,
-        };
-        failures.keep_failure_for_test(
-            &host_uri,
-            "lua",
-            TEST_ULID_LUA_0,
-            pool.prepare_epoch(),
-            failure,
-        );
-        assert!(pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0, Some(answer)));
-        assert!(!pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0, None));
-        // One taken after it is not revoked.
-        let newer =
-            apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(dedent_answer()))
-                .unwrap()
-                .map
-                .origin();
-        let newer = AnswerOrigin {
-            input: answer.input,
-            ..newer
-        };
-        assert!(!pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0, Some(newer)));
-    }
-
     /// A request on an answer the registry holds its region failed on is
     /// refused at once, before the lifecycle pass re-syncs the host: the
     /// failure is read where it is recorded.
     #[tokio::test]
     async fn a_failure_the_registry_holds_refuses_a_request_before_any_resync() {
         use crate::lsp::bridge::prepare_registry::{Answer, PrepareInput, PrepareTarget};
-        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
         let pool = Arc::new(LanguageServerPool::preparing());
         let coordinator = crate::lsp::bridge::BridgeCoordinator::with_cancel_forwarder(
             Arc::clone(&pool),
@@ -1301,35 +1256,23 @@ mod tests {
         let key = ConnectionKey::for_server("test-server");
         let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
         pool.insert_connection(Arc::clone(&handle)).await;
-        // The request's answer, taken before the failure.
-        let mut prepared =
-            apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(dedent_answer()))
-                .unwrap();
+        let input = PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id: TEST_ULID_LUA_0,
+            virtual_text: "  a",
+            gaps: &[],
+        };
+        // The request's answer for the input, as the registry gave it out
+        // before the input was asked again (under a new epoch, say).
+        let prepared = pool.prepare_failures_for_test().answered_for_test(input, 0);
         let target = PrepareTarget {
             candidates: Arc::from([]),
             epoch: pool.prepare_epoch(),
         };
-        coordinator.answer_prepare_for_test(
-            &target,
-            PrepareInput {
-                host_uri: &host,
-                host_language: "markdown",
-                injection_language: "lua",
-                region_id: TEST_ULID_LUA_0,
-                virtual_text: "  a",
-                gaps: &[],
-            },
-            Answer::Unusable,
-            true,
-        );
-        let failure = coordinator
-            .prepare_failed_at(&host, "lua", TEST_ULID_LUA_0)
-            .unwrap();
-        // The same input as the failure's, answered before it.
-        Arc::get_mut(&mut prepared.map)
-            .unwrap()
-            .set_input(failure.input);
-        assert!(prepared.map.origin().revoked_by(failure));
+        coordinator.answer_prepare_for_test(&target, input, Answer::Unusable, true);
+        assert!(prepared.map.revoked());
         let probe = std::sync::OnceLock::new();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(1),
@@ -1354,12 +1297,15 @@ mod tests {
     }
 
     /// A request built on an answer its region's peer no longer gives (it
-    /// failed the region since, under a new epoch, say) is not queued, though
-    /// its connection still holds that answer's text: no coordinates are read
-    /// through a failed region, as no push is placed through it.
+    /// failed the same input since, under a new epoch, say) is not queued,
+    /// though its connection still holds that answer's text: no coordinates
+    /// are read through a revoked map, as no push is placed through one.
+    /// The map says so itself, whatever the registry keeps of the failure.
     #[tokio::test]
     async fn a_request_on_a_region_its_peer_failed_is_not_queued() {
-        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        use crate::lsp::bridge::protocol::{
+            AnswerOrigin, PreparedDocument, VirtualLayout, apply_prepare_result,
+        };
         let pool = LanguageServerPool::preparing();
         let host_uri = Url::parse("file:///test/failed.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(
@@ -1369,9 +1315,34 @@ mod tests {
         );
         let uri = virtual_uri.to_uri_string();
         let key = ConnectionKey::for_server("lua");
-        let prepared =
-            apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(dedent_answer()))
-                .unwrap();
+        let failures = pool.prepare_failures_for_test();
+        // An answer for `input`, as the registry gives it out.
+        let answered = |input| -> PreparedDocument {
+            let mut prepared =
+                apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(dedent_answer()))
+                    .unwrap();
+            let map = Arc::get_mut(&mut prepared.map).unwrap();
+            map.set_input(input);
+            failures.share_for_test(&host_uri, "lua", TEST_ULID_LUA_0, map);
+            prepared
+        };
+        let fail = |input| {
+            failures.hold_for_test(
+                &host_uri,
+                "lua",
+                TEST_ULID_LUA_0,
+                pool.prepare_epoch(),
+                Some(AnswerOrigin {
+                    taken: crate::lsp::bridge::protocol::next_presentation(),
+                    input,
+                }),
+            );
+        };
+        let failed = |prepared: &PreparedDocument| {
+            pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0, Some(&prepared.map))
+        };
+        let as_is_failed = || pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0, None);
+        let prepared = answered(1);
         pool.record_sent_for_test(
             &virtual_uri,
             &key,
@@ -1387,90 +1358,50 @@ mod tests {
         };
         assert!(queue(false));
         assert!(!queue(true));
-        // Read from the hold the lifecycle pass publishes.
         pool.open_host_incarnation(&host_uri, 1).await;
         pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  a");
-        let answer = prepared.map.origin();
-        let failed = || pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0, Some(answer));
-        assert!(!failed());
+        assert!(!failed(&prepared));
         pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
-        assert!(!failed(), "pending");
+        assert!(!failed(&prepared), "pending");
+        // Another answer for the same input, and one for another text.
+        let again = answered(1);
+        let other = answered(2);
         // The same input asked again (under a new epoch, say), taken after
-        // the request's, and failed.
-        let failure = |input| crate::lsp::bridge::protocol::AnswerOrigin {
-            taken: crate::lsp::bridge::protocol::next_presentation(),
-            input,
-        };
-        let first = failure(answer.input);
-        pool.prepare_failures_for_test().hold_for_test(
-            &host_uri,
-            "lua",
-            TEST_ULID_LUA_0,
-            pool.prepare_epoch(),
-            Some(first),
-        );
-        assert!(
-            failed(),
-            "an answer for the failed input taken before it failed"
-        );
-        assert!(
-            pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0, None),
-            "as is"
-        );
+        // those answers, and failed: both are revoked, the held text with
+        // them; the other text's answer is not.
+        fail(1);
+        assert!(failed(&prepared));
+        assert!(failed(&again));
+        assert!(!queue(false), "the held text's coordinates are not read");
+        assert!(!failed(&other));
+        assert!(as_is_failed(), "as is");
         // An answer taken after the failure (a newer text's, which the next
-        // pass is about to send) is not refused by the stale hold, nor by
-        // the same failure held again...
-        let newer =
-            apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(dedent_answer()))
-                .unwrap();
-        let newer_failed =
-            || pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0, Some(newer.map.origin()));
-        pool.prepare_failures_for_test().hold_for_test(
-            &host_uri,
-            "lua",
-            TEST_ULID_LUA_0,
-            pool.prepare_epoch(),
-            Some(first),
-        );
-        assert!(!newer_failed());
+        // pass is about to send) is not refused by it...
+        let after = answered(1);
+        assert!(!failed(&after));
         // ...but is by a later failure of its input (another epoch's, say).
-        let later = failure(newer.map.origin().input);
-        pool.prepare_failures_for_test().hold_for_test(
+        fail(1);
+        assert!(failed(&after));
+        // The registry moved on (the region held on another input, the
+        // failure's answer evicted): the maps it revoked stay revoked, and a
+        // text as is is no longer refused by it.
+        failures.hold_for_test(
             &host_uri,
             "lua",
             TEST_ULID_LUA_0,
             pool.prepare_epoch(),
-            Some(later),
+            None,
         );
-        assert!(newer_failed());
-        // A failure of another text revokes no answer for this one, however
-        // old (an undo back to a text answered before the edit that failed).
-        let other = failure(answer.input.wrapping_add(1));
-        pool.prepare_failures_for_test().hold_for_test(
-            &host_uri,
-            "lua",
-            TEST_ULID_LUA_0,
-            pool.prepare_epoch(),
-            Some(other),
-        );
-        assert!(!failed());
-        assert!(
-            pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0, None),
-            "a text as is still is"
-        );
+        assert!(failed(&prepared));
+        assert!(!as_is_failed());
         // Once the epoch moves, before the lifecycle pass holds the region
-        // on another input: the failure revokes the answers it did, but no
-        // longer says the region is not bridged.
-        pool.prepare_failures_for_test().hold_for_test(
-            &host_uri,
-            "lua",
-            TEST_ULID_LUA_0,
-            pool.prepare_epoch(),
-            Some(first),
-        );
+        // on another input: the failure no longer says the region is not
+        // bridged.
+        fail(2);
+        assert!(as_is_failed());
         pool.advance_prepare_epoch();
-        assert!(failed());
-        assert!(!pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0, None));
+        assert!(!as_is_failed());
+        assert!(failed(&other));
     }
 
     #[tokio::test]

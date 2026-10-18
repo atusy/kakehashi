@@ -82,7 +82,7 @@ pub(crate) use pool::{ConnectionHandle, ConnectionKey};
 pub(crate) use pool::{RecoveryDecision, Reservation};
 pub(crate) use progress_registry::{ProgressConnectionId, ProgressRegistry};
 #[cfg(test)]
-pub(crate) use protocol::AnswerOrigin;
+pub(crate) use protocol::PreparedDocument;
 pub(crate) use protocol::PreparedMap;
 pub(crate) use protocol::RegionOffset;
 pub(crate) use protocol::RequestId;
