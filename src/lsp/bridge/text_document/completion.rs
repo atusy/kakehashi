@@ -22,8 +22,7 @@ use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::{
     EditMode, JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
     build_position_based_request, host_position_in_removed_indent, response_has_jsonrpc_error,
-    text_edit_safe_in_region, translate_virtual_additional_edits_to_host,
-    translate_virtual_text_edits_to_host,
+    text_edit_safe_in_region, translate_virtual_main_and_additional_edits_to_host,
 };
 use tower_lsp_server::ls_types::TextDocumentPositionParams;
 
@@ -278,35 +277,40 @@ pub(super) fn transform_completion_item(
             || request_host_position
                 .is_none_or(|position| range.start <= position && position <= range.end)
     };
-    // The primary edit as the server sent it, through each range the client
-    // may apply it with: a prepared document's additional edits are mapped
-    // together with it below. Cloned only then: this runs per item of the
-    // hottest response.
-    let sent_primaries: Vec<TextEdit> = match &item.text_edit {
-        _ if !prepared || item.additional_text_edits.is_none() => Vec::new(),
-        Some(CompletionTextEdit::Edit(edit)) => vec![edit.clone()],
-        Some(CompletionTextEdit::InsertAndReplace(edit)) => vec![
-            TextEdit {
-                range: edit.insert,
-                new_text: edit.new_text.clone(),
-            },
-            TextEdit {
-                range: edit.replace,
-                new_text: edit.new_text.clone(),
-            },
-        ],
-        None => Vec::new(),
+    // Transform text_edit if present, and the additional edits with it (on a
+    // prepared document, as the one set the client applies, through each
+    // range it may apply the primary with).
+    let additional = item.additional_text_edits.as_mut();
+    let additional_kept = match &mut item.text_edit {
+        None => translate_virtual_main_and_additional_edits_to_host(
+            &mut [],
+            additional,
+            offset,
+            EditMode::Extent,
+        )
+        .unwrap_or(false),
+        Some(CompletionTextEdit::Edit(edit)) => {
+            let Some(kept) = translate_virtual_main_and_additional_edits_to_host(
+                std::slice::from_mut(edit),
+                additional,
+                offset,
+                EditMode::Extent,
+            ) else {
+                return false;
+            };
+            kept
+        }
+        Some(CompletionTextEdit::InsertAndReplace(edit)) => {
+            let Some(kept) = translate_insert_replace_edit_to_host(edit, additional, offset) else {
+                return false;
+            };
+            kept
+        }
     };
-
-    // Transform text_edit if present
     if let Some(ref mut text_edit) = item.text_edit {
         match text_edit {
             CompletionTextEdit::Edit(edit) => {
-                if !translate_virtual_text_edits_to_host(
-                    std::slice::from_mut(edit),
-                    offset,
-                    EditMode::Extent,
-                ) || !contains_request(&edit.range)
+                if !contains_request(&edit.range)
                     || !text_edit_safe_in_region(edit, offset, region_end)
                     || snippet_unsafe(&edit.new_text, Some(edit.range.start.line))
                 {
@@ -314,10 +318,7 @@ pub(super) fn transform_completion_item(
                 }
             }
             CompletionTextEdit::InsertAndReplace(edit) => {
-                if !translate_insert_replace_edit_to_host(edit, offset)
-                    || !contains_request(&edit.insert)
-                    || !contains_request(&edit.replace)
-                {
+                if !contains_request(&edit.insert) || !contains_request(&edit.replace) {
                     return false;
                 }
                 // Check both ranges through one probe edit, moving new_text in
@@ -398,69 +399,62 @@ pub(super) fn transform_completion_item(
     // over fidelity, never corruption. On a prepared document an item
     // without a textEdit has no primary to check them with (the client
     // inserts at the caret, over a range it picks): they are dropped.
-    if let Some(ref mut additional_edits) = item.additional_text_edits {
-        let translated = translate_virtual_additional_edits_to_host(
-            &sent_primaries,
-            additional_edits,
-            offset,
-            EditMode::Extent,
-        );
-        if !translated
+    if let Some(ref additional_edits) = item.additional_text_edits
+        && (!additional_kept
             || !additional_edits
                 .iter()
-                .all(|edit| text_edit_safe_in_region(edit, offset, region_end))
-        {
-            log::warn!(
-                target: "kakehashi::bridge",
-                "completion: dropped an item's additionalTextEdits ({}): a member is unsafe for the injection region (escapes it, breaks line prefixes, merges content into the closing fence, or reaches host text its prepared document hides)",
-                additional_edits.len()
-            );
-            item.additional_text_edits = None;
-        }
+                .all(|edit| text_edit_safe_in_region(edit, offset, region_end)))
+    {
+        log::warn!(
+            target: "kakehashi::bridge",
+            "completion: dropped an item's additionalTextEdits ({}): a member is unsafe for the injection region (escapes it, breaks line prefixes, merges content into the closing fence, or reaches host text its prepared document hides)",
+            additional_edits.len()
+        );
+        item.additional_text_edits = None;
     }
     true
 }
 
-/// Translate both ranges of an insert/replace completion edit in place;
-/// `false` when either is refused. Under a prepared document both go
-/// through the edit seam with the shared `newText`, which must map to the
-/// same text for either choice the client makes.
+/// Translate both ranges of an insert/replace completion edit in place,
+/// with the item's additional edits (see
+/// `translate_virtual_main_and_additional_edits_to_host`, whose answer this
+/// is). Under a prepared document each range goes through the edit seam with
+/// the shared `newText`, which must map to the same text for either choice
+/// the client makes.
 fn translate_insert_replace_edit_to_host(
     edit: &mut tower_lsp_server::ls_types::InsertReplaceEdit,
+    additional: Option<&mut Vec<tower_lsp_server::ls_types::TextEdit>>,
     offset: &RegionOffset,
-) -> bool {
+) -> Option<bool> {
     use tower_lsp_server::ls_types::TextEdit;
-    let mut ranges = [
+    let prepared = offset.prepared().is_some();
+    let new_text = std::mem::take(&mut edit.new_text);
+    // As is, only the ranges translate: the text stays out of the way.
+    let mut mains = [
         TextEdit {
             range: edit.insert,
-            new_text: String::new(),
+            new_text: if prepared {
+                new_text.clone()
+            } else {
+                String::new()
+            },
         },
         TextEdit {
             range: edit.replace,
-            new_text: std::mem::take(&mut edit.new_text),
+            new_text,
         },
     ];
-    if offset.prepared().is_some() {
-        ranges[0].new_text = ranges[1].new_text.clone();
-    }
-    let translated = if offset.prepared().is_none() {
-        // As ranges only: no text moves.
-        translate_virtual_text_edits_to_host(&mut ranges, offset, EditMode::Extent)
-    } else {
-        // One set each: the two are alternatives, never applied together.
-        let [insert, replace] = &mut ranges;
-        translate_virtual_text_edits_to_host(std::slice::from_mut(insert), offset, EditMode::Extent)
-            && translate_virtual_text_edits_to_host(
-                std::slice::from_mut(replace),
-                offset,
-                EditMode::Extent,
-            )
-            && insert.new_text == replace.new_text
-    };
-    let [insert, replace] = ranges;
+    let kept = translate_virtual_main_and_additional_edits_to_host(
+        &mut mains,
+        additional,
+        offset,
+        EditMode::Extent,
+    );
+    let [insert, replace] = mains;
     edit.new_text = replace.new_text;
-    if !translated {
-        return false;
+    let kept = kept?;
+    if prepared && insert.new_text != edit.new_text {
+        return None;
     }
     edit.insert = insert.range;
     edit.replace = replace.range;
@@ -472,10 +466,10 @@ fn translate_insert_replace_edit_to_host(
         if edit.replace.start < edit.insert.start && edit.insert.start <= edit.replace.end {
             edit.replace.start = edit.insert.start;
         } else {
-            return false;
+            return None;
         }
     }
-    true
+    Some(kept)
 }
 
 /// How the client inserts a completion's multi-line text (LSP
@@ -1179,10 +1173,14 @@ mod tests {
                 Position::new(0, 5),
             ),
         };
-        assert!(translate_insert_replace_edit_to_host(
-            &mut edit,
-            &dedented_offset("  if x:\n    y\n")
-        ));
+        assert_eq!(
+            translate_insert_replace_edit_to_host(
+                &mut edit,
+                None,
+                &dedented_offset("  if x:\n    y\n")
+            ),
+            Some(true)
+        );
         assert_eq!(edit.insert.start, edit.replace.start);
         assert_eq!(
             edit.replace,
@@ -1204,10 +1202,14 @@ mod tests {
                 Position::new(1, 3),
             ),
         };
-        assert!(translate_insert_replace_edit_to_host(
-            &mut edit,
-            &dedented_offset("  if x:\n    y\n")
-        ));
+        assert_eq!(
+            translate_insert_replace_edit_to_host(
+                &mut edit,
+                None,
+                &dedented_offset("  if x:\n    y\n")
+            ),
+            Some(true)
+        );
         assert_eq!(edit.insert.start, Position::new(11, 4));
         assert_eq!(edit.replace.end, Position::new(11, 5));
         assert_eq!(edit.new_text, "yes\n    z");

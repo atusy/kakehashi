@@ -225,12 +225,13 @@ pub(crate) fn translate_virtual_text_edits_to_host(
     true
 }
 
-/// Translate, in place, the additional edits a client applies together with
-/// a main edit, as `mode` reads them; `false` — the caller drops them — when
-/// they are refused, with `additional` left as it came. `sent_mains` are the
-/// main edit as the server sent it, once per range the client may apply it
-/// through (an insert/replace edit has two); the caller translates the main
-/// edit itself.
+/// Translate, in place, a main edit and the additional edits a client
+/// applies together with it, as `mode` reads them. `mains` is the main edit
+/// once per range the client may apply it through (an insert/replace edit
+/// has two; none for an item with no main edit), each translated alone.
+/// `None` — the caller drops the carrier — when a main edit is refused;
+/// otherwise whether the additional edits were kept (`true` without any),
+/// refused ones left as they came for the caller to drop.
 ///
 /// A prepared document maps each main edit with the additional ones as the
 /// one set the client applies: edits harmless one by one can together
@@ -238,40 +239,52 @@ pub(crate) fn translate_virtual_text_edits_to_host(
 /// when every set maps, with its main edit mapping as it does alone (so the
 /// edits sent are the set checked), and the additional edits mapping alike
 /// in every set. With no main edit there is no set to check: refused. An
-/// unprepared document's edits translate as ranges, `sent_mains` unread.
-pub(crate) fn translate_virtual_additional_edits_to_host(
-    sent_mains: &[TextEdit],
-    additional: &mut Vec<TextEdit>,
+/// unprepared document's edits translate as ranges, allocating nothing.
+pub(crate) fn translate_virtual_main_and_additional_edits_to_host(
+    mains: &mut [TextEdit],
+    additional: Option<&mut Vec<TextEdit>>,
     offset: &RegionOffset,
     mode: EditMode,
-) -> bool {
+) -> Option<bool> {
+    // The main edits as sent, to map with the additional ones: cloned only
+    // on a prepared document that has any.
+    let sent: Vec<TextEdit> = match &additional {
+        Some(_) if offset.prepared().is_some() => mains.to_vec(),
+        _ => Vec::new(),
+    };
+    for main in mains.iter_mut() {
+        if !translate_virtual_text_edits_to_host(std::slice::from_mut(main), offset, mode) {
+            return None;
+        }
+    }
+    let Some(additional) = additional else {
+        return Some(true);
+    };
     if offset.prepared().is_none() {
-        return translate_virtual_text_edits_to_host(additional, offset, mode);
+        return Some(translate_virtual_text_edits_to_host(
+            additional, offset, mode,
+        ));
     }
     let mut agreed: Option<Vec<TextEdit>> = None;
-    for main in sent_mains {
-        let mut alone = [main.clone()];
-        if !translate_virtual_text_edits_to_host(&mut alone, offset, mode) {
-            return false;
-        }
+    for (sent, mapped) in sent.into_iter().zip(mains.iter()) {
         let mut set = Vec::with_capacity(additional.len() + 1);
-        set.push(main.clone());
+        set.push(sent);
         set.extend(additional.iter().cloned());
-        if !translate_virtual_text_edits_to_host(&mut set, offset, mode) || set[0] != alone[0] {
-            return false;
+        if !translate_virtual_text_edits_to_host(&mut set, offset, mode) || set[0] != *mapped {
+            return Some(false);
         }
-        let mapped = set.split_off(1);
-        if agreed.as_ref().is_some_and(|agreed| *agreed != mapped) {
-            return false;
+        let set = set.split_off(1);
+        if agreed.as_ref().is_some_and(|agreed| *agreed != set) {
+            return Some(false);
         }
-        agreed = Some(mapped);
+        agreed = Some(set);
     }
     match agreed {
         Some(mapped) => {
             *additional = mapped;
-            true
+            Some(true)
         }
-        None => false,
+        None => Some(false),
     }
 }
 
