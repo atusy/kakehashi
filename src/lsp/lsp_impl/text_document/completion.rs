@@ -36,7 +36,7 @@ impl Kakehashi {
         let lsp_uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
-        let requery = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let requery = std::sync::atomic::AtomicBool::new(false);
         let virt = self.completion_virt_layer(&lsp_uri, position, &requery);
         let host = self.completion_host_layer(&lsp_uri, raw_params);
         let response = self
@@ -159,15 +159,18 @@ impl Kakehashi {
     ///
     /// On a prepared document an incomplete list without items (the
     /// server's own, or one whose every item did not map back) is no result:
-    /// it would win over another server's items or the host layer's. Its ask
-    /// to re-query is kept in `requery` for the answer that does win: the
-    /// next keystroke can move the caret to where items map (off an emptied
-    /// gap's end, say).
+    /// it would win over another server's items or the host layer's. When no
+    /// server of the layer answers with items, its ask to re-query is kept in
+    /// `requery` for whatever answer wins: the next keystroke can move the
+    /// caret to where items map (off an emptied gap's end, say). Asks from a
+    /// layer that answered are moot (its items win again on re-query) and,
+    /// arriving in any order around the winner, would make the ask depend on
+    /// timing: they are not kept.
     async fn completion_virt_layer(
         &self,
         lsp_uri: &Uri,
         position: Position,
-        requery: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        requery: &std::sync::atomic::AtomicBool,
     ) -> Result<Option<CompletionResponse>> {
         // Use shared preamble to resolve injection context with ALL matching servers
         let Some(ctx) = self
@@ -183,13 +186,18 @@ impl Kakehashi {
         // Fan-out completion requests to all matching servers
         let pool = self.bridge.pool_arc();
         let position = ctx.position;
+        // Only a prepared document's servers can ask without answering.
+        let asked = ctx
+            .document
+            .prepared
+            .is_some()
+            .then(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
         let result = dispatch_preferred(
             &ctx.document,
             pool.clone(),
             |t| {
-                let requery = std::sync::Arc::clone(requery);
+                let asked = asked.clone();
                 async move {
-                    let prepared = t.offset.prepared().is_some();
                     let list = t
                         .pool
                         .send_completion_request(
@@ -205,12 +213,14 @@ impl Kakehashi {
                             t.upstream_id,
                         )
                         .await?;
-                    Ok(match list {
-                        Some(list) if prepared && list.items.is_empty() && list.is_incomplete => {
-                            requery.store(true, std::sync::atomic::Ordering::Relaxed);
+                    Ok(match (list, asked) {
+                        (Some(list), Some(asked))
+                            if list.items.is_empty() && list.is_incomplete =>
+                        {
+                            asked.store(true, std::sync::atomic::Ordering::Relaxed);
                             None
                         }
-                        list => list,
+                        (list, _) => list,
                     })
                 }
             },
@@ -219,11 +229,19 @@ impl Kakehashi {
         )
         .await;
 
-        result
+        let response = result
             .handle(&self.notifier(), "completion", None, |v| {
                 Ok(v.map(CompletionResponse::List))
             })
-            .await
+            .await?;
+        // With no winner every server finished (or the request was
+        // cancelled), so the ask is read once all are in.
+        if response.is_none()
+            && asked.is_some_and(|asked| asked.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            requery.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(response)
     }
 }
 
