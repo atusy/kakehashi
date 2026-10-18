@@ -146,41 +146,42 @@ impl Kakehashi {
             .documents
             .get(uri)
             .map(|document| (document.incarnation(), document.content_version()));
-        if current_lineage == Some((saved_incarnation, saved_content_version))
-            && let Some((host_language, Some(injections))) =
-                self.injection_coordinator().bridge_injections_holding(uri)
-        {
-            // Holding the documents on their inputs, as the lifecycle pass
-            // does, it publishes their holds as the pass would: an input it
-            // moved onto (a failure under a new epoch, say) is held for
-            // requests and lazy opens before any pass runs.
+        if current_lineage == Some((saved_incarnation, saved_content_version)) {
             let injection = self.injection_coordinator();
-            let pass_held =
-                injection.publish_holds(uri, saved_incarnation, &host_language, &injections);
-            injection.close_unprepared_held(uri, &pass_held).await;
-            // Held documents (waiting for their prepare answers, or answered
-            // unusably) are not sent, their save included: it is forwarded
-            // to each whose prepared text is sent while the host is still at
-            // the saved version (one answered unusably never is).
-            // Nothing is held without the prepare layer: no scan.
-            let prepares = pool.prepares();
-            let held: Vec<String> = if prepares {
-                injections
-                    .iter()
-                    .filter(|injection| injection.held)
-                    .map(|injection| injection.region_id.clone())
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            if !held.is_empty() {
-                self.bridge
-                    .hold_save(uri, saved_incarnation, saved_content_version, held);
+            if let Some((host_language, Some(injections))) =
+                injection.bridge_injections_holding(uri)
+            {
+                // Holding the documents on their inputs, as the lifecycle
+                // pass does, it publishes their holds as the pass would: an
+                // input it moved onto (a failure under a new epoch, say) is
+                // held for requests and lazy opens before any pass runs.
+                let pass_held =
+                    injection.publish_holds(uri, saved_incarnation, &host_language, &injections);
+                injection.close_unprepared_held(uri, &pass_held).await;
+                // Held documents (waiting for their prepare answers, or answered
+                // unusably) are not sent, their save included: it is forwarded
+                // to each whose prepared text is sent while the host is still at
+                // the saved version (one answered unusably never is).
+                // Nothing is held without the prepare layer: no scan.
+                let prepares = pool.prepares();
+                let held: Vec<String> = if prepares {
+                    injections
+                        .iter()
+                        .filter(|injection| injection.held)
+                        .map(|injection| injection.region_id.clone())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                if !held.is_empty() {
+                    self.bridge
+                        .hold_save(uri, saved_incarnation, saved_content_version, held);
+                }
+                let injections =
+                    crate::lsp::lsp_impl::coordinator::sendable_injections(prepares, injections);
+                pool.sync_and_forward_did_save_to_virtual_docs(uri, saved_incarnation, &injections)
+                    .await;
             }
-            let injections =
-                crate::lsp::lsp_impl::coordinator::sendable_injections(prepares, injections);
-            pool.sync_and_forward_did_save_to_virtual_docs(uri, saved_incarnation, &injections)
-                .await;
         }
         drop(edit_guard);
         // `edit_lock` get-or-inserts, so a close during the settle leaves this
