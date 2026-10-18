@@ -412,7 +412,11 @@ impl PreparedMap {
         } else {
             first
         };
-        let inserted = self.reindent(virtual_start, first, new_text, following, tail)?;
+        // Text joining that line takes its indent only from a line of text
+        // or one holding the indent the peer removed: joining a blank line,
+        // it starts a new line of the content.
+        let joined = tail.filter(|_| removed_at_end.is_some() || begins_line(following));
+        let inserted = self.reindent(virtual_start, first, new_text, following, tail, joined)?;
         // A CR and an LF meeting at either edge of the change make one line
         // break in P, or two in V where host text the change stops beside (an
         // emptied gap) sits between them: the server's lines would no longer
@@ -484,6 +488,7 @@ impl PreparedMap {
         text: &str,
         following: Option<char>,
         tail: Option<&str>,
+        joined: Option<&str>,
     ) -> Option<String> {
         let breaks_line = text.contains(['\n', '\r']);
         // New text starting a line takes an indent unless it opens with a
@@ -514,21 +519,30 @@ impl PreparedMap {
         let line_indent = if breaks_line { uniform()? } else { "" };
         let mut output = String::with_capacity(text.len() + first_indent.len() + line_indent.len());
         output.push_str(first_indent);
-        let mut chars = text.chars().peekable();
-        while let Some(character) = chars.next() {
+        // The text after the last line break joins the existing line the
+        // edit ends before (when one follows): that line's own indent, not
+        // the segment's, starts it — a line the peer left alone stays
+        // unindented, the indentation-only last line keeps its own.
+        let last_break = text.rfind(['\n', '\r']);
+        let mut chars = text.char_indices().peekable();
+        while let Some((at, character)) = chars.next() {
             output.push(character);
-            let line_break =
-                character == '\n' || (character == '\r' && chars.peek() != Some(&'\n'));
+            let next = chars.peek().map(|&(_, next)| next);
+            let line_break = character == '\n' || (character == '\r' && next != Some('\n'));
             if !line_break {
                 continue;
             }
-            match (chars.peek(), tail) {
+            match (next, tail, joined) {
                 // The break before the existing line: that line's own indent.
-                (None, Some(tail)) => output.push_str(tail),
-                // A new line starting with text (not another break).
-                (next, _) if begins_line(next.copied().or(following)) => {
-                    output.push_str(line_indent)
+                (None, Some(tail), _) => output.push_str(tail),
+                // The last break, its text joining the existing line.
+                (Some(next), _, Some(joined))
+                    if Some(at) == last_break && begins_line(Some(next)) =>
+                {
+                    output.push_str(joined)
                 }
+                // A new line starting with text (not another break).
+                (next, _, _) if begins_line(next.or(following)) => output.push_str(line_indent),
                 _ => {}
             }
         }
@@ -582,12 +596,13 @@ fn is_line_end(text: &str, offset: usize) -> bool {
     offset == text.len() || matches!(text.as_bytes().get(offset), Some(b'\n' | b'\r'))
 }
 
-/// Whether `text` holds only whitespace from `offset` to its line's end.
+/// Whether `text` holds only spaces and tabs from `offset` to its line's
+/// end: the blanks a peer may delete (another whitespace character is text).
 fn is_blank_from(text: &str, offset: usize) -> bool {
     text[offset..]
         .split(['\n', '\r'])
         .next()
-        .is_none_or(|rest| rest.trim().is_empty())
+        .is_none_or(|rest| rest.trim_matches([' ', '\t']).is_empty())
 }
 
 #[cfg(test)]
