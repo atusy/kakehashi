@@ -3102,6 +3102,20 @@ mod formatting {
     }
 
     #[test]
+    fn a_line_deleted_above_one_losing_its_own_indent_keeps_them_apart() {
+        // `0a0` (dedented) deleted, `\t1b c1` (left alone, a tab of its own)
+        // brought to column 0: the deletion and the tab's touch at the line
+        // start, and the line keeps its removed indent (none).
+        let virtual_text = "  0a0\r\n\t1b c1\r\n";
+        let map = dedent_lines(virtual_text, &[2, 0]);
+        let answer = [edit((0, 0), (2, 0), "1b c1\r\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("1b c1\r\n")
+        );
+    }
+
+    #[test]
     fn lines_joined_keep_the_first_ones_indent() {
         // `0x` deleted and `1x` joined with `2x`: the joined line is `1x`.
         let virtual_text = "0if x:0\n    1if x:1\n    2if x:2\n";

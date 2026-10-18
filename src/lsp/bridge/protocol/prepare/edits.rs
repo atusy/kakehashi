@@ -935,14 +935,17 @@ fn diff_hunks(old: &str, new: &str, deadline: Instant) -> Vec<Hunk> {
             // Touching stretches merge (mapped apart, each would read the
             // other's place as P's), but not at a line start where the later
             // writes text over that line's start, or the earlier ends with a
-            // line break in both texts: merged, the later line would map as
-            // one the stretch writes anew, with the content's indent rather
-            // than its own. Apart, neither's text bears on the other there.
+            // line break of P it keeps or one before more of P: merged, the
+            // later line would map as one the stretch writes anew, with the
+            // content's indent rather than its own. Apart, neither's text
+            // bears on the other there. (Lines deleted through P's end go
+            // together: the indentation-only last line goes with them.)
             let apart = |last: &Hunk| {
                 let breaks = |text: &str, end: usize| text[..end].ends_with(['\n', '\r']);
                 is_line_start(old, old_bytes.start)
                     && ((!new_bytes.is_empty() && !old_bytes.is_empty())
-                        || (breaks(old, last.old.end) && breaks(new, last.new.end)))
+                        || (breaks(old, last.old.end)
+                            && (breaks(new, last.new.end) || old_bytes.end < old.len())))
             };
             match hunks.last_mut() {
                 Some(last)
