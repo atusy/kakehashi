@@ -3681,7 +3681,7 @@ mod tests {
                 prepared: true,
                 stale_version,
             },
-            origin: Some(virtual_uri.to_uri_string()),
+            origin: None,
         };
         assert_eq!(held_of(Some(Arc::clone(&tracker)), 3), Some(stamp(false)));
         assert_eq!(held_of(Some(Arc::clone(&tracker)), 2), Some(stamp(true)));

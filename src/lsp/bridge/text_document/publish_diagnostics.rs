@@ -100,7 +100,8 @@ pub(in crate::lsp::bridge) fn forward_push(
             crate::lsp::diagnostic_cache::HeldStamp {
                 connection: deps.connection_key.clone(),
                 observed: tracker.observe(&uri, &deps.connection_key, version),
-                origin: Some(uri.clone()),
+                // Filled in where the slot is recorded.
+                origin: None,
             }
         });
     let _ = deps.upstream_tx.send(

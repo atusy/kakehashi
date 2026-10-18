@@ -1038,6 +1038,12 @@ impl DiagnosticPublisher {
         // when it was read, while the rule allows (see
         // `BridgeCoordinator::place_held`).
         let slot = (DiagnosticSource::Region(region_id.clone()), server.clone());
+        // The document it is about, filled in only for a slot recorded (the
+        // reader stamps no URI, saving a copy per push frame).
+        let held = held.map(|held| HeldStamp {
+            origin: Some(virtual_uri.to_owned()),
+            ..held
+        });
         let changed = self.aggregator.record_held(
             &host,
             DiagnosticSource::Region(region_id),
@@ -4318,6 +4324,61 @@ mod tests {
         assert!(
             server.diagnostics.is_dirty(),
             "a geometry-deferred push must still bump coverage (drives the refresh nudge)"
+        );
+    }
+
+    /// A recorded region push's stamp names the document it is about, so it
+    /// is placed only through that one (see `BridgeCoordinator::place_held`).
+    #[tokio::test]
+    async fn a_recorded_region_push_is_stamped_with_its_document() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let host_uri = Url::parse("file:///test/stamped_origin.md").unwrap();
+        server.documents.insert(
+            host_uri.clone(),
+            "```lua\nlocal x = 1\n```\n".to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap(),
+            "lua",
+            "region-1",
+        );
+        let key = crate::lsp::bridge::ConnectionKey::for_server("lua_ls");
+        server
+            .bridge
+            .register_opened_document_for_test(&host_uri, &virtual_uri, &key)
+            .await;
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "lua_ls".to_string(),
+            BridgeServerConfig {
+                cmd: Some(vec!["lua-language-server".to_string()]),
+                ..Default::default()
+            },
+        );
+        server.settings_manager.apply_settings(settings);
+        let stamp = HeldStamp {
+            connection: key,
+            observed: crate::lsp::bridge::Observed::Now,
+            origin: None,
+        };
+        DiagnosticPublisher::new(server)
+            .record_region_push(
+                &virtual_uri.to_uri_string(),
+                "lua_ls".to_string(),
+                ProgressConnectionId::for_test(1),
+                Some(stamp),
+                vec![diag("unused variable")],
+            )
+            .await
+            .expect("recorded");
+        let slots = server.diagnostics.snapshot(&host_uri);
+        let slot = &slots[&DiagnosticSource::Region("region-1".to_string())]["lua_ls"];
+        assert_eq!(
+            slot.held.as_ref().and_then(|held| held.origin.as_deref()),
+            Some(virtual_uri.to_uri_string().as_str())
         );
     }
 
