@@ -682,6 +682,13 @@ mod tests {
         assert_eq!(presentations[0].label, "#ff0000");
         assert_eq!(presentations[1].label, "rgb(255, 0, 0)");
         assert_eq!(presentations[2].label, "hsl(0, 100%, 50%)");
+        // Without a map the label stays implicit, as main sends it: only a
+        // prepared document's is made an explicit edit.
+        assert!(
+            presentations
+                .iter()
+                .all(|presentation| presentation.text_edit.is_none())
+        );
     }
 
     #[rstest]

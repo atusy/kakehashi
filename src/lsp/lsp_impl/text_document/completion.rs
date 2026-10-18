@@ -187,13 +187,7 @@ impl Kakehashi {
         // Fan-out completion requests to all matching servers
         let pool = self.bridge.pool_arc();
         let position = ctx.position;
-        // Only a prepared document's servers can ask without answering:
-        // what each answered, read once the fan-in decided.
-        let answers = ctx
-            .document
-            .prepared
-            .is_some()
-            .then(|| std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, bool)>::new())));
+        let answers = virt_answers(ctx.document.prepared.is_some());
         let result = dispatch_preferred(
             &ctx.document,
             pool.clone(),
@@ -216,25 +210,7 @@ impl Kakehashi {
                             t.upstream_id,
                         )
                         .await?;
-                    let Some(answers) = answers else {
-                        return Ok(list);
-                    };
-                    let record = |asked| {
-                        if let Ok(mut answers) = answers.lock() {
-                            answers.push((server_name.unwrap_or_default(), asked));
-                        }
-                    };
-                    Ok(match list {
-                        Some(list) if list.items.is_empty() && list.is_incomplete => {
-                            record(true);
-                            None
-                        }
-                        Some(list) if completion_list_has_result(&list) => {
-                            record(false);
-                            Some(list)
-                        }
-                        list => list,
-                    })
+                    Ok(record_virt_answer(list, answers.as_deref(), server_name))
                 }
             },
             |opt| opt.as_ref().is_some_and(completion_list_has_result),
@@ -266,6 +242,45 @@ impl Kakehashi {
             requery.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(response)
+    }
+}
+
+/// What each server of the virt layer answered, read once the fan-in
+/// decided: kept only for a prepared document, the only one whose servers
+/// can ask without answering (see [`record_virt_answer`]).
+type VirtAnswers = std::sync::Arc<std::sync::Mutex<Vec<(String, bool)>>>;
+
+fn virt_answers(prepared: bool) -> Option<VirtAnswers> {
+    prepared.then(VirtAnswers::default)
+}
+
+/// A virt server's list as the fan-in sees it, with what it answered
+/// recorded in `answers` (a prepared document's only, see
+/// [`virt_answers`]): an incomplete list without items is an ask, no result;
+/// one with a result is an answer. Without `answers` the list is as sent.
+fn record_virt_answer(
+    list: Option<CompletionList>,
+    answers: Option<&std::sync::Mutex<Vec<(String, bool)>>>,
+    server_name: Option<String>,
+) -> Option<CompletionList> {
+    let Some(answers) = answers else {
+        return list;
+    };
+    let record = |asked| {
+        if let Ok(mut answers) = answers.lock() {
+            answers.push((server_name.unwrap_or_default(), asked));
+        }
+    };
+    match list {
+        Some(list) if list.items.is_empty() && list.is_incomplete => {
+            record(true);
+            None
+        }
+        Some(list) if completion_list_has_result(&list) => {
+            record(false);
+            Some(list)
+        }
+        list => list,
     }
 }
 
@@ -428,6 +443,43 @@ fn completion_list_has_result(list: &CompletionList) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_prepared_documents_servers_ask_without_answering() {
+        use tower_lsp_server::ls_types::CompletionItem;
+        let ask = || {
+            Some(CompletionList {
+                is_incomplete: true,
+                items: vec![],
+            })
+        };
+        let items = Some(CompletionList {
+            is_incomplete: false,
+            items: vec![CompletionItem {
+                label: "x".to_string(),
+                ..Default::default()
+            }],
+        });
+        // Unprepared: nothing is kept, and an incomplete empty list stays
+        // the result it is, as main sends it.
+        assert!(virt_answers(false).is_none());
+        assert_eq!(record_virt_answer(ask(), None, None), ask());
+        // Prepared: it is an ask, no result; items are an answer.
+        let answers = virt_answers(true).unwrap();
+        assert_eq!(
+            record_virt_answer(ask(), Some(&answers), Some("a".to_string())),
+            None
+        );
+        assert_eq!(
+            record_virt_answer(items.clone(), Some(&answers), Some("b".to_string())),
+            items
+        );
+        assert_eq!(record_virt_answer(None, Some(&answers), None), None);
+        assert_eq!(
+            *answers.lock().unwrap(),
+            vec![("a".to_string(), true), ("b".to_string(), false)]
+        );
+    }
 
     #[test]
     fn a_server_ranked_above_the_winner_asks_for_the_answer() {

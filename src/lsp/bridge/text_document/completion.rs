@@ -1206,6 +1206,44 @@ mod tests {
         }
     }
 
+    /// The prepared-only rules leave an unprepared item as main sends it:
+    /// its edit range need not contain the caret, its multi-line edit keeps
+    /// the insert mode it asked for whatever the client does, and its
+    /// snippet stays a snippet.
+    #[rstest]
+    #[case::as_is_settable(ClientInsertMode::AsIsSettable)]
+    #[case::adjusting(ClientInsertMode::AdjustsIndentation)]
+    #[case::as_is(ClientInsertMode::AsIs)]
+    fn prepared_only_rules_leave_an_unprepared_item_alone(#[case] insert_mode: ClientInsertMode) {
+        use tower_lsp_server::ls_types::{InsertTextFormat, InsertTextMode};
+        let offset = RegionOffset::new(10, 0);
+        let mut completed = item(json!({
+            "label": "if",
+            "insertTextMode": 2,
+            "insertTextFormat": 2,
+            "textEdit": {
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}},
+                "newText": "if ${1:x}:\n  pass"
+            }
+        }));
+        assert!(transform_completion_item(
+            &mut completed,
+            &offset,
+            Position::new(12, 0),
+            // Past the edit's range.
+            Some(Position::new(11, 2)),
+            insert_mode,
+        ));
+        assert_eq!(
+            completed.insert_text_mode,
+            Some(InsertTextMode::ADJUST_INDENTATION)
+        );
+        assert_eq!(
+            completed.insert_text_format,
+            Some(InsertTextFormat::SNIPPET)
+        );
+    }
+
     #[test]
     fn the_client_insert_mode_follows_its_capabilities() {
         let caps = |value: serde_json::Value| -> tower_lsp_server::ls_types::ClientCapabilities {
