@@ -2443,6 +2443,7 @@ mod tests {
             "textDocument/prepareRename",
             "textDocument/formatting",
             "textDocument/rangeFormatting",
+            "textDocument/linkedEditingRange",
         ] {
             assert!(!method_closed_to(&resolved, method, false), "{method}");
             assert!(method_closed_to(&resolved, method, true), "{method}");
