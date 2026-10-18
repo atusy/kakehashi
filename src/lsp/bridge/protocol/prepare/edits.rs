@@ -996,15 +996,22 @@ const ALIGNMENTS: [Alignment; 4] = [
 /// Pairs of an old line and the new line written as its text with more
 /// after it, in order: the first such old line for each new line, past the
 /// one paired before.
+///
+/// The search is quadratic in the lines left unpaired: it stops at
+/// `deadline`, as the diffs do, for the answer to be refused.
 fn joined_lines(
     old_keys: &[Vec<String>; 2],
     new_keys: &[Vec<String>; 2],
     old_range: &Range<usize>,
     new_range: &Range<usize>,
+    deadline: Instant,
 ) -> Vec<(usize, usize)> {
     let mut pairs = Vec::new();
     let mut old_from = old_range.start;
     for new_line in new_range.clone() {
+        if Instant::now() >= deadline {
+            break;
+        }
         let written = &new_keys[1][new_line];
         if let Some(old_line) = (old_from..old_range.end).find(|&old_line| {
             let text = &old_keys[1][old_line];
@@ -1042,7 +1049,7 @@ fn align_lines(
         return;
     };
     let pairs: Vec<(usize, usize)> = match alignment {
-        Alignment::Joined => joined_lines(old_keys, new_keys, &old_range, &new_range),
+        Alignment::Joined => joined_lines(old_keys, new_keys, &old_range, &new_range, deadline),
         Alignment::Diff(keys, algorithm, takes_part) => {
             let candidates = |all: &[String], range: &Range<usize>| -> Vec<usize> {
                 range

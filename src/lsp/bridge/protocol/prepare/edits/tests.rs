@@ -3078,6 +3078,30 @@ mod formatting {
     }
 
     #[test]
+    fn pairing_many_unalike_lines_stops_at_the_deadline() {
+        // Thousands of lines none of which pairs: the join search is
+        // quadratic, and must give up with the diffs for the answer to be
+        // refused in time, not run on.
+        let virtual_text: String = (0..20000).map(|line| format!("  a{line}\n")).collect();
+        let changes: Vec<_> = (0..20000)
+            .map(|line| json!({"range": {"start": {"line": line, "character": 0}, "end": {"line": line, "character": 2}}, "newText": ""}))
+            .collect();
+        let map = prepare(&virtual_text, json!(changes));
+        let formatted: String = (0..20000).map(|line| format!("b{line}\n")).collect();
+        let answer = [edit((0, 0), (20000, 0), &formatted)];
+        let started = std::time::Instant::now();
+        assert_eq!(
+            map.map_edits_within(&answer, EditMode::Formatting, Duration::from_millis(50)),
+            None
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
     fn lines_joined_keep_the_first_ones_indent() {
         // `0x` deleted and `1x` joined with `2x`: the joined line is `1x`.
         let virtual_text = "0if x:0\n    1if x:1\n    2if x:2\n";
