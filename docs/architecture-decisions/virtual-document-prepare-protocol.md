@@ -247,7 +247,8 @@ An answer's edits are mapped only while the map its request was built on
 still describes the region's current host text, as recorded when the
 answer arrives. While the host's last edit has not been settled yet (its
 parse or lifecycle pass still running, so the recorded text may predate
-it), while the host's newer text waits for its prepare answer, or once the same prepared text is recorded under another map (an edit to
+it), while the host's newer text waits for its prepare answer, or once
+the same prepared text is recorded under another map (an edit to
 indentation the peer removes changes the host but not P), the answer's
 edits are dropped: completion and color presentations answer nothing,
 inlay hints stay shown without their edits. Once typing has recorded
