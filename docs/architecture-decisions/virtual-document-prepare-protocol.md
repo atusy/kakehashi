@@ -224,7 +224,9 @@ edited V. It is refused, and dropped like any unsafe set, when:
   (one ending where another starts, or two inserting at one place) at a
   line start, or with a line break or no text on the side where they meet:
   how each regains a removed indent, or where a CR and an LF meet, depends
-  on the other's text;
+  on the other's text — but for lines inserted at a line start before an
+  edit starting there with text (an import above the line a completion
+  rewrites), which keep to their own lines;
 - an edge of a mapped edit falls between a CR and an LF of V, where no LSP
   position is;
 - an edit reaches into a gap's text (or, for a gap the peer emptied,
