@@ -335,7 +335,7 @@ impl super::BridgeCoordinator {
         host_uri: &Url,
         injection_language: &str,
         region_id: &str,
-    ) -> Option<u64> {
+    ) -> Option<super::protocol::AnswerOrigin> {
         self.prepare.as_ref().and_then(|layer| {
             layer.registry.failed_at(
                 host_uri,

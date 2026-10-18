@@ -205,7 +205,10 @@ re-syncs its host as it arrives, and the host's diagnostics are collected
 again (through the edit's debounce when the answer is an edit's, as for a
 usable one). Its servers keep the prepared text they last held, but no
 coordinates are read through it any more — a request built on an earlier
-answer is not admitted, nor opens the document, as no push is placed. A
+answer for that same input (under an earlier epoch) is not admitted, nor
+opens the document, as no push is placed. A request built on an answer for
+another text (an edit since, or an undo back to it) is left to the
+held-text check. A
 missing answer from the chosen peer (crashing, timing out, or
 answering with one of LSP's retryable cancellation codes) is retried with
 backoff — one second, doubling to a minute — without waiting for an edit,

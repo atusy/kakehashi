@@ -440,6 +440,7 @@ pub(crate) fn apply_prepare_result_at(
         runs,
         fingerprint,
         built: taken,
+        input: 0,
     };
     Ok(PreparedDocument {
         text,
@@ -663,6 +664,28 @@ pub(crate) struct PreparedMap {
     /// Where the input its answer came from was taken in the presentation
     /// order (see [`apply_prepare_result_at`]); not part of its equality.
     built: u64,
+    /// That input's identity apart from the epoch it was asked under (see
+    /// [`AnswerOrigin`]); set by the registry, not part of its equality.
+    input: u64,
+}
+
+/// Which answer a prepared text came from: when its input was taken, in the
+/// presentation order (one per registry cell), and the input's identity
+/// apart from the epoch and candidates it was asked under — the same text
+/// asked again after an epoch move has the same `input`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AnswerOrigin {
+    pub(crate) taken: u64,
+    pub(crate) input: u64,
+}
+
+impl AnswerOrigin {
+    /// Whether an answer from `self` is one `failure` revokes: an answer for
+    /// the same input taken before that input failed. An answer for another
+    /// text, or taken after, is left to the held-text check.
+    pub(crate) fn revoked_by(self, failure: AnswerOrigin) -> bool {
+        self.input == failure.input && self.taken < failure.taken
+    }
 }
 
 /// A process-wide order of the decisions about what a virtual document's
@@ -686,6 +709,20 @@ impl PreparedMap {
     /// presentation order (see [`apply_prepare_result_at`]).
     pub(crate) fn built(&self) -> u64 {
         self.built
+    }
+
+    /// Which answer this map came from (see [`AnswerOrigin`]).
+    pub(crate) fn origin(&self) -> AnswerOrigin {
+        AnswerOrigin {
+            taken: self.built,
+            input: self.input,
+        }
+    }
+
+    /// Name the input this map's answer was given for (see
+    /// [`AnswerOrigin::input`]), as the registry applies the answer.
+    pub(crate) fn set_input(&mut self, input: u64) {
+        self.input = input;
     }
 
     /// The virtual text this map's answer was given for.

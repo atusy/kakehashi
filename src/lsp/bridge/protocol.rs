@@ -39,9 +39,9 @@ pub(crate) use lifecycle::*;
 #[cfg(test)]
 pub(crate) use prepare::apply_prepare_result;
 pub(crate) use prepare::{
-    Bias, PREPARE_METHOD, PREPARE_TIMEOUT, PrepareHostTextDocument, PrepareParams, PrepareResult,
-    PrepareTextDocument, PreparedDocument, PreparedMap, VirtualLayout, apply_prepare_result_at,
-    next_presentation, parse_prepare_response,
+    AnswerOrigin, Bias, PREPARE_METHOD, PREPARE_TIMEOUT, PrepareHostTextDocument, PrepareParams,
+    PrepareResult, PrepareTextDocument, PreparedDocument, PreparedMap, VirtualLayout,
+    apply_prepare_result_at, next_presentation, parse_prepare_response,
 };
 pub(crate) use request::*;
 pub(crate) use request_id::RequestId;

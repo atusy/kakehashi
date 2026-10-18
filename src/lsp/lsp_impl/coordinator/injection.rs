@@ -2956,12 +2956,27 @@ mod tests {
         )
         .unwrap()
         .map
-        .built();
+        .origin()
+        .taken;
         injection.process_injections_for_resync(&uri).await;
         assert!(failed());
-        // The failure is the input's, not the pass's: that later answer is a
-        // newer text's, and is not refused by it.
-        assert!(!pool.prepare_failed(&uri, "rust", &region.region_id, Some(after)));
+        // The failure is the input's, not the pass's: an answer for that
+        // input taken after it is not refused by it, one taken before is.
+        let failure = server
+            .bridge
+            .prepare_failed_at(&uri, "rust", &region.region_id)
+            .unwrap();
+        let answer = |taken| crate::lsp::bridge::AnswerOrigin {
+            taken,
+            input: failure.input,
+        };
+        assert!(!pool.prepare_failed(&uri, "rust", &region.region_id, Some(answer(after))));
+        assert!(pool.prepare_failed(
+            &uri,
+            "rust",
+            &region.region_id,
+            Some(answer(failure.taken - 1))
+        ));
     }
 
     /// A probe that finds no prepare target leaves the region's lookups be:
