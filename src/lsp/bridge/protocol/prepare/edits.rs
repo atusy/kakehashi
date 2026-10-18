@@ -63,15 +63,36 @@ impl PreparedMap {
         // mapped one by one neither sees: at a line start, or with a line
         // break or no text at all on the side where they meet. Mid-line
         // between text, neither decides anything there.
-        if order.windows(2).any(|pair| {
+        //
+        // Lines inserted at a line start before another edit there (an
+        // import above the line a completion rewrites) are the exception:
+        // the insertion ends with a line break, after which the existing
+        // line regains its own indent, and the later edit, starting with
+        // text, keeps to that line — provided it maps after the insertion
+        // (one taking the line's removed indent along would not; checked
+        // once mapped).
+        let lines_before = |earlier: usize, later: usize| {
+            ranges[earlier].is_empty()
+                && edits[earlier].new_text.ends_with(['\n', '\r'])
+                && begins_line(edits[later].new_text.chars().next())
+        };
+        let mut lines_inserted_before = Vec::new();
+        for pair in order.windows(2) {
             let (earlier, later) = (pair[0], pair[1]);
             let meeting = ranges[later].start;
-            ranges[earlier].end == meeting
-                && (is_line_start(prepared, meeting)
-                    || !begins_line(edits[earlier].new_text.chars().next_back())
-                    || !begins_line(edits[later].new_text.chars().next()))
-        }) {
-            return None;
+            if ranges[earlier].end != meeting {
+                continue;
+            }
+            if is_line_start(prepared, meeting) {
+                if !lines_before(earlier, later) {
+                    return None;
+                }
+                lines_inserted_before.push((earlier, later));
+            } else if !begins_line(edits[earlier].new_text.chars().next_back())
+                || !begins_line(edits[later].new_text.chars().next())
+            {
+                return None;
+            }
         }
         let mut mapped = vec![None; edits.len()];
         for &index in &order {
@@ -86,6 +107,12 @@ impl PreparedMap {
             .into_iter()
             .map(|hunk| hunk.expect("every edit is placed"))
             .collect();
+        if lines_inserted_before
+            .iter()
+            .any(|&(earlier, later)| mapped[earlier].0.start != mapped[later].0.start)
+        {
+            return None;
+        }
         self.mapped_edits_keep_host_text(&mapped).then(|| {
             mapped
                 .into_iter()

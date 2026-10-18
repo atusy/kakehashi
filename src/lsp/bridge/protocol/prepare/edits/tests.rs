@@ -167,6 +167,8 @@ fn touching_edits_are_refused() {
         [edit((0, 0), (0, 0), "a"), edit((0, 0), (0, 2), "if")],
         [edit((0, 0), (1, 0), "z\n"), edit((1, 0), (2, 0), "")],
         [edit((1, 0), (1, 1), "w"), edit((0, 0), (1, 0), "")],
+        // Lines inserted before a change taking the line's indent along.
+        [edit((1, 0), (1, 0), "w\n"), edit((1, 0), (2, 0), "")],
     ] {
         assert_eq!(map.map_edits(&edits, EditMode::Extent), None, "{edits:?}");
     }
@@ -176,21 +178,30 @@ fn touching_edits_are_refused() {
 }
 
 #[test]
-fn edits_touching_mid_line_between_text_map() {
-    // Neither decides an indent nor a line break where they meet (a
-    // completion rewriting the receiver right before its own range, say).
-    let (virtual_text, map) = dedented();
-    let edits = [edit((0, 3), (0, 3), "z"), edit((0, 2), (0, 3), "_")];
+fn lines_inserted_before_an_edit_on_the_same_line_map() {
+    // A completion rewriting `pa` on the region's first line with an import
+    // added above it.
+    let virtual_text = "  pa\n  x\n";
+    let map = dedent_by_two(virtual_text);
+    let edits = [
+        edit((0, 0), (0, 2), "Path"),
+        edit((0, 0), (0, 0), "from pathlib import Path\n"),
+    ];
     let mapped = map.map_edits(&edits, EditMode::Extent).unwrap();
-    assert_eq!(apply_to(&virtual_text, &mapped), "  if_zx:\n    y\n");
-    // With no text, or a line break, on the side where they meet, they do.
-    for edits in [
-        [edit((0, 2), (0, 3), ""), edit((0, 3), (0, 3), "z")],
-        [edit((0, 2), (0, 3), "\n"), edit((0, 3), (0, 3), "z")],
-        [edit((0, 2), (0, 3), "_"), edit((0, 3), (0, 3), "\rz")],
-    ] {
-        assert_eq!(map.map_edits(&edits, EditMode::Extent), None, "{edits:?}");
-    }
+    assert_eq!(
+        apply_to(virtual_text, &mapped),
+        "  from pathlib import Path\n  Path\n  x\n"
+    );
+    // Two imports at one place, in the order sent.
+    let edits = [
+        edit((0, 0), (0, 0), "import a\n"),
+        edit((0, 0), (0, 0), "import b\n"),
+    ];
+    let mapped = map.map_edits(&edits, EditMode::Extent).unwrap();
+    assert_eq!(
+        apply_to(virtual_text, &mapped),
+        "  import a\n  import b\n  pa\n  x\n"
+    );
 }
 
 #[test]
