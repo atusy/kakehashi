@@ -362,7 +362,7 @@ pub(crate) struct HostVirtualContents {
     /// Only accepted parse-label promotions establish this admission fence.
     /// Explicit aliases keep their existing canonical request behavior.
     promoted_language: Option<HostLanguageAdmission>,
-    contents: DashMap<String, DashMap<String, Arc<LatestText>>>,
+    contents: DashMap<String, DashMap<String, LatestText>>,
     /// (language, region id) of the regions the lifecycle pass holds for a
     /// prepare peer known to prepare them (see
     /// [`LanguageServerPool::hold_latest_virtual_content`]): no request opens
@@ -386,8 +386,17 @@ impl HostVirtualContents {
 /// The latest text forwarded for a virtual document, which a deferred
 /// didOpen substitutes: what downstream servers are sent, with the prepared
 /// map when a peer prepared it.
+#[derive(Debug, Clone)]
+pub(crate) enum LatestText {
+    /// Without experimental features: the text alone, one allocation as
+    /// before preparing existed, since nothing reads a map or a stamp.
+    Text(Arc<str>),
+    /// With them: when it was recorded, and the map a peer prepared it with.
+    Stamped(Arc<StampedText>),
+}
+
 #[derive(Debug)]
-pub(crate) struct LatestText {
+pub(crate) struct StampedText {
     text: String,
     map: Option<Arc<super::protocol::PreparedMap>>,
     /// When it was last recorded (see [`super::protocol::next_presentation`]),
@@ -398,10 +407,33 @@ pub(crate) struct LatestText {
 
 impl LatestText {
     fn as_sent(&self) -> SentText<'_> {
-        SentText {
-            text: &self.text,
-            map: self.map.as_ref(),
+        match self {
+            Self::Text(text) => SentText { text, map: None },
+            Self::Stamped(stamped) => SentText {
+                text: &stamped.text,
+                map: stamped.map.as_ref(),
+            },
         }
+    }
+
+    fn map(&self) -> Option<&Arc<super::protocol::PreparedMap>> {
+        match self {
+            Self::Text(_) => None,
+            Self::Stamped(stamped) => stamped.map.as_ref(),
+        }
+    }
+
+    /// When it was last recorded; never, without experimental features.
+    fn recorded(&self) -> u64 {
+        match self {
+            Self::Text(_) => 0,
+            Self::Stamped(stamped) => stamped.recorded.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    fn is(&self, content: SentText<'_>) -> bool {
+        let held = self.as_sent();
+        held.text == content.text && held.map.map(Arc::as_ref) == content.map.map(Arc::as_ref)
     }
 }
 
@@ -2901,7 +2933,7 @@ impl LanguageServerPool {
                         .and_then(|regions| {
                             regions
                                 .get(virtual_uri.region_id())
-                                .map(|entry| Arc::clone(entry.value()))
+                                .map(|entry| entry.value().clone())
                         })
                 }),
             ),
@@ -2919,11 +2951,12 @@ impl LanguageServerPool {
         // check.
         // Never a cached text as is for a held region, however new.
         let virtual_content = current_content
-            .as_deref()
+            .as_ref()
             .filter(|cached| {
-                provided.map.is_none_or(|request| {
-                    cached.recorded.load(std::sync::atomic::Ordering::Relaxed) > request.built()
-                }) && (cached.map.is_some() || !region_held)
+                provided
+                    .map
+                    .is_none_or(|request| cached.recorded() > request.built())
+                    && (cached.map().is_some() || !region_held)
             })
             .map_or(provided, LatestText::as_sent);
         // What the connection holds is recorded as the didOpen is queued,
@@ -3036,20 +3069,24 @@ impl LanguageServerPool {
             }
         };
         let latest = || {
-            Arc::new(LatestText {
-                text: content.text.to_string(),
-                map: content.map.cloned(),
-                recorded: std::sync::atomic::AtomicU64::new(stamp()),
-            })
+            if stamped {
+                LatestText::Stamped(Arc::new(StampedText {
+                    text: content.text.to_string(),
+                    map: content.map.cloned(),
+                    recorded: std::sync::atomic::AtomicU64::new(stamp()),
+                }))
+            } else {
+                LatestText::Text(Arc::from(content.text))
+            }
         };
         match host.contents.get(language) {
-            Some(regions) => match regions.get(region_id).filter(|cached| {
-                cached.text == content.text && cached.map.as_deref() == content.map.map(Arc::as_ref)
-            }) {
-                Some(_) if !stamped => return,
-                Some(cached) => cached
-                    .recorded
-                    .store(stamp(), std::sync::atomic::Ordering::Relaxed),
+            Some(regions) => match regions.get(region_id).filter(|cached| cached.is(content)) {
+                Some(cached) => match cached.value() {
+                    LatestText::Text(_) => return,
+                    LatestText::Stamped(cached) => cached
+                        .recorded
+                        .store(stamp(), std::sync::atomic::Ordering::Relaxed),
+                },
                 None => {
                     regions.insert(region_id.to_string(), latest());
                 }
@@ -9877,7 +9914,7 @@ mod tests {
         let before = {
             let host = pool.latest_virtual_contents.get(&host_uri).unwrap();
             let regions = host.contents.get("lua").unwrap();
-            Arc::clone(regions.get(TEST_ULID_LUA_0).unwrap().value())
+            regions.get(TEST_ULID_LUA_0).unwrap().value().clone()
         };
 
         pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "print('same')");
@@ -9885,7 +9922,11 @@ mod tests {
         let after = {
             let host = pool.latest_virtual_contents.get(&host_uri).unwrap();
             let regions = host.contents.get("lua").unwrap();
-            Arc::clone(regions.get(TEST_ULID_LUA_0).unwrap().value())
+            regions.get(TEST_ULID_LUA_0).unwrap().value().clone()
+        };
+        // Without experimental features, the text alone: one allocation.
+        let (LatestText::Text(before), LatestText::Text(after)) = (before, after) else {
+            panic!("no stamp nor map without experimental features");
         };
         assert!(Arc::ptr_eq(&before, &after));
     }
