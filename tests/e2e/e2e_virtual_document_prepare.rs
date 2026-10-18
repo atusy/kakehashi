@@ -309,8 +309,9 @@ fn edits_on_a_prepared_document_map_back_reindented() {
             "newText": "-- c\n  "
         }])
     );
-    // A caret in the removed indent gets none: the server would see it at
-    // the line's content.
+    // A caret in the removed indent gets none, not even an item without an
+    // edit, which the client would insert at the caret unmapped: the server
+    // would see it at the line's content.
     let response = client.send_request(
         "textDocument/completion",
         json!({ "textDocument": { "uri": uri }, "position": { "line": 4, "character": 1 } }),
@@ -342,7 +343,8 @@ fn edits_on_a_prepared_document_map_back_reindented() {
         }])
     );
 
-    // A presentation keyed to the request range over `x` maps back onto it.
+    // A presentation keyed to the request range over `x` maps back onto it,
+    // as does one the server places there itself (P (0, 6)-(0, 7)).
     let range = json!({
         "start": { "line": 3, "character": 8 },
         "end": { "line": 3, "character": 9 }
@@ -356,10 +358,14 @@ fn edits_on_a_prepared_document_map_back_reindented() {
         }),
     );
     let presentations = result_items(&response);
-    assert_eq!(presentations.len(), 1, "{response}");
+    assert_eq!(presentations.len(), 2, "{response}");
     assert_eq!(
         presentations[0]["textEdit"],
         json!({ "range": range, "newText": "#ff0000" })
+    );
+    assert_eq!(
+        presentations[1]["textEdit"],
+        json!({ "range": range, "newText": "#00ff00" })
     );
 }
 

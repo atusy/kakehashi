@@ -870,6 +870,12 @@ mod tests {
     /// A region at host line 10 holding `virtual_text`, dedented by two on
     /// every line starting with two spaces.
     fn dedented_offset(virtual_text: &str) -> RegionOffset {
+        RegionOffset::new(10, 0).with_prepared(dedented_map(virtual_text))
+    }
+
+    /// The map of `virtual_text` dedented by two on every line starting
+    /// with two spaces.
+    fn dedented_map(virtual_text: &str) -> std::sync::Arc<crate::lsp::bridge::PreparedMap> {
         use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
         let changes: Vec<_> = virtual_text
             .split('\n')
@@ -883,14 +889,13 @@ mod tests {
         let result =
             serde_json::from_value(json!({"segments": [{"type": "content", "changes": changes}]}))
                 .unwrap();
-        let map = apply_prepare_result(
+        apply_prepare_result(
             virtual_text,
             &VirtualLayout::single(virtual_text),
             Some(result),
         )
         .unwrap()
-        .map;
-        RegionOffset::new(10, 0).with_prepared(map)
+        .map
     }
 
     fn item(value: serde_json::Value) -> CompletionItem {
@@ -943,8 +948,10 @@ mod tests {
     #[test]
     fn a_prepared_item_without_a_text_edit_drops_its_additional_edits() {
         // Inserted at the caret over a range the client picks: there is no
-        // primary edit to check the additional edits with.
-        let offset = dedented_offset("  a\n  \n  b\n");
+        // primary edit to check the additional edits with. (A region at line
+        // 0, where the edits as sent would be in bounds: only the refusal
+        // drops them.)
+        let offset = RegionOffset::new(0, 0).with_prepared(dedented_map("  a\n  \n  b\n"));
         let mut completed = item(json!({
             "label": "x",
             "additionalTextEdits": [{
@@ -955,8 +962,8 @@ mod tests {
         assert!(transform_completion_item(
             &mut completed,
             &offset,
-            Position::new(13, 0),
-            Some(Position::new(11, 2)),
+            Position::new(3, 0),
+            Some(Position::new(1, 2)),
             ClientInsertMode::default(),
         ));
         assert_eq!(completed.additional_text_edits, None);
@@ -1214,6 +1221,28 @@ mod tests {
         assert_eq!(edit.insert.start, Position::new(11, 4));
         assert_eq!(edit.replace.end, Position::new(11, 5));
         assert_eq!(edit.new_text, "yes\n    z");
+    }
+
+    #[test]
+    fn insert_replace_ranges_mapping_the_text_apart_are_refused() {
+        // `ab`, dedented: inserted before `b` the line break is followed by
+        // `b`, whose line regains the indent; replacing `b` it ends the
+        // line. The shared text would differ between the client's choices.
+        let mut edit = tower_lsp_server::ls_types::InsertReplaceEdit {
+            new_text: "x\n".to_string(),
+            insert: tower_lsp_server::ls_types::Range::new(
+                Position::new(0, 1),
+                Position::new(0, 1),
+            ),
+            replace: tower_lsp_server::ls_types::Range::new(
+                Position::new(0, 1),
+                Position::new(0, 2),
+            ),
+        };
+        assert_eq!(
+            translate_insert_replace_edit_to_host(&mut edit, None, &dedented_offset("  ab\n  c\n")),
+            None
+        );
     }
 
     #[test]

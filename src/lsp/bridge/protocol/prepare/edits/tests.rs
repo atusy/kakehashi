@@ -934,6 +934,48 @@ fn a_range_reaching_into_a_gap_is_in_it() {
     assert!(!map.virtual_range_in_gap(LspRange::new(pos(0, 4), pos(0, 4))));
 }
 
+#[test]
+fn a_caret_on_the_first_deleted_closing_line_is_in_removed_indent() {
+    let (_, map) = trailing_blank_dedented();
+    // V (1, 0) is where the deleted lines start, and P's end maps there, but
+    // what the client inserts at a caret there joins the first of those
+    // lines, which P does not have.
+    assert!(!map.virtual_position_in_removed_indent(pos(0, 3)));
+    assert!(map.virtual_position_in_removed_indent(pos(1, 0)));
+    assert!(map.virtual_position_in_removed_indent(pos(1, 1)));
+    assert!(map.virtual_position_in_removed_indent(pos(2, 0)));
+}
+
+#[test]
+fn a_caret_at_the_end_of_a_deleted_closing_indent_is_in_removed_indent() {
+    // `''\n  a\n\n  ''`'s value ends after `a`: a caret right before the
+    // closing `''` stands for P's end, which maps above the blank line.
+    let map = prepare(
+        "  a\n\n  ",
+        json!([
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": ""},
+            {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
+        ]),
+    );
+    assert!(!map.virtual_position_in_removed_indent(pos(0, 3)));
+    assert!(map.virtual_position_in_removed_indent(pos(1, 0)));
+    assert!(map.virtual_position_in_removed_indent(pos(2, 0)));
+    assert!(map.virtual_position_in_removed_indent(pos(2, 2)));
+}
+
+#[test]
+fn a_caret_in_a_removed_indent_or_a_deleted_leading_line_is_in_removed_indent() {
+    let (_, map) = leading_blank_dedented();
+    // P has no position on the deleted line nor inside the indent: a caret
+    // there stands in for one at the line's content.
+    assert!(map.virtual_position_in_removed_indent(pos(0, 0)));
+    assert!(map.virtual_position_in_removed_indent(pos(1, 0)));
+    assert!(map.virtual_position_in_removed_indent(pos(1, 1)));
+    assert!(!map.virtual_position_in_removed_indent(pos(1, 2)));
+    assert!(!map.virtual_position_in_removed_indent(pos(1, 3)));
+}
+
 // =============================================================================
 // Property: mapped edits keep the host's text and the server's content
 // =============================================================================

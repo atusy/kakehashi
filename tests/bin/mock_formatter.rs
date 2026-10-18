@@ -25,8 +25,9 @@
 //!   formatting uppercase; rename replaces the first line; a pull diagnostic
 //!   spans the first line and carries the full text; completion inserts
 //!   `int(x)\nprint(y)` at the caret and the line `-- c` above the
-//!   document's first, inlay hints and color presentations answer as in the
-//!   other modes. Proves what a prepared virtual
+//!   document's first (and offers `echo-plain` with no edit), inlay hints
+//!   answer as in the other modes, and color presentations add one over
+//!   (0, 6)-(0, 7). Proves what a prepared virtual
 //!   document looks like downstream and how its coordinates map back. On a
 //!   save of a text holding `SHOW` it asks the editor to show the document
 //!   with its first line selected; holding `EDIT`, it asks to apply an edit
@@ -1184,7 +1185,7 @@ fn main() {
             // data survived the round trip through the routing envelope (#958).
             "textDocument/completion" if mode == "echo-document" => {
                 let position = message["params"]["position"].clone();
-                let result = json!({"isIncomplete": false, "items": [{
+                let result = json!({"isIncomplete": false, "items": [{ "label": "echo-plain" }, {
                     "label": "echo-edit",
                     "textEdit": {
                         "range": { "start": position, "end": position },
@@ -2187,10 +2188,24 @@ fn main() {
                         .filter(|uri| documents.contains_key(*uri))
                         .and(range)
                         .map(|range| {
-                            json!([{
+                            let mut presentations = json!([{
                                 "label": label,
                                 "textEdit": { "range": range, "newText": new_text }
-                            }])
+                            }]);
+                            // One the server places itself: (0, 6)-(0, 7).
+                            if mode == "echo-document" {
+                                presentations.as_array_mut().unwrap().push(json!({
+                                    "label": "echo-fixed",
+                                    "textEdit": {
+                                        "range": {
+                                            "start": { "line": 0, "character": 6 },
+                                            "end": { "line": 0, "character": 7 }
+                                        },
+                                        "newText": "#00ff00"
+                                    }
+                                }));
+                            }
+                            presentations
                         })
                         .unwrap_or(Value::Null)
                 };

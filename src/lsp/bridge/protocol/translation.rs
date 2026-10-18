@@ -270,6 +270,10 @@ pub(crate) fn translate_virtual_main_and_additional_edits_to_host(
         let mut set = Vec::with_capacity(additional.len() + 1);
         set.push(sent);
         set.extend(additional.iter().cloned());
+        // Each edit maps from P and itself alone (touching edits whose texts
+        // would bear on each other are refused), so the main edit maps in
+        // the set as alone and the additional edits alike for every main:
+        // these comparisons guard that the set sent is the set checked.
         if !translate_virtual_text_edits_to_host(&mut set, offset, mode) || set[0] != *mapped {
             return Some(false);
         }
@@ -504,6 +508,27 @@ mod tests {
             range,
             Range::new(Position::new(10, 6), Position::new(11, 0))
         );
+    }
+
+    #[test]
+    fn a_host_caret_in_removed_indent_is_recognized() {
+        // `prepared_offset`: host line 11 is V line 1 (`    y`), from column
+        // 0, its first two columns removed.
+        let offset = prepared_offset();
+        for character in [0, 1] {
+            assert!(
+                host_position_in_removed_indent(Position::new(11, character), &offset),
+                "{character}"
+            );
+        }
+        assert!(!host_position_in_removed_indent(
+            Position::new(11, 2),
+            &offset
+        ));
+        assert!(!host_position_in_removed_indent(
+            Position::new(11, 1),
+            &RegionOffset::new(10, 4)
+        ));
     }
 
     #[test]
