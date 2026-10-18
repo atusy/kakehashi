@@ -1483,6 +1483,37 @@ mod tests {
         ));
     }
 
+    /// An item without a textEdit is made one only from single-line text:
+    /// multi-line text is dropped before the caret probe, so the edit it is
+    /// given never spans lines, and no client insert mode re-indents it.
+    #[rstest]
+    #[case::as_is_settable(ClientInsertMode::AsIsSettable)]
+    #[case::adjusting(ClientInsertMode::AdjustsIndentation)]
+    #[case::as_is(ClientInsertMode::AsIs)]
+    fn an_implicit_item_is_made_an_edit_only_on_one_line(#[case] insert_mode: ClientInsertMode) {
+        // A blank line among dedented ones: the caret there regains the indent.
+        let offset = dedented_offset("  a\n\n  b\n");
+        let transform = |completed: &mut CompletionItem| {
+            transform_completion_item(
+                completed,
+                &offset,
+                Position::new(13, 0),
+                Some(Position::new(11, 0)),
+                insert_mode,
+            )
+        };
+        let mut single = item(json!({"label": "foo"}));
+        assert!(transform(&mut single));
+        let Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(edit)) = &single.text_edit
+        else {
+            panic!("made an edit: {single:?}");
+        };
+        assert_eq!(edit.new_text, "  foo");
+        assert_eq!(single.insert_text_mode, None);
+        let mut multi = item(json!({"label": "x", "insertText": "if a:\n  b"}));
+        assert!(!transform(&mut multi));
+    }
+
     #[test]
     fn an_implicit_item_whose_caret_edit_maps_off_the_caret_is_dropped() {
         // The caret right after the emptied interpolation's host text: the
