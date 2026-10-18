@@ -3393,8 +3393,13 @@ impl LanguageServerPool {
     /// Whether the host text a prepared request's map describes is still
     /// the region's current host text, read from the region's latest
     /// recorded content in one step: whether it is settled, its hold, then
-    /// its map.
+    /// its map — once the map itself is not revoked.
     ///
+    /// - Revoked (its peer failed its input since: see
+    ///   `PreparedMap::revoked`): an answer it no longer gives — no. The
+    ///   executor refuses such a reply whole once it arrives (see
+    ///   [`Self::prepare_failed`]); read here too, a revocation landing
+    ///   after that check still places no edit through the map.
     /// - Not settled (the host edited, the lifecycle pass for the edit not
     ///   finished, so the recorded content may predate it; see
     ///   [`Self::note_host_edited`]): the host moved, to a map not known
@@ -3420,6 +3425,9 @@ impl LanguageServerPool {
         region_id: &str,
         request_map: &super::protocol::PreparedMap,
     ) -> bool {
+        if request_map.revoked() {
+            return false;
+        }
         let Some(host) = self.latest_virtual_contents.get(host_uri) else {
             return true;
         };
