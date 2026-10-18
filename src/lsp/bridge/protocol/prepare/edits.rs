@@ -981,6 +981,9 @@ enum Alignment {
     /// A line written as an old line's text with more after it: that line,
     /// lines joined onto it (see [`joined_lines`]).
     Joined,
+    /// Blank lines with blank lines, as many as can pair, those alike to
+    /// the whitespace first (see [`blank_lines`]).
+    Blanks,
 }
 
 /// How [`align_lines`] pairs lines, from the surest to the loosest:
@@ -989,24 +992,75 @@ enum Alignment {
 ///   once in each text anchoring the rest (patience): a reindented line is
 ///   the line it was, and a blank line cannot pair with it instead.
 /// - Lines of text other lines were joined onto.
-/// - Lines holding whitespace alike but for their line break (patience
-///   again: such a line unlike the others is that line), before empty
-///   lines, which are all alike, can pair with it instead.
-/// - Blank lines alike but for whitespace, before text written in a run
-///   can take a blank line's place: a blank line given other whitespace is
-///   the line it was, and a line written beside it one of its own.
+/// - Blank lines among themselves: as many as can pair, so that text the
+///   formatter writes beside blank lines is never read as written on one
+///   while a blank line of the answer could be that line; among as many,
+///   those alike to the whitespace (a kept whitespace line kept as it was).
 ///
 /// What is left between pairs (lines rewritten past telling, lines written
 /// or removed) is diffed by character as one run. Which of several blank
-/// lines alike a line was written on, or which went, no answer tells: the
-/// run's diff decides, and text it writes on a whitespace line the peer
-/// kept gains no indent.
-const ALIGNMENTS: [Alignment; 4] = [
+/// lines alike a line was written on, or which went, no answer tells; text
+/// the run's diff writes on a whitespace line the peer kept gains no
+/// indent, as typed text there does.
+const ALIGNMENTS: [Alignment; 3] = [
     Alignment::Diff(1, similar::Algorithm::Patience, |key| !key.is_empty()),
     Alignment::Joined,
-    Alignment::Diff(0, similar::Algorithm::Patience, |key| !key.is_empty()),
-    Alignment::Diff(1, similar::Algorithm::Myers, |_| true),
+    Alignment::Blanks,
 ];
+
+/// Pairs of the blank lines of `old_range` with those of `new_range`, in
+/// order: as many as an alignment of them can pair, and among those, as
+/// many pairs alike to the whitespace as can be. Lines of text take no
+/// part. Quadratic in the blank lines: past `deadline` it pairs nothing,
+/// for the answer to be refused.
+fn blank_lines(
+    old_keys: &[Vec<String>; 2],
+    new_keys: &[Vec<String>; 2],
+    old_range: &Range<usize>,
+    new_range: &Range<usize>,
+    deadline: Instant,
+) -> Vec<(usize, usize)> {
+    let blanks = |keys: &[Vec<String>; 2], range: &Range<usize>| -> Vec<usize> {
+        range
+            .clone()
+            .filter(|&index| keys[1][index].is_empty())
+            .collect()
+    };
+    let (old, new) = (blanks(old_keys, old_range), blanks(new_keys, new_range));
+    // Alike to the whitespace, holding some: empty lines are all alike, and
+    // say nothing of which is which.
+    let alike = |old_line: usize, new_line: usize| {
+        !old_keys[0][old_line].is_empty() && old_keys[0][old_line] == new_keys[0][new_line]
+    };
+    // score[i][j]: the best of old[i..] against new[j..]; a pair counts 1,
+    // and 2 more when alike to the whitespace: a pair alike outweighs any
+    // one other pair it would cost.
+    let mut score = vec![vec![0u32; new.len() + 1]; old.len() + 1];
+    for i in (0..old.len()).rev() {
+        if Instant::now() >= deadline {
+            return Vec::new();
+        }
+        for j in (0..new.len()).rev() {
+            let alike = alike(old[i], new[j]);
+            let paired = score[i + 1][j + 1] + 1 + 2 * u32::from(alike);
+            score[i][j] = paired.max(score[i + 1][j]).max(score[i][j + 1]);
+        }
+    }
+    let mut pairs = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < old.len() && j < new.len() {
+        let alike = alike(old[i], new[j]);
+        if score[i][j] == score[i + 1][j + 1] + 1 + 2 * u32::from(alike) {
+            pairs.push((old[i], new[j]));
+            (i, j) = (i + 1, j + 1);
+        } else if score[i][j] == score[i + 1][j] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    pairs
+}
 
 /// Pairs of an old line and the new line written as its text with more
 /// after it, in order: the first such old line for each new line, past the
@@ -1065,6 +1119,7 @@ fn align_lines(
     };
     let pairs: Vec<(usize, usize)> = match alignment {
         Alignment::Joined => joined_lines(old_keys, new_keys, &old_range, &new_range, deadline),
+        Alignment::Blanks => blank_lines(old_keys, new_keys, &old_range, &new_range, deadline),
         Alignment::Diff(keys, algorithm, takes_part) => {
             let candidates = |all: &[String], range: &Range<usize>| -> Vec<usize> {
                 range
