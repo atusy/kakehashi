@@ -202,6 +202,9 @@ impl Kakehashi {
                 let mut current: std::borrow::Cow<'_, str> = std::borrow::Cow::Borrowed(&original);
                 let mut producers = 0usize;
                 let mut sole_edits: Option<Vec<TextEdit>> = None;
+                // The prepared regions virt edits were mapped through: the
+                // result builds on them, checked once it is final.
+                let mut virt_sources = Vec::new();
                 for layer in &layer_cfg.priorities {
                     let edits = match layer {
                         LayerSource::Virt => {
@@ -214,9 +217,6 @@ impl Kakehashi {
                                 );
                                 continue;
                             }
-                            // Used at once, as the text the next layer formats:
-                            // checked as the final answer is (see the
-                            // preferred arm).
                             self.virt_format_edits(
                                 &uri,
                                 &snapshot,
@@ -228,13 +228,9 @@ impl Kakehashi {
                                 revision,
                             )
                             .await?
-                            .and_then(|(edits, sources)| {
-                                self.formatting_sources_current(
-                                    &lsp_uri,
-                                    &sources,
-                                    &cancel_state.request_error_sink,
-                                )
-                                .then_some(edits)
+                            .map(|(edits, sources)| {
+                                virt_sources = sources;
+                                edits
                             })
                         }
                         LayerSource::Host => {
@@ -252,6 +248,16 @@ impl Kakehashi {
                         producers += 1;
                         sole_edits = Some(edits);
                     }
+                }
+                // The final answer: the virt edits it builds on checked once
+                // more against the host text, which may have moved while later
+                // layers ran.
+                if !self.formatting_sources_current(
+                    &lsp_uri,
+                    &virt_sources,
+                    &cancel_state.request_error_sink,
+                ) {
+                    return Ok(None);
                 }
                 match producers {
                     0 => None,
