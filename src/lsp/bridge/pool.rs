@@ -2836,14 +2836,19 @@ impl LanguageServerPool {
                     .get(host_uri)
                     .is_some_and(|host| host.holds(virtual_uri.language(), virtual_uri.region_id()))
         };
+        // Whatever the text comes from: a snapshot checked against the
+        // host's revision too, as the hold can come after it was taken
+        // without moving that revision (an epoch move gaining the pair its
+        // peer).
         let refused = |content: &VirtualOpenContent<'_>, held: bool| {
-            matches!(content, VirtualOpenContent::LatestKnown(provided)
-                if self.prepare_failed(
-                    host_uri,
-                    virtual_uri.language(),
-                    virtual_uri.region_id(),
-                    provided.map.map(|map| &**map),
-                ) || provided.map.is_none() && held)
+            let (VirtualOpenContent::LatestKnown(provided)
+            | VirtualOpenContent::Snapshot(provided)) = content;
+            self.prepare_failed(
+                host_uri,
+                virtual_uri.language(),
+                virtual_uri.region_id(),
+                provided.map.map(|map| &**map),
+            ) || provided.map.is_none() && held
         };
         if refused(&content, region_held()) {
             drop(transition_guard);
@@ -10222,6 +10227,48 @@ mod tests {
         // Without the prepare layer, nothing is.
         let plain = LanguageServerPool::new();
         assert!(!plain.refuses_text_as_is(&host_uri, &virtual_uri, &key));
+    }
+
+    /// A snapshot open (an eager open checked against the host's revision)
+    /// is refused like any other once the lifecycle pass holds its region:
+    /// the hold can come after the snapshot was taken without moving the
+    /// host's revision (an epoch move gaining the pair its peer).
+    #[tokio::test]
+    async fn a_snapshot_open_of_a_held_region_is_refused_as_is() {
+        let pool = LanguageServerPool::preparing();
+        let host_uri = Url::parse("file:///test/snapshot-open-held.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
+        assert!(
+            pool.ensure_document_opened_from_snapshot(
+                &mut sender,
+                &host_uri,
+                &virtual_uri,
+                "  x = 1",
+                &key
+            )
+            .await
+            .is_err()
+        );
+        assert!(rx.try_recv().is_err(), "nothing was sent as is");
+        // A prepared snapshot opens it.
+        let map = dedent_map("  x = 1");
+        pool.ensure_document_opened_from_snapshot(
+            &mut sender,
+            &host_uri,
+            &virtual_uri,
+            SentText {
+                text: "x = 1",
+                map: Some(&map),
+            },
+            &key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened_text(&mut rx), "x = 1");
     }
 
     #[tokio::test]
