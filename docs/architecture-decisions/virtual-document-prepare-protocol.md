@@ -211,8 +211,9 @@ covers the indentation the peer removed from that line, and a change ending
 at a line start keeps that line's own removed indentation (the change takes
 it along and gives it back). Every line the edit's text begins regains the
 indentation the peer removed from the segment it lands in, provided every
-indentation the peer removed in that segment is the same (lines it left
-alone do not count); otherwise an edit creating a line there is refused,
+indentation the peer removed from the segment's content lines is the same
+(lines it left alone do not count, nor do whitespace-only lines, but in a
+segment holding nothing else); otherwise an edit creating a line there is refused,
 since no single indentation is right. A segment that says nothing of its
 indentation (no indentation removed, and no block of text opening a line
 of its own: the rest of a line after an interpolation, blank lines)

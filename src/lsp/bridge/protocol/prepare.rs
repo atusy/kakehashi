@@ -394,6 +394,10 @@ fn build_prepared(
                 .map_err(|reason| PrepareError::InvalidChange { index, reason })?;
                 let mut cursor = segment.virtual_range.start;
                 let mut deleted: Vec<&str> = Vec::new();
+                // Indentation removed from whitespace-only lines: the
+                // content's indent only in a segment with no content line to
+                // say it (a blank line left indented says nothing of it).
+                let mut blank: Vec<&str> = Vec::new();
                 let mut closing: Option<&str> = None;
                 let deletes_closing_lines = deletions
                     .iter()
@@ -429,7 +433,15 @@ fn build_prepared(
                     if closing_indent {
                         closing = Some(&virtual_text[deletion.clone()]);
                     } else if kind == RunKind::Deleted {
-                        deleted.push(&virtual_text[deletion.clone()]);
+                        let rest_of_line = virtual_text[deletion.end..]
+                            .split(['\n', '\r'])
+                            .next()
+                            .unwrap_or_default();
+                        if rest_of_line.chars().all(|c| matches!(c, ' ' | '\t')) {
+                            blank.push(&virtual_text[deletion.clone()]);
+                        } else {
+                            deleted.push(&virtual_text[deletion.clone()]);
+                        }
                     }
                     cursor = deletion.end;
                 }
@@ -441,11 +453,17 @@ fn build_prepared(
                     virtual_text,
                     "",
                 );
+                let whitespace_only = virtual_segment
+                    .chars()
+                    .all(|c| matches!(c, ' ' | '\t' | '\n' | '\r'));
+                // Content lines set the indent new lines regain; with none,
+                // the blank lines' removed indentation, then the closing one.
+                if deleted.is_empty() && whitespace_only {
+                    deleted = blank;
+                }
                 if deleted.is_empty()
                     && !deletes_closing_lines
-                    && virtual_segment
-                        .chars()
-                        .all(|c| matches!(c, ' ' | '\t' | '\n' | '\r'))
+                    && whitespace_only
                     && let Some(closing) = closing
                 {
                     deleted.push(closing);
@@ -736,9 +754,11 @@ struct SegmentIndent {
     virtual_range: Range<usize>,
     /// `Some(indent)` when every deletion in the segment removed the same
     /// text (a dedent); `None` when they differ, so a new line has no single
-    /// right indentation. The document's deleted indentation-only last line
-    /// (the closing indent) counts only in a segment of whitespace alone
-    /// with no other deletion and no closing lines deleted with it. A
+    /// right indentation. Indentation removed from whitespace-only lines
+    /// counts only in a segment of whitespace alone (a blank line says
+    /// nothing of the content's indent), and the document's deleted
+    /// indentation-only last line (the closing indent) only there with no
+    /// other deletion and no closing lines deleted with it. A
     /// segment without `evidence` takes the previous segment's instead.
     uniform: Option<String>,
     /// Whether the segment says anything of its indentation: an indent
