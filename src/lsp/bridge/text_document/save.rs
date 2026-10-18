@@ -260,6 +260,55 @@ mod tests {
         assert!(did_save_enqueued.get());
     }
 
+    /// The save loop sends no didSave for a text its peer revoked since it
+    /// was taken, unchanged since the last sync (no didChange either), and
+    /// does for one that stands.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_save_sends_no_did_save_for_a_revoked_unchanged_text() {
+        use crate::lsp::bridge::protocol::{Revocation, VirtualLayout, apply_prepare_result};
+        for revoked in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let wire = dir.path().join("wire");
+            let pool = Arc::new(LanguageServerPool::preparing());
+            let key = ConnectionKey::for_server("save");
+            let handle = test_helpers::create_recording_handle(key.clone(), &wire).await;
+            pool.insert_connection(Arc::clone(&handle)).await;
+            let host_uri = Url::parse("file:///test/save-revoked.md").unwrap();
+            let revocation = Arc::new(Revocation::default());
+            let mut map =
+                apply_prepare_result("print(1)", &VirtualLayout::single("print(1)"), None)
+                    .unwrap()
+                    .map;
+            Arc::get_mut(&mut map)
+                .unwrap()
+                .set_revocation(Arc::clone(&revocation));
+            let injection = BridgeInjection {
+                language: "lua".to_string(),
+                region_id: ulid::Ulid::generate().to_string(),
+                content: "print(1)".to_string(),
+                held: false,
+                prepared: Some(Arc::clone(&map)),
+            };
+            let virtual_uri = VirtualDocumentUri::new(
+                &crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap(),
+                &injection.language,
+                &injection.region_id,
+            );
+            pool.register_opened_document(&host_uri, &virtual_uri, &key)
+                .await;
+            pool.record_sent_for_test(&virtual_uri, &key, injection.sent());
+            if revoked {
+                revocation.revoke(u64::MAX);
+            }
+            pool.sync_and_forward_did_save_to_virtual_docs(&host_uri, 1, &[injection])
+                .await;
+            let sent = test_helpers::sent_before_marker(&handle, &wire).await;
+            assert!(!sent.contains("textDocument/didChange"), "{sent}");
+            assert_eq!(sent.contains("textDocument/didSave"), !revoked, "{sent}");
+        }
+    }
+
     #[tokio::test]
     async fn virtual_save_holds_connection_generation_through_transition() {
         let pool = Arc::new(LanguageServerPool::new());

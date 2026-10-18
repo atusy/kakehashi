@@ -174,3 +174,62 @@ impl LanguageServerPool {
             .ok()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::lsp::bridge::coordinator::BridgeInjection;
+    use crate::lsp::bridge::pool::{ConnectionKey, test_helpers};
+
+    /// A lifecycle didChange whose prepared text was revoked since it was
+    /// taken (across the forwarding's awaits) is not sent; one that stands
+    /// is.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_lifecycle_did_change_sends_no_revoked_text() {
+        use crate::lsp::bridge::protocol::{Revocation, VirtualLayout, apply_prepare_result};
+        for revoked in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let wire = dir.path().join("wire");
+            let pool = Arc::new(LanguageServerPool::preparing());
+            let key = ConnectionKey::for_server("change");
+            let handle = test_helpers::create_recording_handle(key.clone(), &wire).await;
+            pool.insert_connection(Arc::clone(&handle)).await;
+            let host_uri = Url::parse("file:///test/change-revoked.md").unwrap();
+            let revocation = Arc::new(Revocation::default());
+            let mut map =
+                apply_prepare_result("print(2)", &VirtualLayout::single("print(2)"), None)
+                    .unwrap()
+                    .map;
+            Arc::get_mut(&mut map)
+                .unwrap()
+                .set_revocation(Arc::clone(&revocation));
+            let injection = BridgeInjection {
+                language: "lua".to_string(),
+                region_id: ulid::Ulid::generate().to_string(),
+                content: "print(2)".to_string(),
+                held: false,
+                prepared: Some(map),
+            };
+            let virtual_uri = VirtualDocumentUri::new(
+                &crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap(),
+                &injection.language,
+                &injection.region_id,
+            );
+            pool.register_opened_document(&host_uri, &virtual_uri, &key)
+                .await;
+            pool.record_sent_for_test(&virtual_uri, &key, "print(1)".into());
+            if revoked {
+                revocation.revoke(u64::MAX);
+            }
+            let synchronized = pool
+                .forward_didchange_to_opened_docs(&host_uri, 1, &[injection])
+                .await;
+            let sent = test_helpers::sent_before_marker(&handle, &wire).await;
+            assert_eq!(sent.contains("textDocument/didChange"), !revoked, "{sent}");
+            assert_eq!(synchronized, !revoked);
+        }
+    }
+}

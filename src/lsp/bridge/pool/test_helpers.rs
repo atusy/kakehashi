@@ -365,6 +365,70 @@ pub(in crate::lsp::bridge) async fn create_silent_handle_with_key(
     (handle, server)
 }
 
+/// A Ready handle under `key` whose process writes every frame it is sent
+/// to `path`, accepting textless `didSave`: for tests that check what
+/// reached the wire. Read it with [`sent_before_marker`].
+#[cfg(unix)]
+pub(in crate::lsp::bridge) async fn create_recording_handle(
+    key: ConnectionKey,
+    path: &std::path::Path,
+) -> Arc<ConnectionHandle> {
+    use tower_lsp_server::ls_types::{
+        ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncOptions,
+        TextDocumentSyncSaveOptions,
+    };
+    let (handle, _pid) = create_handle_with_command(
+        ConnectionState::Ready,
+        key,
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("cat > '{}'", path.display()),
+        ],
+        None,
+    )
+    .await;
+    handle.set_server_capabilities(ServerCapabilities {
+        text_document_sync: Some(TextDocumentSyncCapability::Options(
+            TextDocumentSyncOptions {
+                save: Some(TextDocumentSyncSaveOptions::Supported(true)),
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    });
+    handle
+}
+
+/// What `handle` (see [`create_recording_handle`]) wrote to `path` before a
+/// marker notification sent now: everything queued before this call, the
+/// writer being FIFO.
+#[cfg(unix)]
+pub(in crate::lsp::bridge) async fn sent_before_marker(
+    handle: &ConnectionHandle,
+    path: &std::path::Path,
+) -> String {
+    const MARKER: &str = "kakehashi/test/marker";
+    let marker =
+        crate::lsp::bridge::protocol::JsonRpcNotification::new(MARKER, serde_json::Value::Null);
+    assert!(matches!(
+        handle.send_notification(marker),
+        crate::lsp::bridge::pool::NotificationSendResult::Queued
+    ));
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let written = std::fs::read_to_string(path).unwrap_or_default();
+        if let Some(end) = written.find(MARKER) {
+            return written[..end].to_string();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the marker never reached the wire: {written}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
 pub(in crate::lsp::bridge) async fn create_handle_with_command(
     state: ConnectionState,
     key: ConnectionKey,
