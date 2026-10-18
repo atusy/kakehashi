@@ -224,17 +224,19 @@ impl Kakehashi {
             })
             .await?;
         let asked = answers.is_some_and(|answers| {
+            // The priority walk is built only once some server asked.
             answers.lock().is_ok_and(|answers| {
-                asked_above_the_winner(
-                    &answers,
-                    &crate::lsp::aggregation::server::truncate_entries(
-                        crate::lsp::aggregation::server::expand_priorities(
-                            &ctx.document.priorities,
-                            &ctx.document.configs,
+                answers.iter().any(|(_, asked)| *asked)
+                    && asked_above_the_winner(
+                        &answers,
+                        &crate::lsp::aggregation::server::truncate_entries(
+                            crate::lsp::aggregation::server::expand_priorities(
+                                &ctx.document.priorities,
+                                &ctx.document.configs,
+                            ),
+                            ctx.document.max_fan_out,
                         ),
-                        ctx.document.max_fan_out,
-                    ),
-                )
+                    )
             })
         });
         let (response, ask) = virt_layer_answer(response, asked);
