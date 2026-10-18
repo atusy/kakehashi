@@ -1152,7 +1152,9 @@ mod tests {
             tower_lsp_server::ls_types::Range::new(Position::new(3, 5), Position::new(3, 5))
         );
 
-        // One edit of the set rewriting the placeholder drops the set.
+        // One edit of the set rewriting the placeholder drops the set — at a
+        // region where the edits as sent would be in bounds, so only the
+        // refusal drops them.
         let mut into_gap = hint(json!([
             {
                 "range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 1}},
@@ -1163,7 +1165,10 @@ mod tests {
                 "newText": "2"
             }
         ]));
-        transform(&mut into_gap, &prepared_offset());
+        transform(
+            &mut into_gap,
+            &RegionOffset::new(0, 0).with_prepared(map.clone()),
+        );
         assert!(into_gap.text_edits.is_none());
 
         let mut as_is = hint(insertion);

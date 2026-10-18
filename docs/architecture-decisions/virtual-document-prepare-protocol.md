@@ -230,6 +230,9 @@ dropped like any unsafe set, when:
   longer start one;
 - a line break P hides — a deleted edge line's, or a replaced gap's — would
   fuse with one beside it into a single CRLF.
+- a CR and an LF would meet at an edit's edge in one document but not in
+  the other (a CR inserted before an LF P shows right after a gap it
+  emptied: one line break in P, two in V).
 
 No edit in P reaches into the deleted edge lines or the closing indent
 deleted with them: P has no position inside them.

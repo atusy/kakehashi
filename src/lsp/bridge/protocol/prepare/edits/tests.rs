@@ -925,6 +925,8 @@ mod properties {
         /// 0: content only; 1: an interpolation (a gap) after the body; 2:
         /// the whole line is host text (a gap such as a fence).
         gap: usize,
+        /// Whether content follows an interpolation on its line.
+        after_gap: bool,
     }
 
     const INDENTS: [&str; 4] = ["", "  ", "    ", "\t"];
@@ -943,14 +945,20 @@ mod properties {
     ];
 
     fn line_spec() -> impl Strategy<Value = LineSpec> {
-        (0..INDENTS.len(), 0..BODIES.len(), 0..EOLS.len(), 0..3usize).prop_map(
-            |(indent, body, eol, gap)| LineSpec {
+        (
+            0..INDENTS.len(),
+            0..BODIES.len(),
+            0..EOLS.len(),
+            0..3usize,
+            any::<bool>(),
+        )
+            .prop_map(|(indent, body, eol, gap, after_gap)| LineSpec {
                 indent,
                 body,
                 eol,
                 gap,
-            },
-        )
+                after_gap,
+            })
     }
 
     /// An edit to P: two char-boundary picks, a column overshoot, a text.
@@ -984,8 +992,9 @@ mod properties {
             if line.gap == 2 {
                 // Host lines masked by line breaks, as between two fences.
                 let start = text.len();
-                text.push('\n');
-                pieces.push((SegmentKind::Gap, start..text.len(), "```\n".to_string()));
+                let eol = if eol.is_empty() { "\n" } else { eol };
+                text.push_str(eol);
+                pieces.push((SegmentKind::Gap, start..text.len(), format!("```{eol}")));
                 continue;
             }
             let head = format!("{}{}", INDENTS[line.indent], BODIES[line.body]);
@@ -994,7 +1003,9 @@ mod properties {
                 let start = text.len();
                 text.push_str("    ");
                 pieces.push((SegmentKind::Gap, start..text.len(), "${x}".to_string()));
-                pieces.push(content(&mut text, "y"));
+                if line.after_gap {
+                    pieces.push(content(&mut text, "y"));
+                }
             }
             pieces.push(content(&mut text, eol));
         }
@@ -1215,6 +1226,16 @@ mod properties {
                 run
             );
         }
+        // (c) The edits add or remove as many lines in V as in P.
+        let line_breaks = |text: &str| {
+            text.matches('\n').count() + text.matches('\r').count() - text.matches("\r\n").count()
+        };
+        prop_assert_eq!(
+            line_breaks(&edited) as isize - line_breaks(virtual_text) as isize,
+            line_breaks(&apply_to(&map.prepared_lines.text, edits)) as isize
+                - line_breaks(&map.prepared_lines.text) as isize,
+            "line count"
+        );
         // (b) Whitespace aside, the edited V's content between the gaps is
         // the edited P's between them.
         let prepared = &map.prepared_lines.text;
@@ -1411,4 +1432,171 @@ fn an_edit_ending_between_a_cr_and_a_gaps_lf_is_refused() {
         prepared.map.map_one_with_extent(&edit((0, 0), (1, 0), "q")),
         None
     );
+}
+
+#[test]
+fn a_cr_meeting_an_lf_across_an_emptied_gap_is_refused() {
+    // `é${x}\na`, the interpolation emptied and both lines dedented: a CR
+    // inserted after `é` makes one CRLF in P, but the gap's host text keeps
+    // it apart from the LF in V, which gains a line.
+    let virtual_text = "  é    \n  a\n";
+    let gap = "  é".len();
+    let prepared = prepare_pieces(
+        virtual_text,
+        [
+            (SegmentKind::Content, 0..gap, String::new()),
+            (SegmentKind::Gap, gap..gap + 4, "${x}".to_string()),
+            (
+                SegmentKind::Content,
+                gap + 4..virtual_text.len(),
+                String::new(),
+            ),
+        ],
+        json!({"segments": [
+            {"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+            ]},
+            {"type": "gap", "content": ""},
+            {"type": "content", "changes": [
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+            ]}
+        ]}),
+    );
+    assert_eq!(prepared.text, "é\na\n");
+    let map = prepared.map;
+    assert_eq!(map.map_one_with_extent(&edit((0, 1), (0, 1), "\r")), None);
+    assert_eq!(map.map_one_with_extent(&edit((0, 0), (0, 1), "\r")), None);
+    // A CR kept apart from the LF by text maps.
+    let mapped = map
+        .map_one_with_extent(&edit((0, 1), (0, 1), "\rb"))
+        .unwrap();
+    assert_eq!(apply_to(virtual_text, &[mapped]), "  é\r  b    \n  a\n");
+}
+
+#[test]
+fn a_cr_an_edit_inserts_before_an_lf_both_documents_show_joins_alike() {
+    let (virtual_text, map) = dedented();
+    let mapped = map
+        .map_one_with_extent(&edit((0, 5), (0, 5), "\r"))
+        .unwrap();
+    assert_eq!(apply_to(&virtual_text, &[mapped]), "  if x:\r\n    y\n");
+}
+
+#[test]
+fn an_empty_insertion_inserts_no_indent() {
+    let virtual_text = "  a\n\n";
+    let map = prepare(
+        virtual_text,
+        json!([
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+        ]),
+    );
+    for at in [(1, 0), (2, 0)] {
+        let mapped = map.map_one_with_extent(&edit(at, at, "")).unwrap();
+        assert_eq!(mapped.new_text, "", "{at:?}");
+    }
+}
+
+#[test]
+fn a_whole_line_replaced_before_a_blank_line_keeps_its_indent() {
+    let virtual_text = "  a\n\n  b\n";
+    let map = dedent_by_two(virtual_text);
+    let replaced = map.map_one_with_extent(&edit((0, 0), (1, 0), "x")).unwrap();
+    assert_eq!(apply_to(virtual_text, &[replaced]), "  x\n  b\n");
+}
+
+#[test]
+fn whole_line_edits_beside_an_emptied_gap_after_a_removed_indent_map() {
+    // `\n  foo\n  ${x}b\n` with `${x}` emptied: P's last line starts with
+    // the indent, then the gap.
+    let virtual_text = "\n  foo\n      b\n";
+    let prepared = prepare_pieces(
+        virtual_text,
+        [
+            (SegmentKind::Content, 0..9, String::new()),
+            (SegmentKind::Gap, 9..13, "${x}".to_string()),
+            (SegmentKind::Content, 13..15, String::new()),
+        ],
+        json!({"segments": [
+            {"type": "content", "changes": [
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""},
+                {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
+            ]},
+            {"type": "gap", "content": ""},
+            {"type": "content"}
+        ]}),
+    );
+    let deleted = prepared
+        .map
+        .map_one_with_extent(&edit((2, 0), (3, 0), ""))
+        .unwrap();
+    assert_eq!(apply_to(virtual_text, &[deleted]), "\n  foo\n      ");
+    let replaced = prepared
+        .map
+        .map_one_with_extent(&edit((2, 0), (3, 0), "q\n"))
+        .unwrap();
+    assert_eq!(apply_to(virtual_text, &[replaced]), "\n  foo\n      q\n");
+}
+
+#[test]
+fn line_breaks_that_meet_across_a_host_runs_edge_in_v_stay_met() {
+    // `a${x}b`, the gap's masked text ending with the CR of a CRLF whose LF
+    // opens the next content, the gap shown as `y`: an edit elsewhere keeps
+    // that CRLF as it was.
+    let virtual_text = "a \r\nb";
+    let prepared = prepare_pieces(
+        virtual_text,
+        [
+            (SegmentKind::Content, 0..1, String::new()),
+            (SegmentKind::Gap, 1..3, "x\r".to_string()),
+            (SegmentKind::Content, 3..5, String::new()),
+        ],
+        json!({"segments": [{"type": "content"}, {"type": "gap", "content": "y"}, {"type": "content"}]}),
+    );
+    assert_eq!(prepared.text, "ay\nb");
+    let mapped = prepared
+        .map
+        .map_one_with_extent(&edit((1, 0), (1, 1), "c"))
+        .unwrap();
+    assert_eq!(apply_to(virtual_text, &[mapped]), "a \r\nc");
+    // The mirror: content ending with the CR, the gap's masked text opening
+    // with the LF.
+    let virtual_text = "a\r\n b";
+    let prepared = prepare_pieces(
+        virtual_text,
+        [
+            (SegmentKind::Content, 0..2, String::new()),
+            (SegmentKind::Gap, 2..4, "\nx".to_string()),
+            (SegmentKind::Content, 4..5, String::new()),
+        ],
+        json!({"segments": [{"type": "content"}, {"type": "gap", "content": "y"}, {"type": "content"}]}),
+    );
+    assert_eq!(prepared.text, "a\ryb");
+    let mapped = prepared
+        .map
+        .map_one_with_extent(&edit((0, 0), (0, 1), "c"))
+        .unwrap();
+    assert_eq!(apply_to(virtual_text, &[mapped]), "c\r\n b");
+}
+
+#[test]
+fn a_cr_before_a_gap_shown_opening_with_its_lf_is_the_servers_to_join() {
+    // `a${\nx}b`, the gap shown as `\ny`: P shows the LF, so a CR inserted
+    // before it joins it in both documents.
+    let virtual_text = "a\n b";
+    let prepared = prepare_pieces(
+        virtual_text,
+        [
+            (SegmentKind::Content, 0..1, String::new()),
+            (SegmentKind::Gap, 1..3, "\nx".to_string()),
+            (SegmentKind::Content, 3..4, String::new()),
+        ],
+        json!({"segments": [{"type": "content"}, {"type": "gap", "content": "\ny"}, {"type": "content"}]}),
+    );
+    assert_eq!(prepared.text, "a\nyb");
+    let mapped = prepared
+        .map
+        .map_one_with_extent(&edit((0, 1), (0, 1), "\r"))
+        .unwrap();
+    assert_eq!(apply_to(virtual_text, &[mapped]), "a\r\n b");
 }
