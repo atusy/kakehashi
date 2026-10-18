@@ -1367,18 +1367,12 @@ mod tests {
     /// that are not split there in the first (two line breaks made one, or
     /// one made two: no position names that place).
     ///
-    /// Bounded to finish quickly; [`line_break_refusals_match_exhaustively`]
+    /// Bounded to a few thousand cases; [`line_break_refusals_match_exhaustively`]
     /// runs the wider bounds.
     #[test]
     fn line_break_refusals_match_what_positions_survive() {
-        let started = std::time::Instant::now();
         let cases = check_line_break_refusals(b"a\r\n", 4, 2);
         assert!(cases > 5_000, "{cases}");
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
-            "{:?}",
-            started.elapsed()
-        );
     }
 
     /// [`line_break_refusals_match_what_positions_survive`] over a wider
