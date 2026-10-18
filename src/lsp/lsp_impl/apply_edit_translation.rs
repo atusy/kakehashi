@@ -178,6 +178,7 @@ impl ApplyEditTranslator {
             &self.bridge,
             &host_url,
             &region_id,
+            virtual_uri,
             held,
         ) else {
             // The region moved or was removed since the downstream produced

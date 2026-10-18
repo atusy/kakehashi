@@ -91,7 +91,7 @@ impl ShowDocumentTranslator {
         // Only a selection needs the (live-parse) region offset, so skip
         // resolving it when there's nothing to translate.
         if params.selection.is_some() {
-            match self.region_offset(&host_url, &region_id, held) {
+            match self.region_offset(&host_url, &region_id, params.uri.as_str(), held) {
                 Some(offset) => return Self::apply_host_translation(params, host_uri, &offset),
                 // Offset unavailable (region invalidated by edits, or otherwise
                 // unresolvable): drop the selection we can't translate — a
@@ -130,6 +130,7 @@ impl ShowDocumentTranslator {
         &self,
         host_url: &Url,
         region_id: &str,
+        origin_uri: &str,
         held: Option<&crate::lsp::diagnostic_cache::HeldStamp>,
     ) -> Option<RegionOffset> {
         resolve_region_offset_for_held(
@@ -138,6 +139,7 @@ impl ShowDocumentTranslator {
             &self.bridge,
             host_url,
             region_id,
+            origin_uri,
             held,
         )
         .map(|(offset, _region_end, _contiguous, _language)| offset)
