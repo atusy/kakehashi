@@ -984,7 +984,7 @@ impl PreparedMap {
     /// Whether the V range reaches inside a gap's host text (an empty range:
     /// whether it sits strictly inside one).
     pub(crate) fn virtual_range_in_gap(&self, range: tower_lsp_server::ls_types::Range) -> bool {
-        self.virtual_range_touches_gap(
+        self.virtual_range_reaches_into_gap(
             self.virtual_lines.offset_clamped(range.start),
             self.virtual_lines.offset_clamped(range.end),
         )
@@ -994,12 +994,12 @@ impl PreparedMap {
     /// downstream position stands for.
     pub(crate) fn virtual_position_in_gap(&self, position: Position) -> bool {
         let offset = self.virtual_lines.offset_clamped(position);
-        self.virtual_range_touches_gap(offset, offset)
+        self.virtual_range_reaches_into_gap(offset, offset)
     }
 
     /// Whether the V range `start..end` reaches inside a gap's V text (an
     /// empty range: whether it sits strictly inside one).
-    fn virtual_range_touches_gap(&self, start: usize, end: usize) -> bool {
+    fn virtual_range_reaches_into_gap(&self, start: usize, end: usize) -> bool {
         let first = self.runs.partition_point(|run| run.virtual_.end <= start);
         self.runs[first..]
             .iter()

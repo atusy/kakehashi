@@ -48,7 +48,7 @@ impl PreparedMap {
     /// and P does not show (see [`Self::mapped_edits_keep_host_text`]).
     /// `None` — refuse the set — when an edit is reversed, edits overlap in
     /// P or once mapped (or touch where either's text bears on the other),
-    /// an edit touches a gap, a line created in content has no single
+    /// an edit reaches into a gap, a line created in content has no single
     /// indentation to regain, or the host text would not survive.
     pub(crate) fn map_edits(&self, edits: &[TextEdit], mode: EditMode) -> Option<Vec<TextEdit>> {
         let EditMode::Extent = mode;
@@ -161,7 +161,7 @@ impl PreparedMap {
             }
             virtual_text[offset..].chars().next()
         };
-        // Changes never reach into a gap (see `hunk_touches_gap`) nor into
+        // Changes never reach into a gap (see `hunk_reaches_into_gap`) nor into
         // the deleted edge lines, which P has no position inside. Only a run
         // a change meets at one of its edges can read differently there than
         // in V, where each held: those are the runs looked at. A CR and an LF
@@ -237,7 +237,7 @@ impl PreparedMap {
         new_text: &str,
         following: Option<char>,
     ) -> Option<(Range<usize>, String)> {
-        if self.hunk_touches_gap(&old) {
+        if self.hunk_reaches_into_gap(&old) {
             return None;
         }
         let prepared_after = following;
@@ -281,7 +281,7 @@ impl PreparedMap {
             })
         };
         // Backstop: host text a gap stands for is never inside a mapped change.
-        if self.virtual_range_touches_gap(virtual_start, virtual_end) {
+        if self.virtual_range_reaches_into_gap(virtual_start, virtual_end) {
             return None;
         }
         // What follows the change in V: a gap the peer emptied right at its
@@ -366,7 +366,7 @@ impl PreparedMap {
 
     /// Whether replacing P's `old` bytes reaches into a gap's text in P (a
     /// gap emptied in P: whether it spans the gap's position).
-    fn hunk_touches_gap(&self, old: &Range<usize>) -> bool {
+    fn hunk_reaches_into_gap(&self, old: &Range<usize>) -> bool {
         // Runs tile P in order: only those from the first ending at or after
         // the change's start can touch it.
         let first = self
