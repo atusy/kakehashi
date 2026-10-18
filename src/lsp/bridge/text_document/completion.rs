@@ -274,6 +274,9 @@ pub(super) fn transform_completion_item(
         if inserted.contains(['$', '\\']) {
             return false;
         }
+        // Literal text means the same as plain text, which a client's
+        // snippet engine cannot re-indent once more on insertion.
+        item.insert_text_format = Some(tower_lsp_server::ls_types::InsertTextFormat::PLAIN_TEXT);
     }
     // LSP requires an item's edit ranges to contain the requested position.
     // Out of a prepared document a range can map past it: the server saw the
@@ -1126,6 +1129,20 @@ mod tests {
                 "{completed}"
             );
         }
+        // Kept, it goes out as the plain text it is.
+        let mut literal = item(json!({"label": "x", "insertTextFormat": 2, "insertText": snippet}));
+        if transform_completion_item(
+            &mut literal,
+            &offset,
+            Position::new(11, 0),
+            Some(Position::new(10, 3)),
+            ClientInsertMode::default(),
+        ) {
+            assert_eq!(
+                literal.insert_text_format,
+                Some(tower_lsp_server::ls_types::InsertTextFormat::PLAIN_TEXT)
+            );
+        }
         // As is, a snippet is the client's to expand.
         let mut as_is = item(json!({"label": "x", "insertTextFormat": 2, "insertText": snippet}));
         assert!(transform_completion_item(
@@ -1135,6 +1152,10 @@ mod tests {
             Some(Position::new(10, 3)),
             ClientInsertMode::default(),
         ));
+        assert_eq!(
+            as_is.insert_text_format,
+            Some(tower_lsp_server::ls_types::InsertTextFormat::SNIPPET)
+        );
     }
 
     #[test]
