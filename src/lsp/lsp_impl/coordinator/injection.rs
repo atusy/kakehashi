@@ -114,8 +114,15 @@ pub(crate) struct InjectionPass {
 }
 
 /// The injections to send downstream: all but the held ones (see
-/// `BridgeInjection::held`).
-pub(crate) fn sendable_injections(injections: Vec<BridgeInjection>) -> Vec<BridgeInjection> {
+/// `BridgeInjection::held`). A pool that prepares nothing holds none, so
+/// its injections are passed through without a scan.
+pub(crate) fn sendable_injections(
+    prepares: bool,
+    injections: Vec<BridgeInjection>,
+) -> Vec<BridgeInjection> {
+    if !prepares {
+        return injections;
+    }
     injections
         .into_iter()
         .filter(|injection| !injection.held)
@@ -731,16 +738,22 @@ impl InjectionCoordinator {
         // candidates' handshakes tell whether any prepares it is most likely
         // sent as is again once they do, and closing its documents meanwhile
         // would only drop their diagnostics.
-        let held: Vec<(&str, &str)> = injections
-            .iter()
-            .filter(|injection| {
-                injection.held
-                    && self
-                        .bridge
-                        .prepare_peer_known(&host_language, &injection.language)
-            })
-            .map(|injection| (injection.language.as_str(), injection.region_id.as_str()))
-            .collect();
+        // Nothing is held without the prepare layer: no scan.
+        let prepares = self.bridge.pool().prepares();
+        let held: Vec<(&str, &str)> = if prepares {
+            injections
+                .iter()
+                .filter(|injection| {
+                    injection.held
+                        && self
+                            .bridge
+                            .prepare_peer_known(&host_language, &injection.language)
+                })
+                .map(|injection| (injection.language.as_str(), injection.region_id.as_str()))
+                .collect()
+        } else {
+            Vec::new()
+        };
         if !held.is_empty() {
             for (language, region_id) in &held {
                 self.bridge.pool().hold_latest_virtual_content(
@@ -755,7 +768,7 @@ impl InjectionCoordinator {
                     .evict_source(uri, &DiagnosticSource::Region(region_id));
             }
         }
-        let still_held: HashSet<String> = if replay_held_save {
+        let still_held: HashSet<String> = if replay_held_save && prepares {
             injections
                 .iter()
                 .filter(|injection| injection.held)
@@ -764,7 +777,7 @@ impl InjectionCoordinator {
         } else {
             HashSet::new()
         };
-        let injections = sendable_injections(injections);
+        let injections = sendable_injections(prepares, injections);
 
         let synchronized = if forward_did_change {
             self.bridge
@@ -1438,7 +1451,7 @@ impl InjectionCoordinator {
                     let Some(injections) = this.resolve_injection_data(&uri, &host_language) else {
                         continue;
                     };
-                    let injections = sendable_injections(injections);
+                    let injections = sendable_injections(this.bridge.pool().prepares(), injections);
                     let settings = this.settings_manager.load_settings();
                     let edit_lock = ReopenEditLock::new(&this.documents, &uri);
                     let read = || this.reopen_document_revision(&uri, revision);
@@ -1486,7 +1499,7 @@ impl InjectionCoordinator {
         key: &crate::lsp::bridge::ConnectionKey,
         injections: Vec<BridgeInjection>,
     ) -> crate::lsp::bridge::OpenOutcome {
-        let injections = sendable_injections(injections);
+        let injections = sendable_injections(self.bridge.pool().prepares(), injections);
         let edit_lock = ReopenEditLock::new(&self.documents, uri);
         let read = || self.reopen_document_revision(uri, revision);
         let outcome = self
@@ -1776,10 +1789,11 @@ mod tests {
             assert!(held.held);
             assert!(held.content.is_empty());
         }
-        let sent: Vec<_> = super::sendable_injections(vec![as_is, pending, prepared, unusable])
-            .into_iter()
-            .map(|injection| injection.content)
-            .collect();
+        let sent: Vec<_> =
+            super::sendable_injections(true, vec![as_is, pending, prepared, unusable])
+                .into_iter()
+                .map(|injection| injection.content)
+                .collect();
         assert_eq!(sent, ["  a", "a"]);
     }
 
