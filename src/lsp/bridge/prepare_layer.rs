@@ -328,6 +328,24 @@ impl super::BridgeCoordinator {
             .answer_for_test(target, input, answer, held);
     }
 
+    /// When the failure the lifecycle pass holds a region on was taken (see
+    /// `PrepareRegistry::failed_at`); `None` unless its answer is unusable.
+    pub(crate) fn prepare_failed_at(
+        &self,
+        host_uri: &Url,
+        injection_language: &str,
+        region_id: &str,
+    ) -> Option<u64> {
+        self.prepare.as_ref().and_then(|layer| {
+            layer.registry.failed_at(
+                host_uri,
+                injection_language,
+                region_id,
+                self.pool.prepare_epoch(),
+            )
+        })
+    }
+
     /// What the lifecycle pass knows of a region's current document (see
     /// [`RegionPrepare`]).
     pub(crate) fn prepare_region(

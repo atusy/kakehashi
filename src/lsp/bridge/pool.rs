@@ -367,8 +367,8 @@ pub(crate) struct HostVirtualContents {
     /// prepare peer known to prepare them (see
     /// [`LanguageServerPool::hold_latest_virtual_content`]): no request opens
     /// one with text as is — nor at all, with a text from an answer taken
-    /// before its peer failed it (`Some`: when the failure was held, in the
-    /// presentation order). `None` for a pool that prepares nothing, which
+    /// before its peer failed it (`Some`: when the failed input was taken,
+    /// in the presentation order, which identifies that failure). `None` for a pool that prepares nothing, which
     /// holds nothing: no map is allocated for each host it opens.
     held: Option<DashMap<(String, String), Option<u64>>>,
     /// How many entries `held` has: read in place of `held`'s emptiness,
@@ -382,8 +382,8 @@ impl HostVirtualContents {
         self.hold(language, region_id).is_some()
     }
 
-    /// The hold on `(language, region_id)`, if any: when its peer's failure
-    /// was held, if it failed (see `held`).
+    /// The hold on `(language, region_id)`, if any: when its failed input
+    /// was taken, if its peer failed it (see `held`).
     fn hold(&self, language: &str, region_id: &str) -> Option<Option<u64>> {
         if self.held_count.load(Ordering::Acquire) == 0 {
             return None;
@@ -3139,16 +3139,17 @@ impl LanguageServerPool {
     /// for a prepare peer known to prepare it: what was last forwarded for
     /// it was sent as is, and a request opening it lazily must not send
     /// that (or its own text as is) while it waits — or after its peer
-    /// failed. Cleared once text is recorded for it again. `failed`: its
-    /// peer answered it unusably, and no request reads coordinates through
-    /// it either (see [`Self::prepare_failed`]).
+    /// failed. Cleared once text is recorded for it again. `failed_at`: its
+    /// peer answered unusably the input taken then (in the presentation
+    /// order), and no request on an answer taken before reads coordinates
+    /// through it either (see [`Self::prepare_failed`]).
     pub(crate) fn hold_latest_virtual_content(
         &self,
         host_uri: &Url,
         incarnation: u64,
         language: &str,
         region_id: &str,
-        failed: bool,
+        failed_at: Option<u64>,
     ) {
         if let Some(host) = self.latest_virtual_contents.get(host_uri)
             && host.incarnation == incarnation
@@ -3158,19 +3159,11 @@ impl LanguageServerPool {
             // count never reads below what `held` holds (removals take the
             // entry out first), so no open sees a held region as free.
             host.held_count.fetch_add(1, Ordering::AcqRel);
-            let failed_at = || failed.then(super::protocol::next_presentation);
-            match held.entry((language.to_string(), region_id.to_string())) {
-                dashmap::mapref::entry::Entry::Vacant(entry) => {
-                    entry.insert(failed_at());
-                }
-                dashmap::mapref::entry::Entry::Occupied(mut entry) => {
-                    host.held_count.fetch_sub(1, Ordering::AcqRel);
-                    // A failure held already keeps when it was held: a later
-                    // pass finding the same failure fails no newer answer.
-                    if !failed || entry.get().is_none() {
-                        entry.insert(failed_at());
-                    }
-                }
+            if held
+                .insert((language.to_string(), region_id.to_string()), failed_at)
+                .is_some()
+            {
+                host.held_count.fetch_sub(1, Ordering::AcqRel);
             }
         }
     }
@@ -9676,7 +9669,7 @@ mod tests {
         // forwarded as is) and regained one (the region held again).
         let map = dedent_map("  x = 1");
         pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  x = 1");
-        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, false);
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, None);
         let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
         pool.ensure_document_opened(
             &mut sender,
@@ -9735,7 +9728,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
         // The pass holds the region; its sweep finds nothing registered.
-        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, false);
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, None);
         drop(versions);
         assert!(open.await.unwrap().is_err());
         assert!(rx.try_recv().is_err(), "nothing was sent as is");
@@ -9755,7 +9748,13 @@ mod tests {
         pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  x = 1");
         // The request's answer, taken before its peer failed the region.
         let map = dedent_map("  x = 1");
-        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, true);
+        pool.hold_latest_virtual_content(
+            &host_uri,
+            1,
+            "lua",
+            TEST_ULID_LUA_0,
+            Some(crate::lsp::bridge::protocol::next_presentation()),
+        );
         let prepared = SentText {
             text: "x = 1",
             map: Some(&map),
@@ -9769,7 +9768,7 @@ mod tests {
         assert!(rx.try_recv().is_err(), "nothing was sent");
         // Pending again (a new epoch's attempt): the prepared text opens it.
         // (So would an answer taken after the failure, a newer text's.)
-        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, false);
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, None);
         pool.ensure_document_opened(&mut sender, &host_uri, &virtual_uri, prepared, &key)
             .await
             .unwrap();
@@ -9793,7 +9792,7 @@ mod tests {
         );
         // Held for its peer.
         pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  x = 1");
-        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, false);
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, None);
         assert!(pool.refuses_text_as_is(&host_uri, &virtual_uri, &key));
         // Holding a prepared text of it.
         pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  x = 1");
@@ -9824,7 +9823,7 @@ mod tests {
         let key = ConnectionKey::for_server("lua");
         pool.open_host_incarnation(&host_uri, 1).await;
         pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  x = 1");
-        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, false);
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, None);
         let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
         assert!(
             pool.ensure_document_opened(&mut sender, &host_uri, &virtual_uri, "  x = 1", &key)

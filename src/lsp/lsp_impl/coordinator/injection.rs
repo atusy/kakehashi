@@ -695,7 +695,7 @@ impl InjectionCoordinator {
         // reads coordinates through it, as no push is placed through it.
         // Nothing is held without the prepare layer: no scan.
         let prepares = self.bridge.pool().prepares();
-        let held: Vec<(&str, &str, bool)> = if prepares {
+        let held: Vec<(&str, &str, Option<u64>)> = if prepares {
             injections
                 .iter()
                 .filter(|injection| {
@@ -708,22 +708,24 @@ impl InjectionCoordinator {
                     (
                         injection.language.as_str(),
                         injection.region_id.as_str(),
-                        self.bridge
-                            .prepare_region(uri, &injection.language, &injection.region_id)
-                            .failed,
+                        self.bridge.prepare_failed_at(
+                            uri,
+                            &injection.language,
+                            &injection.region_id,
+                        ),
                     )
                 })
                 .collect()
         } else {
             Vec::new()
         };
-        for (language, region_id, failed) in &held {
+        for (language, region_id, failed_at) in &held {
             self.bridge.pool().hold_latest_virtual_content(
                 uri,
                 incarnation,
                 language,
                 region_id,
-                *failed,
+                *failed_at,
             );
         }
         // Stop the previous pass before closing a replaced language-bearing URI;
@@ -2934,8 +2936,20 @@ mod tests {
             crate::lsp::bridge::PrepareAnswer::Unusable,
             true,
         );
+        // An answer taken after the failed input, before the pass found it.
+        let after = crate::lsp::bridge::apply_prepare_result(
+            "a",
+            &crate::lsp::bridge::VirtualLayout::single("a"),
+            None,
+        )
+        .unwrap()
+        .map
+        .built();
         injection.process_injections_for_resync(&uri).await;
         assert!(failed());
+        // The failure is the input's, not the pass's: that later answer is a
+        // newer text's, and is not refused by it.
+        assert!(!pool.prepare_failed(&uri, "rust", &region.region_id, Some(after)));
     }
 
     /// A probe that finds no prepare target leaves the region's lookups be:
