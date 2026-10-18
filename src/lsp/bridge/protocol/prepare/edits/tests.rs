@@ -3095,6 +3095,19 @@ mod formatting {
     }
 
     #[test]
+    fn lines_broken_by_a_lone_cr_are_paired_as_lines() {
+        // A kept ` ` joined onto `a` (dedented), lines broken by a lone CR:
+        // the joined line is `a`'s, its removed indent back.
+        let virtual_text = " \r  a\r\r";
+        let map = dedent_lines(virtual_text, &[0, 2, 0]);
+        let answer = [edit((0, 0), (3, 0), "  a\r\r")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("    a\r\r")
+        );
+    }
+
+    #[test]
     fn a_line_deleted_above_one_losing_its_own_indent_keeps_them_apart() {
         // `0a0` (dedented) deleted, `\t1b c1` (left alone, a tab of its own)
         // brought to column 0: the deletion and the tab's touch at the line
