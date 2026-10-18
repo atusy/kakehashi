@@ -17,9 +17,10 @@
 //!   uppercases the text. Exercises the pipeline's capability-based
 //!   whole-region rangeFormatting fallback (concatenated-formatting-pipeline
 //!   Decision point 3.2).
-//! - `echo-document` — advertises `hoverProvider`,
-//!   `documentFormattingProvider`, `documentRangeFormattingProvider`,
-//!   `renameProvider`, `diagnosticProvider`, and full sync with save; hover
+//! - `echo-document` — advertises `hoverProvider`, `completionProvider`,
+//!   `inlayHintProvider`, `colorProvider`, `documentFormattingProvider`,
+//!   `documentRangeFormattingProvider`, `renameProvider`,
+//!   `diagnosticProvider`, and full sync with save; hover
 //!   answers the full text this server holds for the document, ranged over
 //!   the hovered line in its own coordinates; formatting and range
 //!   formatting uppercase; rename replaces the first line; a pull diagnostic
@@ -1178,11 +1179,6 @@ fn main() {
                     .unwrap_or(Value::Null);
                 respond(&mut writer, id, result);
             }
-            // Answers only for documents this server received via `didOpen`,
-            // so a non-null result proves the host document was synced and the
-            // request carried the real URI. The item's `data` carries that URI
-            // back, so `completionItem/resolve` can prove the downstream's own
-            // data survived the round trip through the routing envelope (#958).
             "textDocument/completion" if mode == "echo-document" => {
                 let position = message["params"]["position"].clone();
                 let result = json!({"isIncomplete": false, "items": [{ "label": "echo-plain" }, {
@@ -1201,6 +1197,11 @@ fn main() {
                 }]});
                 respond(&mut writer, id, result);
             }
+            // Answers only for documents this server received via `didOpen`,
+            // so a non-null result proves the host document was synced and the
+            // request carried the real URI. The item's `data` carries that URI
+            // back, so `completionItem/resolve` can prove the downstream's own
+            // data survived the round trip through the routing envelope (#958).
             "textDocument/completion" => {
                 let result = message
                     .pointer("/params/textDocument/uri")
