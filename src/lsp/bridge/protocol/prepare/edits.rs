@@ -33,9 +33,11 @@ pub(crate) enum EditMode {
     Formatting,
 }
 
-/// How long the diff of a formatting answer may search for the fewest
-/// changes (see [`EditMode::Formatting`]). An answer whose diff runs out of
-/// time is refused: the diff then falls back to coarser stretches, which can
+/// How long the diff of a formatting answer may search, pairing lines and
+/// then the fewest changes within them (see [`EditMode::Formatting`]); the
+/// work around the search (applying the answer to P, the per-character
+/// tables, mapping each stretch) runs in time linear in the texts on top of
+/// it. An answer whose diff runs out of time is refused: the diff then falls back to coarser stretches, which can
 /// span lines the formatter left alone, and a stretch maps every line it
 /// spans as one it wrote, with the segment's indent rather than the line's
 /// own. So the budget bears only on which answers are refused.
@@ -59,7 +61,9 @@ enum FirstIndent<'a> {
 
 impl PreparedMap {
     /// Translate a set of edits a downstream server made to P into edits to
-    /// V, as `mode` reads them (see [`EditMode`]), one for each in order.
+    /// V, as `mode` reads them (see [`EditMode`]): with extents, one for each
+    /// in order; for a formatting answer, one for each stretch the edited P
+    /// differs from P in, in P's order (none when it changes nothing).
     ///
     /// Every edit (with [`EditMode::Formatting`], every stretch the edited P
     /// differs from P in) is mapped on its own, keeping its extent and
@@ -84,8 +88,8 @@ impl PreparedMap {
         self.map_edits_within(edits, mode, FORMATTING_DIFF_BUDGET)
     }
 
-    /// [`Self::map_edits`], diffing a formatting answer for at most
-    /// `budget`.
+    /// [`Self::map_edits`], the diff of a formatting answer searching for
+    /// at most `budget`.
     pub(super) fn map_edits_within(
         &self,
         edits: &[TextEdit],
