@@ -309,7 +309,11 @@ impl Kakehashi {
             // Non-contiguous combined injections contain masked host-only gaps.
             // A formatter returns a contiguous whole-document replacement, which
             // would replace those real host gaps as well and corrupt the document.
-            if !resolved.contiguous {
+            if crate::lsp::lsp_impl::bridge_context::method_closed_to(
+                resolved,
+                "textDocument/formatting",
+                false,
+            ) {
                 continue;
             }
             let configs = self
@@ -349,11 +353,6 @@ impl Kakehashi {
                 }
                 RegionFormatPlan::Concatenated(_) | RegionFormatPlan::Preferred => {}
             }
-            // Same-range query alternatives are tried in discovery priority
-            // order, but an unconfigured or explicitly disabled language is
-            // not a winner. Reserve the span only after planning so the first
-            // executable alternative formats it; later executable layers are
-            // suppressed to keep emitted edits non-overlapping.
             let span = (
                 resolved.region.byte_range.start,
                 resolved.region.byte_range.end,
@@ -361,26 +360,6 @@ impl Kakehashi {
             if spans.is_reserved(span) {
                 continue;
             }
-            // A formatter's edits to a prepared document are not mapped back
-            // through its map: closed as a non-contiguous one is. Asked only
-            // of a region that formats: one that would not, being unplanned or
-            // its span taken, sends no request, so its peer is not waited for
-            // and no failure of it is counted. One closed or unprepared takes
-            // no span, and one unprepared counts unless a later alternative
-            // answers for the span (an empty answer, already formatted,
-            // included).
-            let gate = match self
-                .method_gate(uri, language_name, resolved, "textDocument/formatting")
-                .await
-            {
-                crate::lsp::lsp_impl::bridge_context::MethodGate::Open => Ok(Some(())),
-                crate::lsp::lsp_impl::bridge_context::MethodGate::Closed => Ok(None),
-                crate::lsp::lsp_impl::bridge_context::MethodGate::Unprepared => Err(()),
-            };
-            if spans.admit(span, gate).is_none() {
-                continue;
-            }
-            let owed = spans.owes(span);
             let region_ctx = DocumentRequestContext {
                 prepared: None,
                 uri: uri.clone(),
@@ -393,6 +372,31 @@ impl Kakehashi {
                 max_fan_out: agg.max_fan_out,
                 client_progress_token: None,
             };
+            // The document as its servers see it: prepared when its peer
+            // prepares it, waiting for the answer (the lifecycle pass has
+            // started every region's attempt already: waiting for each in
+            // turn costs the slowest one).
+            let region_ctx = crate::lsp::lsp_impl::bridge_context::prepare_request_context(
+                &self.bridge,
+                language_name,
+                region_ctx,
+            )
+            .await
+            .ok();
+            // A formatter's edits to a prepared document are not mapped back
+            // through its map: closed as a non-contiguous one is.
+            let Some(region_ctx) = spans.admit(span, region_ctx, |ctx| {
+                !crate::lsp::lsp_impl::bridge_context::method_closed_to(
+                    &ctx.resolved,
+                    "textDocument/formatting",
+                    ctx.prepared.is_some(),
+                )
+            }) else {
+                continue;
+            };
+            // One unprepared before it counts unless this one answers for
+            // the span (an empty answer, already formatted, included).
+            let owed = spans.owes(span);
             // Decide how this region formats — concatenated pipeline, preferred
             // fan-out, or skip — from its resolved aggregation config. See
             // [`plan_region_format`] for the allowlist rule
@@ -849,7 +853,7 @@ async fn pipeline_step_request_kind(
 /// Discovery orders same-range alternate languages by query-pattern
 /// priority, but an unconfigured or explicitly disabled language (never
 /// offered here), one whose peer could not prepare it, or one closed to the
-/// method is not a winner: the span is reserved only by the
+/// method (`runnable`) is not a winner: the span is reserved only by the
 /// first alternative that can format it, and later ones are suppressed to
 /// keep emitted edits non-overlapping.
 #[derive(Default)]
@@ -865,23 +869,25 @@ impl SpanReservations {
         self.reserved.contains(&span)
     }
 
-    /// The context to format `span` with, offered in discovery order (see
-    /// `prepare_request_context_for`): `None` when an earlier alternative
-    /// reserved the span, or this one could not be prepared (`Err`,
-    /// remembered) or is closed to the method (`Ok(None)`).
-    pub(super) fn admit<T, E>(
+    /// The context to format `span` with, offered in discovery order:
+    /// `None` when an earlier alternative reserved the span, or this one
+    /// has no prepared context or cannot run.
+    pub(super) fn admit<T>(
         &mut self,
         span: (usize, usize),
-        ctx: std::result::Result<Option<T>, E>,
+        ctx: Option<T>,
+        runnable: impl FnOnce(&T) -> bool,
     ) -> Option<T> {
         if self.reserved.contains(&span) {
             return None;
         }
-        let Ok(ctx) = ctx else {
+        let Some(ctx) = ctx else {
             self.unprepared.insert(span);
             return None;
         };
-        let ctx = ctx?;
+        if !runnable(&ctx) {
+            return None;
+        }
         self.reserved.insert(span);
         Some(ctx)
     }
@@ -2163,25 +2169,26 @@ mod tests {
     #[test]
     fn a_span_goes_to_the_first_alternative_that_can_format_it() {
         let mut spans = SpanReservations::default();
-        // The first alternative's peer could not prepare it, the next is
-        // closed to the method: the one after that formats the span.
-        assert_eq!(spans.admit::<&str, ()>((0, 4), Err(())), None);
-        assert_eq!(spans.admit::<&str, ()>((0, 4), Ok(None)), None);
+        let runnable = |ctx: &&str| *ctx != "closed";
+        // The first alternative's peer could not prepare it: the next one
+        // that can run formats the span.
+        assert_eq!(spans.admit((0, 4), None, runnable), None);
+        assert_eq!(spans.admit((0, 4), Some("closed"), runnable), None);
         assert!(!spans.is_reserved((0, 4)));
-        assert_eq!(spans.admit::<_, ()>((0, 4), Ok(Some("lua"))), Some("lua"));
+        assert_eq!(spans.admit((0, 4), Some("lua"), runnable), Some("lua"));
         assert!(spans.is_reserved((0, 4)));
-        assert_eq!(spans.admit::<_, ()>((0, 4), Ok(Some("vim"))), None);
+        assert_eq!(spans.admit((0, 4), Some("vim"), runnable), None);
         // A span only an unprepared alternative was offered for is left
         // unformatted.
-        assert_eq!(spans.admit::<&str, ()>((5, 9), Err(())), None);
+        assert_eq!(spans.admit((5, 9), None, runnable), None);
         assert_eq!(spans.unprepared(), 1);
         // The alternative taking a span after an unprepared one answers
         // for it; one taking it first owes nothing.
         assert!(spans.owes((0, 4)));
-        assert_eq!(spans.admit::<_, ()>((5, 9), Ok(Some("lua"))), Some("lua"));
+        assert_eq!(spans.admit((5, 9), Some("lua"), runnable), Some("lua"));
         assert!(spans.owes((5, 9)));
         assert_eq!(spans.unprepared(), 0);
-        assert_eq!(spans.admit::<_, ()>((10, 14), Ok(Some("lua"))), Some("lua"));
+        assert_eq!(spans.admit((10, 14), Some("lua"), runnable), Some("lua"));
         assert!(!spans.owes((10, 14)));
     }
 
