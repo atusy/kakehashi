@@ -101,17 +101,21 @@ fn transform_folding_range_response_to_host(
         // length (LSP), for the start as for the end: a prepared line can
         // join several virtual ones, and the fold starts on the last.
         for folding in &mut ranges {
-            let start = prepared.to_virtual(
-                Position::new(
-                    folding.start_line,
-                    folding.start_character.unwrap_or(u32::MAX),
-                ),
-                Bias::Start,
+            let start = Position::new(
+                folding.start_line,
+                folding.start_character.unwrap_or(u32::MAX),
             );
-            let end = prepared.to_virtual(
-                Position::new(folding.end_line, folding.end_character.unwrap_or(u32::MAX)),
-                Bias::End,
-            );
+            let end = Position::new(folding.end_line, folding.end_character.unwrap_or(u32::MAX));
+            // Empty as the prepared document reads it: opposite biases
+            // could map its endpoints apart across a gap, inside out (see
+            // `translate_virtual_range_to_host`).
+            let empty = prepared.same_prepared_offset(start, end);
+            let start = prepared.to_virtual(start, Bias::Start);
+            let end = if empty {
+                start
+            } else {
+                prepared.to_virtual(end, Bias::End)
+            };
             // A character given stays given, at its mapped column. One
             // omitted (the line's end) stays omitted only while the mapped
             // endpoint is still its virtual line's end: a prepared line may
@@ -233,6 +237,46 @@ mod tests {
         )
         .unwrap();
         assert_eq!((ranges[0].start_line, ranges[0].end_line), (12, 12));
+    }
+
+    /// An empty fold stays empty: its endpoints, one offset in the prepared
+    /// document, map with one bias, as a range's do, rather than apart
+    /// across a gap the prepared text dropped (inside out).
+    #[test]
+    fn an_empty_fold_stays_empty_across_a_dropped_gap() {
+        use crate::language::injection::VirtualGap;
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let virtual_text = "ab\n  \ncd";
+        let gaps = [VirtualGap {
+            virtual_range: 2..6,
+            host_text: "\n  \n".to_string(),
+        }];
+        let answer = serde_json::from_value(serde_json::json!({"segments": [
+            {"type": "content"},
+            {"type": "gap", "content": ""},
+            {"type": "content"}
+        ]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::from_gaps(virtual_text, &gaps),
+            Some(answer),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "abcd");
+        let response = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": [
+            {"startLine": 0, "startCharacter": 2, "endLine": 0, "endCharacter": 2}
+        ]});
+        let ranges = transform_folding_range_response_to_host(
+            response,
+            &RegionOffset::new(10, 0).with_prepared(prepared.map),
+        )
+        .unwrap();
+        let fold = &ranges[0];
+        assert_eq!(
+            (fold.start_line, fold.start_character),
+            (fold.end_line, fold.end_character)
+        );
     }
 
     /// A fold over a prepared line joining several virtual ones starts where
