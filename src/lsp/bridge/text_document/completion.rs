@@ -92,15 +92,11 @@ impl LanguageServerPool {
                 build_completion_request(virtual_uri, host_position, &offset, request_id)
             },
             |response, ctx| {
-                // Edits for a text whose host coordinates moved since.
-                if !ctx.request_text_held {
-                    return None;
-                }
-                transform_completion_response_to_host(
+                completion_response_to_host(
                     response,
-                    ctx.offset,
+                    ctx,
                     region_end,
-                    Some(host_position),
+                    host_position,
                     origin.has_capability("completionItem/resolve"),
                     &EnvelopeContext {
                         server_name,
@@ -118,6 +114,33 @@ impl LanguageServerPool {
         )
         .await
     }
+}
+
+/// [`transform_completion_response_to_host`] for a response as the executor
+/// hands it over: nothing when the connection holds the request's prepared
+/// text under another map by now (see `BridgeResponseContext`), its items'
+/// edits made for host coordinates that moved since.
+fn completion_response_to_host(
+    response: serde_json::Value,
+    ctx: &super::super::pool::BridgeResponseContext<'_>,
+    region_end: Position,
+    request_host_position: Position,
+    server_resolves: bool,
+    envelope_ctx: &EnvelopeContext<'_>,
+    insert_mode: ClientInsertMode,
+) -> Option<CompletionList> {
+    if !ctx.request_text_held {
+        return None;
+    }
+    transform_completion_response_to_host(
+        response,
+        ctx.offset,
+        region_end,
+        Some(request_host_position),
+        server_resolves,
+        envelope_ctx,
+        insert_mode,
+    )
 }
 
 /// Build a JSON-RPC completion request for a downstream language server.
@@ -1523,6 +1546,44 @@ mod tests {
             .expect("a list");
             assert!(list.is_incomplete && list.items.is_empty(), "{list:?}");
         }
+    }
+
+    #[test]
+    fn an_answer_for_a_text_held_under_a_new_map_is_dropped() {
+        let offset = dedented_offset("  a\n");
+        let host_uri: tower_lsp_server::ls_types::Uri = "file:///test.md".parse().unwrap();
+        let response = json!({"jsonrpc": "2.0", "id": 1, "result": [{"label": "x", "textEdit": {
+            "range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 1}},
+            "newText": "x"
+        }}]});
+        let answer = |held: bool| {
+            let ctx = super::super::super::pool::BridgeResponseContext {
+                virtual_uri_string: "file:///test.md/v.lua".to_string(),
+                host_uri_lsp: &host_uri,
+                offset: &offset,
+                request_text_held: held,
+            };
+            completion_response_to_host(
+                response.clone(),
+                &ctx,
+                Position::new(11, 0),
+                Position::new(10, 3),
+                false,
+                &EnvelopeContext {
+                    server_name: "lua-ls",
+                    injection_language: "lua",
+                    incarnation: Some(1),
+                    host_uri: "file:///test.md",
+                    region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    offset: &offset,
+                    region_end: Some(Position::new(11, 0)),
+                    host_layer: false,
+                },
+                ClientInsertMode::default(),
+            )
+        };
+        assert_eq!(answer(true).map(|list| list.items.len()), Some(1));
+        assert_eq!(answer(false), None);
     }
 
     #[test]
