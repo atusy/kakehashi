@@ -368,7 +368,7 @@ async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
         documents,
         incarnation,
         content_version,
-        settings_generation,
+        mut settings_generation,
         trigger,
         resnapshot,
         #[cfg(test)]
@@ -403,6 +403,11 @@ async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
     // still leaving it out would replace that collection.
     if let Some(resnapshot) = resnapshot {
         snapshot_data = resnapshot(incarnation, content_version);
+        // Ranked under the settings that snapshot was taken with: the timer
+        // knew none (scheduled without a snapshot), or older ones.
+        if let Some(snapshot) = &snapshot_data {
+            settings_generation = snapshot.lineage.settings_generation;
+        }
     }
     #[cfg(test)]
     if let Some(gate) = &execution_gate {

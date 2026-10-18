@@ -1487,6 +1487,87 @@ print("hello")
         );
     }
 
+    /// A debounced collection that takes its snapshot when it fires runs
+    /// under the settings that snapshot was taken with, not the ones (or
+    /// none) its timer was scheduled under: it supersedes lower-ranked work
+    /// at its version under those settings rather than losing to it.
+    #[tokio::test]
+    async fn a_resnapshot_registers_under_the_settings_it_was_taken_with() {
+        use std::sync::Arc;
+
+        use crate::lsp::debounced_diagnostics::{DebouncedDiagnosticsManager, Resnapshot};
+        use crate::lsp::lsp_impl::DiagnosticPublisher;
+        use crate::lsp::lsp_impl::text_document::publish_diagnostic::{
+            DiagnosticSnapshot, DiagnosticSnapshotLineage,
+        };
+        use crate::lsp::synthetic_diagnostics::{
+            SyntheticDiagnosticTrigger, SyntheticDiagnosticsManager,
+        };
+
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///test/resnapshot_settings.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn a() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let (incarnation, content_version) = {
+            let document = server.documents.get(&uri).unwrap();
+            (document.incarnation(), document.content_version())
+        };
+        let synthetic = Arc::new(SyntheticDiagnosticsManager::new());
+        // Change-ranked work at this version under settings generation 5.
+        let earlier = tokio::spawn(std::future::pending::<()>());
+        assert!(synthetic.register_task_for_lineage(
+            uri.clone(),
+            incarnation,
+            content_version,
+            5,
+            SyntheticDiagnosticTrigger::Change,
+            earlier.abort_handle(),
+        ));
+        let resnapshot: Resnapshot = Box::new(|incarnation, content_version| {
+            Some(DiagnosticSnapshot {
+                lineage: DiagnosticSnapshotLineage {
+                    incarnation,
+                    content_version,
+                    settings_generation: 5,
+                },
+                virt_contexts: vec![],
+                host: None,
+                host_pull_enabled: false,
+                narrower_than_editor_pull: false,
+                prepare_pending: false,
+                layer_cfg: crate::config::settings::ResolvedLayerConfig {
+                    priorities: vec![],
+                    strategy: crate::config::settings::AggregationStrategy::Concatenated,
+                },
+            })
+        });
+        let manager = DebouncedDiagnosticsManager::with_duration(Duration::ZERO);
+        // Scheduled with no snapshot: its timer knows no settings generation.
+        manager.schedule(
+            uri.clone(),
+            None,
+            server.bridge.pool_arc(),
+            Arc::clone(&server.bridge),
+            Arc::clone(&synthetic),
+            Arc::new(DiagnosticPublisher::new(server)),
+            Arc::clone(&server.documents),
+            SyntheticDiagnosticTrigger::Prepared,
+            Some(resnapshot),
+        );
+        timeout(Duration::from_secs(1), async {
+            while !earlier.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the collection under generation 5 supersedes the change-ranked work");
+    }
+
     #[tokio::test]
     async fn fired_debounce_cannot_resync_document_closed_before_body_runs() {
         use std::sync::Arc;
