@@ -394,6 +394,7 @@ fn build_prepared(
                 .map_err(|reason| PrepareError::InvalidChange { index, reason })?;
                 let mut cursor = segment.virtual_range.start;
                 let mut deleted: Vec<&str> = Vec::new();
+                let mut closing: Option<&str> = None;
                 let deletes_closing_lines = deletions
                     .iter()
                     .any(|(_, kind)| *kind == RunKind::TrailingLines);
@@ -414,16 +415,20 @@ fn build_prepared(
                         virtual_text,
                         "",
                     );
-                    // The closing indent deleted with the document's closing
-                    // lines (the indent before a closing `''`, which must go
-                    // with them) indents no content line, so it says nothing
-                    // of the indent new lines regain. Without closing lines
-                    // deleted, an indentation-only last line may be content
-                    // of its own, and counts as any line does.
-                    let closing_indent = deletes_closing_lines
+                    // The indentation-only last line the peer deleted (the
+                    // indent before a closing `''`, with the closing lines or
+                    // right after content, where nixfmt puts it shallower
+                    // than the content) does not outvote the content's
+                    // dedent: new lines regain the content's. With closing
+                    // lines deleted it says nothing at all; without, and no
+                    // content line dedented, it is the only indent the
+                    // segment's lines (that last one among them) have.
+                    let closing_indent = kind == RunKind::Deleted
                         && index == last_index
                         && deletion.end == segment.virtual_range.end;
-                    if kind == RunKind::Deleted && !closing_indent {
+                    if closing_indent {
+                        closing = Some(&virtual_text[deletion.clone()]);
+                    } else if kind == RunKind::Deleted {
                         deleted.push(&virtual_text[deletion.clone()]);
                     }
                     cursor = deletion.end;
@@ -436,6 +441,12 @@ fn build_prepared(
                     virtual_text,
                     "",
                 );
+                if deleted.is_empty()
+                    && !deletes_closing_lines
+                    && let Some(closing) = closing
+                {
+                    deleted.push(closing);
+                }
                 indents.push(SegmentIndent::from_deletions(
                     virtual_text,
                     segment.virtual_range.clone(),
@@ -737,7 +748,9 @@ impl SegmentIndent {
         // the peer left unindented, not the rest of the line before it.
         let evidence = !deleted.is_empty()
             || (is_line_start(virtual_text, virtual_range.start)
-                && !virtual_text[virtual_range.clone()].trim().is_empty());
+                && !virtual_text[virtual_range.clone()]
+                    .trim_matches([' ', '\t', '\n', '\r'])
+                    .is_empty());
         let uniform = match deleted.split_first() {
             None => Some(String::new()),
             Some((first, rest)) => rest

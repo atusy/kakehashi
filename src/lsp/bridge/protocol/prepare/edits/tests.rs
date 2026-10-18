@@ -2335,3 +2335,76 @@ fn a_block_the_peer_left_unindented_regains_no_indent() {
         .unwrap();
     assert_eq!(apply_to(virtual_text, &[added]), "  a\n\nb\nc\n");
 }
+
+#[test]
+fn lines_created_above_a_shallower_closing_indent_regain_the_contents() {
+    // The nixfmt layout: `''\n    foo\n  ''`, the closing indent shallower
+    // than the content and deleted right after it.
+    let virtual_text = "\n    foo\n  ";
+    let map = prepare(
+        virtual_text,
+        json!([
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 4}}, "newText": ""},
+            {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
+        ]),
+    );
+    assert_eq!(map.prepared_lines.text, "foo\n");
+    let imported = map
+        .map_one_with_extent(&edit((0, 0), (0, 0), "x\n"))
+        .unwrap();
+    assert_eq!(apply_to(virtual_text, &[imported]), "\n    x\n    foo\n  ");
+    let completed = map
+        .map_one_with_extent(&edit((0, 0), (0, 3), "if a:\n  b"))
+        .unwrap();
+    assert_eq!(
+        apply_to(virtual_text, &[completed]),
+        "\n    if a:\n      b\n  "
+    );
+}
+
+#[test]
+fn only_spaces_and_tabs_are_blank() {
+    // A line left alone holding an ideographic space is a line of text: what
+    // is typed there joins it, regaining no indent.
+    let virtual_text = "  a\n\u{3000}\n";
+    let map = prepare(
+        virtual_text,
+        json!([
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+        ]),
+    );
+    let typed = map.map_one_with_extent(&edit((1, 0), (1, 0), "x")).unwrap();
+    assert_eq!(apply_to(virtual_text, &[typed]), "  a\nx\u{3000}\n");
+}
+
+#[test]
+fn text_joining_an_existing_line_takes_that_lines_indent() {
+    // `b` left alone: the text after the inserted line break joins it, and
+    // stays unindented with it.
+    let virtual_text = "  a\nb\n";
+    let map = prepare(
+        virtual_text,
+        json!([
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+        ]),
+    );
+    let inserted = map
+        .map_one_with_extent(&edit((1, 0), (1, 0), "x\ny"))
+        .unwrap();
+    assert_eq!(apply_to(virtual_text, &[inserted]), "  a\n  x\nyb\n");
+    // Joining the indentation-only last line, it keeps that line's indent.
+    let virtual_text = "\t \n\tb c\n ";
+    let map = prepare(
+        virtual_text,
+        json!([
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 1}}, "newText": ""},
+            {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 1}}, "newText": ""}
+        ]),
+    );
+    let joined = map
+        .map_one_with_extent(&edit((2, 0), (2, 0), "\r\nw"))
+        .unwrap();
+    assert_eq!(apply_to(virtual_text, &[joined]), "\t \n\tb c\n\r\n w");
+}
