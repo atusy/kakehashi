@@ -1011,12 +1011,19 @@ fn fuses_a_line_break(prepared: &str, runs: &[Run], virtual_text: &str) -> bool 
             .map(|_| index)
     };
     // The V offset of the prepared byte at `offset`, when it is one V holds
-    // verbatim.
+    // verbatim: unchanged content, or a gap kept as its original text (a
+    // CRLF's LF left out of combined captures that took its CR, say).
     let virtual_offset = |offset: usize| {
         run_of(offset).and_then(|index| {
             let run = &runs[index];
-            (run.kind == RunKind::Identity)
-                .then(|| run.virtual_.start + (offset - run.prepared.start))
+            let verbatim = match run.kind {
+                RunKind::Identity => true,
+                RunKind::Gap => {
+                    prepared.get(run.prepared.clone()) == virtual_text.get(run.virtual_.clone())
+                }
+                _ => false,
+            };
+            verbatim.then(|| run.virtual_.start + (offset - run.prepared.start))
         })
     };
     prepared.match_indices("\r\n").any(|(cr, _)| {
@@ -1068,6 +1075,47 @@ mod tests {
         // V keeps a CRLF: dedenting the next line joins nothing.
         let kept = dedent_line_1("a\r\n  b", 2).unwrap();
         assert_eq!(kept.text, "a\r\nb");
+    }
+
+    /// A CRLF split between content and a gap, as combined Rust line
+    /// comments with their children included capture it (the CR in the
+    /// comment, the LF between comments), is the virtual text's own: kept by
+    /// a `null` answer, it fuses nothing.
+    #[test]
+    fn a_crlf_split_between_content_and_a_kept_gap_is_the_virtual_texts_own() {
+        // `// a\r\n// b\r\n`: each comment holds its CR; the LF between
+        // them is a gap.
+        let virtual_text = "// a\r\n// b\r";
+        let gaps = [VirtualGap {
+            virtual_range: 5..6,
+            host_text: "\n".to_string(),
+        }];
+        let layout = VirtualLayout::from_gaps(virtual_text, &gaps);
+        let prepared = apply_prepare_result(virtual_text, &layout, None).unwrap();
+        assert_eq!(prepared.text, virtual_text);
+        // So is one the gap starts with its CR, the content going on with its LF.
+        let virtual_text = "a\r\nb";
+        let gaps = [VirtualGap {
+            virtual_range: 1..2,
+            host_text: "\r".to_string(),
+        }];
+        let layout = VirtualLayout::from_gaps(virtual_text, &gaps);
+        assert!(apply_prepare_result(virtual_text, &layout, None).is_ok());
+        // A gap whose placeholder brings the CR the content's LF lacked
+        // still fuses one.
+        let virtual_text = "ax\nb";
+        let gaps = [VirtualGap {
+            virtual_range: 1..2,
+            host_text: "x".to_string(),
+        }];
+        let layout = VirtualLayout::from_gaps(virtual_text, &gaps);
+        let answer: PrepareResult = serde_json::from_value(serde_json::json!({"segments": [
+            {"type": "content"},
+            {"type": "gap", "content": "\r"},
+            {"type": "content"}
+        ]}))
+        .unwrap();
+        assert!(apply_prepare_result(virtual_text, &layout, Some(answer)).is_err());
     }
 
     /// A gap placeholder that would complete a CRLF with the content beside
