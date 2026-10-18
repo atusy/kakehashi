@@ -233,7 +233,7 @@ edited V. It is refused, and dropped like any unsafe set, when:
   combined blocks, or the document's deleted closing lines — would no
   longer start one;
 - a line break P hides — a deleted edge line's, or a replaced gap's — would
-  fuse with one beside it into a single CRLF.
+  fuse with one beside it into a single CRLF;
 - a CR and an LF would meet at an edit's edge in one document but not in
   the other (a CR inserted before an LF P shows right after a gap it
   emptied: one line break in P, two in V).
@@ -247,8 +247,9 @@ like any other. A request range reaching into a gap stands for host text no
 presentation may replace (with the gap emptied, its prepared range is even
 empty, and an edit there would only insert beside it), and one right after
 an emptied gap reaches the server where the gap's start does, an edit there
-mapping back before the gap: for either, no presentation is returned. Additional edits refused with the main edit are dropped, the main
-edit kept as it maps alone.
+mapping back before the gap: for either, no presentation is returned.
+Additional edits refused with the main edit are dropped, the main edit kept
+as it maps alone.
 
 Completion keeps to what the client inserts where it asked:
 
