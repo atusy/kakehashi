@@ -131,9 +131,12 @@ pub(super) fn presentation(
                     stale_version,
                     ..
                 } => stale_version || generation != held.map(|held| held.generation),
-                Observed::Through(generation) => {
-                    held.is_none_or(|held| held.generation > generation)
-                }
+                // Also held as is since, the same text having been held
+                // prepared when it was read: placed as is, an edit read
+                // through a prepared text would escape its refusal.
+                Observed::Through(generation) => held.is_none_or(|held| {
+                    held.generation > generation || held.as_is_since > generation
+                }),
                 Observed::Now => false,
             };
         if newer {
@@ -165,6 +168,7 @@ mod tests {
             map,
             generation,
             version: 1,
+            as_is_since: 0,
         }
     }
 
