@@ -345,6 +345,11 @@ pub(crate) struct ServerRequestDeps {
     /// experimental features off): every connection holds its texts as is,
     /// and nothing is stamped.
     pub(crate) document_tracker: Option<Arc<crate::lsp::bridge::pool::DocumentTracker>>,
+    /// This process, among those spawned under `connection_key`: the count
+    /// of the key's purges when it was spawned, stamped with what it sends.
+    /// Taken at spawn, not as messages are read: a purge that retires it
+    /// bumps the count while this reader may still be draining.
+    pub(crate) incarnation: u64,
     /// This server's current workspace settings, shared with the pool, used to
     /// answer downstream `workspace/configuration` pulls (downstream-settings-propagation).
     /// `None` slot = no settings configured for this server. The pool seeds it at
@@ -366,7 +371,7 @@ impl ServerRequestDeps {
             .as_ref()
             .map(|tracker| crate::lsp::diagnostic_cache::HeldStamp {
                 connection: self.connection_key.clone(),
-                observed: tracker.observe_through(),
+                observed: tracker.observe_through(self.incarnation),
                 origin: None,
             })
     }
@@ -657,6 +662,7 @@ where
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
             document_tracker: None,
+            incarnation: 0,
         },
     )
 }
@@ -755,6 +761,7 @@ async fn reader_loop(
         client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
         progress_connection_id,
         document_tracker: None,
+        incarnation: 0,
     };
     reader_loop_with_liveness(reader, router, cancel_token, liveness, server_request_deps).await
 }
@@ -1386,6 +1393,7 @@ mod tests {
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
             document_tracker: None,
+            incarnation: 0,
         };
         (deps, window_rx, (rx, upstream_rx))
     }
@@ -1526,6 +1534,7 @@ mod tests {
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
             document_tracker: None,
+            incarnation: 0,
         };
 
         let notification = |text: &str| {
@@ -1609,6 +1618,7 @@ mod tests {
                 ),
                 progress_connection_id: conn,
                 document_tracker: None,
+                incarnation: 0,
             },
         );
 
@@ -2065,6 +2075,7 @@ mod tests {
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
             document_tracker: None,
+            incarnation: 0,
         };
 
         let message = json!({
@@ -2643,6 +2654,7 @@ mod tests {
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
             document_tracker: None,
+            incarnation: 0,
         };
 
         // Then unregister it
@@ -2709,6 +2721,7 @@ mod tests {
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
             document_tracker: None,
+            incarnation: 0,
         };
 
         let message = json!({
@@ -2802,6 +2815,7 @@ mod tests {
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
             document_tracker: None,
+            incarnation: 0,
         };
 
         let create = json!({
@@ -2866,6 +2880,7 @@ mod tests {
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
             document_tracker: None,
+            incarnation: 0,
         };
 
         let create = json!({
@@ -2928,6 +2943,7 @@ mod tests {
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
             document_tracker: None,
+            incarnation: 0,
         };
 
         let create = json!({
@@ -2991,6 +3007,7 @@ mod tests {
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
             document_tracker: None,
+            incarnation: 0,
         };
 
         let create = json!({
@@ -3063,6 +3080,7 @@ mod tests {
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
             document_tracker: None,
+            incarnation: 0,
         };
 
         let make = || {
@@ -3153,6 +3171,7 @@ mod tests {
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
             document_tracker: None,
+            incarnation: 0,
         };
 
         let message = json!({
@@ -3214,6 +3233,7 @@ mod tests {
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
             document_tracker: None,
+            incarnation: 0,
         };
 
         // A renderable "begin" announces the token (create first) and is forwarded
@@ -3303,6 +3323,7 @@ mod tests {
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
             document_tracker: None,
+            incarnation: 0,
         };
 
         let progress = json!({
@@ -3347,6 +3368,7 @@ mod tests {
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
             document_tracker: None,
+            incarnation: 0,
         };
 
         let message = json!({
@@ -3407,6 +3429,7 @@ mod tests {
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
             document_tracker: None,
+            incarnation: 0,
         };
 
         let message = json!({
@@ -3456,6 +3479,7 @@ mod tests {
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
             document_tracker: None,
+            incarnation: 0,
         };
 
         let message = json!({
@@ -3505,6 +3529,7 @@ mod tests {
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
             document_tracker: None,
+            incarnation: 0,
         };
 
         let message = json!({
@@ -3560,6 +3585,7 @@ mod tests {
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
             document_tracker: None,
+            incarnation: 0,
         };
 
         let message = json!({
@@ -3659,6 +3685,7 @@ mod tests {
                 ),
                 progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
                 document_tracker: tracker,
+                incarnation: 0,
             };
             crate::lsp::bridge::text_document::publish_diagnostics::forward_push(
                 push(version),
@@ -3680,6 +3707,7 @@ mod tests {
                 generation: Some(1),
                 prepared: true,
                 stale_version,
+                incarnation: 0,
             },
             origin: None,
         };
@@ -3711,6 +3739,7 @@ mod tests {
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
             document_tracker: tracker,
+            incarnation: 0,
         };
         assert_eq!(deps_with(None).held_through(), None);
 
@@ -3743,7 +3772,13 @@ mod tests {
                 1,
             );
         }
-        assert_eq!(observed(), Some(Observed::Through(2)));
+        assert_eq!(
+            observed(),
+            Some(Observed::Through {
+                generation: 2,
+                incarnation: 0
+            })
+        );
     }
 
     /// A non-virtual (real host URI) push is now routed up too — the publisher
@@ -3773,6 +3808,7 @@ mod tests {
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
             document_tracker: None,
+            incarnation: 0,
         };
 
         let message = json!({
@@ -3831,6 +3867,7 @@ mod tests {
                 ),
                 progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
                 document_tracker: None,
+                incarnation: 0,
             };
             (deps, upstream_rx)
         };
@@ -3915,6 +3952,7 @@ mod tests {
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
             document_tracker: None,
+            incarnation: 0,
         };
 
         let message = json!({
@@ -3960,6 +3998,7 @@ mod tests {
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
             document_tracker: None,
+            incarnation: 0,
         };
 
         // client/registerCapability with no params field at all
@@ -4020,6 +4059,7 @@ mod tests {
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
             document_tracker: None,
+            incarnation: 0,
         };
 
         // client/unregisterCapability with no params field at all
@@ -4091,6 +4131,7 @@ mod tests {
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
             document_tracker: None,
+            incarnation: 0,
         };
         let handle = tokio::spawn(async move {
             let message = json!({
@@ -4157,6 +4198,7 @@ mod tests {
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
             document_tracker: None,
+            incarnation: 0,
         };
 
         let message = json!({
@@ -4681,6 +4723,7 @@ mod tests {
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
             document_tracker: None,
+            incarnation: 0,
         };
         (deps, response_rx, upstream_request_rx)
     }
@@ -5136,6 +5179,7 @@ mod tests {
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
             document_tracker: None,
+            incarnation: 0,
         };
         (deps, (rx, upstream_rx, window_rx))
     }

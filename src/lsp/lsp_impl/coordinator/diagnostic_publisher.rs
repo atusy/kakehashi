@@ -1036,10 +1036,15 @@ impl DiagnosticPublisher {
         }
         // Known stale already — computed for a prepared text the connection
         // no longer holds (another version named, or another text recorded
-        // since): it would place nowhere, and recorded it would replace the
-        // slot of the push for the text held, dropping those diagnostics.
+        // since), or sent by a process its replacement took over from: it
+        // would place nowhere, and recorded it would replace the slot of the
+        // push for the text held, dropping those diagnostics.
         if let Some(stamp) = &held
             && (stamp.names_stale_version()
+                || self
+                    .bridge
+                    .pool()
+                    .sent_by_retired(&stamp.connection, stamp.observed)
                 || matches!(
                     stamp.observed,
                     crate::lsp::bridge::Observed::Read {
@@ -4447,6 +4452,7 @@ mod tests {
                 generation: None,
                 prepared: true,
                 stale_version,
+                incarnation: 0,
             },
             origin: None,
         };
@@ -4471,6 +4477,78 @@ mod tests {
         let slots = server.diagnostics.snapshot(&host_uri);
         let slot = &slots[&DiagnosticSource::Region("region-1".to_string())]["lua_ls"];
         assert_eq!(slot.diagnostics[0].message, "current");
+    }
+
+    /// A push its connection's retired process sent, read after the
+    /// replacement recorded the document again, is dropped before it
+    /// reaches the cache: it would pass for the replacement's and replace
+    /// the slot of the replacement's push.
+    #[tokio::test]
+    async fn a_push_from_a_retired_process_keeps_its_replacements_diagnostics() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let host_uri = Url::parse("file:///test/retired_push.md").unwrap();
+        server.documents.insert(
+            host_uri.clone(),
+            "```lua\nlocal x = 1\n```\n".to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap(),
+            "lua",
+            "region-1",
+        );
+        let key = crate::lsp::bridge::ConnectionKey::for_server("lua_ls");
+        // The retired process's records are gone; the replacement opened
+        // the document again.
+        server.bridge.purge_connection_for_test(&key).await;
+        server
+            .bridge
+            .register_opened_document_for_test(&host_uri, &virtual_uri, &key)
+            .await;
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "lua_ls".to_string(),
+            BridgeServerConfig {
+                cmd: Some(vec!["lua-language-server".to_string()]),
+                ..Default::default()
+            },
+        );
+        server.settings_manager.apply_settings(settings);
+        let uri = virtual_uri.to_uri_string();
+        server
+            .bridge
+            .record_sent_as_is_for_test(&virtual_uri, &key, "local x = 1\n");
+        let generation = server
+            .bridge
+            .pool()
+            .held_text(&uri, &key)
+            .map(|held| held.generation);
+        let publisher = DiagnosticPublisher::new(server);
+        let push = |incarnation, connection_id, message| {
+            publisher.record_region_push(
+                &uri,
+                "lua_ls".to_string(),
+                ProgressConnectionId::for_test(connection_id),
+                Some(HeldStamp {
+                    connection: key.clone(),
+                    observed: crate::lsp::bridge::Observed::Read {
+                        generation,
+                        prepared: true,
+                        stale_version: false,
+                        incarnation,
+                    },
+                    origin: None,
+                }),
+                vec![diag(message)],
+            )
+        };
+        assert!(push(1, 2, "replacement").await.is_some());
+        assert!(push(0, 1, "retired").await.is_none(), "dropped");
+        let slots = server.diagnostics.snapshot(&host_uri);
+        let slot = &slots[&DiagnosticSource::Region("region-1".to_string())]["lua_ls"];
+        assert_eq!(slot.diagnostics[0].message, "replacement");
     }
 
     #[tokio::test]

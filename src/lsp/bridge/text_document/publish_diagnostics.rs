@@ -99,7 +99,7 @@ pub(in crate::lsp::bridge) fn forward_push(
                 .and_then(|version| i32::try_from(version).ok());
             crate::lsp::diagnostic_cache::HeldStamp {
                 connection: deps.connection_key.clone(),
-                observed: tracker.observe(&uri, &deps.connection_key, version),
+                observed: tracker.observe(&uri, &deps.connection_key, deps.incarnation, version),
                 // Filled in where the slot is recorded.
                 origin: None,
             }

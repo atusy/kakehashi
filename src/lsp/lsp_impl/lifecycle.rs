@@ -3861,6 +3861,7 @@ mod tests {
                         generation: Some(generation),
                         prepared: true,
                         stale_version,
+                        incarnation: 0,
                     },
                     origin: None,
                 }),
