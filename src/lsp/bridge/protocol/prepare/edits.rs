@@ -60,22 +60,13 @@ impl PreparedMap {
         // mapped one by one neither sees: at a line start, or with a line
         // break or no text at all on the side where they meet. Mid-line
         // between text, neither decides anything there.
-        let breaks = |c: char| c == '\n' || c == '\r';
         if order.windows(2).any(|pair| {
             let (earlier, later) = (pair[0], pair[1]);
             let meeting = ranges[later].start;
             ranges[earlier].end == meeting
                 && (is_line_start(prepared, meeting)
-                    || !edits[earlier]
-                        .new_text
-                        .chars()
-                        .next_back()
-                        .is_some_and(|last| !breaks(last))
-                    || !edits[later]
-                        .new_text
-                        .chars()
-                        .next()
-                        .is_some_and(|first| !breaks(first)))
+                    || !begins_line(edits[earlier].new_text.chars().next_back())
+                    || !begins_line(edits[later].new_text.chars().next()))
         }) {
             return None;
         }
@@ -184,7 +175,7 @@ impl PreparedMap {
             })
             .chain(first_closing_line);
         for run in line_starts {
-            if before(run.virtual_.start).is_some_and(|c| c != '\n' && c != '\r') {
+            if begins_line(before(run.virtual_.start)) {
                 return false;
             }
         }
@@ -290,9 +281,7 @@ impl PreparedMap {
             // non-blank line: what remains is that existing line, which keeps
             // its own indent (deleting a line must not re-indent the next).
             Some(_)
-                if !new_text.contains(['\n', '\r'])
-                    && tail.is_some()
-                    && following.is_some_and(|next| next != '\n' && next != '\r') =>
+                if !new_text.contains(['\n', '\r']) && tail.is_some() && begins_line(following) =>
             {
                 FirstIndent::Exact(tail.unwrap_or_default())
             }
@@ -389,8 +378,6 @@ impl PreparedMap {
         following: Option<char>,
         tail: Option<&str>,
     ) -> Option<String> {
-        let begins_line =
-            |next: Option<char>| next.is_some_and(|next| next != '\n' && next != '\r');
         let breaks_line = text.contains(['\n', '\r']);
         let first = if begins_line(text.chars().next().or(following)) {
             first
@@ -463,6 +450,12 @@ fn sorted_extents(lines: &LineMap, edits: &[TextEdit]) -> Option<(Vec<Range<usiz
         return None;
     }
     Some((ranges, order))
+}
+
+/// Whether `next` is a character that is no line break: one that begins
+/// (or continues) a line rather than ending it.
+fn begins_line(next: Option<char>) -> bool {
+    next.is_some_and(|next| next != '\n' && next != '\r')
 }
 
 fn is_line_end(text: &str, offset: usize) -> bool {
