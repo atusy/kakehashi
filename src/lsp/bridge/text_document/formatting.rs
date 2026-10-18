@@ -41,9 +41,7 @@ use tower_lsp_server::ls_types::{
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
-use super::super::protocol::{
-    EditMode, translate_virtual_range_to_host, translate_virtual_text_edits_to_host,
-};
+use super::super::protocol::{EditMode, translate_virtual_text_edits_to_host};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, region_host_end,
     response_has_jsonrpc_error, text_edit_safe_in_region,
@@ -660,21 +658,16 @@ fn transform_formatting_style_response(
     // host text P does not show (the deleted edge lines). An answer the map
     // refuses fails the request (the CLI reports it), unlike the malformed
     // answers dropped below: the server did its job, and the region is left
-    // unformatted only because its result cannot be placed in the host.
-    if offset.prepared().is_some() {
-        if !translate_virtual_text_edits_to_host(&mut edits, offset, EditMode::Formatting) {
-            warn!(
-                target: "kakehashi::bridge",
-                "Refused a formatting response: its result cannot be mapped back through the prepared virtual document"
-            );
-            return Err(io::Error::other(
-                "formatting response cannot be mapped back through the prepared virtual document",
-            ));
-        }
-    } else {
-        for edit in &mut edits {
-            translate_virtual_range_to_host(&mut edit.range, offset);
-        }
+    // unformatted only because its result cannot be placed in the host. An
+    // unprepared document's edits translate as ranges, never refused.
+    if !translate_virtual_text_edits_to_host(&mut edits, offset, EditMode::Formatting) {
+        warn!(
+            target: "kakehashi::bridge",
+            "Refused a formatting response: its result cannot be mapped back through the prepared virtual document"
+        );
+        return Err(io::Error::other(
+            "formatting response cannot be mapped back through the prepared virtual document",
+        ));
     }
 
     // Clamp positions past the end of the last content line into the region:
