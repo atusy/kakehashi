@@ -178,6 +178,31 @@ fn touching_edits_are_refused() {
 }
 
 #[test]
+fn lines_inserted_where_a_placeholder_breaks_a_host_line_touch_nothing() {
+    // `  a${x}\n`, the interpolation shown as `x\n`: P's line after it is
+    // the rest of the host line, no line start of the host's.
+    let virtual_text = "  a    \n";
+    let prepared = prepare_pieces(
+        virtual_text,
+        [
+            (SegmentKind::Content, 0..3, String::new()),
+            (SegmentKind::Gap, 3..7, "${x}".to_string()),
+            (SegmentKind::Content, 7..8, String::new()),
+        ],
+        json!({"segments": [
+            {"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+            ]},
+            {"type": "gap", "content": "x\n"},
+            {"type": "content"}
+        ]}),
+    );
+    assert_eq!(prepared.text, "ax\n\n");
+    let edits = [edit((1, 0), (1, 0), "\n"), edit((1, 0), (2, 0), "z\n")];
+    assert_eq!(prepared.map.map_edits(&edits, EditMode::Extent), None);
+}
+
+#[test]
 fn lines_inserted_before_an_edit_on_the_same_line_map() {
     // A completion rewriting `pa` on the region's first line with an import
     // added above it.
