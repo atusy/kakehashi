@@ -602,14 +602,11 @@ fn translate_item_ranges_host_to_virtual(item: &mut CompletionItem, offset: &Reg
 /// The resolved item may have its own `data` (from the downstream's resolve
 /// response). We wrap it again so that future resolves can still be routed.
 fn re_envelope_item(item: &mut CompletionItem, envelope: &KakehashiEnvelope) {
-    // The offset is written as a fresh mint writes it, but keeps the mark of
-    // an item minted from a prepared document, which no RegionOffset carries
-    // without the map: dropped, the item would describe the region again once
-    // the pair lost its peer, and resolve through a map-less offset. The
-    // layer is kept too: a host-layer item resolved once must still take the
-    // host path on the client's NEXT resolve of it.
-    let mut offset = super::completion::EnvelopeOffset::from(&RegionOffset::from(&envelope.offset));
-    offset.prepared = envelope.offset.prepared;
+    // The offset as a fresh mint writes it, keeping the prepared mark (see
+    // `EnvelopeOffset::rewritten`), as every carrier re-envelopes. The layer
+    // is kept too: a host-layer item resolved once must still take the host
+    // path on the client's NEXT resolve of it.
+    let offset = envelope.offset.rewritten();
     // Field by field: `..envelope.clone()` would clone `inner`, the
     // server's whole data payload, only to drop it.
     let rebuilt = KakehashiEnvelope {
