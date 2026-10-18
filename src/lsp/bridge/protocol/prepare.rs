@@ -460,8 +460,8 @@ fn build_prepared(
     if check_line_breaks && fuses_a_line_break(&text, &runs, virtual_text) {
         return Err(PrepareError::FusedLineBreak);
     }
-    // A segment that says nothing of its indentation (no indent removed, no
-    // line of text starting in it: the rest of a line after an
+    // A segment that says nothing of its indentation (no indent removed,
+    // and no block of text of its own: the rest of a line after an
     // interpolation, blank lines) is indented as the content before it.
     for index in 1..indents.len() {
         if !indents[index].evidence {
@@ -725,21 +725,19 @@ struct SegmentIndent {
     /// right indentation.
     uniform: Option<String>,
     /// Whether the segment says anything of its indentation: an indent
-    /// removed, or a line of text starting in it that kept its own.
+    /// removed, or text in a segment that opens a line of its own.
     evidence: bool,
 }
 
 impl SegmentIndent {
     fn from_deletions(virtual_text: &str, virtual_range: Range<usize>, deleted: &[&str]) -> Self {
+        // A line of text the peer left alone says nothing of the indent new
+        // lines regain, as within one segment; but a segment that opens a
+        // line of its own (a block after a fence) and holds text is a block
+        // the peer left unindented, not the rest of the line before it.
         let evidence = !deleted.is_empty()
-            || virtual_range.clone().any(|at| {
-                is_line_start(virtual_text, at)
-                    && !splits_crlf(virtual_text, at)
-                    && virtual_text[at..virtual_range.end]
-                        .split(['\n', '\r'])
-                        .next()
-                        .is_some_and(|line| !line.trim().is_empty())
-            });
+            || (is_line_start(virtual_text, virtual_range.start)
+                && !virtual_text[virtual_range.clone()].trim().is_empty());
         let uniform = match deleted.split_first() {
             None => Some(String::new()),
             Some((first, rest)) => rest
