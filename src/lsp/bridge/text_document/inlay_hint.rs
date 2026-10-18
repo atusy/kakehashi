@@ -266,7 +266,7 @@ impl LanguageServerPool {
                 )
             },
             |response, ctx| {
-                transform_inlay_hint_response_to_host_and_envelope(
+                let mut hints = transform_inlay_hint_response_to_host_and_envelope(
                     response,
                     &ctx.virtual_uri_string,
                     ctx.host_uri_lsp,
@@ -285,7 +285,15 @@ impl LanguageServerPool {
                         host_layer: false,
                     },
                     origin.has_capability("inlayHint/resolve"),
-                )
+                );
+                // Edits for a text whose host coordinates moved since are
+                // not offered; the hints stay shown, as a position is.
+                if !ctx.request_text_held {
+                    for hint in hints.iter_mut().flatten() {
+                        hint.text_edits = None;
+                    }
+                }
+                hints
             },
         )
         .await
