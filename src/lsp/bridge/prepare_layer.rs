@@ -741,7 +741,10 @@ mod tests {
             .unwrap();
         assert_eq!(resync.host_uri, host);
         assert!(resync.ready, "settles the debt");
-        assert!(resync.edited, "and collects through the debounce, not at once");
+        assert!(
+            resync.edited,
+            "and collects through the debounce, not at once"
+        );
         // A pull that saw that answer already waits for the other.
         coordinator.owe_pull_after_prepare(&host, coordinator.prepare_host_answers(&host));
         assert!(
