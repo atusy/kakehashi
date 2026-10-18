@@ -1716,3 +1716,35 @@ fn a_cr_before_a_gap_shown_opening_with_its_lf_is_the_servers_to_join() {
         .unwrap();
     assert_eq!(apply_to(virtual_text, &[mapped]), "a\r\n b");
 }
+
+#[test]
+fn a_line_created_after_an_interpolation_takes_the_indent_of_its_line() {
+    // `\n  foo ${x} bar\n`: the segment after the interpolation starts no
+    // line of its own and removed no indent; a line created in it is
+    // indented as the line it began on.
+    let virtual_text = "\n  foo      bar\n";
+    let prepared = prepare_pieces(
+        virtual_text,
+        [
+            (SegmentKind::Content, 0..7, String::new()),
+            (SegmentKind::Gap, 7..11, "${x}".to_string()),
+            (SegmentKind::Content, 11..16, String::new()),
+        ],
+        json!({"segments": [
+            {"type": "content", "changes": [
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+            ]},
+            {"type": "gap", "content": "1"},
+            {"type": "content"}
+        ]}),
+    );
+    assert_eq!(prepared.text, "\nfoo 1 bar\n");
+    let appended = prepared
+        .map
+        .map_one_with_extent(&edit((1, 9), (1, 9), "\nbaz"))
+        .unwrap();
+    assert_eq!(
+        apply_to(virtual_text, &[appended]),
+        "\n  foo      bar\n  baz\n"
+    );
+}
