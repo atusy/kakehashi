@@ -773,8 +773,6 @@ impl PrepareRegistry {
         self.closed_hosts.remove(host_uri.as_str());
     }
 
-    /// Forget a closed host's documents: until it opens again, nothing is
-    /// looked up for it.
     /// How many answers re-synced `host_uri` (see `host_answers`).
     pub(crate) fn host_answers(&self, host_uri: &Url) -> u64 {
         self.host_answers
@@ -782,6 +780,8 @@ impl PrepareRegistry {
             .map_or(0, |answers| *answers)
     }
 
+    /// Forget a closed host's documents: until it opens again, nothing is
+    /// looked up for it.
     pub(crate) fn forget_host(&self, host_uri: &Url) {
         self.host_answers.remove(host_uri.as_str());
         // Every close, whether anything was looked up yet or not: a request
