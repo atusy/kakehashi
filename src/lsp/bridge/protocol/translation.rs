@@ -215,13 +215,9 @@ pub(crate) fn translate_virtual_text_edits_to_host(
         }
         return true;
     };
-    let Some(mut mapped) = prepared.map_edits(edits, mode) else {
+    let Some(mapped) = map_to_host(prepared, edits, offset, mode) else {
         return false;
     };
-    for edit in &mut mapped {
-        translate_unprepared_virtual_position_to_host(&mut edit.range.start, offset);
-        translate_unprepared_virtual_position_to_host(&mut edit.range.end, offset);
-    }
     *edits = mapped;
     true
 }
@@ -238,16 +234,35 @@ pub(crate) fn translate_virtual_text_edit_to_host(
         translate_virtual_range_to_host(&mut edit.range, offset);
         return true;
     };
-    let Some(Ok([mut mapped])) = prepared
-        .map_edits(std::slice::from_ref(edit), EditMode::Extent)
-        .map(<[TextEdit; 1]>::try_from)
-    else {
+    let Some(Ok([mapped])) = map_to_host(
+        prepared,
+        std::slice::from_ref(edit),
+        offset,
+        EditMode::Extent,
+    )
+    .map(<[TextEdit; 1]>::try_from) else {
         return false;
     };
-    translate_unprepared_virtual_position_to_host(&mut mapped.range.start, offset);
-    translate_unprepared_virtual_position_to_host(&mut mapped.range.end, offset);
     *edit = mapped;
     true
+}
+
+/// `edits` to the prepared document `prepared` describes, mapped onto the
+/// virtual document as `mode` reads them and placed in host coordinates;
+/// `None` when refused. What both forms of the seam share past the
+/// unprepared case.
+fn map_to_host(
+    prepared: &PreparedMap,
+    edits: &[TextEdit],
+    offset: &RegionOffset,
+    mode: EditMode,
+) -> Option<Vec<TextEdit>> {
+    let mut mapped = prepared.map_edits(edits, mode)?;
+    for edit in &mut mapped {
+        translate_unprepared_virtual_position_to_host(&mut edit.range.start, offset);
+        translate_unprepared_virtual_position_to_host(&mut edit.range.end, offset);
+    }
+    Some(mapped)
 }
 
 /// Translate, in place, a main edit and the additional edits a client
