@@ -347,15 +347,16 @@ impl Default for PrepareRegistry {
 pub(crate) struct PrepareFailures(Arc<Regions>);
 
 impl PrepareFailures {
-    /// Whether a text from `answer` (`None`: a text as is) is refused by the
-    /// failure the lifecycle pass holds `region_id` (under
-    /// `injection_language`) of `host_uri` on:
-    /// - an answer the failure revokes (for the same input, taken before
-    ///   it; see `AnswerOrigin::revoked_by`) is one the peer no longer
-    ///   gives, whatever epoch the failure was taken under, until the pass
-    ///   holds the region on another input;
-    /// - a text as is is refused while the failure stands at `epoch` (the
-    ///   region is not bridged).
+    /// Whether a text from `answer` (`None`: a text as is) is refused by a
+    /// failure recorded for `region_id` (under `injection_language`) of
+    /// `host_uri`:
+    /// - an answer any failure kept for the region revokes (for the same
+    ///   input, taken before it; see `AnswerOrigin::revoked_by`) is one the
+    ///   peer no longer gives, whatever epoch the failure was taken under,
+    ///   and wherever the lifecycle pass holds the region now (an edit
+    ///   moving it on while a request ran, a request's own lookup failing);
+    /// - a text as is is refused while the failure the pass holds the
+    ///   region on stands at `epoch` (the region is not bridged).
     pub(crate) fn revokes(
         &self,
         host_uri: &Url,
@@ -365,24 +366,53 @@ impl PrepareFailures {
         answer: Option<super::protocol::AnswerOrigin>,
     ) -> bool {
         let host_uri = host_uri.as_str();
+        let failed = |cell: &Cell| matches!(cell.outcome.get(), Some(Answer::Unusable));
         self.0
             .get(&region_hash(host_uri, injection_language, region_id))
             .filter(|region| region.is(host_uri, injection_language, region_id))
-            .and_then(|region| {
-                region.held_cell().and_then(|cell| {
-                    matches!(cell.outcome.get(), Some(Answer::Unusable)).then_some((
-                        cell.epoch == epoch,
-                        super::protocol::AnswerOrigin {
-                            taken: cell.taken,
-                            input: cell.input,
-                        },
-                    ))
-                })
+            .is_some_and(|region| match answer {
+                // A region keeps at most a few slots.
+                Some(answer) => region.slots.iter().any(|slot| {
+                    failed(&slot.cell)
+                        && answer.revoked_by(super::protocol::AnswerOrigin {
+                            taken: slot.cell.taken,
+                            input: slot.cell.input,
+                        })
+                }),
+                None => region
+                    .held_cell()
+                    .is_some_and(|cell| failed(cell) && cell.epoch == epoch),
             })
-            .is_some_and(|(standing, failure)| match answer {
-                Some(answer) => answer.revoked_by(failure),
-                None => standing,
-            })
+    }
+
+    /// Keep a failure of `failure`'s input, taken as `failure` says, among
+    /// `region_id`'s answers, without the lifecycle pass holding the region
+    /// on it (one it moved off, or a request's own lookup).
+    #[cfg(test)]
+    pub(crate) fn keep_failure_for_test(
+        &self,
+        host_uri: &Url,
+        injection_language: &str,
+        region_id: &str,
+        epoch: u64,
+        failure: super::protocol::AnswerOrigin,
+    ) {
+        let mut cell = Cell::new(epoch, failure.input);
+        cell.taken = failure.taken;
+        let _ = cell.outcome.set(Answer::Unusable);
+        let mut region = self
+            .0
+            .get_mut(&region_hash(
+                host_uri.as_str(),
+                injection_language,
+                region_id,
+            ))
+            .expect("a region held");
+        let key = region.slots.iter().map(|slot| slot.key).max().unwrap_or(0) + 1;
+        region.slots.push(Slot {
+            key,
+            cell: Arc::new(cell),
+        });
     }
 
     /// Hold `region_id` (under `injection_language`) of `host_uri` on an
