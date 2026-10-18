@@ -2709,7 +2709,7 @@ mod tests {
             pending,
             crate::lsp::bridge::PrepareLookup::Pending
         ));
-        server.bridge.owe_pull_after_prepare(&host);
+        server.bridge.owe_pull_after_prepare(&host, 0);
         scheduler.settle_pull_debt_after_prepare(&host, false);
         assert_eq!(requested(), 0);
         scheduler.settle_pull_debt_after_prepare(&host, true);
@@ -2718,7 +2718,7 @@ mod tests {
         let host = Url::parse("file:///test/owed_pull_other.md").unwrap();
         let requested = || server.diagnostics.metrics_snapshot().refreshes_requested - 1;
 
-        server.bridge.owe_pull_after_prepare(&host);
+        server.bridge.owe_pull_after_prepare(&host, 0);
         scheduler.settle_pull_debt_after_prepare(&host, true);
         assert_eq!(requested(), 1);
         // Settled: a later pass asks nothing more.
@@ -2726,7 +2726,7 @@ mod tests {
         assert_eq!(requested(), 1);
 
         // A pass with no answer in, while none is pending any more.
-        server.bridge.owe_pull_after_prepare(&host);
+        server.bridge.owe_pull_after_prepare(&host, 0);
         scheduler.settle_pull_debt_after_prepare(&host, false);
         assert_eq!(requested(), 2);
     }

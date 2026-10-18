@@ -298,6 +298,10 @@ pub(crate) struct PrepareRegistry {
     closed_hosts: Arc<DashMap<String, u64>>,
     /// Source of `closed_hosts`' order.
     closes: AtomicU64,
+    /// How many answers re-synced each host, since it was last forgotten:
+    /// what tells a pull that skipped a host's documents whether any of
+    /// their answers landed while it ran. Shared with the attempts.
+    host_answers: Arc<DashMap<String, u64>>,
     /// Source of `textDocument.version`: shared by all documents, so a
     /// document forgotten and prepared again (a reopen) never repeats a
     /// version the peer saw.
@@ -324,6 +328,7 @@ impl Default for PrepareRegistry {
             prepared_scan: std::sync::Mutex::new(None),
             closed_hosts: Arc::default(),
             closes: AtomicU64::new(0),
+            host_answers: Arc::default(),
             next_revision: Arc::new(AtomicI32::new(1)),
             resync_tx,
             resync_rx: std::sync::Mutex::new(Some(resync_rx)),
@@ -587,7 +592,15 @@ impl PrepareRegistry {
 
     /// Forget a closed host's documents: until it opens again, nothing is
     /// looked up for it.
+    /// How many answers re-synced `host_uri` (see `host_answers`).
+    pub(crate) fn host_answers(&self, host_uri: &Url) -> u64 {
+        self.host_answers
+            .get(host_uri.as_str())
+            .map_or(0, |answers| *answers)
+    }
+
     pub(crate) fn forget_host(&self, host_uri: &Url) {
+        self.host_answers.remove(host_uri.as_str());
         // Every close, whether anything was looked up yet or not: a request
         // resolved before the close may still be about to look up.
         let order = self.closes.fetch_add(1, Ordering::AcqRel);
@@ -624,6 +637,12 @@ impl PrepareRegistry {
             .expect("an input under the current epoch");
         assert!(slot.cell.outcome.set(answer).is_ok(), "answered already");
         self.held_changes.fetch_add(1, Ordering::AcqRel);
+        if held {
+            *self
+                .host_answers
+                .entry(input.host_uri.to_string())
+                .or_default() += 1;
+        }
     }
 
     /// The slot answering `input` under `epoch`, created when missing.
@@ -756,6 +775,7 @@ impl PrepareRegistry {
         let resync_tx = self.resync_tx.clone();
         let held_changes = Arc::clone(&self.held_changes);
         let closed_hosts = Arc::clone(&self.closed_hosts);
+        let host_answers = Arc::clone(&self.host_answers);
         tokio::spawn(async move {
             let cell = Arc::clone(&end.0);
             // Its cell still stands: kept by its region, under the current
@@ -794,6 +814,7 @@ impl PrepareRegistry {
                     // outdated meanwhile re-syncs nothing: the epoch's move
                     // does.
                     if held() && pool.prepare_epoch() == cell.epoch {
+                        *host_answers.entry(job.host_uri.to_string()).or_default() += 1;
                         // The receiver is gone only at shutdown.
                         let _ = resync_tx.send(Resync {
                             host_uri: job.host_uri.clone(),
@@ -1321,6 +1342,8 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(resync.try_recv().ok(), Some(ready(false)));
+        // Each answer that re-syncs the host is counted for it.
+        assert_eq!(registry.host_answers(&host), 1);
         registry.lookup_or_start(&pool, &target, input(&host, "b"));
         assert!(
             registry

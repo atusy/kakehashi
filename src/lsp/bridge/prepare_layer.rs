@@ -246,13 +246,24 @@ impl super::BridgeCoordinator {
         }
     }
 
+    /// How many prepare answers re-synced `host`: taken as a pull starts, to
+    /// tell [`Self::owe_pull_after_prepare`] whether any landed meanwhile.
+    pub(crate) fn prepare_host_answers(&self, host: &Url) -> u64 {
+        self.prepare
+            .as_ref()
+            .map_or(0, |layer| layer.registry.host_answers(host))
+    }
+
     /// Note that an editor's pull for `host` was answered without documents
     /// still waiting for their prepare answers: it is owed a
-    /// `workspace/diagnostic/refresh` once a resync pass sends them. When
-    /// none is pending any more — the answer came while the pull ran, and
-    /// its resync may already have looked for the debt — the host is synced
-    /// again, so a pass that reaches every server settles it.
-    pub(crate) fn owe_pull_after_prepare(&self, host: &Url) {
+    /// `workspace/diagnostic/refresh` once a resync pass sends them. When an
+    /// answer for the host landed while the pull ran (`answers_then`, as
+    /// [`Self::prepare_host_answers`] read it when the pull started), its
+    /// resync may already have looked for the debt, before it was owed: the
+    /// host is synced again, as ready, so the pass settles it though another
+    /// of its documents is still pending. So it is when none is pending any
+    /// more.
+    pub(crate) fn owe_pull_after_prepare(&self, host: &Url, answers_then: u64) {
         let Some(layer) = &self.prepare else {
             return;
         };
@@ -264,11 +275,12 @@ impl super::BridgeCoordinator {
             layer.pull_debts.remove(host);
             return;
         }
-        if !self.prepare_host_has_pending(host) {
+        let answered = layer.registry.host_answers(host) != answers_then;
+        if answered || !self.prepare_host_has_pending(host) {
             layer.registry.requeue_resync(
                 Resync {
                     host_uri: host.clone(),
-                    ready: false,
+                    ready: answered,
                     recollect: false,
                     edited: false,
                 },
@@ -655,6 +667,87 @@ mod tests {
         ));
     }
 
+    /// A pull that skipped two documents, one answered while it ran: that
+    /// answer's resync came before the debt, and the other document is still
+    /// pending. The host is synced again as ready, so the debt is settled
+    /// without waiting for the other.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pull_owed_after_an_answer_landed_is_synced_though_another_is_pending() {
+        use super::super::pool::test_helpers::{
+            advertise_prepare_for_test, create_handle_with_command,
+        };
+        let pool = Arc::new(LanguageServerPool::preparing());
+        let coordinator = BridgeCoordinator::with_cancel_forwarder(
+            Arc::clone(&pool),
+            CancelForwarder::new(Arc::clone(&pool)),
+        );
+        let (mut resyncs, _epochs) = coordinator.take_prepare_resyncs().unwrap();
+        // A peer that never answers.
+        let silent = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "cat > /dev/null".to_string(),
+        ];
+        let (handle, _) = create_handle_with_command(
+            crate::lsp::bridge::ConnectionState::Ready,
+            crate::lsp::bridge::ConnectionKey::for_server("peer"),
+            silent.clone(),
+            None,
+        )
+        .await;
+        advertise_prepare_for_test(&handle, true);
+        pool.insert_connection(handle).await;
+        let target = super::super::PrepareTarget {
+            candidates: vec![super::super::ResolvedServerConfig {
+                server_name: "peer".to_string(),
+                config: Arc::new(crate::config::settings::BridgeServerConfig {
+                    cmd: Some(silent),
+                    ..Default::default()
+                }),
+            }]
+            .into(),
+            epoch: pool.prepare_epoch(),
+        };
+        let host = Url::parse("file:///test/owed-while-pending.md").unwrap();
+        let input = |region_id| super::PrepareInput {
+            host_uri: &host,
+            host_language: "markdown",
+            injection_language: "lua",
+            region_id,
+            virtual_text: "a",
+            gaps: &[],
+        };
+        // The pull starts, and skips both documents.
+        let answers_then = coordinator.prepare_host_answers(&host);
+        assert!(matches!(
+            coordinator.prepared_document_now(&target, input(TEST_ULID_LUA_0)),
+            super::PrepareLookup::Pending
+        ));
+        // One is answered (and re-syncs the host) before the pull owes it.
+        coordinator.answer_prepare_for_test(
+            &target,
+            input(super::super::pool::test_helpers::TEST_ULID_LUA_1),
+            super::super::prepare_registry::Answer::AsIs,
+            true,
+        );
+        assert!(coordinator.prepare_host_has_pending(&host));
+        coordinator.owe_pull_after_prepare(&host, answers_then);
+        let resync = tokio::time::timeout(std::time::Duration::from_secs(5), resyncs.recv())
+            .await
+            .expect("synced again")
+            .unwrap();
+        assert_eq!(resync.host_uri, host);
+        assert!(resync.ready, "settles the debt");
+        // A pull that saw that answer already waits for the other.
+        coordinator.owe_pull_after_prepare(&host, coordinator.prepare_host_answers(&host));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), resyncs.recv())
+                .await
+                .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn a_pull_owed_a_refresh_is_settled_once_and_forgotten_with_its_host() {
         let pool = Arc::new(LanguageServerPool::preparing());
@@ -667,7 +760,7 @@ mod tests {
 
         // Nothing pending any more: the host is synced again, so a pass
         // reaches the debt.
-        coordinator.owe_pull_after_prepare(&host);
+        coordinator.owe_pull_after_prepare(&host, 0);
         let resync = resyncs.recv().await.unwrap();
         assert_eq!(resync.host_uri, host);
         assert!(coordinator.take_pull_debt_after_prepare(&host));
@@ -699,11 +792,11 @@ mod tests {
             super::super::prepare_registry::Answer::AsIs,
             true,
         );
-        coordinator.owe_pull_after_prepare(&host);
+        coordinator.owe_pull_after_prepare(&host, 0);
         coordinator.forget_prepared_host(&host);
         assert!(!coordinator.take_pull_debt_after_prepare(&host));
         // Nor does a pull still running past the close.
-        coordinator.owe_pull_after_prepare(&host);
+        coordinator.owe_pull_after_prepare(&host, 0);
         assert!(!coordinator.take_pull_debt_after_prepare(&host));
     }
 
