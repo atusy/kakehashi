@@ -323,7 +323,7 @@ impl BridgeCoordinator {
         // One switch: the layer exists where the pool records advertisements.
         let prepare = pool
             .prepares()
-            .then(super::prepare_layer::PrepareLayer::new);
+            .then(|| super::prepare_layer::PrepareLayer::new(&pool));
         Self {
             pool,
             node_tracker: Arc::new(NodeTracker::new()),
@@ -353,7 +353,7 @@ impl BridgeCoordinator {
     ) -> Self {
         let prepare = pool
             .prepares()
-            .then(super::prepare_layer::PrepareLayer::new);
+            .then(|| super::prepare_layer::PrepareLayer::new(&pool));
         Self {
             pool,
             node_tracker: Arc::new(NodeTracker::new()),

@@ -339,7 +339,92 @@ impl Default for PrepareRegistry {
     }
 }
 
+/// The failures the lifecycle pass holds regions on, read from the
+/// registry's own table: what a request or a lazy open asks before it reads
+/// coordinates through a region, at the moment an answer is recorded, with
+/// no copy to wait for.
+#[derive(Clone, Default)]
+pub(crate) struct PrepareFailures(Arc<Regions>);
+
+impl PrepareFailures {
+    /// Whether a text from `answer` (`None`: a text as is) is refused by the
+    /// failure the lifecycle pass holds `region_id` (under
+    /// `injection_language`) of `host_uri` on:
+    /// - an answer the failure revokes (for the same input, taken before
+    ///   it; see `AnswerOrigin::revoked_by`) is one the peer no longer
+    ///   gives, whatever epoch the failure was taken under, until the pass
+    ///   holds the region on another input;
+    /// - a text as is is refused while the failure stands at `epoch` (the
+    ///   region is not bridged).
+    pub(crate) fn revokes(
+        &self,
+        host_uri: &Url,
+        injection_language: &str,
+        region_id: &str,
+        epoch: u64,
+        answer: Option<super::protocol::AnswerOrigin>,
+    ) -> bool {
+        let host_uri = host_uri.as_str();
+        self.0
+            .get(&region_hash(host_uri, injection_language, region_id))
+            .filter(|region| region.is(host_uri, injection_language, region_id))
+            .and_then(|region| {
+                region.held_cell().and_then(|cell| {
+                    matches!(cell.outcome.get(), Some(Answer::Unusable)).then_some((
+                        cell.epoch == epoch,
+                        super::protocol::AnswerOrigin {
+                            taken: cell.taken,
+                            input: cell.input,
+                        },
+                    ))
+                })
+            })
+            .is_some_and(|(standing, failure)| match answer {
+                Some(answer) => answer.revoked_by(failure),
+                None => standing,
+            })
+    }
+
+    /// Hold `region_id` (under `injection_language`) of `host_uri` on an
+    /// input looked up at `epoch`: failed, taken and identified as `failure`
+    /// says, or (`None`) still waiting for its answer.
+    #[cfg(test)]
+    pub(crate) fn hold_for_test(
+        &self,
+        host_uri: &Url,
+        injection_language: &str,
+        region_id: &str,
+        epoch: u64,
+        failure: Option<super::protocol::AnswerOrigin>,
+    ) {
+        let mut cell = Cell::new(epoch, failure.map_or(0, |failure| failure.input));
+        if let Some(failure) = failure {
+            cell.taken = failure.taken;
+            let _ = cell.outcome.set(Answer::Unusable);
+        }
+        self.0.insert(
+            region_hash(host_uri.as_str(), injection_language, region_id),
+            Region {
+                host_uri: host_uri.to_string(),
+                injection_language: injection_language.to_string(),
+                region_id: region_id.to_string(),
+                slots: vec![Slot {
+                    key: 0,
+                    cell: Arc::new(cell),
+                }],
+                held: Some(0),
+            },
+        );
+    }
+}
+
 impl PrepareRegistry {
+    /// The failures the lifecycle pass holds regions on (see
+    /// [`PrepareFailures`]), shared with the table they are read from.
+    pub(crate) fn failures(&self) -> PrepareFailures {
+        PrepareFailures(Arc::clone(&self.regions))
+    }
+
     /// Whether no region was ever looked up (see `used`).
     pub(crate) fn unused(&self) -> bool {
         !self.used.load(Ordering::Acquire)
@@ -482,6 +567,7 @@ impl PrepareRegistry {
     /// `epoch` is unusable: when it was taken and what it is, so the answers
     /// that failure revokes (for the same input, taken before) are told from
     /// the others.
+    #[cfg(test)]
     pub(crate) fn failed_at(
         &self,
         host_uri: &Url,

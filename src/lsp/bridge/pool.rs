@@ -366,11 +366,11 @@ pub(crate) struct HostVirtualContents {
     /// (language, region id) of the regions the lifecycle pass holds for a
     /// prepare peer known to prepare them (see
     /// [`LanguageServerPool::hold_latest_virtual_content`]): no request opens
-    /// one with text as is — nor at all, with a text from an answer its
-    /// peer's failure revokes (`Some`: the failed input, see
-    /// `AnswerOrigin::revoked_by`). `None` for a pool that prepares nothing, which
-    /// holds nothing: no map is allocated for each host it opens.
-    held: Option<DashMap<(String, String), Option<super::protocol::AnswerOrigin>>>,
+    /// one with text as is. Whether a peer failed one is the registry's to
+    /// say (see [`LanguageServerPool::prepare_failed`]). `None` for a pool
+    /// that prepares nothing, which holds nothing: no map is allocated for
+    /// each host it opens.
+    held: Option<dashmap::DashSet<(String, String)>>,
     /// How many entries `held` has: read in place of `held`'s emptiness,
     /// which locks every shard, on every lazy open and every recorded text.
     held_count: std::sync::atomic::AtomicUsize,
@@ -379,35 +379,12 @@ pub(crate) struct HostVirtualContents {
 impl HostVirtualContents {
     /// Whether the lifecycle pass holds `(language, region_id)` (see `held`).
     fn holds(&self, language: &str, region_id: &str) -> bool {
-        self.hold(language, region_id).is_some()
+        self.held_count.load(Ordering::Acquire) > 0
+            && self
+                .held
+                .as_ref()
+                .is_some_and(|held| held.contains(&(language.to_string(), region_id.to_string())))
     }
-
-    /// The hold on `(language, region_id)`, if any: its failed input, if its
-    /// peer failed it (see `held`).
-    fn hold(
-        &self,
-        language: &str,
-        region_id: &str,
-    ) -> Option<Option<super::protocol::AnswerOrigin>> {
-        if self.held_count.load(Ordering::Acquire) == 0 {
-            return None;
-        }
-        self.held.as_ref().and_then(|held| {
-            held.get(&(language.to_string(), region_id.to_string()))
-                .map(|failed| *failed)
-        })
-    }
-}
-
-/// Whether a text from `answer` (`None`: a text as is) is refused by a
-/// region held with `failure`: an answer for the failed input taken before
-/// it failed is one the peer no longer gives. One for another text (an undo
-/// back to it, an edit since), or taken after, is a held-text matter.
-fn failed_for(
-    failure: Option<super::protocol::AnswerOrigin>,
-    answer: Option<super::protocol::AnswerOrigin>,
-) -> bool {
-    failure.is_some_and(|failure| answer.is_none_or(|answer| answer.revoked_by(failure)))
 }
 
 /// What a connection held for a virtual document as a resolve was queued
@@ -704,6 +681,9 @@ pub struct LanguageServerPool {
     /// `None` with experimental features off (decided once, at
     /// construction): no connection's advertisement is then recorded.
     prepare_advertisements: Option<Arc<PrepareAdvertisements>>,
+    /// The failures the prepare registry holds regions on, read in place
+    /// (see [`Self::prepare_failed`]). Installed with the prepare layer.
+    prepare_failures: std::sync::OnceLock<super::prepare_registry::PrepareFailures>,
 }
 
 impl Default for LanguageServerPool {
@@ -778,6 +758,7 @@ impl LanguageServerPool {
             inbound_request_registry: super::InboundRequestRegistry::default(),
             command_origins: Arc::new(CommandOriginRegistry::default()),
             prepare_advertisements: crate::experimental::enabled().then(Arc::default),
+            prepare_failures: std::sync::OnceLock::new(),
         }
     }
 
@@ -2823,25 +2804,26 @@ impl LanguageServerPool {
         // with text as is (a request resolved before its pair gained the
         // peer), whether its own or the last forwarded.
         // Nothing is ever held without the prepare layer.
-        // The hold on the region: `Some(failed at)`. A failed one opens with
-        // no text from an answer taken before it failed: the peer no longer
-        // gives that answer.
-        let region_hold = || {
-            if !self.prepares() {
-                return None;
-            }
-            self.latest_virtual_contents
-                .get(host_uri)
-                .and_then(|host| host.hold(virtual_uri.language(), virtual_uri.region_id()))
+        // A region its peer failed opens with no text from an answer taken
+        // before it failed (the peer no longer gives that answer), as the
+        // registry says the moment it is recorded.
+        let region_held = || {
+            self.prepares()
+                && self
+                    .latest_virtual_contents
+                    .get(host_uri)
+                    .is_some_and(|host| host.holds(virtual_uri.language(), virtual_uri.region_id()))
         };
-        let refused = |content: &VirtualOpenContent<'_>,
-                       hold: Option<Option<super::protocol::AnswerOrigin>>| {
+        let refused = |content: &VirtualOpenContent<'_>, held: bool| {
             matches!(content, VirtualOpenContent::LatestKnown(provided)
-                if hold.is_some_and(|failure| {
-                    failed_for(failure, provided.map.map(|map| map.origin()))
-                }) || provided.map.is_none() && hold.is_some())
+                if self.prepare_failed(
+                    host_uri,
+                    virtual_uri.language(),
+                    virtual_uri.region_id(),
+                    provided.map.map(|map| map.origin()),
+                ) || provided.map.is_none() && held)
         };
-        if refused(&content, region_hold()) {
+        if refused(&content, region_held()) {
             drop(transition_guard);
             self.remove_open_transition_lock_if_unshared(virtual_uri, connection_key, &transition);
             return Err(io::Error::new(
@@ -2945,9 +2927,8 @@ impl LanguageServerPool {
         // its claim, and swept past it, is seen here; one published after
         // this read is followed by a sweep that finds the document and
         // closes it.
-        let hold = region_hold();
-        let region_held = hold.is_some();
-        if refused(&content, hold) {
+        let region_held = region_held();
+        if refused(&content, region_held) {
             self.document_tracker
                 .rollback_open_claim_if(host_uri, virtual_uri, connection_key, &claim)
                 .await;
@@ -3153,17 +3134,13 @@ impl LanguageServerPool {
     /// for a prepare peer known to prepare it: what was last forwarded for
     /// it was sent as is, and a request opening it lazily must not send
     /// that (or its own text as is) while it waits — or after its peer
-    /// failed. Cleared once text is recorded for it again. `failure`: its
-    /// peer answered that input unusably, and no request on an answer the
-    /// failure revokes reads coordinates through it either (see
-    /// [`Self::prepare_failed`]).
+    /// failed. Cleared once text is recorded for it again.
     pub(crate) fn hold_latest_virtual_content(
         &self,
         host_uri: &Url,
         incarnation: u64,
         language: &str,
         region_id: &str,
-        failure: Option<super::protocol::AnswerOrigin>,
     ) {
         if let Some(host) = self.latest_virtual_contents.get(host_uri)
             && host.incarnation == incarnation
@@ -3173,10 +3150,7 @@ impl LanguageServerPool {
             // count never reads below what `held` holds (removals take the
             // entry out first), so no open sees a held region as free.
             host.held_count.fetch_add(1, Ordering::AcqRel);
-            if held
-                .insert((language.to_string(), region_id.to_string()), failure)
-                .is_some()
-            {
+            if !held.insert((language.to_string(), region_id.to_string())) {
                 host.held_count.fetch_sub(1, Ordering::AcqRel);
             }
         }
@@ -3241,10 +3215,12 @@ impl LanguageServerPool {
 
     /// Whether the lifecycle pass holds `region_id` (under `language`) of
     /// `host_uri` as failed by its peer in a way that revokes a request's
-    /// `answer` (`None` for a request as is; see `AnswerOrigin::revoked_by`
-    /// and [`Self::hold_latest_virtual_content`]): that request reads no
-    /// coordinates through it, as no push is placed through it. A request
-    /// on another text, or answered after the failure, is not refused by it.
+    /// `answer` (`None` for a request as is; see
+    /// `PrepareFailures::revokes`): that request reads no coordinates
+    /// through it, as no push is placed through it. A request on another
+    /// text, or answered after the failure, is not refused by it. Read from
+    /// the registry as the answer is recorded; never without the prepare
+    /// layer.
     pub(crate) fn prepare_failed(
         &self,
         host_uri: &Url,
@@ -3252,10 +3228,25 @@ impl LanguageServerPool {
         region_id: &str,
         answer: Option<super::protocol::AnswerOrigin>,
     ) -> bool {
-        self.latest_virtual_contents
-            .get(host_uri)
-            .and_then(|host| host.hold(language, region_id))
-            .is_some_and(|failure| failed_for(failure, answer))
+        self.prepare_failures.get().is_some_and(|failures| {
+            failures.revokes(host_uri, language, region_id, self.prepare_epoch(), answer)
+        })
+    }
+
+    /// Read the failures the prepare registry holds regions on (see
+    /// [`Self::prepare_failed`]): installed once, with the prepare layer.
+    pub(crate) fn install_prepare_failures(
+        &self,
+        failures: super::prepare_registry::PrepareFailures,
+    ) {
+        let _ = self.prepare_failures.set(failures);
+    }
+
+    /// The failures [`Self::prepare_failed`] reads, installed on first use
+    /// for a pool no prepare layer was built over.
+    #[cfg(test)]
+    pub(crate) fn prepare_failures_for_test(&self) -> &super::prepare_registry::PrepareFailures {
+        self.prepare_failures.get_or_init(Default::default)
     }
 
     /// The document's lifecycle lock, created on first use. Transitions lock it
@@ -3337,7 +3328,7 @@ impl LanguageServerPool {
                 incarnation,
                 promoted_language: None,
                 contents: DashMap::new(),
-                held: self.prepares().then(DashMap::new),
+                held: self.prepares().then(dashmap::DashSet::new),
                 held_count: std::sync::atomic::AtomicUsize::new(0),
             },
         );
@@ -9759,7 +9750,7 @@ mod tests {
         // forwarded as is) and regained one (the region held again).
         let map = dedent_map("  x = 1");
         pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  x = 1");
-        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, None);
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
         let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
         pool.ensure_document_opened(
             &mut sender,
@@ -9818,7 +9809,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
         // The pass holds the region; its sweep finds nothing registered.
-        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, None);
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
         drop(versions);
         assert!(open.await.unwrap().is_err());
         assert!(rx.try_recv().is_err(), "nothing was sent as is");
@@ -9838,11 +9829,11 @@ mod tests {
         pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  x = 1");
         // The request's answer, taken before its peer failed the region.
         let map = dedent_map("  x = 1");
-        pool.hold_latest_virtual_content(
+        pool.prepare_failures_for_test().hold_for_test(
             &host_uri,
-            1,
             "lua",
             TEST_ULID_LUA_0,
+            pool.prepare_epoch(),
             Some(crate::lsp::bridge::protocol::AnswerOrigin {
                 taken: crate::lsp::bridge::protocol::next_presentation(),
                 input: map.origin().input,
@@ -9861,7 +9852,14 @@ mod tests {
         assert!(rx.try_recv().is_err(), "nothing was sent");
         // Pending again (a new epoch's attempt): the prepared text opens it.
         // (So would an answer taken after the failure, a newer text's.)
-        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, None);
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
+        pool.prepare_failures_for_test().hold_for_test(
+            &host_uri,
+            "lua",
+            TEST_ULID_LUA_0,
+            pool.prepare_epoch(),
+            None,
+        );
         pool.ensure_document_opened(&mut sender, &host_uri, &virtual_uri, prepared, &key)
             .await
             .unwrap();
@@ -9917,7 +9915,7 @@ mod tests {
         );
         // Held for its peer.
         pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  x = 1");
-        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, None);
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
         assert!(pool.refuses_text_as_is(&host_uri, &virtual_uri, &key));
         // Holding a prepared text of it.
         pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  x = 1");
@@ -9948,7 +9946,7 @@ mod tests {
         let key = ConnectionKey::for_server("lua");
         pool.open_host_incarnation(&host_uri, 1).await;
         pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  x = 1");
-        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, None);
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
         let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
         assert!(
             pool.ensure_document_opened(&mut sender, &host_uri, &virtual_uri, "  x = 1", &key)

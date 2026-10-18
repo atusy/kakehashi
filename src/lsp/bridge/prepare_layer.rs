@@ -53,9 +53,13 @@ pub(crate) struct HeldSave {
 }
 
 impl PrepareLayer {
-    pub(crate) fn new() -> Self {
+    /// A layer over `pool`, which reads the failures its registry holds
+    /// regions on in place (see `LanguageServerPool::prepare_failed`).
+    pub(crate) fn new(pool: &LanguageServerPool) -> Self {
+        let registry = PrepareRegistry::default();
+        pool.install_prepare_failures(registry.failures());
         Self {
-            registry: PrepareRegistry::default(),
+            registry,
             targets: arc_swap::ArcSwap::new(Arc::new(Targets {
                 settings: Arc::default(),
                 resolved: DashMap::new(),
@@ -330,6 +334,7 @@ impl super::BridgeCoordinator {
 
     /// When the failure the lifecycle pass holds a region on was taken (see
     /// `PrepareRegistry::failed_at`); `None` unless its answer is unusable.
+    #[cfg(test)]
     pub(crate) fn prepare_failed_at(
         &self,
         host_uri: &Url,
