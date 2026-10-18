@@ -2395,6 +2395,50 @@ fn text_replacing_whole_lines_joins_the_next_as_that_line_is() {
 }
 
 #[test]
+fn a_blank_lines_removed_indent_does_not_set_the_contents() {
+    // `x` left alone, the blank line after it dedented: a line created
+    // after `x` regains nothing, the blank line its own indent.
+    let virtual_text = "x\n  \n";
+    let map = prepare(
+        virtual_text,
+        json!([
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+        ]),
+    );
+    assert_eq!(map.prepared_lines.text, "x\n\n");
+    let inserted = map
+        .map_one_with_extent(&edit((0, 1), (0, 1), "\ny"))
+        .unwrap();
+    assert_eq!(apply_to(virtual_text, &[inserted]), "x\ny\n  \n");
+    // Content dedented by two, the blank line by four: the content's two
+    // (the differing blank line no longer leaves no single indent).
+    let virtual_text = "  x\n    \n";
+    let map = prepare(
+        virtual_text,
+        json!([
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 4}}, "newText": ""}
+        ]),
+    );
+    let inserted = map
+        .map_one_with_extent(&edit((0, 1), (0, 1), "\ny"))
+        .unwrap();
+    assert_eq!(apply_to(virtual_text, &[inserted]), "  x\n  y\n    \n");
+    // Without content, the blank lines' removed indent is the one new
+    // lines regain.
+    let virtual_text = "  \n  \n";
+    let map = prepare(
+        virtual_text,
+        json!([
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+        ]),
+    );
+    let typed = map.map_one_with_extent(&edit((0, 0), (0, 0), "z")).unwrap();
+    assert_eq!(apply_to(virtual_text, &[typed]), "  z\n  \n");
+}
+
+#[test]
 fn only_spaces_and_tabs_are_blank() {
     // A line left alone holding an ideographic space is a line of text: what
     // is typed there joins it, regaining no indent.
