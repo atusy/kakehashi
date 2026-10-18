@@ -243,6 +243,18 @@ edited V. It is refused, and dropped like any unsafe set, when:
 No edit in P reaches into the deleted edge lines or the closing indent
 deleted with them: P has no position inside them.
 
+An answer's edits are mapped only while the map its request was built on
+still describes the region's current host text, as recorded when the
+answer arrives. While the host's newer text waits for its prepare answer,
+or once the same prepared text is recorded under another map (an edit to
+indentation the peer removes changes the host but not P), the answer's
+edits are dropped: completion and color presentations answer nothing,
+inlay hints stay shown without their edits. Once typing has recorded
+another prepared text, an answer is stale as any LSP answer is when the
+document changes meanwhile, and is kept, as on unprepared documents; so
+an answer arriving within a keystroke's prepare round-trip is dropped,
+one arriving after it kept.
+
 A color presentation without a `textEdit` replaces the request range with
 its label; on a prepared document that edit is made explicit and mapped
 like any other. A request range reaching into a gap stands for host text no

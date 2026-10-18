@@ -971,7 +971,7 @@ impl DocumentTracker {
 
     /// What `connection_key` holds for `virtual_uri` now, and whether it was
     /// ever sent a prepared text of it, from one read.
-    pub(super) fn held_now(
+    fn held_now(
         &self,
         virtual_uri: &str,
         connection_key: &ConnectionKey,
