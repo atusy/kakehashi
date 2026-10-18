@@ -2944,6 +2944,7 @@ impl LanguageServerPool {
         // A deferred open refreshes from the forwarded-content cache as close
         // to enqueue as possible. A revision-guarded repair already owns newer
         // authoritative text: that cache can still trail the completed parse.
+        let latest_known = matches!(content, VirtualOpenContent::LatestKnown(_));
         let (provided, current_content) = match content {
             VirtualOpenContent::LatestKnown(provided) => (
                 provided,
@@ -2979,6 +2980,28 @@ impl LanguageServerPool {
                     && (cached.map().is_some() || !region_held)
             })
             .map_or(provided, LatestText::as_sent);
+        // Checked again on the text it sends when that is the cached one:
+        // an answer its peer failed since is not opened, whichever it is.
+        if latest_known
+            && self.prepare_failed(
+                host_uri,
+                virtual_uri.language(),
+                virtual_uri.region_id(),
+                virtual_content.map.map(|map| map.origin()),
+            )
+        {
+            self.document_tracker
+                .rollback_open_claim_if(host_uri, virtual_uri, connection_key, &claim)
+                .await;
+            claim_guard.disarm();
+            drop(claim_guard);
+            drop(transition_guard);
+            self.remove_open_transition_lock_if_unshared(virtual_uri, connection_key, &transition);
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "bridge: the region is held for its prepare peer",
+            ));
+        }
         // What the connection holds is recorded as the didOpen is queued,
         // taken back unless it is (see `DocumentTracker::record_and_queue`):
         // a server pushing diagnostics the moment it opens the document finds
@@ -9864,6 +9887,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(opened_text(&mut rx), "x = 1");
+    }
+
+    /// A lazy open substituting the newer cached text for a request's
+    /// checks the text it sends: a cached answer its peer failed since is
+    /// not opened, though the request's own answer stands.
+    #[tokio::test]
+    async fn a_lazy_open_does_not_send_a_cached_answer_its_peer_failed() {
+        let pool = LanguageServerPool::preparing();
+        let host_uri = Url::parse("file:///test/lazy-open-cached-failed.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        // The request's answer, for one input.
+        let mut request = dedent_map("  x = 1");
+        Arc::get_mut(&mut request).unwrap().set_input(1);
+        // A newer answer, for another input, cached by the lifecycle pass.
+        let mut cached = dedent_map("  x = 1");
+        Arc::get_mut(&mut cached).unwrap().set_input(2);
+        pool.record_latest_virtual_content(
+            &host_uri,
+            1,
+            "lua",
+            TEST_ULID_LUA_0,
+            SentText {
+                text: "x = 1",
+                map: Some(&cached),
+            },
+        );
+        // Its peer failed that newer input since.
+        pool.prepare_failures_for_test().hold_for_test(
+            &host_uri,
+            "lua",
+            TEST_ULID_LUA_0,
+            pool.prepare_epoch(),
+            Some(crate::lsp::bridge::protocol::AnswerOrigin {
+                taken: crate::lsp::bridge::protocol::next_presentation(),
+                input: 2,
+            }),
+        );
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
+        let opened = pool
+            .ensure_document_opened(
+                &mut sender,
+                &host_uri,
+                &virtual_uri,
+                SentText {
+                    text: "x = 1",
+                    map: Some(&request),
+                },
+                &key,
+            )
+            .await;
+        assert!(opened.is_err());
+        assert!(rx.try_recv().is_err(), "nothing was sent");
     }
 
     /// A resolve's note of the text its connection held: unchanged until
