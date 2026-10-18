@@ -2953,7 +2953,8 @@ mod formatting {
         Some(apply_to(virtual_text, &mapped))
     }
 
-    /// [`formatted`] with time enough and with none, which must agree.
+    /// [`formatted`] with time enough; with none, an answer changing
+    /// anything is refused.
     fn formatted_either_way(
         map: &PreparedMap,
         virtual_text: &str,
@@ -2961,10 +2962,40 @@ mod formatting {
     ) -> Option<String> {
         let precise = formatted(map, virtual_text, edits, Duration::from_secs(10));
         let coarse = formatted(map, virtual_text, edits, Duration::ZERO);
-        if let Some(coarse) = &coarse {
-            assert_eq!(Some(coarse), precise.as_ref(), "a coarse diff maps alike");
+        if precise.as_deref() != Some(virtual_text) {
+            assert_eq!(coarse, None, "a diff out of time is refused");
         }
         precise
+    }
+
+    #[test]
+    fn lines_the_formatter_left_alone_keep_their_own_indent() {
+        // `b` was left at column 0; the formatter changed the lines around
+        // it. A diff out of time would cover `b` and indent it as content.
+        let virtual_text = "  a\nb\n  c\n";
+        let map = prepare(
+            virtual_text,
+            json!([
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+                {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
+            ]),
+        );
+        let answer = [edit((0, 0), (3, 0), "A\nb\nC\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  A\nb\n  C\n")
+        );
+        // A whitespace-only line the peer kept, shorter than the indent.
+        let virtual_text = "    if x:\n \n";
+        let map = prepare(
+            virtual_text,
+            json!([{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 4}}, "newText": ""}]),
+        );
+        let answer = [edit((0, 0), (2, 0), "    if x:\n    \n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("        if x:\n    \n")
+        );
     }
 
     #[test]
@@ -2987,6 +3018,11 @@ mod formatting {
         let answer = [edit((0, 0), (2, 0), "if x:\n  y\n")];
         assert_eq!(map.map_edits(&answer, EditMode::Formatting), Some(vec![]));
         assert_eq!(map.map_edits(&[], EditMode::Formatting), Some(vec![]));
+        // Nothing to diff: not refused for want of time.
+        assert_eq!(
+            map.map_edits_within(&answer, EditMode::Formatting, Duration::ZERO),
+            Some(vec![])
+        );
     }
 
     #[test]
@@ -3432,7 +3468,7 @@ mod formatting_reference {
             failure_persistence: None,
             ..Config::default()
         });
-        let (mapped_sets, refused) = (Cell::new(0), Cell::new(0));
+        let (mapped_sets, changing) = (Cell::new(0), Cell::new(0));
         let strategy = (
             prop::collection::vec(prop::option::weighted(0.8, 0..BODIES.len()), 1..6),
             prop::sample::select(vec!["  ", "\t", "    "]),
@@ -3458,10 +3494,12 @@ mod formatting_reference {
                     prop_assert_eq!(apply(&prepared, &edits), formatted.clone());
                     let Some(mapped) = map.map_edits_within(&edits, EditMode::Formatting, budget)
                     else {
-                        refused.set(refused.get() + 1);
                         return Ok(());
                     };
                     mapped_sets.set(mapped_sets.get() + 1);
+                    if formatted != prepared {
+                        changing.set(changing.get() + 1);
+                    }
                     let got = apply(&document.virtual_text, &mapped);
                     let expected = reference(&document, &formatted, indent);
                     prop_assert_eq!(
@@ -3477,18 +3515,20 @@ mod formatting_reference {
                 },
             )
             .unwrap();
-        (mapped_sets.get(), refused.get())
+        (mapped_sets.get(), changing.get())
     }
 
     #[test]
     fn formatting_answers_give_exactly_the_reference_host_text() {
-        let (mapped, refused) = check(Duration::from_secs(10), 3000);
-        assert!(mapped > 1500, "mapped {mapped}, refused {refused}");
+        let (mapped, changing) = check(Duration::from_secs(10), 3000);
+        assert!(changing > 1200, "mapped {mapped}, {changing} changing P");
     }
 
     #[test]
-    fn coarse_diffs_give_exactly_the_reference_host_text_or_are_refused() {
-        let (mapped, refused) = check(Duration::ZERO, 3000);
-        assert!(mapped > 300, "mapped {mapped}, refused {refused}");
+    fn answers_whose_diff_runs_out_of_time_are_refused() {
+        // Only an answer changing nothing needs no diff.
+        let (mapped, changing) = check(Duration::ZERO, 1000);
+        assert_eq!(changing, 0, "mapped {mapped}");
+        assert!(mapped > 0);
     }
 }
