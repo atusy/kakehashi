@@ -133,7 +133,11 @@ pub(super) fn presentation(
         // retired (see `DocumentTracker::sent_by_retired`).
         let newer = held.is_none() && observed != Observed::Now
             || match observed {
-                Observed::AsIsThen => held.is_none_or(|held| held.map.is_some()),
+                // Read while the connection held no prepared text of the
+                // document, nor ever had: no record of the text they were
+                // computed for, which the one held now — even as is, after a
+                // prepared one since — may not be.
+                Observed::AsIsThen => true,
                 Observed::Read {
                     generation,
                     stale_version,
@@ -209,6 +213,24 @@ mod tests {
         prepared: false,
         failed: false,
     };
+
+    /// Coordinates read before any connection was sent a prepared text
+    /// carry no record of the text they were computed for. Once the
+    /// document went through a prepared text since, the one held as is now
+    /// may not be theirs (edited, replaced), so they place nowhere. A
+    /// document never prepared places them as is, as before.
+    #[test]
+    fn coordinates_read_before_any_preparation_place_nowhere_once_it_was_prepared() {
+        let as_is = held(5, None);
+        assert!(matches!(
+            presentation(Some(&as_is), true, Observed::AsIsThen, AS_IS, "v"),
+            Presentation::Unavailable
+        ));
+        assert!(matches!(
+            presentation(Some(&as_is), false, Observed::AsIsThen, AS_IS, "v"),
+            Presentation::AsIs
+        ));
+    }
 
     /// A prepared text its peer revoked since (it failed the text's input
     /// again, under a new epoch, say) translates nothing: a push, a
