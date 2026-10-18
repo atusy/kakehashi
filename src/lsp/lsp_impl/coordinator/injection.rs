@@ -697,6 +697,45 @@ impl InjectionCoordinator {
     where
         F: std::future::Future<Output = ()>,
     {
+        let pass = self
+            .run_injection_pass_unsettled(
+                uri,
+                forward_did_change,
+                required,
+                after_lifecycle_lock,
+                replay_held_save,
+            )
+            .await;
+        // Its holds and texts published for the revision it looked at (see
+        // `LanguageServerPool::note_host_settled`). Only a forwarding pass
+        // records every sent region's text; one that could not look, or
+        // whose sends were not all queued, leaves it to the retry.
+        if forward_did_change
+            && pass.looked
+            && pass.synchronized
+            && let Some(revision) = pass.revision
+        {
+            self.bridge.pool().note_host_settled(
+                uri,
+                revision.incarnation,
+                revision.content_version,
+            );
+        }
+        pass
+    }
+
+    /// [`Self::run_injection_pass`] before it notes what it settled.
+    async fn run_injection_pass_unsettled<F>(
+        &self,
+        uri: &Url,
+        forward_did_change: bool,
+        required: Option<InjectionTarget>,
+        after_lifecycle_lock: F,
+        replay_held_save: bool,
+    ) -> InjectionPass
+    where
+        F: std::future::Future<Output = ()>,
+    {
         // Serialize the complete tree-derived downstream pass with didClose and
         // didOpen. The pass uses the document state observed after it acquires
         // this guard; holding the same lifecycle lock through

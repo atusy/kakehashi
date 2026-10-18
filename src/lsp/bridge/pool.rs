@@ -364,6 +364,14 @@ pub(crate) struct HostVirtualContents {
     /// Explicit aliases keep their existing canonical request behavior.
     promoted_language: Option<HostLanguageAdmission>,
     contents: DashMap<String, DashMap<String, LatestText>>,
+    /// The host's content version as of its last edit (see
+    /// [`LanguageServerPool::note_host_edited`]), and the one the lifecycle
+    /// pass last finished publishing holds and texts for (see
+    /// [`LanguageServerPool::note_host_settled`]): while the second is
+    /// behind, this container may describe an older host text. Kept only
+    /// by a pool that prepares.
+    edited: AtomicU64,
+    settled: AtomicU64,
 }
 
 /// What a text meets for one region of one host, read at once from the
@@ -3384,8 +3392,13 @@ impl LanguageServerPool {
 
     /// Whether the host text a prepared request's map describes is still
     /// the region's current host text, read from the region's latest
-    /// recorded content in one step: its hold, then its map.
+    /// recorded content in one step: whether it is settled, its hold, then
+    /// its map.
     ///
+    /// - Not settled (the host edited, the lifecycle pass for the edit not
+    ///   finished, so the recorded content may predate it; see
+    ///   [`Self::note_host_edited`]): the host moved, to a map not known
+    ///   yet — no.
     /// - Held (a newer input's answer pending, or failed): the host moved,
     ///   to a map not known yet — no.
     /// - The latest map prepares the request's very text, yet differs: the
@@ -3410,6 +3423,13 @@ impl LanguageServerPool {
         let Some(host) = self.latest_virtual_contents.get(host_uri) else {
             return true;
         };
+        // The edit first: a pass settling at least that version published
+        // its holds and texts before it settled, so with it read settled the
+        // hold and content read next are at least that pass's.
+        let edited = host.edited.load(Ordering::Acquire);
+        if host.settled.load(Ordering::Acquire) < edited {
+            return false;
+        }
         if self.host_withholds(host_uri, &host, language, region_id) {
             return false;
         }
@@ -3423,6 +3443,35 @@ impl LanguageServerPool {
                 latest.prepared_text() != request_map.prepared_text() || *latest == *request_map
             }
             _ => true,
+        }
+    }
+
+    /// Note that `host_uri`'s text was edited to `content_version`: from
+    /// now until the lifecycle pass settles that version, its regions'
+    /// latest texts may describe the text before the edit (see
+    /// [`Self::host_text_still_current`]). Called as the edit is applied,
+    /// before any await. Nothing is kept by a pool that prepares nothing.
+    pub(crate) fn note_host_edited(&self, host_uri: &Url, incarnation: u64, content_version: u64) {
+        if !self.prepares() {
+            return;
+        }
+        if let Some(host) = self.latest_virtual_contents.get(host_uri)
+            && host.incarnation == incarnation
+        {
+            host.edited.fetch_max(content_version, Ordering::AcqRel);
+        }
+    }
+
+    /// Note that the lifecycle pass finished publishing `host_uri`'s holds
+    /// and texts for `content_version` (see [`Self::note_host_edited`]).
+    pub(crate) fn note_host_settled(&self, host_uri: &Url, incarnation: u64, content_version: u64) {
+        if !self.prepares() {
+            return;
+        }
+        if let Some(host) = self.latest_virtual_contents.get(host_uri)
+            && host.incarnation == incarnation
+        {
+            host.settled.fetch_max(content_version, Ordering::AcqRel);
         }
     }
 
@@ -3505,6 +3554,8 @@ impl LanguageServerPool {
                 incarnation,
                 promoted_language: None,
                 contents: DashMap::new(),
+                edited: AtomicU64::new(0),
+                settled: AtomicU64::new(0),
             },
         );
     }

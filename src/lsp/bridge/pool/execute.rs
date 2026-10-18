@@ -50,11 +50,13 @@ pub(crate) struct BridgeResponseContext<'a> {
     /// The injection region offset for coordinate translation back to host space.
     pub offset: &'a RegionOffset,
     /// Whether the host text the request's map describes was still the
-    /// region's current host text when the response arrived (see
+    /// region's current host text when the response arrived, as the
+    /// region's latest recorded content tells (see
     /// `LanguageServerPool::host_text_still_current`). Always so as is.
-    /// When not, the host moved under a prepared text the server may still
-    /// hold (an edit to indentation the peer removes leaves it as it was),
-    /// and edits mapped through the request's map would land elsewhere.
+    /// When not, the host moved, possibly under a prepared text that stayed
+    /// the same (an edit to indentation the peer removes leaves it as it
+    /// was), and edits mapped through the request's map would land
+    /// elsewhere.
     pub request_text_held: bool,
 }
 
@@ -1198,7 +1200,31 @@ mod tests {
         // The request's own map current again (an undo): kept.
         record(&before);
         assert!(current(&request));
+        // The host edited, its pass not settled yet (the parse window,
+        // before any hold is published): the recorded text may be the one
+        // before the edit, so pending.
+        pool.note_host_edited(&host_uri, 1, 7);
+        assert!(!current(&request));
+        // A pass settling an older version, or another incarnation's,
+        // settles nothing.
+        pool.note_host_settled(&host_uri, 1, 6);
+        pool.note_host_settled(&host_uri, 2, 7);
+        assert!(!current(&request));
+        // Settled: the recorded text describes the host again.
+        pool.note_host_settled(&host_uri, 1, 7);
+        assert!(current(&request));
+        // An older pass finishing late does not unsettle it.
+        pool.note_host_settled(&host_uri, 1, 5);
+        assert!(current(&request));
+        // Edited and settled past the request's map: the existing rule.
+        pool.note_host_edited(&host_uri, 1, 8);
+        record(&reindented);
+        pool.note_host_settled(&host_uri, 1, 8);
+        assert!(!current(&request));
+        record(&before);
         // A request as is reads nothing.
+        pool.note_host_edited(&host_uri, 1, 9);
+        assert!(current(&RegionOffset::new(0, 0)));
         pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, None);
         assert!(current(&RegionOffset::new(0, 0)));
     }
