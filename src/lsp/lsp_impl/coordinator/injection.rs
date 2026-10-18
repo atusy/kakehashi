@@ -583,9 +583,11 @@ impl InjectionCoordinator {
         if held.is_empty() {
             return;
         }
-        for region_id in self.bridge.close_unprepared_held_docs(uri, held).await {
-            self.diagnostics
-                .evict_source(uri, &DiagnosticSource::Region(region_id));
+        // Only the closed servers' slots: another server may hold the same
+        // region prepared, its diagnostics valid.
+        let closed = self.bridge.close_unprepared_held_docs(uri, held).await;
+        if !closed.is_empty() {
+            self.diagnostics.evict_region_servers(uri, &closed);
         }
     }
 
@@ -2858,6 +2860,72 @@ mod tests {
             received.try_recv().is_err(),
             "reconciliation must synchronize already-opened content too"
         );
+    }
+
+    /// Closing a held region's document on the server that holds it as is
+    /// evicts that server's diagnostics for the region only: another server
+    /// holding the region prepared keeps its own.
+    #[tokio::test]
+    async fn closing_one_servers_unprepared_document_keeps_anothers_diagnostics() {
+        use crate::lsp::bridge::ConnectionKey;
+        use crate::lsp::bridge::VirtualDocumentUri;
+        use crate::lsp::diagnostic_cache::DiagnosticSource;
+        use std::sync::Arc;
+        let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
+        let (service, _socket) = tower_lsp_server::LspService::new(|client| {
+            crate::lsp::lsp_impl::Kakehashi::with_cancel_forwarder(
+                client,
+                Arc::clone(&pool),
+                crate::lsp::CancelForwarder::new(Arc::clone(&pool)),
+            )
+        });
+        let server = service.inner();
+        let host = url::Url::parse("file:///test/held-two-servers.md").unwrap();
+        let region = "01JPMQ8ZYYQA1W3AVPW4JDRZFR";
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host).unwrap(),
+            "lua",
+            region,
+        );
+        let map = crate::lsp::bridge::apply_prepare_result(
+            "x",
+            &crate::lsp::bridge::VirtualLayout::single("x"),
+            None,
+        )
+        .unwrap()
+        .map;
+        for name in ["as-is", "prepared"] {
+            server.bridge.insert_ready_test_connection(name).await;
+            let key = ConnectionKey::for_server(name);
+            server
+                .bridge
+                .register_opened_document_for_test(&host, &virtual_uri, &key)
+                .await;
+            if name == "prepared" {
+                server
+                    .bridge
+                    .record_sent_prepared_for_test(&virtual_uri, &key, "x", &map);
+            } else {
+                server
+                    .bridge
+                    .record_sent_as_is_for_test(&virtual_uri, &key, "x");
+            }
+            server.diagnostics.record(
+                &host,
+                DiagnosticSource::Region(region.to_string()),
+                name.to_string(),
+                None,
+                vec![tower_lsp_server::ls_types::Diagnostic::default()],
+            );
+        }
+        server
+            .injection_coordinator()
+            .close_unprepared_held(&host, &[("lua", region)])
+            .await;
+        let slots = server.diagnostics.snapshot(&host);
+        let servers = &slots[&DiagnosticSource::Region(region.to_string())];
+        assert!(!servers.contains_key("as-is"), "{servers:?}");
+        assert!(servers.contains_key("prepared"), "{servers:?}");
     }
 
     /// The lifecycle pass holds a region its peer answered unusably as

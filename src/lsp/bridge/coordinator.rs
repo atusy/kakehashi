@@ -721,6 +721,26 @@ impl BridgeCoordinator {
             .record_sent_for_test(virtual_uri, connection_key, text.into());
     }
 
+    /// Record `text`, prepared under `map`, as sent to `connection_key` for
+    /// `virtual_uri`, as a queued send would.
+    #[cfg(test)]
+    pub(crate) fn record_sent_prepared_for_test(
+        &self,
+        virtual_uri: &crate::lsp::bridge::protocol::VirtualDocumentUri,
+        connection_key: &crate::lsp::bridge::pool::ConnectionKey,
+        text: &str,
+        map: &Arc<super::protocol::PreparedMap>,
+    ) {
+        self.pool.record_sent_for_test(
+            virtual_uri,
+            connection_key,
+            super::pool::SentText {
+                text,
+                map: Some(map),
+            },
+        );
+    }
+
     /// Purge `connection_key`'s document records, as retiring its process
     /// does.
     #[cfg(test)]
@@ -1404,12 +1424,12 @@ impl BridgeCoordinator {
     /// id)`) on the connections that hold them unprepared — sent before their
     /// pair gained a prepare peer, or never recorded: until the peer answers
     /// (or if it fails) that text would stay bridged, which a prepared pair
-    /// never is. Returns the regions closed.
+    /// never is. Returns each closed document's `(region_id, server)`.
     pub(crate) async fn close_unprepared_held_docs(
         &self,
         uri: &Url,
         held: &[(&str, &str)],
-    ) -> Vec<String> {
+    ) -> Vec<(String, String)> {
         let held: std::collections::HashSet<(&str, &str)> = held.iter().copied().collect();
         if held.is_empty() {
             return Vec::new();
@@ -1424,7 +1444,12 @@ impl BridgeCoordinator {
             })
             .await
             .into_iter()
-            .map(|doc| doc.virtual_uri.region_id().to_string())
+            .map(|doc| {
+                (
+                    doc.virtual_uri.region_id().to_string(),
+                    doc.connection_key.server().to_string(),
+                )
+            })
             .collect()
     }
 
@@ -2619,7 +2644,10 @@ mod tests {
             .await;
         // Held and holding its text as is: closed. Held but prepared, or
         // not held: left open.
-        assert_eq!(closed, vec![TEST_ULID_LUA_0.to_string()]);
+        assert_eq!(
+            closed,
+            vec![(TEST_ULID_LUA_0.to_string(), "ls".to_string())]
+        );
         assert!(!pool.is_document_opened(&unprepared));
         assert!(pool.is_document_opened(&prepared));
         assert!(pool.is_document_opened(&other));
