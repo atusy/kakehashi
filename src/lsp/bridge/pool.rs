@@ -411,9 +411,10 @@ fn failed_for(
 }
 
 /// What a connection held for a virtual document as a resolve was queued
-/// (see [`LanguageServerPool::note_held`]): its URI, the connection, and the
-/// generation of the text on record. Empty without the prepare layer.
-pub(crate) struct HeldNote(Option<(String, ConnectionKey, Option<u64>)>);
+/// (see [`LanguageServerPool::note_held`]): its URI, the connection, the
+/// generation of the text on record, and whether that text is held as is.
+/// Empty without the prepare layer.
+pub(crate) struct HeldNote(Option<(String, ConnectionKey, Option<u64>, bool)>);
 
 /// The latest text forwarded for a virtual document, which a deferred
 /// didOpen substitutes: what downstream servers are sent, with the prepared
@@ -3182,32 +3183,37 @@ impl LanguageServerPool {
     }
 
     /// What `connection_key` holds for `virtual_uri`, noted as a resolve is
-    /// queued: a resolve has no text check of its own (its item is from a
-    /// text the region had then), so whether its reply was computed on the
-    /// text noted is told afterwards by [`Self::held_unchanged`]. Nothing is
-    /// noted without the prepare layer, where every text is held as is.
+    /// queued: a resolve has no text check of its own (its item was minted
+    /// from the region's text as is — one minted from a prepared text never
+    /// resolves), so whether its reply was computed on a text held as is,
+    /// and that one, is told afterwards by [`Self::held_unchanged`]. Nothing
+    /// is noted without the prepare layer, where every text is held as is.
     pub(crate) fn note_held(&self, virtual_uri: &str, connection_key: &ConnectionKey) -> HeldNote {
         HeldNote(self.prepares().then(|| {
+            let held = self.held_text(virtual_uri, connection_key);
             (
                 virtual_uri.to_owned(),
                 connection_key.clone(),
-                self.held_text(virtual_uri, connection_key)
-                    .map(|held| held.generation),
+                held.as_ref().map(|held| held.generation),
+                held.is_none_or(|held| held.map.is_none()),
             )
         }))
     }
 
-    /// Whether the connection still holds the text `note` was taken on: no
-    /// text was recorded for the document since (a prepared one sent ahead
-    /// of the resolve after a peer was gained, say), so the reply is in the
-    /// coordinates of the text noted.
+    /// Whether the reply to a resolve noted as `note` was computed on a text
+    /// held as is: the connection held one as the resolve was queued (not a
+    /// prepared text sent before it, after a peer was gained), and no text
+    /// was recorded for the document since (one sent ahead of it after the
+    /// note), so the reply is in the coordinates of the item's text.
     pub(crate) fn held_unchanged(&self, note: &HeldNote) -> bool {
         note.0
             .as_ref()
-            .is_none_or(|(virtual_uri, connection_key, generation)| {
-                self.held_text(virtual_uri, connection_key)
-                    .map(|held| held.generation)
-                    == *generation
+            .is_none_or(|(virtual_uri, connection_key, generation, as_is)| {
+                *as_is
+                    && self
+                        .held_text(virtual_uri, connection_key)
+                        .map(|held| held.generation)
+                        == *generation
             })
     }
 
@@ -9842,6 +9848,9 @@ mod tests {
                 map: Some(&map),
             },
         );
+        assert!(!pool.held_unchanged(&note));
+        // Noted while a prepared text is held: the item's text as is is not.
+        let note = pool.note_held(&uri, &key);
         assert!(!pool.held_unchanged(&note));
         let plain = LanguageServerPool::new();
         plain.record_sent_for_test(&virtual_uri, &key, SentText::from("  a"));
