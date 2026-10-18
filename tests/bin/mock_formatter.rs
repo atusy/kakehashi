@@ -23,7 +23,10 @@
 //!   answers the full text this server holds for the document, ranged over
 //!   the hovered line in its own coordinates; formatting and range
 //!   formatting uppercase; rename replaces the first line; a pull diagnostic
-//!   spans the first line and carries the full text. Proves what a prepared virtual
+//!   spans the first line and carries the full text; completion inserts
+//!   `int(x)\nprint(y)` at the caret and the line `-- c` above the
+//!   document's first, inlay hints and color presentations answer as in the
+//!   other modes. Proves what a prepared virtual
 //!   document looks like downstream and how its coordinates map back. On a
 //!   save of a text holding `SHOW` it asks the editor to show the document
 //!   with its first line selected; holding `EDIT`, it asks to apply an edit
@@ -355,6 +358,9 @@ fn main() {
                     }),
                     "echo-document" => json!({
                         "hoverProvider": true,
+                        "completionProvider": {},
+                        "inlayHintProvider": true,
+                        "colorProvider": true,
                         "documentFormattingProvider": true,
                         "documentRangeFormattingProvider": true,
                         "renameProvider": true,
@@ -1176,6 +1182,24 @@ fn main() {
             // request carried the real URI. The item's `data` carries that URI
             // back, so `completionItem/resolve` can prove the downstream's own
             // data survived the round trip through the routing envelope (#958).
+            "textDocument/completion" if mode == "echo-document" => {
+                let position = message["params"]["position"].clone();
+                let result = json!({"isIncomplete": false, "items": [{
+                    "label": "echo-edit",
+                    "textEdit": {
+                        "range": { "start": position, "end": position },
+                        "newText": "int(x)\nprint(y)"
+                    },
+                    "additionalTextEdits": [{
+                        "range": {
+                            "start": { "line": 0, "character": 0 },
+                            "end": { "line": 0, "character": 0 }
+                        },
+                        "newText": "-- c\n"
+                    }]
+                }]});
+                respond(&mut writer, id, result);
+            }
             "textDocument/completion" => {
                 let result = message
                     .pointer("/params/textDocument/uri")

@@ -259,6 +259,110 @@ fn downstream_sees_the_dedented_document_and_maps_back() {
     );
 }
 
+/// The completion items, inlay hints or color presentations a request got,
+/// whichever shape its result takes.
+fn result_items(response: &Value) -> Vec<Value> {
+    match &response["result"] {
+        Value::Array(items) => items.clone(),
+        Value::Object(list) => list["items"].as_array().cloned().unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+#[test]
+fn edits_on_a_prepared_document_map_back_reindented() {
+    let (mut client, _dir) = Setup::default().start();
+    let uri = "file:///prepare/edits.md";
+    let text = "# t\n\n```lua\n  local x = 1\n  pr\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+
+    // Completion at the end of `pr` (P (1, 2)): the inserted second line
+    // regains the host indent, and the line added above the first lands
+    // after the host's indent, followed by it.
+    let response = client.send_request(
+        "textDocument/completion",
+        json!({ "textDocument": { "uri": uri }, "position": { "line": 4, "character": 4 } }),
+    );
+    let items = result_items(&response);
+    let item = items
+        .iter()
+        .find(|item| item["label"] == "echo-edit")
+        .unwrap_or_else(|| panic!("no echo-edit item: {response}"));
+    assert_eq!(
+        item["textEdit"],
+        json!({
+            "range": {
+                "start": { "line": 4, "character": 4 },
+                "end": { "line": 4, "character": 4 }
+            },
+            "newText": "int(x)\n  print(y)"
+        })
+    );
+    assert_eq!(
+        item["additionalTextEdits"],
+        json!([{
+            "range": {
+                "start": { "line": 3, "character": 2 },
+                "end": { "line": 3, "character": 2 }
+            },
+            "newText": "-- c\n  "
+        }])
+    );
+    // A caret in the removed indent gets none: the server would see it at
+    // the line's content.
+    let response = client.send_request(
+        "textDocument/completion",
+        json!({ "textDocument": { "uri": uri }, "position": { "line": 4, "character": 1 } }),
+    );
+    assert!(result_items(&response).is_empty(), "{response}");
+
+    // The hint's edit at P (0, 0) lands after the host indent.
+    let response = client.send_request(
+        "textDocument/inlayHint",
+        json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": 3, "character": 0 },
+                "end": { "line": 5, "character": 0 }
+            }
+        }),
+    );
+    let hints = result_items(&response);
+    assert_eq!(hints.len(), 1, "{response}");
+    assert_eq!(hints[0]["position"], json!({ "line": 3, "character": 3 }));
+    assert_eq!(
+        hints[0]["textEdits"],
+        json!([{
+            "range": {
+                "start": { "line": 3, "character": 2 },
+                "end": { "line": 3, "character": 2 }
+            },
+            "newText": "existing "
+        }])
+    );
+
+    // A presentation keyed to the request range over `x` maps back onto it.
+    let range = json!({
+        "start": { "line": 3, "character": 8 },
+        "end": { "line": 3, "character": 9 }
+    });
+    let response = client.send_request(
+        "textDocument/colorPresentation",
+        json!({
+            "textDocument": { "uri": uri },
+            "color": { "red": 1.0, "green": 0.0, "blue": 0.0, "alpha": 1.0 },
+            "range": range
+        }),
+    );
+    let presentations = result_items(&response);
+    assert_eq!(presentations.len(), 1, "{response}");
+    assert_eq!(
+        presentations[0]["textEdit"],
+        json!({ "range": range, "newText": "#ff0000" })
+    );
+}
+
 #[test]
 fn formatting_is_not_offered_on_a_prepared_document() {
     let (mut client, _dir) = Setup::default().start();
