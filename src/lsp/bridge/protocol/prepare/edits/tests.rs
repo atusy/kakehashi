@@ -1717,6 +1717,375 @@ fn a_cr_before_a_gap_shown_opening_with_its_lf_is_the_servers_to_join() {
     assert_eq!(apply_to(virtual_text, &[mapped]), "a\r\n b");
 }
 
+// =============================================================================
+// Property: mapped edits give exactly the host text a line-based reference
+// builds from the edited prepared text
+// =============================================================================
+
+mod exact_reference {
+    use super::*;
+    use proptest::prelude::*;
+    use proptest::test_runner::{Config, TestCaseError, TestRunner};
+    use std::cell::Cell;
+
+    /// One line of a generated document.
+    #[derive(Debug, Clone)]
+    enum Line {
+        /// Indented content (`body` from [`BODIES`]), with an interpolation
+        /// after it and text after that when `gap` says so.
+        Content { body: usize, gap: Option<bool> },
+        /// An empty line inside the content.
+        Empty,
+        /// Host lines between two fences: a gap starting a line.
+        Fence,
+    }
+
+    const BODIES: [&str; 4] = ["a", "é", "𝄞x", "b c"];
+    const PLACEHOLDERS: [Option<&str>; 4] = [None, Some(""), Some("1"), Some("x\n")];
+    const INSERTS: [&str; 9] = ["", "z", "\n", "q\n", "\nw", "é𝄞", "  ", "\n\n", "\nw\n"];
+
+    /// A generated document: its pieces and the text the reference puts
+    /// back around the edited content.
+    struct Document {
+        virtual_text: String,
+        pieces: Vec<(SegmentKind, Range<usize>, String)>,
+        /// Whether each gap is a fence (starts a line), in order.
+        fences: Vec<bool>,
+        changes: Vec<serde_json::Value>,
+        /// Text before the content: the deleted leading blank lines.
+        leading: String,
+        /// Text after the content: the deleted closing lines, then the
+        /// closing indent deleted with them.
+        closing: String,
+        /// Whether the last line is an indentation-only line the peer
+        /// deleted with no closing lines before it: a content line of its
+        /// own (see the ADR), whose indent comes back even when empty.
+        indent_only_last_line: bool,
+    }
+
+    fn line() -> impl Strategy<Value = Line> {
+        prop_oneof![
+            4 => (0..BODIES.len(), prop::option::of(any::<bool>()))
+                .prop_map(|(body, gap)| Line::Content { body, gap }),
+            1 => Just(Line::Empty),
+            1 => Just(Line::Fence),
+        ]
+    }
+
+    /// The document `lines` describe, indented by `indent`, between
+    /// `leading` blank lines and `trailing` ones, optionally ending with a
+    /// closing indent; `None` for a shape the peer could not answer for
+    /// (a fence first or last, a block between fences with no content line).
+    fn document(
+        lines: &[Line],
+        indent: &str,
+        leading: usize,
+        trailing: usize,
+        closing_indent: bool,
+    ) -> Option<Document> {
+        if matches!(lines.first(), Some(Line::Fence) | None)
+            || matches!(lines.last(), Some(Line::Fence))
+        {
+            return None;
+        }
+        // Every block between fences holds a content line: a block of only
+        // empty lines says nothing of the indentation lines there regain.
+        let mut has_content = false;
+        for line in lines {
+            match line {
+                Line::Content { .. } => has_content = true,
+                Line::Fence if !has_content => return None,
+                Line::Fence => has_content = false,
+                Line::Empty => {}
+            }
+        }
+        if !has_content {
+            return None;
+        }
+        let mut text = String::new();
+        let mut pieces = Vec::new();
+        let mut fences = Vec::new();
+        let mut changes = Vec::new();
+        fn push_content(
+            text: &mut String,
+            pieces: &mut Vec<(SegmentKind, Range<usize>, String)>,
+            piece: &str,
+        ) {
+            let start = text.len();
+            text.push_str(piece);
+            pieces.push((SegmentKind::Content, start..text.len(), String::new()));
+        }
+        let leading_text = "\n".repeat(leading);
+        push_content(&mut text, &mut pieces, &leading_text);
+        for line in lines {
+            match line {
+                Line::Empty => push_content(&mut text, &mut pieces, "\n"),
+                Line::Fence => {
+                    let start = text.len();
+                    text.push('\n');
+                    pieces.push((SegmentKind::Gap, start..text.len(), "```\n".to_string()));
+                    fences.push(true);
+                }
+                Line::Content { body, gap } => {
+                    push_content(
+                        &mut text,
+                        &mut pieces,
+                        &format!("{indent}{}", BODIES[*body]),
+                    );
+                    if let Some(after) = gap {
+                        let start = text.len();
+                        text.push_str("    ");
+                        pieces.push((SegmentKind::Gap, start..text.len(), "${x}".to_string()));
+                        fences.push(false);
+                        if *after {
+                            push_content(&mut text, &mut pieces, " y");
+                        }
+                    }
+                    push_content(&mut text, &mut pieces, "\n");
+                }
+            }
+        }
+        let content_end = text.len();
+        push_content(&mut text, &mut pieces, &"\n".repeat(trailing));
+        if closing_indent {
+            push_content(&mut text, &mut pieces, indent);
+        }
+        // The answer, segment by segment: built after the layout merges
+        // the pieces.
+        let layout = VirtualLayout::from_pieces(&text, pieces.clone());
+        let segments = layout.segments();
+        let last = segments.len() - 1;
+        for (index, segment) in segments.iter().enumerate() {
+            let mut segment_changes = Vec::new();
+            if segment.kind == SegmentKind::Content {
+                let range = segment.virtual_range.clone();
+                let segment_text = &text[range.clone()];
+                let lines = LineMap::new(segment_text.to_string());
+                let change = |start: usize, end: usize| {
+                    json!({"range": {
+                        "start": lines.position(start - range.start),
+                        "end": lines.position(end - range.start)
+                    }, "newText": ""})
+                };
+                for at in range.clone() {
+                    if !text.is_char_boundary(at) || !super::super::super::is_line_start(&text, at)
+                    {
+                        continue;
+                    }
+                    // Edge blank lines go whole, one change each.
+                    let edge_line = (index == 0 && at < leading)
+                        || (index == last && at >= content_end && at < content_end + trailing);
+                    if edge_line {
+                        segment_changes.push(change(at, at + 1));
+                    } else if text[at..range.end].starts_with(indent) {
+                        segment_changes.push(change(at, at + indent.len()));
+                    }
+                }
+            }
+            changes.push(segment_changes);
+        }
+        let indent_only_last_line = closing_indent && trailing == 0;
+        Some(Document {
+            leading: leading_text,
+            closing: if indent_only_last_line {
+                String::new()
+            } else {
+                format!(
+                    "{}{}",
+                    "\n".repeat(trailing),
+                    if closing_indent { indent } else { "" }
+                )
+            },
+            indent_only_last_line,
+            virtual_text: text,
+            pieces,
+            fences,
+            changes: changes.into_iter().map(serde_json::Value::from).collect(),
+        })
+    }
+
+    /// The host text the edited P stands for, built line by line: the gaps'
+    /// host text put back where they sit in the edited P, every line
+    /// starting in content (not with a fence) indented, the deleted edge
+    /// text put back around it. `None` where the edited P leaves a fence or
+    /// the closing text not starting a line, which the host cannot take.
+    fn reference(
+        document: &Document,
+        map: &PreparedMap,
+        edits: &[TextEdit],
+        indent: &str,
+    ) -> Option<String> {
+        let prepared = &map.prepared_lines.text;
+        let edited = apply_to(prepared, edits);
+        let ranges: Vec<(Range<usize>, usize)> = edits
+            .iter()
+            .map(|edit| {
+                (
+                    map.prepared_lines.offset_clamped(edit.range.start)
+                        ..map.prepared_lines.offset_clamped(edit.range.end),
+                    edit.new_text.len(),
+                )
+            })
+            .collect();
+        // Where a P offset outside every edit lands in the edited P, after
+        // the edits ending at or before it (an insertion there included).
+        let shifted = |offset: usize| {
+            ranges
+                .iter()
+                .filter(|(range, _)| range.end <= offset)
+                .fold(offset, |at, (range, len)| at + len - range.len())
+        };
+        // The edited P with each gap's prepared text swapped for its host
+        // (V) text, and which characters a fence holds.
+        let gaps: Vec<&super::super::super::Run> = map
+            .runs
+            .iter()
+            .filter(|run| run.kind == RunKind::Gap)
+            .collect();
+        let mut text = String::new();
+        let mut fence_starts = Vec::new();
+        let mut cursor = 0;
+        for (gap, fence) in gaps.iter().zip(&document.fences) {
+            let start = shifted(gap.prepared.start);
+            text.push_str(&edited[cursor..start]);
+            if *fence {
+                fence_starts.push(text.len());
+            }
+            text.push_str(&document.virtual_text[gap.virtual_.clone()]);
+            cursor = start + gap.prepared.len();
+        }
+        text.push_str(&edited[cursor..]);
+        // A fence starts a line.
+        for &start in &fence_starts {
+            if start > 0 && !text[..start].ends_with('\n') {
+                return None;
+            }
+        }
+        let mut indented = String::new();
+        let mut at_line_start = true;
+        for (offset, character) in text.char_indices() {
+            if at_line_start && character != '\n' && !fence_starts.contains(&offset) {
+                indented.push_str(indent);
+            }
+            indented.push(character);
+            at_line_start = character == '\n';
+        }
+        // The indentation-only last line keeps its indent, empty as it is.
+        if document.indent_only_last_line && at_line_start {
+            indented.push_str(indent);
+        }
+        // The closing text starts a line too.
+        if !document.closing.is_empty() && !indented.is_empty() && !indented.ends_with('\n') {
+            return None;
+        }
+        Some(format!(
+            "{}{indented}{}",
+            document.leading, document.closing
+        ))
+    }
+
+    #[test]
+    fn mapped_edits_give_exactly_the_reference_host_text() {
+        let mut runner = TestRunner::new(Config {
+            cases: 4000,
+            failure_persistence: None,
+            ..Config::default()
+        });
+        let (mapped_sets, refused_by_reference) = (Cell::new(0), Cell::new(0));
+        let strategy = (
+            prop::collection::vec(line(), 1..6),
+            prop::sample::select(vec!["  ", "\t", "    "]),
+            (0..3usize, 0..3usize, any::<bool>()),
+            prop::collection::vec(0..PLACEHOLDERS.len(), 1..4),
+            prop::collection::vec((any::<u16>(), any::<u16>(), 0..INSERTS.len()), 1..3),
+        );
+        runner
+            .run(
+                &strategy,
+                |(lines, indent, (leading, trailing, closing), placeholders, specs)| {
+                    let Some(document) = document(&lines, indent, leading, trailing, closing)
+                    else {
+                        return Ok(());
+                    };
+                    let layout = VirtualLayout::from_pieces(
+                        &document.virtual_text,
+                        document.pieces.clone(),
+                    );
+                    let mut gaps = placeholders.iter().cycle();
+                    let answer: Vec<serde_json::Value> = layout
+                        .segments()
+                        .iter()
+                        .zip(&document.changes)
+                        .map(|(segment, changes)| match segment.kind {
+                            SegmentKind::Content => {
+                                json!({"type": "content", "changes": changes})
+                            }
+                            SegmentKind::Gap => match PLACEHOLDERS[*gaps.next().unwrap()] {
+                                None => json!({"type": "gap"}),
+                                Some(content) => json!({"type": "gap", "content": content}),
+                            },
+                        })
+                        .collect();
+                    let Ok(prepared) = apply_prepare_result(
+                        &document.virtual_text,
+                        &layout,
+                        serde_json::from_value(json!({ "segments": answer })).unwrap(),
+                    ) else {
+                        return Ok(());
+                    };
+                    let map = &prepared.map;
+                    let text = &map.prepared_lines.text;
+                    let boundaries: Vec<usize> = (0..=text.len())
+                        .filter(|&at| text.is_char_boundary(at))
+                        .collect();
+                    let edits: Vec<TextEdit> = specs
+                        .iter()
+                        .map(|&(a, b, insert)| {
+                            let a = boundaries[a as usize % boundaries.len()];
+                            let b = boundaries[b as usize % boundaries.len()];
+                            TextEdit {
+                                range: LspRange::new(
+                                    map.prepared_lines.position(a.min(b)),
+                                    map.prepared_lines.position(a.max(b)),
+                                ),
+                                new_text: INSERTS[insert].to_string(),
+                            }
+                        })
+                        .collect();
+                    let Some(mapped) = map.map_edits(&edits, EditMode::Extent) else {
+                        return Ok(());
+                    };
+                    mapped_sets.set(mapped_sets.get() + 1);
+                    let got = apply_to(&document.virtual_text, &mapped);
+                    match reference(&document, map, &edits, indent) {
+                        Some(expected) => prop_assert_eq!(
+                            &got,
+                            &expected,
+                            "{:?} on {:?} (P {:?})",
+                            edits,
+                            document.virtual_text,
+                            text
+                        ),
+                        None => {
+                            refused_by_reference.set(refused_by_reference.get() + 1);
+                            prop_assert!(
+                                false,
+                                "mapped though the host cannot take it: {:?} on {:?} (P {:?}) -> {:?}",
+                                edits,
+                                document.virtual_text,
+                                text,
+                                got
+                            );
+                        }
+                    }
+                    Ok::<(), TestCaseError>(())
+                },
+            )
+            .unwrap();
+        assert!(mapped_sets.get() > 400, "mapped {}", mapped_sets.get());
+    }
+}
+
 #[test]
 fn a_line_created_after_an_interpolation_takes_the_indent_of_its_line() {
     // `\n  foo ${x} bar\n`: the segment after the interpolation starts no
@@ -1747,4 +2116,127 @@ fn a_line_created_after_an_interpolation_takes_the_indent_of_its_line() {
         apply_to(virtual_text, &[appended]),
         "\n  foo      bar\n  baz\n"
     );
+}
+
+#[test]
+fn the_indentation_only_last_line_keeps_its_indent() {
+    // `\n  foo\n  `: the last line holds only the indent the peer removed (a
+    // content line of its own, no closing lines deleted before it).
+    let virtual_text = "\n  foo\n  ";
+    let map = prepare(
+        virtual_text,
+        json!([
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
+        ]),
+    );
+    assert_eq!(map.prepared_lines.text, "foo\n");
+    for (edit, expected) in [
+        (edit((0, 0), (1, 0), "bar\n"), "\n  bar\n  "),
+        (edit((0, 0), (1, 0), ""), "\n  "),
+        (edit((1, 0), (1, 0), "bar\n"), "\n  foo\n  bar\n  "),
+    ] {
+        let mapped = map.map_one_with_extent(&edit).unwrap();
+        assert_eq!(apply_to(virtual_text, &[mapped]), expected, "{edit:?}");
+    }
+}
+
+#[test]
+fn deleting_a_line_keeps_the_next_whitespace_only_lines_indent() {
+    let virtual_text = "  a\n  \n  b\n";
+    let map = dedent_by_two(virtual_text);
+    let removed = map.map_one_with_extent(&edit((0, 0), (1, 0), "")).unwrap();
+    assert_eq!(apply_to(virtual_text, &[removed]), "  \n  b\n");
+    // Nothing inserted on it takes its indent away.
+    let nothing = map.map_one_with_extent(&edit((1, 0), (1, 0), "")).unwrap();
+    assert_eq!(apply_to(virtual_text, &[nothing]), virtual_text);
+}
+
+#[test]
+fn a_line_left_starting_with_an_emptied_interpolation_keeps_its_indent() {
+    // `\n  a${x} y\n`, the interpolation emptied: deleting `a` leaves the
+    // line starting with the interpolation, after the host's indent.
+    let virtual_text = "\n  a     y\n";
+    let prepared = prepare_pieces(
+        virtual_text,
+        [
+            (SegmentKind::Content, 0..4, String::new()),
+            (SegmentKind::Gap, 4..8, "${x}".to_string()),
+            (SegmentKind::Content, 8..11, String::new()),
+        ],
+        json!({"segments": [
+            {"type": "content", "changes": [
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+            ]},
+            {"type": "gap", "content": ""},
+            {"type": "content"}
+        ]}),
+    );
+    assert_eq!(prepared.text, "\na y\n");
+    let replaced = prepared
+        .map
+        .map_one_with_extent(&edit((0, 0), (1, 1), "\n\n"))
+        .unwrap();
+    // The indent, the interpolation's masked text, then ` y`.
+    assert_eq!(apply_to(virtual_text, &[replaced]), "\n\n       y\n");
+}
+
+#[test]
+fn a_line_break_a_placeholder_shows_mid_line_starts_no_existing_line() {
+    // `  b c${x} y\n`, the interpolation shown as `x\n`: P's line ` y` is the
+    // rest of the host line, which keeps no indent of its own.
+    let virtual_text = "  b c     y\n";
+    let prepared = prepare_pieces(
+        virtual_text,
+        [
+            (SegmentKind::Content, 0..5, String::new()),
+            (SegmentKind::Gap, 5..9, "${x}".to_string()),
+            (SegmentKind::Content, 9..12, String::new()),
+        ],
+        json!({"segments": [
+            {"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+            ]},
+            {"type": "gap", "content": "x\n"},
+            {"type": "content"}
+        ]}),
+    );
+    assert_eq!(prepared.text, "b cx\n y\n");
+    // A line break inserted before ` y` makes it a line of the content.
+    let broken = prepared
+        .map
+        .map_one_with_extent(&edit((1, 0), (1, 0), "\n"))
+        .unwrap();
+    assert_eq!(apply_to(virtual_text, &[broken]), "  b c    \n   y\n");
+}
+
+#[test]
+fn text_after_a_fence_shown_without_its_line_break_starts_a_line() {
+    // `  a\n` + a fence + `\n  b\n`, the fence shown as `1`: P joins it with
+    // the blank line after it, which is a line of its own in the host.
+    let virtual_text = "  a\n\n\n  b\n";
+    let prepared = prepare_pieces(
+        virtual_text,
+        [
+            (SegmentKind::Content, 0..4, String::new()),
+            (SegmentKind::Gap, 4..5, "```\n".to_string()),
+            (SegmentKind::Content, 5..10, String::new()),
+        ],
+        json!({"segments": [
+            {"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+            ]},
+            {"type": "gap", "content": "1"},
+            {"type": "content", "changes": [
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+            ]}
+        ]}),
+    );
+    assert_eq!(prepared.text, "a\n1\nb\n");
+    let typed = prepared
+        .map
+        .map_one_with_extent(&edit((1, 1), (1, 1), "z"))
+        .unwrap();
+    assert_eq!(apply_to(virtual_text, &[typed]), "  a\n\n  z\n  b\n");
 }

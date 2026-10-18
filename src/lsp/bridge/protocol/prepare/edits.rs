@@ -36,6 +36,9 @@ enum FirstIndent<'a> {
     /// Exactly this: the edit replaces a whole line including the indent the
     /// peer removed from it.
     Exact(&'a str),
+    /// The existing line the edit ends before, which it joins: that line's
+    /// own removed indent, whatever the line holds.
+    Existing(&'a str),
 }
 
 impl PreparedMap {
@@ -259,7 +262,12 @@ impl PreparedMap {
         // completion replacing the line's first word keeps the indent.
         let prepared = &self.prepared_lines.text;
         let clears_line = new_text.is_empty() && is_line_end(prepared, old.end);
-        let whole_lines = is_line_start(prepared, old.start)
+        // (A line start in V that P shows mid-line, after a gap whose
+        // placeholder holds no line break, counts: its removed indent sits
+        // there.)
+        let starts_line = is_line_start(prepared, old.start)
+            || empty_run(&self.runs, old.start, |kind| kind == RunKind::Deleted).is_some();
+        let whole_lines = starts_line
             && (prepared[old.clone()].contains(['\n', '\r'])
                 || clears_line && !old.is_empty()
                 || new_text.starts_with(['\n', '\r']));
@@ -292,27 +300,54 @@ impl PreparedMap {
             return None;
         }
         // What follows the change in V: a gap the peer emptied right at its
-        // end is not the text after it in P.
+        // end, not the text after it in P — host text a line can start with
+        // (an interpolation), or a line break (a fence's).
         let following = match empty_run(&self.runs, old.end, |kind| kind == RunKind::Gap) {
-            Some(gap) if gap.virtual_.start == virtual_end => None,
+            Some(gap) if gap.virtual_.start == virtual_end => {
+                self.virtual_lines.text[gap.virtual_.clone()].chars().next()
+            }
             _ => following,
         };
         let virtual_text = &self.virtual_lines.text;
         // The existing line after a change ending at a P line start keeps its
         // own removed indent (none, for a line the peer did not dedent), not
-        // the segment's uniform one.
-        let tail = (following.is_some() && is_line_start(prepared, old.end)).then(|| {
-            empty_run(&self.runs, old.end, |kind| kind == RunKind::Deleted)
-                .map_or("", |run| &virtual_text[run.virtual_.clone()])
-        });
+        // the segment's uniform one — blank or whitespace-only as it may be,
+        // the indentation-only last line too. The change took that indent
+        // along (or, inserting, left it before its own text): it gives it
+        // back. With nothing after P's end, there is no such line.
+        let removed_at_end = empty_run(&self.runs, old.end, |kind| kind == RunKind::Deleted)
+            .filter(|run| run.virtual_.end == virtual_end);
+        // (A P line start a gap's placeholder opened mid-line in V starts
+        // no existing line: what follows is the rest of that V line.)
+        let tail = (is_line_start(prepared, old.end)
+            && (removed_at_end.is_some()
+                || following.is_some() && is_line_start(virtual_text, virtual_end)))
+        .then(|| removed_at_end.map_or("", |run| &virtual_text[run.virtual_.clone()]));
+        // A V line start right after a gap's own line break (a fence the
+        // peer replaced by text without one) is a line start P shows
+        // mid-line.
+        let after_gap = {
+            let first = self
+                .runs
+                .partition_point(|run| run.virtual_.end < virtual_start);
+            self.runs[first..]
+                .iter()
+                .take_while(|run| run.virtual_.end == virtual_start)
+                .any(|run| run.kind == RunKind::Gap && !run.prepared.is_empty())
+        };
         let first = match start_indent {
-            // Whole lines replaced by text without a line break, before a
-            // non-blank line: what remains is that existing line, which keeps
-            // its own indent (deleting a line must not re-indent the next).
-            Some(_)
-                if !new_text.contains(['\n', '\r']) && tail.is_some() && begins_line(following) =>
+            // Whole lines deleted before an existing line, or replaced by
+            // text without a line break before a non-blank one: what remains
+            // is that line, which keeps its own indent (deleting a line must
+            // not re-indent the next). Text joining a blank line is that
+            // line's content instead, indented as the replaced line was.
+            _ if whole_lines
+                && is_line_start(virtual_text, virtual_start)
+                && !new_text.contains(['\n', '\r'])
+                && tail.is_some()
+                && (new_text.is_empty() || begins_line(following)) =>
             {
-                FirstIndent::Exact(tail.unwrap_or_default())
+                FirstIndent::Existing(tail.unwrap_or_default())
             }
             // The replaced line's own removed indent comes back.
             Some(run) => FirstIndent::Exact(&virtual_text[run.virtual_.clone()]),
@@ -322,7 +357,7 @@ impl PreparedMap {
             // just joins a non-blank line the peer did not dedent belongs to
             // that line, which has no indent to restore.
             None if is_line_start(virtual_text, virtual_start)
-                && is_line_start(prepared, old.start)
+                && (is_line_start(prepared, old.start) || after_gap)
                 && (is_blank_from(virtual_text, virtual_start)
                     || new_text.contains(['\n', '\r'])) =>
             {
@@ -408,10 +443,13 @@ impl PreparedMap {
         tail: Option<&str>,
     ) -> Option<String> {
         let breaks_line = text.contains(['\n', '\r']);
-        let first = if begins_line(text.chars().next().or(following)) {
-            first
-        } else {
-            FirstIndent::None
+        // New text starting a line takes an indent unless it opens with a
+        // line break (a blank line carries none); an existing line's own
+        // indent comes back whatever it holds.
+        let first = match first {
+            FirstIndent::Existing(_) => first,
+            _ if begins_line(text.chars().next().or(following)) => first,
+            _ => FirstIndent::None,
         };
         if matches!(first, FirstIndent::None) && !breaks_line {
             return Some(text.to_string());
@@ -427,7 +465,7 @@ impl PreparedMap {
         };
         let first_indent = match first {
             FirstIndent::None => "",
-            FirstIndent::Exact(indent) => indent,
+            FirstIndent::Exact(indent) | FirstIndent::Existing(indent) => indent,
             FirstIndent::Uniform => uniform()?,
         };
         let line_indent = if breaks_line { uniform()? } else { "" };
@@ -438,12 +476,17 @@ impl PreparedMap {
             output.push(character);
             let line_break =
                 character == '\n' || (character == '\r' && chars.peek() != Some(&'\n'));
-            if line_break && begins_line(chars.peek().copied().or(following)) {
-                match (chars.peek(), tail) {
-                    // The break before existing text: that line's own indent.
-                    (None, Some(tail)) => output.push_str(tail),
-                    _ => output.push_str(line_indent),
+            if !line_break {
+                continue;
+            }
+            match (chars.peek(), tail) {
+                // The break before the existing line: that line's own indent.
+                (None, Some(tail)) => output.push_str(tail),
+                // A new line starting with text (not another break).
+                (next, _) if begins_line(next.copied().or(following)) => {
+                    output.push_str(line_indent)
                 }
+                _ => {}
             }
         }
         Some(output)
