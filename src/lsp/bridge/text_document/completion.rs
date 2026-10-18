@@ -450,6 +450,11 @@ pub(super) fn transform_completion_item(
                 return false;
             }
             if probe[0].new_text != effective {
+                // Written here, it answers to the region's checks as any
+                // edit does (a caret on the closing fence's line, say).
+                if !text_edit_safe_in_region(&probe[0], offset, region_end) {
+                    return false;
+                }
                 let [edit] = probe;
                 item.text_edit = Some(CompletionTextEdit::Edit(edit));
             }
@@ -1102,6 +1107,22 @@ mod tests {
             ClientInsertMode::default(),
         ));
         assert_eq!(after_text.text_edit, None);
+    }
+
+    #[test]
+    fn a_caret_edit_written_for_an_item_answers_to_the_region_checks() {
+        // `  a\n` dedented, the caret at column 0 of the closing fence's line
+        // (the region's end): as an edit the item would regain the indent
+        // and push text onto the fence.
+        let offset = dedented_offset("  a\n");
+        let mut completed = item(json!({"label": "foo"}));
+        assert!(!transform_completion_item(
+            &mut completed,
+            &offset,
+            Position::new(11, 0),
+            Some(Position::new(11, 0)),
+            ClientInsertMode::default(),
+        ));
     }
 
     #[test]
