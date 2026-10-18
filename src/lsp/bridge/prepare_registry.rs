@@ -474,6 +474,28 @@ impl PrepareRegistry {
             .unwrap_or_default()
     }
 
+    /// When the input the lifecycle pass holds `region_id` (under
+    /// `injection_language`) of `host_uri` on was taken, in the presentation
+    /// order, if its answer standing at `epoch` is unusable: identifies that
+    /// failure, so an answer taken before it is told from one taken after.
+    pub(crate) fn failed_at(
+        &self,
+        host_uri: &Url,
+        injection_language: &str,
+        region_id: &str,
+        epoch: u64,
+    ) -> Option<u64> {
+        let host_uri = host_uri.as_str();
+        self.regions
+            .get(&region_hash(host_uri, injection_language, region_id))
+            .filter(|region| region.is(host_uri, injection_language, region_id))
+            .and_then(|region| {
+                region.held_cell().and_then(|cell| {
+                    matches!(cell.standing(epoch), Ok(Some(Answer::Unusable))).then_some(cell.taken)
+                })
+            })
+    }
+
     /// Whether the lifecycle pass prepares any region (holds it on an answer
     /// other than as is, or one it waits for) as it stands at `epoch`: see
     /// [`Self::region`].

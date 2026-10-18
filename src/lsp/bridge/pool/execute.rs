@@ -1164,9 +1164,11 @@ mod tests {
         let built = Some(prepared.map.built());
         let failed = || pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0, built);
         assert!(!failed());
-        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, false);
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, None);
         assert!(!failed(), "pending");
-        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, true);
+        // The failed input, taken after the request's.
+        let first = crate::lsp::bridge::protocol::next_presentation();
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, Some(first));
         assert!(failed(), "an answer taken before the failure");
         assert!(
             pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0, None),
@@ -1174,12 +1176,18 @@ mod tests {
         );
         // An answer taken after the failure (a newer text's, which the next
         // pass is about to send) is not refused by the stale hold, nor by
-        // the same failure held again.
+        // the same failure held again...
         let newer =
             apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(dedent_answer()))
                 .unwrap();
-        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, true);
-        assert!(!pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0, Some(newer.map.built())));
+        let newer_failed =
+            || pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0, Some(newer.map.built()));
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, Some(first));
+        assert!(!newer_failed());
+        // ...but is by a later failure (another epoch's, say).
+        let later = crate::lsp::bridge::protocol::next_presentation();
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, Some(later));
+        assert!(newer_failed());
     }
 
     #[tokio::test]
