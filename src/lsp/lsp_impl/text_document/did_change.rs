@@ -110,7 +110,11 @@ impl Kakehashi {
         self.documents.apply_edit(&uri, text, &edits);
         // Before any await: a prepared answer arriving from now on is judged
         // against a host text its regions' latest texts may not describe yet.
-        if let Some(document) = self.documents.get(&uri) {
+        // Gated first: a pool preparing nothing keeps nothing, and typing
+        // there pays no document lookup for it.
+        if self.bridge.pool().prepares()
+            && let Some(document) = self.documents.get(&uri)
+        {
             self.bridge.pool().note_host_edited(
                 &uri,
                 document.incarnation(),
