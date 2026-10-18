@@ -377,8 +377,8 @@ fn formatting_is_not_offered_on_a_prepared_document() {
     open(&mut client, uri, text);
     hover_with_retry(&mut client, uri, 3, 4);
 
-    // The echo mock would uppercase the document; no edit is mapped back
-    // through a prepared one. Refused up front, not by a wait for a text the
+    // The echo mock would uppercase the document; a formatter's edits to a
+    // prepared one are not mapped back through its map. Refused up front, not by a wait for a text the
     // server never holds (which would take the 5 s budget).
     for method in ["textDocument/formatting", "textDocument/rangeFormatting"] {
         let started = Instant::now();
