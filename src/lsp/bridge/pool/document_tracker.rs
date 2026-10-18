@@ -2627,6 +2627,57 @@ mod tests {
         assert!(Arc::ptr_eq(held.map.as_ref().unwrap(), &second));
     }
 
+    /// An answer for another input — an undo back to a text answered before
+    /// the edit, alike in the text it sends — is held again whenever it was
+    /// taken: the rule against moving backwards is per input.
+    #[tokio::test]
+    async fn an_older_answer_for_another_input_is_held_again() {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result_at};
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let uri = virtual_uri.to_uri_string();
+        let conn = ConnectionKey::for_server("lua");
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, &conn)
+            .await;
+        let answer = |taken| {
+            let mut map = apply_prepare_result_at("a", &VirtualLayout::single("a"), None, taken)
+                .unwrap()
+                .map;
+            Arc::get_mut(&mut map)
+                .unwrap()
+                .set_revocation(Arc::default());
+            map
+        };
+        let undone = answer(10);
+        let edited = answer(30);
+        tracker.record_sent_for_test(
+            &virtual_uri,
+            &conn,
+            SentText {
+                text: "a",
+                map: Some(&edited),
+            },
+            1,
+        );
+        assert!(
+            tracker
+                .increment_version_if_content_changed(
+                    &virtual_uri,
+                    &conn,
+                    SentText {
+                        text: "a",
+                        map: Some(&undone),
+                    },
+                )
+                .await
+                .is_none()
+        );
+        let held = tracker.held_text(&uri, &conn).unwrap();
+        assert!(Arc::ptr_eq(held.map.as_ref().unwrap(), &undone));
+    }
+
     /// An older answer alike in coordinates is never held again over a
     /// newer one (a stale pass or a snapshot repair carrying it): revoked
     /// alone later, it would leave the connection presenting nothing though
