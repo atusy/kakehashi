@@ -696,6 +696,67 @@ fn without_experimental_features_nothing_is_prepared() {
         }),
     );
     assert!(!response["result"].is_null(), "{response}");
+    // Edits translate as ranges only, as on main: no text re-indented.
+    let response = client.send_request(
+        "textDocument/completion",
+        json!({ "textDocument": { "uri": uri }, "position": { "line": 3, "character": 4 } }),
+    );
+    let items = result_items(&response);
+    let item = items
+        .iter()
+        .find(|item| item["label"] == "echo-edit")
+        .unwrap_or_else(|| panic!("no echo-edit item: {response}"));
+    assert_eq!(
+        item["textEdit"],
+        json!({
+            "range": {
+                "start": { "line": 3, "character": 4 },
+                "end": { "line": 3, "character": 4 }
+            },
+            "newText": "int(x)\nprint(y)"
+        })
+    );
+    assert_eq!(
+        item["additionalTextEdits"][0]["range"]["start"],
+        json!({ "line": 3, "character": 0 })
+    );
+    assert_eq!(item["additionalTextEdits"][0]["newText"], "-- c\n");
+    let response = client.send_request(
+        "textDocument/inlayHint",
+        json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": 3, "character": 0 },
+                "end": { "line": 4, "character": 0 }
+            }
+        }),
+    );
+    let hints = result_items(&response);
+    assert_eq!(hints.len(), 1, "{response}");
+    assert_eq!(
+        hints[0]["textEdits"][0]["range"]["start"],
+        json!({ "line": 3, "character": 0 })
+    );
+    let response = client.send_request(
+        "textDocument/colorPresentation",
+        json!({
+            "textDocument": { "uri": uri },
+            "color": { "red": 1.0, "green": 0.0, "blue": 0.0, "alpha": 1.0 },
+            "range": {
+                "start": { "line": 3, "character": 8 },
+                "end": { "line": 3, "character": 9 }
+            }
+        }),
+    );
+    let presentations = result_items(&response);
+    assert_eq!(presentations.len(), 2, "{response}");
+    assert_eq!(
+        presentations[1]["textEdit"]["range"],
+        json!({
+            "start": { "line": 3, "character": 6 },
+            "end": { "line": 3, "character": 7 }
+        })
+    );
     let log = std::fs::read_to_string(dir.path().join("wire.log")).expect("wire log");
     assert!(log.contains("textDocument/didOpen\t"), "{log}");
     assert!(!log.contains("kakehashi/virtualDocument/prepare"), "{log}");
