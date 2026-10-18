@@ -203,7 +203,10 @@ final for that input under the current epoch. When it is the input the
 lifecycle pass holds the document on, and the epoch has not moved, it
 re-syncs its host as it arrives, and the host's diagnostics are collected
 again (through the edit's debounce when the answer is an edit's, as for a
-usable one). A missing answer from the chosen peer (crashing, timing out, or
+usable one). Its servers keep the prepared text they last held, but no
+coordinates are read through it any more — a request built on an earlier
+answer is not admitted, nor opens the document, as no push is placed. A
+missing answer from the chosen peer (crashing, timing out, or
 answering with one of LSP's retryable cancellation codes) is retried with
 backoff — one second, doubling to a minute — without waiting for an edit,
 and requests do not pile further attempts onto a backing-off one.
