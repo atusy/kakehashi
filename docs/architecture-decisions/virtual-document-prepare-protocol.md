@@ -213,20 +213,32 @@ it along and gives it back). Every line the edit's text begins regains the
 indentation the peer removed from the segment it lands in, provided every
 indentation the peer removed in that segment is the same (lines it left
 alone do not count); otherwise an edit creating a line there is refused,
-since no single indentation is right.
+since no single indentation is right. A segment that says nothing of its
+indentation (no indentation removed, and no block of text opening a line
+of its own: the rest of a line after an interpolation, blank lines)
+regains the segment's before it. The document's deleted indentation-only
+last line (the indentation before a closing `''`) counts only in a segment
+of whitespace alone, with no other indentation removed and no closing
+lines deleted with it: a created line never takes host layout's
+indentation over the content's (nixfmt's shallower closing indent), nor
+any beside content left at column 0. Lines inserted at that last line's
+start are content lines: they go before its indentation, which the text
+after their last line break, if any, joins.
 
 A set of edits the client applies together (a hint's `textEdits`, a
 completion item's or color presentation's main edit with its
 `additionalTextEdits`) is mapped one by one and checked as a whole on the
 edited V. It is refused, and dropped like any unsafe set, when:
 
-- an edit is reversed; edits overlap in P or once mapped; or edits touch
+- an edit is reversed, or reaches a line past P's last; edits overlap in
+  P or once mapped; or edits touch
   (one ending where another starts, or two inserting at one place) at a
   line start, or with a line break or no text on the side where they meet:
   how each regains a removed indent, or where a CR and an LF meet, depends
   on the other's text — but for lines inserted at a line start before an
   edit starting there with text (an import above the line a completion
-  rewrites), which keep to their own lines;
+  rewrites), which keep to their own lines, provided the host has a line
+  start there too and both map to the same place;
 - an edge of a mapped edit falls between a CR and an LF of V, where no LSP
   position is;
 - an edit reaches into a gap's text (or, for a gap the peer emptied,
@@ -278,6 +290,7 @@ Completion keeps to what the client inserts where it asked:
   text alike and keep their shared start.
 - A snippet is kept only when it is literal text: what a client expands
   tabstops, placeholders, variables or escapes to is not the text checked.
+  Kept, it is sent as plain text, which no snippet engine re-indents.
 - An item without a `textEdit` is inserted at the caret, outside the map:
   it is dropped when its text breaks a line; where the same text as an
   edit at the caret regains an indent (a blank line among dedented ones),
@@ -286,6 +299,14 @@ Completion keeps to what the client inserts where it asked:
 - A mapped multi-line edit already regained the removed indentation: the
   item asks a client that supports it to insert as is, and is dropped for
   one that always adjusts indentation.
+- An incomplete list without items (the server's own, or one whose every
+  item did not map back) is no result: it would win over another server's
+  items. Its ask to re-query still stands when the server ranks above the
+  layer's winning server, since the next keystroke may move the caret to
+  where its items map: the winning list is marked incomplete. With no
+  items in the layer, the host layer's answer is marked incomplete when it
+  came after the injected layer finished, and nothing at all answers an
+  empty incomplete list.
 
 ### Failure
 

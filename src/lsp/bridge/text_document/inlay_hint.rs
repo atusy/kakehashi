@@ -784,16 +784,11 @@ fn build_inlay_hint_request(
     JsonRpcRequest::new(request_id.as_i64(), "textDocument/inlayHint", params)
 }
 
-/// Translate inlay-hint response items from virtual to host coordinates:
-/// `position` and any `textEdits` go through `offset`. For `InlayHintLabelPart`
-/// labels, each part's `location` is rewritten with the same URI filter as
-/// other handlers — keep real files, translate same-virtual-URI matches and
-/// swap to the host URI, drop cross-region virtual URIs.
 /// [`transform_inlay_hint_response_to_host_and_envelope`] for a response as
-/// the executor hands it over: when the connection holds the request's
-/// prepared text under another map by now (see `BridgeResponseContext`), the
-/// hints' edits, made for host coordinates that moved since, are not
-/// offered; the hints stay shown, as a position is.
+/// the executor hands it over: when the request's map no longer describes
+/// the region's current host text (see `BridgeResponseContext`), the hints'
+/// edits, made for host coordinates that moved since, are not offered; the
+/// hints stay shown, as a position is.
 fn inlay_hint_response_to_host(
     response: serde_json::Value,
     ctx: &super::super::pool::BridgeResponseContext<'_>,
@@ -810,7 +805,7 @@ fn inlay_hint_response_to_host(
         envelope_ctx,
         server_resolves,
     );
-    if !ctx.request_text_held {
+    if !ctx.request_map_current {
         for hint in hints.iter_mut().flatten() {
             hint.text_edits = None;
         }
@@ -818,6 +813,11 @@ fn inlay_hint_response_to_host(
     hints
 }
 
+/// Translate inlay-hint response items from virtual to host coordinates:
+/// `position` and any `textEdits` go through `offset`. For `InlayHintLabelPart`
+/// labels, each part's `location` is rewritten with the same URI filter as
+/// other handlers — keep real files, translate same-virtual-URI matches and
+/// swap to the host URI, drop cross-region virtual URIs.
 fn transform_inlay_hint_response_to_host_and_envelope(
     mut response: serde_json::Value,
     request_virtual_uri: &str,
@@ -1112,16 +1112,10 @@ mod tests {
         assert!(extract_inlay_hint_envelope(&result).is_some());
     }
 
-    // ==========================================================================
-    // Inlay hint request builder tests
-    // ==========================================================================
-
-    /// A hint from a prepared document is placed through its map, and its
-    /// edits are mapped through it as one set: kept when they keep off the
-    /// host text the document hides, dropped when they would not. From an
-    /// unprepared one, its edits are translated as ranges.
+    /// A response whose request's map no longer describes the region's
+    /// current host text keeps its hints shown, without their edits.
     #[test]
-    fn hints_for_a_text_held_under_a_new_map_lose_their_edits() {
+    fn hints_whose_map_is_no_longer_current_lose_their_edits() {
         use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
         let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
             {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
@@ -1141,12 +1135,12 @@ mod tests {
                 "newText": ": x"
             }]
         }]});
-        let answer = |held: bool| {
+        let answer = |current: bool| {
             let ctx = super::super::super::pool::BridgeResponseContext {
                 virtual_uri_string: "file:///test.md/v.lua".to_string(),
                 host_uri_lsp: &host_uri,
                 offset: &offset,
-                request_text_held: held,
+                request_map_current: current,
             };
             inlay_hint_response_to_host(
                 response.clone(),
@@ -1174,6 +1168,10 @@ mod tests {
         assert!(stale[0].text_edits.is_none());
     }
 
+    /// A hint from a prepared document is placed through its map, and its
+    /// edits are mapped through it as one set: kept when they keep off the
+    /// host text the document hides, dropped when they would not. From an
+    /// unprepared one, its edits are translated as ranges.
     #[test]
     fn a_prepared_hints_edits_map_through_its_document() {
         use crate::lsp::bridge::protocol::{SegmentKind, VirtualLayout, apply_prepare_result};
@@ -1258,6 +1256,10 @@ mod tests {
         let edits = as_is.text_edits.expect("edits of an unprepared hint stay");
         assert_eq!(edits[0].range.start, Position::new(3, 3));
     }
+
+    // ==========================================================================
+    // Inlay hint request builder tests
+    // ==========================================================================
 
     #[test]
     fn inlay_hint_response_wraps_downstream_data_for_resolve_routing() {

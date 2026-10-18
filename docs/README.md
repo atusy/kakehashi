@@ -951,8 +951,8 @@ kakehashi translates every position and range between the prepared and the
 original document: hovers, definitions, diagnostics, folding ranges and the
 like work as on any document. The edits of completion items, inlay hints
 and color presentations are mapped back too: lines they add regain the
-indentation the prepare server removed, and edits that would touch host text
-the prepared document does not show are dropped (completion snippets are
+indentation the prepare server removed, and edits that would reach into host
+text the prepared document does not show are dropped (completion snippets are
 offered only when they are literal text). Code actions, rename, formatting
 and the other edit-producing methods are not available on a prepared
 document. Items listed from a prepared document are not resolved further:

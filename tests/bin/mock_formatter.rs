@@ -28,7 +28,8 @@
 //!   `int(x)\nprint(y)` at the caret and the line `-- c` above the
 //!   document's first (and offers `echo-plain` with no edit), inlay hints
 //!   answer as in the other modes, and color presentations add one over
-//!   (0, 6)-(0, 7). Proves what a prepared virtual
+//!   (0, 6)-(0, 7); a document holding `SNIPPETS` gets an incomplete list
+//!   of snippets only instead. Proves what a prepared virtual
 //!   document looks like downstream and how its coordinates map back. On a
 //!   save of a text holding `SHOW` it asks the editor to show the document
 //!   with its first line selected; holding `EDIT`, it asks to apply an edit

@@ -57,7 +57,7 @@ pub(crate) struct BridgeResponseContext<'a> {
     /// the same (an edit to indentation the peer removes leaves it as it
     /// was), and edits mapped through the request's map would land
     /// elsewhere.
-    pub request_text_held: bool,
+    pub request_map_current: bool,
 }
 
 pub(crate) struct RequestHostLifecycle<'a> {
@@ -387,7 +387,7 @@ impl LanguageServerPool {
             virtual_uri_string: uri_string.to_string(),
             host_uri_lsp,
             offset,
-            request_text_held: offset.prepared().is_none_or(|request_map| {
+            request_map_current: offset.prepared().is_none_or(|request_map| {
                 self.host_text_still_current(host_uri, language, region_id, request_map)
             }),
         }
@@ -716,7 +716,7 @@ impl LanguageServerPool {
                 virtual_uri_string: virtual_uri.to_uri_string(),
                 host_uri_lsp: &host_uri_lsp,
                 offset,
-                request_text_held: true,
+                request_map_current: true,
             };
             return Ok(transform_response(
                 serde_json::json!({ "result": null }),
@@ -1184,7 +1184,7 @@ mod tests {
                 (&host_uri, "lua", TEST_ULID_LUA_0),
                 offset,
             )
-            .request_text_held
+            .request_map_current
         };
         assert!(current(&request));
         // The host's newer text waits for its answer: held.
@@ -1996,7 +1996,7 @@ mod tests {
             virtual_uri_string: "file:///project/virtual.lua".to_string(),
             host_uri_lsp: &host_uri,
             offset: &offset,
-            request_text_held: true,
+            request_map_current: true,
         };
         assert_eq!(ctx.virtual_uri_string, "file:///project/virtual.lua");
         assert_eq!(ctx.host_uri_lsp, &host_uri);

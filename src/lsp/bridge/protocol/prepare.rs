@@ -736,7 +736,10 @@ struct SegmentIndent {
     virtual_range: Range<usize>,
     /// `Some(indent)` when every deletion in the segment removed the same
     /// text (a dedent); `None` when they differ, so a new line has no single
-    /// right indentation.
+    /// right indentation. The document's deleted indentation-only last line
+    /// (the closing indent) counts only in a segment of whitespace alone
+    /// with no other deletion and no closing lines deleted with it. A
+    /// segment without `evidence` takes the previous segment's instead.
     uniform: Option<String>,
     /// Whether the segment says anything of its indentation: an indent
     /// removed, or text in a segment that opens a line of its own.

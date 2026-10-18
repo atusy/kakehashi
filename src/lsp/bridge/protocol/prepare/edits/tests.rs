@@ -158,7 +158,7 @@ fn emptied_gap() -> (String, PreparedMap) {
 }
 
 #[test]
-fn touching_edits_are_refused() {
+fn edits_touching_where_one_bears_on_the_other_are_refused() {
     // How each regains a removed indent depends on the other's text: two
     // insertions at one place, or an edit ending where another starts.
     let (_, map) = dedented();
