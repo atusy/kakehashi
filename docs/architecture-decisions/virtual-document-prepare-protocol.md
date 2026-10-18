@@ -263,10 +263,10 @@ Completion keeps to what the client inserts where it asked:
 - A snippet is kept only when it is literal text: what a client expands
   tabstops, placeholders, variables or escapes to is not the text checked.
 - An item without a `textEdit` is inserted at the caret, outside the map:
-  it is dropped when its text breaks a line, or when the same text as an
-  edit at the caret would map otherwise (on a blank line among dedented
-  ones it would regain the indent), and its additional edits are dropped,
-  having no main edit to be checked with.
+  it is dropped when its text breaks a line; where the same text as an
+  edit at the caret regains an indent (a blank line among dedented ones),
+  it goes out as that edit; its additional edits are dropped, having no
+  main edit to be checked with.
 - A mapped multi-line edit already regained the removed indentation: the
   item asks a client that supports it to insert as is, and is dropped for
   one that always adjusts indentation.
