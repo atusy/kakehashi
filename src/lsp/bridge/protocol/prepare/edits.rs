@@ -36,11 +36,11 @@ pub(crate) enum EditMode {
 /// How long the diff of a formatting answer may search, pairing lines and
 /// then the fewest changes within them (see [`EditMode::Formatting`]); the
 /// work around the search (applying the answer to P, the per-character
-/// tables, mapping each stretch) runs in time linear in the texts on top of
-/// it. An answer whose diff runs out of time is refused: the diff then falls back to coarser stretches, which can
-/// span lines the formatter left alone, and a stretch maps every line it
-/// spans as one it wrote, with the segment's indent rather than the line's
-/// own. So the budget bears only on which answers are refused.
+/// tables, mapping each stretch) runs in time linear in the texts on top.
+/// An answer whose diff runs out of time is refused. Out of time, the diff
+/// falls back to coarser stretches, which can span lines the formatter left
+/// alone and would map them with the segment's indent, not their own. So
+/// the budget bears only on which answers are refused.
 const FORMATTING_DIFF_BUDGET: Duration = Duration::from_millis(200);
 
 /// The indentation a mapped edit's first line regains.
