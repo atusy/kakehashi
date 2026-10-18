@@ -259,7 +259,7 @@ impl DebouncedDiagnosticsManager {
         }
 
         let data = DebouncedDiagnosticData {
-            uri: uri.clone(),
+            uri,
             snapshot_data,
             bridge_pool,
             bridge,

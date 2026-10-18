@@ -720,7 +720,7 @@ impl Kakehashi {
                         "textDocument/diagnostic",
                     )
                     .push_fallback;
-                    push_fallback_by_lang.insert(injection_language.clone(), fallback);
+                    push_fallback_by_lang.insert(injection_language, fallback);
                     fallback
                 }
             };
