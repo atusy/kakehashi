@@ -82,15 +82,15 @@ impl LanguageServerPool {
 }
 
 /// [`transform_color_presentation_response_to_host`] for a response as the
-/// executor hands it over: nothing when the connection holds the request's
-/// prepared text under another map by now (see `BridgeResponseContext`).
+/// executor hands it over: nothing when the request's map no longer
+/// describes the region's current host text (see `BridgeResponseContext`).
 fn color_presentation_response_to_host(
     response: serde_json::Value,
     ctx: &super::super::pool::BridgeResponseContext<'_>,
     region_end: Position,
     host_request_range: Range,
 ) -> Vec<ColorPresentation> {
-    if !ctx.request_text_held {
+    if !ctx.request_map_current {
         return Vec::new();
     }
     transform_color_presentation_response_to_host(
@@ -918,19 +918,19 @@ mod tests {
     }
 
     #[test]
-    fn an_answer_for_a_text_held_under_a_new_map_is_dropped() {
+    fn an_answer_whose_map_is_no_longer_current_is_dropped() {
         let offset = dedented_offset();
         let host_uri: tower_lsp_server::ls_types::Uri = "file:///test.md".parse().unwrap();
         let response = json!({"jsonrpc": "2.0", "id": 1, "result": [{"label": "x", "textEdit": {
             "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 1}},
             "newText": "c"
         }}]});
-        let answer = |held: bool| {
+        let answer = |current: bool| {
             let ctx = super::super::super::pool::BridgeResponseContext {
                 virtual_uri_string: "file:///test.md/v.lua".to_string(),
                 host_uri_lsp: &host_uri,
                 offset: &offset,
-                request_text_held: held,
+                request_map_current: current,
             };
             color_presentation_response_to_host(
                 response.clone(),

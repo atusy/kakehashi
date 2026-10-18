@@ -5,6 +5,10 @@
 //! label fallback at the request position) is unsafe for the injection region —
 //! escape it, break per-line `> ` prefixes, or merge content into the closing
 //! fence — if applied verbatim (see `transform_completion_item`).
+//! On a prepared document the items' edits map back through its map,
+//! re-indented; a literal snippet goes out as plain text, and an item without
+//! an edit is made an explicit one where its text at the caret regains an
+//! indent, or dropped where it would map off the caret.
 //! Messages are queued via the channel-based writer task (ls-bridge-message-ordering) for FIFO
 //! ordering with other messages.
 
@@ -117,8 +121,8 @@ impl LanguageServerPool {
 }
 
 /// [`transform_completion_response_to_host`] for a response as the executor
-/// hands it over: nothing when the connection holds the request's prepared
-/// text under another map by now (see `BridgeResponseContext`), its items'
+/// hands it over: nothing when the request's map no longer describes the
+/// region's current host text (see `BridgeResponseContext`), its items'
 /// edits made for host coordinates that moved since.
 fn completion_response_to_host(
     response: serde_json::Value,
@@ -129,7 +133,7 @@ fn completion_response_to_host(
     envelope_ctx: &EnvelopeContext<'_>,
     insert_mode: ClientInsertMode,
 ) -> Option<CompletionList> {
-    if !ctx.request_text_held {
+    if !ctx.request_map_current {
         return None;
     }
     transform_completion_response_to_host(
@@ -233,7 +237,10 @@ fn transform_completion_response_to_host(
 /// additionalTextEdits if present. On a prepared document the edits go
 /// through its map (`translate_virtual_main_and_additional_edits_to_host`),
 /// their text re-indented, and the item may be given `insertTextMode: asIs`
-/// (see `ClientInsertMode`).
+/// (see `ClientInsertMode`). A literal snippet there is sent as plain text,
+/// and an item without an edit is probed as an edit at the caret: made that
+/// explicit edit when its text regains an indent, dropped when it maps off
+/// the caret.
 ///
 /// Returns `false` when the item's primary insertion — its text edit, or the
 /// insertText/label fallback applied at the request position — is unsafe for the
@@ -1733,19 +1740,19 @@ mod tests {
     }
 
     #[test]
-    fn an_answer_for_a_text_held_under_a_new_map_is_dropped() {
+    fn an_answer_whose_map_is_no_longer_current_is_dropped() {
         let offset = dedented_offset("  a\n");
         let host_uri: tower_lsp_server::ls_types::Uri = "file:///test.md".parse().unwrap();
         let response = json!({"jsonrpc": "2.0", "id": 1, "result": [{"label": "x", "textEdit": {
             "range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 1}},
             "newText": "x"
         }}]});
-        let answer = |held: bool| {
+        let answer = |current: bool| {
             let ctx = super::super::super::pool::BridgeResponseContext {
                 virtual_uri_string: "file:///test.md/v.lua".to_string(),
                 host_uri_lsp: &host_uri,
                 offset: &offset,
-                request_text_held: held,
+                request_map_current: current,
             };
             completion_response_to_host(
                 response.clone(),

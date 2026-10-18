@@ -49,10 +49,11 @@ impl Kakehashi {
                 return Ok(params);
             }
             // An item minted from a prepared document never resolves (see
-            // `completion_geometry_matches`): refused before a connection, a
-            // parse wait or the edit lock, which a client resolving on every
-            // selection move would otherwise pay each time for the same item
-            // back, envelope kept, as every later refusal returns it.
+            // `completion_geometry_matches`). It is refused here, before a
+            // connection, a parse wait or the edit lock, which a client
+            // resolving on every selection move would otherwise pay each
+            // time; the item goes back with its envelope kept, as every later
+            // refusal returns it.
             if envelope.offset.prepared {
                 return Ok(params);
             }

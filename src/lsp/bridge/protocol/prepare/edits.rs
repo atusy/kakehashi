@@ -49,8 +49,8 @@ impl PreparedMap {
     /// indentation the peer removed from lines it creates or replaces. The
     /// mapped set is then checked as a whole against the host text V holds
     /// and P does not show (see [`Self::mapped_edits_keep_host_text`]).
-    /// `None` — refuse the set — when an edit is reversed, edits overlap in
-    /// P or once mapped (or touch where either's text bears on the other),
+    /// `None` — refuse the set — when an edit is reversed, reaches a line
+    /// past P's last, edits overlap in P or once mapped (or touch where either's text bears on the other),
     /// an edit reaches into a gap, a line created in content has no single
     /// indentation to regain, or the host text would not survive.
     ///
@@ -75,9 +75,10 @@ impl PreparedMap {
         // import above the line a completion rewrites) are the exception:
         // the insertion ends with a line break, after which the existing
         // line regains its own indent, and the later edit, starting with
-        // text, keeps to that line — provided it maps after the insertion
-        // (one taking the line's removed indent along would not; checked
-        // once mapped).
+        // text, keeps to that line — provided both map to the same V start,
+        // where the client applies them in order (a later edit taking the
+        // line's removed indent along would start before the insertion;
+        // checked once mapped).
         // Only at a line start the host has too: one a placeholder's own line
         // break shows in P mid-line in V starts no existing host line, whose
         // indent the inserted lines' last break could give back.
