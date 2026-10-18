@@ -708,11 +708,12 @@ impl InjectionCoordinator {
             .await;
         // Its holds and texts published for the revision it looked at (see
         // `LanguageServerPool::note_host_settled`). Only a forwarding pass
-        // records every sent region's text; one that could not look, or
-        // whose sends were not all queued, leaves it to the retry.
+        // records every sendable region's text, before sending any: one
+        // whose sends were not all queued still settled the store (what a
+        // connection holds is checked as each request is queued), while one
+        // that could not look leaves it to its retry.
         if forward_did_change
             && pass.looked
-            && pass.synchronized
             && let Some(revision) = pass.revision
         {
             self.bridge.pool().note_host_settled(
