@@ -403,6 +403,31 @@ pub(super) fn transform_completion_item(
         if snippet_unsafe(effective, request_host_line) {
             return false;
         }
+        // On a prepared document the client inserts the text at the caret
+        // as is. Where the same text as an edit would come back otherwise —
+        // regaining an indent at a blank line among dedented ones — the two
+        // disagree, and which is right is no range the client was given:
+        // refused.
+        if prepared
+            && let Some(caret) = request_host_position
+            && !effective.is_empty()
+        {
+            let mut at = caret;
+            super::super::protocol::translate_host_position_to_virtual(&mut at, offset);
+            let mut probe = [TextEdit {
+                range: tower_lsp_server::ls_types::Range::new(at, at),
+                new_text: effective.to_string(),
+            }];
+            if !super::super::protocol::translate_virtual_text_edits_to_host(
+                &mut probe,
+                offset,
+                EditMode::Extent,
+            ) || probe[0].range != tower_lsp_server::ls_types::Range::new(caret, caret)
+                || probe[0].new_text != effective
+            {
+                return false;
+            }
+        }
     }
 
     // Transform additional_text_edits if present. ALL-OR-NOTHING: the array
@@ -997,6 +1022,45 @@ mod tests {
             ClientInsertMode::default(),
         ));
         assert_eq!(completed.additional_text_edits, Some(vec![]));
+    }
+
+    #[test]
+    fn a_prepared_item_inserted_at_the_caret_must_mean_what_its_edit_would() {
+        // `    abc\n\n    xyz\n` dedented by four: on the blank line an edit
+        // would regain the indent the client's verbatim insertion lacks.
+        let virtual_text = "    abc\n\n    xyz\n";
+        let map = {
+            use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+            let result = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 4}}, "newText": ""},
+                {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 4}}, "newText": ""}
+            ]}]}))
+            .unwrap();
+            apply_prepare_result(
+                virtual_text,
+                &VirtualLayout::single(virtual_text),
+                Some(result),
+            )
+            .unwrap()
+            .map
+        };
+        let offset = RegionOffset::new(10, 0).with_prepared(map);
+        let plain = || item(json!({"label": "foo"}));
+        assert!(!transform_completion_item(
+            &mut plain(),
+            &offset,
+            Position::new(13, 0),
+            Some(Position::new(11, 0)),
+            ClientInsertMode::default(),
+        ));
+        // After text, the insertion is what the edit would be.
+        assert!(transform_completion_item(
+            &mut plain(),
+            &offset,
+            Position::new(13, 0),
+            Some(Position::new(10, 7)),
+            ClientInsertMode::default(),
+        ));
     }
 
     #[test]
