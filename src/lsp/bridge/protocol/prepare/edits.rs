@@ -333,9 +333,10 @@ impl PreparedMap {
         // Lines inserted at a line start whose removed indent is not the
         // content's (the indentation-only last line's, shallower than the
         // content in the nixfmt layout) are lines of the content: they go
-        // before that indent, which the existing line gets back after them.
+        // before that indent, which the existing line gets back after them —
+        // joined by the text after their last line break, if any.
         let lines_before_own_indent = old.is_empty()
-            && new_text.ends_with(['\n', '\r'])
+            && new_text.contains(['\n', '\r'])
             && removed_at_start.is_some_and(|run| {
                 Some(&self.virtual_lines.text[run.virtual_.clone()])
                     != self.uniform_indent_at(plain_start)

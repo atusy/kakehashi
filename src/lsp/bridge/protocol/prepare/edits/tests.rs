@@ -2447,6 +2447,46 @@ fn lines_inserted_before_a_shallower_closing_indent_are_content_lines() {
 }
 
 #[test]
+fn text_ending_mid_line_inserted_before_a_closing_indent_regains_it_once() {
+    // Lines created at the closing line's start are content lines; the text
+    // after the last line break joins the closing line, after its own
+    // indent: the closing indent is regained once, not on both.
+    let virtual_text = "b c\r\n    ";
+    let map = prepare(
+        virtual_text,
+        json!([
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 4}}, "newText": ""}
+        ]),
+    );
+    assert_eq!(map.prepared_lines.text, "b c\r\n");
+    let inserted = |text| {
+        let edit = map
+            .map_one_with_extent(&edit((1, 0), (1, 0), text))
+            .unwrap();
+        apply_to(virtual_text, &[edit])
+    };
+    assert_eq!(inserted("if a:\n  b\nc"), "b c\r\nif a:\n  b\n    c");
+    assert_eq!(inserted("x\n  y"), "b c\r\nx\n      y");
+    // The nixfmt layout, the closing indent shallower than the content's.
+    let virtual_text = "  foo(1)\r ";
+    let map = prepare(
+        virtual_text,
+        json!([
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 1}}, "newText": ""}
+        ]),
+    );
+    assert_eq!(map.prepared_lines.text, "foo(1)\r");
+    let inserted = map
+        .map_one_with_extent(&edit((1, 0), (1, 0), "if a:\n  b\nc"))
+        .unwrap();
+    assert_eq!(
+        apply_to(virtual_text, &[inserted]),
+        "  foo(1)\r  if a:\n    b\n c"
+    );
+}
+
+#[test]
 fn a_closing_indent_after_content_left_alone_is_no_indent_to_regain() {
     // `a` at column 0, only the closing indent deleted: a line created after
     // `a` regains no indent.
